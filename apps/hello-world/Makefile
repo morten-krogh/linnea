@@ -1,4 +1,4 @@
-cflags := -std=c11 -g -Weverything -O0
+cflags := -std=c11 -g -Wpedantic -O0
 
 ldflags :=
 ldlibs := -lpthread
