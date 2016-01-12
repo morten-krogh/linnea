@@ -1,4 +1,4 @@
-cflags := -Wall
+cflags := -pthread -O2 -Weverything -g
 
 src-dir := src
 include-dir := include
@@ -14,7 +14,7 @@ additional-objects = $(filter-out $(target-objects), $(current-objects))
 all: clean-additional-objects $(target-objects)
 
 $(lib-dir)/%.o: $(src-dir)/%.c $(includes)
-	cc $(CFLAGS) -I$(include-dir) -c -o $@ $<
+	cc $(cflags) -I$(include-dir) -c -o $@ $<
 
 .PHONY: clean clean-additional-objects
 
