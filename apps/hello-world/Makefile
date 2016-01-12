@@ -23,13 +23,14 @@ stale-objects = $(filter-out $(target-objects), $(current-objects))
 
 server := bin/server
 
-#vpath %.c $(linnea-src-dir) $(app-src-dir)
-VPATH := $(linnea-src-dir) $(app-src-dir)
+vpath %.c $(linnea-src-dir) $(app-src-dir)
 
 all: clean-stale-objects $(server)
 
+rebuild: clean all
+
 $(server): $(target-objects)
-	$(cc) $(cflags) $(ldflags) $(target_arch) $(target-objects) -o $(server)
+	$(cc) $(ldlibs) $(target-objects) -o $(server)
 
 $(lib-dir)/%.o: %.c $(includes)
 	$(cc) $(cflags) -I$(linnea-include-dir) -I$(app-include-dir) -c -o $@ $<
