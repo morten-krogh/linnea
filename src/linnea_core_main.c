@@ -1,4 +1,4 @@
-
+#include "linnea_core.h"
 
 int main(void)
 {
