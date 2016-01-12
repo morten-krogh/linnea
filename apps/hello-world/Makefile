@@ -29,7 +29,7 @@ VPATH := $(linnea-src-dir) $(app-src-dir)
 all: clean-stale-objects $(server)
 
 $(server): $(target-objects)
-	$(cc) $(ldflags) $(target_arch) $(target-objects) -o $(server)
+	$(cc) $(cflags) $(ldflags) $(target_arch) $(target-objects) -o $(server)
 
 $(lib-dir)/%.o: %.c $(includes)
 	$(cc) $(cflags) -I$(linnea-include-dir) -I$(app-include-dir) -c -o $@ $<

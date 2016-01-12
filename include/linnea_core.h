@@ -3,5 +3,6 @@
 
 #include <stddef.h>
 
+void linnea_core_init(void);
 
 #endif
