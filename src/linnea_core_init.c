@@ -1,4 +1,4 @@
-#include "linnea_core.h"
+#include "linnea.h"
 
 void linnea_core_init(void)
 {
