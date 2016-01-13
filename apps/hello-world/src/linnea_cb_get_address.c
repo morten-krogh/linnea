@@ -1,8 +1,8 @@
 #include "linnea.h"
 
-void linnea_cb_get_address(void *app_state, int *ai_family, char **hostname, char **servname)
+void linnea_cb_get_address(struct state *state)
 {
-	*ai_family = PF_INET; 
-	*hostname = NULL;
-	*servname = "9000";
+	state->ai_family = PF_INET;
+	state->hostname = "localhost";
+	state->port = "9000";
 }
