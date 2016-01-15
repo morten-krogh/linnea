@@ -23,8 +23,10 @@ void linnea_core_accept_loop(struct state *state)
 		state_and_connection->connection = connection;
 		
 		pthread_t thread;
-		if (pthread_create(&thread, &attr, linnea_core_start_connection, state_and_connection) != 0) {
+		if (pthread_create(&thread, &attr, linnea_core_connection_start, state_and_connection) != 0) {
 			close(accepted_fd);
+			free(connection);
+			free(state_and_connection);
 		}
 	}
 }

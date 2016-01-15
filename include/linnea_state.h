@@ -16,8 +16,9 @@ struct connection {
 	int accepted_fd;
 	struct sockaddr_storage remote_addr;
 	socklen_t remote_addr_len;
+	void* app_connection_state;
 	
-
+	
 
 
 

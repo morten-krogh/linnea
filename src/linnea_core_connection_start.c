@@ -1,6 +1,6 @@
 #include "linnea.h"
 
-void *linnea_core_start_connection(void *arg)
+void *linnea_core_connection_start(void *arg)
 {
 	struct state_and_connection *state_and_connection = (struct state_and_connection*) arg;
 
@@ -9,10 +9,12 @@ void *linnea_core_start_connection(void *arg)
 
 	free(state_and_connection);
 
-	int accepted_fd = connection->accepted_fd;
+	linnea_cb_connection_init(state, connection);
 
+	
+	
 	while (true) {
-		printf("accepted_fd = %d\n", accepted_fd);
+
 		sleep(5);
 	}
 	
