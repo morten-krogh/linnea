@@ -46,7 +46,13 @@ struct linnea_buffer *linnea_buffer_resize(struct linnea_buffer *buf, size_t cap
 
 struct linnea_buffer* linnea_buffer_append(struct linnea_buffer *buf, const char *data, size_t len)
 {
+	if (buf->len + len > buf->cap) {
+		linnea_buffer_resize(buf, buf->len + len);
+	} else if (buf->start + buf->len + len > buf->cap) {
+		linnea_buffer_move(buf);
+	}
 
+	memcpy(buf->data + buf->start + buf->len, data, len);
 
 	return buf;
 }
