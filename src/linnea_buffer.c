@@ -1,11 +1,9 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "linnea_buffer.h"
 
-struct linnea_buffer {
-	char *data;
-	size_t start;
-	size_t len;
-	size_t cap;
-};
 
 struct linnea_buffer *linnea_buffer_init(struct linnea_buffer *buf, size_t capacity){
 	buf->data = NULL;
@@ -32,12 +30,12 @@ static void linnea_buffer_move(struct linnea_buffer *buf)
 
 struct linnea_buffer *linnea_buffer_resize(struct linnea_buffer *buf, size_t capacity)
 {
-	if (capacity < len || buf->capacity == capacity) return;
+	if (capacity < buf->len || buf->cap == capacity) return buf;
 
 	linnea_buffer_move(buf);
 
 	char *realloced_data = (char *) realloc(buf->data, capacity);
-	if (realloced_data == NULL) return;
+	if (realloced_data == NULL) return buf;
 
 	buf->data = realloced_data;
 	buf->cap = capacity;
@@ -59,5 +57,5 @@ struct linnea_buffer* linnea_buffer_append(struct linnea_buffer *buf, const char
 
 int linnea_buffer_print(const struct linnea_buffer *buf)
 {
-	return printf("%.*s", buf->len, buf->data + buf->start);
+	return printf("%.*s", (int) buf->len, buf->data + buf->start);
 }
