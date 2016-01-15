@@ -18,6 +18,7 @@ struct linnea_context {
 
 struct linnea_context *linnea_context_init(struct linnea_context *context);
 void linnea_context_start_event_loop(struct linnea_context *context);
+//int linnea_context_add_listener(struct linnea_context *contex);
 
 
 
