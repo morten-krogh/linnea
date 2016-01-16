@@ -20,8 +20,16 @@ struct linnea_socket {
 	size_t max_in_buffer_size;
 };
 
+struct linnea_sockets {
+	struct linnea_socket *data;
+	size_t len;
+	size_t cap;
+};
+
 struct linnea_socket *linnea_socket_init(struct linnea_socket *socket, int fd);
 void linnea_socket_free(struct linnea_socket *socket);
+
+struct linnea_sockets *linnea_sockets_init(struct linnea_sockets *sockets);
 
 
 
