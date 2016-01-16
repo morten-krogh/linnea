@@ -6,7 +6,7 @@
 
 
 
-int linnea_create_listener(const int ai_family, const char *hostname, const char *servname, struct sockaddr *socket_addr)
+int linnea_network_create_listener(const int ai_family, const char *hostname, const char *servname, struct sockaddr *socket_addr)
 {
 	struct addrinfo hints;
 

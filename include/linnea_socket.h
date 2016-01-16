@@ -4,7 +4,6 @@
 #include <stdbool.h>
 
 #include "linnea_buffer.h"
-#include "linnea_context.h"
 
 enum linnea_socket_state {
 	listener,
