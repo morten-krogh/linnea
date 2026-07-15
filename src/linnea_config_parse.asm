@@ -9,7 +9,10 @@
 ;   member := ws string ws ':' ws value
 ;
 ; Server keys are "host" (string), "port" (integer), "hostname" (string),
-; "root" (string), accepted in any order, each required exactly once.
+; "locations" (array of location objects), accepted in any order, each
+; required exactly once. Location keys are "prefix" (string, required)
+; plus exactly one of "root" (string) and "proxy" ("ip:port" string,
+; IPv4 literal only, validated and prebuilt into a sockaddr_in here).
 ; JSON subset: whitespace is space/tab/newline/carriage-return; strings
 ; have no escape sequences; numbers are non-negative decimal integers
 ; capped at 65535.
@@ -26,6 +29,7 @@ global linnea_parser_state
 extern linnea_error_parse
 extern linnea_string_equal
 extern linnea_string_copy
+extern linnea_network_parse_ipv4
 
 section .rodata
 
@@ -43,8 +47,14 @@ key_port:               db "port"
 key_port_len            equ $ - key_port
 key_hostname:           db "hostname"
 key_hostname_len        equ $ - key_hostname
+key_locations:          db "locations"
+key_locations_len       equ $ - key_locations
+key_prefix:             db "prefix"
+key_prefix_len          equ $ - key_prefix
 key_root:               db "root"
 key_root_len            equ $ - key_root
+key_proxy:              db "proxy"
+key_proxy_len           equ $ - key_proxy
 
 msg_eof:                db "unexpected end of file"
 msg_eof_len             equ $ - msg_eof
@@ -58,12 +68,18 @@ msg_trailing:           db "trailing content after config"
 msg_trailing_len        equ $ - msg_trailing
 msg_too_many:           db "too many servers (max 16)"
 msg_too_many_len        equ $ - msg_too_many
+msg_too_many_locs:      db "too many locations (max 8)"
+msg_too_many_locs_len   equ $ - msg_too_many_locs
 msg_unknown_key:        db "unknown key"
 msg_unknown_key_len     equ $ - msg_unknown_key
 msg_dup_key:            db "duplicate key"
 msg_dup_key_len         equ $ - msg_dup_key
-msg_missing_key:        db "server requires host, port, hostname and root"
+msg_missing_key:        db "server requires host, port, hostname and locations"
 msg_missing_key_len     equ $ - msg_missing_key
+msg_location_keys:      db "location requires prefix and exactly one of root or proxy"
+msg_location_keys_len   equ $ - msg_location_keys
+msg_bad_proxy:          db "invalid proxy address (IPv4:port required)"
+msg_bad_proxy_len       equ $ - msg_bad_proxy
 msg_unterminated:       db "unterminated string"
 msg_unterminated_len    equ $ - msg_unterminated
 msg_escape:             db "escape sequences not supported"
@@ -86,6 +102,10 @@ msg_hostname_long:      db "hostname too long"
 msg_hostname_long_len   equ $ - msg_hostname_long
 msg_root_long:          db "root too long"
 msg_root_long_len       equ $ - msg_root_long
+msg_prefix_long:        db "prefix too long"
+msg_prefix_long_len     equ $ - msg_prefix_long
+msg_proxy_long:         db "proxy address too long"
+msg_proxy_long_len      equ $ - msg_proxy_long
 msg_log_long:           db "log too long"
 msg_log_long_len        equ $ - msg_log_long
 
@@ -294,7 +314,7 @@ linnea_config_parse:
     jmp linnea_parse_fail
 
 ; linnea_parse_server(rdi=server*) — one server object, keys in any order.
-; Key presence tracked in a bitmask: host=1, port=2, hostname=4, root=8.
+; Key presence tracked in a bitmask: host=1, port=2, hostname=4, locations=8.
 linnea_parse_server:
     push rbx
     push r12
@@ -303,6 +323,7 @@ linnea_parse_server:
     push r15
     mov rbx, rdi               ; server*
     xor r12d, r12d             ; key mask
+    mov qword [rbx + linnea_config_server.location_count], 0
     mov edi, '{'
     call linnea_parse_expect
 .member_loop:
@@ -336,11 +357,11 @@ linnea_parse_server:
     jnz .key_hostname
     mov rdi, r13
     mov rsi, r14
-    lea rdx, [key_root]
-    mov ecx, key_root_len
+    lea rdx, [key_locations]
+    mov ecx, key_locations_len
     call linnea_string_equal
     test eax, eax
-    jnz .key_root
+    jnz .key_locations
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -388,17 +409,40 @@ linnea_parse_server:
     call linnea_string_copy
     jmp .member_sep
 
-.key_root:
+.key_locations:
     test r12d, 8
     jnz .dup
     or r12d, 8
-    call linnea_parse_string
-    cmp rdx, LINNEA_MAX_ROOT
-    ja .root_long
-    mov [rbx + linnea_config_server.root_len], rdx
-    lea rdi, [rbx + linnea_config_server.root]
-    mov rsi, rax
-    call linnea_string_copy
+    mov edi, '['
+    call linnea_parse_expect
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ']'
+    jne .location_loop
+    call linnea_parse_advance  ; empty array; validation rejects count 0
+    jmp .member_sep
+.location_loop:
+    mov r13, [rbx + linnea_config_server.location_count]
+    cmp r13, LINNEA_MAX_LOCATIONS
+    jae .too_many_locations
+    imul rdi, r13, linnea_config_location_size
+    lea rdi, [rbx + rdi + linnea_config_server.locations]
+    call linnea_parse_location
+    inc qword [rbx + linnea_config_server.location_count]
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ','
+    je .next_location
+    cmp al, ']'
+    je .end_locations
+    lea rdi, [msg_sep_array]
+    mov esi, msg_sep_array_len
+    jmp linnea_parse_fail
+.next_location:
+    call linnea_parse_advance
+    jmp .location_loop
+.end_locations:
+    call linnea_parse_advance
 
 .member_sep:
     call linnea_parse_skip_ws
@@ -440,9 +484,204 @@ linnea_parse_server:
     lea rdi, [msg_hostname_long]
     mov esi, msg_hostname_long_len
     jmp linnea_parse_fail
+.too_many_locations:
+    lea rdi, [msg_too_many_locs]
+    mov esi, msg_too_many_locs_len
+    jmp linnea_parse_fail
+
+; linnea_parse_location(rdi=location*) — one location object.
+; Key presence tracked in a bitmask: prefix=1, root=2, proxy=4; a location
+; requires prefix plus exactly one of root and proxy (final mask 3 or 5).
+; A proxy value is validated here and prebuilt into a sockaddr_in.
+linnea_parse_location:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi               ; location*
+    xor r12d, r12d             ; key mask
+    mov edi, '{'
+    call linnea_parse_expect
+.member_loop:
+    call linnea_parse_skip_ws
+    mov r15, [linnea_parser_state + linnea_parser.pos]   ; key start, for errors
+    call linnea_parse_string
+    mov r13, rax               ; key ptr
+    mov r14, rdx               ; key len
+    mov edi, ':'
+    call linnea_parse_expect
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_prefix]
+    mov ecx, key_prefix_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_prefix
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_root]
+    mov ecx, key_root_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_root
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_proxy]
+    mov ecx, key_proxy_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_proxy
+    lea rdi, [msg_unknown_key]
+    mov esi, msg_unknown_key_len
+    mov rdx, r15
+    jmp linnea_error_parse
+
+.key_prefix:
+    test r12d, 1
+    jnz .dup
+    or r12d, 1
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_PREFIX
+    ja .prefix_long
+    mov [rbx + linnea_config_location.prefix_len], rdx
+    lea rdi, [rbx + linnea_config_location.prefix]
+    mov rsi, rax
+    call linnea_string_copy
+    jmp .member_sep
+
+.key_root:
+    test r12d, 2
+    jnz .dup
+    or r12d, 2
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_ROOT
+    ja .root_long
+    mov [rbx + linnea_config_location.root_len], rdx
+    lea rdi, [rbx + linnea_config_location.root]
+    mov rsi, rax
+    call linnea_string_copy
+    mov qword [rbx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    jmp .member_sep
+
+.key_proxy:
+    test r12d, 4
+    jnz .dup
+    or r12d, 4
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_PROXY_STR
+    ja .proxy_long
+    mov [rbx + linnea_config_location.proxy_str_len], rdx
+    lea rdi, [rbx + linnea_config_location.proxy_str]
+    mov rsi, rax
+    call linnea_string_copy
+    ; split "ip:port" at the ':' — the ip half is NUL-terminated in place
+    ; (we own the buffer), parsed, and the ':' restored
+    lea r13, [rbx + linnea_config_location.proxy_str]
+    mov rdx, [rbx + linnea_config_location.proxy_str_len]
+    xor ecx, ecx
+.proxy_colon_scan:
+    cmp rcx, rdx
+    jae .bad_proxy             ; no ':'
+    cmp byte [r13 + rcx], ':'
+    je .proxy_colon_found
+    inc rcx
+    jmp .proxy_colon_scan
+.proxy_colon_found:
+    test rcx, rcx
+    jz .bad_proxy              ; empty ip part
+    lea rax, [rcx + 1]
+    cmp rax, rdx
+    jae .bad_proxy             ; empty port part
+    mov r14, rcx               ; ':' offset
+    mov byte [r13 + r14], 0
+    mov rdi, r13
+    call linnea_network_parse_ipv4
+    mov byte [r13 + r14], ':'
+    cmp rax, -1
+    je .bad_proxy
+    mov r15d, eax              ; ip, network byte order
+    ; port: decimal digits only, 1-65535
+    mov rdx, [rbx + linnea_config_location.proxy_str_len]
+    sub rdx, r14
+    dec rdx                    ; digit count
+    lea rsi, [r13 + r14 + 1]
+    xor eax, eax               ; port accumulator
+    xor ecx, ecx               ; digit index
+.proxy_port_loop:
+    cmp rcx, rdx
+    jae .proxy_port_done
+    movzx r8d, byte [rsi + rcx]
+    sub r8d, '0'
+    cmp r8d, 9
+    ja .bad_proxy
+    imul eax, eax, 10
+    add eax, r8d
+    cmp eax, 65535
+    ja .bad_proxy
+    inc rcx
+    jmp .proxy_port_loop
+.proxy_port_done:
+    test eax, eax
+    jz .bad_proxy
+    ; prebuild the upstream sockaddr_in
+    lea rdi, [rbx + linnea_config_location.proxy_addr]
+    mov word [rdi], LINNEA_AF_INET
+    xchg al, ah                ; htons
+    mov [rdi + 2], ax
+    mov [rdi + 4], r15d
+    mov qword [rdi + 8], 0
+    mov qword [rbx + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
+
+.member_sep:
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ','
+    je .next_member
+    cmp al, '}'
+    je .end_object
+    lea rdi, [msg_sep_object]
+    mov esi, msg_sep_object_len
+    jmp linnea_parse_fail
+.next_member:
+    call linnea_parse_advance
+    jmp .member_loop
+.end_object:
+    call linnea_parse_advance
+    cmp r12d, 3                ; prefix + root
+    je .done
+    cmp r12d, 5                ; prefix + proxy
+    je .done
+    lea rdi, [msg_location_keys]
+    mov esi, msg_location_keys_len
+    jmp linnea_parse_fail
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.dup:
+    lea rdi, [msg_dup_key]
+    mov esi, msg_dup_key_len
+    mov rdx, r15
+    jmp linnea_error_parse
+.prefix_long:
+    lea rdi, [msg_prefix_long]
+    mov esi, msg_prefix_long_len
+    jmp linnea_parse_fail
 .root_long:
     lea rdi, [msg_root_long]
     mov esi, msg_root_long_len
+    jmp linnea_parse_fail
+.proxy_long:
+    lea rdi, [msg_proxy_long]
+    mov esi, msg_proxy_long_len
+    jmp linnea_parse_fail
+.bad_proxy:
+    lea rdi, [msg_bad_proxy]
+    mov esi, msg_bad_proxy_len
     jmp linnea_parse_fail
 
 ; --- low-level helpers -------------------------------------------------

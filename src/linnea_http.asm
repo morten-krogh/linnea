@@ -1,7 +1,7 @@
-; linnea_http.asm — HTTP/1.1 request parsing and static file serving.
+; linnea_http.asm — HTTP/1.1 request parsing, routing, and static serving.
 ;
 ; Supported subset:
-; - Methods: GET and HEAD; anything else gets 405.
+; - Methods: GET and HEAD on static locations; anything else gets 405.
 ; - Request line: METHOD SP TARGET SP "HTTP/1.1" CRLF; single spaces;
 ;   METHOD 1-32 bytes, TARGET 1-2048 bytes, printable ASCII (0x21-0x7E).
 ;   Other HTTP/x versions get 505, malformed lines 400.
@@ -13,12 +13,16 @@
 ;   response waits until the whole body has arrived, then the body is
 ;   discarded with the head so keep-alive works. Transfer-Encoding: 501.
 ;   Duplicate or malformed Content-Length: 400.
-; - File mapping: the query string is stripped, then the target is
+; - Routing: the query string is stripped, then the target is
 ;   percent-decoded (%XX; bad escapes and %00 give 400). The decoded path
 ;   must be absolute; it is normalized segment by segment (empty and "."
 ;   segments drop, ".." pops — checked after decoding so encoded dots
-;   cannot slip through; popping above the root gives 400). A directory
-;   result maps to its index.html. path = root + normalized target.
+;   cannot slip through; popping above the root gives 400). The result is
+;   matched against the vhost's location prefixes, longest prefix first;
+;   no match gives 404. Prefixes are not stripped: a static location maps
+;   path = location root + normalized path, a proxy location forwards the
+;   whole target upstream.
+; - Static locations: a directory result maps to its index.html.
 ;   Missing/non-regular files: 404.
 ;   The access log records the raw, undecoded target.
 ; - Files are served from a read-only mmap queued behind the header send
@@ -38,11 +42,15 @@ LINNEA_HTTP_RESPOND     equ 1
 
 LINNEA_HTTP_MAX_METHOD  equ 32
 LINNEA_HTTP_MAX_TARGET  equ 2048
-; root (255) + target (2048) + "index.html" + NUL always fits
+; The decoded path is built at LINNEA_HTTP_PATH_ROOT so a matched
+; location's root can be prepended in place, without moving the path:
+; root (255) + target (2048) + "/index.html" + NUL always fits.
+LINNEA_HTTP_PATH_ROOT   equ LINNEA_MAX_ROOT + 1
 LINNEA_HTTP_PATH_BUF    equ 2560
 
 extern linnea_config_instance
 extern linnea_string_from_u64
+extern linnea_string_equal
 extern linnea_string_iequal
 extern linnea_log_write
 extern linnea_log_u64
@@ -179,13 +187,17 @@ section .text
 ;   [rsp+88] Host value ptr (0 = absent)          [rsp+96] Host value len
 ;   [rsp+104] method len    [rsp+112] status      [rsp+120] server* (for log)
 ;   [rsp+128] Content-Length value                [rsp+136] flags: 1=CL, 2=TE
+;   [rsp+144] raw target len, query included (the target len at [rsp+16]
+;             is truncated at '?' for routing)  [rsp+152] location*
+;   [rsp+160] best prefix len (location match scratch)
+;   [rsp+168] directory flag (r9 does not survive the match loop's calls)
 linnea_http_handle:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 144
+    sub rsp, 176
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -198,6 +210,7 @@ linnea_http_handle:
     mov qword [rsp + 104], 0   ; no method yet
     mov qword [rsp + 128], 0   ; no body
     mov qword [rsp + 136], 0   ; no Content-Length/Transfer-Encoding seen
+    mov qword [rsp + 144], 0   ; no raw target yet
     mov ecx, [rbx + linnea_connection.server]
     imul rcx, rcx, linnea_config_server_size
     lea rax, [linnea_config_instance]
@@ -286,6 +299,7 @@ linnea_http_handle:
     mov rax, r15
     sub rax, rcx
     mov [rsp + 16], rax
+    mov [rsp + 144], rax       ; raw length, kept when the query is stripped
     test rax, rax
     jz .resp_400
     cmp rax, LINNEA_HTTP_MAX_TARGET
@@ -475,8 +489,8 @@ linnea_http_handle:
 .parsed:
     test qword [rsp + 136], 2
     jnz .resp_501
-    cmp qword [rsp], -1
-    je .resp_405
+    ; an unknown method is only an error on a static location (405 below);
+    ; proxy locations forward whatever the client sent
     ; the whole body must be buffered so it can be discarded with the
     ; head; only then is keep-alive safe
     mov rax, [rbx + linnea_connection.head_len]
@@ -489,7 +503,8 @@ linnea_http_handle:
     jmp .ret
 .body_ready:
     mov [rbx + linnea_connection.head_len], rax
-    ; strip the query string
+    ; strip the query string for routing; [rsp+144] keeps the raw length
+    ; for proxying and the access log
     mov rsi, [rsp + 8]
     mov rcx, [rsp + 16]
     xor edx, edx
@@ -559,11 +574,9 @@ linnea_http_handle:
     jmp .vhost_loop
 .server_chosen:
     mov [rsp + 120], r12       ; the server that will handle the request
-    ; path = root + percent-decoded target (+ index.html after trailing '/')
-    lea rdi, [path_buf]
-    lea rsi, [r12 + linnea_config_server.root]
-    mov rcx, [r12 + linnea_config_server.root_len]
-    rep movsb
+    ; decode the target into path_buf, leaving room ahead of it for a
+    ; matched location's root to be prepended in place
+    lea rdi, [path_buf + LINNEA_HTTP_PATH_ROOT]
     mov rsi, [rsp + 8]         ; raw target
     mov rcx, [rsp + 16]
     mov r13, rdi               ; start of the decoded target
@@ -668,21 +681,88 @@ linnea_http_handle:
     jmp .norm_loop
 .norm_done:
     cmp rdi, r13               ; everything normalized away = the root
-    jne .norm_dir_check
+    jne .norm_matched
+    mov byte [rdi], '/'        ; materialize "/" so a "/" prefix matches
+    inc rdi
     mov r9d, 1
-.norm_dir_check:
+.norm_matched:
+    ; --- location match: longest prefix wins ------------------------
+    ; path = [r13, rdi); prefixes are matched byte for byte and are not
+    ; stripped — the whole path is appended to the root / sent upstream
+    mov r15, rdi               ; path end
+    mov r8, rdi
+    sub r8, r13                ; path len
+    mov [rsp + 168], r9        ; the compares below clobber r9
+    mov qword [rsp + 152], 0   ; best location*
+    mov qword [rsp + 160], 0   ; best prefix len
+    mov r10, [r12 + linnea_config_server.location_count]
+    xor r11d, r11d             ; location index
+.loc_loop:
+    cmp r11, r10
+    jae .loc_done
+    imul rax, r11, linnea_config_location_size
+    lea rax, [r12 + rax + linnea_config_server.locations]
+    mov rcx, [rax + linnea_config_location.prefix_len]
+    cmp rcx, r8
+    ja .loc_next               ; prefix longer than the path
+    cmp rcx, [rsp + 160]
+    jbe .loc_next              ; not longer than the best match so far
+    ; compare the first prefix_len bytes of the path
+    mov [rsp + 56], rax        ; candidate location*
+    mov [rsp + 64], r8
+    mov [rsp + 72], r10
+    mov [rsp + 80], r11
+    mov rdi, r13
+    mov rsi, rcx
+    lea rdx, [rax + linnea_config_location.prefix]
+    call linnea_string_equal
+    mov r11, [rsp + 80]
+    mov r10, [rsp + 72]
+    mov r8, [rsp + 64]
+    test eax, eax
+    jz .loc_next
+    mov rax, [rsp + 56]
+    mov [rsp + 152], rax
+    mov rcx, [rax + linnea_config_location.prefix_len]
+    mov [rsp + 160], rcx
+.loc_next:
+    inc r11
+    jmp .loc_loop
+.loc_done:
+    mov rax, [rsp + 152]
+    test rax, rax
+    jz .resp_404               ; no location claims this path
+    cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
+    je .resp_501               ; proxying arrives with the next milestone
+
+    ; --- static location ---------------------------------------------
+    cmp qword [rsp], -1
+    je .resp_405               ; files are GET/HEAD only
+    mov rdi, r15               ; path end, from the match above
+    mov r9, [rsp + 168]        ; directory flag
     test r9d, r9d
     jz .path_ready
+    cmp byte [rdi - 1], '/'    ; a directory maps to its index.html
+    je .append_index
     mov byte [rdi], '/'
     inc rdi
+.append_index:
     lea rsi, [index_html]
     mov ecx, index_html_len
     rep movsb
 .path_ready:
     mov byte [rdi], 0
     mov r15, rdi               ; path end, for the extension scan
+    ; prepend the location root, ending where the decoded path starts
+    mov rax, [rsp + 152]
+    mov rcx, [rax + linnea_config_location.root_len]
+    lea r13, [path_buf + LINNEA_HTTP_PATH_ROOT]
+    sub r13, rcx               ; start of the joined path
+    mov rdi, r13
+    lea rsi, [rax + linnea_config_location.root]
+    rep movsb
     ; open + fstat, must be a regular file
-    lea rdi, [path_buf]
+    mov rdi, r13
     xor esi, esi               ; O_RDONLY
     xor edx, edx
     mov eax, LINNEA_SYS_OPEN
@@ -727,8 +807,8 @@ linnea_http_handle:
     mov eax, LINNEA_SYS_CLOSE
     syscall                    ; the mapping outlives the fd
 
-    ; MIME type from the extension (path_buf .. r15)
-    lea rdx, [path_buf]
+    ; MIME type from the extension (joined path start .. r15)
+    mov rdx, r13
     mov rcx, r15               ; scan backwards for '.' before any '/'
 .ext_scan:
     cmp rcx, rdx
@@ -883,7 +963,7 @@ linnea_http_handle:
     mov esi, 1
     call linnea_log_write
     mov rdi, [rsp + 8]
-    mov rsi, [rsp + 16]
+    mov rsi, [rsp + 144]       ; the raw target, query included
     test rdi, rdi
     jnz .log_target
     lea rdi, [log_dash]
@@ -907,7 +987,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 144
+    add rsp, 176
     pop r15
     pop r14
     pop r13

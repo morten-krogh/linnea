@@ -1,0 +1,9 @@
+{
+  "log": "test/linnea.log",
+  "servers": [
+    {
+      "host": "127.0.0.1", "port": 47080, "hostname": "one.test",
+      "locations": []
+    }
+  ]
+}

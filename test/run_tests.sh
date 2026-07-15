@@ -44,9 +44,11 @@ check() {
 }
 
 # --- config parsing and validation ---
-run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test root=test/www" \
+run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test locations=2" \
     timeout 0.5 $BIN test/configs/listen.json
 run_test "config dump"     124 stdout "config: 3 servers timeout=2 max_connections=64" \
+    timeout 0.5 $BIN test/configs/listen.json
+run_test "location dump"   124 stdout "location 1: prefix=/sub root=test/www" \
     timeout 0.5 $BIN test/configs/listen.json
 run_test "bad timeout"     1 stderr "timeout must be between 1 and 3600" \
     $BIN test/configs/bad-timeout.json
@@ -68,6 +70,16 @@ run_test "unknown key"     1 stderr "unknown key" \
     $BIN test/configs/unknown-key.json
 run_test "escape sequence" 1 stderr "escape sequences not supported" \
     $BIN test/configs/escape.json
+run_test "location no prefix" 1 stderr "location requires prefix and exactly one of root or proxy" \
+    $BIN test/configs/location-missing-prefix.json
+run_test "location root+proxy" 1 stderr "location requires prefix and exactly one of root or proxy" \
+    $BIN test/configs/location-both-kinds.json
+run_test "bad proxy address" 1 stderr "invalid proxy address" \
+    $BIN test/configs/bad-proxy-addr.json
+run_test "prefix not absolute" 1 stderr "location prefix must start with '/'" \
+    $BIN test/configs/location-bad-prefix.json
+run_test "empty locations"  1 stderr "at least one location" \
+    $BIN test/configs/empty-locations.json
 
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
@@ -117,6 +129,15 @@ resp=$(curl -si --max-time 2 http://127.0.0.1:47080/style.css)
 check_http "css mime"          "Content-Type: text/css" "$resp"
 resp=$(curl -s --max-time 2 http://127.0.0.1:47090/sub/page.html)
 check_http "subdirectory file" "subdirectory page" "$resp"
+
+# --- location routing: 47090 has "/" -> test/www/sub and "/sub" -> test/www ---
+resp=$(curl -s --max-time 2 http://127.0.0.1:47090/page.html)
+check_http "location root match"  "subdirectory page" "$resp"
+resp=$(curl -si --max-time 2 http://127.0.0.1:47090/hello.txt)
+check_http "location root scopes" "404 Not Found" "$resp"
+# /sub/page.html matches the longer "/sub" prefix (root test/www), not "/"
+resp=$(curl -s --max-time 2 http://127.0.0.1:47090/sub/page.html)
+check_http "longest prefix wins"  "subdirectory page" "$resp"
 resp=$(curl -si --max-time 2 http://127.0.0.1:47080/no-such-file)
 check_http "http 404"          "404 Not Found" "$resp"
 resp=$(curl -si --max-time 2 -I http://127.0.0.1:47080/hello.txt)

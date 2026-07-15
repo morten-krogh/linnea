@@ -8,6 +8,7 @@ default rel
 
 global linnea_network_listen_all
 global linnea_network_peer_format
+global linnea_network_parse_ipv4
 
 extern linnea_error_server
 extern linnea_string_equal

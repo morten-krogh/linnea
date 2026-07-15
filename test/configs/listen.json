@@ -3,8 +3,24 @@
   "timeout": 2,
   "max_connections": 64,
   "servers": [
-    { "host": "127.0.0.1", "port": 47080, "hostname": "one.test", "root": "test/www" },
-    { "host": "127.0.0.1", "port": 47090, "hostname": "two.test", "root": "test/www" },
-    { "host": "127.0.0.1", "port": 47080, "hostname": "three.test", "root": "test/www/sub" }
+    {
+      "host": "127.0.0.1", "port": 47080, "hostname": "one.test",
+      "locations": [
+        { "prefix": "/", "root": "test/www" }
+      ]
+    },
+    {
+      "host": "127.0.0.1", "port": 47090, "hostname": "two.test",
+      "locations": [
+        { "prefix": "/", "root": "test/www/sub" },
+        { "prefix": "/sub", "root": "test/www" }
+      ]
+    },
+    {
+      "host": "127.0.0.1", "port": 47080, "hostname": "three.test",
+      "locations": [
+        { "prefix": "/", "root": "test/www/sub" }
+      ]
+    }
   ]
 }
