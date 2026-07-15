@@ -7,9 +7,11 @@ default rel
 %include "linnea_config.inc"
 
 global linnea_network_listen_all
+global linnea_network_peer_format
 
 extern linnea_error_server
 extern linnea_string_equal
+extern linnea_string_from_u64
 extern linnea_log_write
 extern linnea_log_u64
 extern linnea_log_stamp
@@ -203,6 +205,69 @@ linnea_network_listener_create:
     mov esi, msg_listen_len
     mov rdx, rbx
     jmp linnea_error_server
+
+; linnea_network_peer_format(rdi=socket fd, rsi=out buffer) -> rax=len
+; Writes the connected peer as "a.b.c.d:port". The buffer must have room
+; for linnea_string_from_u64's 20-byte scratch past the write cursor
+; (48 bytes is plenty). On any failure writes "-" and returns 1.
+linnea_network_peer_format:
+    push rbx
+    push r12
+    sub rsp, 40                ; sockaddr (16) + socklen (8); keeps calls aligned
+    mov rbx, rsi               ; out buffer
+    mov eax, LINNEA_SYS_GETPEERNAME
+    mov rsi, rsp
+    lea rdx, [rsp + 16]
+    mov qword [rsp + 16], LINNEA_SOCKADDR_IN_SIZE
+    syscall
+    cmp rax, -4095
+    jae .unknown
+    cmp word [rsp], LINNEA_AF_INET
+    jne .unknown
+    mov r12, rbx               ; write cursor
+    movzx edi, byte [rsp + 4]
+    mov rsi, r12
+    call linnea_string_from_u64
+    add r12, rax
+    mov byte [r12], '.'
+    inc r12
+    movzx edi, byte [rsp + 5]
+    mov rsi, r12
+    call linnea_string_from_u64
+    add r12, rax
+    mov byte [r12], '.'
+    inc r12
+    movzx edi, byte [rsp + 6]
+    mov rsi, r12
+    call linnea_string_from_u64
+    add r12, rax
+    mov byte [r12], '.'
+    inc r12
+    movzx edi, byte [rsp + 7]
+    mov rsi, r12
+    call linnea_string_from_u64
+    add r12, rax
+    mov byte [r12], ':'
+    inc r12
+    movzx eax, word [rsp + 2]
+    xchg al, ah                ; network to host order
+    movzx edi, ax
+    mov rsi, r12
+    call linnea_string_from_u64
+    add r12, rax
+    mov rax, r12
+    sub rax, rbx
+    add rsp, 40
+    pop r12
+    pop rbx
+    ret
+.unknown:
+    mov byte [rbx], '-'
+    mov eax, 1
+    add rsp, 40
+    pop r12
+    pop rbx
+    ret
 
 ; linnea_network_parse_ipv4(rdi=cstr) -> rax
 ; Parses a dotted-quad IPv4 literal. Returns the address as a 32-bit value

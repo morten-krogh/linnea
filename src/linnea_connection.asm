@@ -20,19 +20,21 @@ free_head:      resq 1         ; pool index of first free slot, -1 = none
 
 section .text
 
-; linnea_connections_init() — allocate the pool and chain the free list.
+; linnea_connections_init(rdi=pool size) — allocate and chain the free list.
 linnea_connections_init:
-    mov rdi, linnea_connection_size * LINNEA_MAX_CONNECTIONS
+    push rbx
+    mov rbx, rdi               ; pool size
+    imul rdi, rdi, linnea_connection_size
     call linnea_memory_map
     mov [pool_base], rax
     mov rdx, rax               ; slot cursor
     xor ecx, ecx               ; index
 .chain:
-    cmp rcx, LINNEA_MAX_CONNECTIONS
+    cmp rcx, rbx
     jae .done
     mov [rdx + linnea_connection.index], rcx
     lea r8, [rcx + 1]
-    cmp r8, LINNEA_MAX_CONNECTIONS
+    cmp r8, rbx
     jne .link
     mov r8, -1
 .link:
@@ -42,6 +44,7 @@ linnea_connections_init:
     jmp .chain
 .done:
     mov qword [free_head], 0
+    pop rbx
     ret
 
 ; linnea_connection_alloc() -> rax=connection* or 0 when the pool is empty.

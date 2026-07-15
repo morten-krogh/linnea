@@ -7,12 +7,20 @@
 ;   Other HTTP/x versions get 505, malformed lines 400.
 ; - Header lines: NAME ":" OWS VALUE CRLF; the head must end with
 ;   CRLF CRLF within the input buffer, else 431.
-; - Keep-alive: on by default (HTTP/1.1); disabled by "Connection: close",
-;   by any request that carries a body indicator (Content-Length or
-;   Transfer-Encoding — bodies are never read), and by error responses.
-; - File mapping: target is used verbatim (no percent-decoding), the query
-;   string is stripped, any ".." rejects the request, a trailing "/" maps
-;   to index.html. path = root + target. Missing/non-regular files: 404.
+; - Keep-alive: on by default (HTTP/1.1); disabled by "Connection: close"
+;   and by error responses.
+; - Bodies: head + body must fit the input buffer together, else 413; the
+;   response waits until the whole body has arrived, then the body is
+;   discarded with the head so keep-alive works. Transfer-Encoding: 501.
+;   Duplicate or malformed Content-Length: 400.
+; - File mapping: the query string is stripped, then the target is
+;   percent-decoded (%XX; bad escapes and %00 give 400). The decoded path
+;   must be absolute; it is normalized segment by segment (empty and "."
+;   segments drop, ".." pops — checked after decoding so encoded dots
+;   cannot slip through; popping above the root gives 400). A directory
+;   result maps to its index.html. path = root + normalized target.
+;   Missing/non-regular files: 404.
+;   The access log records the raw, undecoded target.
 ; - Files are served from a read-only mmap queued behind the header send
 ;   (conn.file_*); the event loop munmaps after the send completes.
 
@@ -55,10 +63,18 @@ resp_405:       db "HTTP/1.1 405 Method Not Allowed", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_405_len    equ $ - resp_405
+resp_413:       db "HTTP/1.1 413 Content Too Large", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_413_len    equ $ - resp_413
 resp_431:       db "HTTP/1.1 431 Request Header Fields Too Large", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_431_len    equ $ - resp_431
+resp_501:       db "HTTP/1.1 501 Not Implemented", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_501_len    equ $ - resp_501
 resp_505:       db "HTTP/1.1 505 HTTP Version Not Supported", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
@@ -81,6 +97,8 @@ index_html_len  equ $ - index_html
 
 log_req:        db "request "
 log_req_len     equ $ - log_req
+log_from:       db " from "
+log_from_len    equ $ - log_from
 log_quote:      db ' "'
 log_endq:       db '" '
 log_dash:       db "-"
@@ -160,13 +178,14 @@ section .text
 ;   [rsp+64] name len       [rsp+72] value ptr    [rsp+80] value len
 ;   [rsp+88] Host value ptr (0 = absent)          [rsp+96] Host value len
 ;   [rsp+104] method len    [rsp+112] status      [rsp+120] server* (for log)
+;   [rsp+128] Content-Length value                [rsp+136] flags: 1=CL, 2=TE
 linnea_http_handle:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 128
+    sub rsp, 144
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -177,6 +196,8 @@ linnea_http_handle:
     mov qword [rsp + 88], 0    ; no Host header yet
     mov qword [rsp + 96], 0
     mov qword [rsp + 104], 0   ; no method yet
+    mov qword [rsp + 128], 0   ; no body
+    mov qword [rsp + 136], 0   ; no Content-Length/Transfer-Encoding seen
     mov ecx, [rbx + linnea_connection.server]
     imul rcx, rcx, linnea_config_server_size
     lea rax, [linnea_config_instance]
@@ -376,22 +397,20 @@ linnea_http_handle:
     mov qword [rsp + 24], 0
     jmp .header_next
 .try_content_len:
-    ; any body indicator disables keep-alive: bodies are never read,
-    ; so leftover body bytes must not be parsed as the next request
     mov rdi, [rsp + 56]
     mov rsi, [rsp + 64]
     lea rdx, [hn_content_len]
     mov ecx, 14
     call linnea_string_iequal
     test eax, eax
-    jnz .body_indicator
+    jnz .cl_header
     mov rdi, [rsp + 56]
     mov rsi, [rsp + 64]
     lea rdx, [hn_transfer_enc]
     mov ecx, 17
     call linnea_string_iequal
     test eax, eax
-    jnz .body_indicator
+    jnz .te_header
     ; Host? (first occurrence wins, used for vhost selection)
     cmp qword [rsp + 88], 0
     jne .header_next
@@ -407,8 +426,35 @@ linnea_http_handle:
     mov rax, [rsp + 80]
     mov [rsp + 96], rax
     jmp .header_next
-.body_indicator:
-    mov qword [rsp + 24], 0
+.cl_header:
+    test qword [rsp + 136], 1
+    jnz .resp_400              ; duplicate Content-Length
+    or qword [rsp + 136], 1
+    mov rsi, [rsp + 72]        ; value must be all digits
+    mov rcx, [rsp + 80]
+    test rcx, rcx
+    jz .resp_400
+    mov r9, 1 << 32
+    xor eax, eax
+    xor edx, edx
+.cl_digits:
+    cmp rdx, rcx
+    jae .cl_done
+    movzx r8d, byte [rsi + rdx]
+    sub r8d, '0'
+    cmp r8d, 9
+    ja .resp_400
+    imul rax, rax, 10
+    add rax, r8
+    cmp rax, r9
+    ja .resp_413
+    inc rdx
+    jmp .cl_digits
+.cl_done:
+    mov [rsp + 128], rax
+    jmp .header_next
+.te_header:
+    or qword [rsp + 136], 2    ; chunked etc. are not implemented
 .header_next:
     add r15, 2                 ; past the CRLF
     jmp .header_loop
@@ -427,8 +473,22 @@ linnea_http_handle:
 
     ; --- serve the file ---------------------------------------------
 .parsed:
+    test qword [rsp + 136], 2
+    jnz .resp_501
     cmp qword [rsp], -1
     je .resp_405
+    ; the whole body must be buffered so it can be discarded with the
+    ; head; only then is keep-alive safe
+    mov rax, [rbx + linnea_connection.head_len]
+    add rax, [rsp + 128]
+    cmp rax, LINNEA_CONN_IN_BUF
+    ja .resp_413
+    cmp rax, [rbx + linnea_connection.in_len]
+    jbe .body_ready
+    mov eax, LINNEA_HTTP_NEED_MORE
+    jmp .ret
+.body_ready:
+    mov [rbx + linnea_connection.head_len], rax
     ; strip the query string
     mov rsi, [rsp + 8]
     mov rcx, [rsp + 16]
@@ -444,21 +504,9 @@ linnea_http_handle:
     mov rcx, rdx
 .query_done:
     mov [rsp + 16], rcx
-    ; must be an absolute path without any ".."
     test rcx, rcx
     jz .resp_400
-    cmp byte [rsi], '/'
-    jne .resp_400
-    xor edx, edx
-.dot_scan:
-    lea rax, [rdx + 2]
-    cmp rax, rcx
-    ja .dots_ok
-    cmp word [rsi + rdx], '..'
-    je .resp_400
-    inc rdx
-    jmp .dot_scan
-.dots_ok:
+    ; absolute-path and ".." checks run on the decoded target below
     ; default server = the one whose listener accepted the connection
     mov ecx, [rbx + linnea_connection.server]
     imul rcx, rcx, linnea_config_server_size
@@ -511,20 +559,126 @@ linnea_http_handle:
     jmp .vhost_loop
 .server_chosen:
     mov [rsp + 120], r12       ; the server that will handle the request
-    ; path = root + target (+ index.html after a trailing '/')
+    ; path = root + percent-decoded target (+ index.html after trailing '/')
     lea rdi, [path_buf]
     lea rsi, [r12 + linnea_config_server.root]
     mov rcx, [r12 + linnea_config_server.root_len]
     rep movsb
-    mov rsi, [rsp + 8]
+    mov rsi, [rsp + 8]         ; raw target
     mov rcx, [rsp + 16]
-    rep movsb
-    cmp byte [rdi - 1], '/'
-    jne .no_index
+    mov r13, rdi               ; start of the decoded target
+    xor edx, edx
+.decode_loop:
+    cmp rdx, rcx
+    jae .decode_done
+    movzx eax, byte [rsi + rdx]
+    cmp al, '%'
+    je .decode_pct
+    mov [rdi], al
+    inc rdi
+    inc rdx
+    jmp .decode_loop
+.decode_pct:
+    lea rax, [rdx + 3]
+    cmp rax, rcx
+    ja .resp_400
+    movzx eax, byte [rsi + rdx + 1]
+    call .hex_nibble
+    test eax, eax
+    js .resp_400
+    mov r9d, eax
+    movzx eax, byte [rsi + rdx + 2]
+    call .hex_nibble
+    test eax, eax
+    js .resp_400
+    shl r9d, 4
+    or eax, r9d
+    jz .resp_400               ; %00 would truncate the path
+    mov [rdi], al
+    inc rdi
+    add rdx, 3
+    jmp .decode_loop
+.decode_done:
+    ; normalize the decoded path in place, segment by segment:
+    ; "" and "." drop, ".." pops (above the root: 400); r9 tracks whether
+    ; the path names a directory (trailing "/", "/." or "/..")
+    cmp byte [r13], '/'
+    jne .resp_400
+    mov rsi, r13               ; read cursor, at a '/'
+    mov rcx, rdi               ; end of the decoded input
+    mov rdi, r13               ; write cursor
+    xor r9d, r9d               ; directory flag
+.norm_loop:
+    cmp rsi, rcx
+    jae .norm_done
+    inc rsi                    ; past the '/'; segment = [rsi, rdx)
+    mov rdx, rsi
+.norm_seg_end:
+    cmp rdx, rcx
+    jae .norm_have_seg
+    cmp byte [rdx], '/'
+    je .norm_have_seg
+    inc rdx
+    jmp .norm_seg_end
+.norm_have_seg:
+    mov rax, rdx
+    sub rax, rsi               ; segment length
+    test rax, rax
+    jz .norm_skip
+    cmp rax, 1
+    jne .norm_not_dot
+    cmp byte [rsi], '.'
+    je .norm_skip
+    jmp .norm_copy
+.norm_not_dot:
+    cmp rax, 2
+    jne .norm_copy
+    cmp word [rsi], '..'
+    jne .norm_copy
+    cmp rdi, r13               ; pop the previous segment
+    jbe .resp_400              ; ".." above the root
+    dec rdi
+.norm_pop:
+    cmp rdi, r13
+    jbe .norm_skip
+    cmp byte [rdi], '/'
+    je .norm_skip
+    dec rdi
+    jmp .norm_pop
+.norm_skip:                    ; "", "." and ".." leave a directory if final
+    cmp rdx, rcx
+    jb .norm_next
+    mov r9d, 1
+    jmp .norm_next
+.norm_copy:
+    mov byte [rdi], '/'
+    inc rdi
+.norm_copy_loop:
+    cmp rsi, rdx
+    jae .norm_copied
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .norm_copy_loop
+.norm_copied:
+    xor r9d, r9d
+.norm_next:
+    mov rsi, rdx               ; at the next '/' or the end
+    jmp .norm_loop
+.norm_done:
+    cmp rdi, r13               ; everything normalized away = the root
+    jne .norm_dir_check
+    mov r9d, 1
+.norm_dir_check:
+    test r9d, r9d
+    jz .path_ready
+    mov byte [rdi], '/'
+    inc rdi
     lea rsi, [index_html]
     mov ecx, index_html_len
     rep movsb
-.no_index:
+.path_ready:
     mov byte [rdi], 0
     mov r15, rdi               ; path end, for the extension scan
     ; open + fstat, must be a regular file
@@ -672,10 +826,20 @@ linnea_http_handle:
     mov ecx, resp_405_len
     mov qword [rsp + 112], 405
     jmp .resp_static
+.resp_413:
+    lea rax, [resp_413]
+    mov ecx, resp_413_len
+    mov qword [rsp + 112], 413
+    jmp .resp_static
 .resp_431:
     lea rax, [resp_431]
     mov ecx, resp_431_len
     mov qword [rsp + 112], 431
+    jmp .resp_static
+.resp_501:
+    lea rax, [resp_501]
+    mov ecx, resp_501_len
+    mov qword [rsp + 112], 501
     jmp .resp_static
 .resp_505:
     lea rax, [resp_505]
@@ -697,6 +861,12 @@ linnea_http_handle:
     mov rax, [rsp + 120]
     lea rdi, [rax + linnea_config_server.hostname]
     mov rsi, [rax + linnea_config_server.hostname_len]
+    call linnea_log_write
+    lea rdi, [log_from]
+    mov esi, log_from_len
+    call linnea_log_write
+    lea rdi, [rbx + linnea_connection.peer]
+    mov rsi, [rbx + linnea_connection.peer_len]
     call linnea_log_write
     lea rdi, [log_quote]
     mov esi, 2
@@ -737,7 +907,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 128
+    add rsp, 144
     pop r15
     pop r14
     pop r13
@@ -753,4 +923,23 @@ linnea_http_handle:
     mov rdi, r15
     rep movsb
     mov r15, rdi
+    ret
+
+; .hex_nibble(eax=char) -> eax = 0-15, or -1 for a non-hex character
+.hex_nibble:
+    mov r8d, eax
+    sub r8d, '0'
+    cmp r8d, 9
+    jbe .hex_digit
+    or eax, 0x20               ; ASCII lowercase
+    sub eax, 'a'
+    cmp eax, 5
+    ja .hex_bad
+    add eax, 10
+    ret
+.hex_digit:
+    mov eax, r8d
+    ret
+.hex_bad:
+    mov eax, -1
     ret

@@ -46,6 +46,10 @@ check() {
 # --- config parsing and validation ---
 run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test root=test/www" \
     timeout 0.5 $BIN test/configs/listen.json
+run_test "config dump"     124 stdout "config: 3 servers timeout=2 max_connections=64" \
+    timeout 0.5 $BIN test/configs/listen.json
+run_test "bad timeout"     1 stderr "timeout must be between 1 and 3600" \
+    $BIN test/configs/bad-timeout.json
 run_test "invalid host"    1 stderr "invalid host address" \
     $BIN test/configs/bad-host.json
 run_test "missing argv"    1 stderr "usage:" \
@@ -84,9 +88,10 @@ check_http() {
     fi
 }
 
-# raw_http <request> — send bytes, print the full response
+# raw_http <request> — send bytes, print the full response.
+# printf %b keeps literal '%' in the request while expanding \r\n.
 raw_http() {
-    timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/47080; printf '$1' >&3; cat <&3"
+    timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/47080; printf %b '$1' >&3; cat <&3"
 }
 
 # --- log file ---
@@ -127,16 +132,42 @@ check_http "vhost host:port"   "subdirectory page" "$resp"
 resp=$(curl -s --max-time 2 -H "Host: unknown.test" http://127.0.0.1:47080/hello.txt)
 check_http "vhost default"     "hello from linnea" "$resp"
 
+# --- percent-decoding ---
+resp=$(curl -s --max-time 2 'http://127.0.0.1:47080/a%20b.txt')
+check_http "decode space"      "space file" "$resp"
+resp=$(curl -s --max-time 2 'http://127.0.0.1:47080/sub%2Fpage.html')
+check_http "decode slash"      "subdirectory page" "$resp"
+check_http "encoded traversal" "400 Bad Request" "$(raw_http 'GET /%2e%2e/secret HTTP/1.1\r\nConnection: close\r\n\r\n')"
+check_http "bad escape"        "400 Bad Request" "$(raw_http 'GET /%zz HTTP/1.1\r\nConnection: close\r\n\r\n')"
+check_http "encoded NUL"       "400 Bad Request" "$(raw_http 'GET /%00 HTTP/1.1\r\nConnection: close\r\n\r\n')"
+
+# --- path normalization (raw, curl normalizes dot segments itself) ---
+check_http "double slash"   "hello from linnea" "$(raw_http 'GET //hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n')"
+check_http "dot segment"    "hello from linnea" "$(raw_http 'GET /./hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n')"
+check_http "dotdot resolve" "hello from linnea" "$(raw_http 'GET /sub/../hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n')"
+check_http "dotdot to dir"  "linnea index page" "$(raw_http 'GET /sub/.. HTTP/1.1\r\nConnection: close\r\n\r\n')"
+check_http "above root"     "400 Bad Request" "$(raw_http 'GET /a/../../x HTTP/1.1\r\nConnection: close\r\n\r\n')"
+
+# --- request bodies ---
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nContent-Length: 5\r\n\r\nXXXXXGET /hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n')
+n=$(printf '%s' "$resp" | grep -c "200 OK")
+[ "$n" -eq 2 ]
+check "body discarded, keep-alive" $?
+check_http "chunked 501" "501 Not Implemented" "$(raw_http 'GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n')"
+check_http "body too large 413" "413 Content Too Large" "$(raw_http 'GET / HTTP/1.1\r\nContent-Length: 9000\r\n\r\n')"
+
 # --- protocol errors and traversal (raw, curl normalizes paths) ---
 check_http "http 400" "400 Bad Request" "$(raw_http 'GARBAGE\r\n\r\n')"
 check_http "http 505" "505 HTTP Version Not Supported" "$(raw_http 'GET / HTTP/1.0\r\nConnection: close\r\n\r\n')"
 check_http "traversal blocked" "400 Bad Request" "$(raw_http 'GET /../secret HTTP/1.1\r\nConnection: close\r\n\r\n')"
 
-# --- request log lines ---
-grep -qF 'request one.test "GET /hello.txt" 200 18' "$LOG"
+# --- request log lines (with peer address) ---
+grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /hello\.txt" 200 18' "$LOG"
 check "request log 200" $?
-grep -qF 'request three.test "GET /page.html" 200' "$LOG"
+grep -qE 'request three\.test from 127\.0\.0\.1:[0-9]+ "GET /page\.html" 200' "$LOG"
 check "request log vhost" $?
+grep -qE '"GET /a%20b\.txt" 200' "$LOG"
+check "request log raw target" $?
 grep -qF '"GET /no-such-file" 404 0' "$LOG"
 check "request log 404" $?
 grep -qF '"POST /hello.txt" 405 0' "$LOG"
@@ -159,17 +190,17 @@ n=$(printf '%s' "$resp" | grep -c "200 OK")
 [ "$n" -eq 2 ]
 check "pipelined requests" $?
 
-# --- idle timeout: silent connection must be closed by the server ---
+# --- idle timeout: configured to 2s in listen.json ---
 start=$SECONDS
-if timeout 8 bash -c 'exec 3<>/dev/tcp/127.0.0.1/47080; cat <&3' >/dev/null 2>&1; then
+if timeout 6 bash -c 'exec 3<>/dev/tcp/127.0.0.1/47080; cat <&3' >/dev/null 2>&1; then
     elapsed=$((SECONDS - start))
-    [ "$elapsed" -ge 4 ] && [ "$elapsed" -le 7 ]
-    check "idle timeout (${elapsed}s)" $?
+    [ "$elapsed" -ge 1 ] && [ "$elapsed" -le 4 ]
+    check "configured idle timeout (${elapsed}s)" $?
 else
-    check "idle timeout (connection not closed)" 1
+    check "configured idle timeout (connection not closed)" 1
 fi
 
-grep -q "accepted connection on 127.0.0.1:47080 (fd " "$LOG"
+grep -qE 'accepted connection on 127\.0\.0\.1:47080 from 127\.0\.0\.1:[0-9]+ \(fd ' "$LOG"
 check "accept log line" $?
 
 # --- connection termination log lines ---

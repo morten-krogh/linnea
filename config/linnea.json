@@ -1,5 +1,6 @@
 {
   "log": "linnea.log",
+  "timeout": 60,
   "servers": [
     { "host": "0.0.0.0", "port": 8080, "hostname": "localhost", "root": "test/www" },
     { "host": "0.0.0.0", "port": 8080, "hostname": "linnea.test", "root": "test/www/sub" }

@@ -7,6 +7,10 @@ LINNEA_MAX_ROOT         equ 255      ; max document root path length
 LINNEA_MAX_LOG          equ 255      ; max log file path length
 LINNEA_MAX_CONFIG_FILE  equ 1 << 20  ; sanity cap on config file size
 
+; defaults for the optional top-level config keys
+LINNEA_DEFAULT_TIMEOUT          equ 5     ; idle timeout, seconds
+LINNEA_DEFAULT_MAX_CONNECTIONS  equ 1024
+
 struc linnea_config_server
     .host:          resb LINNEA_MAX_HOST + 1      ; NUL-terminated bind address
     .host_len:      resq 1                        ; length excluding NUL
@@ -23,6 +27,8 @@ endstruc
 
 struc linnea_config
     .server_count:  resq 1
+    .timeout:       resq 1                        ; idle timeout, seconds
+    .max_connections: resq 1                      ; connection pool size
     .log:           resb LINNEA_MAX_LOG + 1       ; NUL-terminated log file path
     .log_len:       resq 1
     .servers:       resb linnea_config_server_size * LINNEA_MAX_SERVERS

@@ -38,9 +38,8 @@ LINNEA_UD_SEND          equ 2
 LINNEA_UD_TIMEOUT       equ 3          ; linked-timeout cqe, always ignored
 
 ; Idle timeout: a linked timeout is attached to every recv. If the peer
-; sends nothing for this long, the recv completes with -ECANCELED and the
-; connection is closed.
-LINNEA_IDLE_TIMEOUT_SEC equ 5
+; sends nothing for that long, the recv completes with -ECANCELED and the
+; connection is closed. The duration comes from the config's "timeout".
 
 ; struct io_uring (liburing 2.15 internal layout)
 LINNEA_URING_RING_SIZE  equ 216

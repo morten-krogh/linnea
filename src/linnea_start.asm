@@ -45,6 +45,7 @@ _start:
     call linnea_config_dump
     lea rdi, [linnea_config_instance]
     call linnea_network_listen_all
+    mov rdi, [linnea_config_instance + linnea_config.max_connections]
     call linnea_connections_init
     lea rdi, [linnea_config_instance]
     call linnea_uring_run      ; never returns

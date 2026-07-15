@@ -3,7 +3,8 @@
 ; Accepted grammar, exactly:
 ;   ws '{' member (ws ',' member)* ws '}' ws EOF
 ; where the top-level members are "log" (string) and "servers" (array of
-; server objects), in any order, each required exactly once.
+; server objects), both required, plus the optional "timeout" (seconds,
+; 1-3600) and "max_connections" (1-65536), in any order, each at most once.
 ;   server := ws '{' member (ws ',' member)* ws '}'
 ;   member := ws string ws ':' ws value
 ;
@@ -32,6 +33,10 @@ key_servers:            db "servers"
 key_servers_len         equ $ - key_servers
 key_log:                db "log"
 key_log_len             equ $ - key_log
+key_timeout:            db "timeout"
+key_timeout_len         equ $ - key_timeout
+key_maxconn:            db "max_connections"
+key_maxconn_len         equ $ - key_maxconn
 key_host:               db "host"
 key_host_len            equ $ - key_host
 key_port:               db "port"
@@ -69,6 +74,12 @@ msg_number:             db "expected number"
 msg_number_len          equ $ - msg_number
 msg_port_range:         db "port must be between 1 and 65535"
 msg_port_range_len      equ $ - msg_port_range
+msg_number_range:       db "number too large"
+msg_number_range_len    equ $ - msg_number_range
+msg_timeout_range:      db "timeout must be between 1 and 3600"
+msg_timeout_range_len   equ $ - msg_timeout_range
+msg_maxconn_range:      db "max_connections must be between 1 and 65536"
+msg_maxconn_range_len   equ $ - msg_maxconn_range
 msg_host_long:          db "host too long"
 msg_host_long_len       equ $ - msg_host_long
 msg_hostname_long:      db "hostname too long"
@@ -94,7 +105,8 @@ section .text
 
 ; linnea_config_parse(rdi=buf, rsi=len, rdx=config*)
 ; Fills the config from the JSON bytes or exits with a parse error.
-; Top-level key presence tracked in a bitmask: servers=1, log=2.
+; Top-level key presence tracked in a bitmask: servers=1, log=2 (required),
+; timeout=4, max_connections=8 (optional, mask bits only for dup detection).
 linnea_config_parse:
     push rbx
     push r12
@@ -107,6 +119,8 @@ linnea_config_parse:
     mov qword [linnea_parser_state + linnea_parser.pos], 0
     mov qword [rbx + linnea_config.server_count], 0
     mov qword [rbx + linnea_config.log_len], 0
+    mov qword [rbx + linnea_config.timeout], LINNEA_DEFAULT_TIMEOUT
+    mov qword [rbx + linnea_config.max_connections], LINNEA_DEFAULT_MAX_CONNECTIONS
     xor r13d, r13d             ; top-level key mask
 
     mov edi, '{'
@@ -131,6 +145,20 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_log
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_timeout]
+    mov ecx, key_timeout_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_timeout
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_maxconn]
+    mov ecx, key_maxconn_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_maxconn
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     jmp linnea_parse_fail
@@ -182,6 +210,30 @@ linnea_config_parse:
     lea rdi, [rbx + linnea_config.log]
     mov rsi, rax
     call linnea_string_copy
+    jmp .top_sep
+
+.top_timeout:
+    test r13d, 4
+    jnz .top_dup
+    or r13d, 4
+    call linnea_parse_u64
+    test rax, rax
+    jz .timeout_range
+    cmp rax, 3600
+    ja .timeout_range
+    mov [rbx + linnea_config.timeout], rax
+    jmp .top_sep
+
+.top_maxconn:
+    test r13d, 8
+    jnz .top_dup
+    or r13d, 8
+    call linnea_parse_u64
+    test rax, rax
+    jz .maxconn_range
+    cmp rax, 65536
+    ja .maxconn_range
+    mov [rbx + linnea_config.max_connections], rax
 
 .top_sep:
     call linnea_parse_skip_ws
@@ -198,7 +250,9 @@ linnea_config_parse:
     jmp .top_loop
 .top_done:
     call linnea_parse_advance
-    cmp r13d, 3
+    mov eax, r13d
+    and eax, 3                 ; log and servers are required
+    cmp eax, 3
     jne .top_missing
     call linnea_parse_skip_ws
     mov rax, [linnea_parser_state + linnea_parser.pos]
@@ -225,6 +279,14 @@ linnea_config_parse:
 .log_long:
     lea rdi, [msg_log_long]
     mov esi, msg_log_long_len
+    jmp linnea_parse_fail
+.timeout_range:
+    lea rdi, [msg_timeout_range]
+    mov esi, msg_timeout_range_len
+    jmp linnea_parse_fail
+.maxconn_range:
+    lea rdi, [msg_maxconn_range]
+    mov esi, msg_maxconn_range_len
     jmp linnea_parse_fail
 .trailing:
     lea rdi, [msg_trailing]
@@ -301,9 +363,17 @@ linnea_parse_server:
     test r12d, 2
     jnz .dup
     or r12d, 2
-    call linnea_parse_u64      ; rax <= 65535
+    call linnea_parse_u64
+    test rax, rax
+    jz .port_range
+    cmp rax, 65535
+    ja .port_range
     mov [rbx + linnea_config_server.port], ax
     jmp .member_sep
+.port_range:
+    lea rdi, [msg_port_range]
+    mov esi, msg_port_range_len
+    jmp linnea_parse_fail
 
 .key_hostname:
     test r12d, 4
@@ -490,7 +560,8 @@ linnea_parse_string:
     jmp linnea_parse_fail
 
 ; linnea_parse_u64() -> rax = value
-; Non-negative decimal integer; errors as soon as the value exceeds 65535.
+; Non-negative decimal integer, capped at 2^32 against overflow; range
+; validation with a key-specific message is the caller's job.
 linnea_parse_u64:
     call linnea_parse_skip_ws
     call linnea_parse_peek
@@ -500,6 +571,7 @@ linnea_parse_u64:
     mov r8, [linnea_parser_state + linnea_parser.pos]
     mov r9, [linnea_parser_state + linnea_parser.base]
     mov r10, [linnea_parser_state + linnea_parser.size]
+    mov r11, 1 << 32
     xor eax, eax               ; accumulator
 .loop:
     cmp r8, r10
@@ -508,9 +580,9 @@ linnea_parse_u64:
     sub ecx, '0'
     cmp ecx, 9
     ja .done
-    imul eax, eax, 10
-    add eax, ecx
-    cmp eax, 65535
+    imul rax, rax, 10
+    add rax, rcx
+    cmp rax, r11
     ja .range
     inc r8
     jmp .loop
@@ -523,8 +595,8 @@ linnea_parse_u64:
     jmp linnea_parse_fail
 .range:
     mov [linnea_parser_state + linnea_parser.pos], r8
-    lea rdi, [msg_port_range]
-    mov esi, msg_port_range_len
+    lea rdi, [msg_number_range]
+    mov esi, msg_number_range_len
     jmp linnea_parse_fail
 
 ; linnea_parse_fail(rdi=msg, rsi=len) — report at current pos, never returns.

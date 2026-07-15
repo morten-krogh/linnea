@@ -24,6 +24,7 @@ extern io_uring_submit
 extern __io_uring_get_cqe
 
 extern linnea_config_instance
+extern linnea_network_peer_format
 extern linnea_connection_alloc
 extern linnea_connection_free
 extern linnea_connection_at
@@ -57,6 +58,8 @@ log_accept:         db "accepted connection on "
 log_accept_len      equ $ - log_accept
 log_closed:         db "closed connection on "
 log_closed_len      equ $ - log_closed
+log_from:           db " from "
+log_from_len        equ $ - log_from
 log_colon:          db ":"
 log_fd:             db " (fd "
 log_fd_len          equ $ - log_fd
@@ -77,7 +80,9 @@ reason_send_err_len equ $ - reason_send_err
 reason_done:        db "close after response"
 reason_done_len     equ $ - reason_done
 
-idle_timeout:       dq LINNEA_IDLE_TIMEOUT_SEC, 0   ; struct __kernel_timespec
+section .data
+
+idle_timeout:       dq LINNEA_DEFAULT_TIMEOUT, 0    ; struct __kernel_timespec
 
 section .bss
 
@@ -95,6 +100,8 @@ linnea_uring_run:
     push r14
     push r15
     mov rbx, rdi               ; config*
+    mov rax, [rbx + linnea_config.timeout]
+    mov [idle_timeout], rax
 
     mov edi, LINNEA_URING_ENTRIES
     lea rsi, [ring]
@@ -156,15 +163,19 @@ linnea_uring_run:
 .on_accept:
     test r15d, r15d
     js .accept_err
-    mov rdi, r13
-    mov esi, r15d
-    call linnea_uring_log_accept
     call linnea_connection_alloc
     test rax, rax
     jz .conn_limit
-    mov [rax + linnea_connection.fd], r15d
-    mov [rax + linnea_connection.server], r13d
-    mov rdi, rax
+    mov r12, rax               ; connection*
+    mov [r12 + linnea_connection.fd], r15d
+    mov [r12 + linnea_connection.server], r13d
+    mov edi, r15d
+    lea rsi, [r12 + linnea_connection.peer]
+    call linnea_network_peer_format
+    mov [r12 + linnea_connection.peer_len], rax
+    mov rdi, r12
+    call linnea_uring_log_accept
+    mov rdi, r12
     call linnea_uring_arm_recv
     call linnea_uring_submit_now
 .accept_rearm:
@@ -464,32 +475,39 @@ linnea_uring_arm_send:
     pop rbx
     ret
 
-; linnea_uring_log_accept(rdi=server index, esi=connection fd)
-; Logs "accepted connection on <host>:<port> (fd N)".
+; linnea_uring_log_accept(rdi=connection*)
+; Logs "accepted connection on <host>:<port> from <peer> (fd N)".
 linnea_uring_log_accept:
     push rbx
     push r12
     push r13
-    mov r12d, esi              ; fd
-    lea rax, [linnea_config_instance]
-    imul rcx, rdi, linnea_config_server_size
-    lea rbx, [rax + rcx + linnea_config.servers]   ; server*
+    mov rbx, rdi               ; connection*
+    mov eax, [rbx + linnea_connection.server]
+    imul rax, rax, linnea_config_server_size
+    lea rcx, [linnea_config_instance]
+    lea r12, [rcx + rax + linnea_config.servers]   ; server*
     call linnea_log_stamp
     lea rdi, [log_accept]
     mov esi, log_accept_len
     call linnea_log_write
-    lea rdi, [rbx + linnea_config_server.host]
-    mov rsi, [rbx + linnea_config_server.host_len]
+    lea rdi, [r12 + linnea_config_server.host]
+    mov rsi, [r12 + linnea_config_server.host_len]
     call linnea_log_write
     lea rdi, [log_colon]
     mov esi, 1
     call linnea_log_write
-    movzx edi, word [rbx + linnea_config_server.port]
+    movzx edi, word [r12 + linnea_config_server.port]
     call linnea_log_u64
+    lea rdi, [log_from]
+    mov esi, log_from_len
+    call linnea_log_write
+    lea rdi, [rbx + linnea_connection.peer]
+    mov rsi, [rbx + linnea_connection.peer_len]
+    call linnea_log_write
     lea rdi, [log_fd]
     mov esi, log_fd_len
     call linnea_log_write
-    mov edi, r12d
+    mov edi, [rbx + linnea_connection.fd]
     call linnea_log_u64
     lea rdi, [log_close]
     mov esi, log_close_len

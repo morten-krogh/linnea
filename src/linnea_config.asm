@@ -17,8 +17,10 @@ section .rodata
 
 dump_config:            db "config: "
 dump_config_len         equ $ - dump_config
-dump_servers:           db " servers", 10
+dump_servers:           db " servers timeout="
 dump_servers_len        equ $ - dump_servers
+dump_maxconn:           db " max_connections="
+dump_maxconn_len        equ $ - dump_maxconn
 dump_server:            db "server "
 dump_server_len         equ $ - dump_server
 dump_host:              db ": host="
@@ -116,6 +118,16 @@ linnea_config_dump:
     call linnea_print_u64_stdout
     lea rdi, [dump_servers]
     mov esi, dump_servers_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.timeout]
+    call linnea_print_u64_stdout
+    lea rdi, [dump_maxconn]
+    mov esi, dump_maxconn_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.max_connections]
+    call linnea_print_u64_stdout
+    lea rdi, [newline]
+    mov esi, 1
     call linnea_print_stdout
     xor r12d, r12d             ; server index
 .loop:
