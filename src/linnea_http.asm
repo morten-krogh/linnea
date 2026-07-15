@@ -36,6 +36,9 @@ LINNEA_HTTP_PATH_BUF    equ 2560
 extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_iequal
+extern linnea_log_write
+extern linnea_log_u64
+extern linnea_log_stamp
 
 section .rodata
 
@@ -75,6 +78,14 @@ method_get:     db "GET"
 method_head:    db "HEAD"
 index_html:     db "index.html"
 index_html_len  equ $ - index_html
+
+log_req:        db "request "
+log_req_len     equ $ - log_req
+log_quote:      db ' "'
+log_endq:       db '" '
+log_dash:       db "-"
+log_sp:         db " "
+log_nl:         db 10
 
 hn_connection:  db "connection"
 hn_content_len: db "content-length"
@@ -148,16 +159,29 @@ section .text
 ;   [rsp+48] mime len       [rsp+56] name ptr / open fd / vhost scratch
 ;   [rsp+64] name len       [rsp+72] value ptr    [rsp+80] value len
 ;   [rsp+88] Host value ptr (0 = absent)          [rsp+96] Host value len
+;   [rsp+104] method len    [rsp+112] status      [rsp+120] server* (for log)
 linnea_http_handle:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 112
+    sub rsp, 128
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
+    mov qword [rsp + 8], 0     ; no target yet
+    mov qword [rsp + 16], 0
+    mov qword [rsp + 24], 1    ; keep_alive default on
+    mov qword [rsp + 32], 0    ; response bytes
+    mov qword [rsp + 88], 0    ; no Host header yet
+    mov qword [rsp + 96], 0
+    mov qword [rsp + 104], 0   ; no method yet
+    mov ecx, [rbx + linnea_connection.server]
+    imul rcx, rcx, linnea_config_server_size
+    lea rax, [linnea_config_instance]
+    lea rax, [rax + rcx + linnea_config.servers]
+    mov [rsp + 120], rax       ; default server, until a vhost matches
 
     ; find the CRLF CRLF terminator
     xor r13d, r13d
@@ -182,9 +206,6 @@ linnea_http_handle:
     mov [rbx + linnea_connection.head_len], rax
     add r13, 2                 ; head limit
     xor r15d, r15d             ; cursor
-    mov qword [rsp + 24], 1    ; keep_alive default on
-    mov qword [rsp + 88], 0    ; no Host header yet
-    mov qword [rsp + 96], 0
 
     ; --- method ---------------------------------------------------
 .method_loop:
@@ -204,6 +225,7 @@ linnea_http_handle:
     jz .resp_400
     cmp r15, LINNEA_HTTP_MAX_METHOD
     ja .resp_400
+    mov [rsp + 104], r15       ; method = in_buf[0 .. len)
     ; GET, HEAD, or 405 (checked after the head parses cleanly)
     mov qword [rsp], -1
     cmp r15, 3
@@ -488,6 +510,7 @@ linnea_http_handle:
     inc r15
     jmp .vhost_loop
 .server_chosen:
+    mov [rsp + 120], r12       ; the server that will handle the request
     ; path = root + target (+ index.html after a trailing '/')
     lea rdi, [path_buf]
     lea rsi, [r12 + linnea_config_server.root]
@@ -627,8 +650,8 @@ linnea_http_handle:
     mov rcx, r15
     sub rcx, rax
     mov [rbx + linnea_connection.out_rem], rcx
-    mov eax, LINNEA_HTTP_RESPOND
-    jmp .ret
+    mov qword [rsp + 112], 200
+    jmp .log_request
 
 .close_404:
     mov rdi, [rsp + 56]
@@ -637,31 +660,84 @@ linnea_http_handle:
 .resp_404:
     lea rax, [resp_404]
     mov ecx, resp_404_len
+    mov qword [rsp + 112], 404
     jmp .resp_static
 .resp_400:
     lea rax, [resp_400]
     mov ecx, resp_400_len
+    mov qword [rsp + 112], 400
     jmp .resp_static
 .resp_405:
     lea rax, [resp_405]
     mov ecx, resp_405_len
+    mov qword [rsp + 112], 405
     jmp .resp_static
 .resp_431:
     lea rax, [resp_431]
     mov ecx, resp_431_len
+    mov qword [rsp + 112], 431
     jmp .resp_static
 .resp_505:
     lea rax, [resp_505]
     mov ecx, resp_505_len
+    mov qword [rsp + 112], 505
 .resp_static:
     mov [rbx + linnea_connection.out_ptr], rax
     mov [rbx + linnea_connection.out_rem], rcx
     mov qword [rbx + linnea_connection.keep_alive], 0
+    mov qword [rsp + 32], 0    ; error responses carry no body
+    ; fall through to .log_request
+
+; access log: 'request <hostname> "<METHOD> <TARGET>" <status> <bytes>'
+.log_request:
+    call linnea_log_stamp
+    lea rdi, [log_req]
+    mov esi, log_req_len
+    call linnea_log_write
+    mov rax, [rsp + 120]
+    lea rdi, [rax + linnea_config_server.hostname]
+    mov rsi, [rax + linnea_config_server.hostname_len]
+    call linnea_log_write
+    lea rdi, [log_quote]
+    mov esi, 2
+    call linnea_log_write
+    mov rdi, r14               ; method text sits at the buffer start
+    mov rsi, [rsp + 104]
+    test rsi, rsi
+    jnz .log_method
+    lea rdi, [log_dash]
+    mov esi, 1
+.log_method:
+    call linnea_log_write
+    lea rdi, [log_sp]
+    mov esi, 1
+    call linnea_log_write
+    mov rdi, [rsp + 8]
+    mov rsi, [rsp + 16]
+    test rdi, rdi
+    jnz .log_target
+    lea rdi, [log_dash]
+    mov esi, 1
+.log_target:
+    call linnea_log_write
+    lea rdi, [log_endq]
+    mov esi, 2
+    call linnea_log_write
+    mov rdi, [rsp + 112]
+    call linnea_log_u64
+    lea rdi, [log_sp]
+    mov esi, 1
+    call linnea_log_write
+    mov rdi, [rsp + 32]
+    call linnea_log_u64
+    lea rdi, [log_nl]
+    mov esi, 1
+    call linnea_log_write
     mov eax, LINNEA_HTTP_RESPOND
     jmp .ret
 
 .ret:
-    add rsp, 112
+    add rsp, 128
     pop r15
     pop r14
     pop r13

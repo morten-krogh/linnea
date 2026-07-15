@@ -33,6 +33,7 @@ extern linnea_print_stderr
 extern linnea_print_u64_stderr
 extern linnea_log_write
 extern linnea_log_u64
+extern linnea_log_stamp
 
 section .rodata
 
@@ -54,11 +55,27 @@ warn_full_len       equ $ - warn_full
 
 log_accept:         db "accepted connection on "
 log_accept_len      equ $ - log_accept
+log_closed:         db "closed connection on "
+log_closed_len      equ $ - log_closed
 log_colon:          db ":"
 log_fd:             db " (fd "
 log_fd_len          equ $ - log_fd
 log_close:          db ")", 10
 log_close_len       equ $ - log_close
+log_reason:         db "): "
+log_reason_len      equ $ - log_reason
+log_nl:             db 10
+
+reason_peer:        db "peer closed"
+reason_peer_len     equ $ - reason_peer
+reason_timeout:     db "idle timeout"
+reason_timeout_len  equ $ - reason_timeout
+reason_recv_err:    db "recv error"
+reason_recv_err_len equ $ - reason_recv_err
+reason_send_err:    db "send error"
+reason_send_err_len equ $ - reason_send_err
+reason_done:        db "close after response"
+reason_done_len     equ $ - reason_done
 
 idle_timeout:       dq LINNEA_IDLE_TIMEOUT_SEC, 0   ; struct __kernel_timespec
 
@@ -185,7 +202,22 @@ linnea_uring_run:
     call linnea_connection_at
     mov r12, rax               ; connection*
     test r15d, r15d
-    jle .conn_close            ; 0 = peer closed, <0 = error/timeout
+    jg .recv_data
+    jz .recv_eof
+    cmp r15d, -LINNEA_ECANCELED
+    je .recv_timeout
+    lea r14, [reason_recv_err]
+    mov r15d, reason_recv_err_len
+    jmp .conn_close
+.recv_eof:
+    lea r14, [reason_peer]
+    mov r15d, reason_peer_len
+    jmp .conn_close
+.recv_timeout:
+    lea r14, [reason_timeout]
+    mov r15d, reason_timeout_len
+    jmp .conn_close
+.recv_data:
     mov eax, r15d
     add [r12 + linnea_connection.in_len], rax
 .process:
@@ -209,7 +241,11 @@ linnea_uring_run:
     call linnea_connection_at
     mov r12, rax
     test r15d, r15d
-    js .conn_close
+    jns .send_ok
+    lea r14, [reason_send_err]
+    mov r15d, reason_send_err_len
+    jmp .conn_close
+.send_ok:
     mov eax, r15d
     add [r12 + linnea_connection.out_ptr], rax
     sub [r12 + linnea_connection.out_rem], rax
@@ -240,7 +276,11 @@ linnea_uring_run:
     mov qword [r12 + linnea_connection.file_size], 0
 .no_unmap:
     cmp qword [r12 + linnea_connection.keep_alive], 0
-    je .conn_close
+    jne .keep_alive_continue
+    lea r14, [reason_done]
+    mov r15d, reason_done_len
+    jmp .conn_close
+.keep_alive_continue:
     ; keep-alive: drop the consumed head, keep any pipelined bytes
     mov rax, [r12 + linnea_connection.in_len]
     sub rax, [r12 + linnea_connection.head_len]
@@ -257,7 +297,37 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 
+; connection teardown; r12 = connection*, r14/r15 = reason string ptr/len
 .conn_close:
+    call linnea_log_stamp
+    lea rdi, [log_closed]
+    mov esi, log_closed_len
+    call linnea_log_write
+    mov eax, [r12 + linnea_connection.server]
+    imul rax, rax, linnea_config_server_size
+    lea r13, [rbx + rax + linnea_config.servers]   ; server*
+    lea rdi, [r13 + linnea_config_server.host]
+    mov rsi, [r13 + linnea_config_server.host_len]
+    call linnea_log_write
+    lea rdi, [log_colon]
+    mov esi, 1
+    call linnea_log_write
+    movzx edi, word [r13 + linnea_config_server.port]
+    call linnea_log_u64
+    lea rdi, [log_fd]
+    mov esi, log_fd_len
+    call linnea_log_write
+    mov edi, [r12 + linnea_connection.fd]
+    call linnea_log_u64
+    lea rdi, [log_reason]
+    mov esi, log_reason_len
+    call linnea_log_write
+    mov rdi, r14
+    mov rsi, r15
+    call linnea_log_write
+    lea rdi, [log_nl]
+    mov esi, 1
+    call linnea_log_write
     mov rdi, [r12 + linnea_connection.file_base]
     test rdi, rdi
     jz .close_no_file
@@ -404,6 +474,7 @@ linnea_uring_log_accept:
     lea rax, [linnea_config_instance]
     imul rcx, rdi, linnea_config_server_size
     lea rbx, [rax + rcx + linnea_config.servers]   ; server*
+    call linnea_log_stamp
     lea rdi, [log_accept]
     mov esi, log_accept_len
     call linnea_log_write

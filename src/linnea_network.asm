@@ -12,6 +12,7 @@ extern linnea_error_server
 extern linnea_string_equal
 extern linnea_log_write
 extern linnea_log_u64
+extern linnea_log_stamp
 
 section .rodata
 
@@ -144,6 +145,7 @@ linnea_network_listener_create:
     cmp rax, -4095
     jae .listen_fail
     mov [rbx + linnea_config_server.listen_fd], r12d
+    call linnea_log_stamp
     lea rdi, [log_listen]
     mov esi, log_listen_len
     call linnea_log_write

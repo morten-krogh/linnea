@@ -48,3 +48,4 @@ LINNEA_URING_CQ_KHEAD   equ 104  ; struct io_uring_cq.khead pointer
 
 LINNEA_URING_ENTRIES    equ 256  ; submission queue depth
 LINNEA_EINTR            equ 4
+LINNEA_ECANCELED        equ 125

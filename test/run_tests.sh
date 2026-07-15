@@ -132,6 +132,18 @@ check_http "http 400" "400 Bad Request" "$(raw_http 'GARBAGE\r\n\r\n')"
 check_http "http 505" "505 HTTP Version Not Supported" "$(raw_http 'GET / HTTP/1.0\r\nConnection: close\r\n\r\n')"
 check_http "traversal blocked" "400 Bad Request" "$(raw_http 'GET /../secret HTTP/1.1\r\nConnection: close\r\n\r\n')"
 
+# --- request log lines ---
+grep -qF 'request one.test "GET /hello.txt" 200 18' "$LOG"
+check "request log 200" $?
+grep -qF 'request three.test "GET /page.html" 200' "$LOG"
+check "request log vhost" $?
+grep -qF '"GET /no-such-file" 404 0' "$LOG"
+check "request log 404" $?
+grep -qF '"POST /hello.txt" 405 0' "$LOG"
+check "request log 405" $?
+grep -qE '^\[20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\] request' "$LOG"
+check "log timestamps" $?
+
 # --- keep-alive: two requests, one connection (count accepts in the log) ---
 before=$(grep -c "accepted connection" "$LOG")
 resp=$(curl -s --max-time 4 http://127.0.0.1:47080/hello.txt http://127.0.0.1:47080/index.html)
@@ -159,6 +171,14 @@ fi
 
 grep -q "accepted connection on 127.0.0.1:47080 (fd " "$LOG"
 check "accept log line" $?
+
+# --- connection termination log lines ---
+grep -qF ': close after response' "$LOG"
+check "termination close-after-response" $?
+grep -qF ': peer closed' "$LOG"
+check "termination peer closed" $?
+grep -qF ': idle timeout' "$LOG"
+check "termination idle timeout" $?
 
 kill $server_pid 2>/dev/null
 wait $server_pid 2>/dev/null
