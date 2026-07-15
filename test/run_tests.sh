@@ -86,6 +86,17 @@ rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is
 # exactly what let a wrong mmap length go unnoticed.
 python3 -c "open('test/www/big.txt','w').write('B'*100000)"
+# Pre-compressed variants. Each one holds different text, so a test can
+# tell which file was served; real deployments would compress the same
+# bytes. The .gz is real gzip (curl --compressed decodes it); the .br is
+# not real brotli, which linnea neither produces nor inspects.
+python3 - <<'PY'
+import gzip
+open('test/www/enc.txt', 'w').write('plain payload')
+with gzip.open('test/www/enc.txt.gz', 'wb') as f:
+    f.write(b'gzip payload')
+open('test/www/enc.txt.br', 'wb').write(b'br payload')
+PY
 python3 test/proxy_backend.py >/dev/null 2>&1 &
 backend_pid=$!
 $BIN test/configs/listen.json >/dev/null 2>&1 &
@@ -213,6 +224,79 @@ check_http "if-none-match wins"  "hello from linnea" "$resp"
 
 grep -qF '"GET /hello.txt" 304 0' "$LOG"
 check "request log 304" $?
+
+# --- pre-compressed variants: enc.txt has both a .br and a .gz beside it ---
+# enc_of <accept-encoding> — the Content-Encoding linnea picked, if any.
+# grep -a: the gzip variant's body is binary.
+enc_of() {
+    curl -si --max-time 2 -H "Accept-Encoding: $1" http://127.0.0.1:47080/enc.txt \
+        | grep -a -io '^content-encoding: .*' | tr -d '\r' | cut -d' ' -f2
+}
+body_of() {
+    curl -s --max-time 2 -H "Accept-Encoding: $1" http://127.0.0.1:47080/enc.txt
+}
+[ "$(enc_of 'gzip, br')" = "br" ]
+check "br preferred over gzip" $?
+[ "$(body_of 'gzip, br')" = "br payload" ]
+check "br variant served" $?
+[ "$(enc_of 'gzip')" = "gzip" ]
+check "gzip when br unwanted" $?
+[ "$(enc_of 'deflate, br')" = "br" ]
+check "unknown codings skipped" $?
+[ "$(enc_of 'BR')" = "br" ]
+check "accept-encoding is case-insensitive" $?
+[ -z "$(enc_of 'identity')" ]
+check "identity gets the plain file" $?
+[ "$(body_of 'identity')" = "plain payload" ]
+check "plain body when no coding taken" $?
+resp=$(curl -si --max-time 2 http://127.0.0.1:47080/enc.txt)
+printf '%s' "$resp" | grep -qai '^content-encoding'
+[ $? -ne 0 ]
+check "no accept-encoding, no coding" $?
+check_http "plain body without accept-encoding" "plain payload" "$resp"
+# q=0 is a refusal, and the fallback must still find the other variant
+[ -z "$(enc_of 'br;q=0')" ]
+check "q=0 refuses a coding" $?
+[ "$(enc_of 'br;q=0, gzip')" = "gzip" ]
+check "q=0 falls back to gzip" $?
+[ "$(enc_of 'br;q=0.001')" = "br" ]
+check "a small q still accepts" $?
+[ -z "$(enc_of 'br;q=0.000')" ]
+check "q=0.000 refuses too" $?
+# the type comes from the name before the suffix, not from ".br"
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:47080/enc.txt)
+check_http "type ignores the suffix" "Content-Type: text/plain" "$resp"
+check_http "variant length"          "Content-Length: 10" "$resp"
+check_http "variant vary"            "Vary: Accept-Encoding" "$resp"
+# curl decoding the real gzip end to end
+[ "$(curl -s --max-time 2 --compressed -H 'Accept-Encoding: gzip' http://127.0.0.1:47080/enc.txt)" = "gzip payload" ]
+check "gzip variant decodes" $?
+# a file with no variants must not claim an encoding, but still varies
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: gzip, br' http://127.0.0.1:47080/hello.txt)
+printf '%s' "$resp" | grep -qai '^content-encoding'
+[ $? -ne 0 ]
+check "no variant, no coding" $?
+check_http "no variant still varies" "Vary: Accept-Encoding" "$resp"
+check_http "no variant serves plain" "hello from linnea" "$resp"
+
+# Each variant is its own representation: a cache must never hand one to a
+# client that asked for another, so the validators have to differ.
+etag_br=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:47080/enc.txt | grep -ai '^etag:' | tr -d '\r' | cut -d' ' -f2)
+etag_gz=$(curl -si --max-time 2 -H 'Accept-Encoding: gzip' http://127.0.0.1:47080/enc.txt | grep -ai '^etag:' | tr -d '\r' | cut -d' ' -f2)
+etag_pl=$(curl -si --max-time 2 http://127.0.0.1:47080/enc.txt | grep -ai '^etag:' | tr -d '\r' | cut -d' ' -f2)
+[ -n "$etag_br" ] && [ "$etag_br" != "$etag_gz" ] && [ "$etag_gz" != "$etag_pl" ] && [ "$etag_br" != "$etag_pl" ]
+check "each variant has its own etag" $?
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' -H "If-None-Match: $etag_br" http://127.0.0.1:47080/enc.txt)
+check_http "variant revalidates 304" "304 Not Modified" "$resp"
+check_http "variant 304 varies"      "Vary: Accept-Encoding" "$resp"
+printf '%s' "$resp" | grep -qai '^content-encoding'
+[ $? -ne 0 ]
+check "variant 304 omits the coding" $?
+# the br etag says nothing about the gzip or plain representations
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: gzip' -H "If-None-Match: $etag_br" http://127.0.0.1:47080/enc.txt)
+check_http "cross-variant etag 200" "200 OK" "$resp"
+resp=$(curl -si --max-time 2 -H "If-None-Match: $etag_br" http://127.0.0.1:47080/enc.txt)
+check_http "variant etag vs plain 200" "plain payload" "$resp"
 
 # --- virtual hosts: 47080 is shared by one.test (default) and three.test ---
 resp=$(curl -s --max-time 2 -H "Host: three.test" http://127.0.0.1:47080/page.html)
@@ -410,7 +494,7 @@ check "termination idle timeout" $?
 kill $server_pid $backend_pid 2>/dev/null
 wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
-rm -f "$LOG" test/www/big.txt
+rm -f "$LOG" test/www/big.txt test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
 
 echo
 echo "$pass passed, $fail failed"

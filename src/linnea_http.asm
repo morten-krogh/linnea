@@ -25,6 +25,16 @@
 ; - Static locations: a directory result maps to its index.html.
 ;   Missing/non-regular files: 404.
 ;   The access log records the raw, undecoded target.
+; - Pre-compressed files: a variant sitting beside the file is the whole
+;   opt-in. When the client's Accept-Encoding allows it, "<path>.br" is
+;   tried, then "<path>.gz", then the file itself; the first one that is
+;   there is served with the matching Content-Encoding. Everything else —
+;   Content-Type, Content-Length, the validators — describes the variant
+;   actually sent, except the type, which still comes from the name before
+;   the suffix. Static responses carry Vary: Accept-Encoding so a cache
+;   cannot hand a variant to a client that cannot read it. A variant with
+;   no plain file beside it answers whoever takes the encoding and 404s
+;   everyone else — shipping both files is the deployer's job.
 ; - Caching: every static 200 carries an ETag built from the file's mtime
 ;   and size, plus Last-Modified. A request whose If-None-Match matches
 ;   (weak comparison, "*" and comma-separated lists included), or whose
@@ -130,6 +140,15 @@ hdr_etag:       db 13, 10, "ETag: "
 hdr_etag_len    equ $ - hdr_etag
 hdr_last_mod:   db 13, 10, "Last-Modified: "
 hdr_last_mod_len equ $ - hdr_last_mod
+hdr_content_enc: db 13, 10, "Content-Encoding: "
+hdr_content_enc_len equ $ - hdr_content_enc
+hdr_vary:       db 13, 10, "Vary: Accept-Encoding"
+hdr_vary_len    equ $ - hdr_vary
+
+enc_br:         db "br"
+enc_br_len      equ $ - enc_br
+enc_gzip:       db "gzip"
+enc_gzip_len    equ $ - enc_gzip
 hdr_keepalive:  db 13, 10, "Connection: keep-alive", 13, 10, 13, 10
 hdr_keepalive_len equ $ - hdr_keepalive
 hdr_close:      db 13, 10, "Connection: close", 13, 10, 13, 10
@@ -171,6 +190,7 @@ hn_host:        db "host"
 hn_expect:      db "expect"
 hn_if_none_match: db "if-none-match"
 hn_if_mod_since: db "if-modified-since"
+hn_accept_enc:  db "accept-encoding"
 hv_close:       db "close"
 
 ; MIME types by file extension; default is application/octet-stream.
@@ -252,13 +272,15 @@ section .text
 ;   [rsp+168] directory flag (r9 does not survive the match loop's calls)
 ;   [rsp+176] If-None-Match ptr (0 = absent)     [rsp+184] its len
 ;   [rsp+192] If-Modified-Since ptr (0 = absent) [rsp+200] its len
+;   [rsp+208] Accept-Encoding ptr (0 = absent)   [rsp+216] its len
+;   [rsp+224] encoding served: 0 none, 1 gzip, 2 br
 linnea_http_handle:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 208
+    sub rsp, 240
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -274,6 +296,8 @@ linnea_http_handle:
     mov qword [rsp + 144], 0   ; no raw target yet
     mov qword [rsp + 176], 0   ; no If-None-Match yet
     mov qword [rsp + 192], 0   ; no If-Modified-Since yet
+    mov qword [rsp + 208], 0   ; no Accept-Encoding yet
+    mov qword [rsp + 224], 0   ; nothing negotiated
     mov ecx, [rbx + linnea_connection.server]
     imul rcx, rcx, linnea_config_server_size
     lea rax, [linnea_config_instance]
@@ -502,6 +526,13 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jnz .ims_header
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_accept_enc]
+    mov ecx, 15
+    call linnea_string_iequal
+    test eax, eax
+    jnz .ae_header
     ; Host? (first occurrence wins, used for vhost selection)
     cmp qword [rsp + 88], 0
     jne .header_next
@@ -532,6 +563,14 @@ linnea_http_handle:
     mov [rsp + 192], rax
     mov rax, [rsp + 80]
     mov [rsp + 200], rax
+    jmp .header_next
+.ae_header:
+    cmp qword [rsp + 208], 0
+    jne .header_next
+    mov rax, [rsp + 72]
+    mov [rsp + 208], rax
+    mov rax, [rsp + 80]
+    mov [rsp + 216], rax
     jmp .header_next
 .cl_header:
     test qword [rsp + 136], 1
@@ -854,25 +893,50 @@ linnea_http_handle:
     mov rdi, r13
     lea rsi, [rax + linnea_config_location.root]
     rep movsb
-    ; open + fstat, must be a regular file
+    ; A pre-compressed file sitting beside this one is the whole opt-in:
+    ; if the client takes the encoding and the variant is there, serve it.
+    ; br goes first — it compresses better than gzip. The suffix is written
+    ; at r15, so the name before it stays intact for the MIME lookup.
+    cmp qword [rsp + 208], 0
+    je .open_plain             ; no Accept-Encoding: nothing to negotiate
+    mov rdi, [rsp + 208]
+    mov rsi, [rsp + 216]
+    lea rdx, [enc_br]
+    mov ecx, enc_br_len
+    call linnea_http_ae_accepts
+    test eax, eax
+    jz .try_gzip
+    mov dword [r15], '.br'     ; three bytes and the NUL
     mov rdi, r13
-    xor esi, esi               ; O_RDONLY
-    xor edx, edx
-    mov eax, LINNEA_SYS_OPEN
-    syscall
-    cmp rax, -4095
-    jae .resp_404
-    mov [rsp + 56], rax        ; fd
-    mov rdi, rax
-    lea rsi, [statbuf]
-    mov eax, LINNEA_SYS_FSTAT
-    syscall
-    cmp rax, -4095
-    jae .close_404
-    mov eax, [statbuf + LINNEA_STAT_ST_MODE]
-    and eax, LINNEA_S_IFMT
-    cmp eax, LINNEA_S_IFREG
-    jne .close_404
+    call .open_regular
+    test eax, eax
+    js .try_gzip
+    mov qword [rsp + 224], 2
+    jmp .have_file
+.try_gzip:
+    mov rdi, [rsp + 208]
+    mov rsi, [rsp + 216]
+    lea rdx, [enc_gzip]
+    mov ecx, enc_gzip_len
+    call linnea_http_ae_accepts
+    test eax, eax
+    jz .open_plain
+    mov dword [r15], '.gz'
+    mov rdi, r13
+    call .open_regular
+    test eax, eax
+    js .open_plain
+    mov qword [rsp + 224], 1
+    jmp .have_file
+.open_plain:
+    mov byte [r15], 0          ; drop whichever suffix was tried
+    mov qword [rsp + 224], 0
+    mov rdi, r13
+    call .open_regular
+    test eax, eax
+    js .resp_404
+.have_file:
+    mov [rsp + 56], rax        ; fd; statbuf describes the file we opened
     mov rax, [statbuf + LINNEA_STAT_ST_SIZE]
     mov [rsp + 32], rax        ; file size
     ; --- validators: ETag "<hex mtime>-<hex size>" and Last-Modified ---
@@ -1011,6 +1075,25 @@ linnea_http_handle:
     lea rdi, [num_buf]
     mov rsi, rax
     call .append
+    cmp qword [rsp + 224], 0
+    je .no_enc_hdr
+    lea rdi, [hdr_content_enc]
+    mov esi, hdr_content_enc_len
+    call .append
+    cmp qword [rsp + 224], 2
+    je .enc_is_br
+    lea rdi, [enc_gzip]
+    mov esi, enc_gzip_len
+    jmp .enc_emit
+.enc_is_br:
+    lea rdi, [enc_br]
+    mov esi, enc_br_len
+.enc_emit:
+    call .append
+.no_enc_hdr:
+    lea rdi, [hdr_vary]
+    mov esi, hdr_vary_len
+    call .append
     call .append_validators
     cmp qword [rsp + 24], 0
     je .conn_close_hdr
@@ -1042,6 +1125,9 @@ linnea_http_handle:
     lea rdi, [status_304]
     mov esi, status_304_len
     call .append
+    lea rdi, [hdr_vary]        ; a 304 must carry the Vary of its 200; the
+    mov esi, hdr_vary_len      ; encoding itself is metadata it should not
+    call .append               ; restate
     call .append_validators
     cmp qword [rsp + 24], 0
     je .conn_close_304
@@ -1297,11 +1383,45 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 208
+    add rsp, 240
     pop r15
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; .open_regular(rdi=path cstr) -> rax = fd, or -1 if it is missing or is
+; not a regular file. statbuf describes the file on success. Probing for a
+; variant must not be able to open a directory named "foo.br".
+.open_regular:
+    push rbx
+    xor esi, esi               ; O_RDONLY
+    xor edx, edx
+    mov eax, LINNEA_SYS_OPEN
+    syscall
+    cmp rax, -4095
+    jae .open_missing
+    mov rbx, rax               ; fd
+    mov rdi, rax
+    lea rsi, [statbuf]
+    mov eax, LINNEA_SYS_FSTAT
+    syscall
+    cmp rax, -4095
+    jae .open_reject
+    mov eax, [statbuf + LINNEA_STAT_ST_MODE]
+    and eax, LINNEA_S_IFMT
+    cmp eax, LINNEA_S_IFREG
+    jne .open_reject
+    mov rax, rbx
+    pop rbx
+    ret
+.open_reject:
+    mov edi, ebx
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+.open_missing:
+    mov rax, -1
     pop rbx
     ret
 
@@ -1349,6 +1469,176 @@ linnea_http_handle:
     ret
 .hex_bad:
     mov eax, -1
+    ret
+
+; linnea_http_ae_accepts(rdi=value, rsi=len, rdx=token, rcx=token len) -> rax
+; 1 when an Accept-Encoding names this coding and does not refuse it with
+; q=0. Relative q values are not compared: linnea has exactly two variants
+; and its own preference between them (br first), so all it needs to know
+; is whether a coding is allowed at all. "*" is not honoured — it would
+; mean guessing which coding the client meant.
+; Locals: [rsp+0] token end (linnea_string_iequal clobbers rcx)
+linnea_http_ae_accepts:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 16
+    mov rbx, rdi               ; value
+    mov r12, rsi               ; value len
+    mov r13, rdx               ; token
+    mov r14, rcx               ; token len
+    xor r15d, r15d             ; cursor
+.element:
+    cmp r15, r12
+    jae .no
+    movzx eax, byte [rbx + r15]
+    cmp al, ' '
+    je .element_skip
+    cmp al, 9
+    je .element_skip
+    cmp al, ','
+    je .element_skip
+    jmp .token_start
+.element_skip:
+    inc r15
+    jmp .element
+.token_start:
+    mov rcx, r15
+.token_scan:
+    cmp rcx, r12
+    jae .token_end
+    movzx eax, byte [rbx + rcx]
+    cmp al, ','
+    je .token_end
+    cmp al, ';'
+    je .token_end
+    cmp al, ' '
+    je .token_end
+    cmp al, 9
+    je .token_end
+    inc rcx
+    jmp .token_scan
+.token_end:
+    mov [rsp], rcx
+    mov rax, rcx
+    sub rax, r15               ; candidate length
+    lea rdi, [rbx + r15]
+    mov rsi, rax
+    mov rdx, r13
+    mov rcx, r14
+    call linnea_string_iequal
+    mov rcx, [rsp]
+    test eax, eax
+    jnz .matched
+.to_comma:                     ; some other coding: skip the whole element
+    cmp rcx, r12
+    jae .no
+    cmp byte [rbx + rcx], ','
+    je .comma
+    inc rcx
+    jmp .to_comma
+.comma:
+    lea r15, [rcx + 1]
+    jmp .element
+.matched:
+    mov r15, rcx               ; parameters may still refuse it
+.param_ws:
+    cmp r15, r12
+    jae .yes
+    movzx eax, byte [rbx + r15]
+    cmp al, ' '
+    je .param_ws_next
+    cmp al, 9
+    je .param_ws_next
+    jmp .param
+.param_ws_next:
+    inc r15
+    jmp .param_ws
+.param:
+    cmp al, ';'
+    jne .yes                   ; end of the element: no q at all
+    inc r15
+.q_ws:
+    cmp r15, r12
+    jae .yes
+    movzx eax, byte [rbx + r15]
+    cmp al, ' '
+    je .q_ws_next
+    cmp al, 9
+    je .q_ws_next
+    jmp .q_name
+.q_ws_next:
+    inc r15
+    jmp .q_ws
+.q_name:
+    or al, 0x20                ; ASCII lowercase
+    cmp al, 'q'
+    jne .yes                   ; some other parameter: leave it accepted
+    inc r15
+.eq_ws:
+    cmp r15, r12
+    jae .yes
+    movzx eax, byte [rbx + r15]
+    cmp al, ' '
+    je .eq_ws_next
+    cmp al, 9
+    je .eq_ws_next
+    jmp .eq
+.eq_ws_next:
+    inc r15
+    jmp .eq_ws
+.eq:
+    cmp al, '='
+    jne .yes
+    inc r15
+.value_ws:
+    cmp r15, r12
+    jae .yes
+    movzx eax, byte [rbx + r15]
+    cmp al, ' '
+    je .value_ws_next
+    cmp al, 9
+    je .value_ws_next
+    jmp .value
+.value_ws_next:
+    inc r15
+    jmp .value_ws
+.value:
+    cmp al, '0'                ; only q=0, in its various spellings, refuses
+    jne .yes
+    inc r15
+    cmp r15, r12
+    jae .no                    ; bare "0"
+    cmp byte [rbx + r15], '.'
+    jne .no                    ; "0" then a separator
+    inc r15
+.fraction:
+    cmp r15, r12
+    jae .no                    ; "0." and zeros all the way
+    movzx eax, byte [rbx + r15]
+    cmp al, '0'
+    je .fraction_next
+    sub eax, '1'
+    cmp eax, 8
+    jbe .yes                   ; a nonzero digit: 0.001 still allows it
+    jmp .no                    ; the value ended: every digit was zero
+.fraction_next:
+    inc r15
+    jmp .fraction
+.yes:
+    mov eax, 1
+    jmp .ret
+.no:
+    xor eax, eax
+.ret:
+    add rsp, 16
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; linnea_http_inm_match(rdi=value, rsi=len, rdx=etag, rcx=etag len) -> rax
