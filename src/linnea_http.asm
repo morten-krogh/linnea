@@ -25,6 +25,14 @@
 ; - Static locations: a directory result maps to its index.html.
 ;   Missing/non-regular files: 404.
 ;   The access log records the raw, undecoded target.
+; - Caching: every static 200 carries an ETag built from the file's mtime
+;   and size, plus Last-Modified. A request whose If-None-Match matches
+;   (weak comparison, "*" and comma-separated lists included), or whose
+;   If-Modified-Since is at or after the file's mtime, gets a 304 instead
+;   — one that keeps the connection alive, since a revalidation that cost
+;   a new connection each time would defeat the point. If-None-Match wins
+;   when both are present; an If-Modified-Since we cannot parse is
+;   ignored, which costs a needless 200 and nothing worse.
 ; - Files are served from a read-only mmap queued behind the header send
 ;   (conn.file_*); the event loop munmaps after the send completes.
 ; - Proxy locations: a fresh upstream connection per request. The request
@@ -46,6 +54,7 @@ default rel
 %include "linnea_config.inc"
 %include "linnea_connection.inc"
 %include "linnea_http.inc"
+%include "linnea_time.inc"
 
 global linnea_http_handle
 global linnea_http_proxy_error
@@ -62,8 +71,11 @@ LINNEA_HTTP_PATH_BUF    equ 2560
 
 extern linnea_config_instance
 extern linnea_string_from_u64
+extern linnea_string_from_hex_u64
 extern linnea_string_equal
 extern linnea_string_iequal
+extern linnea_time_http_date
+extern linnea_time_parse_http_date
 extern linnea_log_write
 extern linnea_log_u64
 extern linnea_log_stamp
@@ -110,8 +122,14 @@ resp_505_len    equ $ - resp_505
 
 status_200:     db "HTTP/1.1 200 OK", 13, 10, "Content-Type: "
 status_200_len  equ $ - status_200
+status_304:     db "HTTP/1.1 304 Not Modified"
+status_304_len  equ $ - status_304
 hdr_length:     db 13, 10, "Content-Length: "
 hdr_length_len  equ $ - hdr_length
+hdr_etag:       db 13, 10, "ETag: "
+hdr_etag_len    equ $ - hdr_etag
+hdr_last_mod:   db 13, 10, "Last-Modified: "
+hdr_last_mod_len equ $ - hdr_last_mod
 hdr_keepalive:  db 13, 10, "Connection: keep-alive", 13, 10, 13, 10
 hdr_keepalive_len equ $ - hdr_keepalive
 hdr_close:      db 13, 10, "Connection: close", 13, 10, 13, 10
@@ -151,6 +169,8 @@ hn_content_len: db "content-length"
 hn_transfer_enc: db "transfer-encoding"
 hn_host:        db "host"
 hn_expect:      db "expect"
+hn_if_none_match: db "if-none-match"
+hn_if_mod_since: db "if-modified-since"
 hv_close:       db "close"
 
 ; MIME types by file extension; default is application/octet-stream.
@@ -203,6 +223,11 @@ mime_table:
 section .bss
 
 num_buf:        resb 20
+; '"' + 16 hex mtime digits + '-' + 16 hex size digits + '"', with room for
+; the hex formatter's 16-byte scratch past each write cursor
+etag_buf:       resb 48
+etag_len:       resq 1
+date_buf:       resb LINNEA_HTTP_DATE_LEN
 path_buf:       resb LINNEA_HTTP_PATH_BUF
 statbuf:        resb LINNEA_STAT_SIZE
 
@@ -225,13 +250,15 @@ section .text
 ;             is truncated at '?' for routing)  [rsp+152] location*
 ;   [rsp+160] best prefix len (location match scratch)
 ;   [rsp+168] directory flag (r9 does not survive the match loop's calls)
+;   [rsp+176] If-None-Match ptr (0 = absent)     [rsp+184] its len
+;   [rsp+192] If-Modified-Since ptr (0 = absent) [rsp+200] its len
 linnea_http_handle:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 176
+    sub rsp, 208
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -245,6 +272,8 @@ linnea_http_handle:
     mov qword [rsp + 128], 0   ; no body
     mov qword [rsp + 136], 0   ; no Content-Length/Transfer-Encoding seen
     mov qword [rsp + 144], 0   ; no raw target yet
+    mov qword [rsp + 176], 0   ; no If-None-Match yet
+    mov qword [rsp + 192], 0   ; no If-Modified-Since yet
     mov ecx, [rbx + linnea_connection.server]
     imul rcx, rcx, linnea_config_server_size
     lea rax, [linnea_config_instance]
@@ -459,6 +488,20 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jnz .te_header
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_if_none_match]
+    mov ecx, 13
+    call linnea_string_iequal
+    test eax, eax
+    jnz .inm_header
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_if_mod_since]
+    mov ecx, 17
+    call linnea_string_iequal
+    test eax, eax
+    jnz .ims_header
     ; Host? (first occurrence wins, used for vhost selection)
     cmp qword [rsp + 88], 0
     jne .header_next
@@ -473,6 +516,22 @@ linnea_http_handle:
     mov [rsp + 88], rax
     mov rax, [rsp + 80]
     mov [rsp + 96], rax
+    jmp .header_next
+.inm_header:                   ; first occurrence wins, as for Host
+    cmp qword [rsp + 176], 0
+    jne .header_next
+    mov rax, [rsp + 72]
+    mov [rsp + 176], rax
+    mov rax, [rsp + 80]
+    mov [rsp + 184], rax
+    jmp .header_next
+.ims_header:
+    cmp qword [rsp + 192], 0
+    jne .header_next
+    mov rax, [rsp + 72]
+    mov [rsp + 192], rax
+    mov rax, [rsp + 80]
+    mov [rsp + 200], rax
     jmp .header_next
 .cl_header:
     test qword [rsp + 136], 1
@@ -816,9 +875,58 @@ linnea_http_handle:
     jne .close_404
     mov rax, [statbuf + LINNEA_STAT_ST_SIZE]
     mov [rsp + 32], rax        ; file size
+    ; --- validators: ETag "<hex mtime>-<hex size>" and Last-Modified ---
+    ; the number formatters clobber rdi/rsi/rcx, so the write cursor waits
+    ; on the stack across each call
+    lea rax, [etag_buf]
+    mov byte [rax], '"'
+    mov rdi, [statbuf + LINNEA_STAT_ST_MTIME]
+    lea rsi, [etag_buf + 1]
+    call linnea_string_from_hex_u64
+    lea rcx, [etag_buf + 1]
+    add rcx, rax
+    mov byte [rcx], '-'
+    inc rcx
+    mov [rsp + 64], rcx
+    mov rdi, [rsp + 32]        ; file size
+    mov rsi, rcx
+    call linnea_string_from_hex_u64
+    mov rcx, [rsp + 64]
+    add rcx, rax
+    mov byte [rcx], '"'
+    inc rcx
+    lea rax, [etag_buf]
+    sub rcx, rax
+    mov [etag_len], rcx
+    mov rdi, [statbuf + LINNEA_STAT_ST_MTIME]
+    lea rsi, [date_buf]
+    call linnea_time_http_date
+    ; --- conditional request: If-None-Match wins over If-Modified-Since -
+    cmp qword [rsp + 176], 0
+    je .check_ims
+    mov rdi, [rsp + 176]
+    mov rsi, [rsp + 184]
+    lea rdx, [etag_buf]
+    mov rcx, [etag_len]
+    call linnea_http_inm_match
+    test eax, eax
+    jnz .resp_304
+    jmp .send_full             ; a mismatch overrides any If-Modified-Since
+.check_ims:
+    cmp qword [rsp + 192], 0
+    je .send_full
+    mov rdi, [rsp + 192]
+    mov rsi, [rsp + 200]
+    call linnea_time_parse_http_date
+    cmp rax, -1
+    je .send_full              ; unparseable: the RFC says ignore it
+    cmp [statbuf + LINNEA_STAT_ST_MTIME], rax
+    jbe .resp_304              ; not modified since the client's copy
+.send_full:
     ; GET with content: map the file and queue it behind the headers
     cmp qword [rsp], 0
     jne .no_map                ; HEAD: headers only
+    mov rax, [rsp + 32]        ; file size
     test rax, rax
     jz .no_map                 ; empty file
     mov rsi, rax
@@ -903,6 +1011,7 @@ linnea_http_handle:
     lea rdi, [num_buf]
     mov rsi, rax
     call .append
+    call .append_validators
     cmp qword [rsp + 24], 0
     je .conn_close_hdr
     lea rdi, [hdr_keepalive]
@@ -919,6 +1028,38 @@ linnea_http_handle:
     sub rcx, rax
     mov [rbx + linnea_connection.out_rem], rcx
     mov qword [rsp + 112], 200
+    jmp .log_request
+
+; --- 304: the validators, no body, and the connection stays up ---------
+.resp_304:
+    mov rdi, [rsp + 56]        ; the file is not going to be read
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    mov rax, [rsp + 24]
+    mov [rbx + linnea_connection.keep_alive], rax
+    mov qword [rbx + linnea_connection.file_rem], 0
+    lea r15, [rbx + linnea_connection.out_buf]
+    lea rdi, [status_304]
+    mov esi, status_304_len
+    call .append
+    call .append_validators
+    cmp qword [rsp + 24], 0
+    je .conn_close_304
+    lea rdi, [hdr_keepalive]
+    mov esi, hdr_keepalive_len
+    jmp .conn_hdr_304
+.conn_close_304:
+    lea rdi, [hdr_close]
+    mov esi, hdr_close_len
+.conn_hdr_304:
+    call .append
+    lea rax, [rbx + linnea_connection.out_buf]
+    mov [rbx + linnea_connection.out_ptr], rax
+    mov rcx, r15
+    sub rcx, rax
+    mov [rbx + linnea_connection.out_rem], rcx
+    mov qword [rsp + 112], 304
+    mov qword [rsp + 32], 0    ; a 304 carries no body
     jmp .log_request
 
 ; --- proxy location: rewrite the request and open the upstream socket ---
@@ -1156,13 +1297,30 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 176
+    add rsp, 208
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
     ret
+
+; .append_validators() — the ETag and Last-Modified lines, from the
+; buffers filled after the fstat. Shared by the 200 and 304 paths so a
+; revalidating client always gets back exactly what it will compare next.
+.append_validators:
+    lea rdi, [hdr_etag]
+    mov esi, hdr_etag_len
+    call .append
+    lea rdi, [etag_buf]
+    mov rsi, [etag_len]
+    call .append
+    lea rdi, [hdr_last_mod]
+    mov esi, hdr_last_mod_len
+    call .append
+    lea rdi, [date_buf]
+    mov esi, LINNEA_HTTP_DATE_LEN
+    jmp .append
 
 ; .append(rdi=ptr, rsi=len) — local helper; r15 is the write cursor.
 ; The 200 header line lengths are bounded well under LINNEA_CONN_OUT_BUF.
@@ -1191,6 +1349,92 @@ linnea_http_handle:
     ret
 .hex_bad:
     mov eax, -1
+    ret
+
+; linnea_http_inm_match(rdi=value, rsi=len, rdx=etag, rcx=etag len) -> rax
+; 1 if an If-None-Match value matches our entity-tag. The value is "*", or
+; a comma-separated list of entity-tags, each optionally weak ("W/"). The
+; comparison is weak (RFC 9110 13.1.2): the W/ prefix does not affect a
+; match, so it is simply skipped. The etag we are handed carries its
+; quotes, and so does each candidate.
+; Locals: [rsp+0] closing-quote offset (linnea_string_equal clobbers rcx)
+linnea_http_inm_match:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 16
+    mov rbx, rdi               ; value
+    mov r12, rsi               ; value len
+    mov r13, rdx               ; our etag
+    mov r14, rcx               ; our etag len
+    xor r15d, r15d             ; cursor
+.next:
+    cmp r15, r12
+    jae .no
+    movzx eax, byte [rbx + r15]
+    cmp al, ' '
+    je .skip
+    cmp al, 9
+    je .skip
+    cmp al, ','
+    je .skip
+    jmp .candidate
+.skip:
+    inc r15
+    jmp .next
+.candidate:
+    cmp al, '*'
+    je .yes                    ; matches any representation, and we have one
+    cmp al, 'W'
+    jne .quoted
+    lea rax, [r15 + 1]
+    cmp rax, r12
+    jae .no
+    cmp byte [rbx + rax], '/'
+    jne .no
+    add r15, 2
+.quoted:
+    cmp r15, r12
+    jae .no
+    cmp byte [rbx + r15], '"'
+    jne .no                    ; not an entity-tag: nothing here can match
+    lea rcx, [r15 + 1]
+.find_close:
+    cmp rcx, r12
+    jae .no                    ; unterminated
+    cmp byte [rbx + rcx], '"'
+    je .close_found
+    inc rcx
+    jmp .find_close
+.close_found:
+    mov [rsp], rcx
+    mov rax, rcx
+    sub rax, r15
+    inc rax                    ; candidate length, quotes included
+    lea rdi, [rbx + r15]
+    mov rsi, rax
+    mov rdx, r13
+    mov rcx, r14
+    call linnea_string_equal
+    test eax, eax
+    jnz .yes
+    mov r15, [rsp]
+    inc r15                    ; past the closing quote, on to the next tag
+    jmp .next
+.yes:
+    mov eax, 1
+    jmp .ret
+.no:
+    xor eax, eax
+.ret:
+    add rsp, 16
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; --- proxying ----------------------------------------------------------

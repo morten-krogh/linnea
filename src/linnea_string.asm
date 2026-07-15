@@ -7,6 +7,7 @@ global linnea_string_equal
 global linnea_string_iequal
 global linnea_string_copy
 global linnea_string_from_u64
+global linnea_string_from_hex_u64
 
 section .text
 
@@ -81,6 +82,35 @@ linnea_string_copy:
     mov rcx, rdx
     rep movsb
     mov byte [rdi], 0
+    ret
+
+; linnea_string_from_hex_u64(rdi=value, rsi=buf) -> rax=len
+; Formats value as lowercase hex at the start of buf, no leading zeros
+; (0 formats as "0"). buf must be >= 16 bytes.
+linnea_string_from_hex_u64:
+    mov rax, rdi
+    lea r8, [rsi + 16]         ; end of buf
+    mov r9, r8                 ; write cursor, moves down
+.digit:
+    mov ecx, eax
+    and ecx, 0x0F
+    cmp cl, 10
+    jb .decimal
+    add cl, 'a' - 10
+    jmp .put
+.decimal:
+    add cl, '0'
+.put:
+    dec r9
+    mov [r9], cl
+    shr rax, 4
+    jnz .digit
+    mov rcx, r8
+    sub rcx, r9                ; len
+    mov rax, rcx
+    mov rdi, rsi               ; dst = start of buf
+    mov rsi, r9                ; src = first digit
+    rep movsb
     ret
 
 ; linnea_string_from_u64(rdi=value, rsi=buf) -> rax=len

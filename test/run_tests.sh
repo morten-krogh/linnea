@@ -83,6 +83,9 @@ run_test "empty locations"  1 stderr "at least one location" \
 
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
+# A file spanning several pages: every other fixture fits in one, which is
+# exactly what let a wrong mmap length go unnoticed.
+python3 -c "open('test/www/big.txt','w').write('B'*100000)"
 python3 test/proxy_backend.py >/dev/null 2>&1 &
 backend_pid=$!
 $BIN test/configs/listen.json >/dev/null 2>&1 &
@@ -146,6 +149,70 @@ resp=$(curl -si --max-time 2 -I http://127.0.0.1:47080/hello.txt)
 check_http "HEAD length"       "Content-Length: 18" "$resp"
 resp=$(curl -si --max-time 2 -X POST http://127.0.0.1:47080/hello.txt)
 check_http "http 405"          "405 Method Not Allowed" "$resp"
+
+# a file larger than one page: the mapped length must be the whole file
+n=$(curl -s --max-time 5 http://127.0.0.1:47080/big.txt | wc -c)
+[ "$n" -eq 100000 ]
+check "large file length ($n bytes)" $?
+junk=$(curl -s --max-time 5 http://127.0.0.1:47080/big.txt | tr -d 'B' | wc -c)
+[ "$junk" -eq 0 ]
+check "large file intact" $?
+
+# --- caching: ETag / Last-Modified and conditional requests ---
+resp=$(curl -si --max-time 2 http://127.0.0.1:47080/hello.txt)
+check_http "etag present"        "ETag: \"" "$resp"
+check_http "last-modified present" "Last-Modified: " "$resp"
+printf '%s' "$resp" | grep -qE '^ETag: "[0-9a-f]+-12"'
+check "etag is mtime-size in hex" $?
+printf '%s' "$resp" | grep -qE '^Last-Modified: [A-Z][a-z]{2}, [0-9]{2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT'
+check "last-modified is an HTTP date" $?
+
+etag=$(printf '%s' "$resp" | grep -i '^etag:' | tr -d '\r' | cut -d' ' -f2)
+lastmod=$(printf '%s' "$resp" | grep -i '^last-modified:' | tr -d '\r' | cut -d' ' -f2-)
+
+resp=$(curl -si --max-time 2 -H "If-None-Match: $etag" http://127.0.0.1:47080/hello.txt)
+check_http "if-none-match 304"   "304 Not Modified" "$resp"
+check_http "304 repeats etag"    "ETag: $etag" "$resp"
+check_http "304 keeps alive"     "Connection: keep-alive" "$resp"
+printf '%s' "$resp" | grep -qF "hello from linnea"
+[ $? -ne 0 ]
+check "304 carries no body" $?
+# a 304 that cost a new connection each time would defeat revalidation
+before=$(grep -c "accepted connection" "$LOG")
+curl -s --max-time 4 -H "If-None-Match: $etag" -o /dev/null \
+    http://127.0.0.1:47080/hello.txt http://127.0.0.1:47080/hello.txt
+after=$(grep -c "accepted connection" "$LOG")
+[ $((after - before)) -eq 1 ]
+check "304 single accept" $?
+
+resp=$(curl -si --max-time 2 -H 'If-None-Match: "stale"' http://127.0.0.1:47080/hello.txt)
+check_http "stale etag 200"      "hello from linnea" "$resp"
+resp=$(curl -si --max-time 2 -H "If-None-Match: W/$etag" http://127.0.0.1:47080/hello.txt)
+check_http "weak etag 304"       "304 Not Modified" "$resp"
+resp=$(curl -si --max-time 2 -H 'If-None-Match: *' http://127.0.0.1:47080/hello.txt)
+check_http "if-none-match star"  "304 Not Modified" "$resp"
+resp=$(curl -si --max-time 2 -H "If-None-Match: \"a\", W/\"b\", $etag" http://127.0.0.1:47080/hello.txt)
+check_http "etag list 304"       "304 Not Modified" "$resp"
+resp=$(curl -si --max-time 2 -I -H "If-None-Match: $etag" http://127.0.0.1:47080/hello.txt)
+check_http "HEAD 304"            "304 Not Modified" "$resp"
+
+resp=$(curl -si --max-time 2 -H "If-Modified-Since: $lastmod" http://127.0.0.1:47080/hello.txt)
+check_http "if-modified-since 304" "304 Not Modified" "$resp"
+resp=$(curl -si --max-time 2 -z "$lastmod" http://127.0.0.1:47080/hello.txt)
+check_http "curl time-cond 304"  "304 Not Modified" "$resp"
+resp=$(curl -si --max-time 2 -H "If-Modified-Since: Wed, 01 Jan 2020 00:00:00 GMT" http://127.0.0.1:47080/hello.txt)
+check_http "older date 200"      "hello from linnea" "$resp"
+# an unparseable date must be ignored, not treated as a condition
+resp=$(curl -si --max-time 2 -H "If-Modified-Since: not a date" http://127.0.0.1:47080/hello.txt)
+check_http "bad date ignored"    "hello from linnea" "$resp"
+resp=$(curl -si --max-time 2 -H "If-Modified-Since: Sunday, 06-Nov-94 08:49:37 GMT" http://127.0.0.1:47080/hello.txt)
+check_http "rfc850 date ignored" "hello from linnea" "$resp"
+# If-None-Match wins outright when both are present
+resp=$(curl -si --max-time 2 -H 'If-None-Match: "x"' -H "If-Modified-Since: $lastmod" http://127.0.0.1:47080/hello.txt)
+check_http "if-none-match wins"  "hello from linnea" "$resp"
+
+grep -qF '"GET /hello.txt" 304 0' "$LOG"
+check "request log 304" $?
 
 # --- virtual hosts: 47080 is shared by one.test (default) and three.test ---
 resp=$(curl -s --max-time 2 -H "Host: three.test" http://127.0.0.1:47080/page.html)
@@ -343,7 +410,7 @@ check "termination idle timeout" $?
 kill $server_pid $backend_pid 2>/dev/null
 wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
-rm -f "$LOG"
+rm -f "$LOG" test/www/big.txt
 
 echo
 echo "$pass passed, $fail failed"

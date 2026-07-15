@@ -36,6 +36,7 @@ LINNEA_MAP_ANONYMOUS equ 0x20
 
 LINNEA_STAT_ST_MODE  equ 24   ; offset of st_mode in struct stat, x86-64
 LINNEA_STAT_ST_SIZE  equ 48   ; offset of st_size in struct stat, x86-64
+LINNEA_STAT_ST_MTIME equ 88   ; offset of st_mtime in struct stat, x86-64
 LINNEA_STAT_SIZE     equ 144  ; sizeof(struct stat), x86-64
 LINNEA_S_IFMT        equ 0xF000
 LINNEA_S_IFREG       equ 0x8000
