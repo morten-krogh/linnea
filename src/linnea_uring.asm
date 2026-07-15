@@ -29,10 +29,10 @@ extern linnea_connection_free
 extern linnea_connection_at
 extern linnea_http_handle
 extern linnea_error_exit
-extern linnea_print_stdout
 extern linnea_print_stderr
-extern linnea_print_u64_stdout
 extern linnea_print_u64_stderr
+extern linnea_log_write
+extern linnea_log_u64
 
 section .rodata
 
@@ -90,8 +90,13 @@ linnea_uring_run:
 .arm_loop:
     cmp r12, [rbx + linnea_config.server_count]
     jae .armed
+    imul rdx, r12, linnea_config_server_size
+    lea rdx, [rbx + rdx + linnea_config.servers]
+    cmp dword [rdx + linnea_config_server.listener_owner], 0
+    je .arm_next               ; shares another server's listener
     mov rdi, r12
     call linnea_uring_arm_accept
+.arm_next:
     inc r12
     jmp .arm_loop
 .armed:
@@ -401,23 +406,23 @@ linnea_uring_log_accept:
     lea rbx, [rax + rcx + linnea_config.servers]   ; server*
     lea rdi, [log_accept]
     mov esi, log_accept_len
-    call linnea_print_stdout
+    call linnea_log_write
     lea rdi, [rbx + linnea_config_server.host]
     mov rsi, [rbx + linnea_config_server.host_len]
-    call linnea_print_stdout
+    call linnea_log_write
     lea rdi, [log_colon]
     mov esi, 1
-    call linnea_print_stdout
+    call linnea_log_write
     movzx edi, word [rbx + linnea_config_server.port]
-    call linnea_print_u64_stdout
+    call linnea_log_u64
     lea rdi, [log_fd]
     mov esi, log_fd_len
-    call linnea_print_stdout
+    call linnea_log_write
     mov edi, r12d
-    call linnea_print_u64_stdout
+    call linnea_log_u64
     lea rdi, [log_close]
     mov esi, log_close_len
-    call linnea_print_stdout
+    call linnea_log_write
     pop r13
     pop r12
     pop rbx

@@ -24,8 +24,6 @@ usage_msg:      db "usage: linnea <config.json>", 10
 usage_msg_len   equ $ - usage_msg
 prefix_msg:     db "linnea: "
 prefix_len      equ $ - prefix_msg
-open_msg:       db "cannot open config file: "
-open_msg_len    equ $ - open_msg
 parse_msg:      db "parse error at line "
 parse_msg_len   equ $ - parse_msg
 column_msg:     db ", column "
@@ -63,18 +61,21 @@ linnea_error_exit:
     call linnea_print_stderr
     jmp linnea_error_die
 
-; linnea_error_open(rdi=path cstr) — prints "linnea: cannot open config file: <path>\n"
+; linnea_error_open(rdi=msg, rsi=len, rdx=path cstr)
+; Prints "linnea: <msg><path>\n" and exits.
 linnea_error_open:
     mov r12, rdi
+    mov r13, rsi
+    mov r14, rdx
     lea rdi, [prefix_msg]
     mov esi, prefix_len
     call linnea_print_stderr
-    lea rdi, [open_msg]
-    mov esi, open_msg_len
+    mov rdi, r12
+    mov rsi, r13
     call linnea_print_stderr
-    mov rdi, r12
+    mov rdi, r14
     call linnea_string_length
-    mov rdi, r12
+    mov rdi, r14
     mov rsi, rax
     call linnea_print_stderr
     lea rdi, [newline_msg]

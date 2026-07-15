@@ -41,6 +41,8 @@ msg_empty_hostname:     db "server hostname must not be empty"
 msg_empty_hostname_len  equ $ - msg_empty_hostname
 msg_empty_root:         db "server root must not be empty"
 msg_empty_root_len      equ $ - msg_empty_root
+msg_empty_log:          db "config log must not be empty"
+msg_empty_log_len       equ $ - msg_empty_log
 
 section .bss
 
@@ -51,6 +53,8 @@ section .text
 ; linnea_config_validate(rdi=config*) — semantic rules, checked after parse.
 ; Exits with an error message on the first violation.
 linnea_config_validate:
+    cmp qword [rdi + linnea_config.log_len], 0
+    je .empty_log
     mov rax, [rdi + linnea_config.server_count]
     test rax, rax
     jz .no_servers
@@ -91,6 +95,10 @@ linnea_config_validate:
 .empty_root:
     lea rdi, [msg_empty_root]
     mov esi, msg_empty_root_len
+    jmp linnea_error_exit
+.empty_log:
+    lea rdi, [msg_empty_log]
+    mov esi, msg_empty_log_len
     jmp linnea_error_exit
 
 ; linnea_config_dump(rdi=config*) — human-readable dump to stdout:

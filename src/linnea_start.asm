@@ -14,6 +14,7 @@ extern linnea_config_parse
 extern linnea_config_validate
 extern linnea_config_dump
 extern linnea_config_instance
+extern linnea_log_open
 extern linnea_network_listen_all
 extern linnea_connections_init
 extern linnea_uring_run
@@ -38,6 +39,8 @@ _start:
     call linnea_file_unmap
     lea rdi, [linnea_config_instance]
     call linnea_config_validate
+    lea rdi, [linnea_config_instance + linnea_config.log]
+    call linnea_log_open
     lea rdi, [linnea_config_instance]
     call linnea_config_dump
     lea rdi, [linnea_config_instance]

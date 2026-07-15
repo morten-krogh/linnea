@@ -1,14 +1,17 @@
 ; linnea_config_parse.asm — schema-specific JSON parser for the config.
 ;
 ; Accepted grammar, exactly:
-;   ws '{' ws '"servers"' ws ':' ws '[' [ server (ws ',' server)* ] ws ']' ws '}' ws EOF
+;   ws '{' member (ws ',' member)* ws '}' ws EOF
+; where the top-level members are "log" (string) and "servers" (array of
+; server objects), in any order, each required exactly once.
 ;   server := ws '{' member (ws ',' member)* ws '}'
 ;   member := ws string ws ':' ws value
 ;
 ; Server keys are "host" (string), "port" (integer), "hostname" (string),
-; accepted in any order, each required exactly once. JSON subset: whitespace
-; is space/tab/newline/carriage-return; strings have no escape sequences;
-; numbers are non-negative decimal integers capped at 65535.
+; "root" (string), accepted in any order, each required exactly once.
+; JSON subset: whitespace is space/tab/newline/carriage-return; strings
+; have no escape sequences; numbers are non-negative decimal integers
+; capped at 65535.
 ; All errors exit via linnea_error_parse with the byte offset of the error.
 
 default rel
@@ -27,6 +30,8 @@ section .rodata
 
 key_servers:            db "servers"
 key_servers_len         equ $ - key_servers
+key_log:                db "log"
+key_log_len             equ $ - key_log
 key_host:               db "host"
 key_host_len            equ $ - key_host
 key_port:               db "port"
@@ -38,8 +43,8 @@ key_root_len            equ $ - key_root
 
 msg_eof:                db "unexpected end of file"
 msg_eof_len             equ $ - msg_eof
-msg_servers:            db 'expected "servers"'
-msg_servers_len         equ $ - msg_servers
+msg_top_missing:        db "config requires log and servers"
+msg_top_missing_len     equ $ - msg_top_missing
 msg_sep_array:          db "expected ',' or ']'"
 msg_sep_array_len       equ $ - msg_sep_array
 msg_sep_object:         db "expected ',' or '}'"
@@ -70,6 +75,8 @@ msg_hostname_long:      db "hostname too long"
 msg_hostname_long_len   equ $ - msg_hostname_long
 msg_root_long:          db "root too long"
 msg_root_long_len       equ $ - msg_root_long
+msg_log_long:           db "log too long"
+msg_log_long_len        equ $ - msg_log_long
 
 section .data
 
@@ -87,37 +94,59 @@ section .text
 
 ; linnea_config_parse(rdi=buf, rsi=len, rdx=config*)
 ; Fills the config from the JSON bytes or exits with a parse error.
+; Top-level key presence tracked in a bitmask: servers=1, log=2.
 linnea_config_parse:
     push rbx
     push r12
+    push r13
+    push r14
+    push r15
     mov rbx, rdx               ; config*
     mov [linnea_parser_state + linnea_parser.base], rdi
     mov [linnea_parser_state + linnea_parser.size], rsi
     mov qword [linnea_parser_state + linnea_parser.pos], 0
     mov qword [rbx + linnea_config.server_count], 0
+    mov qword [rbx + linnea_config.log_len], 0
+    xor r13d, r13d             ; top-level key mask
 
     mov edi, '{'
     call linnea_parse_expect
+.top_loop:
     call linnea_parse_string   ; rax=ptr, rdx=len
-    mov rdi, rax
-    mov rsi, rdx
+    mov r14, rax
+    mov r15, rdx
+    mov edi, ':'
+    call linnea_parse_expect
+    mov rdi, r14
+    mov rsi, r15
     lea rdx, [key_servers]
     mov ecx, key_servers_len
     call linnea_string_equal
     test eax, eax
-    jz .bad_servers_key
-    mov edi, ':'
-    call linnea_parse_expect
+    jnz .top_servers
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_log]
+    mov ecx, key_log_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_log
+    lea rdi, [msg_unknown_key]
+    mov esi, msg_unknown_key_len
+    jmp linnea_parse_fail
+
+.top_servers:
+    test r13d, 1
+    jnz .top_dup
+    or r13d, 1
     mov edi, '['
     call linnea_parse_expect
-
     call linnea_parse_skip_ws
     call linnea_parse_peek
     cmp al, ']'
     jne .server_loop
     call linnea_parse_advance  ; empty array; validation rejects count 0
-    jmp .after_array
-
+    jmp .top_sep
 .server_loop:
     mov r12, [rbx + linnea_config.server_count]
     cmp r12, LINNEA_MAX_SERVERS
@@ -140,23 +169,62 @@ linnea_config_parse:
     jmp .server_loop
 .end_array:
     call linnea_parse_advance
-.after_array:
-    mov edi, '}'
-    call linnea_parse_expect
+    jmp .top_sep
+
+.top_log:
+    test r13d, 2
+    jnz .top_dup
+    or r13d, 2
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_LOG
+    ja .log_long
+    mov [rbx + linnea_config.log_len], rdx
+    lea rdi, [rbx + linnea_config.log]
+    mov rsi, rax
+    call linnea_string_copy
+
+.top_sep:
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ','
+    je .top_next
+    cmp al, '}'
+    je .top_done
+    lea rdi, [msg_sep_object]
+    mov esi, msg_sep_object_len
+    jmp linnea_parse_fail
+.top_next:
+    call linnea_parse_advance
+    jmp .top_loop
+.top_done:
+    call linnea_parse_advance
+    cmp r13d, 3
+    jne .top_missing
     call linnea_parse_skip_ws
     mov rax, [linnea_parser_state + linnea_parser.pos]
     cmp rax, [linnea_parser_state + linnea_parser.size]
     jb .trailing
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
-.bad_servers_key:
-    lea rdi, [msg_servers]
-    mov esi, msg_servers_len
+.top_dup:
+    lea rdi, [msg_dup_key]
+    mov esi, msg_dup_key_len
+    jmp linnea_parse_fail
+.top_missing:
+    lea rdi, [msg_top_missing]
+    mov esi, msg_top_missing_len
     jmp linnea_parse_fail
 .too_many:
     lea rdi, [msg_too_many]
     mov esi, msg_too_many_len
+    jmp linnea_parse_fail
+.log_long:
+    lea rdi, [msg_log_long]
+    mov esi, msg_log_long_len
     jmp linnea_parse_fail
 .trailing:
     lea rdi, [msg_trailing]

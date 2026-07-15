@@ -13,6 +13,8 @@ extern linnea_error_open
 
 section .rodata
 
+msg_open:       db "cannot open config file: "
+msg_open_len    equ $ - msg_open
 msg_fstat:      db "cannot stat config file"
 msg_fstat_len   equ $ - msg_fstat
 msg_empty:      db "config file is empty"
@@ -73,7 +75,9 @@ linnea_file_map_readonly:
     pop rbx
     ret
 .open_fail:
-    mov rdi, rbx
+    lea rdi, [msg_open]
+    mov esi, msg_open_len
+    mov rdx, rbx
     jmp linnea_error_open
 .fstat_fail:
     lea rdi, [msg_fstat]

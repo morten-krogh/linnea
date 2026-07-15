@@ -21,6 +21,10 @@ LINNEA_STDOUT        equ 1
 LINNEA_STDERR        equ 2
 
 LINNEA_O_RDONLY      equ 0
+LINNEA_O_WRONLY      equ 1
+LINNEA_O_CREAT       equ 0x40
+LINNEA_O_APPEND      equ 0x400
+LINNEA_MODE_0644     equ 420  ; rw-r--r--
 LINNEA_PROT_READ     equ 1
 LINNEA_PROT_WRITE    equ 2
 LINNEA_MAP_PRIVATE   equ 2

@@ -33,3 +33,5 @@
 
 \#*\#
 .\#*
+# Server log files
+*.log

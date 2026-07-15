@@ -79,6 +79,7 @@ index_html_len  equ $ - index_html
 hn_connection:  db "connection"
 hn_content_len: db "content-length"
 hn_transfer_enc: db "transfer-encoding"
+hn_host:        db "host"
 hv_close:       db "close"
 
 ; MIME types by file extension; default is application/octet-stream.
@@ -144,15 +145,16 @@ section .text
 ; Stack locals:
 ;   [rsp+0]  is_head        [rsp+8]  target ptr   [rsp+16] target len
 ;   [rsp+24] keep_alive     [rsp+32] file size    [rsp+40] mime ptr
-;   [rsp+48] mime len       [rsp+56] name ptr / open fd
+;   [rsp+48] mime len       [rsp+56] name ptr / open fd / vhost scratch
 ;   [rsp+64] name len       [rsp+72] value ptr    [rsp+80] value len
+;   [rsp+88] Host value ptr (0 = absent)          [rsp+96] Host value len
 linnea_http_handle:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 96
+    sub rsp, 112
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -181,6 +183,8 @@ linnea_http_handle:
     add r13, 2                 ; head limit
     xor r15d, r15d             ; cursor
     mov qword [rsp + 24], 1    ; keep_alive default on
+    mov qword [rsp + 88], 0    ; no Host header yet
+    mov qword [rsp + 96], 0
 
     ; --- method ---------------------------------------------------
 .method_loop:
@@ -365,7 +369,22 @@ linnea_http_handle:
     mov ecx, 17
     call linnea_string_iequal
     test eax, eax
+    jnz .body_indicator
+    ; Host? (first occurrence wins, used for vhost selection)
+    cmp qword [rsp + 88], 0
+    jne .header_next
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_host]
+    mov ecx, 4
+    call linnea_string_iequal
+    test eax, eax
     jz .header_next
+    mov rax, [rsp + 72]
+    mov [rsp + 88], rax
+    mov rax, [rsp + 80]
+    mov [rsp + 96], rax
+    jmp .header_next
 .body_indicator:
     mov qword [rsp + 24], 0
 .header_next:
@@ -418,11 +437,58 @@ linnea_http_handle:
     inc rdx
     jmp .dot_scan
 .dots_ok:
-    ; path = root + target (+ index.html after a trailing '/')
+    ; default server = the one whose listener accepted the connection
     mov ecx, [rbx + linnea_connection.server]
     imul rcx, rcx, linnea_config_server_size
     lea rax, [linnea_config_instance]
     lea r12, [rax + rcx + linnea_config.servers]   ; server*
+    ; vhost selection: match the Host header (port stripped) against the
+    ; hostnames of all servers sharing this listener; no match = default
+    mov rcx, [rsp + 96]
+    test rcx, rcx
+    jz .server_chosen
+    mov rsi, [rsp + 88]
+    xor edx, edx
+.host_port_scan:
+    cmp rdx, rcx
+    jae .host_port_done
+    cmp byte [rsi + rdx], ':'
+    je .host_port_found
+    inc rdx
+    jmp .host_port_scan
+.host_port_found:
+    mov rcx, rdx
+.host_port_done:
+    mov [rsp + 96], rcx
+    test rcx, rcx
+    jz .server_chosen
+    lea rax, [linnea_config_instance]
+    mov r13, [rax + linnea_config.server_count]
+    xor r15d, r15d             ; candidate index
+.vhost_loop:
+    cmp r15, r13
+    jae .server_chosen
+    imul rdx, r15, linnea_config_server_size
+    lea rax, [linnea_config_instance]
+    lea rdx, [rax + rdx + linnea_config.servers]
+    mov eax, [rdx + linnea_config_server.listen_fd]
+    cmp eax, [r12 + linnea_config_server.listen_fd]
+    jne .vhost_next
+    mov [rsp + 56], rdx        ; candidate server*
+    mov rcx, [rdx + linnea_config_server.hostname_len]
+    lea rdx, [rdx + linnea_config_server.hostname]
+    mov rdi, [rsp + 88]
+    mov rsi, [rsp + 96]
+    call linnea_string_iequal
+    test eax, eax
+    jz .vhost_next
+    mov r12, [rsp + 56]        ; matched vhost
+    jmp .server_chosen
+.vhost_next:
+    inc r15
+    jmp .vhost_loop
+.server_chosen:
+    ; path = root + target (+ index.html after a trailing '/')
     lea rdi, [path_buf]
     lea rsi, [r12 + linnea_config_server.root]
     mov rcx, [r12 + linnea_config_server.root_len]
@@ -595,7 +661,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 96
+    add rsp, 112
     pop r15
     pop r14
     pop r13

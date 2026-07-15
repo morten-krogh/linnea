@@ -6,6 +6,7 @@ default rel
 
 global linnea_print_stdout
 global linnea_print_stderr
+global linnea_print_fd
 global linnea_print_u64_stdout
 global linnea_print_u64_stderr
 

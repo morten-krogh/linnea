@@ -1,6 +1,8 @@
 {
+  "log": "test/linnea.log",
   "servers": [
     { "host": "127.0.0.1", "port": 47080, "hostname": "one.test", "root": "test/www" },
-    { "host": "127.0.0.1", "port": 47090, "hostname": "two.test", "root": "test/www" }
+    { "host": "127.0.0.1", "port": 47090, "hostname": "two.test", "root": "test/www" },
+    { "host": "127.0.0.1", "port": 47080, "hostname": "three.test", "root": "test/www/sub" }
   ]
 }

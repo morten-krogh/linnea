@@ -9,8 +9,9 @@ default rel
 global linnea_network_listen_all
 
 extern linnea_error_server
-extern linnea_print_stdout
-extern linnea_print_u64_stdout
+extern linnea_string_equal
+extern linnea_log_write
+extern linnea_log_u64
 
 section .rodata
 
@@ -42,20 +43,55 @@ sockaddr_scratch:   resb LINNEA_SOCKADDR_IN_SIZE
 section .text
 
 ; linnea_network_listen_all(rdi=config*) — create every listener or exit.
+; Servers with the same host:port share one listening socket: only the
+; first binds (listener_owner=1); later ones copy its fd (vhosts).
 linnea_network_listen_all:
     push rbx
     push r12
+    push r13
+    push r14
+    push r15
     mov rbx, rdi
-    xor r12d, r12d             ; server index
+    xor r12d, r12d             ; server index i
 .loop:
     cmp r12, [rbx + linnea_config.server_count]
     jae .done
-    imul rdi, r12, linnea_config_server_size
-    lea rdi, [rbx + rdi + linnea_config.servers]
+    imul r14, r12, linnea_config_server_size
+    lea r14, [rbx + r14 + linnea_config.servers]   ; server i
+    xor r13d, r13d             ; earlier server index j
+.scan_prior:
+    cmp r13, r12
+    jae .no_share
+    imul r15, r13, linnea_config_server_size
+    lea r15, [rbx + r15 + linnea_config.servers]   ; server j
+    mov ax, [r14 + linnea_config_server.port]
+    cmp ax, [r15 + linnea_config_server.port]
+    jne .next_prior
+    lea rdi, [r14 + linnea_config_server.host]
+    mov rsi, [r14 + linnea_config_server.host_len]
+    lea rdx, [r15 + linnea_config_server.host]
+    mov rcx, [r15 + linnea_config_server.host_len]
+    call linnea_string_equal
+    test eax, eax
+    jz .next_prior
+    mov eax, [r15 + linnea_config_server.listen_fd]
+    mov [r14 + linnea_config_server.listen_fd], eax
+    mov dword [r14 + linnea_config_server.listener_owner], 0
+    jmp .next_server
+.next_prior:
+    inc r13
+    jmp .scan_prior
+.no_share:
+    mov rdi, r14
     call linnea_network_listener_create
+    mov dword [r14 + linnea_config_server.listener_owner], 1
+.next_server:
     inc r12
     jmp .loop
 .done:
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
@@ -110,24 +146,24 @@ linnea_network_listener_create:
     mov [rbx + linnea_config_server.listen_fd], r12d
     lea rdi, [log_listen]
     mov esi, log_listen_len
-    call linnea_print_stdout
+    call linnea_log_write
     lea rdi, [rbx + linnea_config_server.host]
     mov rsi, [rbx + linnea_config_server.host_len]
-    call linnea_print_stdout
+    call linnea_log_write
     lea rdi, [log_colon]
     mov esi, 1
-    call linnea_print_stdout
+    call linnea_log_write
     movzx edi, word [rbx + linnea_config_server.port]
-    call linnea_print_u64_stdout
+    call linnea_log_u64
     lea rdi, [log_open]
     mov esi, log_open_len
-    call linnea_print_stdout
+    call linnea_log_write
     lea rdi, [rbx + linnea_config_server.hostname]
     mov rsi, [rbx + linnea_config_server.hostname_len]
-    call linnea_print_stdout
+    call linnea_log_write
     lea rdi, [log_close]
     mov esi, log_close_len
-    call linnea_print_stdout
+    call linnea_log_write
     pop r12
     pop rbx
     ret

@@ -1,6 +1,7 @@
 {
+  "log": "linnea.log",
   "servers": [
-    { "host": "0.0.0.0", "port": 8080, "hostname": "example.com", "root": "/srv/linnea/example.com" },
-    { "host": "127.0.0.1", "port": 9000, "hostname": "internal.example.com", "root": "/srv/linnea/internal" }
+    { "host": "0.0.0.0", "port": 8080, "hostname": "localhost", "root": "test/www" },
+    { "host": "0.0.0.0", "port": 8080, "hostname": "linnea.test", "root": "test/www/sub" }
   ]
 }
