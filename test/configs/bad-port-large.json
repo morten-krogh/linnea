@@ -1,0 +1,5 @@
+{
+  "servers": [
+    { "host": "0.0.0.0", "port": 70000, "hostname": "example.com" }
+  ]
+}
