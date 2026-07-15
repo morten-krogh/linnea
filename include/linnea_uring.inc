@@ -24,6 +24,7 @@ LINNEA_CQE_FLAGS        equ 12   ; u32
 
 LINNEA_IORING_OP_ACCEPT      equ 13
 LINNEA_IORING_OP_LINK_TIMEOUT equ 15
+LINNEA_IORING_OP_CONNECT     equ 16
 LINNEA_IORING_OP_SEND        equ 26
 LINNEA_IORING_OP_RECV        equ 27
 LINNEA_IORING_ACCEPT_MULTISHOT equ 1   ; set in sqe.ioprio
@@ -31,11 +32,14 @@ LINNEA_IORING_CQE_F_MORE     equ 2     ; multishot op is still armed
 LINNEA_IOSQE_IO_LINK         equ 4     ; sqe.flags: link to the next sqe
 
 ; user_data encoding: (index << 8) | op tag. For accepts the index is the
-; server index; for recv/send/timeout it is the connection pool index.
+; server index; for every other tag it is the connection pool index.
 LINNEA_UD_ACCEPT        equ 0
 LINNEA_UD_RECV          equ 1
 LINNEA_UD_SEND          equ 2
 LINNEA_UD_TIMEOUT       equ 3          ; linked-timeout cqe, always ignored
+LINNEA_UD_CONNECT       equ 4          ; connect to a proxy upstream
+LINNEA_UD_UP_SEND       equ 5          ; request bytes to the upstream
+LINNEA_UD_UP_RECV       equ 6          ; response bytes from the upstream
 
 ; Idle timeout: a linked timeout is attached to every recv. If the peer
 ; sends nothing for that long, the recv completes with -ECANCELED and the

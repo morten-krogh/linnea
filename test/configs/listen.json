@@ -6,7 +6,9 @@
     {
       "host": "127.0.0.1", "port": 47080, "hostname": "one.test",
       "locations": [
-        { "prefix": "/", "root": "test/www" }
+        { "prefix": "/", "root": "test/www" },
+        { "prefix": "/api", "proxy": "127.0.0.1:47100" },
+        { "prefix": "/down", "proxy": "127.0.0.1:47199" }
       ]
     },
     {

@@ -5,6 +5,18 @@
 ; from out_buf, then the mmap'd file if any). Keep-alive connections
 ; consume the request bytes and continue; others are closed.
 ;
+; A request routed to a proxy location instead runs an upstream exchange:
+; connect -> send the rewritten request -> read the response head -> relay
+; the body to the client, a bufferful at a time. Every step is driven from
+; the completion of the step before, so a connection still has exactly one
+; operation in flight at any moment (recv, send, connect, or an upstream
+; send/recv — never two). That invariant is what makes closing a
+; connection safe without cancelling anything: the only completion that
+; can outlive it is a linked timeout, and those are dropped at dispatch
+; before the pool index is ever resolved. Nothing is armed on the client
+; socket while the upstream exchange runs, so a client that disappears
+; mid-exchange surfaces on the next send to it.
+;
 ; CQE user_data encodes (index << 8) | op tag — see linnea_uring.inc.
 ; Listener/ring errors are fatal; per-connection errors just close and
 ; free that connection; accept errors are logged and the accept re-armed.
@@ -14,6 +26,7 @@ default rel
 %include "linnea_syscall.inc"
 %include "linnea_config.inc"
 %include "linnea_connection.inc"
+%include "linnea_http.inc"
 %include "linnea_uring.inc"
 
 global linnea_uring_run
@@ -29,6 +42,9 @@ extern linnea_connection_alloc
 extern linnea_connection_free
 extern linnea_connection_at
 extern linnea_http_handle
+extern linnea_http_proxy_error
+extern linnea_http_proxy_head
+extern linnea_http_proxy_log
 extern linnea_error_exit
 extern linnea_print_stderr
 extern linnea_print_u64_stderr
@@ -79,6 +95,12 @@ reason_send_err:    db "send error"
 reason_send_err_len equ $ - reason_send_err
 reason_done:        db "close after response"
 reason_done_len     equ $ - reason_done
+reason_up_early:    db "upstream closed early"
+reason_up_early_len equ $ - reason_up_early
+reason_up_timeout:  db "upstream timeout"
+reason_up_timeout_len equ $ - reason_up_timeout
+reason_up_recv_err: db "upstream recv error"
+reason_up_recv_err_len equ $ - reason_up_recv_err
 
 section .data
 
@@ -158,6 +180,12 @@ linnea_uring_run:
     je .on_recv
     cmp eax, LINNEA_UD_SEND
     je .on_send
+    cmp eax, LINNEA_UD_CONNECT
+    je .on_connect
+    cmp eax, LINNEA_UD_UP_SEND
+    je .on_up_send
+    cmp eax, LINNEA_UD_UP_RECV
+    je .on_up_recv
 
 ; --- accept completion: r13 = server index, r15d = connection fd ------
 .on_accept:
@@ -236,8 +264,15 @@ linnea_uring_run:
     call linnea_http_handle
     test eax, eax
     jz .recv_more
+    cmp eax, LINNEA_HTTP_PROXY
+    je .proxy_connect
     mov rdi, r12               ; response ready
     call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.proxy_connect:
+    mov rdi, r12               ; the request goes to an upstream first
+    call linnea_uring_arm_connect
     call linnea_uring_submit_now
     jmp .wait
 .recv_more:
@@ -265,7 +300,7 @@ linnea_uring_run:
     ; current segment done; is the file body still queued?
     mov rax, [r12 + linnea_connection.file_rem]
     test rax, rax
-    jz .response_done
+    jz .send_drained
     mov [r12 + linnea_connection.out_rem], rax
     mov rax, [r12 + linnea_connection.file_ptr]
     mov [r12 + linnea_connection.out_ptr], rax
@@ -275,6 +310,10 @@ linnea_uring_run:
     call linnea_uring_arm_send
     call linnea_uring_submit_now
     jmp .wait
+.send_drained:
+    ; a relayed response continues with the next chunk from the upstream
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_RELAY
+    je .relay_next
 
 .response_done:
     mov rdi, [r12 + linnea_connection.file_base]
@@ -307,6 +346,196 @@ linnea_uring_run:
     call linnea_uring_arm_recv
     call linnea_uring_submit_now
     jmp .wait
+
+; --- connect completion: r13 = connection index, r15d = 0 or -errno -----
+; Nothing has been sent to the client yet, so a failure here can still be
+; answered with a status of our own.
+.on_connect:
+    mov rdi, r13
+    call linnea_connection_at
+    mov r12, rax
+    test r15d, r15d
+    jz .connect_ok
+    cmp r15d, -LINNEA_ECANCELED
+    je .connect_timeout
+    mov esi, 502               ; refused, unreachable, no route
+    jmp .proxy_fail
+.connect_timeout:
+    mov esi, 504
+    jmp .proxy_fail
+.connect_ok:
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
+    mov rdi, r12
+    call linnea_uring_arm_up_send
+    call linnea_uring_submit_now
+    jmp .wait
+
+; give up on the upstream and answer the client instead; esi = 502 or 504
+.proxy_fail:
+    mov rdi, r12
+    call linnea_http_proxy_error
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+
+; --- upstream send completion: r15d = bytes or -errno ------------------
+.on_up_send:
+    mov rdi, r13
+    call linnea_connection_at
+    mov r12, rax
+    test r15d, r15d
+    js .up_send_err
+    mov eax, r15d
+    add [r12 + linnea_connection.out_ptr], rax
+    sub [r12 + linnea_connection.out_rem], rax
+    cmp qword [r12 + linnea_connection.out_rem], 0
+    jne .up_send_more
+    ; head sent; is the request body still queued behind it?
+    mov rax, [r12 + linnea_connection.file_rem]
+    test rax, rax
+    jz .up_send_done
+    mov [r12 + linnea_connection.out_rem], rax
+    mov rax, [r12 + linnea_connection.file_ptr]
+    mov [r12 + linnea_connection.out_ptr], rax
+    mov qword [r12 + linnea_connection.file_rem], 0
+.up_send_more:
+    mov rdi, r12
+    call linnea_uring_arm_up_send
+    call linnea_uring_submit_now
+    jmp .wait
+.up_send_err:
+    mov esi, 502
+    jmp .proxy_fail
+.up_send_done:
+    ; the whole request is out; read the response head back into up_buf
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_HEAD
+    mov qword [r12 + linnea_connection.up_len], 0
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.up_buf]
+    mov edx, LINNEA_CONN_UP_BUF
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+
+; --- upstream recv completion: r15d = bytes or -errno ------------------
+.on_up_recv:
+    mov rdi, r13
+    call linnea_connection_at
+    mov r12, rax
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_RELAY
+    je .relay_recv
+    ; reading the response head
+    test r15d, r15d
+    jg .head_data
+    jz .head_eof
+    cmp r15d, -LINNEA_ECANCELED
+    je .head_timeout
+    mov esi, 502
+    jmp .proxy_fail
+.head_eof:
+    mov esi, 502               ; upstream closed without a response
+    jmp .proxy_fail
+.head_timeout:
+    mov esi, 504
+    jmp .proxy_fail
+.head_data:
+    mov eax, r15d
+    add [r12 + linnea_connection.up_len], rax
+    mov rdi, r12
+    call linnea_http_proxy_head
+    cmp eax, LINNEA_HTTP_HEAD_READY
+    je .head_ready
+    test eax, eax
+    js .head_bad
+    ; incomplete: read more, unless the head has filled the buffer
+    mov rax, [r12 + linnea_connection.up_len]
+    cmp rax, LINNEA_CONN_UP_BUF
+    jae .head_bad
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.up_buf]
+    add rsi, rax
+    mov edx, LINNEA_CONN_UP_BUF
+    sub edx, eax
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.head_bad:
+    mov esi, 502
+    jmp .proxy_fail
+.head_ready:
+    mov rdi, r12               ; the rewritten head goes out to the client
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+
+; relaying the body: whatever arrives is forwarded as the next send
+.relay_recv:
+    test r15d, r15d
+    jg .relay_data
+    jz .relay_eof
+    cmp r15d, -LINNEA_ECANCELED
+    je .relay_timeout
+    lea r14, [reason_up_recv_err]
+    mov r15d, reason_up_recv_err_len
+    jmp .conn_close
+.relay_timeout:
+    lea r14, [reason_up_timeout]
+    mov r15d, reason_up_timeout_len
+    jmp .conn_close
+.relay_eof:
+    cmp qword [r12 + linnea_connection.body_rem], 0
+    je .proxy_finish           ; a counted body ended exactly here
+    cmp qword [r12 + linnea_connection.body_rem], -1
+    je .proxy_finish           ; close-delimited: the close is the end
+    lea r14, [reason_up_early]  ; short of the promised Content-Length
+    mov r15d, reason_up_early_len
+    jmp .conn_close
+.relay_data:
+    mov eax, r15d              ; bytes read
+    mov rcx, [r12 + linnea_connection.body_rem]
+    cmp rcx, -1
+    je .relay_send             ; until EOF: forward everything
+    cmp rax, rcx
+    jbe .relay_count
+    mov rax, rcx               ; upstream overshot its Content-Length
+.relay_count:
+    sub [r12 + linnea_connection.body_rem], rax
+.relay_send:
+    lea rcx, [r12 + linnea_connection.up_buf]
+    mov [r12 + linnea_connection.out_ptr], rcx
+    mov [r12 + linnea_connection.out_rem], rax
+    add [r12 + linnea_connection.relayed], rax
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+
+; the client is up to date; either the body is complete or more is coming
+.relay_next:
+    cmp qword [r12 + linnea_connection.body_rem], 0
+    je .proxy_finish
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.up_buf]
+    mov edx, LINNEA_CONN_UP_BUF
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+
+; the exchange is over: close the upstream, log it, then finish the
+; response the same way a static one finishes (keep-alive or close)
+.proxy_finish:
+    mov edi, [r12 + linnea_connection.up_fd]
+    cmp edi, -1
+    je .proxy_logged
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    mov dword [r12 + linnea_connection.up_fd], -1
+.proxy_logged:
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    mov rdi, r12
+    call linnea_http_proxy_log
+    jmp .response_done
 
 ; connection teardown; r12 = connection*, r14/r15 = reason string ptr/len
 .conn_close:
@@ -347,6 +576,13 @@ linnea_uring_run:
     syscall
     mov qword [r12 + linnea_connection.file_base], 0
 .close_no_file:
+    mov edi, [r12 + linnea_connection.up_fd]
+    cmp edi, -1
+    je .close_no_up
+    mov eax, LINNEA_SYS_CLOSE  ; an upstream exchange died with it
+    syscall
+    mov dword [r12 + linnea_connection.up_fd], -1
+.close_no_up:
     mov edi, [r12 + linnea_connection.fd]
     mov eax, LINNEA_SYS_CLOSE
     syscall
@@ -472,6 +708,99 @@ linnea_uring_arm_send:
     shl rcx, 8
     or rcx, LINNEA_UD_SEND
     mov [rax + LINNEA_SQE_USER_DATA], rcx
+    pop rbx
+    ret
+
+; linnea_uring_arm_connect(rdi=connection*)
+; Queue a connect to the matched proxy location's upstream, with a linked
+; idle timeout so an unresponsive upstream cannot pin the connection. The
+; sockaddr lives in the parsed config, so it outlives the operation.
+linnea_uring_arm_connect:
+    push rbx
+    mov rbx, rdi
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_CONNECT
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
+    mov ecx, [rbx + linnea_connection.up_fd]
+    mov [rax + LINNEA_SQE_FD], ecx
+    mov rcx, [rbx + linnea_connection.location]
+    lea rcx, [rcx + linnea_config_location.proxy_addr]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov qword [rax + LINNEA_SQE_OFF], LINNEA_SOCKADDR_IN_SIZE
+    mov rcx, [rbx + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_CONNECT
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    ; the linked timeout sqe must immediately follow the connect sqe
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_LINK_TIMEOUT
+    mov dword [rax + LINNEA_SQE_FD], -1
+    lea rcx, [idle_timeout]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1
+    mov rcx, [rbx + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_TIMEOUT
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    pop rbx
+    ret
+
+; linnea_uring_arm_up_send(rdi=connection*)
+; Queue a send of the unsent request bytes to the upstream. Like client
+; sends, this carries no timeout: a backend that accepts but never reads
+; holds the connection until the client goes away.
+linnea_uring_arm_up_send:
+    push rbx
+    mov rbx, rdi
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_SEND
+    mov ecx, [rbx + linnea_connection.up_fd]
+    mov [rax + LINNEA_SQE_FD], ecx
+    mov rcx, [rbx + linnea_connection.out_ptr]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov ecx, [rbx + linnea_connection.out_rem]
+    mov [rax + LINNEA_SQE_LEN], ecx
+    mov rcx, [rbx + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_UP_SEND
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    pop rbx
+    ret
+
+; linnea_uring_arm_up_recv(rdi=connection*, rsi=buffer, rdx=len)
+; Queue a recv from the upstream with a linked idle timeout, so a silent
+; backend fails the request instead of hanging it.
+linnea_uring_arm_up_recv:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECV
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
+    mov ecx, [rbx + linnea_connection.up_fd]
+    mov [rax + LINNEA_SQE_FD], ecx
+    mov [rax + LINNEA_SQE_ADDR], r12
+    mov [rax + LINNEA_SQE_LEN], r13d
+    mov rcx, [rbx + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_UP_RECV
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    ; the linked timeout sqe must immediately follow the recv sqe
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_LINK_TIMEOUT
+    mov dword [rax + LINNEA_SQE_FD], -1
+    lea rcx, [idle_timeout]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1
+    mov rcx, [rbx + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_TIMEOUT
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    pop r13
+    pop r12
     pop rbx
     ret
 

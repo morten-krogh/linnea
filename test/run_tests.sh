@@ -83,6 +83,8 @@ run_test "empty locations"  1 stderr "at least one location" \
 
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
+python3 test/proxy_backend.py >/dev/null 2>&1 &
+backend_pid=$!
 $BIN test/configs/listen.json >/dev/null 2>&1 &
 server_pid=$!
 sleep 0.3
@@ -224,6 +226,112 @@ fi
 grep -qE 'accepted connection on 127\.0\.0\.1:47080 from 127\.0\.0\.1:[0-9]+ \(fd ' "$LOG"
 check "accept log line" $?
 
+# --- proxying: /api -> the test backend, /down -> nothing listening ---
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/simple)
+check_http "proxy body"          "backend body" "$resp"
+check_http "proxy status"        "200 OK" "$resp"
+check_http "proxy content-length" "Content-Length: 12" "$resp"
+check_http "proxy keeps alive"   "Connection: keep-alive" "$resp"
+
+# the prefix is not stripped and the query survives: the backend echoes the target
+resp=$(curl -s --max-time 3 'http://127.0.0.1:47080/api/target?x=1&y=2')
+check_http "proxy target forwarded" "/api/target?x=1&y=2" "$resp"
+
+# the client's Connection header is replaced, everything else passes through
+resp=$(curl -s --max-time 3 -H 'X-Test: abc' -H 'Connection: keep-alive' \
+    http://127.0.0.1:47080/api/headers)
+check_http "proxy forwards headers" "X-Test: abc" "$resp"
+check_http "proxy forwards host"    "Host: 127.0.0.1:47080" "$resp"
+check_http "proxy closes upstream"  "Connection: close" "$resp"
+
+resp=$(curl -s --max-time 3 -d 'hello body' http://127.0.0.1:47080/api/echo)
+check_http "proxy forwards body" "hello body" "$resp"
+
+# a HEAD response is head-only even though the backend sends Content-Length:
+# waiting for that body would hang until the idle timeout
+resp=$(curl -si --max-time 3 -I http://127.0.0.1:47080/api/simple)
+check_http "proxy HEAD length"   "Content-Length: 12" "$resp"
+check_http "proxy HEAD no hang"  "200 OK" "$resp"
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/204)
+check_http "proxy 204 no body"   "204 No Content" "$resp"
+
+# chunked and close-delimited bodies have no length we can pass on, so the
+# client connection has to close to delimit them
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/chunked)
+check_http "proxy chunked body"  "chunked body" "$resp"
+check_http "proxy chunked framing" "Transfer-Encoding: chunked" "$resp"
+check_http "proxy chunked closes" "Connection: close" "$resp"
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/eof)
+check_http "proxy eof body"      "eof delimited body" "$resp"
+check_http "proxy eof closes"    "Connection: close" "$resp"
+
+# a body bigger than the relay buffer takes several upstream reads
+n=$(curl -s --max-time 5 http://127.0.0.1:47080/api/big | wc -c)
+[ "$n" -eq 40000 ]
+check "proxy large body ($n bytes)" $?
+
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/http10)
+check_http "proxy 1.0 upstream"  "HTTP/1.1 200 OK" "$resp"
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/301)
+check_http "proxy passes status" "301 Moved Permanently" "$resp"
+check_http "proxy passes header" "Location: /elsewhere" "$resp"
+
+# proxied and static requests share one keep-alive connection
+before=$(grep -c "accepted connection" "$LOG")
+resp=$(curl -s --max-time 4 http://127.0.0.1:47080/api/simple http://127.0.0.1:47080/hello.txt)
+after=$(grep -c "accepted connection" "$LOG")
+check_http "proxy then static body" "hello from linnea" "$resp"
+[ $((after - before)) -eq 1 ]
+check "proxy keep-alive single accept" $?
+
+# --- proxy failures ---
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/down/x)
+check_http "proxy refused 502"   "502 Bad Gateway" "$resp"
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/garbage)
+check_http "proxy garbage 502"   "502 Bad Gateway" "$resp"
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/bighead)
+check_http "proxy huge head 502" "502 Bad Gateway" "$resp"
+# contradictory upstream framing must never reach the client: forwarding
+# both would let a compromised backend split the next keep-alive response
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/tecl)
+check_http "proxy TE+CL 502"     "502 Bad Gateway" "$resp"
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/cljunk)
+check_http "proxy bad CL 502"    "502 Bad Gateway" "$resp"
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/clpad)
+check_http "proxy CL whitespace" "valid" "$resp"
+# Expect must not be forwarded: the body is already buffered, and an
+# interim 100 Continue would be parsed as the response itself
+resp=$(raw_http 'POST /api/expect HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\nHELLO')
+check_http "proxy drops Expect"  "real" "$resp"
+printf '%s' "$resp" | grep -qF "100 Continue"
+[ $? -ne 0 ]
+check "proxy no interim 100 leak" $?
+# the backend sleeps 4s; the config's timeout is 2s
+start=$SECONDS
+resp=$(curl -si --max-time 8 http://127.0.0.1:47080/api/slow)
+elapsed=$((SECONDS - start))
+check_http "proxy slow 504"      "504 Gateway Timeout" "$resp"
+[ "$elapsed" -le 4 ]
+check "proxy 504 on time (${elapsed}s)" $?
+# a body cut short of its Content-Length must not look like a clean end
+curl -s --max-time 3 http://127.0.0.1:47080/api/truncated >/dev/null 2>&1
+grep -qF ': upstream closed early' "$LOG"
+check "proxy truncated body" $?
+
+# --- proxied request log lines: upstream status, relayed byte count ---
+grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /api/simple" 200 12' "$LOG"
+check "proxy log 200" $?
+grep -qF '"POST /api/echo" 200 10' "$LOG"
+check "proxy log body bytes" $?
+grep -qF '"GET /api/target?x=1&y=2" 200' "$LOG"
+check "proxy log query" $?
+grep -qF '"GET /down/x" 502 0' "$LOG"
+check "proxy log 502" $?
+grep -qF '"GET /api/slow" 504 0' "$LOG"
+check "proxy log 504" $?
+grep -qF '"HEAD /api/simple" 200 0' "$LOG"
+check "proxy log HEAD" $?
+
 # --- connection termination log lines ---
 grep -qF ': close after response' "$LOG"
 check "termination close-after-response" $?
@@ -232,8 +340,9 @@ check "termination peer closed" $?
 grep -qF ': idle timeout' "$LOG"
 check "termination idle timeout" $?
 
-kill $server_pid 2>/dev/null
+kill $server_pid $backend_pid 2>/dev/null
 wait $server_pid 2>/dev/null
+wait $backend_pid 2>/dev/null
 rm -f "$LOG"
 
 echo

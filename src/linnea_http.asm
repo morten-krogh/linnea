@@ -27,18 +27,30 @@
 ;   The access log records the raw, undecoded target.
 ; - Files are served from a read-only mmap queued behind the header send
 ;   (conn.file_*); the event loop munmaps after the send completes.
+; - Proxy locations: a fresh upstream connection per request. The request
+;   is rewritten into conn.up_buf (raw target, client headers except
+;   Connection, then "Connection: close") and the buffered body is queued
+;   behind it; the event loop connects, sends, then reads the response
+;   head back into up_buf. The head is rewritten into conn.out_buf: the
+;   status line and headers pass through except Connection, which we set
+;   from the client's own keep-alive wish. Client keep-alive survives only
+;   when the body length is known (Content-Length, or no body at all for
+;   HEAD/204/304); a chunked or close-delimited response is relayed until
+;   the upstream closes and forces Connection: close. Upstream failures
+;   map to 502, upstream timeouts to 504. Proxied requests are logged on
+;   completion, with the upstream status and the relayed byte count.
 
 default rel
 
 %include "linnea_syscall.inc"
 %include "linnea_config.inc"
 %include "linnea_connection.inc"
+%include "linnea_http.inc"
 
 global linnea_http_handle
-
-; linnea_http_handle return values
-LINNEA_HTTP_NEED_MORE   equ 0
-LINNEA_HTTP_RESPOND     equ 1
+global linnea_http_proxy_error
+global linnea_http_proxy_head
+global linnea_http_proxy_log
 
 LINNEA_HTTP_MAX_METHOD  equ 32
 LINNEA_HTTP_MAX_TARGET  equ 2048
@@ -83,6 +95,14 @@ resp_501:       db "HTTP/1.1 501 Not Implemented", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_501_len    equ $ - resp_501
+resp_502:       db "HTTP/1.1 502 Bad Gateway", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_502_len    equ $ - resp_502
+resp_504:       db "HTTP/1.1 504 Gateway Timeout", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_504_len    equ $ - resp_504
 resp_505:       db "HTTP/1.1 505 HTTP Version Not Supported", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
@@ -97,7 +117,20 @@ hdr_keepalive_len equ $ - hdr_keepalive
 hdr_close:      db 13, 10, "Connection: close", 13, 10, 13, 10
 hdr_close_len   equ $ - hdr_close
 
+; Rewritten heads end their last copied header line with CRLF, so these
+; carry no leading CRLF of their own.
+hdr_up_close:   db "Connection: close", 13, 10, 13, 10
+hdr_up_close_len equ $ - hdr_up_close
+hdr_up_keepalive: db "Connection: keep-alive", 13, 10, 13, 10
+hdr_up_keepalive_len equ $ - hdr_up_keepalive
+req_version:    db " HTTP/1.1", 13, 10
+req_version_len equ $ - req_version
+version_11_sp:  db "HTTP/1.1 "
+version_11_sp_len equ $ - version_11_sp
+
 version_11:     db "HTTP/1.1"          ; 8 bytes, compared as one qword
+version_10:     db "HTTP/1.0"          ; accepted from an upstream, rewritten
+crlf:           db 13, 10
 method_get:     db "GET"
 method_head:    db "HEAD"
 index_html:     db "index.html"
@@ -117,6 +150,7 @@ hn_connection:  db "connection"
 hn_content_len: db "content-length"
 hn_transfer_enc: db "transfer-encoding"
 hn_host:        db "host"
+hn_expect:      db "expect"
 hv_close:       db "close"
 
 ; MIME types by file extension; default is application/octet-stream.
@@ -733,7 +767,7 @@ linnea_http_handle:
     test rax, rax
     jz .resp_404               ; no location claims this path
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
-    je .resp_501               ; proxying arrives with the next milestone
+    je .proxy_start
 
     ; --- static location ---------------------------------------------
     cmp qword [rsp], -1
@@ -887,6 +921,135 @@ linnea_http_handle:
     mov qword [rsp + 112], 200
     jmp .log_request
 
+; --- proxy location: rewrite the request and open the upstream socket ---
+; The event loop takes it from here (connect, send, read the head back).
+.proxy_start:
+    mov [rbx + linnea_connection.location], rax
+    mov rcx, [rsp + 120]
+    mov [rbx + linnea_connection.vhost], rcx   ; the log fires on completion
+    mov rcx, [rsp + 24]
+    mov [rbx + linnea_connection.keep_alive], rcx
+    xor ecx, ecx
+    cmp qword [rsp], 1
+    sete cl
+    mov [rbx + linnea_connection.is_head], rcx ; a HEAD response has no body
+    mov qword [rbx + linnea_connection.up_status], 0
+    mov qword [rbx + linnea_connection.relayed], 0
+    mov qword [rbx + linnea_connection.up_len], 0
+    mov qword [rbx + linnea_connection.body_rem], 0
+    ; request line: the method and raw target as the client sent them
+    lea r15, [rbx + linnea_connection.up_buf]  ; append cursor
+    mov rdi, r14
+    mov rsi, [rsp + 104]
+    call .append
+    lea rdi, [log_sp]
+    mov esi, 1
+    call .append
+    mov rdi, [rsp + 8]
+    mov rsi, [rsp + 144]
+    call .append
+    lea rdi, [req_version]
+    mov esi, req_version_len
+    call .append
+    ; header lines, verbatim except Connection (we send our own)
+    mov r13, [rbx + linnea_connection.head_len]
+    sub r13, [rsp + 128]       ; head_len covers the body too
+    sub r13, 2                 ; lines end before the terminating CRLF
+    xor ecx, ecx
+.proxy_rl_scan:
+    cmp byte [r14 + rcx], 13   ; the head is known to hold CRLF CRLF
+    je .proxy_rl_found
+    inc rcx
+    jmp .proxy_rl_scan
+.proxy_rl_found:
+    add rcx, 2
+    mov [rsp + 56], rcx        ; line cursor
+.proxy_hdr_loop:
+    mov rcx, [rsp + 56]
+    cmp rcx, r13
+    jae .proxy_hdr_done
+    mov rdx, rcx
+.proxy_eol_scan:
+    cmp byte [r14 + rdx], 13
+    je .proxy_eol_found
+    inc rdx
+    jmp .proxy_eol_scan
+.proxy_eol_found:
+    mov [rsp + 64], rdx        ; CR offset
+    mov r8, rcx
+.proxy_colon_scan:
+    cmp r8, rdx
+    jae .proxy_copy_line
+    cmp byte [r14 + r8], ':'
+    je .proxy_colon_found
+    inc r8
+    jmp .proxy_colon_scan
+.proxy_colon_found:
+    mov r9, r8                 ; colon offset; iequal clobbers r8
+    mov rax, r8
+    sub rax, rcx               ; header name length
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_connection]
+    mov ecx, 10
+    call linnea_string_iequal
+    test eax, eax
+    jnz .proxy_next_line       ; ours replaces it
+    ; The whole body is already buffered, so there is nothing left for the
+    ; upstream to authorize: forwarding Expect would only invite a 100
+    ; Continue, which this exchange has no way to handle.
+    mov rcx, [rsp + 56]
+    mov rax, r9
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_expect]
+    mov ecx, 6
+    call linnea_string_iequal
+    test eax, eax
+    jnz .proxy_next_line
+.proxy_copy_line:
+    mov rcx, [rsp + 56]
+    mov rdx, [rsp + 64]
+    lea rdi, [r14 + rcx]
+    mov rsi, rdx
+    sub rsi, rcx
+    add rsi, 2                 ; include the CRLF
+    call .append
+.proxy_next_line:
+    mov rdx, [rsp + 64]
+    add rdx, 2
+    mov [rsp + 56], rdx
+    jmp .proxy_hdr_loop
+.proxy_hdr_done:
+    lea rdi, [hdr_up_close]    ; one request per upstream connection
+    mov esi, hdr_up_close_len
+    call .append
+    ; send window: the rewritten head, then the buffered body behind it
+    lea rax, [rbx + linnea_connection.up_buf]
+    mov [rbx + linnea_connection.out_ptr], rax
+    mov rcx, r15
+    sub rcx, rax
+    mov [rbx + linnea_connection.out_rem], rcx
+    mov rcx, [rsp + 128]       ; Content-Length (0 = no body queued)
+    mov [rbx + linnea_connection.file_rem], rcx
+    mov rax, [rbx + linnea_connection.head_len]
+    sub rax, rcx               ; the body sits right after the head
+    lea rdx, [rbx + linnea_connection.in_buf]
+    add rax, rdx
+    mov [rbx + linnea_connection.file_ptr], rax
+    mov eax, LINNEA_SYS_SOCKET
+    mov edi, LINNEA_AF_INET
+    mov esi, LINNEA_SOCK_STREAM
+    xor edx, edx
+    syscall
+    cmp rax, -4095
+    jae .resp_502
+    mov [rbx + linnea_connection.up_fd], eax
+    mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_CONNECTING
+    mov eax, LINNEA_HTTP_PROXY
+    jmp .ret
+
 .close_404:
     mov rdi, [rsp + 56]
     mov eax, LINNEA_SYS_CLOSE
@@ -921,6 +1084,11 @@ linnea_http_handle:
     mov ecx, resp_501_len
     mov qword [rsp + 112], 501
     jmp .resp_static
+.resp_502:
+    lea rax, [resp_502]
+    mov ecx, resp_502_len
+    mov qword [rsp + 112], 502
+    jmp .resp_static
 .resp_505:
     lea rax, [resp_505]
     mov ecx, resp_505_len
@@ -929,6 +1097,7 @@ linnea_http_handle:
     mov [rbx + linnea_connection.out_ptr], rax
     mov [rbx + linnea_connection.out_rem], rcx
     mov qword [rbx + linnea_connection.keep_alive], 0
+    mov qword [rbx + linnea_connection.file_rem], 0  ; drop anything queued
     mov qword [rsp + 32], 0    ; error responses carry no body
     ; fall through to .log_request
 
@@ -1022,4 +1191,448 @@ linnea_http_handle:
     ret
 .hex_bad:
     mov eax, -1
+    ret
+
+; --- proxying ----------------------------------------------------------
+
+; linnea_http_log_conn(rdi=conn*, rsi=status, rdx=bytes)
+; The access log line for a proxied request, emitted once the exchange is
+; over. The method and target are re-derived from in_buf: proxying arms no
+; client recv, so the request head is still intact, and the head is only
+; dropped afterwards by the event loop's keep-alive compaction.
+linnea_http_log_conn:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 32
+    mov rbx, rdi
+    mov [rsp], rsi             ; status
+    mov [rsp + 8], rdx         ; body bytes
+    lea r14, [rbx + linnea_connection.in_buf]
+    xor r12d, r12d
+.method_scan:
+    cmp r12, [rbx + linnea_connection.in_len]
+    jae .method_done
+    cmp byte [r14 + r12], ' '
+    je .method_done
+    inc r12
+    jmp .method_scan
+.method_done:
+    mov [rsp + 16], r12        ; method len
+    lea r13, [r12 + 1]         ; target start
+    mov r15, r13
+.target_scan:
+    cmp r15, [rbx + linnea_connection.in_len]
+    jae .target_done
+    cmp byte [r14 + r15], ' '
+    je .target_done
+    inc r15
+    jmp .target_scan
+.target_done:
+    sub r15, r13
+    mov [rsp + 24], r15        ; target len
+    add r13, r14               ; target ptr
+    call linnea_log_stamp
+    lea rdi, [log_req]
+    mov esi, log_req_len
+    call linnea_log_write
+    mov rax, [rbx + linnea_connection.vhost]
+    lea rdi, [rax + linnea_config_server.hostname]
+    mov rsi, [rax + linnea_config_server.hostname_len]
+    call linnea_log_write
+    lea rdi, [log_from]
+    mov esi, log_from_len
+    call linnea_log_write
+    lea rdi, [rbx + linnea_connection.peer]
+    mov rsi, [rbx + linnea_connection.peer_len]
+    call linnea_log_write
+    lea rdi, [log_quote]
+    mov esi, 2
+    call linnea_log_write
+    mov rdi, r14
+    mov rsi, [rsp + 16]
+    call linnea_log_write
+    lea rdi, [log_sp]
+    mov esi, 1
+    call linnea_log_write
+    mov rdi, r13
+    mov rsi, [rsp + 24]
+    call linnea_log_write
+    lea rdi, [log_endq]
+    mov esi, 2
+    call linnea_log_write
+    mov rdi, [rsp]
+    call linnea_log_u64
+    lea rdi, [log_sp]
+    mov esi, 1
+    call linnea_log_write
+    mov rdi, [rsp + 8]
+    call linnea_log_u64
+    lea rdi, [log_nl]
+    mov esi, 1
+    call linnea_log_write
+    add rsp, 32
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_http_proxy_error(rdi=conn*, rsi=502 or 504)
+; Abandons the upstream exchange and answers the client with a static
+; error instead. Only valid before any response byte has been sent, which
+; is every failure up to and including the response head.
+linnea_http_proxy_error:
+    push rbx
+    push r12
+    sub rsp, 8
+    mov rbx, rdi
+    mov r12, rsi
+    mov edi, [rbx + linnea_connection.up_fd]
+    cmp edi, -1
+    je .no_up
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    mov dword [rbx + linnea_connection.up_fd], -1
+.no_up:
+    mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    cmp r12, 504
+    je .gateway_timeout
+    lea rax, [resp_502]
+    mov ecx, resp_502_len
+    jmp .set
+.gateway_timeout:
+    lea rax, [resp_504]
+    mov ecx, resp_504_len
+.set:
+    mov [rbx + linnea_connection.out_ptr], rax
+    mov [rbx + linnea_connection.out_rem], rcx
+    mov qword [rbx + linnea_connection.keep_alive], 0
+    mov qword [rbx + linnea_connection.file_rem], 0   ; drop the queued body
+    mov rdi, rbx
+    mov rsi, r12
+    xor edx, edx
+    call linnea_http_log_conn
+    add rsp, 8
+    pop r12
+    pop rbx
+    ret
+
+; linnea_http_proxy_log(rdi=conn*) — the completion log line for a proxied
+; request: the upstream's status and the body bytes actually relayed.
+linnea_http_proxy_log:
+    mov rsi, [rdi + linnea_connection.up_status]
+    mov rdx, [rdi + linnea_connection.relayed]
+    jmp linnea_http_log_conn
+
+; linnea_http_proxy_head(rdi=conn*) -> rax
+;   LINNEA_HTTP_HEAD_MORE  (0): the head is not complete yet
+;   LINNEA_HTTP_HEAD_READY (1): out_buf holds the rewritten head, the send
+;                               window and body framing are set, state RELAY
+;   LINNEA_HTTP_HEAD_BAD  (-1): malformed head; the caller answers 502
+; The head passes through except Connection, which is replaced with the
+; client's own keep-alive wish — and that wish only survives if the body
+; length is known, since a close-delimited body is the only frame left.
+; Locals:
+;   [rsp+0] head end   [rsp+8] Content-Length   [rsp+16] flags: 1=CL, 2=TE
+;   [rsp+24] line cursor  [rsp+32] CR offset    [rsp+40] header lines end
+linnea_http_proxy_head:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 48
+    mov rbx, rdi
+    lea r14, [rbx + linnea_connection.up_buf]
+    mov r12, [rbx + linnea_connection.up_len]
+    mov qword [rsp + 8], 0
+    mov qword [rsp + 16], 0
+    ; the head ends at the first CRLF CRLF
+    xor r13d, r13d
+.scan:
+    lea rax, [r13 + 4]
+    cmp rax, r12
+    ja .need_more
+    cmp dword [r14 + r13], 0x0A0D0A0D
+    je .found
+    inc r13
+    jmp .scan
+.need_more:
+    mov eax, LINNEA_HTTP_HEAD_MORE
+    jmp .ret
+.found:
+    lea rax, [r13 + 4]
+    mov [rsp], rax             ; head end
+    add r13, 2
+    mov [rsp + 40], r13        ; header lines end before the empty line's CRLF
+
+    ; --- status line: "HTTP/1.x SSS ..." ----------------------------
+    cmp qword [rsp], 13        ; "HTTP/1.1 200" + CRLF at the very least
+    jb .bad
+    mov rax, [r14]
+    lea rcx, [version_11]
+    cmp rax, [rcx]
+    je .version_ok
+    lea rcx, [version_10]
+    cmp rax, [rcx]
+    jne .bad
+.version_ok:
+    cmp byte [r14 + 8], ' '
+    jne .bad
+    xor eax, eax
+    xor ecx, ecx
+.status_loop:
+    cmp ecx, 3
+    jae .status_done
+    movzx edx, byte [r14 + rcx + 9]
+    sub edx, '0'
+    cmp edx, 9
+    ja .bad
+    imul eax, eax, 10
+    add eax, edx
+    inc ecx
+    jmp .status_loop
+.status_done:
+    mov [rbx + linnea_connection.up_status], rax
+    ; rewrite the version, then pass the rest of the line through
+    lea r15, [rbx + linnea_connection.out_buf]
+    lea rdi, [version_11_sp]
+    mov esi, version_11_sp_len
+    call .append
+    mov rcx, 9
+.status_eol_scan:
+    cmp rcx, r13
+    jae .bad
+    cmp byte [r14 + rcx], 13
+    je .status_eol_found
+    inc rcx
+    jmp .status_eol_scan
+.status_eol_found:
+    mov [rsp + 32], rcx
+    lea rdi, [r14 + 9]
+    mov rsi, rcx
+    sub rsi, 9
+    call .append
+    lea rdi, [crlf]
+    mov esi, 2
+    call .append
+    mov rcx, [rsp + 32]
+    add rcx, 2
+    mov [rsp + 24], rcx        ; first header line
+
+    ; --- header lines ------------------------------------------------
+.header_loop:
+    mov rcx, [rsp + 24]
+    cmp rcx, [rsp + 40]
+    jae .header_done
+    mov rdx, rcx
+.eol_scan:
+    cmp rdx, [rsp + 40]
+    jae .bad                   ; the terminator guarantees a CR before here
+    cmp byte [r14 + rdx], 13
+    je .eol_found
+    inc rdx
+    jmp .eol_scan
+.eol_found:
+    mov [rsp + 32], rdx
+    mov r8, rcx
+.colon_scan:
+    cmp r8, rdx
+    jae .copy_line             ; no colon: pass it through untouched
+    cmp byte [r14 + r8], ':'
+    je .colon_found
+    inc r8
+    jmp .colon_scan
+.colon_found:
+    mov r13, r8                ; colon offset, for the value scan
+    mov rax, r8
+    sub rax, rcx               ; header name length
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_connection]
+    mov ecx, 10
+    call linnea_string_iequal
+    test eax, eax
+    jnz .next_line             ; ours replaces it
+    mov rcx, [rsp + 24]
+    mov rax, r13
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_content_len]
+    mov ecx, 14
+    call linnea_string_iequal
+    test eax, eax
+    jnz .content_len
+    mov rcx, [rsp + 24]
+    mov rax, r13
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_transfer_enc]
+    mov ecx, 17
+    call linnea_string_iequal
+    test eax, eax
+    jz .copy_line
+    or qword [rsp + 16], 2     ; chunked: the framing is the upstream's
+    jmp .copy_line
+.content_len:
+    test qword [rsp + 16], 1
+    jnz .bad                   ; duplicate Content-Length
+    or qword [rsp + 16], 1
+    ; value = [colon+1, CR), OWS-trimmed, digits only
+    lea rcx, [r13 + 1]
+    mov rdx, [rsp + 32]
+.cl_ows:
+    cmp rcx, rdx
+    jae .bad
+    movzx eax, byte [r14 + rcx]
+    cmp al, ' '
+    je .cl_ows_next
+    cmp al, 9
+    jne .cl_digits
+.cl_ows_next:
+    inc rcx
+    jmp .cl_ows
+.cl_digits:
+    xor r8d, r8d               ; value
+    xor r9d, r9d               ; digit count
+.cl_loop:
+    cmp rcx, rdx
+    jae .cl_done
+    movzx eax, byte [r14 + rcx]
+    cmp al, ' '
+    je .cl_trail
+    cmp al, 9
+    je .cl_trail
+    sub eax, '0'
+    cmp eax, 9
+    ja .bad
+    imul r8, r8, 10
+    add r8, rax
+    mov r10, 1 << 32
+    cmp r8, r10
+    ja .bad
+    inc r9d
+    inc rcx
+    jmp .cl_loop
+.cl_trail:
+    ; only trailing whitespace may follow the digits: a value like
+    ; "12 34" would frame the body as 12 while the client reads the
+    ; header we copied verbatim and disagrees
+    cmp rcx, rdx
+    jae .cl_done
+    movzx eax, byte [r14 + rcx]
+    cmp al, ' '
+    je .cl_trail_next
+    cmp al, 9
+    jne .bad
+.cl_trail_next:
+    inc rcx
+    jmp .cl_trail
+.cl_done:
+    test r9d, r9d
+    jz .bad                    ; empty value
+    mov [rsp + 8], r8
+.copy_line:
+    mov rcx, [rsp + 24]
+    mov rdx, [rsp + 32]
+    lea rdi, [r14 + rcx]
+    mov rsi, rdx
+    sub rsi, rcx
+    add rsi, 2                 ; include the CRLF
+    call .append
+.next_line:
+    mov rdx, [rsp + 32]
+    add rdx, 2
+    mov [rsp + 24], rdx
+    jmp .header_loop
+
+    ; --- body framing and our own Connection header -------------------
+.header_done:
+    ; Transfer-Encoding and Content-Length together contradict each other
+    ; (RFC 9112 6.3: TE wins, and forwarding both is a response-splitting
+    ; vector). Refuse the response rather than pick a side.
+    mov rax, [rsp + 16]
+    and rax, 3
+    cmp rax, 3
+    je .bad
+    cmp qword [rbx + linnea_connection.is_head], 0
+    jne .no_body               ; a HEAD response is head-only, whatever it claims
+    mov rax, [rbx + linnea_connection.up_status]
+    cmp rax, 204
+    je .no_body
+    cmp rax, 304
+    je .no_body
+    test qword [rsp + 16], 1
+    jz .until_eof              ; no Content-Length: chunked or close-delimited
+    mov rax, [rsp + 8]
+    mov [rbx + linnea_connection.body_rem], rax
+    jmp .conn_hdr
+.no_body:
+    mov qword [rbx + linnea_connection.body_rem], 0
+    jmp .conn_hdr
+.until_eof:
+    mov qword [rbx + linnea_connection.body_rem], -1
+    mov qword [rbx + linnea_connection.keep_alive], 0
+.conn_hdr:
+    cmp qword [rbx + linnea_connection.keep_alive], 0
+    je .close_hdr
+    lea rdi, [hdr_up_keepalive]
+    mov esi, hdr_up_keepalive_len
+    jmp .emit_conn
+.close_hdr:
+    lea rdi, [hdr_up_close]
+    mov esi, hdr_up_close_len
+.emit_conn:
+    call .append
+
+    ; body bytes that arrived with the head go out behind it
+    mov rax, [rbx + linnea_connection.up_len]
+    sub rax, [rsp]             ; leftover
+    mov rcx, [rbx + linnea_connection.body_rem]
+    cmp rcx, -1
+    je .leftover_set           ; until EOF: relay everything buffered
+    cmp rax, rcx
+    jbe .leftover_count
+    mov rax, rcx               ; upstream overshot its Content-Length
+.leftover_count:
+    sub [rbx + linnea_connection.body_rem], rax
+.leftover_set:
+    mov [rbx + linnea_connection.file_rem], rax
+    add [rbx + linnea_connection.relayed], rax
+    mov rcx, [rsp]
+    lea rdx, [r14 + rcx]
+    mov [rbx + linnea_connection.file_ptr], rdx
+    lea rax, [rbx + linnea_connection.out_buf]
+    mov [rbx + linnea_connection.out_ptr], rax
+    mov rcx, r15
+    sub rcx, rax
+    mov [rbx + linnea_connection.out_rem], rcx
+    mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_RELAY
+    mov eax, LINNEA_HTTP_HEAD_READY
+    jmp .ret
+.bad:
+    mov eax, LINNEA_HTTP_HEAD_BAD
+.ret:
+    add rsp, 48
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; .append(rdi=ptr, rsi=len) — r15 is the write cursor. out_buf carries
+; enough slack over up_buf to hold the rewritten head (see the .inc).
+.append:
+    mov rcx, rsi
+    mov rsi, rdi
+    mov rdi, r15
+    rep movsb
+    mov r15, rdi
     ret
