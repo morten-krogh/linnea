@@ -1,21 +1,24 @@
-; linnea_http.asm — HTTP/1.1 request head parsing and response building.
+; linnea_http.asm — HTTP/1.1 request parsing and static file serving.
 ;
-; Supported subset for this milestone:
+; Supported subset:
+; - Methods: GET and HEAD; anything else gets 405.
 ; - Request line: METHOD SP TARGET SP "HTTP/1.1" CRLF; single spaces;
 ;   METHOD 1-32 bytes, TARGET 1-2048 bytes, printable ASCII (0x21-0x7E).
-; - Header lines: NAME ":" OWS VALUE CRLF. NAME is non-empty printable
-;   ASCII without ':'; VALUE may contain tab and bytes >= 0x20. The Host
-;   header value is extracted (first occurrence, max 255 bytes).
-; - The head must end with CRLF CRLF within the input buffer, else 431.
-; - Request bodies are not read; every response says Connection: close
-;   and the connection is closed after the response is sent.
-; - Non-HTTP/1.1 versions get 505, anything malformed gets 400.
-;
-; The 200 response echoes what was parsed, one line per field:
-;   server: <config hostname> / method / target / host (or "-").
+;   Other HTTP/x versions get 505, malformed lines 400.
+; - Header lines: NAME ":" OWS VALUE CRLF; the head must end with
+;   CRLF CRLF within the input buffer, else 431.
+; - Keep-alive: on by default (HTTP/1.1); disabled by "Connection: close",
+;   by any request that carries a body indicator (Content-Length or
+;   Transfer-Encoding — bodies are never read), and by error responses.
+; - File mapping: target is used verbatim (no percent-decoding), the query
+;   string is stripped, any ".." rejects the request, a trailing "/" maps
+;   to index.html. path = root + target. Missing/non-regular files: 404.
+; - Files are served from a read-only mmap queued behind the header send
+;   (conn.file_*); the event loop munmaps after the send completes.
 
 default rel
 
+%include "linnea_syscall.inc"
 %include "linnea_config.inc"
 %include "linnea_connection.inc"
 
@@ -27,7 +30,8 @@ LINNEA_HTTP_RESPOND     equ 1
 
 LINNEA_HTTP_MAX_METHOD  equ 32
 LINNEA_HTTP_MAX_TARGET  equ 2048
-LINNEA_HTTP_MAX_HOST    equ 255
+; root (255) + target (2048) + "index.html" + NUL always fits
+LINNEA_HTTP_PATH_BUF    equ 2560
 
 extern linnea_config_instance
 extern linnea_string_from_u64
@@ -39,6 +43,15 @@ resp_400:       db "HTTP/1.1 400 Bad Request", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_400_len    equ $ - resp_400
+resp_404:       db "HTTP/1.1 404 Not Found", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_404_len    equ $ - resp_404
+resp_405:       db "HTTP/1.1 405 Method Not Allowed", 13, 10
+                db "Allow: GET, HEAD", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_405_len    equ $ - resp_405
 resp_431:       db "HTTP/1.1 431 Request Header Fields Too Large", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
@@ -48,51 +61,98 @@ resp_505:       db "HTTP/1.1 505 HTTP Version Not Supported", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_505_len    equ $ - resp_505
 
-status_200:     db "HTTP/1.1 200 OK", 13, 10
-                db "Content-Type: text/plain", 13, 10
-                db "Content-Length: "
+status_200:     db "HTTP/1.1 200 OK", 13, 10, "Content-Type: "
 status_200_len  equ $ - status_200
-hdr_end:        db 13, 10, "Connection: close", 13, 10, 13, 10
-hdr_end_len     equ $ - hdr_end
+hdr_length:     db 13, 10, "Content-Length: "
+hdr_length_len  equ $ - hdr_length
+hdr_keepalive:  db 13, 10, "Connection: keep-alive", 13, 10, 13, 10
+hdr_keepalive_len equ $ - hdr_keepalive
+hdr_close:      db 13, 10, "Connection: close", 13, 10, 13, 10
+hdr_close_len   equ $ - hdr_close
 
-body_server:    db "server: "
-body_server_len equ $ - body_server
-body_method:    db "method: "
-body_method_len equ $ - body_method
-body_target:    db "target: "
-body_target_len equ $ - body_target
-body_host:      db "host: "
-body_host_len   equ $ - body_host
-; fixed body bytes: the four labels plus four CRLFs
-BODY_FIXED      equ body_server_len + body_method_len + body_target_len + body_host_len + 8
+version_11:     db "HTTP/1.1"          ; 8 bytes, compared as one qword
+method_get:     db "GET"
+method_head:    db "HEAD"
+index_html:     db "index.html"
+index_html_len  equ $ - index_html
 
-crlf:           db 13, 10
-dash:           db "-"
-key_host:       db "host"
-version_11:     db "HTTP/1.1"  ; 8 bytes, compared as one qword
+hn_connection:  db "connection"
+hn_content_len: db "content-length"
+hn_transfer_enc: db "transfer-encoding"
+hv_close:       db "close"
+
+; MIME types by file extension; default is application/octet-stream.
+mime_html:      db "text/html"
+mime_html_len   equ $ - mime_html
+mime_css:       db "text/css"
+mime_css_len    equ $ - mime_css
+mime_js:        db "application/javascript"
+mime_js_len     equ $ - mime_js
+mime_json:      db "application/json"
+mime_json_len   equ $ - mime_json
+mime_txt:       db "text/plain"
+mime_txt_len    equ $ - mime_txt
+mime_png:       db "image/png"
+mime_png_len    equ $ - mime_png
+mime_jpeg:      db "image/jpeg"
+mime_jpeg_len   equ $ - mime_jpeg
+mime_gif:       db "image/gif"
+mime_gif_len    equ $ - mime_gif
+mime_svg:       db "image/svg+xml"
+mime_svg_len    equ $ - mime_svg
+mime_default:   db "application/octet-stream"
+mime_default_len equ $ - mime_default
+
+ext_html:       db "html"
+ext_css:        db "css"
+ext_js:         db "js"
+ext_json:       db "json"
+ext_txt:        db "txt"
+ext_png:        db "png"
+ext_jpg:        db "jpg"
+ext_jpeg:       db "jpeg"
+ext_gif:        db "gif"
+ext_svg:        db "svg"
+
+; entries: ext ptr, ext len, mime ptr, mime len; terminated by a 0 ptr
+mime_table:
+    dq ext_html, 4, mime_html, mime_html_len
+    dq ext_css,  3, mime_css,  mime_css_len
+    dq ext_js,   2, mime_js,   mime_js_len
+    dq ext_json, 4, mime_json, mime_json_len
+    dq ext_txt,  3, mime_txt,  mime_txt_len
+    dq ext_png,  3, mime_png,  mime_png_len
+    dq ext_jpg,  3, mime_jpeg, mime_jpeg_len
+    dq ext_jpeg, 4, mime_jpeg, mime_jpeg_len
+    dq ext_gif,  3, mime_gif,  mime_gif_len
+    dq ext_svg,  3, mime_svg,  mime_svg_len
+    dq 0
 
 section .bss
 
 num_buf:        resb 20
+path_buf:       resb LINNEA_HTTP_PATH_BUF
+statbuf:        resb LINNEA_STAT_SIZE
 
 section .text
 
 ; linnea_http_handle(rdi=connection*) -> rax
 ;   LINNEA_HTTP_NEED_MORE: incomplete head, arm another recv
-;   LINNEA_HTTP_RESPOND:   out_ptr/out_rem set, send then close
+;   LINNEA_HTTP_RESPOND:   out/file fields set; send, then consult
+;                          conn.keep_alive
 ;
 ; Stack locals:
-;   [rsp+0]  method ptr   [rsp+8]  method len
-;   [rsp+16] target ptr   [rsp+24] target len
-;   [rsp+32] host ptr (0 = absent)  [rsp+40] host len
-;   [rsp+48] scratch value ptr      [rsp+56] scratch value len
+;   [rsp+0]  is_head        [rsp+8]  target ptr   [rsp+16] target len
+;   [rsp+24] keep_alive     [rsp+32] file size    [rsp+40] mime ptr
+;   [rsp+48] mime len       [rsp+56] name ptr / open fd
+;   [rsp+64] name len       [rsp+72] value ptr    [rsp+80] value len
 linnea_http_handle:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 64
+    sub rsp, 96
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -114,13 +174,15 @@ linnea_http_handle:
     jmp .ret
 
 .found:
-    ; r13 points at the last header line's CRLF; lines end strictly
+    ; whole head = terminator offset + 4 bytes; lines end strictly
     ; before r13 + 2 (the terminating empty line's CRLF).
+    lea rax, [r13 + 4]
+    mov [rbx + linnea_connection.head_len], rax
     add r13, 2                 ; head limit
     xor r15d, r15d             ; cursor
+    mov qword [rsp + 24], 1    ; keep_alive default on
 
     ; --- method ---------------------------------------------------
-    mov [rsp], r14             ; method starts at offset 0
 .method_loop:
     cmp r15, r13
     jae .resp_400
@@ -134,16 +196,32 @@ linnea_http_handle:
     inc r15
     jmp .method_loop
 .method_done:
-    mov [rsp + 8], r15
     test r15, r15
     jz .resp_400
     cmp r15, LINNEA_HTTP_MAX_METHOD
     ja .resp_400
+    ; GET, HEAD, or 405 (checked after the head parses cleanly)
+    mov qword [rsp], -1
+    cmp r15, 3
+    jne .try_head
+    cmp word [r14], 'GE'
+    jne .method_known
+    cmp byte [r14 + 2], 'T'
+    jne .method_known
+    mov qword [rsp], 0         ; GET
+    jmp .method_known
+.try_head:
+    cmp r15, 4
+    jne .method_known
+    cmp dword [r14], 'HEAD'
+    jne .method_known
+    mov qword [rsp], 1         ; HEAD
+.method_known:
     inc r15                    ; skip the SP
 
     ; --- target ---------------------------------------------------
     lea rax, [r14 + r15]
-    mov [rsp + 16], rax
+    mov [rsp + 8], rax
     mov rcx, r15
 .target_loop:
     cmp r15, r13
@@ -160,7 +238,7 @@ linnea_http_handle:
 .target_done:
     mov rax, r15
     sub rax, rcx
-    mov [rsp + 24], rax
+    mov [rsp + 16], rax
     test rax, rax
     jz .resp_400
     cmp rax, LINNEA_HTTP_MAX_TARGET
@@ -181,8 +259,6 @@ linnea_http_handle:
     add r15, 2
 
     ; --- header lines ---------------------------------------------
-    mov qword [rsp + 32], 0    ; no Host seen yet
-    mov qword [rsp + 40], 0
 .header_loop:
     cmp r15, r13
     jae .parsed
@@ -246,32 +322,58 @@ linnea_http_handle:
     cmp al, 9
     je .trim_dec
     jmp .trimmed
-.trim_dec:
-    dec r10
-    jmp .trim
 .trimmed:
-    ; first Host header wins
-    cmp qword [rsp + 32], 0
-    jne .header_next
+    ; stash name and value for the iequal calls below
+    lea rax, [r14 + rcx]
+    mov [rsp + 56], rax
+    mov [rsp + 64], r8
     lea rax, [r14 + r9]
-    mov [rsp + 48], rax
+    mov [rsp + 72], rax
     mov rax, r10
     sub rax, r9
-    mov [rsp + 56], rax
-    lea rdi, [r14 + rcx]
-    mov rsi, r8
-    lea rdx, [key_host]
-    mov ecx, 4
+    mov [rsp + 80], rax
+    ; Connection: close?
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_connection]
+    mov ecx, 10
+    call linnea_string_iequal
+    test eax, eax
+    jz .try_content_len
+    mov rdi, [rsp + 72]
+    mov rsi, [rsp + 80]
+    lea rdx, [hv_close]
+    mov ecx, 5
     call linnea_string_iequal
     test eax, eax
     jz .header_next
-    mov rax, [rsp + 48]
-    mov [rsp + 32], rax
-    mov rax, [rsp + 56]
-    mov [rsp + 40], rax
+    mov qword [rsp + 24], 0
+    jmp .header_next
+.try_content_len:
+    ; any body indicator disables keep-alive: bodies are never read,
+    ; so leftover body bytes must not be parsed as the next request
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_content_len]
+    mov ecx, 14
+    call linnea_string_iequal
+    test eax, eax
+    jnz .body_indicator
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_transfer_enc]
+    mov ecx, 17
+    call linnea_string_iequal
+    test eax, eax
+    jz .header_next
+.body_indicator:
+    mov qword [rsp + 24], 0
 .header_next:
     add r15, 2                 ; past the CRLF
     jmp .header_loop
+.trim_dec:
+    dec r10
+    jmp .trim
 
 .version_other:
     ; "HTTP/" followed by an unsupported version -> 505, else 400
@@ -282,82 +384,178 @@ linnea_http_handle:
     jne .resp_400
     jmp .resp_505
 
-    ; --- build the 200 response ------------------------------------
+    ; --- serve the file ---------------------------------------------
 .parsed:
-    cmp qword [rsp + 40], LINNEA_HTTP_MAX_HOST
-    ja .resp_400
+    cmp qword [rsp], -1
+    je .resp_405
+    ; strip the query string
+    mov rsi, [rsp + 8]
+    mov rcx, [rsp + 16]
+    xor edx, edx
+.query_scan:
+    cmp rdx, rcx
+    jae .query_done
+    cmp byte [rsi + rdx], '?'
+    je .query_found
+    inc rdx
+    jmp .query_scan
+.query_found:
+    mov rcx, rdx
+.query_done:
+    mov [rsp + 16], rcx
+    ; must be an absolute path without any ".."
+    test rcx, rcx
+    jz .resp_400
+    cmp byte [rsi], '/'
+    jne .resp_400
+    xor edx, edx
+.dot_scan:
+    lea rax, [rdx + 2]
+    cmp rax, rcx
+    ja .dots_ok
+    cmp word [rsi + rdx], '..'
+    je .resp_400
+    inc rdx
+    jmp .dot_scan
+.dots_ok:
+    ; path = root + target (+ index.html after a trailing '/')
     mov ecx, [rbx + linnea_connection.server]
     imul rcx, rcx, linnea_config_server_size
     lea rax, [linnea_config_instance]
     lea r12, [rax + rcx + linnea_config.servers]   ; server*
-    ; body length
-    mov rax, BODY_FIXED
-    add rax, [r12 + linnea_config_server.hostname_len]
-    add rax, [rsp + 8]
-    add rax, [rsp + 24]
-    mov rcx, [rsp + 40]
-    cmp qword [rsp + 32], 0
-    jne .host_len_ok
-    mov ecx, 1                 ; "-"
-.host_len_ok:
-    add rax, rcx
-    mov r13, rax               ; body length
-    ; assemble into out_buf, r15 = write cursor
+    lea rdi, [path_buf]
+    lea rsi, [r12 + linnea_config_server.root]
+    mov rcx, [r12 + linnea_config_server.root_len]
+    rep movsb
+    mov rsi, [rsp + 8]
+    mov rcx, [rsp + 16]
+    rep movsb
+    cmp byte [rdi - 1], '/'
+    jne .no_index
+    lea rsi, [index_html]
+    mov ecx, index_html_len
+    rep movsb
+.no_index:
+    mov byte [rdi], 0
+    mov r15, rdi               ; path end, for the extension scan
+    ; open + fstat, must be a regular file
+    lea rdi, [path_buf]
+    xor esi, esi               ; O_RDONLY
+    xor edx, edx
+    mov eax, LINNEA_SYS_OPEN
+    syscall
+    cmp rax, -4095
+    jae .resp_404
+    mov [rsp + 56], rax        ; fd
+    mov rdi, rax
+    lea rsi, [statbuf]
+    mov eax, LINNEA_SYS_FSTAT
+    syscall
+    cmp rax, -4095
+    jae .close_404
+    mov eax, [statbuf + LINNEA_STAT_ST_MODE]
+    and eax, LINNEA_S_IFMT
+    cmp eax, LINNEA_S_IFREG
+    jne .close_404
+    mov rax, [statbuf + LINNEA_STAT_ST_SIZE]
+    mov [rsp + 32], rax        ; file size
+    ; GET with content: map the file and queue it behind the headers
+    cmp qword [rsp], 0
+    jne .no_map                ; HEAD: headers only
+    test rax, rax
+    jz .no_map                 ; empty file
+    mov rsi, rax
+    xor edi, edi
+    mov edx, LINNEA_PROT_READ
+    mov r10d, LINNEA_MAP_PRIVATE
+    mov r8, [rsp + 56]
+    xor r9d, r9d
+    mov eax, LINNEA_SYS_MMAP
+    syscall
+    cmp rax, -4095
+    jae .close_404
+    mov [rbx + linnea_connection.file_base], rax
+    mov [rbx + linnea_connection.file_ptr], rax
+    mov rcx, [rsp + 32]
+    mov [rbx + linnea_connection.file_size], rcx
+    mov [rbx + linnea_connection.file_rem], rcx
+.no_map:
+    mov rdi, [rsp + 56]
+    mov eax, LINNEA_SYS_CLOSE
+    syscall                    ; the mapping outlives the fd
+
+    ; MIME type from the extension (path_buf .. r15)
+    lea rdx, [path_buf]
+    mov rcx, r15               ; scan backwards for '.' before any '/'
+.ext_scan:
+    cmp rcx, rdx
+    jbe .ext_none
+    movzx eax, byte [rcx - 1]
+    cmp al, '.'
+    je .ext_found
+    cmp al, '/'
+    je .ext_none
+    dec rcx
+    jmp .ext_scan
+.ext_found:
+    mov [rsp + 72], rcx        ; ext ptr
+    mov rax, r15
+    sub rax, rcx
+    mov [rsp + 80], rax        ; ext len
+    lea r12, [mime_table]
+.mime_loop:
+    mov rdx, [r12]
+    test rdx, rdx
+    jz .ext_none
+    mov rdi, [rsp + 72]
+    mov rsi, [rsp + 80]
+    mov rcx, [r12 + 8]
+    call linnea_string_iequal
+    test eax, eax
+    jnz .mime_found
+    add r12, 32
+    jmp .mime_loop
+.mime_found:
+    mov rax, [r12 + 16]
+    mov [rsp + 40], rax
+    mov rax, [r12 + 24]
+    mov [rsp + 48], rax
+    jmp .build_headers
+.ext_none:
+    lea rax, [mime_default]
+    mov [rsp + 40], rax
+    mov qword [rsp + 48], mime_default_len
+
+    ; --- 200 response headers ----------------------------------------
+.build_headers:
+    mov rax, [rsp + 24]
+    mov [rbx + linnea_connection.keep_alive], rax
     lea r15, [rbx + linnea_connection.out_buf]
     lea rdi, [status_200]
     mov esi, status_200_len
     call .append
-    mov rdi, r13
+    mov rdi, [rsp + 40]
+    mov rsi, [rsp + 48]
+    call .append
+    lea rdi, [hdr_length]
+    mov esi, hdr_length_len
+    call .append
+    mov rdi, [rsp + 32]
     lea rsi, [num_buf]
     call linnea_string_from_u64
     lea rdi, [num_buf]
     mov rsi, rax
     call .append
-    lea rdi, [hdr_end]
-    mov esi, hdr_end_len
+    cmp qword [rsp + 24], 0
+    je .conn_close_hdr
+    lea rdi, [hdr_keepalive]
+    mov esi, hdr_keepalive_len
+    jmp .conn_hdr
+.conn_close_hdr:
+    lea rdi, [hdr_close]
+    mov esi, hdr_close_len
+.conn_hdr:
     call .append
-    lea rdi, [body_server]
-    mov esi, body_server_len
-    call .append
-    lea rdi, [r12 + linnea_config_server.hostname]
-    mov rsi, [r12 + linnea_config_server.hostname_len]
-    call .append
-    lea rdi, [crlf]
-    mov esi, 2
-    call .append
-    lea rdi, [body_method]
-    mov esi, body_method_len
-    call .append
-    mov rdi, [rsp]
-    mov rsi, [rsp + 8]
-    call .append
-    lea rdi, [crlf]
-    mov esi, 2
-    call .append
-    lea rdi, [body_target]
-    mov esi, body_target_len
-    call .append
-    mov rdi, [rsp + 16]
-    mov rsi, [rsp + 24]
-    call .append
-    lea rdi, [crlf]
-    mov esi, 2
-    call .append
-    lea rdi, [body_host]
-    mov esi, body_host_len
-    call .append
-    mov rdi, [rsp + 32]
-    mov rsi, [rsp + 40]
-    test rdi, rdi
-    jnz .host_append
-    lea rdi, [dash]
-    mov esi, 1
-.host_append:
-    call .append
-    lea rdi, [crlf]
-    mov esi, 2
-    call .append
-    ; hand the response to the caller
     lea rax, [rbx + linnea_connection.out_buf]
     mov [rbx + linnea_connection.out_ptr], rax
     mov rcx, r15
@@ -366,27 +564,38 @@ linnea_http_handle:
     mov eax, LINNEA_HTTP_RESPOND
     jmp .ret
 
+.close_404:
+    mov rdi, [rsp + 56]
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+.resp_404:
+    lea rax, [resp_404]
+    mov ecx, resp_404_len
+    jmp .resp_static
 .resp_400:
     lea rax, [resp_400]
-    mov [rbx + linnea_connection.out_ptr], rax
-    mov qword [rbx + linnea_connection.out_rem], resp_400_len
-    mov eax, LINNEA_HTTP_RESPOND
-    jmp .ret
+    mov ecx, resp_400_len
+    jmp .resp_static
+.resp_405:
+    lea rax, [resp_405]
+    mov ecx, resp_405_len
+    jmp .resp_static
 .resp_431:
     lea rax, [resp_431]
-    mov [rbx + linnea_connection.out_ptr], rax
-    mov qword [rbx + linnea_connection.out_rem], resp_431_len
-    mov eax, LINNEA_HTTP_RESPOND
-    jmp .ret
+    mov ecx, resp_431_len
+    jmp .resp_static
 .resp_505:
     lea rax, [resp_505]
+    mov ecx, resp_505_len
+.resp_static:
     mov [rbx + linnea_connection.out_ptr], rax
-    mov qword [rbx + linnea_connection.out_rem], resp_505_len
+    mov [rbx + linnea_connection.out_rem], rcx
+    mov qword [rbx + linnea_connection.keep_alive], 0
     mov eax, LINNEA_HTTP_RESPOND
     jmp .ret
 
 .ret:
-    add rsp, 64
+    add rsp, 96
     pop r15
     pop r14
     pop r13
@@ -395,8 +604,7 @@ linnea_http_handle:
     ret
 
 ; .append(rdi=ptr, rsi=len) — local helper; r15 is the write cursor.
-; The response caps (method 32, target 2048, host 255, hostname 255)
-; keep the total well under LINNEA_CONN_OUT_BUF.
+; The 200 header line lengths are bounded well under LINNEA_CONN_OUT_BUF.
 .append:
     mov rcx, rsi
     mov rsi, rdi

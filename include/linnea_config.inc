@@ -3,6 +3,7 @@
 LINNEA_MAX_SERVERS      equ 16
 LINNEA_MAX_HOST         equ 63       ; max host string length (buffer +1 for NUL)
 LINNEA_MAX_HOSTNAME     equ 255      ; max hostname string length (DNS limit)
+LINNEA_MAX_ROOT         equ 255      ; max document root path length
 LINNEA_MAX_CONFIG_FILE  equ 1 << 20  ; sanity cap on config file size
 
 struc linnea_config_server
@@ -13,6 +14,8 @@ struc linnea_config_server
     .port:          resw 1                        ; u16, host byte order
     .pad:           resw 1
     .listen_fd:     resd 1                        ; listening socket, set by linnea_network
+    .root:          resb LINNEA_MAX_ROOT + 1      ; NUL-terminated document root
+    .root_len:      resq 1
 endstruc
 
 struc linnea_config

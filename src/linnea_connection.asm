@@ -54,6 +54,13 @@ linnea_connection_alloc:
     mov rcx, [rdx + linnea_connection.next_free]
     mov [free_head], rcx
     mov qword [rdx + linnea_connection.in_len], 0
+    mov qword [rdx + linnea_connection.head_len], 0
+    mov qword [rdx + linnea_connection.keep_alive], 0
+    mov qword [rdx + linnea_connection.out_rem], 0
+    mov qword [rdx + linnea_connection.file_base], 0
+    mov qword [rdx + linnea_connection.file_size], 0
+    mov qword [rdx + linnea_connection.file_ptr], 0
+    mov qword [rdx + linnea_connection.file_rem], 0
     mov rax, rdx
     ret
 .empty:

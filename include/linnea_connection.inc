@@ -10,8 +10,14 @@ struc linnea_connection
     .index:         resq 1         ; own pool index, kept for user_data and free
     .next_free:     resq 1         ; free-list link (pool index), -1 = end
     .in_len:        resq 1         ; bytes received so far
+    .head_len:      resq 1         ; bytes consumed by the current request head
+    .keep_alive:    resq 1         ; 1 = keep the connection after the response
     .out_ptr:       resq 1         ; unsent response bytes
     .out_rem:       resq 1
+    .file_base:     resq 1         ; mmap'd file being served (0 = none)
+    .file_size:     resq 1         ; full mapping size, for munmap
+    .file_ptr:      resq 1         ; file bytes queued behind the header send
+    .file_rem:      resq 1
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
 endstruc

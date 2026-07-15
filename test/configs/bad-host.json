@@ -1,5 +1,5 @@
 {
   "servers": [
-    { "host": "example.com", "port": 47080, "hostname": "one.test" }
+    { "host": "example.com", "port": 47080, "hostname": "one.test", "root": "test/www" }
   ]
 }

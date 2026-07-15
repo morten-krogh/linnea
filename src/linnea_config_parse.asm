@@ -33,6 +33,8 @@ key_port:               db "port"
 key_port_len            equ $ - key_port
 key_hostname:           db "hostname"
 key_hostname_len        equ $ - key_hostname
+key_root:               db "root"
+key_root_len            equ $ - key_root
 
 msg_eof:                db "unexpected end of file"
 msg_eof_len             equ $ - msg_eof
@@ -50,7 +52,7 @@ msg_unknown_key:        db "unknown key"
 msg_unknown_key_len     equ $ - msg_unknown_key
 msg_dup_key:            db "duplicate key"
 msg_dup_key_len         equ $ - msg_dup_key
-msg_missing_key:        db "server requires host, port and hostname"
+msg_missing_key:        db "server requires host, port, hostname and root"
 msg_missing_key_len     equ $ - msg_missing_key
 msg_unterminated:       db "unterminated string"
 msg_unterminated_len    equ $ - msg_unterminated
@@ -66,6 +68,8 @@ msg_host_long:          db "host too long"
 msg_host_long_len       equ $ - msg_host_long
 msg_hostname_long:      db "hostname too long"
 msg_hostname_long_len   equ $ - msg_hostname_long
+msg_root_long:          db "root too long"
+msg_root_long_len       equ $ - msg_root_long
 
 section .data
 
@@ -160,7 +164,7 @@ linnea_config_parse:
     jmp linnea_parse_fail
 
 ; linnea_parse_server(rdi=server*) — one server object, keys in any order.
-; Key presence tracked in a bitmask: host=1, port=2, hostname=4.
+; Key presence tracked in a bitmask: host=1, port=2, hostname=4, root=8.
 linnea_parse_server:
     push rbx
     push r12
@@ -200,6 +204,13 @@ linnea_parse_server:
     call linnea_string_equal
     test eax, eax
     jnz .key_hostname
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_root]
+    mov ecx, key_root_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_root
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -237,6 +248,19 @@ linnea_parse_server:
     lea rdi, [rbx + linnea_config_server.hostname]
     mov rsi, rax
     call linnea_string_copy
+    jmp .member_sep
+
+.key_root:
+    test r12d, 8
+    jnz .dup
+    or r12d, 8
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_ROOT
+    ja .root_long
+    mov [rbx + linnea_config_server.root_len], rdx
+    lea rdi, [rbx + linnea_config_server.root]
+    mov rsi, rax
+    call linnea_string_copy
 
 .member_sep:
     call linnea_parse_skip_ws
@@ -253,7 +277,7 @@ linnea_parse_server:
     jmp .member_loop
 .end_object:
     call linnea_parse_advance
-    cmp r12d, 7
+    cmp r12d, 15
     jne .missing
     pop r15
     pop r14
@@ -277,6 +301,10 @@ linnea_parse_server:
 .hostname_long:
     lea rdi, [msg_hostname_long]
     mov esi, msg_hostname_long_len
+    jmp linnea_parse_fail
+.root_long:
+    lea rdi, [msg_root_long]
+    mov esi, msg_root_long_len
     jmp linnea_parse_fail
 
 ; --- low-level helpers -------------------------------------------------

@@ -1,7 +1,9 @@
 ; linnea_uring.asm — io_uring event loop built on liburing (vendored,
 ; nolibc build). One multishot accept is armed per listening socket.
-; Accepted connections get a pool slot and a recv; complete request heads
-; are answered by linnea_http and the connection is closed after the send.
+; Accepted connections get a pool slot and a recv with a linked idle
+; timeout; complete request heads are answered by linnea_http (headers
+; from out_buf, then the mmap'd file if any). Keep-alive connections
+; consume the request bytes and continue; others are closed.
 ;
 ; CQE user_data encodes (index << 8) | op tag — see linnea_uring.inc.
 ; Listener/ring errors are fatal; per-connection errors just close and
@@ -57,6 +59,8 @@ log_fd:             db " (fd "
 log_fd_len          equ $ - log_fd
 log_close:          db ")", 10
 log_close_len       equ $ - log_close
+
+idle_timeout:       dq LINNEA_IDLE_TIMEOUT_SEC, 0   ; struct __kernel_timespec
 
 section .bss
 
@@ -119,6 +123,8 @@ linnea_uring_run:
     mov eax, r13d
     and eax, 0xff              ; op tag
     shr r13, 8                 ; index
+    cmp eax, LINNEA_UD_TIMEOUT
+    je .wait                   ; timeout cqes carry no work
     cmp eax, LINNEA_UD_RECV
     je .on_recv
     cmp eax, LINNEA_UD_SEND
@@ -167,14 +173,17 @@ linnea_uring_run:
     jmp .accept_rearm
 
 ; --- recv completion: r13 = connection index, r15d = bytes or -errno --
+; A fired idle timeout surfaces here as -ECANCELED and closes the
+; connection like any other recv failure.
 .on_recv:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax               ; connection*
     test r15d, r15d
-    jle .conn_close            ; 0 = peer closed, <0 = connection error
+    jle .conn_close            ; 0 = peer closed, <0 = error/timeout
     mov eax, r15d
     add [r12 + linnea_connection.in_len], rax
+.process:
     mov rdi, r12
     call linnea_http_handle
     test eax, eax
@@ -200,13 +209,58 @@ linnea_uring_run:
     add [r12 + linnea_connection.out_ptr], rax
     sub [r12 + linnea_connection.out_rem], rax
     cmp qword [r12 + linnea_connection.out_rem], 0
-    je .conn_close             ; fully sent: Connection: close
+    jne .send_more
+    ; current segment done; is the file body still queued?
+    mov rax, [r12 + linnea_connection.file_rem]
+    test rax, rax
+    jz .response_done
+    mov [r12 + linnea_connection.out_rem], rax
+    mov rax, [r12 + linnea_connection.file_ptr]
+    mov [r12 + linnea_connection.out_ptr], rax
+    mov qword [r12 + linnea_connection.file_rem], 0
+.send_more:
     mov rdi, r12
     call linnea_uring_arm_send
     call linnea_uring_submit_now
     jmp .wait
 
+.response_done:
+    mov rdi, [r12 + linnea_connection.file_base]
+    test rdi, rdi
+    jz .no_unmap
+    mov rsi, [r12 + linnea_connection.file_size]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    mov qword [r12 + linnea_connection.file_base], 0
+    mov qword [r12 + linnea_connection.file_size], 0
+.no_unmap:
+    cmp qword [r12 + linnea_connection.keep_alive], 0
+    je .conn_close
+    ; keep-alive: drop the consumed head, keep any pipelined bytes
+    mov rax, [r12 + linnea_connection.in_len]
+    sub rax, [r12 + linnea_connection.head_len]
+    mov [r12 + linnea_connection.in_len], rax
+    lea rdi, [r12 + linnea_connection.in_buf]
+    mov rsi, rdi
+    add rsi, [r12 + linnea_connection.head_len]
+    mov rcx, rax
+    rep movsb                  ; forward copy, dst < src
+    cmp qword [r12 + linnea_connection.in_len], 0
+    jne .process               ; a pipelined request is already buffered
+    mov rdi, r12
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+
 .conn_close:
+    mov rdi, [r12 + linnea_connection.file_base]
+    test rdi, rdi
+    jz .close_no_file
+    mov rsi, [r12 + linnea_connection.file_size]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    mov qword [r12 + linnea_connection.file_base], 0
+.close_no_file:
     mov edi, [r12 + linnea_connection.fd]
     mov eax, LINNEA_SYS_CLOSE
     syscall
@@ -280,12 +334,15 @@ linnea_uring_arm_accept:
     ret
 
 ; linnea_uring_arm_recv(rdi=connection*)
-; Queue a recv into the free tail of the connection's input buffer.
+; Queue a recv into the free tail of the connection's input buffer, with
+; a linked idle timeout: if the peer stays silent the recv completes with
+; -ECANCELED and the connection is closed.
 linnea_uring_arm_recv:
     push rbx
     mov rbx, rdi
     call linnea_uring_get_sqe_zeroed
     mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECV
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
     mov ecx, [rbx + linnea_connection.fd]
     mov [rax + LINNEA_SQE_FD], ecx
     mov rcx, [rbx + linnea_connection.in_len]
@@ -297,6 +354,17 @@ linnea_uring_arm_recv:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_RECV
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    ; the linked timeout sqe must immediately follow the recv sqe
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_LINK_TIMEOUT
+    mov dword [rax + LINNEA_SQE_FD], -1
+    lea rcx, [idle_timeout]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1
+    mov rcx, [rbx + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_TIMEOUT
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     pop rbx
     ret

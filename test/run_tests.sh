@@ -81,19 +81,70 @@ raw_http() {
     timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/47080; printf '$1' >&3; cat <&3"
 }
 
-resp=$(curl -s --max-time 2 http://127.0.0.1:47080/hello)
-check_http "http 200 server"  "server: one.test" "$resp"
-check_http "http 200 method"  "method: GET" "$resp"
-check_http "http 200 target"  "target: /hello" "$resp"
-check_http "http 200 host"    "host: 127.0.0.1:47080" "$resp"
+# --- static file serving ---
+resp=$(curl -s --max-time 2 http://127.0.0.1:47080/hello.txt)
+check_http "file txt body"     "hello from linnea" "$resp"
+resp=$(curl -si --max-time 2 http://127.0.0.1:47080/hello.txt)
+check_http "file txt mime"     "Content-Type: text/plain" "$resp"
+resp=$(curl -si --max-time 2 http://127.0.0.1:47080/)
+check_http "index html body"   "linnea index page" "$resp"
+check_http "index html mime"   "Content-Type: text/html" "$resp"
+resp=$(curl -s --max-time 2 http://127.0.0.1:47090/sub/page.html)
+check_http "subdirectory file" "subdirectory page" "$resp"
+resp=$(curl -si --max-time 2 http://127.0.0.1:47080/query.txt?x=1)
+check_http "query stripped"    "404 Not Found" "$resp"
+resp=$(curl -si --max-time 2 http://127.0.0.1:47080/no-such-file)
+check_http "http 404"          "404 Not Found" "$resp"
+resp=$(curl -si --max-time 2 -I http://127.0.0.1:47080/hello.txt)
+check_http "HEAD length"       "Content-Length: 18" "$resp"
+resp=$(curl -si --max-time 2 -X POST http://127.0.0.1:47080/hello.txt)
+check_http "http 405"          "405 Method Not Allowed" "$resp"
 
-resp=$(curl -s --max-time 2 -H "Host: custom.example" http://127.0.0.1:47090/x)
-check_http "http host header" "host: custom.example" "$resp"
-check_http "http second port" "server: two.test" "$resp"
-
+# --- protocol errors and traversal (raw, curl normalizes paths) ---
 check_http "http 400" "400 Bad Request" "$(raw_http 'GARBAGE\r\n\r\n')"
-check_http "http 505" "505 HTTP Version Not Supported" "$(raw_http 'GET / HTTP/1.0\r\n\r\n')"
-check_http "http no host" "host: -" "$(raw_http 'GET / HTTP/1.1\r\n\r\n')"
+check_http "http 505" "505 HTTP Version Not Supported" "$(raw_http 'GET / HTTP/1.0\r\nConnection: close\r\n\r\n')"
+check_http "traversal blocked" "400 Bad Request" "$(raw_http 'GET /../secret HTTP/1.1\r\nConnection: close\r\n\r\n')"
+
+# --- keep-alive: two requests, one connection (count accepts) ---
+before=$(grep -c "accepted connection" "$server_log")
+resp=$(curl -s --max-time 4 http://127.0.0.1:47080/hello.txt http://127.0.0.1:47080/index.html)
+after=$(grep -c "accepted connection" "$server_log")
+check_http "keep-alive body 1" "hello from linnea" "$resp"
+check_http "keep-alive body 2" "linnea index page" "$resp"
+if [ $((after - before)) -eq 1 ]; then
+    echo "PASS: keep-alive single accept"
+    pass=$((pass + 1))
+else
+    echo "FAIL: keep-alive single accept (accepts: $((after - before)))"
+    fail=$((fail + 1))
+fi
+
+# --- pipelined requests in one write ---
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\n\r\nGET /hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n')
+n=$(printf '%s' "$resp" | grep -c "200 OK")
+if [ "$n" -eq 2 ]; then
+    echo "PASS: pipelined requests"
+    pass=$((pass + 1))
+else
+    echo "FAIL: pipelined requests (200s: $n)"
+    fail=$((fail + 1))
+fi
+
+# --- idle timeout: silent connection must be closed by the server ---
+start=$SECONDS
+if timeout 8 bash -c 'exec 3<>/dev/tcp/127.0.0.1/47080; cat <&3' >/dev/null 2>&1; then
+    elapsed=$((SECONDS - start))
+    if [ "$elapsed" -ge 4 ] && [ "$elapsed" -le 7 ]; then
+        echo "PASS: idle timeout (${elapsed}s)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL: idle timeout (closed after ${elapsed}s, expected ~5s)"
+        fail=$((fail + 1))
+    fi
+else
+    echo "FAIL: idle timeout (connection not closed by server)"
+    fail=$((fail + 1))
+fi
 
 sleep 0.2
 if grep -q "accepted connection on 127.0.0.1:47080 (fd " "$server_log"; then

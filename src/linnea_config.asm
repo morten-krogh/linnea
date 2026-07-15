@@ -27,6 +27,8 @@ dump_port:              db " port="
 dump_port_len           equ $ - dump_port
 dump_hostname:          db " hostname="
 dump_hostname_len       equ $ - dump_hostname
+dump_root:              db " root="
+dump_root_len           equ $ - dump_root
 newline:                db 10
 
 msg_no_servers:         db "config must define at least one server"
@@ -37,6 +39,8 @@ msg_empty_host:         db "server host must not be empty"
 msg_empty_host_len      equ $ - msg_empty_host
 msg_empty_hostname:     db "server hostname must not be empty"
 msg_empty_hostname_len  equ $ - msg_empty_hostname
+msg_empty_root:         db "server root must not be empty"
+msg_empty_root_len      equ $ - msg_empty_root
 
 section .bss
 
@@ -62,6 +66,8 @@ linnea_config_validate:
     je .empty_host
     cmp qword [r9 + linnea_config_server.hostname_len], 0
     je .empty_hostname
+    cmp qword [r9 + linnea_config_server.root_len], 0
+    je .empty_root
     inc r8
     jmp .loop
 .ok:
@@ -81,6 +87,10 @@ linnea_config_validate:
 .empty_hostname:
     lea rdi, [msg_empty_hostname]
     mov esi, msg_empty_hostname_len
+    jmp linnea_error_exit
+.empty_root:
+    lea rdi, [msg_empty_root]
+    mov esi, msg_empty_root_len
     jmp linnea_error_exit
 
 ; linnea_config_dump(rdi=config*) — human-readable dump to stdout:
@@ -126,6 +136,12 @@ linnea_config_dump:
     call linnea_print_stdout
     lea rdi, [r13 + linnea_config_server.hostname]
     mov rsi, [r13 + linnea_config_server.hostname_len]
+    call linnea_print_stdout
+    lea rdi, [dump_root]
+    mov esi, dump_root_len
+    call linnea_print_stdout
+    lea rdi, [r13 + linnea_config_server.root]
+    mov rsi, [r13 + linnea_config_server.root_len]
     call linnea_print_stdout
     lea rdi, [newline]
     mov esi, 1
