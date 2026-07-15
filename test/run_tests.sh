@@ -57,21 +57,44 @@ run_test "unknown key"     1 stderr "unknown key" \
 run_test "escape sequence" 1 stderr "escape sequences not supported" \
     $BIN test/configs/escape.json
 
-# The event loop must accept a TCP connection and (for now) close it:
-# reading from the socket must return EOF quickly rather than blocking,
-# and the server must log the accepted connection.
+# HTTP tests against a running server.
 server_log=$(mktemp)
 $BIN test/configs/listen.json >"$server_log" 2>&1 &
 server_pid=$!
 sleep 0.3
-if (exec 3<>/dev/tcp/127.0.0.1/47080) 2>/dev/null &&
-   timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/47080; cat <&3' >/dev/null; then
-    echo "PASS: tcp connect and server close"
-    pass=$((pass + 1))
-else
-    echo "FAIL: tcp connect and server close"
-    fail=$((fail + 1))
-fi
+
+# check_http <name> <grep-pattern> <response-text>
+check_http() {
+    local name=$1 pattern=$2 resp=$3
+    if printf '%s' "$resp" | grep -qF "$pattern"; then
+        echo "PASS: $name"
+        pass=$((pass + 1))
+    else
+        echo "FAIL: $name (pattern: $pattern)"
+        printf '%s\n' "--- response ---" "$resp" "----------------"
+        fail=$((fail + 1))
+    fi
+}
+
+# raw_http <request> — send bytes, print the full response
+raw_http() {
+    timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/47080; printf '$1' >&3; cat <&3"
+}
+
+resp=$(curl -s --max-time 2 http://127.0.0.1:47080/hello)
+check_http "http 200 server"  "server: one.test" "$resp"
+check_http "http 200 method"  "method: GET" "$resp"
+check_http "http 200 target"  "target: /hello" "$resp"
+check_http "http 200 host"    "host: 127.0.0.1:47080" "$resp"
+
+resp=$(curl -s --max-time 2 -H "Host: custom.example" http://127.0.0.1:47090/x)
+check_http "http host header" "host: custom.example" "$resp"
+check_http "http second port" "server: two.test" "$resp"
+
+check_http "http 400" "400 Bad Request" "$(raw_http 'GARBAGE\r\n\r\n')"
+check_http "http 505" "505 HTTP Version Not Supported" "$(raw_http 'GET / HTTP/1.0\r\n\r\n')"
+check_http "http no host" "host: -" "$(raw_http 'GET / HTTP/1.1\r\n\r\n')"
+
 sleep 0.2
 if grep -q "accepted connection on 127.0.0.1:47080 (fd " "$server_log"; then
     echo "PASS: accept log"

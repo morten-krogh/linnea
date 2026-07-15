@@ -15,6 +15,7 @@ extern linnea_config_validate
 extern linnea_config_dump
 extern linnea_config_instance
 extern linnea_network_listen_all
+extern linnea_connections_init
 extern linnea_uring_run
 extern linnea_error_usage
 
@@ -41,6 +42,7 @@ _start:
     call linnea_config_dump
     lea rdi, [linnea_config_instance]
     call linnea_network_listen_all
+    call linnea_connections_init
     lea rdi, [linnea_config_instance]
     call linnea_uring_run      ; never returns
 .usage:

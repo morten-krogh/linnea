@@ -22,7 +22,9 @@ LINNEA_STDERR        equ 2
 
 LINNEA_O_RDONLY      equ 0
 LINNEA_PROT_READ     equ 1
+LINNEA_PROT_WRITE    equ 2
 LINNEA_MAP_PRIVATE   equ 2
+LINNEA_MAP_ANONYMOUS equ 0x20
 
 LINNEA_STAT_ST_SIZE  equ 48   ; offset of st_size in struct stat, x86-64
 LINNEA_STAT_SIZE     equ 144  ; sizeof(struct stat), x86-64

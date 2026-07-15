@@ -4,6 +4,7 @@ default rel
 
 global linnea_string_length
 global linnea_string_equal
+global linnea_string_iequal
 global linnea_string_copy
 global linnea_string_from_u64
 
@@ -30,6 +31,40 @@ linnea_string_equal:
     jae .yes
     mov r8b, [rdi + rax]
     cmp r8b, [rdx + rax]
+    jne .no
+    inc rax
+    jmp .loop
+.yes:
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
+; linnea_string_iequal(rdi=ptr1, rsi=len1, rdx=ptr2, rcx=len2) -> rax=1/0
+; ASCII case-insensitive comparison (for HTTP header names).
+linnea_string_iequal:
+    cmp rsi, rcx
+    jne .no
+    xor eax, eax
+.loop:
+    cmp rax, rsi
+    jae .yes
+    mov r8b, [rdi + rax]
+    mov r9b, [rdx + rax]
+    cmp r8b, 'A'
+    jb .c1
+    cmp r8b, 'Z'
+    ja .c1
+    add r8b, 32
+.c1:
+    cmp r9b, 'A'
+    jb .c2
+    cmp r9b, 'Z'
+    ja .c2
+    add r9b, 32
+.c2:
+    cmp r8b, r9b
     jne .no
     inc rax
     jmp .loop
