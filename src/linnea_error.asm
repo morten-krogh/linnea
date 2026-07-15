@@ -11,10 +11,11 @@ global linnea_error_usage
 global linnea_error_exit
 global linnea_error_open
 global linnea_error_parse
+global linnea_error_server
 
 extern linnea_print_stderr
+extern linnea_print_u64_stderr
 extern linnea_string_length
-extern linnea_string_from_u64
 extern linnea_parser_state
 
 section .rodata
@@ -31,11 +32,12 @@ column_msg:     db ", column "
 column_msg_len  equ $ - column_msg
 colon_msg:      db ": "
 colon_msg_len   equ $ - colon_msg
+space_msg:      db " "
+colon_char:     db ":"
+errno_open:     db " (errno "
+errno_open_len  equ $ - errno_open
+errno_close:    db ")"
 newline_msg:    db 10
-
-section .bss
-
-num_buf:        resb 20
 
 section .text
 
@@ -112,12 +114,12 @@ linnea_error_parse:
     mov esi, parse_msg_len
     call linnea_print_stderr
     mov rdi, rbx
-    call print_u64_stderr
+    call linnea_print_u64_stderr
     lea rdi, [column_msg]
     mov esi, column_msg_len
     call linnea_print_stderr
     mov rdi, r15
-    call print_u64_stderr
+    call linnea_print_u64_stderr
     lea rdi, [colon_msg]
     mov esi, colon_msg_len
     call linnea_print_stderr
@@ -129,13 +131,46 @@ linnea_error_parse:
     call linnea_print_stderr
     jmp linnea_error_die
 
-; print_u64_stderr(rdi=value) — file-local
-print_u64_stderr:
-    lea rsi, [num_buf]
-    call linnea_string_from_u64
-    lea rdi, [num_buf]
-    mov rsi, rax
-    jmp linnea_print_stderr
+; linnea_error_server(rdi=msg, rsi=len, rdx=server*, rcx=errno)
+; Prints "linnea: <msg> <host>:<port> (errno N)\n"; the errno part is
+; omitted when rcx is 0.
+linnea_error_server:
+    mov r12, rdi               ; msg
+    mov r13, rsi               ; len
+    mov r14, rdx               ; server*
+    mov r15, rcx               ; errno, 0 = none
+    lea rdi, [prefix_msg]
+    mov esi, prefix_len
+    call linnea_print_stderr
+    mov rdi, r12
+    mov rsi, r13
+    call linnea_print_stderr
+    lea rdi, [space_msg]
+    mov esi, 1
+    call linnea_print_stderr
+    lea rdi, [r14 + linnea_config_server.host]
+    mov rsi, [r14 + linnea_config_server.host_len]
+    call linnea_print_stderr
+    lea rdi, [colon_char]
+    mov esi, 1
+    call linnea_print_stderr
+    movzx edi, word [r14 + linnea_config_server.port]
+    call linnea_print_u64_stderr
+    test r15, r15
+    jz .newline
+    lea rdi, [errno_open]
+    mov esi, errno_open_len
+    call linnea_print_stderr
+    mov rdi, r15
+    call linnea_print_u64_stderr
+    lea rdi, [errno_close]
+    mov esi, 1
+    call linnea_print_stderr
+.newline:
+    lea rdi, [newline_msg]
+    mov esi, 1
+    call linnea_print_stderr
+    jmp linnea_error_die
 
 ; linnea_error_die() — file-local, exit(1)
 linnea_error_die:

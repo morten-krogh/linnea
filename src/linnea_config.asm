@@ -10,7 +10,7 @@ global linnea_config_validate
 global linnea_config_dump
 
 extern linnea_print_stdout
-extern linnea_string_from_u64
+extern linnea_print_u64_stdout
 extern linnea_error_exit
 
 section .rodata
@@ -41,7 +41,6 @@ msg_empty_hostname_len  equ $ - msg_empty_hostname
 section .bss
 
 linnea_config_instance: resb linnea_config_size
-num_buf:                resb 20
 
 section .text
 
@@ -96,7 +95,7 @@ linnea_config_dump:
     mov esi, dump_config_len
     call linnea_print_stdout
     mov rdi, [rbx + linnea_config.server_count]
-    call print_u64_stdout
+    call linnea_print_u64_stdout
     lea rdi, [dump_servers]
     mov esi, dump_servers_len
     call linnea_print_stdout
@@ -110,7 +109,7 @@ linnea_config_dump:
     mov esi, dump_server_len
     call linnea_print_stdout
     mov rdi, r12
-    call print_u64_stdout
+    call linnea_print_u64_stdout
     lea rdi, [dump_host]
     mov esi, dump_host_len
     call linnea_print_stdout
@@ -121,7 +120,7 @@ linnea_config_dump:
     mov esi, dump_port_len
     call linnea_print_stdout
     movzx edi, word [r13 + linnea_config_server.port]
-    call print_u64_stdout
+    call linnea_print_u64_stdout
     lea rdi, [dump_hostname]
     mov esi, dump_hostname_len
     call linnea_print_stdout
@@ -138,11 +137,3 @@ linnea_config_dump:
     pop r12
     pop rbx
     ret
-
-; print_u64_stdout(rdi=value) — file-local
-print_u64_stdout:
-    lea rsi, [num_buf]
-    call linnea_string_from_u64
-    lea rdi, [num_buf]
-    mov rsi, rax
-    jmp linnea_print_stdout

@@ -1,5 +1,5 @@
 ; linnea_start.asm — entry point and top-level orchestration:
-; map config file -> parse -> unmap -> validate -> dump -> exit(0).
+; map config file -> parse -> unmap -> validate -> dump -> listen -> event loop.
 
 default rel
 
@@ -14,6 +14,8 @@ extern linnea_config_parse
 extern linnea_config_validate
 extern linnea_config_dump
 extern linnea_config_instance
+extern linnea_network_listen_all
+extern linnea_uring_run
 extern linnea_error_usage
 
 section .text
@@ -37,8 +39,9 @@ _start:
     call linnea_config_validate
     lea rdi, [linnea_config_instance]
     call linnea_config_dump
-    mov eax, LINNEA_SYS_EXIT
-    xor edi, edi
-    syscall
+    lea rdi, [linnea_config_instance]
+    call linnea_network_listen_all
+    lea rdi, [linnea_config_instance]
+    call linnea_uring_run      ; never returns
 .usage:
     jmp linnea_error_usage

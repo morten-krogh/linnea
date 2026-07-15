@@ -11,7 +11,8 @@ struc linnea_config_server
     .hostname:      resb LINNEA_MAX_HOSTNAME + 1  ; NUL-terminated server name
     .hostname_len:  resq 1
     .port:          resw 1                        ; u16, host byte order
-    .reserved:      resb 6                        ; pad to 8-byte multiple
+    .pad:           resw 1
+    .listen_fd:     resd 1                        ; listening socket, set by linnea_network
 endstruc
 
 struc linnea_config

@@ -1,0 +1,6 @@
+{
+  "servers": [
+    { "host": "127.0.0.1", "port": 47100, "hostname": "one.test" },
+    { "host": "127.0.0.1", "port": 47100, "hostname": "two.test" }
+  ]
+}

@@ -6,6 +6,14 @@ default rel
 
 global linnea_print_stdout
 global linnea_print_stderr
+global linnea_print_u64_stdout
+global linnea_print_u64_stderr
+
+extern linnea_string_from_u64
+
+section .bss
+
+num_buf: resb 20
 
 section .text
 
@@ -38,3 +46,19 @@ linnea_print_fd:
     jmp .loop
 .done:
     ret
+
+; linnea_print_u64_stdout(rdi=value)
+linnea_print_u64_stdout:
+    lea rsi, [num_buf]
+    call linnea_string_from_u64
+    lea rdi, [num_buf]
+    mov rsi, rax
+    jmp linnea_print_stdout
+
+; linnea_print_u64_stderr(rdi=value)
+linnea_print_u64_stderr:
+    lea rsi, [num_buf]
+    call linnea_string_from_u64
+    lea rdi, [num_buf]
+    mov rsi, rax
+    jmp linnea_print_stderr
