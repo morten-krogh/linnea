@@ -57,6 +57,13 @@
 ;   the upstream closes and forces Connection: close. Upstream failures
 ;   map to 502, upstream timeouts to 504. Proxied requests are logged on
 ;   completion, with the upstream status and the relayed byte count.
+; - Upgrades (websockets etc.): when the client's Connection header lists
+;   the upgrade token and an Upgrade header is present, the wish is
+;   forwarded ("Connection: upgrade" instead of close; Upgrade and the
+;   Sec-WebSocket-* headers pass through anyway). A 101 answer switches
+;   the connection to a blind full-duplex byte tunnel, driven by the
+;   event loop; any other answer is a normal proxied response. A 101
+;   the client never asked for is a 502.
 
 default rel
 
@@ -160,6 +167,8 @@ hdr_up_close:   db "Connection: close", 13, 10, 13, 10
 hdr_up_close_len equ $ - hdr_up_close
 hdr_up_keepalive: db "Connection: keep-alive", 13, 10, 13, 10
 hdr_up_keepalive_len equ $ - hdr_up_keepalive
+hdr_up_upgrade: db "Connection: upgrade", 13, 10, 13, 10
+hdr_up_upgrade_len equ $ - hdr_up_upgrade
 req_version:    db " HTTP/1.1", 13, 10
 req_version_len equ $ - req_version
 version_11_sp:  db "HTTP/1.1 "
@@ -191,6 +200,7 @@ hn_expect:      db "expect"
 hn_if_none_match: db "if-none-match"
 hn_if_mod_since: db "if-modified-since"
 hn_accept_enc:  db "accept-encoding"
+hn_upgrade:     db "upgrade"       ; the header name and the Connection token
 hv_close:       db "close"
 
 ; MIME types by file extension; default is application/octet-stream.
@@ -274,6 +284,8 @@ section .text
 ;   [rsp+192] If-Modified-Since ptr (0 = absent) [rsp+200] its len
 ;   [rsp+208] Accept-Encoding ptr (0 = absent)   [rsp+216] its len
 ;   [rsp+224] encoding served: 0 none, 1 gzip, 2 br
+;   [rsp+232] upgrade flags: 1 = Connection lists the upgrade token,
+;             2 = an Upgrade header is present; 3 = forward the wish
 linnea_http_handle:
     push rbx
     push r12
@@ -298,6 +310,7 @@ linnea_http_handle:
     mov qword [rsp + 192], 0   ; no If-Modified-Since yet
     mov qword [rsp + 208], 0   ; no Accept-Encoding yet
     mov qword [rsp + 224], 0   ; nothing negotiated
+    mov qword [rsp + 232], 0   ; no upgrade asked
     mov ecx, [rbx + linnea_connection.server]
     imul rcx, rcx, linnea_config_server_size
     lea rax, [linnea_config_instance]
@@ -480,7 +493,7 @@ linnea_http_handle:
     mov rax, r10
     sub rax, r9
     mov [rsp + 80], rax
-    ; Connection: close?
+    ; Connection: "close", or a token list that may ask to upgrade
     mov rdi, [rsp + 56]
     mov rsi, [rsp + 64]
     lea rdx, [hn_connection]
@@ -494,9 +507,55 @@ linnea_http_handle:
     mov ecx, 5
     call linnea_string_iequal
     test eax, eax
-    jz .header_next
+    jz .conn_tokens
     mov qword [rsp + 24], 0
     jmp .header_next
+.conn_tokens:
+    ; scan the comma-separated list for the "upgrade" token; the name
+    ; scratch at [rsp+56/64] is free once the name has matched
+    mov rax, [rsp + 72]
+    mov [rsp + 56], rax        ; token cursor
+    add rax, [rsp + 80]
+    mov [rsp + 64], rax        ; value end
+.conn_tok_start:
+    mov rax, [rsp + 56]
+    cmp rax, [rsp + 64]
+    jae .header_next
+    movzx ecx, byte [rax]
+    cmp cl, ','
+    je .conn_tok_skip
+    cmp cl, ' '
+    je .conn_tok_skip
+    cmp cl, 9
+    je .conn_tok_skip
+    mov rdx, rax               ; token start; find its end
+.conn_tok_end:
+    cmp rdx, [rsp + 64]
+    jae .conn_tok_have
+    movzx ecx, byte [rdx]
+    cmp cl, ','
+    je .conn_tok_have
+    cmp cl, ' '
+    je .conn_tok_have
+    cmp cl, 9
+    je .conn_tok_have
+    inc rdx
+    jmp .conn_tok_end
+.conn_tok_have:
+    mov rdi, rax
+    mov rsi, rdx
+    sub rsi, rax               ; token length
+    mov [rsp + 56], rdx        ; resume after this token
+    lea rdx, [hn_upgrade]
+    mov ecx, 7
+    call linnea_string_iequal
+    test eax, eax
+    jz .conn_tok_start
+    or qword [rsp + 232], 1    ; the client asks to upgrade
+    jmp .conn_tok_start
+.conn_tok_skip:
+    inc qword [rsp + 56]
+    jmp .conn_tok_start
 .try_content_len:
     mov rdi, [rsp + 56]
     mov rsi, [rsp + 64]
@@ -533,6 +592,17 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jnz .ae_header
+    ; Upgrade? only its presence matters; the value passes through verbatim
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_upgrade]
+    mov ecx, 7
+    call linnea_string_iequal
+    test eax, eax
+    jz .try_host
+    or qword [rsp + 232], 2
+    jmp .header_next
+.try_host:
     ; Host? (first occurrence wins, used for vhost selection)
     cmp qword [rsp + 88], 0
     jne .header_next
@@ -1164,6 +1234,12 @@ linnea_http_handle:
     mov qword [rbx + linnea_connection.relayed], 0
     mov qword [rbx + linnea_connection.up_len], 0
     mov qword [rbx + linnea_connection.body_rem], 0
+    xor ecx, ecx               ; upgrade only when Connection lists the
+    mov rax, [rsp + 232]       ; token AND an Upgrade header names a
+    and rax, 3                 ; protocol to switch to
+    cmp rax, 3
+    sete cl
+    mov [rbx + linnea_connection.upgrade], rcx
     ; request line: the method and raw target as the client sent them
     lea r15, [rbx + linnea_connection.up_buf]  ; append cursor
     mov rdi, r14
@@ -1249,8 +1325,15 @@ linnea_http_handle:
     mov [rsp + 56], rdx
     jmp .proxy_hdr_loop
 .proxy_hdr_done:
+    cmp qword [rbx + linnea_connection.upgrade], 0
+    jne .proxy_conn_upgrade
     lea rdi, [hdr_up_close]    ; one request per upstream connection
     mov esi, hdr_up_close_len
+    jmp .proxy_conn_emit
+.proxy_conn_upgrade:
+    lea rdi, [hdr_up_upgrade]  ; forward the client's upgrade wish
+    mov esi, hdr_up_upgrade_len
+.proxy_conn_emit:
     call .append
     ; send window: the rewritten head, then the buffered body behind it
     lea rax, [rbx + linnea_connection.up_buf]
@@ -2088,6 +2171,8 @@ linnea_http_proxy_head:
 
     ; --- body framing and our own Connection header -------------------
 .header_done:
+    cmp qword [rbx + linnea_connection.up_status], 101
+    je .upgrade_head
     ; Transfer-Encoding and Content-Length together contradict each other
     ; (RFC 9112 6.3: TE wins, and forwarding both is a response-splitting
     ; vector). Refuse the response rather than pick a side.
@@ -2148,6 +2233,39 @@ linnea_http_proxy_head:
     sub rcx, rax
     mov [rbx + linnea_connection.out_rem], rcx
     mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_RELAY
+    mov eax, LINNEA_HTTP_HEAD_READY
+    jmp .ret
+
+    ; --- 101: the upstream agreed to switch protocols ------------------
+    ; Only meaningful when the client's upgrade wish was forwarded, and a
+    ; 101 has no body, so any framing header on it is nonsense. The head
+    ; goes out with our own "Connection: upgrade"; the Upgrade header has
+    ; already passed through verbatim. Bytes past the head are the
+    ; server's first tunnel bytes and are queued behind the head send.
+    ; When it drains, the event loop switches to the full-duplex tunnel.
+.upgrade_head:
+    cmp qword [rbx + linnea_connection.upgrade], 0
+    je .bad
+    cmp qword [rsp + 16], 0    ; CL/TE flags
+    jne .bad
+    lea rdi, [hdr_up_upgrade]
+    mov esi, hdr_up_upgrade_len
+    call .append
+    mov qword [rbx + linnea_connection.keep_alive], 0
+    mov qword [rbx + linnea_connection.body_rem], 0
+    mov rax, [rbx + linnea_connection.up_len]
+    sub rax, [rsp]             ; leftover tunnel bytes, relayed verbatim
+    mov [rbx + linnea_connection.file_rem], rax
+    add [rbx + linnea_connection.relayed], rax
+    mov rcx, [rsp]
+    lea rdx, [r14 + rcx]
+    mov [rbx + linnea_connection.file_ptr], rdx
+    lea rax, [rbx + linnea_connection.out_buf]
+    mov [rbx + linnea_connection.out_ptr], rax
+    mov rcx, r15
+    sub rcx, rax
+    mov [rbx + linnea_connection.out_rem], rcx
+    mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_UPGRADE
     mov eax, LINNEA_HTTP_HEAD_READY
     jmp .ret
 .bad:

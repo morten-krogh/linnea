@@ -487,6 +487,37 @@ check "proxy log 504" $?
 grep -qF '"HEAD /api/simple" 200 0' "$LOG"
 check "proxy log HEAD" $?
 
+# --- websockets: upgrade passthrough and the full-duplex tunnel ---
+out=$(python3 test/ws_client.py echo)
+[ "$out" = "OK" ]
+check "ws echo round trips ($out)" $?
+out=$(python3 test/ws_client.py pipelined)
+[ "$out" = "OK" ]
+check "ws client bytes before the 101 ($out)" $?
+out=$(python3 test/ws_client.py push)
+[ "$out" = "OK" ]
+check "ws server push and 101 leftover ($out)" $?
+out=$(python3 test/ws_client.py tick)
+[ "$out" = "OK" ]
+check "ws one-way traffic outlives idle timeout ($out)" $?
+out=$(python3 test/ws_client.py silent)
+[ "$out" = "OK" ]
+check "ws idle tunnel times out ($out)" $?
+out=$(python3 test/ws_client.py reject)
+[ "$out" = "OK" ]
+check "ws upgrade refusal passes through ($out)" $?
+# a 101 the client never asked for must not start a tunnel
+resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/101)
+check_http "unrequested 101 becomes 502" "502 Bad Gateway" "$resp"
+# an upgrade wish on a static location changes nothing
+resp=$(curl -si --max-time 3 -H 'Connection: upgrade' -H 'Upgrade: websocket' \
+    http://127.0.0.1:47080/hello.txt)
+check_http "upgrade on static location" "hello from linnea" "$resp"
+grep -qF '"GET /api/ws-echo" 101 0' "$LOG"
+check "ws request log 101" $?
+grep -qF ': upstream closed' "$LOG"
+check "ws termination upstream closed" $?
+
 # --- send timeout: a client that stops reading must not pin its slot ---
 # huge.bin is sparse and far larger than any kernel socket buffering, so
 # once the client's window fills the send stalls and its linked timeout

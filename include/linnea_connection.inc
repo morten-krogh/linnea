@@ -18,6 +18,12 @@ LINNEA_PROXY_CONNECTING equ 1      ; connect() to the upstream is in flight
 LINNEA_PROXY_SENDING    equ 2      ; sending the request upstream
 LINNEA_PROXY_HEAD       equ 3      ; reading the upstream response head
 LINNEA_PROXY_RELAY      equ 4      ; relaying the upstream body to the client
+LINNEA_PROXY_UPGRADE    equ 5      ; a 101 head is going out to the client;
+                                   ; when it drains the tunnel starts
+LINNEA_PROXY_TUNNEL     equ 6      ; full-duplex byte relay after a 101; the
+                                   ; one-op invariant becomes one PER DIRECTION
+LINNEA_PROXY_CLOSING    equ 7      ; tunnel torn down; both sockets are shut
+                                   ; down, waiting for in-flight ops to drain
 
 struc linnea_connection
     .fd:            resd 1         ; accepted socket
@@ -47,6 +53,18 @@ struc linnea_connection
     .up_len:        resq 1         ; bytes buffered in up_buf
     .up_status:     resq 1         ; upstream status code, for the log
     .is_head:       resq 1         ; 1 = the client sent HEAD (no body relay)
+    ; --- upgrade tunnel (websockets etc.) ----------------------------
+    .upgrade:       resq 1         ; 1 = the client asked to upgrade and the
+                                   ; wish was forwarded; a 101 starts a tunnel
+    .ws_c2u_busy:   resq 1         ; an op is in flight client->upstream
+    .ws_u2c_busy:   resq 1         ; an op is in flight upstream->client
+    .ws_c2u_ptr:    resq 1         ; unsent client bytes (in_buf); the
+    .ws_c2u_rem:    resq 1         ; u2c direction owns out_ptr/out_rem
+    .last_activity: resq 1         ; CLOCK_MONOTONIC seconds of the last data
+                                   ; in either direction; a tunnel recv that
+                                   ; times out re-arms unless both are idle
+    .close_reason:  resq 1         ; teardown reason, held while CLOSING
+    .close_reason_len: resq 1      ; waits for the other direction's op
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

@@ -20,6 +20,12 @@
 ; peer can pin a connection slot beyond it. Partial progress re-arms the
 ; op with a fresh timeout: only a peer making no progress at all is cut.
 ;
+; A 101 from the upstream turns the connection into a full-duplex tunnel
+; (websockets): two independent recv->send chains, one per direction, so
+; the invariant becomes one op per DIRECTION. Teardown still cancels
+; nothing: both sockets are shut down and the slot is freed once the
+; other direction's op has drained (see the tunnel section).
+;
 ; CQE user_data encodes (index << 8) | op tag — see linnea_uring.inc.
 ; Listener/ring errors are fatal; per-connection errors just close and
 ; free that connection; accept errors are logged and the accept re-armed.
@@ -106,6 +112,10 @@ reason_up_timeout:  db "upstream timeout"
 reason_up_timeout_len equ $ - reason_up_timeout
 reason_up_recv_err: db "upstream recv error"
 reason_up_recv_err_len equ $ - reason_up_recv_err
+reason_up_closed:   db "upstream closed"
+reason_up_closed_len equ $ - reason_up_closed
+reason_up_send_err: db "upstream send error"
+reason_up_send_err_len equ $ - reason_up_send_err
 
 section .data
 
@@ -115,6 +125,8 @@ section .bss
 
 ring:               resb LINNEA_URING_RING_SIZE
 cqe_ptr:            resq 1
+idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
+                               ; tunnel's last_activity comparison
 
 section .text
 
@@ -129,6 +141,8 @@ linnea_uring_run:
     mov rbx, rdi               ; config*
     mov rax, [rbx + linnea_config.timeout]
     mov [idle_timeout], rax
+    imul rax, rax, 1000000000
+    mov [idle_timeout_ns], rax
 
     mov edi, LINNEA_URING_ENTRIES
     lea rsi, [ring]
@@ -245,6 +259,10 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax               ; connection*
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
+    je .tunnel_client_recv
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
+    je .closing_c2u
     test r15d, r15d
     jg .recv_data
     jz .recv_eof
@@ -293,6 +311,10 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
+    je .tunnel_client_send
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
+    je .closing_u2c
     test r15d, r15d
     jns .send_ok
     cmp r15d, -LINNEA_ECANCELED
@@ -327,6 +349,9 @@ linnea_uring_run:
     ; a relayed response continues with the next chunk from the upstream
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_RELAY
     je .relay_next
+    ; a drained 101 head switches the connection to the tunnel
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_UPGRADE
+    je .tunnel_start
 
 .response_done:
     mov rdi, [r12 + linnea_connection.file_base]
@@ -397,6 +422,10 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
+    je .tunnel_up_send
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
+    je .closing_c2u
     test r15d, r15d
     js .up_send_err
     mov eax, r15d
@@ -439,6 +468,10 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
+    je .tunnel_up_recv
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
+    je .closing_u2c
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_RELAY
     je .relay_recv
     ; reading the response head
@@ -553,6 +586,241 @@ linnea_uring_run:
     call linnea_http_proxy_log
     jmp .response_done
 
+; --- upgrade tunnel ------------------------------------------------------
+; After a 101 the connection is a blind byte relay. Each direction runs
+; its own recv -> send chain: client->upstream through in_buf and the
+; ws_c2u cursor, upstream->client through up_buf and out_ptr/out_rem, so
+; exactly one op per DIRECTION is in flight. Data in either direction
+; refreshes last_activity; a recv that times out re-arms unless the whole
+; tunnel has been idle for the timeout. Teardown shuts down both sockets
+; so the other direction's op (if any) completes promptly, and the slot
+; is freed only once both chains are idle — still no cancellation.
+
+; the 101 head (plus any first server bytes behind it) has drained: log
+; the request line while in_buf still holds it, then start both chains
+.tunnel_start:
+    mov rdi, r12
+    call linnea_http_proxy_log
+    call linnea_uring_now
+    mov [r12 + linnea_connection.last_activity], rax
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
+    mov qword [r12 + linnea_connection.ws_u2c_busy], 1
+    mov qword [r12 + linnea_connection.ws_c2u_busy], 1
+    mov rdi, r12               ; upstream->client: wait for tunnel bytes
+    lea rsi, [r12 + linnea_connection.up_buf]
+    mov edx, LINNEA_CONN_UP_BUF
+    call linnea_uring_arm_up_recv
+    ; client->upstream: bytes sent ahead of the 101 are already buffered
+    ; behind the request head; forward them before reading the client
+    mov rax, [r12 + linnea_connection.in_len]
+    sub rax, [r12 + linnea_connection.head_len]
+    mov qword [r12 + linnea_connection.in_len], 0  ; in_buf is a plain
+    test rax, rax                                  ; tunnel buffer now
+    jz .tunnel_arm_client_recv
+    lea rcx, [r12 + linnea_connection.in_buf]
+    add rcx, [r12 + linnea_connection.head_len]
+    mov [r12 + linnea_connection.ws_c2u_ptr], rcx
+    mov [r12 + linnea_connection.ws_c2u_rem], rax
+    mov rdi, r12
+    mov rsi, rcx
+    mov rdx, rax
+    call linnea_uring_arm_up_send_buf
+    call linnea_uring_submit_now
+    jmp .wait
+.tunnel_arm_client_recv:
+    mov rdi, r12               ; in_len is 0: recv gets the whole buffer
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+
+; client recv completed: r15d = bytes or -errno; forward bytes upstream
+.tunnel_client_recv:
+    mov qword [r12 + linnea_connection.ws_c2u_busy], 0
+    test r15d, r15d
+    jg .tunnel_c2u_data
+    jz .tunnel_client_eof
+    cmp r15d, -LINNEA_ECANCELED
+    je .tunnel_c2u_idle
+    lea r14, [reason_recv_err]
+    mov r15d, reason_recv_err_len
+    jmp .tunnel_close
+.tunnel_client_eof:
+    lea r14, [reason_peer]
+    mov r15d, reason_peer_len
+    jmp .tunnel_close
+.tunnel_c2u_data:
+    call linnea_uring_now
+    mov [r12 + linnea_connection.last_activity], rax
+    mov eax, r15d
+    lea rcx, [r12 + linnea_connection.in_buf]
+    mov [r12 + linnea_connection.ws_c2u_ptr], rcx
+    mov [r12 + linnea_connection.ws_c2u_rem], rax
+    mov qword [r12 + linnea_connection.ws_c2u_busy], 1
+    mov rdi, r12
+    mov rsi, rcx
+    mov rdx, rax
+    call linnea_uring_arm_up_send_buf
+    call linnea_uring_submit_now
+    jmp .wait
+.tunnel_c2u_idle:
+    call linnea_uring_now
+    sub rax, [r12 + linnea_connection.last_activity]
+    cmp rax, [idle_timeout_ns]
+    jge .tunnel_idle_close
+    mov qword [r12 + linnea_connection.ws_c2u_busy], 1
+    mov rdi, r12               ; the other direction was active: re-arm
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.tunnel_idle_close:
+    lea r14, [reason_timeout]
+    mov r15d, reason_timeout_len
+    jmp .tunnel_close
+
+; forward to the upstream completed: r15d = bytes or -errno
+.tunnel_up_send:
+    mov qword [r12 + linnea_connection.ws_c2u_busy], 0
+    test r15d, r15d
+    js .tunnel_up_send_err
+    mov eax, r15d
+    add [r12 + linnea_connection.ws_c2u_ptr], rax
+    sub [r12 + linnea_connection.ws_c2u_rem], rax
+    mov qword [r12 + linnea_connection.ws_c2u_busy], 1
+    cmp qword [r12 + linnea_connection.ws_c2u_rem], 0
+    jne .tunnel_up_send_more
+    mov rdi, r12               ; all forwarded: read the client again
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.tunnel_up_send_more:
+    mov rdi, r12
+    mov rsi, [r12 + linnea_connection.ws_c2u_ptr]
+    mov rdx, [r12 + linnea_connection.ws_c2u_rem]
+    call linnea_uring_arm_up_send_buf
+    call linnea_uring_submit_now
+    jmp .wait
+.tunnel_up_send_err:
+    cmp r15d, -LINNEA_ECANCELED
+    je .tunnel_up_send_stall
+    lea r14, [reason_up_send_err]
+    mov r15d, reason_up_send_err_len
+    jmp .tunnel_close
+.tunnel_up_send_stall:
+    lea r14, [reason_up_timeout]
+    mov r15d, reason_up_timeout_len
+    jmp .tunnel_close
+
+; upstream recv completed: r15d = bytes or -errno; forward to the client
+.tunnel_up_recv:
+    mov qword [r12 + linnea_connection.ws_u2c_busy], 0
+    test r15d, r15d
+    jg .tunnel_u2c_data
+    jz .tunnel_up_eof
+    cmp r15d, -LINNEA_ECANCELED
+    je .tunnel_u2c_idle
+    lea r14, [reason_up_recv_err]
+    mov r15d, reason_up_recv_err_len
+    jmp .tunnel_close
+.tunnel_up_eof:
+    lea r14, [reason_up_closed]
+    mov r15d, reason_up_closed_len
+    jmp .tunnel_close
+.tunnel_u2c_data:
+    call linnea_uring_now
+    mov [r12 + linnea_connection.last_activity], rax
+    mov eax, r15d
+    lea rcx, [r12 + linnea_connection.up_buf]
+    mov [r12 + linnea_connection.out_ptr], rcx
+    mov [r12 + linnea_connection.out_rem], rax
+    add [r12 + linnea_connection.relayed], rax
+    mov qword [r12 + linnea_connection.ws_u2c_busy], 1
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.tunnel_u2c_idle:
+    call linnea_uring_now
+    sub rax, [r12 + linnea_connection.last_activity]
+    cmp rax, [idle_timeout_ns]
+    jge .tunnel_idle_close
+    mov qword [r12 + linnea_connection.ws_u2c_busy], 1
+    mov rdi, r12               ; the other direction was active: re-arm
+    lea rsi, [r12 + linnea_connection.up_buf]
+    mov edx, LINNEA_CONN_UP_BUF
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+
+; client send completed: r15d = bytes or -errno
+.tunnel_client_send:
+    mov qword [r12 + linnea_connection.ws_u2c_busy], 0
+    test r15d, r15d
+    js .tunnel_client_send_err
+    mov eax, r15d
+    add [r12 + linnea_connection.out_ptr], rax
+    sub [r12 + linnea_connection.out_rem], rax
+    mov qword [r12 + linnea_connection.ws_u2c_busy], 1
+    cmp qword [r12 + linnea_connection.out_rem], 0
+    jne .tunnel_client_send_more
+    mov rdi, r12               ; all delivered: read the upstream again
+    lea rsi, [r12 + linnea_connection.up_buf]
+    mov edx, LINNEA_CONN_UP_BUF
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.tunnel_client_send_more:
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.tunnel_client_send_err:
+    cmp r15d, -LINNEA_ECANCELED
+    je .tunnel_client_send_stall
+    lea r14, [reason_send_err]
+    mov r15d, reason_send_err_len
+    jmp .tunnel_close
+.tunnel_client_send_stall:
+    lea r14, [reason_send_timeout]
+    mov r15d, reason_send_timeout_len
+    jmp .tunnel_close
+
+; tunnel teardown; r14/r15 = reason. The op that got us here is done, but
+; the other direction may still have one in flight: shut both sockets
+; down so it completes promptly, and free only when both chains are idle.
+.tunnel_close:
+    mov edi, [r12 + linnea_connection.fd]
+    mov esi, LINNEA_SHUT_RDWR
+    mov eax, LINNEA_SYS_SHUTDOWN
+    syscall
+    mov edi, [r12 + linnea_connection.up_fd]
+    mov esi, LINNEA_SHUT_RDWR
+    mov eax, LINNEA_SYS_SHUTDOWN
+    syscall
+    mov rax, [r12 + linnea_connection.ws_c2u_busy]
+    or rax, [r12 + linnea_connection.ws_u2c_busy]
+    test rax, rax
+    jz .conn_close
+    mov [r12 + linnea_connection.close_reason], r14
+    mov [r12 + linnea_connection.close_reason_len], r15
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
+    jmp .wait
+
+; a straggler op of a torn-down tunnel completed (its result no longer
+; matters: both sockets are shut down); free once both chains are idle
+.closing_c2u:
+    mov qword [r12 + linnea_connection.ws_c2u_busy], 0
+    jmp .closing_check
+.closing_u2c:
+    mov qword [r12 + linnea_connection.ws_u2c_busy], 0
+.closing_check:
+    mov rax, [r12 + linnea_connection.ws_c2u_busy]
+    or rax, [r12 + linnea_connection.ws_u2c_busy]
+    test rax, rax
+    jnz .wait
+    mov r14, [r12 + linnea_connection.close_reason]
+    mov r15, [r12 + linnea_connection.close_reason_len]
+    jmp .conn_close
+
 ; connection teardown; r12 = connection*, r14/r15 = reason string ptr/len
 .conn_close:
     call linnea_log_stamp
@@ -614,6 +882,21 @@ linnea_uring_run:
     lea rdi, [msg_wait]
     mov esi, msg_wait_len
     jmp linnea_error_exit
+
+; linnea_uring_now() -> rax = CLOCK_MONOTONIC nanoseconds, for tunnel
+; idleness. Nanoseconds, not seconds: whole-second truncation could call
+; a tunnel idle up to a second early.
+linnea_uring_now:
+    sub rsp, 24
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    mov edi, LINNEA_CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    imul rax, rax, 1000000000
+    add rax, [rsp + 8]
+    add rsp, 24
+    ret
 
 ; linnea_uring_submit_now() — submit queued sqes, fatal on error.
 linnea_uring_submit_now:
@@ -719,26 +1002,36 @@ linnea_uring_arm_recv:
     jmp linnea_uring_arm_link_timeout
 
 ; linnea_uring_arm_send(rdi=connection*)
-; Queue a send of the unsent response bytes, with a linked idle timeout:
-; a client that stops reading closes instead of pinning the slot. Partial
-; sends re-arm with a fresh timeout, so slow readers are unaffected.
+; Queue a send of the unsent response bytes (out_ptr/out_rem), with a
+; linked idle timeout: a client that stops reading closes instead of
+; pinning the slot. Partial sends re-arm with a fresh timeout, so slow
+; readers are unaffected.
 linnea_uring_arm_send:
+    mov rsi, [rdi + linnea_connection.out_ptr]
+    mov rdx, [rdi + linnea_connection.out_rem]
+    ; fall through
+; linnea_uring_arm_send_buf(rdi=connection*, rsi=ptr, rdx=len)
+linnea_uring_arm_send_buf:
     push rbx
+    push r12
+    push r13
     mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
     call linnea_uring_get_sqe_zeroed
     mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_SEND
     mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
     mov ecx, [rbx + linnea_connection.fd]
     mov [rax + LINNEA_SQE_FD], ecx
-    mov rcx, [rbx + linnea_connection.out_ptr]
-    mov [rax + LINNEA_SQE_ADDR], rcx
-    mov ecx, [rbx + linnea_connection.out_rem]
-    mov [rax + LINNEA_SQE_LEN], ecx
+    mov [rax + LINNEA_SQE_ADDR], r12
+    mov [rax + LINNEA_SQE_LEN], r13d
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_SEND
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx               ; the timeout sqe must immediately follow
+    pop r13
+    pop r12
     pop rbx
     jmp linnea_uring_arm_link_timeout
 
@@ -767,26 +1060,35 @@ linnea_uring_arm_connect:
     jmp linnea_uring_arm_link_timeout
 
 ; linnea_uring_arm_up_send(rdi=connection*)
-; Queue a send of the unsent request bytes to the upstream, with a linked
-; idle timeout: a backend that accepts but never reads fails the request
-; with a 504 instead of pinning the slot.
+; Queue a send of the unsent request bytes (out_ptr/out_rem) to the
+; upstream, with a linked idle timeout: a backend that accepts but never
+; reads fails the request with a 504 instead of pinning the slot.
 linnea_uring_arm_up_send:
+    mov rsi, [rdi + linnea_connection.out_ptr]
+    mov rdx, [rdi + linnea_connection.out_rem]
+    ; fall through
+; linnea_uring_arm_up_send_buf(rdi=connection*, rsi=ptr, rdx=len)
+linnea_uring_arm_up_send_buf:
     push rbx
+    push r12
+    push r13
     mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
     call linnea_uring_get_sqe_zeroed
     mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_SEND
     mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
     mov ecx, [rbx + linnea_connection.up_fd]
     mov [rax + LINNEA_SQE_FD], ecx
-    mov rcx, [rbx + linnea_connection.out_ptr]
-    mov [rax + LINNEA_SQE_ADDR], rcx
-    mov ecx, [rbx + linnea_connection.out_rem]
-    mov [rax + LINNEA_SQE_LEN], ecx
+    mov [rax + LINNEA_SQE_ADDR], r12
+    mov [rax + LINNEA_SQE_LEN], r13d
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_UP_SEND
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx               ; the timeout sqe must immediately follow
+    pop r13
+    pop r12
     pop rbx
     jmp linnea_uring_arm_link_timeout
 
