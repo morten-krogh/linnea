@@ -12,6 +12,9 @@ global linnea_config_dump
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 extern linnea_error_exit
+extern linnea_error_duplicate_hostname
+extern linnea_string_equal
+extern linnea_string_iequal
 
 section .rodata
 
@@ -108,7 +111,61 @@ linnea_config_validate:
     inc r8
     jmp .loop
 .ok:
+    ; servers sharing a listener (same host:port, as linnea_network pairs
+    ; them) must not repeat a hostname: Host matching takes the first, so
+    ; a duplicate could never be selected. Compared case-insensitively,
+    ; like the vhost lookup.
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi
+    mov r12d, 1                ; server index i
+.dup_loop:
+    cmp r12, [rbx + linnea_config.server_count]
+    jae .dup_ok
+    imul r13, r12, linnea_config_server_size
+    lea r13, [rbx + r13 + linnea_config.servers]   ; server i
+    xor r14d, r14d             ; earlier server index j
+.dup_prior:
+    cmp r14, r12
+    jae .dup_next
+    imul r15, r14, linnea_config_server_size
+    lea r15, [rbx + r15 + linnea_config.servers]   ; server j
+    mov ax, [r13 + linnea_config_server.port]
+    cmp ax, [r15 + linnea_config_server.port]
+    jne .dup_prior_next
+    lea rdi, [r13 + linnea_config_server.host]
+    mov rsi, [r13 + linnea_config_server.host_len]
+    lea rdx, [r15 + linnea_config_server.host]
+    mov rcx, [r15 + linnea_config_server.host_len]
+    call linnea_string_equal
+    test eax, eax
+    jz .dup_prior_next
+    lea rdi, [r13 + linnea_config_server.hostname]
+    mov rsi, [r13 + linnea_config_server.hostname_len]
+    lea rdx, [r15 + linnea_config_server.hostname]
+    mov rcx, [r15 + linnea_config_server.hostname_len]
+    call linnea_string_iequal
+    test eax, eax
+    jnz .dup_hostname
+.dup_prior_next:
+    inc r14
+    jmp .dup_prior
+.dup_next:
+    inc r12
+    jmp .dup_loop
+.dup_ok:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
+.dup_hostname:
+    mov rdi, r13
+    jmp linnea_error_duplicate_hostname
 .no_servers:
     lea rdi, [msg_no_servers]
     mov esi, msg_no_servers_len

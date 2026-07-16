@@ -1,0 +1,8 @@
+{
+  "log": "test/linnea.log",
+  "servers": [
+    { "host": "127.0.0.1", "port": 47080, "hostname": "dup.test", "locations": [ { "prefix": "/", "root": "test/www" } ] },
+    { "host": "127.0.0.1", "port": 47090, "hostname": "dup.test", "locations": [ { "prefix": "/", "root": "test/www" } ] },
+    { "host": "127.0.0.1", "port": 47080, "hostname": "DUP.Test", "locations": [ { "prefix": "/", "root": "test/www" } ] }
+  ]
+}

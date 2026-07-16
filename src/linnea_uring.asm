@@ -15,7 +15,10 @@
 ; can outlive it is a linked timeout, and those are dropped at dispatch
 ; before the pool index is ever resolved. Nothing is armed on the client
 ; socket while the upstream exchange runs, so a client that disappears
-; mid-exchange surfaces on the next send to it.
+; mid-exchange surfaces on the next send to it — and every operation,
+; sends included, carries a linked idle timeout, so no dead or stalled
+; peer can pin a connection slot beyond it. Partial progress re-arms the
+; op with a fresh timeout: only a peer making no progress at all is cut.
 ;
 ; CQE user_data encodes (index << 8) | op tag — see linnea_uring.inc.
 ; Listener/ring errors are fatal; per-connection errors just close and
@@ -93,6 +96,8 @@ reason_recv_err:    db "recv error"
 reason_recv_err_len equ $ - reason_recv_err
 reason_send_err:    db "send error"
 reason_send_err_len equ $ - reason_send_err
+reason_send_timeout: db "send timeout"
+reason_send_timeout_len equ $ - reason_send_timeout
 reason_done:        db "close after response"
 reason_done_len     equ $ - reason_done
 reason_up_early:    db "upstream closed early"
@@ -282,14 +287,22 @@ linnea_uring_run:
     jmp .wait
 
 ; --- send completion: r13 = connection index, r15d = bytes or -errno --
+; A send that moved no bytes for the idle timeout completes -ECANCELED:
+; the client has stopped reading, so the connection is torn down.
 .on_send:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
     test r15d, r15d
     jns .send_ok
+    cmp r15d, -LINNEA_ECANCELED
+    je .send_timeout
     lea r14, [reason_send_err]
     mov r15d, reason_send_err_len
+    jmp .conn_close
+.send_timeout:
+    lea r14, [reason_send_timeout]
+    mov r15d, reason_send_timeout_len
     jmp .conn_close
 .send_ok:
     mov eax, r15d
@@ -405,7 +418,10 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .up_send_err:
-    mov esi, 502
+    mov esi, 502               ; nothing sent to the client yet either way
+    cmp r15d, -LINNEA_ECANCELED
+    jne .proxy_fail
+    mov esi, 504               ; backend accepted but stopped reading
     jmp .proxy_fail
 .up_send_done:
     ; the whole request is out; read the response head back into up_buf
@@ -635,6 +651,27 @@ linnea_uring_get_sqe_zeroed:
     mov esi, msg_sqe_len
     jmp linnea_error_exit
 
+; linnea_uring_arm_link_timeout(rdi=connection*)
+; Queue the idle timeout sqe linked to the sqe queued just before, which
+; must have IOSQE_IO_LINK set. If the linked op makes no progress before
+; the timeout it completes with -ECANCELED; the timeout's own cqe carries
+; LINNEA_UD_TIMEOUT and is dropped at dispatch. Caller submits.
+linnea_uring_arm_link_timeout:
+    push rbx
+    mov rbx, rdi
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_LINK_TIMEOUT
+    mov dword [rax + LINNEA_SQE_FD], -1
+    lea rcx, [idle_timeout]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1
+    mov rcx, [rbx + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_TIMEOUT
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    pop rbx
+    ret
+
 ; linnea_uring_arm_accept(rdi=server index)
 ; Queue a multishot accept for the server's listener. Caller submits.
 linnea_uring_arm_accept:
@@ -677,27 +714,20 @@ linnea_uring_arm_recv:
     shl rcx, 8
     or rcx, LINNEA_UD_RECV
     mov [rax + LINNEA_SQE_USER_DATA], rcx
-    ; the linked timeout sqe must immediately follow the recv sqe
-    call linnea_uring_get_sqe_zeroed
-    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_LINK_TIMEOUT
-    mov dword [rax + LINNEA_SQE_FD], -1
-    lea rcx, [idle_timeout]
-    mov [rax + LINNEA_SQE_ADDR], rcx
-    mov dword [rax + LINNEA_SQE_LEN], 1
-    mov rcx, [rbx + linnea_connection.index]
-    shl rcx, 8
-    or rcx, LINNEA_UD_TIMEOUT
-    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    mov rdi, rbx               ; the timeout sqe must immediately follow
     pop rbx
-    ret
+    jmp linnea_uring_arm_link_timeout
 
 ; linnea_uring_arm_send(rdi=connection*)
-; Queue a send of the unsent response bytes.
+; Queue a send of the unsent response bytes, with a linked idle timeout:
+; a client that stops reading closes instead of pinning the slot. Partial
+; sends re-arm with a fresh timeout, so slow readers are unaffected.
 linnea_uring_arm_send:
     push rbx
     mov rbx, rdi
     call linnea_uring_get_sqe_zeroed
     mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_SEND
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
     mov ecx, [rbx + linnea_connection.fd]
     mov [rax + LINNEA_SQE_FD], ecx
     mov rcx, [rbx + linnea_connection.out_ptr]
@@ -708,8 +738,9 @@ linnea_uring_arm_send:
     shl rcx, 8
     or rcx, LINNEA_UD_SEND
     mov [rax + LINNEA_SQE_USER_DATA], rcx
+    mov rdi, rbx               ; the timeout sqe must immediately follow
     pop rbx
-    ret
+    jmp linnea_uring_arm_link_timeout
 
 ; linnea_uring_arm_connect(rdi=connection*)
 ; Queue a connect to the matched proxy location's upstream, with a linked
@@ -731,29 +762,20 @@ linnea_uring_arm_connect:
     shl rcx, 8
     or rcx, LINNEA_UD_CONNECT
     mov [rax + LINNEA_SQE_USER_DATA], rcx
-    ; the linked timeout sqe must immediately follow the connect sqe
-    call linnea_uring_get_sqe_zeroed
-    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_LINK_TIMEOUT
-    mov dword [rax + LINNEA_SQE_FD], -1
-    lea rcx, [idle_timeout]
-    mov [rax + LINNEA_SQE_ADDR], rcx
-    mov dword [rax + LINNEA_SQE_LEN], 1
-    mov rcx, [rbx + linnea_connection.index]
-    shl rcx, 8
-    or rcx, LINNEA_UD_TIMEOUT
-    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    mov rdi, rbx               ; the timeout sqe must immediately follow
     pop rbx
-    ret
+    jmp linnea_uring_arm_link_timeout
 
 ; linnea_uring_arm_up_send(rdi=connection*)
-; Queue a send of the unsent request bytes to the upstream. Like client
-; sends, this carries no timeout: a backend that accepts but never reads
-; holds the connection until the client goes away.
+; Queue a send of the unsent request bytes to the upstream, with a linked
+; idle timeout: a backend that accepts but never reads fails the request
+; with a 504 instead of pinning the slot.
 linnea_uring_arm_up_send:
     push rbx
     mov rbx, rdi
     call linnea_uring_get_sqe_zeroed
     mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_SEND
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
     mov ecx, [rbx + linnea_connection.up_fd]
     mov [rax + LINNEA_SQE_FD], ecx
     mov rcx, [rbx + linnea_connection.out_ptr]
@@ -764,8 +786,9 @@ linnea_uring_arm_up_send:
     shl rcx, 8
     or rcx, LINNEA_UD_UP_SEND
     mov [rax + LINNEA_SQE_USER_DATA], rcx
+    mov rdi, rbx               ; the timeout sqe must immediately follow
     pop rbx
-    ret
+    jmp linnea_uring_arm_link_timeout
 
 ; linnea_uring_arm_up_recv(rdi=connection*, rsi=buffer, rdx=len)
 ; Queue a recv from the upstream with a linked idle timeout, so a silent
@@ -788,21 +811,11 @@ linnea_uring_arm_up_recv:
     shl rcx, 8
     or rcx, LINNEA_UD_UP_RECV
     mov [rax + LINNEA_SQE_USER_DATA], rcx
-    ; the linked timeout sqe must immediately follow the recv sqe
-    call linnea_uring_get_sqe_zeroed
-    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_LINK_TIMEOUT
-    mov dword [rax + LINNEA_SQE_FD], -1
-    lea rcx, [idle_timeout]
-    mov [rax + LINNEA_SQE_ADDR], rcx
-    mov dword [rax + LINNEA_SQE_LEN], 1
-    mov rcx, [rbx + linnea_connection.index]
-    shl rcx, 8
-    or rcx, LINNEA_UD_TIMEOUT
-    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    mov rdi, rbx               ; the timeout sqe must immediately follow
     pop r13
     pop r12
     pop rbx
-    ret
+    jmp linnea_uring_arm_link_timeout
 
 ; linnea_uring_log_accept(rdi=connection*)
 ; Logs "accepted connection on <host>:<port> from <peer> (fd N)".

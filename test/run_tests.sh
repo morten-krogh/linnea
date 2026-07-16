@@ -80,6 +80,10 @@ run_test "prefix not absolute" 1 stderr "location prefix must start with '/'" \
     $BIN test/configs/location-bad-prefix.json
 run_test "empty locations"  1 stderr "at least one location" \
     $BIN test/configs/empty-locations.json
+# the middle server reuses the hostname on another port, which is fine;
+# the clash is on the shared listener, case-insensitively
+run_test "duplicate hostname" 1 stderr "duplicate hostname DUP.Test on 127.0.0.1:47080" \
+    $BIN test/configs/dup-hostname.json
 
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
@@ -483,6 +487,26 @@ check "proxy log 504" $?
 grep -qF '"HEAD /api/simple" 200 0' "$LOG"
 check "proxy log HEAD" $?
 
+# --- send timeout: a client that stops reading must not pin its slot ---
+# huge.bin is sparse and far larger than any kernel socket buffering, so
+# once the client's window fills the send stalls and its linked timeout
+# (2s in this config) fires.
+truncate -s 64M test/www/huge.bin
+(exec 3<>/dev/tcp/127.0.0.1/47080
+ printf 'GET /huge.bin HTTP/1.1\r\n\r\n' >&3
+ sleep 6) &
+stall_pid=$!
+sleep 4
+grep -qF ': send timeout' "$LOG"
+check "termination send timeout" $?
+kill $stall_pid 2>/dev/null
+wait $stall_pid 2>/dev/null
+# a slow but reading client must survive a transfer spanning several
+# timeout windows: partial sends re-arm with a fresh timeout each time
+n=$(curl -s --max-time 12 --limit-rate 16M http://127.0.0.1:47080/huge.bin | wc -c)
+[ "$n" -eq 67108864 ]
+check "slow reader outlives send timeout ($n bytes)" $?
+
 # --- connection termination log lines ---
 grep -qF ': close after response' "$LOG"
 check "termination close-after-response" $?
@@ -494,7 +518,7 @@ check "termination idle timeout" $?
 kill $server_pid $backend_pid 2>/dev/null
 wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
-rm -f "$LOG" test/www/big.txt test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
+rm -f "$LOG" test/www/big.txt test/www/huge.bin test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
 
 echo
 echo "$pass passed, $fail failed"

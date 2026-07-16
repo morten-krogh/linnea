@@ -41,9 +41,10 @@ LINNEA_UD_CONNECT       equ 4          ; connect to a proxy upstream
 LINNEA_UD_UP_SEND       equ 5          ; request bytes to the upstream
 LINNEA_UD_UP_RECV       equ 6          ; response bytes from the upstream
 
-; Idle timeout: a linked timeout is attached to every recv. If the peer
-; sends nothing for that long, the recv completes with -ECANCELED and the
-; connection is closed. The duration comes from the config's "timeout".
+; Idle timeout: a linked timeout is attached to every per-connection op
+; (recv, send, connect, upstream send/recv). An op that makes no progress
+; for that long completes with -ECANCELED; the request fails or the
+; connection closes. The duration comes from the config's "timeout".
 
 ; struct io_uring (liburing 2.15 internal layout)
 LINNEA_URING_RING_SIZE  equ 216

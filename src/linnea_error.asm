@@ -12,6 +12,7 @@ global linnea_error_exit
 global linnea_error_open
 global linnea_error_parse
 global linnea_error_server
+global linnea_error_duplicate_hostname
 
 extern linnea_print_stderr
 extern linnea_print_u64_stderr
@@ -32,6 +33,10 @@ colon_msg:      db ": "
 colon_msg_len   equ $ - colon_msg
 space_msg:      db " "
 colon_char:     db ":"
+dup_msg:        db "duplicate hostname "
+dup_msg_len     equ $ - dup_msg
+on_msg:         db " on "
+on_msg_len      equ $ - on_msg
 errno_open:     db " (errno "
 errno_open_len  equ $ - errno_open
 errno_close:    db ")"
@@ -168,6 +173,35 @@ linnea_error_server:
     mov esi, 1
     call linnea_print_stderr
 .newline:
+    lea rdi, [newline_msg]
+    mov esi, 1
+    call linnea_print_stderr
+    jmp linnea_error_die
+
+; linnea_error_duplicate_hostname(rdi=server*)
+; Prints "linnea: duplicate hostname <hostname> on <host>:<port>\n" and exits.
+linnea_error_duplicate_hostname:
+    mov r14, rdi               ; server*
+    lea rdi, [prefix_msg]
+    mov esi, prefix_len
+    call linnea_print_stderr
+    lea rdi, [dup_msg]
+    mov esi, dup_msg_len
+    call linnea_print_stderr
+    lea rdi, [r14 + linnea_config_server.hostname]
+    mov rsi, [r14 + linnea_config_server.hostname_len]
+    call linnea_print_stderr
+    lea rdi, [on_msg]
+    mov esi, on_msg_len
+    call linnea_print_stderr
+    lea rdi, [r14 + linnea_config_server.host]
+    mov rsi, [r14 + linnea_config_server.host_len]
+    call linnea_print_stderr
+    lea rdi, [colon_char]
+    mov esi, 1
+    call linnea_print_stderr
+    movzx edi, word [r14 + linnea_config_server.port]
+    call linnea_print_u64_stderr
     lea rdi, [newline_msg]
     mov esi, 1
     call linnea_print_stderr
