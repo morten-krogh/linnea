@@ -90,6 +90,74 @@ def x25519_iter(n):
     return k
 
 
+# --- Ed25519 reference (RFC 8032), for vectors and the differential ------
+_D = (-121665 * pow(121666, _P - 2, _P)) % _P
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _ed_recover_x(y, sign):
+    xx = ((y * y - 1) * pow(_D * y * y + 1, _P - 2, _P)) % _P
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P != 0:
+        x = (x * _I) % _P
+    if x % 2 != sign:
+        x = _P - x
+    return x
+
+
+_ED_BY = (4 * pow(5, _P - 2, _P)) % _P
+_ED_B = (_ed_recover_x(_ED_BY, 0), _ED_BY)
+
+
+def _ed_add(p, q):
+    x1, y1 = p
+    x2, y2 = q
+    x3 = (x1 * y2 + x2 * y1) * pow(1 + _D * x1 * x2 * y1 * y2, _P - 2, _P)
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - _D * x1 * x2 * y1 * y2, _P - 2, _P)
+    return (x3 % _P, y3 % _P)
+
+
+def _ed_scalarmult(p, e):
+    q = (0, 1)
+    while e > 0:
+        if e & 1:
+            q = _ed_add(q, p)
+        p = _ed_add(p, p)
+        e >>= 1
+    return q
+
+
+def _ed_encode(p):
+    x, y = p
+    return bytes((y | ((x & 1) << 255)).to_bytes(32, "little"))
+
+
+def ed25519_sign(seed, msg):
+    h = hashlib.sha512(seed).digest()
+    a = bytearray(h[:32])
+    a[0] &= 248
+    a[31] &= 127
+    a[31] |= 64
+    s = _decode_le(a)
+    prefix = h[32:]
+    pub = _ed_encode(_ed_scalarmult(_ED_B, s))
+    r = _decode_le(hashlib.sha512(prefix + msg).digest()) % _L
+    rr = _ed_encode(_ed_scalarmult(_ED_B, r))
+    k = _decode_le(hashlib.sha512(rr + pub + msg).digest()) % _L
+    ss = (r + k * s) % _L
+    return rr + ss.to_bytes(32, "little")
+
+
+def ed25519_pubkey(seed):
+    h = hashlib.sha512(seed).digest()
+    a = bytearray(h[:32])
+    a[0] &= 248
+    a[31] &= 127
+    a[31] |= 64
+    return _ed_encode(_ed_scalarmult(_ED_B, _decode_le(a)))
+
+
 def blob(label, data):
     """One db line naming a byte string; empty strings still get a label."""
     if not data:
@@ -126,6 +194,28 @@ def main():
     for n, ln in labels:
         out.append("    dq sha_msg_%d, %d, sha_exp_%d\n" % (n, ln, n))
     out.append("sha256_test_count equ (($ - sha256_tests) / 24)\n")
+
+    # ---- SHA-512: same messages, exercising the 128-byte block/pad ----
+    sha512_msgs = [
+        b"",
+        b"abc",
+        b"The quick brown fox jumps over the lazy dog",
+        b"a" * 111,     # largest that still fits one padded block
+        b"a" * 112,     # forces a second, length-only block
+        b"a" * 127,
+        b"a" * 128,     # exactly one block
+        b"a" * 129,
+        bytes(range(256)) * 4,
+    ]
+    labels = []
+    for n, m in enumerate(sha512_msgs):
+        out.append(blob("sha5_msg_%d" % n, m))
+        out.append(blob("sha5_exp_%d" % n, hashlib.sha512(m).digest()))
+        labels.append((n, len(m)))
+    out.append("align 8\nsha512_tests:\n")
+    for n, ln in labels:
+        out.append("    dq sha5_msg_%d, %d, sha5_exp_%d\n" % (n, ln, n))
+    out.append("sha512_test_count equ (($ - sha512_tests) / 24)\n")
 
     # ---- HMAC-SHA256: RFC 4231 test cases 1-7 -----------------------
     hmac_cases = [
@@ -263,6 +353,32 @@ def main():
     for n, rounds in labels:
         out.append("    dq %d, x_iter_exp_%d\n" % (rounds, n))
     out.append("x25519_iter_test_count equ (($ - x25519_iter_tests) / 16)\n")
+
+    # ---- Ed25519 signing vectors ------------------------------------
+    # Expected signatures come from the reference above, which is
+    # cross-checked byte-for-byte against OpenSSL in diff_ed25519.py. The
+    # messages (empty, one byte, and lengths that straddle a SHA-512 block)
+    # exercise the update path inside signing.
+    ed_seeds = [
+        "00" * 32,
+        "9d61b19deffebc3a6c66682ee73310e75a20e33ddf8e37b37b19a11e4e5b8e1e",
+        "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+        "ff" * 32,
+    ]
+    ed_msgs = [b"", bytes.fromhex("72"), bytes.fromhex("af82"), b"a" * 260]
+    labels = []
+    for n, (seed_hex, msg) in enumerate(zip(ed_seeds, ed_msgs)):
+        seed = bytes.fromhex(seed_hex)
+        got = ed25519_sign(seed, msg)
+        out.append(blob("ed_seed_%d" % n, seed))
+        out.append(blob("ed_msg_%d" % n, msg))
+        out.append(blob("ed_sig_%d" % n, got))
+        labels.append((n, len(msg)))
+    out.append("align 8\ned25519_tests:\n")
+    for n, mlen in labels:
+        out.append("    dq ed_seed_%d, ed_msg_%d, %d, ed_sig_%d\n"
+                    % (n, n, mlen, n))
+    out.append("ed25519_test_count equ (($ - ed25519_tests) / 32)\n")
 
     print("".join(out), end="")
 

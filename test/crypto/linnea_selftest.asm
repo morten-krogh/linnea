@@ -21,18 +21,24 @@ global _start
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 extern linnea_sha256
+extern linnea_sha512
 extern linnea_hmac_sha256
 extern linnea_hkdf_extract
 extern linnea_hkdf_expand
 extern linnea_x25519
+extern linnea_ed25519_sign
 
 section .rodata
 
 mode_stdin:  db "sha256-stdin", 0
+mode_s512:   db "sha512-stdin", 0
 mode_xstdin: db "x25519-stdin", 0
 mode_xiter:  db "x25519-iter", 0
+mode_edstd:  db "ed25519-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
+lbl_sha5:    db "sha512 "
+lbl_sha5_len equ $ - lbl_sha5
 lbl_hmac:    db "hmac "
 lbl_hmac_len equ $ - lbl_hmac
 lbl_ext:     db "hkdf-extract "
@@ -43,6 +49,8 @@ lbl_x:       db "x25519 "
 lbl_x_len    equ $ - lbl_x
 lbl_xi:      db "x25519-iter "
 lbl_xi_len   equ $ - lbl_xi
+lbl_ed:      db "ed25519 "
+lbl_ed_len   equ $ - lbl_ed
 sep_slash:   db "/"
 nl:          db 10
 
@@ -67,6 +75,11 @@ _start:
     test eax, eax
     jnz .stdin
     mov rdi, [rsp + 16]
+    lea rsi, [mode_s512]
+    call streq
+    test eax, eax
+    jnz .s512
+    mov rdi, [rsp + 16]
     lea rsi, [mode_xstdin]
     call streq
     test eax, eax
@@ -76,6 +89,11 @@ _start:
     call streq
     test eax, eax
     jnz .xiter
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_edstd]
+    call streq
+    test eax, eax
+    jnz .edstdin
 
 ; ---- known-answer tables --------------------------------------------
 .vectors:
@@ -110,6 +128,35 @@ _start:
     add r15, sha256_test_count
     sub r15, r13               ; += (total - pass); the count is a constant,
                                ; rcx was clobbered by report's print calls
+
+    ; SHA-512
+    lea rbx, [sha512_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.sha5_loop:
+    cmp r12, sha512_test_count
+    jae .sha5_done
+    imul rax, r12, 24
+    lea r14, [rbx + rax]
+    mov rdi, [r14 + 0]
+    mov rsi, [r14 + 8]
+    lea rdx, [outbuf]
+    call linnea_sha512
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 16]
+    mov rcx, 64
+    call memeq
+    add r13, rax
+    inc r12
+    jmp .sha5_loop
+.sha5_done:
+    lea rdi, [lbl_sha5]
+    mov rsi, lbl_sha5_len
+    mov rdx, r13
+    mov rcx, sha512_test_count
+    call report
+    add r15, sha512_test_count
+    sub r15, r13
 
     ; HMAC
     lea rbx, [hmac_tests]
@@ -262,6 +309,36 @@ _start:
     add r15, x25519_iter_test_count
     sub r15, r13
 
+    ; Ed25519 signing
+    lea rbx, [ed25519_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.ed_loop:
+    cmp r12, ed25519_test_count
+    jae .ed_done
+    imul rax, r12, 32
+    lea r14, [rbx + rax]
+    lea rdi, [outbuf]          ; sig out (64 bytes)
+    mov rsi, [r14 + 8]         ; msg
+    mov rdx, [r14 + 16]        ; msglen
+    mov rcx, [r14 + 0]         ; seed
+    call linnea_ed25519_sign
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 24]        ; expected sig
+    mov rcx, 64
+    call memeq
+    add r13, rax
+    inc r12
+    jmp .ed_loop
+.ed_done:
+    lea rdi, [lbl_ed]
+    mov rsi, lbl_ed_len
+    mov rdx, r13
+    mov rcx, ed25519_test_count
+    call report
+    add r15, ed25519_test_count
+    sub r15, r13
+
     ; exit 1 if anything failed
     mov edi, 1
     test r15, r15
@@ -312,6 +389,32 @@ _start:
     mov eax, LINNEA_SYS_EXIT
     syscall
 
+; ---- ed25519-stdin: frames of [4-byte len][seed32 || msg] -> 64-byte sig
+.edstdin:
+    lea rdi, [lenbuf]
+    mov rsi, 4
+    call read_full
+    cmp eax, 4
+    jne .edstdin_done
+    mov ecx, [lenbuf]
+    lea rdi, [inbuf]
+    mov rsi, rcx
+    call read_full
+    lea rdi, [outbuf]          ; sig (64)
+    lea rsi, [inbuf + 32]      ; msg
+    mov edx, [lenbuf]
+    sub edx, 32                ; msglen = frame - seed
+    lea rcx, [inbuf]           ; seed
+    call linnea_ed25519_sign
+    lea rdi, [outbuf]
+    mov rsi, 64
+    call linnea_print_stdout
+    jmp .edstdin
+.edstdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
 ; ---- sha256-stdin differential mode ---------------------------------
 .stdin:
     lea rdi, [lenbuf]
@@ -332,6 +435,30 @@ _start:
     call linnea_print_stdout
     jmp .stdin
 .stdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; ---- sha512-stdin differential mode ---------------------------------
+.s512:
+    lea rdi, [lenbuf]
+    mov rsi, 4
+    call read_full
+    cmp eax, 4
+    jne .s512_done
+    mov ecx, [lenbuf]
+    lea rdi, [inbuf]
+    mov rsi, rcx
+    call read_full
+    lea rdi, [inbuf]
+    mov esi, [lenbuf]
+    lea rdx, [outbuf]
+    call linnea_sha512
+    lea rdi, [outbuf]
+    mov rsi, 64
+    call linnea_print_stdout
+    jmp .s512
+.s512_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall
