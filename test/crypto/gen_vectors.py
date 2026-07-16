@@ -9,6 +9,8 @@ the incremental buffering path. Run: python3 gen_vectors.py > sha256_vectors.inc
 """
 import hashlib
 import hmac
+import json
+import os
 
 
 def hkdf_extract(salt, ikm):
@@ -156,6 +158,116 @@ def ed25519_pubkey(seed):
     a[31] &= 127
     a[31] |= 64
     return _ed_encode(_ed_scalarmult(_ED_B, _decode_le(a)))
+
+
+# --- AES-128-GCM reference (NIST SP 800-38D), for vectors and the ------
+# --- differential. The S-box is generated, not typed, to avoid typos. ---
+def _aes_build_sbox():
+    exp, log = [0] * 256, [0] * 256
+    x = 1
+    for i in range(255):
+        exp[i], log[x] = x, i
+        x ^= (x << 1) ^ (0x11B if x & 0x80 else 0)
+    exp[255] = exp[0]          # 3^255 = 3^0; inv(1) reads this slot
+    sbox = [0x63] * 256
+    for b in range(1, 256):
+        inv = exp[255 - log[b]]
+        s = 0
+        for shift in (0, 1, 2, 3, 4):
+            s ^= ((inv << shift) | (inv >> (8 - shift))) & 0xFF
+        sbox[b] = s ^ 0x63
+    return sbox
+
+
+_SBOX = _aes_build_sbox()
+
+
+def _xtime(b):
+    return ((b << 1) ^ 0x1B) & 0xFF if b & 0x80 else b << 1
+
+
+def _aes128_expand(key):
+    w = [list(key[4 * i:4 * i + 4]) for i in range(4)]
+    rcon = 1
+    for i in range(4, 44):
+        t = list(w[i - 1])
+        if i % 4 == 0:
+            t = [_SBOX[t[1]] ^ rcon, _SBOX[t[2]], _SBOX[t[3]], _SBOX[t[0]]]
+            rcon = _xtime(rcon)
+        w.append([a ^ b for a, b in zip(w[i - 4], t)])
+    return [sum(w[4 * r + c][i] << (8 * (4 * c + i) - 0) for c in range(4)
+                for i in range(4)) for r in range(11)]
+
+
+def _aes128_encrypt(rk, block):
+    s = [b for b in block]
+    def add_rk(r):
+        k = rk[r]
+        for i in range(16):
+            s[i] ^= (k >> (8 * i)) & 0xFF
+    add_rk(0)
+    for rnd in range(1, 11):
+        s[:] = [_SBOX[b] for b in s]
+        s[:] = [s[(i + 4 * (i % 4)) % 16] for i in range(16)]  # ShiftRows
+        if rnd < 10:
+            for c in range(0, 16, 4):
+                a = s[c:c + 4]
+                t = a[0] ^ a[1] ^ a[2] ^ a[3]
+                s[c + 0] ^= t ^ _xtime(a[0] ^ a[1])
+                s[c + 1] ^= t ^ _xtime(a[1] ^ a[2])
+                s[c + 2] ^= t ^ _xtime(a[2] ^ a[3])
+                s[c + 3] ^= t ^ _xtime(a[3] ^ a[0])
+        add_rk(rnd)
+    return bytes(s)
+
+
+def _gmul(x, y):
+    R = 0xE1 << 120
+    z, v = 0, x
+    for i in range(127, -1, -1):
+        if (y >> i) & 1:
+            z ^= v
+        v = (v >> 1) ^ (R if v & 1 else 0)
+    return z
+
+
+def _ghash(h, aad, ct):
+    def pad(b):
+        return b + bytes(-len(b) % 16)
+    data = pad(aad) + pad(ct) + (len(aad) * 8).to_bytes(8, "big") \
+        + (len(ct) * 8).to_bytes(8, "big")
+    y = 0
+    for i in range(0, len(data), 16):
+        y = _gmul(y ^ int.from_bytes(data[i:i + 16], "big"), h)
+    return y.to_bytes(16, "big")
+
+
+def _gcm_keystream(rk, nonce, nbytes):
+    ks, ctr = b"", 2
+    while len(ks) < nbytes:
+        ks += _aes128_encrypt(rk, nonce + ctr.to_bytes(4, "big"))
+        ctr += 1
+    return ks[:nbytes]
+
+
+def aesgcm_seal(key, nonce, aad, pt):
+    """Returns ct || tag, the same shape linnea_aesgcm_seal writes."""
+    rk = _aes128_expand(key)
+    h = int.from_bytes(_aes128_encrypt(rk, bytes(16)), "big")
+    ct = bytes(a ^ b for a, b in zip(pt, _gcm_keystream(rk, nonce, len(pt))))
+    s = _ghash(h, aad, ct)
+    tmask = _aes128_encrypt(rk, nonce + b"\x00\x00\x00\x01")
+    return ct + bytes(a ^ b for a, b in zip(s, tmask))
+
+
+def _det_bytes(tag, n):
+    """Deterministic pseudo-random test data (stable across runs)."""
+    out = b""
+    ctr = 0
+    while len(out) < n:
+        out += hashlib.sha256(b"linnea-gcm:%s:%d" % (tag, ctr)).digest()
+        ctr += 1
+    return out[:n]
 
 
 def blob(label, data):
@@ -379,6 +491,121 @@ def main():
         out.append("    dq ed_seed_%d, ed_msg_%d, %d, ed_sig_%d\n"
                     % (n, n, mlen, n))
     out.append("ed25519_test_count equ (($ - ed25519_tests) / 32)\n")
+
+    # ---- AES-128-GCM ------------------------------------------------
+    # The reference above is asserted against the McGrew-Viega spec
+    # vectors and every Wycheproof case for our exact profile (128-bit
+    # key, 96-bit nonce, 128-bit tag) before anything is emitted.
+    mv = [
+        ("00" * 16, "00" * 12, "", "",
+         "58e2fccefa7e3061367f1d57a4e7455a"),
+        ("00" * 16, "00" * 12, "", "00" * 16,
+         "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf"),
+        ("feffe9928665731c6d6a8f9467308308", "cafebabefacedbaddecaf888", "",
+         "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
+         "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255",
+         "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e"
+         "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f5985"
+         "4d5c2af327cd64a62cf35abd2ba6fab4"),
+        ("feffe9928665731c6d6a8f9467308308", "cafebabefacedbaddecaf888",
+         "feedfacedeadbeeffeedfacedeadbeefabaddad2",
+         "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
+         "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39",
+         "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e"
+         "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091"
+         "5bc94fbc3221a5db94fae95ae7121a47"),
+    ]
+    mv_cases = []
+    for keyh, ivh, aadh, pth, exph in mv:
+        key, iv, aad, pt, exp = (bytes.fromhex(h)
+                                 for h in (keyh, ivh, aadh, pth, exph))
+        got = aesgcm_seal(key, iv, aad, pt)
+        assert got == exp, ("McGrew-Viega", got.hex(), exph)
+        mv_cases.append((key, iv, aad, pt, exp))
+
+    wy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "wycheproof_aes_gcm.json")
+    with open(wy_path) as f:
+        wy_data = json.load(f)
+    wy = []
+    for g in wy_data["testGroups"]:
+        if g["keySize"] == 128 and g["ivSize"] == 96 and g["tagSize"] == 128:
+            for t in g["tests"]:
+                key, iv, aad, msg, ct, tag = (
+                    bytes.fromhex(t[k])
+                    for k in ("key", "iv", "aad", "msg", "ct", "tag"))
+                valid = t["result"] == "valid"
+                assert (aesgcm_seal(key, iv, aad, msg) == ct + tag) == valid, \
+                    ("wycheproof tcId", t["tcId"])
+                wy.append((key, iv, aad, msg, ct + tag, valid))
+
+    # Boundary lengths: empty, one byte, straddling every block edge, a
+    # TLS-record-header-sized AAD (5), and one multi-KB message.
+    gen_lens = [(0, 0), (0, 5), (1, 0), (15, 5), (16, 0), (16, 13),
+                (17, 5), (31, 0), (32, 32), (33, 1), (63, 5), (64, 0),
+                (65, 17), (255, 5), (256, 16), (1024, 5), (4109, 5)]
+    gen_cases = []
+    for n, (ptl, aadl) in enumerate(gen_lens):
+        key = _det_bytes(b"key%d" % n, 16)
+        nonce = _det_bytes(b"nonce%d" % n, 12)
+        aad = _det_bytes(b"aad%d" % n, aadl)
+        pt = _det_bytes(b"pt%d" % n, ptl)
+        gen_cases.append((key, nonce, aad, pt,
+                          aesgcm_seal(key, nonce, aad, pt)))
+
+    seal_cases = gen_cases + mv_cases \
+        + [(k, i, a, m, ct) for (k, i, a, m, ct, valid) in wy if valid]
+    labels = []
+    for n, (key, nonce, aad, pt, exp) in enumerate(seal_cases):
+        out.append(blob("gcm_s_key_%d" % n, key))
+        out.append(blob("gcm_s_nonce_%d" % n, nonce))
+        out.append(blob("gcm_s_aad_%d" % n, aad))
+        out.append(blob("gcm_s_pt_%d" % n, pt))
+        out.append(blob("gcm_s_exp_%d" % n, exp))
+        labels.append((n, len(aad), len(pt)))
+    out.append("align 8\naesgcm_seal_tests:\n")
+    for n, al, pl in labels:
+        out.append("    dq gcm_s_key_%d, gcm_s_nonce_%d, gcm_s_aad_%d, %d, "
+                   "gcm_s_pt_%d, %d, gcm_s_exp_%d\n" % (n, n, n, al, n, pl, n))
+    out.append("aesgcm_seal_test_count equ (($ - aesgcm_seal_tests) / 56)\n")
+
+    # Open cases: every Wycheproof case (the invalid ones must be
+    # rejected with the output zeroed), round-trips of the boundary
+    # cases, plus local tampering: tag bit, ciphertext byte, AAD byte,
+    # and inputs shorter than a tag.
+    def flipped(b, i, bit):
+        b = bytearray(b)
+        b[i] ^= bit
+        return bytes(b)
+
+    open_cases = []
+    for (key, iv, aad, msg, cttag, valid) in wy:
+        exp_pt = msg if valid else bytes(max(len(cttag) - 16, 0))
+        open_cases.append((key, iv, aad, cttag, exp_pt, 1 if valid else 0))
+    for (key, nonce, aad, pt, cttag) in gen_cases:
+        open_cases.append((key, nonce, aad, cttag, pt, 1))
+    key, nonce, aad, pt, cttag = gen_cases[5]      # 16-byte pt, 13-byte aad
+    zero_pt = bytes(len(pt))
+    open_cases.append((key, nonce, aad,
+                       flipped(cttag, len(cttag) - 1, 1), zero_pt, 0))
+    open_cases.append((key, nonce, aad, flipped(cttag, 0, 0x80), zero_pt, 0))
+    open_cases.append((key, nonce, flipped(aad, 0, 1), cttag, zero_pt, 0))
+    open_cases.append((key, nonce, aad, cttag[:15], b"", 0))
+    open_cases.append((key, nonce, aad, b"", b"", 0))
+    labels = []
+    for n, (key, nonce, aad, ct, exp_pt, ok) in enumerate(open_cases):
+        out.append(blob("gcm_o_key_%d" % n, key))
+        out.append(blob("gcm_o_nonce_%d" % n, nonce))
+        out.append(blob("gcm_o_aad_%d" % n, aad))
+        out.append(blob("gcm_o_ct_%d" % n, ct))
+        out.append(blob("gcm_o_pt_%d" % n, exp_pt))
+        labels.append((n, len(aad), len(ct), ok))
+    out.append("align 8\naesgcm_open_tests:\n")
+    for n, al, cl, ok in labels:
+        out.append("    dq gcm_o_key_%d, gcm_o_nonce_%d, gcm_o_aad_%d, %d, "
+                   "gcm_o_ct_%d, %d, gcm_o_pt_%d, %d\n"
+                   % (n, n, n, al, n, cl, n, ok))
+    out.append("aesgcm_open_test_count equ (($ - aesgcm_open_tests) / 64)\n")
 
     print("".join(out), end="")
 

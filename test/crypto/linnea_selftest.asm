@@ -14,6 +14,7 @@ default rel
 
 %include "linnea_syscall.inc"
 %include "linnea_sha256.inc"
+%include "linnea_aesgcm.inc"
 %include "sha256_vectors.inc"
 
 global _start
@@ -27,6 +28,9 @@ extern linnea_hkdf_extract
 extern linnea_hkdf_expand
 extern linnea_x25519
 extern linnea_ed25519_sign
+extern linnea_aesgcm_init
+extern linnea_aesgcm_seal
+extern linnea_aesgcm_open
 
 section .rodata
 
@@ -35,6 +39,8 @@ mode_s512:   db "sha512-stdin", 0
 mode_xstdin: db "x25519-stdin", 0
 mode_xiter:  db "x25519-iter", 0
 mode_edstd:  db "ed25519-stdin", 0
+mode_gseal:  db "aesgcm-stdin", 0
+mode_gopen:  db "aesgcm-open-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
 lbl_sha5:    db "sha512 "
@@ -51,17 +57,22 @@ lbl_xi:      db "x25519-iter "
 lbl_xi_len   equ $ - lbl_xi
 lbl_ed:      db "ed25519 "
 lbl_ed_len   equ $ - lbl_ed
+lbl_gs:      db "aesgcm-seal "
+lbl_gs_len   equ $ - lbl_gs
+lbl_go:      db "aesgcm-open "
+lbl_go_len   equ $ - lbl_go
 sep_slash:   db "/"
 nl:          db 10
 
 section .bss
 
-outbuf:      resb 128           ; digest / OKM scratch
+outbuf:      resb 1 << 20       ; digest / OKM / AEAD output scratch
 lenbuf:      resb 8
 inbuf:       resb 1 << 20       ; stdin-mode input frame
 iter_k:      resb 32            ; X25519 iterated-test working values
 iter_u:      resb 32
 iter_r:      resb 32
+gcm_ctx:     resb linnea_aesgcm_ctx_size
 
 section .text
 
@@ -94,6 +105,16 @@ _start:
     call streq
     test eax, eax
     jnz .edstdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_gseal]
+    call streq
+    test eax, eax
+    jnz .gsstdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_gopen]
+    call streq
+    test eax, eax
+    jnz .gostdin
 
 ; ---- known-answer tables --------------------------------------------
 .vectors:
@@ -339,6 +360,96 @@ _start:
     add r15, ed25519_test_count
     sub r15, r13
 
+    ; AES-GCM seal: out must be ct || tag, ptlen + 16 bytes
+    lea rbx, [aesgcm_seal_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.gs_loop:
+    cmp r12, aesgcm_seal_test_count
+    jae .gs_done
+    imul rax, r12, 56
+    lea r14, [rbx + rax]
+    lea rdi, [gcm_ctx]
+    mov rsi, [r14 + 0]         ; key
+    call linnea_aesgcm_init
+    lea rdi, [gcm_ctx]
+    mov rsi, [r14 + 8]         ; nonce
+    mov rdx, [r14 + 16]        ; aad
+    mov rcx, [r14 + 24]        ; aadlen
+    mov r8,  [r14 + 32]        ; pt
+    mov r9,  [r14 + 40]        ; ptlen
+    sub rsp, 16
+    lea rax, [outbuf]
+    mov [rsp], rax
+    call linnea_aesgcm_seal
+    add rsp, 16
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 48]        ; expected ct || tag
+    mov rcx, [r14 + 40]
+    add rcx, 16
+    call memeq
+    add r13, rax
+    inc r12
+    jmp .gs_loop
+.gs_done:
+    lea rdi, [lbl_gs]
+    mov rsi, lbl_gs_len
+    mov rdx, r13
+    mov rcx, aesgcm_seal_test_count
+    call report
+    add r15, aesgcm_seal_test_count
+    sub r15, r13
+
+    ; AES-GCM open: the ok flag must match, and out must hold the
+    ; expected plaintext (zeros for rejected inputs)
+    lea rbx, [aesgcm_open_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.go_loop:
+    cmp r12, aesgcm_open_test_count
+    jae .go_done
+    imul rax, r12, 64
+    lea r14, [rbx + rax]
+    lea rdi, [gcm_ctx]
+    mov rsi, [r14 + 0]         ; key
+    call linnea_aesgcm_init
+    lea rdi, [gcm_ctx]
+    mov rsi, [r14 + 8]         ; nonce
+    mov rdx, [r14 + 16]        ; aad
+    mov rcx, [r14 + 24]        ; aadlen
+    mov r8,  [r14 + 32]        ; ct || tag
+    mov r9,  [r14 + 40]        ; ctlen incl. tag
+    sub rsp, 16
+    lea rax, [outbuf]
+    mov [rsp], rax
+    call linnea_aesgcm_open
+    add rsp, 16
+    xor edx, edx
+    test rax, rax
+    setz dl                    ; 1 = accepted
+    cmp rdx, [r14 + 56]        ; expected ok flag
+    jne .go_next
+    mov rcx, [r14 + 40]        ; plaintext length, 0 if shorter than a tag
+    sub rcx, 16
+    jns .go_ptlen
+    xor ecx, ecx
+.go_ptlen:
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 48]        ; expected plaintext
+    call memeq
+    add r13, rax
+.go_next:
+    inc r12
+    jmp .go_loop
+.go_done:
+    lea rdi, [lbl_go]
+    mov rsi, lbl_go_len
+    mov rdx, r13
+    mov rcx, aesgcm_open_test_count
+    call report
+    add r15, aesgcm_open_test_count
+    sub r15, r13
+
     ; exit 1 if anything failed
     mov edi, 1
     test r15, r15
@@ -411,6 +522,94 @@ _start:
     call linnea_print_stdout
     jmp .edstdin
 .edstdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; ---- aesgcm-stdin: frames of [4-byte len][key16 || nonce12 ||
+; aadlen4 || aad || pt] -> ct || tag (ptlen + 16 bytes) ----------------
+.gsstdin:
+    lea rdi, [lenbuf]
+    mov rsi, 4
+    call read_full
+    cmp eax, 4
+    jne .gsstdin_done
+    mov ecx, [lenbuf]
+    lea rdi, [inbuf]
+    mov rsi, rcx
+    call read_full
+    lea rdi, [gcm_ctx]
+    lea rsi, [inbuf]           ; key
+    call linnea_aesgcm_init
+    mov ecx, [inbuf + 28]      ; aadlen
+    lea rdx, [inbuf + 32]      ; aad
+    lea r8, [rdx + rcx]        ; pt
+    mov r9d, [lenbuf]
+    sub r9, 32
+    sub r9, rcx                ; ptlen = frame - key - nonce - aadlen4 - aad
+    lea rdi, [gcm_ctx]
+    lea rsi, [inbuf + 16]      ; nonce
+    sub rsp, 16
+    lea rax, [outbuf]
+    mov [rsp], rax
+    call linnea_aesgcm_seal
+    add rsp, 16
+    mov esi, [lenbuf]          ; reply length = ptlen + 16
+    sub esi, 16
+    sub esi, [inbuf + 28]
+    lea rdi, [outbuf]
+    call linnea_print_stdout
+    jmp .gsstdin
+.gsstdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; ---- aesgcm-open-stdin: frames of [4-byte len][key16 || nonce12 ||
+; aadlen4 || aad || ct || tag] -> [1-byte rc][pt (ctlen - 16 bytes,
+; zeros when the tag was rejected)] ------------------------------------
+.gostdin:
+    lea rdi, [lenbuf]
+    mov rsi, 4
+    call read_full
+    cmp eax, 4
+    jne .gostdin_done
+    mov ecx, [lenbuf]
+    lea rdi, [inbuf]
+    mov rsi, rcx
+    call read_full
+    lea rdi, [gcm_ctx]
+    lea rsi, [inbuf]           ; key
+    call linnea_aesgcm_init
+    mov ecx, [inbuf + 28]      ; aadlen
+    lea rdx, [inbuf + 32]      ; aad
+    lea r8, [rdx + rcx]        ; ct || tag
+    mov r9d, [lenbuf]
+    sub r9, 32
+    sub r9, rcx                ; ctlen incl. tag
+    lea rdi, [gcm_ctx]
+    lea rsi, [inbuf + 16]      ; nonce
+    sub rsp, 16
+    lea rax, [outbuf + 1]      ; plaintext lands after the rc byte
+    mov [rsp], rax
+    call linnea_aesgcm_open
+    add rsp, 16
+    xor edx, edx
+    test rax, rax
+    setnz dl                   ; rc: 0 accepted, 1 rejected
+    mov [outbuf], dl
+    mov esi, [lenbuf]          ; reply length = 1 + (ctlen - 16)
+    sub esi, 32
+    sub esi, [inbuf + 28]
+    sub esi, 16
+    jns .gostdin_write
+    xor esi, esi
+.gostdin_write:
+    inc esi
+    lea rdi, [outbuf]
+    call linnea_print_stdout
+    jmp .gostdin
+.gostdin_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall
