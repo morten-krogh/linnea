@@ -3,6 +3,7 @@
 ; syscall clobbers rcx and r11. Errors return -errno in rax
 ; (unsigned rax > -4096, test with: cmp rax, -4095 / jae error).
 
+LINNEA_SYS_READ      equ 0
 LINNEA_SYS_WRITE     equ 1
 LINNEA_SYS_OPEN      equ 2
 LINNEA_SYS_CLOSE     equ 3

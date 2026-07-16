@@ -1,0 +1,3 @@
+# Build artifacts: object files and the generated vector table.
+*.o
+sha256_vectors.inc

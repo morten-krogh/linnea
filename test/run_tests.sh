@@ -85,6 +85,21 @@ run_test "empty locations"  1 stderr "at least one location" \
 run_test "duplicate hostname" 1 stderr "duplicate hostname DUP.Test on 127.0.0.1:47080" \
     $BIN test/configs/dup-hostname.json
 
+# --- crypto self-test: known-answer vectors for the TLS primitives ---
+# Runs the pre-built binary (built by `make test`/`make selftest`); the
+# heavy differential/fuzz harnesses under test/crypto/ run on demand.
+if [ -x ./bin/linnea-selftest ]; then
+    if ./bin/linnea-selftest >/tmp/linnea_selftest.out 2>&1; then
+        check "crypto selftest ($(tr '\n' ' ' </tmp/linnea_selftest.out))" 0
+    else
+        check "crypto selftest" 1
+        cat /tmp/linnea_selftest.out
+    fi
+    rm -f /tmp/linnea_selftest.out
+else
+    check "crypto selftest (binary not built — run 'make selftest')" 1
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is

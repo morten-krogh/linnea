@@ -26,10 +26,28 @@ $(LIBURING_A):
 src/%.o: src/%.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
 
-clean:
-	rm -f $(OBJS) $(BIN)
+# --- crypto self-test binary (own _start; links only what it needs) ---
+SELFTEST_BIN  = bin/linnea-selftest
+SELFTEST_OBJS = test/crypto/linnea_selftest.o src/linnea_sha256.o \
+                src/linnea_print.o src/linnea_string.o
+CRYPTO_VECS   = test/crypto/sha256_vectors.inc
 
-test: $(BIN)
+$(CRYPTO_VECS): test/crypto/gen_vectors.py
+	python3 $< > $@
+
+test/crypto/linnea_selftest.o: test/crypto/linnea_selftest.asm $(INCS) $(CRYPTO_VECS)
+	$(NASM) $(NASMFLAGS) -I test/crypto/ -o $@ $<
+
+$(SELFTEST_BIN): $(SELFTEST_OBJS)
+	$(LD) -o $@ $^
+
+selftest: $(SELFTEST_BIN)
+	./$(SELFTEST_BIN)
+
+clean:
+	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) test/crypto/*.o $(CRYPTO_VECS)
+
+test: $(BIN) $(SELFTEST_BIN)
 	./test/run_tests.sh
 
-.PHONY: all clean test
+.PHONY: all clean test selftest
