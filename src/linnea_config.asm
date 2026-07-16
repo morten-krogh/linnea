@@ -60,6 +60,13 @@ msg_empty_root:         db "location root must not be empty"
 msg_empty_root_len      equ $ - msg_empty_root
 msg_empty_log:          db "config log must not be empty"
 msg_empty_log_len       equ $ - msg_empty_log
+msg_cert_key:           db "server needs both cert and key, or neither"
+msg_cert_key_len        equ $ - msg_cert_key
+msg_tls_mismatch:       db "servers sharing a listener must all set TLS or none"
+msg_tls_mismatch_len    equ $ - msg_tls_mismatch
+
+dump_tls_on:            db " tls=on cert="
+dump_tls_on_len         equ $ - dump_tls_on
 
 section .bss
 
@@ -108,6 +115,20 @@ linnea_config_validate:
     inc r11
     jmp .loc_loop
 .loc_done:
+    ; TLS is both-or-neither; when both paths are present mark the server
+    ; TLS so the listener-consistency pass and the accept path can see it.
+    mov r10, [r9 + linnea_config_server.cert_path_len]
+    mov r11, [r9 + linnea_config_server.key_path_len]
+    test r10, r10
+    jnz .has_cert
+    test r11, r11
+    jnz .cert_key            ; key without cert
+    jmp .server_next        ; neither: plaintext
+.has_cert:
+    test r11, r11
+    jz .cert_key            ; cert without key
+    mov dword [r9 + linnea_config_server.tls], 1
+.server_next:
     inc r8
     jmp .loop
 .ok:
@@ -143,6 +164,11 @@ linnea_config_validate:
     call linnea_string_equal
     test eax, eax
     jz .dup_prior_next
+    ; same host:port -> the two servers share a listener; their TLS-ness
+    ; must agree (v1 has no SNI cert selection: one listener, one profile)
+    mov eax, [r13 + linnea_config_server.tls]
+    cmp eax, [r15 + linnea_config_server.tls]
+    jne .tls_mismatch
     lea rdi, [r13 + linnea_config_server.hostname]
     mov rsi, [r13 + linnea_config_server.hostname_len]
     lea rdx, [r15 + linnea_config_server.hostname]
@@ -197,6 +223,14 @@ linnea_config_validate:
 .empty_log:
     lea rdi, [msg_empty_log]
     mov esi, msg_empty_log_len
+    jmp linnea_error_exit
+.cert_key:
+    lea rdi, [msg_cert_key]
+    mov esi, msg_cert_key_len
+    jmp linnea_error_exit
+.tls_mismatch:
+    lea rdi, [msg_tls_mismatch]
+    mov esi, msg_tls_mismatch_len
     jmp linnea_error_exit
 
 ; linnea_config_dump(rdi=config*) — human-readable dump to stdout:
@@ -257,6 +291,15 @@ linnea_config_dump:
     lea rdi, [r13 + linnea_config_server.hostname]
     mov rsi, [r13 + linnea_config_server.hostname_len]
     call linnea_print_stdout
+    cmp dword [r13 + linnea_config_server.tls], 0
+    je .no_tls
+    lea rdi, [dump_tls_on]
+    mov esi, dump_tls_on_len
+    call linnea_print_stdout
+    lea rdi, [r13 + linnea_config_server.cert_path]
+    mov rsi, [r13 + linnea_config_server.cert_path_len]
+    call linnea_print_stdout
+.no_tls:
     lea rdi, [dump_locations]
     mov esi, dump_locations_len
     call linnea_print_stdout

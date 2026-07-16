@@ -37,6 +37,7 @@ default rel
 %include "linnea_connection.inc"
 %include "linnea_http.inc"
 %include "linnea_uring.inc"
+%include "linnea_tls.inc"
 
 global linnea_uring_run
 
@@ -60,6 +61,10 @@ extern linnea_print_u64_stderr
 extern linnea_log_write
 extern linnea_log_u64
 extern linnea_log_stamp
+extern linnea_tls_hs_init
+extern linnea_tls_hs_input
+extern linnea_tls_drain_early
+extern linnea_ktls_enable
 
 section .rodata
 
@@ -116,6 +121,14 @@ reason_up_closed:   db "upstream closed"
 reason_up_closed_len equ $ - reason_up_closed
 reason_up_send_err: db "upstream send error"
 reason_up_send_err_len equ $ - reason_up_send_err
+reason_tls_failed:  db "tls handshake failed"
+reason_tls_failed_len equ $ - reason_tls_failed
+reason_tls_badrec:  db "tls bad record"
+reason_tls_badrec_len equ $ - reason_tls_badrec
+reason_tls_split:   db "tls pipelined record too large to buffer"
+reason_tls_split_len equ $ - reason_tls_split
+reason_tls_ktls:    db "tls kernel handoff failed"
+reason_tls_ktls_len equ $ - reason_tls_ktls
 
 section .data
 
@@ -129,6 +142,22 @@ idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
                                ; tunnel's last_activity comparison
 
 section .text
+
+; A TLS connection's handshake state is overlaid on its up_buf (see the
+; accept path): nothing is proxied until the handshake is done, so the two
+; never coexist. That overlay is load-bearing — msg_buf's own bounds are
+; derived from it — so assert it here rather than trust the comment on
+; LINNEA_TLS_MSG_BUF. Emits no bytes; a struc that outgrows up_buf makes
+; the divisor zero and fails the assembly.
+[absolute 0]
+    resb 1 / (LINNEA_CONN_UP_BUF >= linnea_tls_hs_size)
+    ; .tls_handoff hands out_buf to linnea_tls_drain_early as the scratch a
+    ; record's plaintext is decrypted into, bounded only by in_buf's size —
+    ; and decryption happens before the tag is checked, so this bound has to
+    ; hold for a peer that knows no keys. The two buffers are sized
+    ; independently, so state the relationship instead of relying on it.
+    resb 1 / (LINNEA_CONN_OUT_BUF >= LINNEA_CONN_IN_BUF)
+__?SECT?__
 
 ; linnea_uring_run(rdi=config*) — set up the ring, arm accepts, loop forever.
 ; Only returns by exiting the process on error.
@@ -222,6 +251,22 @@ linnea_uring_run:
     mov [r12 + linnea_connection.peer_len], rax
     mov rdi, r12
     call linnea_uring_log_accept
+    ; TLS listeners begin a userspace handshake before any HTTP; its state
+    ; overlays up_buf (no proxying can be active yet). The accepting server
+    ; is always the listener owner, whose cert this connection serves.
+    mov eax, [r12 + linnea_connection.server]
+    imul rax, rax, linnea_config_server_size
+    lea rax, [rbx + rax + linnea_config.servers]
+    cmp dword [rax + linnea_config_server.tls], 0
+    je .accept_recv
+    lea rdi, [r12 + linnea_connection.up_buf]
+    mov rsi, [rax + linnea_config_server.cert_der]
+    mov rdx, [rax + linnea_config_server.cert_der_len]
+    mov rcx, [rax + linnea_config_server.key_seed]
+    xor r8d, r8d
+    call linnea_tls_hs_init
+    mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
+.accept_recv:
     mov rdi, r12
     call linnea_uring_arm_recv
     call linnea_uring_submit_now
@@ -259,6 +304,8 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax               ; connection*
+    cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
+    je .tls_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
     je .tunnel_client_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
@@ -268,6 +315,9 @@ linnea_uring_run:
     jz .recv_eof
     cmp r15d, -LINNEA_ECANCELED
     je .recv_timeout
+    call tls_recv_is_eof
+    test eax, eax
+    jnz .recv_eof
     lea r14, [reason_recv_err]
     mov r15d, reason_recv_err_len
     jmp .conn_close
@@ -311,6 +361,8 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
+    cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
+    je .tls_on_send
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
     je .tunnel_client_send
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
@@ -384,6 +436,170 @@ linnea_uring_run:
     call linnea_uring_arm_recv
     call linnea_uring_submit_now
     jmp .wait
+
+; --- TLS handshake phase: r12 = connection*, r15d = bytes or -errno -----
+; While tls_phase is set, client recv/send drive the userspace handshake
+; (state overlaid on up_buf) instead of HTTP. On completion the app keys
+; go to the kernel (kTLS) and the connection becomes an ordinary plaintext
+; one — the rest of the loop never learns it was ever encrypted.
+.tls_recv:
+    test r15d, r15d
+    jg .tls_recv_data
+    jz .tls_peer_closed
+    cmp r15d, -LINNEA_ECANCELED
+    je .tls_recv_timeout
+    lea r14, [reason_recv_err]
+    mov r15d, reason_recv_err_len
+    jmp .conn_close
+.tls_peer_closed:
+    lea r14, [reason_peer]
+    mov r15d, reason_peer_len
+    jmp .conn_close
+.tls_recv_timeout:
+    lea r14, [reason_timeout]
+    mov r15d, reason_timeout_len
+    jmp .conn_close
+.tls_recv_data:
+    mov eax, r15d
+    add [r12 + linnea_connection.in_len], rax
+    ; Already DONE: the handshake is over and we are only here to collect
+    ; the rest of a record the client pipelined behind its Finished, which
+    ; must be whole before the kernel can take the socket over.
+    cmp dword [r12 + linnea_connection.up_buf + linnea_tls_hs.state], LINNEA_TLS_DONE
+    je .tls_handoff
+.tls_process:
+    lea rdi, [r12 + linnea_connection.up_buf]
+    lea rsi, [r12 + linnea_connection.in_buf]
+    mov rdx, [r12 + linnea_connection.in_len]
+    lea rcx, [r12 + linnea_connection.out_buf]
+    mov r8, LINNEA_CONN_OUT_BUF
+    call linnea_tls_hs_input       ; rax = state
+    mov r10, rax                   ; not r13: the loop's r13 is the
+                                   ; connection index and shared code below
+                                   ; still expects it
+    ; drop the consumed bytes from the front of in_buf
+    mov rcx, [r12 + linnea_connection.up_buf + linnea_tls_hs.consumed]
+    test rcx, rcx
+    jz .tls_after_consume
+    mov rax, [r12 + linnea_connection.in_len]
+    sub rax, rcx                   ; bytes kept
+    mov [r12 + linnea_connection.in_len], rax
+    lea rdi, [r12 + linnea_connection.in_buf]
+    lea rsi, [rdi + rcx]
+    mov rcx, rax
+    rep movsb                      ; forward copy, dst < src
+.tls_after_consume:
+    mov rax, [r12 + linnea_connection.up_buf + linnea_tls_hs.out_len]
+    test rax, rax
+    jz .tls_no_out
+    lea rcx, [r12 + linnea_connection.out_buf]
+    mov [r12 + linnea_connection.out_ptr], rcx
+    mov [r12 + linnea_connection.out_rem], rax
+    mov qword [r12 + linnea_connection.file_rem], 0
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.tls_no_out:
+    cmp r10, LINNEA_TLS_DONE
+    je .tls_handoff
+    mov rdi, r12                   ; WAIT_CH/WAIT_FIN: need more client bytes
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+
+.tls_on_send:
+    test r15d, r15d
+    js .tls_send_err
+    mov eax, r15d
+    add [r12 + linnea_connection.out_ptr], rax
+    sub [r12 + linnea_connection.out_rem], rax
+    cmp qword [r12 + linnea_connection.out_rem], 0
+    jne .tls_send_more
+    cmp dword [r12 + linnea_connection.up_buf + linnea_tls_hs.state], LINNEA_TLS_FAILED
+    je .tls_send_failed
+    ; the flight is out (WAIT_FIN): process buffered bytes or read more
+    cmp qword [r12 + linnea_connection.in_len], 0
+    jne .tls_process
+    mov rdi, r12
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.tls_send_more:
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.tls_send_failed:
+    lea r14, [reason_tls_failed]
+    mov r15d, reason_tls_failed_len
+    jmp .conn_close
+.tls_send_err:
+    cmp r15d, -LINNEA_ECANCELED
+    je .tls_send_stall
+    lea r14, [reason_send_err]
+    mov r15d, reason_send_err_len
+    jmp .conn_close
+.tls_send_stall:
+    lea r14, [reason_send_timeout]
+    mov r15d, reason_send_timeout_len
+    jmp .conn_close
+
+; handshake complete: decrypt any pipelined early data, then hand the
+; application keys to the kernel and fall into the ordinary HTTP path.
+.tls_handoff:
+    lea rdi, [r12 + linnea_connection.up_buf]
+    lea rsi, [r12 + linnea_connection.in_buf]
+    mov rdx, [r12 + linnea_connection.in_len]
+    lea rcx, [r12 + linnea_connection.out_buf]
+    mov r8, LINNEA_CONN_IN_BUF
+    call linnea_tls_drain_early    ; rax = plaintext len / -1 / -2 / -3
+    cmp rax, -1
+    je .tls_badrec
+    cmp rax, -2
+    je .tls_early_more
+    cmp rax, -3
+    je .tls_split
+    mov [r12 + linnea_connection.in_len], rax
+    mov r10, rdx                   ; client RX sequence = records drained
+                                   ; (r10, not r13: .process below is shared
+                                   ; code and still wants the index)
+    mov edi, [r12 + linnea_connection.fd]
+    lea rsi, [r12 + linnea_connection.up_buf + linnea_tls_hs.s_ap]
+    lea rdx, [r12 + linnea_connection.up_buf + linnea_tls_hs.c_ap]
+    xor ecx, ecx                   ; server TX sequence starts at 0
+    mov r8, r10
+    call linnea_ktls_enable
+    test rax, rax
+    js .tls_ktls_fail
+    mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_KTLS
+    cmp qword [r12 + linnea_connection.in_len], 0
+    jne .process                   ; HTTP on the pipelined request
+    mov rdi, r12
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.tls_early_more:
+    ; A pipelined record arrived in pieces (its first segment came in with
+    ; the Finished). Stay in the handshake phase and read the rest: the
+    ; recv carries the usual linked timeout, so a client that never sends
+    ; it is cut like any other idle one.
+    mov rdi, r12
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.tls_badrec:
+    lea r14, [reason_tls_badrec]
+    mov r15d, reason_tls_badrec_len
+    jmp .conn_close
+.tls_split:
+    lea r14, [reason_tls_split]
+    mov r15d, reason_tls_split_len
+    jmp .conn_close
+.tls_ktls_fail:
+    lea r14, [reason_tls_ktls]
+    mov r15d, reason_tls_ktls_len
+    jmp .conn_close
 
 ; --- connect completion: r13 = connection index, r15d = 0 or -errno -----
 ; Nothing has been sent to the client yet, so a failure here can still be
@@ -641,6 +857,9 @@ linnea_uring_run:
     jz .tunnel_client_eof
     cmp r15d, -LINNEA_ECANCELED
     je .tunnel_c2u_idle
+    call tls_recv_is_eof
+    test eax, eax
+    jnz .tunnel_client_eof
     lea r14, [reason_recv_err]
     mov r15d, reason_recv_err_len
     jmp .tunnel_close
@@ -882,6 +1101,28 @@ linnea_uring_run:
     lea rdi, [msg_wait]
     mov esi, msg_wait_len
     jmp linnea_error_exit
+
+; tls_recv_is_eof(r12 = connection*, r15d = -errno) -> eax = 1 when a failed
+; client recv is really an orderly TLS shutdown.
+;
+; kTLS reports a record that is not application data by attaching a
+; TLS_GET_RECORD_TYPE control message. Our recvs are plain IORING_OP_RECV
+; with no cmsg buffer, so the kernel has nowhere to put the record type and
+; fails the read with -EIO instead (net/tls/tls_sw.c tls_record_content_type).
+; That record is the peer's close_notify -- the TLS spelling of the EOF a
+; plaintext connection reports as 0 -- so it must not be logged as an error.
+; A KeyUpdate would surface identically; v1 does not support one and closing
+; is the intended response to it either way.
+; Clobbers rax only.
+tls_recv_is_eof:
+    xor eax, eax
+    cmp r15d, -LINNEA_EIO
+    jne .not_eof
+    cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_KTLS
+    jne .not_eof
+    mov eax, 1
+.not_eof:
+    ret
 
 ; linnea_uring_now() -> rax = CLOCK_MONOTONIC nanoseconds, for tunnel
 ; idleness. Nanoseconds, not seconds: whole-second truncation could call

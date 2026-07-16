@@ -1,0 +1,8 @@
+{
+  "log": "test/linnea.log",
+  "servers": [
+    { "host": "127.0.0.1", "port": 47443, "hostname": "localhost",
+      "cert": "test/tls/server.crt",
+      "locations": [ { "prefix": "/", "root": "test/www" } ] }
+  ]
+}

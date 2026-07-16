@@ -1,0 +1,14 @@
+{
+  "log": "test/linnea.log",
+  "timeout": 5,
+  "servers": [
+    {
+      "host": "127.0.0.1", "port": 47443, "hostname": "localhost",
+      "cert": "test/tls/server.crt", "key": "test/tls/server.key",
+      "locations": [
+        { "prefix": "/", "root": "test/www" },
+        { "prefix": "/api", "proxy": "127.0.0.1:47100" }
+      ]
+    }
+  ]
+}

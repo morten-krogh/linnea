@@ -28,7 +28,41 @@ LINNEA_TLS_FAILED       equ 3
 ; skipped (the RFC 8448 trace ClientHello predates ed25519 support).
 LINNEA_TLS_FLAG_TRACE   equ 1
 
-LINNEA_TLS_MSG_BUF      equ 8192   ; handshake message reassembly space
+; The whole handshake state overlays a connection's up_buf (no proxying is
+; active during the handshake), so linnea_tls_hs_size must stay <= up_buf.
+; The flight buffer holds EE + Certificate(DER) + CertificateVerify +
+; Finished; 4096 covers a single Ed25519 leaf well past any real size.
+LINNEA_TLS_MSG_BUF      equ 4096   ; handshake message reassembly space
+
+; msg_buf is smaller than the largest record in_buf can hold, so the record
+; layer must not be handed anything longer than it. This bound is enforced
+; on UNAUTHENTICATED input (linnea_tls_open writes the plaintext out before
+; it checks the tag), which is what keeps a client's Finished record from
+; running off the end of msg_buf -- and, since the state overlays up_buf,
+; off the end of the connection slot. Stricter than the RFC 8446 ciphertext
+; limit of 2^14+256, which only matters for a Finished padded past 4 KiB.
+LINNEA_TLS_MAX_FRAGMENT equ LINNEA_TLS_MSG_BUF
+
+; build_flight assembles EncryptedExtensions(6) + Certificate(13 + DER) +
+; CertificateVerify(72) + Finished(36) into msg_buf, so a certificate is
+; bounded by msg_buf minus that 127 bytes of framing. linnea_tls_setup
+; refuses a larger one at startup rather than let the flight overrun.
+LINNEA_TLS_FLIGHT_OVERHEAD equ 127
+LINNEA_TLS_MAX_CERT     equ LINNEA_TLS_MSG_BUF - LINNEA_TLS_FLIGHT_OVERHEAD
+
+; kTLS handoff (docs.kernel.org/networking/tls.html). After the handshake
+; the application traffic keys go to the kernel and io_uring send/recv
+; transparently encrypt/decrypt, so the rest of the server is unchanged.
+LINNEA_SOL_TCP          equ 6
+LINNEA_TCP_ULP          equ 31
+LINNEA_SOL_TLS          equ 282
+LINNEA_TLS_TX           equ 1
+LINNEA_TLS_RX           equ 2
+LINNEA_TLS_1_3_VERSION  equ 0x0304
+LINNEA_TLS_CIPHER_AES_GCM_128 equ 51
+; struct tls12_crypto_info_aes_gcm_128 = version(2) cipher(2) iv(8) key(16)
+; salt(4) rec_seq(8) = 40 bytes.
+LINNEA_TLS_CRYPTO_INFO_SIZE equ 40
 
 ; Record content types
 LINNEA_TLS_CT_CCS        equ 20

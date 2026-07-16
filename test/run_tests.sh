@@ -85,6 +85,15 @@ run_test "empty locations"  1 stderr "at least one location" \
 run_test "duplicate hostname" 1 stderr "duplicate hostname DUP.Test on 127.0.0.1:47080" \
     $BIN test/configs/dup-hostname.json
 
+# --- TLS config: "cert" and "key" are both-or-neither, and servers sharing
+# --- a listener must agree (one listener has one certificate: no SNI yet)
+run_test "tls dump"        124 stdout "tls=on cert=test/tls/server.crt" \
+    timeout 0.5 $BIN test/configs/tls.json
+run_test "tls cert without key" 1 stderr "server needs both cert and key, or neither" \
+    $BIN test/configs/bad-cert-only.json
+run_test "tls listener mismatch" 1 stderr "servers sharing a listener must all set TLS or none" \
+    $BIN test/configs/bad-tls-mismatch.json
+
 # --- crypto self-test: known-answer vectors for the TLS primitives ---
 # Runs the pre-built binary (built by `make test`/`make selftest`); the
 # heavy differential/fuzz harnesses under test/crypto/ run on demand.
@@ -716,6 +725,117 @@ PYEOF
     rm -rf "$tlsdir"
 else
     check "tls (linnea-tlstest not built or openssl absent — skipped)" 0
+fi
+
+# --- TLS end to end: the real server, handshake in userspace then kTLS ---
+# Everything past the handshake is the ordinary HTTP path over a socket the
+# kernel encrypts, so these tests are really asking whether the handoff left
+# the connection indistinguishable from a plaintext one.
+if ! grep -qw tls /proc/sys/net/ipv4/tcp_available_ulp 2>/dev/null; then
+    # No kTLS: the handshake would still succeed and every request would then
+    # fail, so skip rather than report a pile of misleading failures.
+    check "tls e2e (kernel tls module not loaded: modprobe tls — skipped)" 0
+else
+    rm -f "$LOG"
+    # Recreated here: the HTTP section removed its copy, and a file spanning
+    # many records is the point of the large-file case below.
+    python3 -c "open('test/www/big.txt','w').write('B'*100000)"
+    python3 test/proxy_backend.py >/dev/null 2>&1 &
+    tls_backend_pid=$!
+    $BIN test/configs/tls.json >/dev/null 2>&1 &
+    tls_server_pid=$!
+    sleep 0.3
+    CA=test/tls/server.crt
+    U=https://localhost:47443
+
+    resp=$(curl -si --max-time 5 --cacert $CA $U/hello.txt)
+    check_http "tls static body"   "hello from linnea" "$resp"
+    check_http "tls static status" "200 OK" "$resp"
+
+    # One connection, two requests: keep-alive has to survive the handoff.
+    # -w reports per transfer, so sum it: the second request must open no
+    # new connection (and so must not repeat the handshake).
+    n=$(curl -s --max-time 5 --cacert $CA -o /dev/null -o /dev/null \
+        -w '%{num_connects}\n' $U/hello.txt $U/index.html | awk '{t += $1} END {print t}')
+    [ "$n" = "1" ]
+    check "tls keep-alive reuses one connection" $?
+
+    # A file spanning many records exercises the kTLS TX path against an
+    # mmap'd send, where the kernel does the fragmenting.
+    n=$(curl -s --max-time 10 --cacert $CA $U/big.txt | wc -c)
+    [ "$n" = "100000" ]
+    check "tls large file intact ($n bytes)" $?
+
+    resp=$(curl -si --max-time 5 --cacert $CA $U/api/simple)
+    check_http "tls proxy body"   "backend body" "$resp"
+    check_http "tls proxy status" "200 OK" "$resp"
+
+    timeout 8 python3 - "$CA" 47443 <<'PYEOF'
+import ssl, socket, sys
+ctx = ssl.create_default_context(cafile=sys.argv[1])
+with socket.create_connection(("localhost", int(sys.argv[2])), timeout=5) as raw:
+    with ctx.wrap_socket(raw, server_hostname="localhost") as s:
+        assert s.version() == "TLSv1.3", s.version()
+        assert s.cipher()[0] == "TLS_AES_128_GCM_SHA256", s.cipher()
+        s.sendall(b"GET /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        # The head and the mmap'd body are separate sends, so under kTLS
+        # they are separate records: read until the body turns up rather
+        # than assuming one recv holds the whole response.
+        buf = b""
+        while b"hello from linnea" not in buf:
+            d = s.recv(4096)
+            assert d, f"connection closed after {buf!r}"
+            buf += d
+        assert b"200 OK" in buf, buf
+PYEOF
+    check "tls python ssl (TLSv1.3, AES-128-GCM)" $?
+
+    # kTLS reports the peer's close_notify as -EIO rather than a 0-length
+    # read, so an orderly shutdown must not be logged as a recv error.
+    curl -s --max-time 5 --cacert $CA $U/hello.txt >/dev/null
+    sleep 0.3
+    grep -q "closed connection on 127.0.0.1:47443 .*: peer closed" "$LOG"
+    check "tls close_notify logs as peer closed" $?
+    ! grep -q "recv error" "$LOG"
+    check "tls orderly close is not a recv error" $?
+
+    timeout 30 python3 test/tls/oversized_record.py $CA 47443 \
+        test/tls/clienthello_seed.bin >/dev/null 2>&1
+    check "tls oversized record refused (msg_buf bound)" $?
+
+    # Records pipelined behind the Finished, including one split the way an
+    # MSS boundary would split it — the case loopback never produces.
+    timeout 40 python3 test/tls/pipelined_early.py $CA 47443 >/dev/null 2>&1
+    check "tls pipelined early records (whole and split)" $?
+
+    # A tunnelled upgrade over TLS: the tunnel has its own recv path, so it
+    # needs the close_notify handling too, and the relay must stay blind to
+    # the fact that the kernel is encrypting underneath it.
+    timeout 10 python3 - "$CA" 47443 <<'PYEOF' >/dev/null 2>&1
+import base64, os, socket, ssl, sys
+ctx = ssl.create_default_context(cafile=sys.argv[1])
+raw = socket.create_connection(("localhost", int(sys.argv[2])), timeout=5)
+s = ctx.wrap_socket(raw, server_hostname="localhost")
+key = base64.b64encode(os.urandom(16)).decode()
+s.sendall(f"GET /api/ws-echo HTTP/1.1\r\nHost: localhost\r\n"
+          f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+          f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
+resp = b""
+while b"\r\n\r\n" not in resp:
+    d = s.recv(4096)
+    assert d, "closed before the 101"
+    resp += d
+assert b"101 Switching Protocols" in resp, resp[:60]
+s.sendall(b"tunnel-bytes-over-tls")          # linnea never parses frames
+assert s.recv(64) == b"tunnel-bytes-over-tls"
+s.close()
+PYEOF
+    check "tls websocket tunnel (101 + blind relay)" $?
+
+    kill $tls_server_pid $tls_backend_pid 2>/dev/null
+    wait $tls_server_pid 2>/dev/null
+    wait $tls_backend_pid 2>/dev/null
+    rm -f "$LOG" test/www/big.txt
 fi
 
 echo

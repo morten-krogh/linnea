@@ -14,6 +14,7 @@ extern linnea_config_parse
 extern linnea_config_validate
 extern linnea_config_dump
 extern linnea_config_instance
+extern linnea_tls_setup
 extern linnea_log_open
 extern linnea_network_listen_all
 extern linnea_connections_init
@@ -43,6 +44,8 @@ _start:
     call linnea_log_open
     lea rdi, [linnea_config_instance]
     call linnea_config_dump
+    lea rdi, [linnea_config_instance]     ; CPUID gate + cert/key loading
+    call linnea_tls_setup
     lea rdi, [linnea_config_instance]
     call linnea_network_listen_all
     mov rdi, [linnea_config_instance + linnea_config.max_connections]

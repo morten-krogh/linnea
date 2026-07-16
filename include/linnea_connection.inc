@@ -25,6 +25,16 @@ LINNEA_PROXY_TUNNEL     equ 6      ; full-duplex byte relay after a 101; the
 LINNEA_PROXY_CLOSING    equ 7      ; tunnel torn down; both sockets are shut
                                    ; down, waiting for in-flight ops to drain
 
+; conn.tls_phase — a TLS connection is only special until the keys reach the
+; kernel; after that the ordinary HTTP/proxy/tunnel path runs unchanged.
+LINNEA_TLS_PHASE_NONE   equ 0      ; plaintext listener
+LINNEA_TLS_PHASE_HS     equ 1      ; userspace handshake: client recv/send are
+                                   ; routed to the TLS handlers, state in up_buf
+LINNEA_TLS_PHASE_KTLS   equ 2      ; handed off: the kernel does record
+                                   ; protection, so this behaves as plaintext
+                                   ; everywhere EXCEPT that recv reports the
+                                   ; peer's close_notify as -EIO (see .recv_eof)
+
 struc linnea_connection
     .fd:            resd 1         ; accepted socket
     .server:        resd 1         ; index of the server that accepted it
@@ -65,6 +75,9 @@ struc linnea_connection
                                    ; times out re-arms unless both are idle
     .close_reason:  resq 1         ; teardown reason, held while CLOSING
     .close_reason_len: resq 1      ; waits for the other direction's op
+    ; --- TLS: the handshake state overlays up_buf, so only a phase flag
+    ; lives here (see LINNEA_TLS_PHASE_* below).
+    .tls_phase:     resq 1
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

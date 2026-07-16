@@ -66,6 +66,7 @@ linnea_connection_alloc:
     mov qword [rdx + linnea_connection.file_rem], 0
     mov dword [rdx + linnea_connection.up_fd], -1
     mov qword [rdx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    mov qword [rdx + linnea_connection.tls_phase], LINNEA_TLS_PHASE_NONE
     mov rax, rdx
     ret
 .empty:

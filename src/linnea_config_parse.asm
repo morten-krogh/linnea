@@ -55,6 +55,10 @@ key_root:               db "root"
 key_root_len            equ $ - key_root
 key_proxy:              db "proxy"
 key_proxy_len           equ $ - key_proxy
+key_cert:               db "cert"
+key_cert_len            equ $ - key_cert
+key_key:                db "key"
+key_key_len             equ $ - key_key
 
 msg_eof:                db "unexpected end of file"
 msg_eof_len             equ $ - msg_eof
@@ -102,6 +106,8 @@ msg_hostname_long:      db "hostname too long"
 msg_hostname_long_len   equ $ - msg_hostname_long
 msg_root_long:          db "root too long"
 msg_root_long_len       equ $ - msg_root_long
+msg_path_long:          db "cert/key path too long"
+msg_path_long_len       equ $ - msg_path_long
 msg_prefix_long:        db "prefix too long"
 msg_prefix_long_len     equ $ - msg_prefix_long
 msg_proxy_long:         db "proxy address too long"
@@ -324,6 +330,11 @@ linnea_parse_server:
     mov rbx, rdi               ; server*
     xor r12d, r12d             ; key mask
     mov qword [rbx + linnea_config_server.location_count], 0
+    ; TLS is opt-in per server: clear the markers so a server with no
+    ; "cert"/"key" is plaintext; validation enforces both-or-neither.
+    mov dword [rbx + linnea_config_server.tls], 0
+    mov qword [rbx + linnea_config_server.cert_path_len], 0
+    mov qword [rbx + linnea_config_server.key_path_len], 0
     mov edi, '{'
     call linnea_parse_expect
 .member_loop:
@@ -362,6 +373,20 @@ linnea_parse_server:
     call linnea_string_equal
     test eax, eax
     jnz .key_locations
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_cert]
+    mov ecx, key_cert_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_cert
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_key]
+    mov ecx, key_key_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_key
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -405,6 +430,32 @@ linnea_parse_server:
     ja .hostname_long
     mov [rbx + linnea_config_server.hostname_len], rdx
     lea rdi, [rbx + linnea_config_server.hostname]
+    mov rsi, rax
+    call linnea_string_copy
+    jmp .member_sep
+
+.key_cert:
+    test r12d, 16
+    jnz .dup
+    or r12d, 16
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_ROOT
+    ja .path_long
+    mov [rbx + linnea_config_server.cert_path_len], rdx
+    lea rdi, [rbx + linnea_config_server.cert_path]
+    mov rsi, rax
+    call linnea_string_copy
+    jmp .member_sep
+
+.key_key:
+    test r12d, 32
+    jnz .dup
+    or r12d, 32
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_ROOT
+    ja .path_long
+    mov [rbx + linnea_config_server.key_path_len], rdx
+    lea rdi, [rbx + linnea_config_server.key_path]
     mov rsi, rax
     call linnea_string_copy
     jmp .member_sep
@@ -459,7 +510,9 @@ linnea_parse_server:
     jmp .member_loop
 .end_object:
     call linnea_parse_advance
-    cmp r12d, 15
+    mov eax, r12d              ; host+port+hostname+locations required;
+    and eax, 15                ; cert/key (bits 16/32) are optional
+    cmp eax, 15
     jne .missing
     pop r15
     pop r14
@@ -483,6 +536,10 @@ linnea_parse_server:
 .hostname_long:
     lea rdi, [msg_hostname_long]
     mov esi, msg_hostname_long_len
+    jmp linnea_parse_fail
+.path_long:
+    lea rdi, [msg_path_long]
+    mov esi, msg_path_long_len
     jmp linnea_parse_fail
 .too_many_locations:
     lea rdi, [msg_too_many_locs]

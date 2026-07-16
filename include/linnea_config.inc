@@ -42,6 +42,16 @@ struc linnea_config_server
     .listen_fd:     resd 1                        ; listening socket, set by linnea_network
     .listener_owner: resd 1                       ; 1 = this server bound the socket;
     .pad2:          resd 1                        ; 0 = shares a prior server's listener
+    ; --- TLS (optional; "cert" and "key" are both-or-neither) --------
+    .tls:           resd 1                        ; 1 = this server serves TLS
+    .pad3:          resd 1
+    .cert_path:     resb LINNEA_MAX_ROOT + 1      ; PEM cert chain path
+    .cert_path_len: resq 1
+    .key_path:      resb LINNEA_MAX_ROOT + 1      ; PEM PKCS#8 key path
+    .key_path_len:  resq 1
+    .cert_der:      resq 1                        ; loaded DER (startup), or 0
+    .cert_der_len:  resq 1
+    .key_seed:      resq 1                        ; Ed25519 seed ptr (startup)
     .location_count: resq 1
     .locations:     resb linnea_config_location_size * LINNEA_MAX_LOCATIONS
 endstruc

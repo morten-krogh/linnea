@@ -23,6 +23,7 @@ default rel
 
 global linnea_tls_hs_init
 global linnea_tls_hs_input
+global linnea_tls_drain_early
 
 extern linnea_sha256_init
 extern linnea_sha256_update
@@ -245,6 +246,13 @@ linnea_tls_hs_input:
     movzx r13d, byte [rbx + 3]
     shl r13d, 8
     mov r13b, [rbx + 4]
+    ; Refuse an over-long fragment on sight, before waiting for the rest of
+    ; it: the plaintext has to fit msg_buf (linnea_tls_open writes it before
+    ; authenticating it, so this must hold for any peer, not just one that
+    ; knows the keys), and a record longer than in_buf could never finish
+    ; arriving anyway. A real Finished record is 58 bytes.
+    cmp r13, LINNEA_TLS_MAX_FRAGMENT
+    ja .fin_overflow
     lea rcx, [r13 + 5]
     cmp rcx, r12
     ja .ret                     ; wait for the full record
@@ -326,6 +334,9 @@ linnea_tls_hs_input:
 
 .fin_bad:
     mov edi, LINNEA_TLS_A_UNEXPECTED_MESSAGE
+    jmp .enc_alert
+.fin_overflow:
+    mov edi, LINNEA_TLS_A_RECORD_OVERFLOW
     jmp .enc_alert
 .fin_badmac:
     mov edi, LINNEA_TLS_A_DECRYPT_ERROR
@@ -974,3 +985,122 @@ getrandom32:
     mov edi, 1
     mov eax, LINNEA_SYS_EXIT
     syscall
+
+; ===================================================================
+; linnea_tls_drain_early(rdi=hs, rsi=in_buf, rdx=in_len, rcx=scratch,
+;                        r8=in_cap)
+; scratch takes one record's plaintext, so it must be at least in_cap: no
+; record longer than the buffer it arrived in ever gets here (see below).
+; The client may pipeline application records right after its Finished --
+; a TLS 1.3 client does not wait for anything before sending its request --
+; so they land as ciphertext in in_buf while the keys are still ours.
+; Decrypt each with the client keys (hs.rkeys, the c_ap keys once the state
+; is DONE), compacting the plaintext to the front of in_buf for the HTTP
+; layer.
+;
+; The kernel can only take over on a record boundary, so this refuses to
+; run at all until the buffer holds whole records: a partial one means the
+; caller must read more first. Closing instead would be wrong -- the first
+; segment of a pipelined request routinely arrives without the rest of it,
+; and dropping those connections would be invisible on loopback (where the
+; whole write lands at once) and common over a real network.
+;
+; Returns:
+;   rax >= 0 : plaintext length, and rdx = the next record sequence number
+;              (what the kernel resumes RX from)
+;   rax = -1 : a record failed to authenticate
+;   rax = -2 : a partial record trails and in_buf has room for the rest --
+;              read more and call again (nothing has been consumed)
+;   rax = -3 : a trailing record cannot fit in_cap even once complete, so
+;              waiting could never help -- the caller closes
+; ===================================================================
+linnea_tls_drain_early:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbx, rdi              ; hs
+    mov r12, rsi              ; in_buf
+    mov r13, rdx              ; in_len
+    mov r14, rcx              ; scratch (one record's plaintext)
+    mov rbp, r8               ; in_buf capacity
+
+    ; --- pass 1: whole records only, and decrypt nothing before we know.
+    ; Decrypting is destructive (it rewrites in_buf and advances the record
+    ; sequence), so a buffer that stops mid-record has to be left exactly as
+    ; it is for the caller to top up and retry.
+    xor r15d, r15d            ; scan cursor
+.scan:
+    mov rax, r13
+    sub rax, r15              ; bytes left to scan
+    jz .scanned              ; ends on a record boundary: ready
+    cmp rax, 5
+    jb .partial              ; header itself is incomplete
+    lea rcx, [r12 + r15]
+    movzx edx, byte [rcx + 3]
+    shl edx, 8
+    mov dl, [rcx + 4]
+    add edx, 5               ; record length = 5 + fragment length
+    mov rcx, r15
+    add rcx, rdx             ; where this record would end
+    cmp rcx, rbp
+    ja .toobig               ; ...past the buffer: waiting cannot help
+    cmp rdx, rax
+    ja .partial              ; the rest has not arrived yet
+    add r15, rdx
+    jmp .scan
+.partial:
+    cmp r13, rbp
+    jae .toobig              ; no room left to receive the remainder
+    mov rax, -2
+    jmp .ret
+.toobig:
+    mov rax, -3
+    jmp .ret
+.scanned:
+
+    ; --- pass 2: every record is whole, so decrypt and compact in place.
+    xor r15d, r15d            ; src cursor
+    xor ebp, ebp             ; dst cursor (compacted plaintext)
+.loop:
+    mov rax, r13
+    sub rax, r15
+    jz .done                 ; pass 1 proved this lands on a boundary
+    lea rcx, [r12 + r15]     ; record start
+    movzx edx, byte [rcx + 3]
+    shl edx, 8
+    mov dl, [rcx + 4]
+    add edx, 5               ; record length = 5 + fragment length
+    lea rdi, [rbx + linnea_tls_hs.rkeys]
+    mov rsi, rcx             ; record ptr
+    mov rcx, r14            ; plaintext scratch (rdx = reclen)
+    push rdx                 ; save reclen (also 16-aligns rsp for the call)
+    call linnea_tls_open     ; rax = content len, rdx = inner type
+    pop rcx                  ; reclen
+    cmp rax, -1
+    je .bad
+    add r15, rcx             ; consume the record
+    cmp rdx, LINNEA_TLS_CT_APPDATA
+    jne .loop               ; non-application record: consumed, nothing to copy
+    mov rcx, rax             ; copy the plaintext to the compacted position
+    lea rdi, [r12 + rbp]
+    mov rsi, r14
+    add rbp, rax
+    rep movsb
+    jmp .loop
+.done:
+    mov rax, rbp            ; total plaintext length
+    mov rdx, [rbx + linnea_tls_hs.rkeys + linnea_tls_keys.seq]
+    jmp .ret
+.bad:
+    mov rax, -1
+.ret:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
