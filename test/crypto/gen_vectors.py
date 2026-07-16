@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 
 
 def hkdf_extract(salt, ikm):
@@ -258,6 +259,206 @@ def aesgcm_seal(key, nonce, aad, pt):
     s = _ghash(h, aad, ct)
     tmask = _aes128_encrypt(rk, nonce + b"\x00\x00\x00\x01")
     return ct + bytes(a ^ b for a, b in zip(s, tmask))
+
+
+# --- TLS 1.3 KDF (RFC 8446 section 7.1) ----------------------------------
+def hkdf_expand_label(secret, label, context, length):
+    lbl = b"tls13 " + label
+    info = length.to_bytes(2, "big") + bytes([len(lbl)]) + lbl \
+        + bytes([len(context)]) + context
+    return hkdf_expand(secret, info, length)
+
+
+def derive_secret(secret, label, transcript_hash):
+    return hkdf_expand_label(secret, label, transcript_hash, 32)
+
+
+def _rfc8448_entries():
+    """Parse every labeled hex payload out of RFC 8448 section 3."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "rfc8448.txt")
+    with open(path) as f:
+        text = f.read()
+    section = text[text.index("\n3.  Simple 1-RTT Handshake"):
+                   text.index("\n4.  Resumed 0-RTT Handshake")]
+    out = []
+    cur = None                     # [name, size, hex-so-far]
+    for line in section.splitlines():
+        m = re.match(r"^ {6}([A-Za-z][A-Za-z0-9 ]*?) \((\d+) octets\):(.*)$",
+                     line)
+        if m:
+            assert cur is None, ("unterminated entry", cur[0])
+            cur = [m.group(1), int(m.group(2)),
+                   m.group(3).replace("(empty)", "")]
+        elif cur is not None and re.match(r"^ +([0-9a-f]{2} ?)+$", line):
+            cur[2] += " " + line.strip()
+        else:
+            continue               # page breaks etc. inside long payloads
+        data = bytes.fromhex(cur[2].replace(" ", ""))
+        assert len(data) <= cur[1], ("overrun", cur[0], len(data), cur[1])
+        if len(data) == cur[1]:
+            out.append((cur[0], data))
+            cur = None
+    assert cur is None, ("truncated entry", cur and cur[0])
+    return out
+
+
+def rfc8448():
+    """Replay the RFC 8448 simple 1-RTT trace through the Python
+    reference (x25519, HKDF, expand-label, AES-GCM records) and assert
+    every intermediate value byte-for-byte. Returns what the vector
+    tables need."""
+    ent = _rfc8448_entries()
+    pos = [0]
+
+    def take(name):
+        assert pos[0] < len(ent), "ran off the trace looking for " + name
+        got_name, data = ent[pos[0]]
+        assert got_name == name, ("trace walk", pos[0], got_name, name)
+        pos[0] += 1
+        return data
+
+    t = {}
+    t["empty_hash"] = hashlib.sha256(b"").digest()
+    t["client_priv"] = take("private key")
+    t["client_pub"] = take("public key")
+    t["ch"] = take("ClientHello")
+    take("payload")
+    t["ch_record"] = take("complete record")
+    assert take("IKM") == bytes(32)
+    early = take("secret")
+    assert early == hkdf_extract(b"", bytes(32))
+    t["early"] = early
+    t["server_priv"] = take("private key")
+    t["server_pub"] = take("public key")
+    assert x25519(t["server_priv"], b"\x09" + bytes(31)) == t["server_pub"]
+    t["sh"] = take("ServerHello")
+    t["server_random"] = t["sh"][6:38]
+
+    def take_derive(prk, label):
+        assert take("PRK") == prk
+        ctx = take("hash")
+        info = take("info")
+        got = take("expanded")
+        assert derive_secret(prk, label, ctx) == got
+        lbl = b"tls13 " + label
+        assert info == (32).to_bytes(2, "big") + bytes([len(lbl)]) + lbl \
+            + bytes([len(ctx)]) + ctx
+        return ctx, got
+
+    empty_hash = hashlib.sha256(b"").digest()
+    ctx, derived = take_derive(early, b"derived")
+    assert ctx == empty_hash
+    assert take("salt") == derived
+    shared = take("IKM")
+    assert shared == x25519(t["server_priv"], t["client_pub"])
+    assert shared == x25519(t["client_priv"], t["server_pub"])
+    t["shared"] = shared
+    hs = take("secret")
+    assert hs == hkdf_extract(derived, shared)
+    t["hs"] = hs
+    th_ch_sh = hashlib.sha256(t["ch"] + t["sh"]).digest()
+    ctx, t["c_hs"] = take_derive(hs, b"c hs traffic")
+    assert ctx == th_ch_sh
+    t["th_ch_sh"] = th_ch_sh
+    ctx, t["s_hs"] = take_derive(hs, b"s hs traffic")
+    ctx, derived2 = take_derive(hs, b"derived")
+    assert ctx == empty_hash
+    assert take("salt") == derived2
+    assert take("IKM") == bytes(32)
+    master = take("secret")
+    assert master == hkdf_extract(derived2, bytes(32))
+    t["master"] = master
+    assert take("payload") == t["sh"]
+    t["sh_record"] = take("complete record")
+    assert t["sh_record"] == b"\x16\x03\x03" + len(t["sh"]).to_bytes(2, "big") \
+        + t["sh"]
+
+    def take_keys(prk):
+        assert take("PRK") == prk
+        take("key info")
+        key = take("key expanded")
+        take("iv info")
+        iv = take("iv expanded")
+        assert key == hkdf_expand_label(prk, b"key", b"", 16)
+        assert iv == hkdf_expand_label(prk, b"iv", b"", 12)
+        return key, iv
+
+    t["s_hs_key"], t["s_hs_iv"] = take_keys(t["s_hs"])
+    t["ee"] = take("EncryptedExtensions")
+    t["cert"] = take("Certificate")
+    t["cv"] = take("CertificateVerify")
+    ctx, t["s_fin_key"] = take_derive(t["s_hs"], b"finished")
+    assert ctx == b""
+    s_verify = take("finished")
+    th_to_cv = hashlib.sha256(t["ch"] + t["sh"] + t["ee"] + t["cert"]
+                              + t["cv"]).digest()
+    assert s_verify == hmac.new(t["s_fin_key"], th_to_cv,
+                                hashlib.sha256).digest()
+    t["s_fin"] = take("Finished")
+    assert t["s_fin"] == b"\x14\x00\x00\x20" + s_verify
+    t["flight"] = take("payload")
+    assert t["flight"] == t["ee"] + t["cert"] + t["cv"] + t["s_fin"]
+    t["flight_record"] = take("complete record")
+
+    def seal_record(key, iv, seq, rtype, payload):
+        nonce = bytes(a ^ b for a, b in
+                      zip(iv, bytes(4) + seq.to_bytes(8, "big")))
+        hdr = b"\x17\x03\x03" + (len(payload) + 17).to_bytes(2, "big")
+        return hdr + aesgcm_seal(key, nonce, hdr, payload + bytes([rtype]))
+
+    assert t["flight_record"] == seal_record(t["s_hs_key"], t["s_hs_iv"], 0,
+                                             0x16, t["flight"])
+    th_to_sfin = hashlib.sha256(t["ch"] + t["sh"] + t["flight"]).digest()
+    ctx, t["c_ap"] = take_derive(master, b"c ap traffic")
+    assert ctx == th_to_sfin
+    t["th_to_sfin"] = th_to_sfin
+    ctx, t["s_ap"] = take_derive(master, b"s ap traffic")
+    ctx, t["exp_master"] = take_derive(master, b"exp master")
+    t["s_ap_key"], t["s_ap_iv"] = take_keys(t["s_ap"])
+    t["c_hs_key"], t["c_hs_iv"] = take_keys(t["c_hs"])
+    ctx, _ = take_derive(early, b"derived")   # the client-side replay of the
+    assert ctx == empty_hash                  # schedule repeats this one
+    ctx, t["c_fin_key"] = take_derive(t["c_hs"], b"finished")
+    assert ctx == b""
+    c_verify = take("finished")
+    assert c_verify == hmac.new(t["c_fin_key"], th_to_sfin,
+                                hashlib.sha256).digest()
+    t["c_fin"] = take("Finished")
+    assert take("payload") == t["c_fin"]
+    t["c_fin_record"] = take("complete record")
+    assert t["c_fin_record"] == seal_record(t["c_hs_key"], t["c_hs_iv"], 0,
+                                            0x16, t["c_fin"])
+    t["c_ap_key"], t["c_ap_iv"] = take_keys(t["c_ap"])
+    ctx, res_master = take_derive(master, b"res master")
+    assert ctx == hashlib.sha256(t["ch"] + t["sh"] + t["flight"]
+                                 + t["c_fin"]).digest()
+    assert take("PRK") == res_master
+    take("hash")
+    take("info")
+    take("expanded")
+    t["nst"] = take("NewSessionTicket")
+    assert take("payload") == t["nst"]
+    t["nst_record"] = take("complete record")     # server app write, seq 0
+    assert t["nst_record"] == seal_record(t["s_ap_key"], t["s_ap_iv"], 0,
+                                          0x16, t["nst"])
+    t["c_app"] = take("payload")                  # client app data, seq 0
+    t["c_app_record"] = take("complete record")
+    assert t["c_app_record"] == seal_record(t["c_ap_key"], t["c_ap_iv"], 0,
+                                            0x17, t["c_app"])
+    t["s_app"] = take("payload")                  # server app data, seq 1
+    t["s_app_record"] = take("complete record")
+    assert t["s_app_record"] == seal_record(t["s_ap_key"], t["s_ap_iv"], 1,
+                                            0x17, t["s_app"])
+    t["c_alert"] = take("payload")                # client close_notify, seq 1
+    t["c_alert_record"] = take("complete record")
+    assert t["c_alert_record"] == seal_record(t["c_ap_key"], t["c_ap_iv"], 1,
+                                              0x15, t["c_alert"])
+    t["s_alert"] = take("payload")                # server close_notify, seq 2
+    t["s_alert_record"] = take("complete record")
+    assert t["s_alert_record"] == seal_record(t["s_ap_key"], t["s_ap_iv"], 2,
+                                              0x15, t["s_alert"])
+    return t
 
 
 def _det_bytes(tag, n):
@@ -606,6 +807,121 @@ def main():
                    "gcm_o_ct_%d, %d, gcm_o_pt_%d, %d\n"
                    % (n, n, n, al, n, cl, n, ok))
     out.append("aesgcm_open_test_count equ (($ - aesgcm_open_tests) / 64)\n")
+
+    # ---- TLS 1.3: HKDF-Expand-Label and record vectors, all anchored --
+    # ---- in the RFC 8448 trace which rfc8448() replayed and asserted --
+    tr = rfc8448()
+    hel_cases = [
+        (tr["early"], b"derived", tr["empty_hash"], 32),
+        (tr["hs"], b"c hs traffic", tr["th_ch_sh"], 32),
+        (tr["hs"], b"s hs traffic", tr["th_ch_sh"], 32),
+        (tr["hs"], b"derived", tr["empty_hash"], 32),
+        (tr["s_hs"], b"key", b"", 16),
+        (tr["s_hs"], b"iv", b"", 12),
+        (tr["s_hs"], b"finished", b"", 32),
+        (tr["c_hs"], b"finished", b"", 32),
+        (tr["master"], b"c ap traffic", tr["th_to_sfin"], 32),
+        (tr["master"], b"s ap traffic", tr["th_to_sfin"], 32),
+        (tr["master"], b"exp master", tr["th_to_sfin"], 32),
+        (tr["s_ap"], b"key", b"", 16),
+        (tr["s_ap"], b"iv", b"", 12),
+        (tr["c_hs"], b"key", b"", 16),
+        (tr["c_hs"], b"iv", b"", 12),
+        (tr["c_ap"], b"key", b"", 16),
+        (tr["c_ap"], b"iv", b"", 12),
+    ]
+    labels = []
+    for n, (secret, label, ctx, outlen) in enumerate(hel_cases):
+        exp = hkdf_expand_label(secret, label, ctx, outlen)
+        out.append(blob("hel_sec_%d" % n, secret))
+        out.append(blob("hel_lbl_%d" % n, label))
+        out.append(blob("hel_ctx_%d" % n, ctx))
+        out.append(blob("hel_exp_%d" % n, exp))
+        labels.append((n, len(label), len(ctx), outlen))
+    out.append("align 8\ntls_hel_tests:\n")
+    for n, ll, cl, ol in labels:
+        out.append("    dq hel_sec_%d, hel_lbl_%d, %d, hel_ctx_%d, %d, "
+                   "hel_exp_%d, %d\n" % (n, n, ll, n, cl, n, ol))
+    out.append("tls_hel_test_count equ (($ - tls_hel_tests) / 56)\n")
+
+    # Record protection: seal cases are (traffic secret, seq, inner type,
+    # payload) -> the trace's exact wire record, covering handshake
+    # coalescing, post-handshake NST, app data and alerts at seq 0/1/2.
+    seal_cases = [
+        (tr["s_hs"], 0, 0x16, tr["flight"], tr["flight_record"]),
+        (tr["c_hs"], 0, 0x16, tr["c_fin"], tr["c_fin_record"]),
+        (tr["s_ap"], 0, 0x16, tr["nst"], tr["nst_record"]),
+        (tr["c_ap"], 0, 0x17, tr["c_app"], tr["c_app_record"]),
+        (tr["s_ap"], 1, 0x17, tr["s_app"], tr["s_app_record"]),
+        (tr["c_ap"], 1, 0x15, tr["c_alert"], tr["c_alert_record"]),
+        (tr["s_ap"], 2, 0x15, tr["s_alert"], tr["s_alert_record"]),
+    ]
+    labels = []
+    for n, (secret, seq, rtype, payload, exp) in enumerate(seal_cases):
+        out.append(blob("tsl_sec_%d" % n, secret))
+        out.append(blob("tsl_pay_%d" % n, payload))
+        out.append(blob("tsl_exp_%d" % n, exp))
+        labels.append((n, seq, rtype, len(payload), len(exp)))
+    out.append("align 8\ntls_seal_tests:\n")
+    for n, seq, rtype, pl, el in labels:
+        out.append("    dq tsl_sec_%d, %d, %d, tsl_pay_%d, %d, tsl_exp_%d, "
+                   "%d\n" % (n, seq, rtype, n, pl, n, el))
+    out.append("tls_seal_test_count equ (($ - tls_seal_tests) / 56)\n")
+
+    # Open direction: the same records decrypted, plus a padded record, a
+    # padding-only record (no content type -> reject), a corrupted tag
+    # and a wrong sequence number.
+    def raw_seal(secret, seq, inner):
+        key = hkdf_expand_label(secret, b"key", b"", 16)
+        iv = hkdf_expand_label(secret, b"iv", b"", 12)
+        nonce = bytes(a ^ b for a, b in
+                      zip(iv, bytes(4) + seq.to_bytes(8, "big")))
+        hdr = b"\x17\x03\x03" + (len(inner) + 16).to_bytes(2, "big")
+        return hdr + aesgcm_seal(key, nonce, hdr, inner)
+
+    padded = raw_seal(tr["c_ap"], 0, tr["c_app"] + b"\x17" + bytes(9))
+    padding_only = raw_seal(tr["c_ap"], 0, bytes(24))
+    corrupt = bytearray(tr["c_fin_record"])
+    corrupt[-1] ^= 0x40
+    open_cases = [
+        (tr["s_hs"], 0, tr["flight_record"], tr["flight"], 0x16, 1),
+        (tr["c_hs"], 0, tr["c_fin_record"], tr["c_fin"], 0x16, 1),
+        (tr["s_ap"], 0, tr["nst_record"], tr["nst"], 0x16, 1),
+        (tr["c_ap"], 0, tr["c_app_record"], tr["c_app"], 0x17, 1),
+        (tr["s_ap"], 1, tr["s_app_record"], tr["s_app"], 0x17, 1),
+        (tr["c_ap"], 1, tr["c_alert_record"], tr["c_alert"], 0x15, 1),
+        (tr["s_ap"], 2, tr["s_alert_record"], tr["s_alert"], 0x15, 1),
+        (tr["c_ap"], 0, padded, tr["c_app"], 0x17, 1),
+        (tr["c_ap"], 0, padding_only, b"", 0, 0),
+        (tr["c_hs"], 0, bytes(corrupt), b"", 0, 0),
+        (tr["c_ap"], 1, tr["c_app_record"], b"", 0, 0),
+    ]
+    labels = []
+    for n, (secret, seq, rec, exp, rtype, ok) in enumerate(open_cases):
+        out.append(blob("top_sec_%d" % n, secret))
+        out.append(blob("top_rec_%d" % n, rec))
+        out.append(blob("top_exp_%d" % n, exp))
+        labels.append((n, seq, len(rec), len(exp), rtype, ok))
+    out.append("align 8\ntls_open_tests:\n")
+    for n, seq, rl, el, rtype, ok in labels:
+        out.append("    dq top_sec_%d, %d, top_rec_%d, %d, top_exp_%d, %d, "
+                   "%d, %d\n" % (n, seq, n, rl, n, el, rtype, ok))
+    out.append("tls_open_test_count equ (($ - tls_open_tests) / 64)\n")
+
+    # The deterministic handshake check: feed the trace's ClientHello
+    # record into linnea_tls with the trace's server key/random injected;
+    # the emitted ServerHello record and the c/s handshake traffic and
+    # master secrets must equal the trace's (the flight beyond that is
+    # Ed25519 where the trace is RSA, so the transcripts then diverge).
+    out.append(blob("trace_ch_rec", tr["ch_record"]))
+    out.append(blob("trace_srv_priv", tr["server_priv"]))
+    out.append(blob("trace_srv_rand", tr["server_random"]))
+    out.append(blob("trace_sh_rec", tr["sh_record"]))
+    out.append(blob("trace_c_hs", tr["c_hs"]))
+    out.append(blob("trace_s_hs", tr["s_hs"]))
+    out.append(blob("trace_master", tr["master"]))
+    out.append("align 8\ntls_trace_ch_rec_len equ %d\n" % len(tr["ch_record"]))
+    out.append("tls_trace_sh_rec_len equ %d\n" % len(tr["sh_record"]))
 
     print("".join(out), end="")
 

@@ -30,8 +30,9 @@ src/%.o: src/%.asm $(INCS)
 SELFTEST_BIN  = bin/linnea-selftest
 SELFTEST_OBJS = test/crypto/linnea_selftest.o src/linnea_sha256.o \
                 src/linnea_sha512.o src/linnea_fe25519.o src/linnea_x25519.o \
-                src/linnea_ed25519.o src/linnea_aesgcm.o src/linnea_print.o \
-                src/linnea_string.o
+                src/linnea_ed25519.o src/linnea_aesgcm.o src/linnea_tls_kdf.o \
+                src/linnea_tls_record.o src/linnea_tls.o src/linnea_pem.o \
+                src/linnea_print.o src/linnea_string.o
 CRYPTO_VECS   = test/crypto/sha256_vectors.inc
 
 $(CRYPTO_VECS): test/crypto/gen_vectors.py
@@ -46,10 +47,26 @@ $(SELFTEST_BIN): $(SELFTEST_OBJS)
 selftest: $(SELFTEST_BIN)
 	./$(SELFTEST_BIN)
 
-clean:
-	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) test/crypto/*.o $(CRYPTO_VECS)
+# --- TLS interop echo server (test-only; own _start) ---
+TLSTEST_BIN  = bin/linnea-tlstest
+TLSTEST_OBJS = test/tls/linnea_tlstest.o src/linnea_tls.o \
+               src/linnea_tls_kdf.o src/linnea_tls_record.o src/linnea_aesgcm.o \
+               src/linnea_sha256.o src/linnea_sha512.o src/linnea_fe25519.o \
+               src/linnea_x25519.o src/linnea_ed25519.o src/linnea_pem.o
 
-test: $(BIN) $(SELFTEST_BIN)
+test/tls/linnea_tlstest.o: test/tls/linnea_tlstest.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(TLSTEST_BIN): $(TLSTEST_OBJS)
+	$(LD) -o $@ $^
+
+tlstest: $(TLSTEST_BIN)
+
+clean:
+	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) test/crypto/*.o \
+	      test/tls/*.o $(CRYPTO_VECS)
+
+test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN)
 	./test/run_tests.sh
 
-.PHONY: all clean test selftest
+.PHONY: all clean test selftest tlstest

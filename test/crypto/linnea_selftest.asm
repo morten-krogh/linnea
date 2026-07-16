@@ -13,8 +13,7 @@
 default rel
 
 %include "linnea_syscall.inc"
-%include "linnea_sha256.inc"
-%include "linnea_aesgcm.inc"
+%include "linnea_tls.inc"
 %include "sha256_vectors.inc"
 
 global _start
@@ -31,6 +30,13 @@ extern linnea_ed25519_sign
 extern linnea_aesgcm_init
 extern linnea_aesgcm_seal
 extern linnea_aesgcm_open
+extern linnea_tls_hkdf_expand_label
+extern linnea_tls_keys_init
+extern linnea_tls_seal
+extern linnea_tls_open
+extern linnea_pem_ed25519_seed
+extern linnea_tls_hs_init
+extern linnea_tls_hs_input
 
 section .rodata
 
@@ -41,6 +47,7 @@ mode_xiter:  db "x25519-iter", 0
 mode_edstd:  db "ed25519-stdin", 0
 mode_gseal:  db "aesgcm-stdin", 0
 mode_gopen:  db "aesgcm-open-stdin", 0
+mode_pem:    db "pem-seed-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
 lbl_sha5:    db "sha512 "
@@ -61,6 +68,16 @@ lbl_gs:      db "aesgcm-seal "
 lbl_gs_len   equ $ - lbl_gs
 lbl_go:      db "aesgcm-open "
 lbl_go_len   equ $ - lbl_go
+lbl_hel:     db "tls-expand-label "
+lbl_hel_len  equ $ - lbl_hel
+lbl_tsl:     db "tls-seal "
+lbl_tsl_len  equ $ - lbl_tsl
+lbl_top:     db "tls-open "
+lbl_top_len  equ $ - lbl_top
+lbl_trace:   db "tls-trace "
+lbl_trace_len equ $ - lbl_trace
+dummy_cert:  db 0x30, 0x82, 0x01, 0x00   ; a small opaque blob; the trace
+                                          ; check never inspects the cert
 sep_slash:   db "/"
 nl:          db 10
 
@@ -73,6 +90,9 @@ iter_k:      resb 32            ; X25519 iterated-test working values
 iter_u:      resb 32
 iter_r:      resb 32
 gcm_ctx:     resb linnea_aesgcm_ctx_size
+tls_keys:    resb linnea_tls_keys_size
+tls_hs:      resb linnea_tls_hs_size
+dummy_seed:  resb 32
 
 section .text
 
@@ -115,6 +135,11 @@ _start:
     call streq
     test eax, eax
     jnz .gostdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_pem]
+    call streq
+    test eax, eax
+    jnz .pemstdin
 
 ; ---- known-answer tables --------------------------------------------
 .vectors:
@@ -450,6 +475,183 @@ _start:
     add r15, aesgcm_open_test_count
     sub r15, r13
 
+    ; TLS 1.3 HKDF-Expand-Label (RFC 8448 trace derivations)
+    lea rbx, [tls_hel_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.hel_loop:
+    cmp r12, tls_hel_test_count
+    jae .hel_done
+    imul rax, r12, 56
+    lea r14, [rbx + rax]
+    mov rdi, [r14 + 0]         ; secret
+    mov rsi, [r14 + 8]         ; label
+    mov rdx, [r14 + 16]        ; labellen
+    mov rcx, [r14 + 24]        ; context
+    mov r8,  [r14 + 32]        ; ctxlen
+    lea r9,  [outbuf]
+    sub rsp, 16
+    mov rax, [r14 + 48]        ; outlen
+    mov [rsp], rax
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 40]        ; expected
+    mov rcx, [r14 + 48]
+    call memeq
+    add r13, rax
+    inc r12
+    jmp .hel_loop
+.hel_done:
+    lea rdi, [lbl_hel]
+    mov rsi, lbl_hel_len
+    mov rdx, r13
+    mov rcx, tls_hel_test_count
+    call report
+    add r15, tls_hel_test_count
+    sub r15, r13
+
+    ; TLS record seal: derive keys from the traffic secret, seal at the
+    ; table's sequence number, compare the exact wire record
+    lea rbx, [tls_seal_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.tsl_loop:
+    cmp r12, tls_seal_test_count
+    jae .tsl_done
+    imul rax, r12, 56
+    lea r14, [rbx + rax]
+    lea rdi, [tls_keys]
+    mov rsi, [r14 + 0]         ; traffic secret
+    call linnea_tls_keys_init
+    mov rax, [r14 + 8]         ; sequence number
+    mov [tls_keys + linnea_tls_keys.seq], rax
+    lea rdi, [tls_keys]
+    mov rsi, [r14 + 16]        ; inner type
+    mov rdx, [r14 + 24]        ; payload
+    mov rcx, [r14 + 32]        ; payload length
+    lea r8, [outbuf]
+    call linnea_tls_seal
+    cmp rax, [r14 + 48]        ; expected record length
+    jne .tsl_next
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 40]        ; expected record
+    mov rcx, [r14 + 48]
+    call memeq
+    add r13, rax
+.tsl_next:
+    inc r12
+    jmp .tsl_loop
+.tsl_done:
+    lea rdi, [lbl_tsl]
+    mov rsi, lbl_tsl_len
+    mov rdx, r13
+    mov rcx, tls_seal_test_count
+    call report
+    add r15, tls_seal_test_count
+    sub r15, r13
+
+    ; TLS record open: same records back through the read side, plus
+    ; padding, corruption and wrong-sequence rejections
+    lea rbx, [tls_open_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.top_loop:
+    cmp r12, tls_open_test_count
+    jae .top_done
+    imul rax, r12, 64
+    lea r14, [rbx + rax]
+    lea rdi, [tls_keys]
+    mov rsi, [r14 + 0]         ; traffic secret
+    call linnea_tls_keys_init
+    mov rax, [r14 + 8]
+    mov [tls_keys + linnea_tls_keys.seq], rax
+    lea rdi, [tls_keys]
+    mov rsi, [r14 + 16]        ; record
+    mov rdx, [r14 + 24]        ; record length
+    lea rcx, [outbuf]
+    call linnea_tls_open
+    cmp qword [r14 + 56], 0    ; expected ok flag
+    je .top_bad
+    cmp rax, [r14 + 40]        ; expected content length
+    jne .top_next
+    cmp rdx, [r14 + 48]        ; expected inner type
+    jne .top_next
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 32]        ; expected content
+    mov rcx, [r14 + 40]
+    call memeq
+    add r13, rax
+    jmp .top_next
+.top_bad:
+    cmp rax, -1
+    jne .top_next
+    inc r13
+.top_next:
+    inc r12
+    jmp .top_loop
+.top_done:
+    lea rdi, [lbl_top]
+    mov rsi, lbl_top_len
+    mov rdx, r13
+    mov rcx, tls_open_test_count
+    call report
+    add r15, tls_open_test_count
+    sub r15, r13
+
+    ; TLS 1.3 handshake vs the RFC 8448 trace: feed the trace ClientHello
+    ; with the trace's ephemeral key + server random injected; the emitted
+    ; ServerHello record and the handshake/master secrets must match the
+    ; trace byte-for-byte. (The flight past the SH signs with our Ed25519
+    ; key where the trace used RSA, so only the schedule is comparable.)
+    lea rdi, [tls_hs]
+    lea rsi, [dummy_cert]
+    mov rdx, 4
+    lea rcx, [dummy_seed]
+    mov r8d, LINNEA_TLS_FLAG_TRACE
+    call linnea_tls_hs_init
+    lea rdi, [tls_hs + linnea_tls_hs.priv]   ; inject server ephemeral key
+    lea rsi, [trace_srv_priv]
+    call copy32
+    lea rdi, [tls_hs + linnea_tls_hs.srand]  ; inject server random
+    lea rsi, [trace_srv_rand]
+    call copy32
+    lea rdi, [tls_hs]
+    lea rsi, [trace_ch_rec]
+    mov rdx, tls_trace_ch_rec_len
+    lea rcx, [outbuf]
+    mov r8, 1 << 20
+    call linnea_tls_hs_input
+
+    xor r13d, r13d
+    lea rdi, [outbuf]           ; ServerHello record bytes
+    lea rsi, [trace_sh_rec]
+    mov rcx, tls_trace_sh_rec_len
+    call memeq
+    add r13, rax
+    lea rdi, [tls_hs + linnea_tls_hs.c_hs]
+    lea rsi, [trace_c_hs]
+    mov rcx, 32
+    call memeq
+    add r13, rax
+    lea rdi, [tls_hs + linnea_tls_hs.s_hs]
+    lea rsi, [trace_s_hs]
+    mov rcx, 32
+    call memeq
+    add r13, rax
+    lea rdi, [tls_hs + linnea_tls_hs.master]
+    lea rsi, [trace_master]
+    mov rcx, 32
+    call memeq
+    add r13, rax
+    lea rdi, [lbl_trace]
+    mov rsi, lbl_trace_len
+    mov rdx, r13
+    mov rcx, 4
+    call report
+    add r15, 4
+    sub r15, r13
+
     ; exit 1 if anything failed
     mov edi, 1
     test r15, r15
@@ -610,6 +812,42 @@ _start:
     call linnea_print_stdout
     jmp .gostdin
 .gostdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; ---- pem-seed-stdin: frame [4-byte len][PEM text] -> [1-byte rc]
+; [32-byte seed] (rc 0 ok, 1 rejected -> seed omitted) -----------------
+.pemstdin:
+    lea rdi, [lenbuf]
+    mov rsi, 4
+    call read_full
+    cmp eax, 4
+    jne .pemstdin_done
+    mov ecx, [lenbuf]
+    lea rdi, [inbuf]
+    mov rsi, rcx
+    call read_full
+    lea rdi, [inbuf]
+    mov esi, [lenbuf]
+    call linnea_pem_ed25519_seed
+    cmp rax, -1
+    je .pem_reject
+    mov byte [outbuf], 0
+    mov rsi, rax
+    lea rdi, [outbuf + 1]
+    call copy32
+    lea rdi, [outbuf]
+    mov rsi, 33
+    call linnea_print_stdout
+    jmp .pemstdin
+.pem_reject:
+    mov byte [outbuf], 1
+    lea rdi, [outbuf]
+    mov rsi, 1
+    call linnea_print_stdout
+    jmp .pemstdin
+.pemstdin_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall

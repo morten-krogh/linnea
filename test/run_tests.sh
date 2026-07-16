@@ -647,6 +647,77 @@ wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
 rm -f "$LOG" test/www/big.txt test/www/huge.bin test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
 
+# --- TLS 1.3: the standalone echo server against real clients ---
+# Needs the openssl CLI (cert generation + s_client) and python3 ssl,
+# both already test-only dependencies. Skips cleanly if either is absent.
+TLSBIN=./bin/linnea-tlstest
+if [ -x "$TLSBIN" ] && command -v openssl >/dev/null 2>&1; then
+    tlsdir=$(mktemp -d)
+    if openssl req -x509 -newkey ed25519 -keyout "$tlsdir/k.pem" \
+            -out "$tlsdir/c.pem" -days 1 -nodes -subj /CN=localhost \
+            >/dev/null 2>&1; then
+        tport=47443
+        "$TLSBIN" "$tlsdir/c.pem" "$tlsdir/k.pem" $tport &
+        tls_pid=$!
+        sleep 0.4
+
+        # openssl s_client: full handshake + application echo
+        got=$(printf 'linnea-tls' | timeout 5 openssl s_client \
+              -connect 127.0.0.1:$tport -CAfile "$tlsdir/c.pem" \
+              -tls1_3 -quiet 2>/dev/null)
+        [ "$got" = "linnea-tls" ]
+        check "tls openssl handshake + echo" $?
+
+        # python ssl: assert protocol + cipher, echo 4B and 16KB
+        timeout 8 python3 - "$tlsdir/c.pem" $tport <<'PYEOF'
+import ssl, socket, sys, os
+ca, port = sys.argv[1], int(sys.argv[2])
+ctx = ssl.create_default_context(cafile=ca)
+with socket.create_connection(("127.0.0.1", port)) as raw:
+    with ctx.wrap_socket(raw, server_hostname="localhost") as s:
+        assert s.version() == "TLSv1.3", s.version()
+        assert s.cipher()[0] == "TLS_AES_128_GCM_SHA256", s.cipher()
+        s.sendall(b"ping"); assert s.recv(16) == b"ping"
+        big = os.urandom(16384); s.sendall(big)
+        got = b""
+        while len(got) < len(big): got += s.recv(65536)
+        assert got == big
+PYEOF
+        check "tls python ssl (TLSv1.3, AES-128-GCM, 16KB echo)" $?
+
+        # negative: plain HTTP to the TLS port -> a fatal alert record
+        alert=$(timeout 3 python3 - $tport <<'PYEOF'
+import socket, sys
+s = socket.socket(); s.settimeout(2)
+s.connect(("127.0.0.1", int(sys.argv[1])))
+s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+d = s.recv(16)
+print("alert" if d[:1] == b"\x15" else "no")
+PYEOF
+)
+        [ "$alert" = alert ]
+        check "tls plain-HTTP to TLS port -> fatal alert" $?
+
+        # negative: a TLS 1.2-only client cannot negotiate our profile
+        timeout 4 openssl s_client -connect 127.0.0.1:$tport -tls1_2 \
+            </dev/null 2>&1 | grep -q "alert"
+        check "tls 1.2 client rejected" $?
+
+        # a short ClientHello fuzz: the server must survive and keep serving
+        timeout 60 python3 test/tls/fuzz_clienthello.py \
+            "$tlsdir/c.pem" $tport 150 >/dev/null 2>&1
+        check "tls clienthello fuzz (150 cases, server survives)" $?
+
+        kill $tls_pid 2>/dev/null
+        wait $tls_pid 2>/dev/null
+    else
+        check "tls (openssl could not generate an ed25519 cert — skipped)" 0
+    fi
+    rm -rf "$tlsdir"
+else
+    check "tls (linnea-tlstest not built or openssl absent — skipped)" 0
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
