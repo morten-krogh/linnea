@@ -24,6 +24,72 @@ def hkdf_expand(prk, info, length):
     return out[:length]
 
 
+# --- X25519 reference (RFC 7748), for generating and cross-checking ------
+_P = 2 ** 255 - 19
+
+
+def _decode_le(b):
+    return sum(b[i] << (8 * i) for i in range(len(b)))
+
+
+def _decode_u(u):
+    u = bytearray(u)
+    u[31] &= 0x7f
+    return _decode_le(u)
+
+
+def _decode_scalar(k):
+    k = bytearray(k)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    return _decode_le(k)
+
+
+def _encode_u(x):
+    return bytes([(x >> (8 * i)) & 0xff for i in range(32)])
+
+
+def x25519(k_bytes, u_bytes):
+    k = _decode_scalar(k_bytes)
+    u = _decode_u(u_bytes)
+    x1, x2, z2, x3, z3, swap = u, 1, 0, u, 1, 0
+    for t in reversed(range(255)):
+        kt = (k >> t) & 1
+        swap ^= kt
+        if swap:
+            x2, x3 = x3, x2
+            z2, z3 = z3, z2
+        swap = kt
+        a = (x2 + z2) % _P
+        aa = a * a % _P
+        b = (x2 - z2) % _P
+        bb = b * b % _P
+        e = (aa - bb) % _P
+        c = (x3 + z3) % _P
+        d = (x3 - z3) % _P
+        da = d * a % _P
+        cb = c * b % _P
+        x3 = (da + cb) ** 2 % _P
+        z3 = x1 * (da - cb) ** 2 % _P
+        x2 = aa * bb % _P
+        z2 = e * (aa + 121665 * e) % _P
+    if swap:
+        x2, x3 = x3, x2
+        z2, z3 = z3, z2
+    return _encode_u(x2 * pow(z2, _P - 2, _P) % _P)
+
+
+def x25519_iter(n):
+    k = bytes([9] + [0] * 31)
+    u = k
+    for _ in range(n):
+        r = x25519(k, u)
+        u = k
+        k = r
+    return k
+
+
 def blob(label, data):
     """One db line naming a byte string; empty strings still get a label."""
     if not data:
@@ -126,6 +192,77 @@ def main():
         out.append("    dq exp_prk_%d, %d, exp_info_%d, %d, exp_out_%d, %d\n"
                     % (n, pl, n, il, n, ol))
     out.append("hkdf_expand_test_count equ (($ - hkdf_expand_tests) / 48)\n")
+
+    # ---- X25519: RFC 7748 section 5.2 single-shot vectors ------------
+    x_cases = [
+        (bytes.fromhex("a546e36bf0527c9d3b16154b82465edd"
+                       "62144c0ac1fc5a18506a2244ba449ac4"),
+         bytes.fromhex("e6db6867583030db3594c1a424b15f7c"
+                       "726624ec26b3353b10a903a6d0ab1c4c")),
+        (bytes.fromhex("4b66e9d4d1b4673c5ad22691957d6af5"
+                       "c11b6421e0ea01d42ca4169e7918ba0d"),
+         bytes.fromhex("e5210f12786811d3f4b7959d0538ae2c"
+                       "31dbe7106fc03c3efc4cd549c715a493")),
+    ]
+    # RFC 7748's published answers, to fail loudly if the reference drifts.
+    expect = [
+        "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552",
+        "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957",
+    ]
+    # Adversarial u-coordinates random pairs never hit: low-order points
+    # (which must yield an all-zero shared secret), the 0 and 1 points,
+    # and non-canonical encodings at and above p. Expected values come
+    # from the reference; the point is that the assembly agrees on them.
+    fixed_scalar = bytes.fromhex(
+        "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    edge_u = [
+        bytes(32),                                  # 0
+        bytes([1]) + bytes(31),                     # 1
+        # canonical low-order points of the curve (order 1, 2, 4, 8)
+        bytes.fromhex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd"
+                      "866205165f49b800"),
+        bytes.fromhex("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86"
+                      "d8224eddd09f1157"),
+        bytes(b"\xff" * 32),                        # non-canonical, > p
+        bytes.fromhex("ecffffffffffffffffffffffffffffffffffffffffffffff"
+                      "ffffffffffffff7f"),          # p - 1
+        bytes.fromhex("edffffffffffffffffffffffffffffffffffffffffffffff"
+                      "ffffffffffffff7f"),          # p
+    ]
+    for u in edge_u:
+        x_cases.append((fixed_scalar, u))
+
+    labels = []
+    for n, (scalar, u) in enumerate(x_cases):
+        got = x25519(scalar, u)
+        if n < len(expect):
+            assert got.hex() == expect[n], (got.hex(), expect[n])
+        out.append(blob("x_scalar_%d" % n, scalar))
+        out.append(blob("x_u_%d" % n, u))
+        out.append(blob("x_exp_%d" % n, got))
+        labels.append(n)
+    out.append("align 8\nx25519_tests:\n")
+    for n in labels:
+        out.append("    dq x_scalar_%d, x_u_%d, x_exp_%d\n" % (n, n, n))
+    out.append("x25519_test_count equ (($ - x25519_tests) / 24)\n")
+
+    # ---- X25519 iterated: the RFC's k=u=9 recurrence ----------------
+    # 1 and 1000 rounds are in-suite; the million-round check runs in the
+    # dev harness (test/crypto/diff_x25519.py).
+    iters = [
+        (1, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079"),
+        (1000, "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51"),
+    ]
+    labels = []
+    for n, (rounds, exp) in enumerate(iters):
+        got = x25519_iter(rounds)
+        assert got.hex() == exp, (got.hex(), exp)
+        out.append(blob("x_iter_exp_%d" % n, got))
+        labels.append((n, rounds))
+    out.append("align 8\nx25519_iter_tests:\n")
+    for n, rounds in labels:
+        out.append("    dq %d, x_iter_exp_%d\n" % (rounds, n))
+    out.append("x25519_iter_test_count equ (($ - x25519_iter_tests) / 16)\n")
 
     print("".join(out), end="")
 
