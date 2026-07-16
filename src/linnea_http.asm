@@ -45,6 +45,12 @@
 ;   ignored, which costs a needless 200 and nothing worse.
 ; - Files are served from a read-only mmap queued behind the header send
 ;   (conn.file_*); the event loop munmaps after the send completes.
+; - Ranges: a single "bytes=" range on a GET gets a 206 slice of the
+;   mmap (Content-Range names it; static 200s advertise Accept-Ranges).
+;   If-Range holds the range back unless its validator strong-matches.
+;   Anything not understood — other units, several ranges, bad syntax —
+;   is ignored in favor of the full 200, which is always safe; a range
+;   that misses the file entirely is a 416 naming the actual length.
 ; - Proxy locations: a fresh upstream connection per request. The request
 ;   is rewritten into conn.up_buf (raw target, client headers except
 ;   Connection, then "Connection: close") and the buffered body is queued
@@ -139,8 +145,13 @@ resp_505_len    equ $ - resp_505
 
 status_200:     db "HTTP/1.1 200 OK", 13, 10, "Content-Type: "
 status_200_len  equ $ - status_200
+status_206:     db "HTTP/1.1 206 Partial Content", 13, 10, "Content-Type: "
+status_206_len  equ $ - status_206
 status_304:     db "HTTP/1.1 304 Not Modified"
 status_304_len  equ $ - status_304
+status_416:     db "HTTP/1.1 416 Range Not Satisfiable", 13, 10
+                db "Content-Range: bytes */"
+status_416_len  equ $ - status_416
 hdr_length:     db 13, 10, "Content-Length: "
 hdr_length_len  equ $ - hdr_length
 hdr_etag:       db 13, 10, "ETag: "
@@ -151,6 +162,10 @@ hdr_content_enc: db 13, 10, "Content-Encoding: "
 hdr_content_enc_len equ $ - hdr_content_enc
 hdr_vary:       db 13, 10, "Vary: Accept-Encoding"
 hdr_vary_len    equ $ - hdr_vary
+hdr_accept_ranges: db 13, 10, "Accept-Ranges: bytes"
+hdr_accept_ranges_len equ $ - hdr_accept_ranges
+hdr_content_range: db 13, 10, "Content-Range: bytes "
+hdr_content_range_len equ $ - hdr_content_range
 
 enc_br:         db "br"
 enc_br_len      equ $ - enc_br
@@ -201,7 +216,11 @@ hn_if_none_match: db "if-none-match"
 hn_if_mod_since: db "if-modified-since"
 hn_accept_enc:  db "accept-encoding"
 hn_upgrade:     db "upgrade"       ; the header name and the Connection token
+hn_range:       db "range"
+hn_if_range:    db "if-range"
 hv_close:       db "close"
+slash_ch:       db "/"
+zero_ch:        db "0"
 
 ; MIME types by file extension; default is application/octet-stream.
 mime_html:      db "text/html"
@@ -286,13 +305,17 @@ section .text
 ;   [rsp+224] encoding served: 0 none, 1 gzip, 2 br
 ;   [rsp+232] upgrade flags: 1 = Connection lists the upgrade token,
 ;             2 = an Upgrade header is present; 3 = forward the wish
+;   [rsp+240] Range ptr (0 = absent)             [rsp+248] its len
+;   [rsp+256] If-Range ptr (0 = absent)          [rsp+264] its len
+;   [rsp+272] body offset   [rsp+280] body length (the whole file, or the
+;             satisfiable range of a 206)
 linnea_http_handle:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 240
+    sub rsp, 288
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -311,6 +334,8 @@ linnea_http_handle:
     mov qword [rsp + 208], 0   ; no Accept-Encoding yet
     mov qword [rsp + 224], 0   ; nothing negotiated
     mov qword [rsp + 232], 0   ; no upgrade asked
+    mov qword [rsp + 240], 0   ; no Range yet
+    mov qword [rsp + 256], 0   ; no If-Range yet
     mov ecx, [rbx + linnea_connection.server]
     imul rcx, rcx, linnea_config_server_size
     lea rax, [linnea_config_instance]
@@ -599,9 +624,24 @@ linnea_http_handle:
     mov ecx, 7
     call linnea_string_iequal
     test eax, eax
-    jz .try_host
+    jz .try_range
     or qword [rsp + 232], 2
     jmp .header_next
+.try_range:
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_range]
+    mov ecx, 5
+    call linnea_string_iequal
+    test eax, eax
+    jnz .range_header
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_if_range]
+    mov ecx, 8
+    call linnea_string_iequal
+    test eax, eax
+    jnz .ifr_header
 .try_host:
     ; Host? (first occurrence wins, used for vhost selection)
     cmp qword [rsp + 88], 0
@@ -641,6 +681,22 @@ linnea_http_handle:
     mov [rsp + 208], rax
     mov rax, [rsp + 80]
     mov [rsp + 216], rax
+    jmp .header_next
+.range_header:                 ; first occurrence wins, as for Host
+    cmp qword [rsp + 240], 0
+    jne .header_next
+    mov rax, [rsp + 72]
+    mov [rsp + 240], rax
+    mov rax, [rsp + 80]
+    mov [rsp + 248], rax
+    jmp .header_next
+.ifr_header:
+    cmp qword [rsp + 256], 0
+    jne .header_next
+    mov rax, [rsp + 72]
+    mov [rsp + 256], rax
+    mov rax, [rsp + 80]
+    mov [rsp + 264], rax
     jmp .header_next
 .cl_header:
     test qword [rsp + 136], 1
@@ -1057,6 +1113,64 @@ linnea_http_handle:
     cmp [statbuf + LINNEA_STAT_ST_MTIME], rax
     jbe .resp_304              ; not modified since the client's copy
 .send_full:
+    ; --- Range: a single bytes=... range, applied to GETs only --------
+    ; Ignoring the header (a full 200) is always safe, so anything not
+    ; understood — another unit, several ranges, bad syntax — serves the
+    ; whole file; only a syntactically valid but unsatisfiable range
+    ; earns a 416. Evaluated after the conditionals, as RFC 9110 orders.
+    mov qword [rsp + 112], 200
+    mov qword [rsp + 272], 0   ; body offset
+    mov rax, [rsp + 32]
+    mov [rsp + 280], rax       ; body length: the whole file until a
+    cmp qword [rsp], 0         ; range narrows it
+    jne .range_done            ; Range is defined for GET alone
+    cmp qword [rsp + 240], 0
+    je .range_done
+    ; If-Range: the range only applies if the representation is the one
+    ; the client already holds — a STRONG validator match (RFC 9110
+    ; 13.1.5), else the whole file, since patching a stale copy with
+    ; fresh bytes would corrupt it
+    cmp qword [rsp + 256], 0
+    je .range_eval
+    mov rdi, [rsp + 256]
+    mov rsi, [rsp + 264]
+    test rsi, rsi
+    jz .range_done
+    movzx eax, byte [rdi]
+    cmp al, '"'
+    je .range_ifr_etag
+    cmp al, 'W'                ; "W/..." is a weak tag, which can never
+    jne .range_ifr_date        ; strong-match — but "Wed, ..." is a date
+    cmp rsi, 2
+    jb .range_done
+    cmp byte [rdi + 1], '/'
+    je .range_done
+.range_ifr_date:
+    call linnea_time_parse_http_date
+    cmp rax, -1
+    je .range_done             ; unparseable: not a match
+    cmp [statbuf + LINNEA_STAT_ST_MTIME], rax
+    jne .range_done            ; strong: the exact instant only
+    jmp .range_eval
+.range_ifr_etag:
+    lea rdx, [etag_buf]
+    mov rcx, [etag_len]
+    call linnea_string_equal   ; strong: byte-identical, case included
+    test eax, eax
+    jz .range_done
+.range_eval:
+    mov rdi, [rsp + 240]
+    mov rsi, [rsp + 248]
+    mov rdx, [rsp + 32]
+    call .range_parse
+    cmp rax, -1
+    je .range_done
+    cmp rax, -2
+    je .resp_416
+    mov [rsp + 272], rax
+    mov [rsp + 280], rdx
+    mov qword [rsp + 112], 206
+.range_done:
     ; GET with content: map the file and queue it behind the headers
     cmp qword [rsp], 0
     jne .no_map                ; HEAD: headers only
@@ -1074,9 +1188,11 @@ linnea_http_handle:
     cmp rax, -4095
     jae .close_404
     mov [rbx + linnea_connection.file_base], rax
-    mov [rbx + linnea_connection.file_ptr], rax
-    mov rcx, [rsp + 32]
+    mov rcx, [rsp + 32]        ; munmap needs the whole mapping
     mov [rbx + linnea_connection.file_size], rcx
+    add rax, [rsp + 272]       ; the requested slice, or the whole file
+    mov [rbx + linnea_connection.file_ptr], rax
+    mov rcx, [rsp + 280]
     mov [rbx + linnea_connection.file_rem], rcx
 .no_map:
     mov rdi, [rsp + 56]
@@ -1125,13 +1241,20 @@ linnea_http_handle:
     mov [rsp + 40], rax
     mov qword [rsp + 48], mime_default_len
 
-    ; --- 200 response headers ----------------------------------------
+    ; --- 200/206 response headers -------------------------------------
 .build_headers:
     mov rax, [rsp + 24]
     mov [rbx + linnea_connection.keep_alive], rax
     lea r15, [rbx + linnea_connection.out_buf]
+    cmp qword [rsp + 112], 206
+    je .status_partial
     lea rdi, [status_200]
     mov esi, status_200_len
+    jmp .status_emit
+.status_partial:
+    lea rdi, [status_206]
+    mov esi, status_206_len
+.status_emit:
     call .append
     mov rdi, [rsp + 40]
     mov rsi, [rsp + 48]
@@ -1139,12 +1262,45 @@ linnea_http_handle:
     lea rdi, [hdr_length]
     mov esi, hdr_length_len
     call .append
+    mov rdi, [rsp + 280]       ; the range's length, or the whole file's
+    lea rsi, [num_buf]
+    call linnea_string_from_u64
+    lea rdi, [num_buf]
+    mov rsi, rax
+    call .append
+    cmp qword [rsp + 112], 206
+    jne .no_content_range
+    ; Content-Range: bytes first-last/size
+    lea rdi, [hdr_content_range]
+    mov esi, hdr_content_range_len
+    call .append
+    mov rdi, [rsp + 272]
+    lea rsi, [num_buf]
+    call linnea_string_from_u64
+    lea rdi, [num_buf]
+    mov rsi, rax
+    call .append
+    lea rdi, [log_dash]
+    mov esi, 1
+    call .append
+    mov rdi, [rsp + 272]
+    add rdi, [rsp + 280]
+    dec rdi                    ; last = first + length - 1
+    lea rsi, [num_buf]
+    call linnea_string_from_u64
+    lea rdi, [num_buf]
+    mov rsi, rax
+    call .append
+    lea rdi, [slash_ch]
+    mov esi, 1
+    call .append
     mov rdi, [rsp + 32]
     lea rsi, [num_buf]
     call linnea_string_from_u64
     lea rdi, [num_buf]
     mov rsi, rax
     call .append
+.no_content_range:
     cmp qword [rsp + 224], 0
     je .no_enc_hdr
     lea rdi, [hdr_content_enc]
@@ -1164,6 +1320,9 @@ linnea_http_handle:
     lea rdi, [hdr_vary]
     mov esi, hdr_vary_len
     call .append
+    lea rdi, [hdr_accept_ranges]
+    mov esi, hdr_accept_ranges_len
+    call .append
     call .append_validators
     cmp qword [rsp + 24], 0
     je .conn_close_hdr
@@ -1180,7 +1339,8 @@ linnea_http_handle:
     mov rcx, r15
     sub rcx, rax
     mov [rbx + linnea_connection.out_rem], rcx
-    mov qword [rsp + 112], 200
+    mov rax, [rsp + 280]       ; the log's byte count: what the body holds
+    mov [rsp + 32], rax
     jmp .log_request
 
 ; --- 304: the validators, no body, and the connection stays up ---------
@@ -1216,6 +1376,52 @@ linnea_http_handle:
     mov [rbx + linnea_connection.out_rem], rcx
     mov qword [rsp + 112], 304
     mov qword [rsp + 32], 0    ; a 304 carries no body
+    jmp .log_request
+
+; --- 416: the range misses the file entirely ---------------------------
+; Built dynamically because it must name the actual length ("Content-
+; Range: bytes */N") so the client can retry sensibly — and, like the
+; 304, so it can preserve keep-alive.
+.resp_416:
+    mov rdi, [rsp + 56]        ; the file is not going to be read
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    mov rax, [rsp + 24]
+    mov [rbx + linnea_connection.keep_alive], rax
+    mov qword [rbx + linnea_connection.file_rem], 0
+    lea r15, [rbx + linnea_connection.out_buf]
+    lea rdi, [status_416]      ; ends with "Content-Range: bytes */"
+    mov esi, status_416_len
+    call .append
+    mov rdi, [rsp + 32]
+    lea rsi, [num_buf]
+    call linnea_string_from_u64
+    lea rdi, [num_buf]
+    mov rsi, rax
+    call .append
+    lea rdi, [hdr_length]
+    mov esi, hdr_length_len
+    call .append
+    lea rdi, [zero_ch]
+    mov esi, 1
+    call .append
+    cmp qword [rsp + 24], 0
+    je .conn_close_416
+    lea rdi, [hdr_keepalive]
+    mov esi, hdr_keepalive_len
+    jmp .conn_hdr_416
+.conn_close_416:
+    lea rdi, [hdr_close]
+    mov esi, hdr_close_len
+.conn_hdr_416:
+    call .append
+    lea rax, [rbx + linnea_connection.out_buf]
+    mov [rbx + linnea_connection.out_ptr], rax
+    mov rcx, r15
+    sub rcx, rax
+    mov [rbx + linnea_connection.out_rem], rcx
+    mov qword [rsp + 112], 416
+    mov qword [rsp + 32], 0    ; no body
     jmp .log_request
 
 ; --- proxy location: rewrite the request and open the upstream socket ---
@@ -1466,7 +1672,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 240
+    add rsp, 288
     pop r15
     pop r14
     pop r13
@@ -1506,6 +1712,139 @@ linnea_http_handle:
 .open_missing:
     mov rax, -1
     pop rbx
+    ret
+
+; .range_parse(rdi=value, rsi=len, rdx=file size) -> rax, rdx
+; Parses a Range value holding a single byte range: "bytes=first-last",
+; "bytes=first-" or "bytes=-suffix". Returns the byte offset in rax and
+; the count in rdx, or rax = -1 when the header should be ignored
+; (another unit, several ranges, malformed) or -2 when the single range
+; is valid but unsatisfiable (a 416). Absurdly long numbers saturate at
+; 2^62, far past any file size, and fall out as unsatisfiable or as a
+; last clamped to the end. No calls, caller-saved registers only.
+.range_parse:
+    mov r10, rdx               ; file size
+    cmp rsi, 7                 ; "bytes=" and at least one spec byte
+    jb .rp_ignore
+    mov r8d, [rdi]
+    or r8d, 0x20202020         ; ASCII lowercase
+    cmp r8d, 'byte'
+    jne .rp_ignore
+    movzx r8d, byte [rdi + 4]
+    or r8d, 0x20
+    cmp r8b, 's'
+    jne .rp_ignore
+    cmp byte [rdi + 5], '='
+    jne .rp_ignore
+    add rdi, 6
+    sub rsi, 6
+    xor ecx, ecx               ; cursor
+    cmp byte [rdi], '-'
+    je .rp_suffix
+    ; ---- first, digits up to '-' -------------------------------------
+    xor eax, eax
+.rp_first_loop:
+    cmp rcx, rsi
+    jae .rp_ignore             ; no '-' at all
+    movzx r8d, byte [rdi + rcx]
+    cmp r8b, '-'
+    je .rp_first_done
+    sub r8d, '0'
+    cmp r8d, 9
+    ja .rp_ignore
+    imul rax, rax, 10
+    add rax, r8
+    mov r11, 1 << 62
+    cmp rax, r11
+    jbe .rp_first_next
+    mov rax, r11               ; saturate
+.rp_first_next:
+    inc rcx
+    jmp .rp_first_loop
+.rp_first_done:
+    inc rcx                    ; past the '-'
+    cmp rcx, rsi
+    jae .rp_open_end           ; "first-": everything from first on
+    ; ---- last, digits to the end -------------------------------------
+    xor r9d, r9d
+.rp_last_loop:
+    cmp rcx, rsi
+    jae .rp_have_last
+    movzx r8d, byte [rdi + rcx]
+    sub r8d, '0'
+    cmp r8d, 9
+    ja .rp_ignore              ; a ',' (several ranges) lands here too
+    imul r9, r9, 10
+    add r9, r8
+    mov r11, 1 << 62
+    cmp r9, r11
+    jbe .rp_last_next
+    mov r9, r11                ; saturate
+.rp_last_next:
+    inc rcx
+    jmp .rp_last_loop
+.rp_have_last:
+    cmp rax, r9
+    ja .rp_ignore              ; first > last is not a range
+    cmp rax, r10
+    jae .rp_unsat              ; starts at or past the end
+    lea r8, [r10 - 1]
+    cmp r9, r8
+    jbe .rp_last_fits
+    mov r9, r8                 ; a long last means "to the end"
+.rp_last_fits:
+    mov rdx, r9
+    sub rdx, rax
+    inc rdx                    ; count = last - first + 1
+    ret
+.rp_open_end:
+    cmp rax, r10
+    jae .rp_unsat
+    mov rdx, r10
+    sub rdx, rax               ; to the end of the file
+    ret
+    ; ---- "-suffix": the last N bytes ----------------------------------
+.rp_suffix:
+    mov ecx, 1                 ; past the '-'
+    xor eax, eax
+    xor r9d, r9d               ; digit count
+.rp_suffix_loop:
+    cmp rcx, rsi
+    jae .rp_suffix_done
+    movzx r8d, byte [rdi + rcx]
+    sub r8d, '0'
+    cmp r8d, 9
+    ja .rp_ignore
+    imul rax, rax, 10
+    add rax, r8
+    mov r11, 1 << 62
+    cmp rax, r11
+    jbe .rp_suffix_next
+    mov rax, r11               ; saturate
+.rp_suffix_next:
+    inc r9d
+    inc rcx
+    jmp .rp_suffix_loop
+.rp_suffix_done:
+    test r9d, r9d
+    jz .rp_ignore              ; bare "-"
+    test rax, rax
+    jz .rp_unsat               ; "-0" selects nothing
+    test r10, r10
+    jz .rp_unsat               ; nothing to take a suffix of
+    cmp rax, r10
+    jbe .rp_suffix_fits
+    mov rax, r10               ; longer than the file: all of it
+.rp_suffix_fits:
+    mov rdx, rax               ; count
+    mov rax, r10
+    sub rax, rdx               ; offset = size - count
+    ret
+.rp_ignore:
+    mov rax, -1
+    ret
+.rp_unsat:
+    mov rax, -2
     ret
 
 ; .append_validators() — the ETag and Last-Modified lines, from the

@@ -302,6 +302,87 @@ check_http "cross-variant etag 200" "200 OK" "$resp"
 resp=$(curl -si --max-time 2 -H "If-None-Match: $etag_br" http://127.0.0.1:47080/enc.txt)
 check_http "variant etag vs plain 200" "plain payload" "$resp"
 
+# --- Range requests: hello.txt is the 18 bytes "hello from linnea\n" ---
+resp=$(curl -si --max-time 2 -r 0-4 http://127.0.0.1:47080/hello.txt)
+check_http "range 206"           "206 Partial Content" "$resp"
+check_http "range content-range" "Content-Range: bytes 0-4/18" "$resp"
+check_http "range length"        "Content-Length: 5" "$resp"
+printf '%s' "$resp" | grep -qF "hello from"
+[ $? -ne 0 ]
+check "range body is the slice" $?
+check_http "range body"          "hello" "$resp"
+resp=$(curl -s --max-time 2 -r 6- http://127.0.0.1:47080/hello.txt)
+[ "$resp" = "from linnea" ]     # the trailing newline is byte 17
+check "range open end" $?
+resp=$(curl -s --max-time 2 -r -7 http://127.0.0.1:47080/hello.txt)
+[ "$resp" = "linnea" ]
+check "range suffix" $?
+resp=$(curl -si --max-time 2 -r 0-0 http://127.0.0.1:47080/hello.txt)
+check_http "range single byte"   "Content-Range: bytes 0-0/18" "$resp"
+check_http "range single length" "Content-Length: 1" "$resp"
+# a last past the end means "to the end"
+resp=$(curl -si --max-time 2 -H 'Range: bytes=6-9999' http://127.0.0.1:47080/hello.txt)
+check_http "range clamped last"  "Content-Range: bytes 6-17/18" "$resp"
+# a suffix longer than the file is the whole file, still a 206
+resp=$(curl -si --max-time 2 -H 'Range: bytes=-9999' http://127.0.0.1:47080/hello.txt)
+check_http "range long suffix"   "Content-Range: bytes 0-17/18" "$resp"
+# 200s advertise the support
+resp=$(curl -si --max-time 2 http://127.0.0.1:47080/hello.txt)
+check_http "accept-ranges"       "Accept-Ranges: bytes" "$resp"
+# unsatisfiable: starts at or past the end -> 416 naming the length
+resp=$(curl -si --max-time 2 -H 'Range: bytes=99-' http://127.0.0.1:47080/hello.txt)
+check_http "range 416"           "416 Range Not Satisfiable" "$resp"
+check_http "416 content-range"   "Content-Range: bytes */18" "$resp"
+check_http "416 keeps alive"     "Connection: keep-alive" "$resp"
+resp=$(curl -si --max-time 2 -H 'Range: bytes=-0' http://127.0.0.1:47080/hello.txt)
+check_http "range -0 is 416"     "416 Range Not Satisfiable" "$resp"
+# not understood -> ignored -> the full 200
+resp=$(curl -si --max-time 2 -H 'Range: bytes=5-2' http://127.0.0.1:47080/hello.txt)
+check_http "backwards range 200" "200 OK" "$resp"
+resp=$(curl -si --max-time 2 -H 'Range: bytes=abc' http://127.0.0.1:47080/hello.txt)
+check_http "garbage range 200"   "200 OK" "$resp"
+resp=$(curl -si --max-time 2 -H 'Range: potatoes=0-4' http://127.0.0.1:47080/hello.txt)
+check_http "other unit 200"      "200 OK" "$resp"
+resp=$(curl -si --max-time 2 -H 'Range: bytes=0-1,3-4' http://127.0.0.1:47080/hello.txt)
+check_http "several ranges 200"  "200 OK" "$resp"
+check_http "several ranges full" "Content-Length: 18" "$resp"
+# Range is defined for GET alone
+resp=$(curl -si --max-time 2 -I -H 'Range: bytes=0-4' http://127.0.0.1:47080/hello.txt)
+check_http "HEAD ignores range"  "200 OK" "$resp"
+check_http "HEAD full length"    "Content-Length: 18" "$resp"
+# the conditionals still win over Range
+resp=$(curl -si --max-time 2 -r 0-4 -H "If-None-Match: $etag" http://127.0.0.1:47080/hello.txt)
+check_http "range vs 304"        "304 Not Modified" "$resp"
+# If-Range: the range only with a strong validator match
+resp=$(curl -si --max-time 2 -r 0-4 -H "If-Range: $etag" http://127.0.0.1:47080/hello.txt)
+check_http "if-range match 206"  "206 Partial Content" "$resp"
+resp=$(curl -si --max-time 2 -r 0-4 -H 'If-Range: "stale"' http://127.0.0.1:47080/hello.txt)
+check_http "if-range stale 200"  "200 OK" "$resp"
+resp=$(curl -si --max-time 2 -r 0-4 -H "If-Range: W/$etag" http://127.0.0.1:47080/hello.txt)
+check_http "if-range weak 200"   "200 OK" "$resp"
+resp=$(curl -si --max-time 2 -r 0-4 -H "If-Range: $lastmod" http://127.0.0.1:47080/hello.txt)
+check_http "if-range date 206"   "206 Partial Content" "$resp"
+resp=$(curl -si --max-time 2 -r 0-4 -H 'If-Range: Wed, 01 Jan 2020 00:00:00 GMT' http://127.0.0.1:47080/hello.txt)
+check_http "if-range old date 200" "200 OK" "$resp"
+# ranges hold on big files and on pre-compressed variants
+n=$(curl -s --max-time 5 -r 90000-99999 http://127.0.0.1:47080/big.txt | tr -d 'B' | wc -c)
+[ "$n" -eq 0 ] && [ "$(curl -s --max-time 5 -r 90000-99999 http://127.0.0.1:47080/big.txt | wc -c)" -eq 10000 ]
+check "range into big file" $?
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' -r 0-1 http://127.0.0.1:47080/enc.txt)
+check_http "variant range slices variant" "Content-Range: bytes 0-1/10" "$resp"
+check_http "variant range body"  "br" "$resp"
+# two ranged requests ride one keep-alive connection
+before=$(grep -c "accepted connection" "$LOG")
+curl -s --max-time 4 -r 0-4 \
+    http://127.0.0.1:47080/hello.txt http://127.0.0.1:47080/hello.txt >/dev/null
+after=$(grep -c "accepted connection" "$LOG")
+[ $((after - before)) -eq 1 ]
+check "206 keep-alive single accept" $?
+grep -qF '"GET /hello.txt" 206 5' "$LOG"
+check "request log 206" $?
+grep -qF '"GET /hello.txt" 416 0' "$LOG"
+check "request log 416" $?
+
 # --- virtual hosts: 47080 is shared by one.test (default) and three.test ---
 resp=$(curl -s --max-time 2 -H "Host: three.test" http://127.0.0.1:47080/page.html)
 check_http "vhost three.test"  "subdirectory page" "$resp"
