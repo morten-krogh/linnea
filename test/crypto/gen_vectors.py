@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import re
 
 
@@ -461,6 +462,72 @@ def rfc8448():
     return t
 
 
+# --- P-256 field reference (GF(p), p = 2^256-2^224+2^192+2^96-1) ---------
+# Montgomery form is private to the assembly; this reference works in plain
+# integers and speaks the big-endian SEC1 encoding that frombytes/tobytes
+# use. Inputs at or above p are reduced, which is what the asm does too.
+P256_P = 2 ** 256 - 2 ** 224 + 2 ** 192 + 2 ** 96 - 1
+
+# opcodes shared with test/crypto/linnea_selftest.asm
+P256_FE_MUL = 0
+P256_FE_SQ = 1
+P256_FE_ADD = 2
+P256_FE_SUB = 3
+P256_FE_INV = 4
+
+
+def p256_fe(op, a, b):
+    a %= P256_P
+    b %= P256_P
+    if op == P256_FE_MUL:
+        return (a * b) % P256_P
+    if op == P256_FE_SQ:
+        return (a * a) % P256_P
+    if op == P256_FE_ADD:
+        return (a + b) % P256_P
+    if op == P256_FE_SUB:
+        return (a - b) % P256_P
+    if op == P256_FE_INV:
+        return pow(a, P256_P - 2, P256_P)     # inv(0) = 0, as Fermat gives
+    raise ValueError(op)
+
+
+def p256_fe_cases():
+    """(op, a, b) triples for the embedded table.
+
+    Weighted towards the operands that drive the reduction's carry chain:
+    values just under p and just under 2^256 are what make a Montgomery
+    round's carry ripple past its four-limb window, and what force the
+    final conditional subtract. A one-limb-short ripple survives ordinary
+    random testing at roughly 1 case in 30000 -- these are the cases that
+    catch it cheaply.
+    """
+    edge = [
+        0, 1, 2,
+        P256_P - 2, P256_P - 1, P256_P, P256_P + 1,     # around the modulus
+        2 ** 256 - 1, 2 ** 256 - 2,                     # non-canonical input
+        (P256_P - 1) // 2, (P256_P + 1) // 2,
+        2 ** 224, 2 ** 224 - 1,                         # the prime's own
+        2 ** 192, 2 ** 96, 2 ** 96 - 1,                 # structural powers
+        2 ** 255, 2 ** 64, 2 ** 64 - 1, 2 ** 128 - 1,
+    ]
+    cases = []
+    for op in (P256_FE_MUL, P256_FE_ADD, P256_FE_SUB):
+        for a in edge:
+            for b in edge:
+                cases.append((op, a, b))
+    for op in (P256_FE_SQ, P256_FE_INV):
+        for a in edge:
+            cases.append((op, a, 0))
+    # a spread of fixed pseudo-random operands, so the table covers the
+    # ordinary path too and not only the extremes
+    rng = random.Random(20260717)
+    for op in (P256_FE_MUL, P256_FE_SQ, P256_FE_ADD, P256_FE_SUB, P256_FE_INV):
+        for _ in range(24):
+            cases.append((op, rng.randrange(2 ** 256), rng.randrange(2 ** 256)))
+    return cases
+
+
 def _det_bytes(tag, n):
     """Deterministic pseudo-random test data (stable across runs)."""
     out = b""
@@ -907,6 +974,23 @@ def main():
         out.append("    dq top_sec_%d, %d, top_rec_%d, %d, top_exp_%d, %d, "
                    "%d, %d\n" % (n, seq, n, rl, n, el, rtype, ok))
     out.append("tls_open_test_count equ (($ - tls_open_tests) / 64)\n")
+
+    # ---- P-256 field arithmetic -------------------------------------
+    # Records are (op, a, b, want); a/b/want are 32-byte big-endian, which
+    # is what linnea_p256_fe_frombytes/tobytes speak. The selftest converts
+    # in, applies the op, converts out, and compares.
+    cases = p256_fe_cases()
+    labels = []
+    for n, (op, a, b) in enumerate(cases):
+        want = p256_fe(op, a, b)
+        out.append(blob("p256a_%d" % n, (a % (2 ** 256)).to_bytes(32, "big")))
+        out.append(blob("p256b_%d" % n, (b % (2 ** 256)).to_bytes(32, "big")))
+        out.append(blob("p256w_%d" % n, want.to_bytes(32, "big")))
+        labels.append((n, op))
+    out.append("align 8\np256_fe_tests:\n")
+    for n, op in labels:
+        out.append("    dq %d, p256a_%d, p256b_%d, p256w_%d\n" % (op, n, n, n))
+    out.append("p256_fe_test_count equ (($ - p256_fe_tests) / 32)\n")
 
     # The deterministic handshake check: feed the trace's ClientHello
     # record into linnea_tls with the trace's server key/random injected;

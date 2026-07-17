@@ -14,6 +14,7 @@ default rel
 
 %include "linnea_syscall.inc"
 %include "linnea_tls.inc"
+%include "linnea_p256_fe.inc"
 %include "sha256_vectors.inc"
 
 global _start
@@ -27,6 +28,13 @@ extern linnea_hkdf_extract
 extern linnea_hkdf_expand
 extern linnea_x25519
 extern linnea_ed25519_sign
+extern linnea_p256_fe_frombytes
+extern linnea_p256_fe_tobytes
+extern linnea_p256_fe_mul
+extern linnea_p256_fe_sq
+extern linnea_p256_fe_add
+extern linnea_p256_fe_sub
+extern linnea_p256_fe_inv
 extern linnea_aesgcm_init
 extern linnea_aesgcm_seal
 extern linnea_aesgcm_open
@@ -48,6 +56,7 @@ mode_edstd:  db "ed25519-stdin", 0
 mode_gseal:  db "aesgcm-stdin", 0
 mode_gopen:  db "aesgcm-open-stdin", 0
 mode_pem:    db "pem-seed-stdin", 0
+mode_p256fe: db "p256-fe-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
 lbl_sha5:    db "sha512 "
@@ -64,6 +73,8 @@ lbl_xi:      db "x25519-iter "
 lbl_xi_len   equ $ - lbl_xi
 lbl_ed:      db "ed25519 "
 lbl_ed_len   equ $ - lbl_ed
+lbl_p256:    db "p256-fe "
+lbl_p256_len equ $ - lbl_p256
 lbl_gs:      db "aesgcm-seal "
 lbl_gs_len   equ $ - lbl_gs
 lbl_go:      db "aesgcm-open "
@@ -89,6 +100,9 @@ inbuf:       resb 1 << 20       ; stdin-mode input frame
 iter_k:      resb 32            ; X25519 iterated-test working values
 iter_u:      resb 32
 iter_r:      resb 32
+p256_a:      resb LINNEA_P256_FE_SIZE   ; P-256 field working values
+p256_b:      resb LINNEA_P256_FE_SIZE
+p256_r:      resb LINNEA_P256_FE_SIZE
 gcm_ctx:     resb linnea_aesgcm_ctx_size
 tls_keys:    resb linnea_tls_keys_size
 tls_hs:      resb linnea_tls_hs_size
@@ -140,6 +154,11 @@ _start:
     call streq
     test eax, eax
     jnz .pemstdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_p256fe]
+    call streq
+    test eax, eax
+    jnz .p256festdin
 
 ; ---- known-answer tables --------------------------------------------
 .vectors:
@@ -383,6 +402,69 @@ _start:
     mov rcx, ed25519_test_count
     call report
     add r15, ed25519_test_count
+    sub r15, r13
+
+    ; P-256 field arithmetic. Each record is (op, a, b, want) with the
+    ; operands big-endian: convert both into Montgomery form, apply the op,
+    ; convert back, compare. That exercises frombytes/tobytes on every case
+    ; as well as the op itself.
+    lea rbx, [p256_fe_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.p256_loop:
+    cmp r12, p256_fe_test_count
+    jae .p256_done
+    imul rax, r12, 32
+    lea r14, [rbx + rax]
+    lea rdi, [p256_a]
+    mov rsi, [r14 + 8]
+    call linnea_p256_fe_frombytes
+    lea rdi, [p256_b]
+    mov rsi, [r14 + 16]
+    call linnea_p256_fe_frombytes
+    mov rax, [r14 + 0]         ; op
+    lea rdi, [p256_r]
+    lea rsi, [p256_a]
+    lea rdx, [p256_b]
+    cmp rax, 0
+    je .p256_mul
+    cmp rax, 1
+    je .p256_sq
+    cmp rax, 2
+    je .p256_add
+    cmp rax, 3
+    je .p256_sub
+    call linnea_p256_fe_inv
+    jmp .p256_cmp
+.p256_mul:
+    call linnea_p256_fe_mul
+    jmp .p256_cmp
+.p256_sq:
+    call linnea_p256_fe_sq
+    jmp .p256_cmp
+.p256_add:
+    call linnea_p256_fe_add
+    jmp .p256_cmp
+.p256_sub:
+    call linnea_p256_fe_sub
+.p256_cmp:
+    lea rdi, [outbuf]
+    lea rsi, [p256_r]
+    call linnea_p256_fe_tobytes
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 24]        ; want
+    mov rcx, 32
+    call memeq
+    add r13, rax
+    inc r12
+    jmp .p256_loop
+.p256_done:
+    lea rdi, [lbl_p256]
+    mov rsi, lbl_p256_len
+    mov rdx, r13
+    mov rcx, p256_fe_test_count
+    call report
+    add r15, p256_fe_test_count
     sub r15, r13
 
     ; AES-GCM seal: out must be ct || tag, ptlen + 16 bytes
@@ -848,6 +930,59 @@ _start:
     call linnea_print_stdout
     jmp .pemstdin
 .pemstdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; ---- p256-fe-stdin mode: 65-byte frames [op][a 32B BE][b 32B BE],
+;      reply with the 32-byte big-endian result. Drives
+;      test/crypto/diff_p256_fe.py; op numbering matches gen_vectors.py.
+.p256festdin:
+    lea rdi, [inbuf]
+    mov rsi, 65
+    call read_full
+    cmp eax, 65
+    jne .p256festdin_done
+    lea rdi, [p256_a]
+    lea rsi, [inbuf + 1]
+    call linnea_p256_fe_frombytes
+    lea rdi, [p256_b]
+    lea rsi, [inbuf + 33]
+    call linnea_p256_fe_frombytes
+    movzx rax, byte [inbuf]
+    lea rdi, [p256_r]
+    lea rsi, [p256_a]
+    lea rdx, [p256_b]
+    cmp rax, 0
+    je .p256fe_mul
+    cmp rax, 1
+    je .p256fe_sq
+    cmp rax, 2
+    je .p256fe_add
+    cmp rax, 3
+    je .p256fe_sub
+    call linnea_p256_fe_inv
+    jmp .p256fe_out
+.p256fe_mul:
+    call linnea_p256_fe_mul
+    jmp .p256fe_out
+.p256fe_sq:
+    call linnea_p256_fe_sq
+    jmp .p256fe_out
+.p256fe_add:
+    call linnea_p256_fe_add
+    jmp .p256fe_out
+.p256fe_sub:
+    call linnea_p256_fe_sub
+.p256fe_out:
+    lea rdi, [outbuf]
+    lea rsi, [p256_r]
+    call linnea_p256_fe_tobytes
+    lea rdi, [outbuf]
+    mov rsi, 32
+    call linnea_print_stdout
+    jmp .p256festdin
+.p256festdin_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall
