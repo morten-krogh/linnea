@@ -30,7 +30,8 @@ src/%.o: src/%.asm $(INCS)
 SELFTEST_BIN  = bin/linnea-selftest
 SELFTEST_OBJS = test/crypto/linnea_selftest.o src/linnea_sha256.o \
                 src/linnea_sha512.o src/linnea_fe25519.o src/linnea_x25519.o \
-                src/linnea_ed25519.o src/linnea_p256_fe.o src/linnea_aesgcm.o \
+                src/linnea_ed25519.o src/linnea_p256_mont.o src/linnea_p256_fe.o \
+                src/linnea_p256_scalar.o src/linnea_aesgcm.o \
                 src/linnea_tls_kdf.o \
                 src/linnea_tls_record.o src/linnea_tls.o src/linnea_pem.o \
                 src/linnea_print.o src/linnea_string.o

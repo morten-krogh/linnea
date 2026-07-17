@@ -35,6 +35,13 @@ extern linnea_p256_fe_sq
 extern linnea_p256_fe_add
 extern linnea_p256_fe_sub
 extern linnea_p256_fe_inv
+extern linnea_p256_scalar_frombytes
+extern linnea_p256_scalar_tobytes
+extern linnea_p256_scalar_mul
+extern linnea_p256_scalar_add
+extern linnea_p256_scalar_sub
+extern linnea_p256_scalar_inv
+extern linnea_p256_scalar_is_valid
 extern linnea_aesgcm_init
 extern linnea_aesgcm_seal
 extern linnea_aesgcm_open
@@ -57,6 +64,7 @@ mode_gseal:  db "aesgcm-stdin", 0
 mode_gopen:  db "aesgcm-open-stdin", 0
 mode_pem:    db "pem-seed-stdin", 0
 mode_p256fe: db "p256-fe-stdin", 0
+mode_p256sc: db "p256-scalar-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
 lbl_sha5:    db "sha512 "
@@ -75,6 +83,10 @@ lbl_ed:      db "ed25519 "
 lbl_ed_len   equ $ - lbl_ed
 lbl_p256:    db "p256-fe "
 lbl_p256_len equ $ - lbl_p256
+lbl_p256sc:  db "p256-scalar "
+lbl_p256sc_len equ $ - lbl_p256sc
+lbl_p256v:   db "p256-scalar-range "
+lbl_p256v_len equ $ - lbl_p256v
 lbl_gs:      db "aesgcm-seal "
 lbl_gs_len   equ $ - lbl_gs
 lbl_go:      db "aesgcm-open "
@@ -159,6 +171,11 @@ _start:
     call streq
     test eax, eax
     jnz .p256festdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_p256sc]
+    call streq
+    test eax, eax
+    jnz .p256scstdin
 
 ; ---- known-answer tables --------------------------------------------
 .vectors:
@@ -465,6 +482,90 @@ _start:
     mov rcx, p256_fe_test_count
     call report
     add r15, p256_fe_test_count
+    sub r15, r13
+
+    ; P-256 scalar arithmetic, mod the group order. Same record layout as
+    ; the field table; the other binding of the same Montgomery core, so
+    ; this is really a test that n's context constants are right and that
+    ; the core still reduces when n0' is not 1.
+    lea rbx, [p256_sc_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.p256sc_loop:
+    cmp r12, p256_sc_test_count
+    jae .p256sc_done
+    imul rax, r12, 32
+    lea r14, [rbx + rax]
+    lea rdi, [p256_a]
+    mov rsi, [r14 + 8]
+    call linnea_p256_scalar_frombytes
+    lea rdi, [p256_b]
+    mov rsi, [r14 + 16]
+    call linnea_p256_scalar_frombytes
+    mov rax, [r14 + 0]         ; op
+    lea rdi, [p256_r]
+    lea rsi, [p256_a]
+    lea rdx, [p256_b]
+    cmp rax, 0
+    je .p256sc_mul
+    cmp rax, 2
+    je .p256sc_add
+    cmp rax, 3
+    je .p256sc_sub
+    call linnea_p256_scalar_inv
+    jmp .p256sc_cmp
+.p256sc_mul:
+    call linnea_p256_scalar_mul
+    jmp .p256sc_cmp
+.p256sc_add:
+    call linnea_p256_scalar_add
+    jmp .p256sc_cmp
+.p256sc_sub:
+    call linnea_p256_scalar_sub
+.p256sc_cmp:
+    lea rdi, [outbuf]
+    lea rsi, [p256_r]
+    call linnea_p256_scalar_tobytes
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 24]
+    mov rcx, 32
+    call memeq
+    add r13, rax
+    inc r12
+    jmp .p256sc_loop
+.p256sc_done:
+    lea rdi, [lbl_p256sc]
+    mov rsi, lbl_p256sc_len
+    mov rdx, r13
+    mov rcx, p256_sc_test_count
+    call report
+    add r15, p256_sc_test_count
+    sub r15, r13
+
+    ; P-256 scalar range check: the RFC 6979 nonce test, [1, n-1]
+    lea rbx, [p256_valid_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.p256v_loop:
+    cmp r12, p256_valid_test_count
+    jae .p256v_done
+    imul rax, r12, 16
+    lea r14, [rbx + rax]
+    mov rdi, [r14 + 0]
+    call linnea_p256_scalar_is_valid
+    cmp rax, [r14 + 8]
+    jne .p256v_next
+    inc r13
+.p256v_next:
+    inc r12
+    jmp .p256v_loop
+.p256v_done:
+    lea rdi, [lbl_p256v]
+    mov rsi, lbl_p256v_len
+    mov rdx, r13
+    mov rcx, p256_valid_test_count
+    call report
+    add r15, p256_valid_test_count
     sub r15, r13
 
     ; AES-GCM seal: out must be ct || tag, ptlen + 16 bytes
@@ -983,6 +1084,53 @@ _start:
     call linnea_print_stdout
     jmp .p256festdin
 .p256festdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; ---- p256-scalar-stdin mode: same 65-byte frame as p256-fe-stdin, but
+;      modulo the group order. Drives test/crypto/diff_p256_scalar.py.
+.p256scstdin:
+    lea rdi, [inbuf]
+    mov rsi, 65
+    call read_full
+    cmp eax, 65
+    jne .p256scstdin_done
+    lea rdi, [p256_a]
+    lea rsi, [inbuf + 1]
+    call linnea_p256_scalar_frombytes
+    lea rdi, [p256_b]
+    lea rsi, [inbuf + 33]
+    call linnea_p256_scalar_frombytes
+    movzx rax, byte [inbuf]
+    lea rdi, [p256_r]
+    lea rsi, [p256_a]
+    lea rdx, [p256_b]
+    cmp rax, 0
+    je .p256sc_s_mul
+    cmp rax, 2
+    je .p256sc_s_add
+    cmp rax, 3
+    je .p256sc_s_sub
+    call linnea_p256_scalar_inv
+    jmp .p256sc_s_out
+.p256sc_s_mul:
+    call linnea_p256_scalar_mul
+    jmp .p256sc_s_out
+.p256sc_s_add:
+    call linnea_p256_scalar_add
+    jmp .p256sc_s_out
+.p256sc_s_sub:
+    call linnea_p256_scalar_sub
+.p256sc_s_out:
+    lea rdi, [outbuf]
+    lea rsi, [p256_r]
+    call linnea_p256_scalar_tobytes
+    lea rdi, [outbuf]
+    mov rsi, 32
+    call linnea_print_stdout
+    jmp .p256scstdin
+.p256scstdin_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall

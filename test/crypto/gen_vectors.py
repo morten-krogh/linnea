@@ -492,6 +492,49 @@ def p256_fe(op, a, b):
     raise ValueError(op)
 
 
+# The group order: P-256's second modulus, where ECDSA's scalars live. It
+# has none of p's structure (its n0' is a real constant), so its reduction
+# carries are checked separately rather than inherited.
+P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+
+
+def p256_scalar(op, a, b):
+    """Same ops, modulo n instead of p."""
+    a %= P256_N
+    b %= P256_N
+    if op == P256_FE_MUL:
+        return (a * b) % P256_N
+    if op == P256_FE_ADD:
+        return (a + b) % P256_N
+    if op == P256_FE_SUB:
+        return (a - b) % P256_N
+    if op == P256_FE_INV:
+        return pow(a, P256_N - 2, P256_N)
+    raise ValueError(op)
+
+
+def p256_scalar_cases():
+    edge = [
+        0, 1, 2,
+        P256_N - 2, P256_N - 1, P256_N, P256_N + 1,
+        2 ** 256 - 1, 2 ** 256 - 2,
+        (P256_N - 1) // 2, (P256_N + 1) // 2,
+        2 ** 224, 2 ** 192, 2 ** 128, 2 ** 64, 2 ** 64 - 1,
+    ]
+    cases = []
+    for op in (P256_FE_MUL, P256_FE_ADD, P256_FE_SUB):
+        for a in edge:
+            for b in edge:
+                cases.append((op, a, b))
+    for a in edge:
+        cases.append((P256_FE_INV, a, 0))
+    rng = random.Random(20260718)
+    for op in (P256_FE_MUL, P256_FE_ADD, P256_FE_SUB, P256_FE_INV):
+        for _ in range(24):
+            cases.append((op, rng.randrange(2 ** 256), rng.randrange(2 ** 256)))
+    return cases
+
+
 def p256_fe_cases():
     """(op, a, b) triples for the embedded table.
 
@@ -991,6 +1034,34 @@ def main():
     for n, op in labels:
         out.append("    dq %d, p256a_%d, p256b_%d, p256w_%d\n" % (op, n, n, n))
     out.append("p256_fe_test_count equ (($ - p256_fe_tests) / 32)\n")
+
+    # ---- P-256 scalar arithmetic (mod the group order) --------------
+    # Same record layout and ops; sq is absent (nothing squares a scalar).
+    cases = p256_scalar_cases()
+    labels = []
+    for n, (op, a, b) in enumerate(cases):
+        want = p256_scalar(op, a, b)
+        out.append(blob("p256sa_%d" % n, (a % (2 ** 256)).to_bytes(32, "big")))
+        out.append(blob("p256sb_%d" % n, (b % (2 ** 256)).to_bytes(32, "big")))
+        out.append(blob("p256sw_%d" % n, want.to_bytes(32, "big")))
+        labels.append((n, op))
+    out.append("align 8\np256_sc_tests:\n")
+    for n, op in labels:
+        out.append("    dq %d, p256sa_%d, p256sb_%d, p256sw_%d\n" % (op, n, n, n))
+    out.append("p256_sc_test_count equ (($ - p256_sc_tests) / 32)\n")
+
+    # is_valid: the RFC 6979 nonce range test, [1, n-1]. Rejection is what
+    # this must get right, so the table is mostly boundaries.
+    valid_cases = [0, 1, 2, P256_N - 1, P256_N, P256_N + 1, 2 ** 256 - 1,
+                   P256_N - 2, (P256_N + 1) // 2, 2 ** 255, 2 ** 128]
+    labels = []
+    for n, v in enumerate(valid_cases):
+        out.append(blob("p256v_%d" % n, (v % (2 ** 256)).to_bytes(32, "big")))
+        labels.append((n, 1 if 1 <= v <= P256_N - 1 else 0))
+    out.append("align 8\np256_valid_tests:\n")
+    for n, want in labels:
+        out.append("    dq p256v_%d, %d\n" % (n, want))
+    out.append("p256_valid_test_count equ (($ - p256_valid_tests) / 16)\n")
 
     # The deterministic handshake check: feed the trace's ClientHello
     # record into linnea_tls with the trace's server key/random injected;
