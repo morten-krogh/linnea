@@ -571,6 +571,204 @@ def p256_fe_cases():
     return cases
 
 
+# --- P-256 curve, points and ECDSA (RFC 6979 deterministic) --------------
+# The reference for the point and signing assembly. Curve constants are
+# checked below rather than trusted: G must be on the curve and n*G must be
+# the identity, and the whole chain is pinned to RFC 6979 A.2.5, which
+# publishes k, r and s for this exact curve and hash.
+P256_A = (P256_P - 3) % P256_P
+P256_B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
+P256_B3 = (3 * P256_B) % P256_P
+P256_GX = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296
+P256_GY = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5
+
+assert (P256_GY ** 2 - (P256_GX ** 3 + P256_A * P256_GX + P256_B)) % P256_P == 0, \
+    "P-256 base point is not on the curve"
+
+
+def p256_padd(p1, p2):
+    """EFD add-2015-rcb for a = -3, projective (X:Y:Z), transcribed verbatim.
+
+    Complete on a prime-order curve: correct for P == Q, the identity, and
+    P == -Q. The assembly runs this same sequence, which is why the ladder
+    below can double by calling it with p1 is p2 and start from infinity
+    without a single branch on the scalar.
+    """
+    m = P256_P
+    X1, Y1, Z1 = p1
+    X2, Y2, Z2 = p2
+    t0 = X1 * X2 % m
+    t1 = Y1 * Y2 % m
+    t2 = Z1 * Z2 % m
+    t3 = (X1 + Y1) * ((X2 + Y2) % m) % m
+    t4 = (t0 + t1) % m
+    t3 = (t3 - t4) % m
+    t4 = (X1 + Z1) * ((X2 + Z2) % m) % m
+    t5 = (t0 + t2) % m
+    t4 = (t4 - t5) % m
+    t5 = (Y1 + Z1) * ((Y2 + Z2) % m) % m
+    X3 = (t1 + t2) % m
+    t5 = (t5 - X3) % m
+    Z3 = P256_A * t4 % m
+    X3 = P256_B3 * t2 % m
+    Z3 = (X3 + Z3) % m
+    X3 = (t1 - Z3) % m
+    Z3 = (t1 + Z3) % m
+    Y3 = X3 * Z3 % m
+    t1 = (t0 + t0 + t0) % m
+    t2 = P256_A * t2 % m
+    t4 = P256_B3 * t4 % m
+    t1 = (t1 + t2) % m
+    t2 = (t0 - t2) % m
+    t2 = P256_A * t2 % m
+    t4 = (t4 + t2) % m
+    t0 = t1 * t4 % m
+    Y3 = (Y3 + t0) % m
+    t0 = t5 * t4 % m
+    X3 = t3 * X3 % m
+    X3 = (X3 - t0) % m
+    t0 = t3 * t1 % m
+    Z3 = t5 * Z3 % m
+    Z3 = (Z3 + t0) % m
+    return (X3, Y3, Z3)
+
+
+P256_G = (P256_GX, P256_GY, 1)
+
+
+def p256_mul(k, pt=P256_G):
+    """The ladder the assembly runs: always double, always add, select."""
+    acc = (0, 1, 0)
+    for bit in range(255, -1, -1):
+        acc = p256_padd(acc, acc)
+        cand = p256_padd(acc, pt)
+        acc = cand if (k >> bit) & 1 else acc
+    return acc
+
+
+def p256_affine(pt):
+    X, Y, Z = pt
+    if Z % P256_P == 0:
+        return None
+    zi = pow(Z, P256_P - 2, P256_P)
+    return (X * zi % P256_P, Y * zi % P256_P)
+
+
+assert p256_affine(p256_mul(P256_N)) is None, "n*G is not the identity"
+
+
+def p256_bits2int(b):
+    # blen == qlen == 256 for P-256 with SHA-256: no truncation happens
+    x = int.from_bytes(b, "big")
+    shift = len(b) * 8 - 256
+    return x >> shift if shift > 0 else x
+
+
+def p256_rfc6979_k(d, h1):
+    """RFC 6979 section 3.2. HMAC-SHA256 gives exactly qlen bits, so the
+    inner 'while tlen < qlen' loop runs once per candidate."""
+    mac = lambda key, msg: hmac.new(key, msg, hashlib.sha256).digest()
+    i2o = lambda x: x.to_bytes(32, "big")
+    b2o = i2o(p256_bits2int(h1) % P256_N)       # bits2octets
+    V = b"\x01" * 32
+    K = b"\x00" * 32
+    K = mac(K, V + b"\x00" + i2o(d) + b2o)
+    V = mac(K, V)
+    K = mac(K, V + b"\x01" + i2o(d) + b2o)
+    V = mac(K, V)
+    while True:
+        V = mac(K, V)
+        k = p256_bits2int(V)
+        if 1 <= k < P256_N:
+            return k
+        K = mac(K, V + b"\x00")
+        V = mac(K, V)
+
+
+def p256_ecdsa_sign(d, h1):
+    """Returns (r, s). h1 is the message DIGEST, as the assembly takes it."""
+    k = p256_rfc6979_k(d, h1)
+    x1, _ = p256_affine(p256_mul(k))
+    r = x1 % P256_N
+    e = p256_bits2int(h1) % P256_N
+    s = pow(k, P256_N - 2, P256_N) * (e + r * d) % P256_N
+    assert r and s, "r or s came out zero: astronomically improbable"
+    return r, s
+
+
+def p256_der_int(x):
+    b = x.to_bytes(32, "big").lstrip(b"\x00") or b"\x00"
+    if b[0] & 0x80:
+        b = b"\x00" + b              # else it reads as a negative integer
+    return b"\x02" + bytes([len(b)]) + b
+
+
+def p256_der_sig(r, s):
+    body = p256_der_int(r) + p256_der_int(s)
+    assert len(body) < 128, "body needs a multi-byte DER length"
+    return b"\x30" + bytes([len(body)]) + body
+
+
+# RFC 6979 Appendix A.2.5, the P-256 / SHA-256 cases.
+P256_RFC6979_X = 0xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721
+P256_RFC6979_UX = 0x60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6
+P256_RFC6979_UY = 0x7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299
+P256_RFC6979_CASES = [
+    (b"sample",
+     0xA6E3C57DD01ABE90086538398355DD4C3B17AA873382B0F24D6129493D8AAD60,
+     0xEFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716,
+     0xF7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8),
+    (b"test",
+     0xD16B6AE827F17175E040871A1C7EC3500192C4C92677336EC2537ACAEE0008E0,
+     0xF1ABB023518351CD71D881567B1EA663ED3EFCF6C5132B354F28D3B0B7D38367,
+     0x019F4113742A2B14BD25926B49C649155F267E60D3814B4C0CC84250E46F0083),
+]
+
+assert p256_affine(p256_mul(P256_RFC6979_X)) == (P256_RFC6979_UX, P256_RFC6979_UY)
+for _msg, _k, _r, _s in P256_RFC6979_CASES:
+    _h = hashlib.sha256(_msg).digest()
+    assert p256_rfc6979_k(P256_RFC6979_X, _h) == _k, "6979 k mismatch"
+    assert p256_ecdsa_sign(P256_RFC6979_X, _h) == (_r, _s), "6979 signature mismatch"
+
+
+def p256_ecdsa_cases():
+    """(digest, privkey, r, s) for the embedded table.
+
+    The RFC's two published cases, then a spread, then a bounded search for
+    the DER shapes the common cases never produce: an r or s whose top byte
+    is zero (the encoder must strip it) and one whose top bit is set (it must
+    prepend 0x00). Without the search a table of random signatures encodes
+    the same shape every time and the stripping path goes untested.
+    """
+    cases = []
+    for msg, _k, r, s in P256_RFC6979_CASES:
+        cases.append((hashlib.sha256(msg).digest(), P256_RFC6979_X, r, s))
+
+    rng = random.Random(20260719)
+    for i in range(8):
+        d = rng.randrange(1, P256_N)
+        h = hashlib.sha256(b"linnea-ecdsa-%d" % i).digest()
+        r, s = p256_ecdsa_sign(d, h)
+        cases.append((h, d, r, s))
+
+    want_short_r = want_short_s = True
+    d = P256_RFC6979_X
+    for i in range(600):
+        if not (want_short_r or want_short_s):
+            break
+        h = hashlib.sha256(b"linnea-der-%d" % i).digest()
+        r, s = p256_ecdsa_sign(d, h)
+        if want_short_r and r < 2 ** 248:        # r loses its top byte
+            cases.append((h, d, r, s))
+            want_short_r = False
+        elif want_short_s and s < 2 ** 248:      # s loses its top byte
+            cases.append((h, d, r, s))
+            want_short_s = False
+    assert not want_short_r, "no short-r case found: DER stripping untested"
+    assert not want_short_s, "no short-s case found: DER stripping untested"
+    return cases
+
+
 def _det_bytes(tag, n):
     """Deterministic pseudo-random test data (stable across runs)."""
     out = b""
@@ -1062,6 +1260,24 @@ def main():
     for n, want in labels:
         out.append("    dq p256v_%d, %d\n" % (n, want))
     out.append("p256_valid_test_count equ (($ - p256_valid_tests) / 16)\n")
+
+    # ---- P-256 ECDSA, deterministic per RFC 6979 --------------------
+    # Records are (digest, privkey, want_der, want_len). The signature is a
+    # pure function of its inputs, so these are exact -- the whole reason
+    # for choosing 6979 over a random nonce.
+    cases = p256_ecdsa_cases()
+    labels = []
+    for n, (h, d, r, s) in enumerate(cases):
+        sig = p256_der_sig(r, s)
+        out.append(blob("p256eh_%d" % n, h))
+        out.append(blob("p256ed_%d" % n, d.to_bytes(32, "big")))
+        out.append(blob("p256es_%d" % n, sig))
+        labels.append((n, len(sig)))
+    out.append("align 8\np256_ecdsa_tests:\n")
+    for n, siglen in labels:
+        out.append("    dq p256eh_%d, p256ed_%d, p256es_%d, %d\n"
+                   % (n, n, n, siglen))
+    out.append("p256_ecdsa_test_count equ (($ - p256_ecdsa_tests) / 32)\n")
 
     # The deterministic handshake check: feed the trace's ClientHello
     # record into linnea_tls with the trace's server key/random injected;

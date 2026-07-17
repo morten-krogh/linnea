@@ -15,6 +15,7 @@ default rel
 %include "linnea_syscall.inc"
 %include "linnea_tls.inc"
 %include "linnea_p256_fe.inc"
+%include "linnea_p256_ecdsa.inc"
 %include "sha256_vectors.inc"
 
 global _start
@@ -42,6 +43,7 @@ extern linnea_p256_scalar_add
 extern linnea_p256_scalar_sub
 extern linnea_p256_scalar_inv
 extern linnea_p256_scalar_is_valid
+extern linnea_p256_ecdsa_sign
 extern linnea_aesgcm_init
 extern linnea_aesgcm_seal
 extern linnea_aesgcm_open
@@ -65,6 +67,7 @@ mode_gopen:  db "aesgcm-open-stdin", 0
 mode_pem:    db "pem-seed-stdin", 0
 mode_p256fe: db "p256-fe-stdin", 0
 mode_p256sc: db "p256-scalar-stdin", 0
+mode_p256ec: db "p256-ecdsa-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
 lbl_sha5:    db "sha512 "
@@ -87,6 +90,8 @@ lbl_p256sc:  db "p256-scalar "
 lbl_p256sc_len equ $ - lbl_p256sc
 lbl_p256v:   db "p256-scalar-range "
 lbl_p256v_len equ $ - lbl_p256v
+lbl_p256ec:  db "p256-ecdsa "
+lbl_p256ec_len equ $ - lbl_p256ec
 lbl_gs:      db "aesgcm-seal "
 lbl_gs_len   equ $ - lbl_gs
 lbl_go:      db "aesgcm-open "
@@ -176,6 +181,11 @@ _start:
     call streq
     test eax, eax
     jnz .p256scstdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_p256ec]
+    call streq
+    test eax, eax
+    jnz .p256ecstdin
 
 ; ---- known-answer tables --------------------------------------------
 .vectors:
@@ -566,6 +576,43 @@ _start:
     mov rcx, p256_valid_test_count
     call report
     add r15, p256_valid_test_count
+    sub r15, r13
+
+    ; P-256 ECDSA. Deterministic (RFC 6979), so the expected signature is
+    ; exact, DER and all -- the two published A.2.5 cases plus shapes whose
+    ; r or s loses its top byte, which is the encoder's stripping path.
+    lea rbx, [p256_ecdsa_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.p256ec_loop:
+    cmp r12, p256_ecdsa_test_count
+    jae .p256ec_done
+    imul rax, r12, 32
+    lea r14, [rbx + rax]
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 0]         ; digest
+    mov rdx, [r14 + 8]         ; private key
+    call linnea_p256_ecdsa_sign
+    cmp rax, [r14 + 24]        ; length must match exactly
+    jne .p256ec_next
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 16]
+    mov rcx, [r14 + 24]
+    call memeq
+    add r13, rax
+    jmp .p256ec_after
+.p256ec_next:
+    ; length wrong: counts as a failure, no comparison
+.p256ec_after:
+    inc r12
+    jmp .p256ec_loop
+.p256ec_done:
+    lea rdi, [lbl_p256ec]
+    mov rsi, lbl_p256ec_len
+    mov rdx, r13
+    mov rcx, p256_ecdsa_test_count
+    call report
+    add r15, p256_ecdsa_test_count
     sub r15, r13
 
     ; AES-GCM seal: out must be ct || tag, ptlen + 16 bytes
@@ -1131,6 +1178,28 @@ _start:
     call linnea_print_stdout
     jmp .p256scstdin
 .p256scstdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; ---- p256-ecdsa-stdin mode: 64-byte frames [digest 32][priv 32], reply
+;      with [1B len][DER signature]. Drives test/crypto/diff_p256_ecdsa.py.
+.p256ecstdin:
+    lea rdi, [inbuf]
+    mov rsi, 64
+    call read_full
+    cmp eax, 64
+    jne .p256ecstdin_done
+    lea rdi, [outbuf + 1]
+    lea rsi, [inbuf]
+    lea rdx, [inbuf + 32]
+    call linnea_p256_ecdsa_sign
+    mov [outbuf], al
+    lea rdi, [outbuf]
+    lea rsi, [rax + 1]
+    call linnea_print_stdout
+    jmp .p256ecstdin
+.p256ecstdin_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall
