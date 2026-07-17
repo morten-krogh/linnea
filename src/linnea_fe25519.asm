@@ -2,7 +2,7 @@
 ;
 ; The representation and the multiply/carry structure follow Adam Langley's
 ; public-domain curve25519-donna (64-bit). Everything runs only during the
-; TLS handshake (X25519 key agreement, Ed25519 signing), never on bulk
+; TLS handshake (X25519 key agreement), never on bulk
 ; data, so this is written for correctness, not for the last cycle. No
 ; secret-dependent branches or memory indices: the ladder that calls this
 ; is constant-time, and cswap below is branch-free.
@@ -23,7 +23,6 @@ global linnea_fe25519_sub
 global linnea_fe25519_mul121665
 global linnea_fe25519_copy
 global linnea_fe25519_cswap
-global linnea_fe25519_cmov
 global linnea_fe25519_invert
 global linnea_fe25519_1
 global linnea_fe25519_0
@@ -527,23 +526,6 @@ linnea_fe25519_cswap:
     xor rcx, rdx
     mov [rdi + i], rax
     mov [rsi + i], rcx
-%assign i i + 8
-%endrep
-    ret
-
-; linnea_fe25519_cmov(rdi=r, rsi=a, rdx=move) — r = a iff move==1, in
-; constant time (mask = 0 - move, XOR the masked difference into r).
-linnea_fe25519_cmov:
-    mov r8, rdx
-    neg r8                     ; 0 or 0xFFFF...FFFF
-%assign i 0
-%rep 5
-    mov rax, [rdi + i]
-    mov rcx, [rsi + i]
-    xor rcx, rax
-    and rcx, r8
-    xor rax, rcx
-    mov [rdi + i], rax
 %assign i i + 8
 %endrep
     ret

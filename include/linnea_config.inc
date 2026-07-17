@@ -51,7 +51,7 @@ struc linnea_config_server
     .key_path_len:  resq 1
     .cert_der:      resq 1                        ; loaded DER (startup), or 0
     .cert_der_len:  resq 1
-    .key_seed:      resq 1                        ; Ed25519 seed ptr (startup)
+    .key_priv:      resq 1                        ; P-256 private scalar ptr (startup)
     .location_count: resq 1
     .locations:     resb linnea_config_location_size * LINNEA_MAX_LOCATIONS
 endstruc

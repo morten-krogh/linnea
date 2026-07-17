@@ -4,7 +4,7 @@
 ; linnea_tls_setup runs once at startup: if any server serves TLS it
 ; requires the instructions the record protection is built on (see
 ; cpuid_check_aesni), then loads each TLS server's PEM certificate (first
-; CERTIFICATE block, sent as opaque DER) and PKCS#8 Ed25519 key into
+; CERTIFICATE block, sent as opaque DER) and PKCS#8 P-256 key into
 ; persistent buffers, bounding the DER so the handshake flight cannot
 ; outgrow the message buffer it is assembled in.
 ;
@@ -28,7 +28,8 @@ global linnea_ktls_enable
 extern linnea_file_map_readonly
 extern linnea_file_unmap
 extern linnea_pem_decode
-extern linnea_pem_ed25519_seed
+extern linnea_pem_p256_key
+extern linnea_p256_scalar_is_valid
 extern linnea_tls_hkdf_expand_label
 extern linnea_error_exit
 
@@ -44,7 +45,7 @@ msg_no_aesni: db "TLS requires a CPU with AES-NI, PCLMULQDQ and SSSE3"
 msg_no_aesni_len equ $ - msg_no_aesni
 msg_bad_cert: db "cannot load TLS certificate (not a PEM CERTIFICATE?)"
 msg_bad_cert_len equ $ - msg_bad_cert
-msg_bad_key:  db "cannot load TLS key (not a PKCS#8 Ed25519 key?)"
+msg_bad_key:  db "cannot load TLS key (not a PKCS#8 P-256 key in [1, n-1]?)"
 msg_bad_key_len equ $ - msg_bad_key
 msg_cert_big: db "TLS certificate too large to fit the handshake flight"
 msg_cert_big_len equ $ - msg_cert_big
@@ -58,7 +59,7 @@ section .bss
 
 alignb 8
 cert_pool:  resb LINNEA_MAX_SERVERS * MAX_CERT_DER
-seed_pool:  resb LINNEA_MAX_SERVERS * 32
+key_pool:  resb LINNEA_MAX_SERVERS * 32
 
 section .text
 
@@ -124,20 +125,29 @@ linnea_tls_setup:
     mov rsi, r15
     call linnea_file_unmap
 
-    ; key: map the PEM, extract the Ed25519 seed, copy into our slot
+    ; key: map the PEM, walk out the P-256 private scalar, copy into our slot
     lea rdi, [r13 + linnea_config_server.key_path]
     call linnea_file_map_readonly
     mov r14, rax
     mov r15, rdx
     mov rdi, rax
     mov rsi, rdx
-    call linnea_pem_ed25519_seed      ; rax = seed ptr (static) or -1
+    call linnea_pem_p256_key          ; rax = scalar ptr (static) or -1
     cmp rax, -1
     je .bad_key
+    ; The scalar must be in [1, n-1]. Checked once here rather than on every
+    ; signature: linnea_p256_ecdsa_sign assumes it, and a key outside the
+    ; range is an operator error to fail at startup, not per handshake.
+    push rax
+    mov rdi, rax
+    call linnea_p256_scalar_is_valid
+    test eax, eax
+    pop rax
+    jz .bad_key
     imul rcx, r12, 32
-    lea rdi, [seed_pool + rcx]
-    mov [r13 + linnea_config_server.key_seed], rdi
-    mov rsi, rax                       ; copy the 32-byte seed out before the
+    lea rdi, [key_pool + rcx]
+    mov [r13 + linnea_config_server.key_priv], rdi
+    mov rsi, rax                       ; copy the 32-byte scalar out before the
     mov rcx, 32                        ; static buffer is reused next server
     rep movsb
     mov rdi, r14

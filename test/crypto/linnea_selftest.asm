@@ -1,6 +1,7 @@
 ; linnea_selftest.asm — standalone crypto self-test binary.
 ;
-; Default: run every embedded known-answer table (SHA-256, HMAC, HKDF)
+; Default: run every embedded known-answer table (SHA-256, HMAC, HKDF,
+; X25519, the two P-256 moduli, ECDSA, AES-GCM, and the TLS record layer)
 ; and print "<name> <pass>/<total>" per category; exit 1 if any failed.
 ; The vectors come from test/crypto/gen_vectors.py (hashlib/hmac are the
 ; reference); this binary checks the assembly against them.
@@ -23,12 +24,10 @@ global _start
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 extern linnea_sha256
-extern linnea_sha512
 extern linnea_hmac_sha256
 extern linnea_hkdf_extract
 extern linnea_hkdf_expand
 extern linnea_x25519
-extern linnea_ed25519_sign
 extern linnea_p256_fe_frombytes
 extern linnea_p256_fe_tobytes
 extern linnea_p256_fe_mul
@@ -51,27 +50,21 @@ extern linnea_tls_hkdf_expand_label
 extern linnea_tls_keys_init
 extern linnea_tls_seal
 extern linnea_tls_open
-extern linnea_pem_ed25519_seed
 extern linnea_tls_hs_init
 extern linnea_tls_hs_input
 
 section .rodata
 
 mode_stdin:  db "sha256-stdin", 0
-mode_s512:   db "sha512-stdin", 0
 mode_xstdin: db "x25519-stdin", 0
 mode_xiter:  db "x25519-iter", 0
-mode_edstd:  db "ed25519-stdin", 0
 mode_gseal:  db "aesgcm-stdin", 0
 mode_gopen:  db "aesgcm-open-stdin", 0
-mode_pem:    db "pem-seed-stdin", 0
 mode_p256fe: db "p256-fe-stdin", 0
 mode_p256sc: db "p256-scalar-stdin", 0
 mode_p256ec: db "p256-ecdsa-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
-lbl_sha5:    db "sha512 "
-lbl_sha5_len equ $ - lbl_sha5
 lbl_hmac:    db "hmac "
 lbl_hmac_len equ $ - lbl_hmac
 lbl_ext:     db "hkdf-extract "
@@ -82,8 +75,6 @@ lbl_x:       db "x25519 "
 lbl_x_len    equ $ - lbl_x
 lbl_xi:      db "x25519-iter "
 lbl_xi_len   equ $ - lbl_xi
-lbl_ed:      db "ed25519 "
-lbl_ed_len   equ $ - lbl_ed
 lbl_p256:    db "p256-fe "
 lbl_p256_len equ $ - lbl_p256
 lbl_p256sc:  db "p256-scalar "
@@ -123,7 +114,8 @@ p256_r:      resb LINNEA_P256_FE_SIZE
 gcm_ctx:     resb linnea_aesgcm_ctx_size
 tls_keys:    resb linnea_tls_keys_size
 tls_hs:      resb linnea_tls_hs_size
-dummy_seed:  resb 32
+dummy_key:   resb 32            ; the trace never signs: its flight
+                                ; diverges from ours after ServerHello
 
 section .text
 
@@ -137,11 +129,6 @@ _start:
     test eax, eax
     jnz .stdin
     mov rdi, [rsp + 16]
-    lea rsi, [mode_s512]
-    call streq
-    test eax, eax
-    jnz .s512
-    mov rdi, [rsp + 16]
     lea rsi, [mode_xstdin]
     call streq
     test eax, eax
@@ -152,11 +139,6 @@ _start:
     test eax, eax
     jnz .xiter
     mov rdi, [rsp + 16]
-    lea rsi, [mode_edstd]
-    call streq
-    test eax, eax
-    jnz .edstdin
-    mov rdi, [rsp + 16]
     lea rsi, [mode_gseal]
     call streq
     test eax, eax
@@ -166,11 +148,6 @@ _start:
     call streq
     test eax, eax
     jnz .gostdin
-    mov rdi, [rsp + 16]
-    lea rsi, [mode_pem]
-    call streq
-    test eax, eax
-    jnz .pemstdin
     mov rdi, [rsp + 16]
     lea rsi, [mode_p256fe]
     call streq
@@ -220,35 +197,6 @@ _start:
     add r15, sha256_test_count
     sub r15, r13               ; += (total - pass); the count is a constant,
                                ; rcx was clobbered by report's print calls
-
-    ; SHA-512
-    lea rbx, [sha512_tests]
-    xor r12d, r12d
-    xor r13d, r13d
-.sha5_loop:
-    cmp r12, sha512_test_count
-    jae .sha5_done
-    imul rax, r12, 24
-    lea r14, [rbx + rax]
-    mov rdi, [r14 + 0]
-    mov rsi, [r14 + 8]
-    lea rdx, [outbuf]
-    call linnea_sha512
-    lea rdi, [outbuf]
-    mov rsi, [r14 + 16]
-    mov rcx, 64
-    call memeq
-    add r13, rax
-    inc r12
-    jmp .sha5_loop
-.sha5_done:
-    lea rdi, [lbl_sha5]
-    mov rsi, lbl_sha5_len
-    mov rdx, r13
-    mov rcx, sha512_test_count
-    call report
-    add r15, sha512_test_count
-    sub r15, r13
 
     ; HMAC
     lea rbx, [hmac_tests]
@@ -399,36 +347,6 @@ _start:
     mov rcx, x25519_iter_test_count
     call report
     add r15, x25519_iter_test_count
-    sub r15, r13
-
-    ; Ed25519 signing
-    lea rbx, [ed25519_tests]
-    xor r12d, r12d
-    xor r13d, r13d
-.ed_loop:
-    cmp r12, ed25519_test_count
-    jae .ed_done
-    imul rax, r12, 32
-    lea r14, [rbx + rax]
-    lea rdi, [outbuf]          ; sig out (64 bytes)
-    mov rsi, [r14 + 8]         ; msg
-    mov rdx, [r14 + 16]        ; msglen
-    mov rcx, [r14 + 0]         ; seed
-    call linnea_ed25519_sign
-    lea rdi, [outbuf]
-    mov rsi, [r14 + 24]        ; expected sig
-    mov rcx, 64
-    call memeq
-    add r13, rax
-    inc r12
-    jmp .ed_loop
-.ed_done:
-    lea rdi, [lbl_ed]
-    mov rsi, lbl_ed_len
-    mov rdx, r13
-    mov rcx, ed25519_test_count
-    call report
-    add r15, ed25519_test_count
     sub r15, r13
 
     ; P-256 field arithmetic. Each record is (op, a, b, want) with the
@@ -832,12 +750,12 @@ _start:
     ; TLS 1.3 handshake vs the RFC 8448 trace: feed the trace ClientHello
     ; with the trace's ephemeral key + server random injected; the emitted
     ; ServerHello record and the handshake/master secrets must match the
-    ; trace byte-for-byte. (The flight past the SH signs with our Ed25519
+    ; trace byte-for-byte. (The flight past the SH signs with our P-256
     ; key where the trace used RSA, so only the schedule is comparable.)
     lea rdi, [tls_hs]
     lea rsi, [dummy_cert]
     mov rdx, 4
-    lea rcx, [dummy_seed]
+    lea rcx, [dummy_key]
     mov r8d, LINNEA_TLS_FLAG_TRACE
     call linnea_tls_hs_init
     lea rdi, [tls_hs + linnea_tls_hs.priv]   ; inject server ephemeral key
@@ -932,32 +850,6 @@ _start:
     mov eax, LINNEA_SYS_EXIT
     syscall
 
-; ---- ed25519-stdin: frames of [4-byte len][seed32 || msg] -> 64-byte sig
-.edstdin:
-    lea rdi, [lenbuf]
-    mov rsi, 4
-    call read_full
-    cmp eax, 4
-    jne .edstdin_done
-    mov ecx, [lenbuf]
-    lea rdi, [inbuf]
-    mov rsi, rcx
-    call read_full
-    lea rdi, [outbuf]          ; sig (64)
-    lea rsi, [inbuf + 32]      ; msg
-    mov edx, [lenbuf]
-    sub edx, 32                ; msglen = frame - seed
-    lea rcx, [inbuf]           ; seed
-    call linnea_ed25519_sign
-    lea rdi, [outbuf]
-    mov rsi, 64
-    call linnea_print_stdout
-    jmp .edstdin
-.edstdin_done:
-    xor edi, edi
-    mov eax, LINNEA_SYS_EXIT
-    syscall
-
 ; ---- aesgcm-stdin: frames of [4-byte len][key16 || nonce12 ||
 ; aadlen4 || aad || pt] -> ct || tag (ptlen + 16 bytes) ----------------
 .gsstdin:
@@ -1042,42 +934,6 @@ _start:
     call linnea_print_stdout
     jmp .gostdin
 .gostdin_done:
-    xor edi, edi
-    mov eax, LINNEA_SYS_EXIT
-    syscall
-
-; ---- pem-seed-stdin: frame [4-byte len][PEM text] -> [1-byte rc]
-; [32-byte seed] (rc 0 ok, 1 rejected -> seed omitted) -----------------
-.pemstdin:
-    lea rdi, [lenbuf]
-    mov rsi, 4
-    call read_full
-    cmp eax, 4
-    jne .pemstdin_done
-    mov ecx, [lenbuf]
-    lea rdi, [inbuf]
-    mov rsi, rcx
-    call read_full
-    lea rdi, [inbuf]
-    mov esi, [lenbuf]
-    call linnea_pem_ed25519_seed
-    cmp rax, -1
-    je .pem_reject
-    mov byte [outbuf], 0
-    mov rsi, rax
-    lea rdi, [outbuf + 1]
-    call copy32
-    lea rdi, [outbuf]
-    mov rsi, 33
-    call linnea_print_stdout
-    jmp .pemstdin
-.pem_reject:
-    mov byte [outbuf], 1
-    lea rdi, [outbuf]
-    mov rsi, 1
-    call linnea_print_stdout
-    jmp .pemstdin
-.pemstdin_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall
@@ -1224,30 +1080,6 @@ _start:
     call linnea_print_stdout
     jmp .stdin
 .stdin_done:
-    xor edi, edi
-    mov eax, LINNEA_SYS_EXIT
-    syscall
-
-; ---- sha512-stdin differential mode ---------------------------------
-.s512:
-    lea rdi, [lenbuf]
-    mov rsi, 4
-    call read_full
-    cmp eax, 4
-    jne .s512_done
-    mov ecx, [lenbuf]
-    lea rdi, [inbuf]
-    mov rsi, rcx
-    call read_full
-    lea rdi, [inbuf]
-    mov esi, [lenbuf]
-    lea rdx, [outbuf]
-    call linnea_sha512
-    lea rdi, [outbuf]
-    mov rsi, 64
-    call linnea_print_stdout
-    jmp .s512
-.s512_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall

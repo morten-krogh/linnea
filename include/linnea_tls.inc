@@ -1,11 +1,12 @@
 ; TLS 1.3 (RFC 8446), the linnea profile: TLS_AES_128_GCM_SHA256 with an
-; x25519 key share and an Ed25519 certificate, no HelloRetryRequest, no
+; x25519 key share and an ECDSA P-256 certificate, no HelloRetryRequest, no
 ; resumption, no 0-RTT, no client certificates. The handshake runs in
-; userspace; application-data record protection moves into the kernel
-; (kTLS) in M6 — until then the same record layer serves both.
+; userspace; application-data record protection is handed to the kernel
+; (kTLS) once it completes.
 
 %include "linnea_sha256.inc"
 %include "linnea_aesgcm.inc"
+%include "linnea_p256_ecdsa.inc"
 
 ; One direction of record protection: the AES-GCM schedule for the
 ; traffic key, the static IV, and the record sequence number that gets
@@ -23,15 +24,19 @@ LINNEA_TLS_WAIT_FIN     equ 1
 LINNEA_TLS_DONE         equ 2
 LINNEA_TLS_FAILED       equ 3
 
-; Test-only: x25519 private key and server random are injected by the
-; caller instead of getrandom(2), and the signature_algorithms check is
-; skipped (the RFC 8448 trace ClientHello predates ed25519 support).
+; Test-only: the x25519 private key and the server random are injected by
+; the caller instead of coming from getrandom(2), and the
+; signature_algorithms check is skipped. The RFC 8448 trace's ClientHello
+; does offer ecdsa_secp256r1_sha256, so the skip is no longer load-bearing
+; for the sigalgs check itself; the injection is what the trace needs, and
+; the flight past ServerHello diverges from the trace regardless (its
+; certificate is RSA).
 LINNEA_TLS_FLAG_TRACE   equ 1
 
 ; The whole handshake state overlays a connection's up_buf (no proxying is
 ; active during the handshake), so linnea_tls_hs_size must stay <= up_buf.
 ; The flight buffer holds EE + Certificate(DER) + CertificateVerify +
-; Finished; 4096 covers a single Ed25519 leaf well past any real size.
+; Finished; 4096 covers a single P-256 leaf well past any real size.
 LINNEA_TLS_MSG_BUF      equ 4096   ; handshake message reassembly space
 
 ; msg_buf is smaller than the largest record in_buf can hold, so the record
@@ -44,10 +49,15 @@ LINNEA_TLS_MSG_BUF      equ 4096   ; handshake message reassembly space
 LINNEA_TLS_MAX_FRAGMENT equ LINNEA_TLS_MSG_BUF
 
 ; build_flight assembles EncryptedExtensions(6) + Certificate(13 + DER) +
-; CertificateVerify(72) + Finished(36) into msg_buf, so a certificate is
-; bounded by msg_buf minus that 127 bytes of framing. linnea_tls_setup
+; CertificateVerify(8 + signature) + Finished(36) into msg_buf, so a
+; certificate is bounded by msg_buf minus that framing. linnea_tls_setup
 ; refuses a larger one at startup rather than let the flight overrun.
-LINNEA_TLS_FLIGHT_OVERHEAD equ 127
+;
+; The CertificateVerify term must be computed from the signature's MAXIMUM,
+; not its typical size: an ECDSA signature is DER, so its length varies with
+; r and s and usually lands a byte or two under the bound. The term is
+; header(4) + scheme(2) + length(2) + LINNEA_P256_ECDSA_MAX_SIG.
+LINNEA_TLS_FLIGHT_OVERHEAD equ 6 + 13 + (8 + LINNEA_P256_ECDSA_MAX_SIG) + 36
 LINNEA_TLS_MAX_CERT     equ LINNEA_TLS_MSG_BUF - LINNEA_TLS_FLIGHT_OVERHEAD
 
 ; kTLS handoff (docs.kernel.org/networking/tls.html). After the handshake
@@ -83,14 +93,14 @@ LINNEA_TLS_A_PROTOCOL_VERSION    equ 70
 LINNEA_TLS_A_INTERNAL_ERROR      equ 80
 
 ; Per-connection handshake state. The traffic secrets stay resident
-; because M6 needs the application secrets for the kTLS handoff after
+; because the kTLS handoff needs the application secrets after
 ; the handshake ends.
 struc linnea_tls_hs
     .state:      resd 1
     .flags:      resd 1
     .cert:       resq 1     ; DER certificate (sent verbatim)
     .cert_len:   resq 1
-    .key_seed:   resq 1     ; 32-byte Ed25519 private seed
+    .key_priv:   resq 1     ; 32-byte P-256 private scalar
     .out_len:    resq 1     ; bytes placed in out by the last _input call
     .consumed:   resq 1     ; input bytes eaten by the last _input call
     .alert:      resd 1     ; alert description sent when state = FAILED

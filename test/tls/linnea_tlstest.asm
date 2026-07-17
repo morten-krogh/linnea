@@ -5,7 +5,7 @@
 ; clients — openssl s_client, curl, python ssl — over a plain accept()
 ; loop: complete one handshake, then echo every application record until
 ; the peer sends close_notify. It exercises the whole flight the RFC 8448
-; trace can't (Ed25519 CertificateVerify, client Finished verification).
+; trace can't (ECDSA CertificateVerify, client Finished verification).
 ;
 ; usage: linnea-tlstest <cert.pem> <key.pem> <port>
 
@@ -15,7 +15,7 @@ default rel
 %include "linnea_tls.inc"
 
 extern linnea_pem_decode
-extern linnea_pem_ed25519_seed
+extern linnea_pem_p256_key
 extern linnea_tls_hs_init
 extern linnea_tls_hs_input
 extern linnea_tls_open
@@ -62,12 +62,12 @@ _start:
     jle .fail
     mov r14, rax               ; cert DER length
 
-    ; --- load the private key seed ---
+    ; --- load the private key scalar ---
     mov rdi, [rsp + 24]        ; argv[2] key path
     call map_file
     mov rdi, rax
     mov rsi, rdx
-    call linnea_pem_ed25519_seed
+    call linnea_pem_p256_key
     cmp rax, -1
     je .fail
     mov r15, rax               ; seed pointer (static in linnea_pem)

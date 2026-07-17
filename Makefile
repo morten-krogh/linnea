@@ -29,11 +29,10 @@ src/%.o: src/%.asm $(INCS)
 # --- crypto self-test binary (own _start; links only what it needs) ---
 SELFTEST_BIN  = bin/linnea-selftest
 SELFTEST_OBJS = test/crypto/linnea_selftest.o src/linnea_sha256.o \
-                src/linnea_sha512.o src/linnea_fe25519.o src/linnea_x25519.o \
-                src/linnea_ed25519.o src/linnea_p256_mont.o src/linnea_p256_fe.o \
+                src/linnea_fe25519.o src/linnea_x25519.o \
+                src/linnea_p256_mont.o src/linnea_p256_fe.o \
                 src/linnea_p256_scalar.o src/linnea_p256_point.o \
-                src/linnea_p256_ecdsa.o src/linnea_aesgcm.o \
-                src/linnea_tls_kdf.o \
+                src/linnea_p256_ecdsa.o src/linnea_aesgcm.o src/linnea_tls_kdf.o \
                 src/linnea_tls_record.o src/linnea_tls.o src/linnea_pem.o \
                 src/linnea_print.o src/linnea_string.o
 CRYPTO_VECS   = test/crypto/sha256_vectors.inc
@@ -54,8 +53,11 @@ selftest: $(SELFTEST_BIN)
 TLSTEST_BIN  = bin/linnea-tlstest
 TLSTEST_OBJS = test/tls/linnea_tlstest.o src/linnea_tls.o \
                src/linnea_tls_kdf.o src/linnea_tls_record.o src/linnea_aesgcm.o \
-               src/linnea_sha256.o src/linnea_sha512.o src/linnea_fe25519.o \
-               src/linnea_x25519.o src/linnea_ed25519.o src/linnea_pem.o
+               src/linnea_sha256.o src/linnea_fe25519.o \
+               src/linnea_x25519.o src/linnea_pem.o \
+               src/linnea_p256_mont.o src/linnea_p256_fe.o \
+               src/linnea_p256_scalar.o src/linnea_p256_point.o \
+               src/linnea_p256_ecdsa.o
 
 test/tls/linnea_tlstest.o: test/tls/linnea_tlstest.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<

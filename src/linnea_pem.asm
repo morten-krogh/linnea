@@ -2,9 +2,8 @@
 ;
 ; linnea_pem_decode finds a "-----BEGIN <name>-----" / "-----END-----"
 ; block and base64-decodes its body (skipping any whitespace) into the
-; caller's buffer. linnea_pem_ed25519_seed decodes a PKCS#8
-; "PRIVATE KEY" block and returns the 32-byte Ed25519 seed, checking the
-; one fixed DER prefix RFC 8410 mandates for this key type.
+; caller's buffer. linnea_pem_p256_key decodes a PKCS#8 "PRIVATE KEY"
+; block and walks its DER to the 32-byte P-256 private scalar.
 ;
 ; Deliberately not a general PEM/DER parser: linnea only ever loads its
 ; own operator-supplied files, one leaf certificate and one key. Errors
@@ -15,7 +14,7 @@
 default rel
 
 global linnea_pem_decode
-global linnea_pem_ed25519_seed
+global linnea_pem_p256_key
 
 section .rodata
 
@@ -25,18 +24,12 @@ end_pfx:    db "-----END "
 end_len     equ $ - end_pfx
 dashes5:    db "-----"
 
-; PKCS#8 / RFC 8410 header for an Ed25519 private key: SEQUENCE, version
-; 0, AlgorithmIdentifier {1.3.101.112}, then OCTET STRING wrapping the
-; 32-byte CurvePrivateKey OCTET STRING.
-pkcs8_ed:   db 0x30,0x2e,0x02,0x01,0x00,0x30,0x05,0x06
-            db 0x03,0x2b,0x65,0x70,0x04,0x22,0x04,0x20
-pkcs8_len   equ $ - pkcs8_ed
-
 section .bss
 
 alignb 8
 b64_table:  resb 256          ; ASCII -> 6-bit value, 0xff for non-alphabet
-seed_buf:   resb 48           ; decoded PKCS#8 key (16 prefix + 32 seed)
+key_buf:    resb 256          ; decoded PKCS#8 EC key; the real thing is
+key_buf_cap equ 256           ; ~138 bytes with the optional public key
 
 section .text
 
@@ -133,30 +126,178 @@ linnea_pem_decode:
     pop rbx
     ret
 
-; ---- linnea_pem_ed25519_seed(rdi=src, rsi=srclen) -> rax = seed ptr or
-;      -1. The returned pointer is a static 32-byte buffer. ------------
-linnea_pem_ed25519_seed:
+; ---- p256_der_open(rdi=p, rsi=end, edx=tag) -> rax = content ptr or -1,
+;      rcx = content length. Checks the tag, decodes the length, and
+;      verifies the content fits within end.
+;
+;      Short form and the 0x81 long form only. A P-256 PKCS#8 key is about
+;      140 bytes, so a length that needs two or more bytes is malformed
+;      rather than merely unsupported, and a 0x81 carrying a value below 128
+;      is non-minimal DER. Both are rejected. ------------------------------
+p256_der_open:
     push rbx
+    mov rbx, rsi
+    sub rbx, rdi
+    cmp rbx, 2
+    jb .bad
+    movzx eax, byte [rdi]
+    cmp eax, edx
+    jne .bad
+    movzx ecx, byte [rdi + 1]
+    lea rax, [rdi + 2]
+    cmp ecx, 0x80
+    jb .have                  ; short form: the byte is the length
+    cmp ecx, 0x81
+    jne .bad
+    cmp rbx, 3
+    jb .bad
+    movzx ecx, byte [rdi + 2]
+    cmp ecx, 0x80
+    jb .bad                   ; 0x81 with a short value: not minimal
+    lea rax, [rdi + 3]
+.have:
+    mov rbx, rsi
+    sub rbx, rax
+    cmp rbx, rcx              ; content must fit inside end
+    jb .bad
+    pop rbx
+    ret
+.bad:
+    mov rax, -1
+    xor ecx, ecx
+    pop rbx
+    ret
+
+; ---- linnea_pem_p256_key(rdi=src, rsi=srclen) -> rax = pointer to the
+;      32-byte private scalar, or -1. The pointer is into a static buffer.
+;
+;      Walks the PKCS#8 structure rather than comparing a fixed prefix: an
+;      EC key's inner SEC1 ECPrivateKey carries an OPTIONAL [1] public key,
+;      and whether the generator emits it shifts every length byte before the
+;      scalar. A prefix compare would accept keys from `openssl genpkey` and
+;      reject otherwise valid ones that omit it.
+;
+;        SEQUENCE                          PrivateKeyInfo
+;          INTEGER 0                       version
+;          SEQUENCE                        AlgorithmIdentifier
+;            OID id-ecPublicKey, OID prime256v1
+;          OCTET STRING                    privateKey, wrapping:
+;            SEQUENCE                      SEC1 ECPrivateKey
+;              INTEGER 1                   version
+;              OCTET STRING (32)           <- the scalar
+;              [1] BIT STRING              publicKey, optional, ignored
+;
+;      The curve is pinned by the AlgorithmIdentifier compare: a P-384 or
+;      secp256k1 key is refused here rather than being silently misused. ---
+linnea_pem_p256_key:
+    push rbx
+    push r12
+    push r13
     lea rdx, [pk_name]
     mov rcx, pk_name_len
-    lea r8, [seed_buf]
-    mov r9, 48
+    lea r8, [key_buf]
+    mov r9, key_buf_cap
     call linnea_pem_decode
-    cmp rax, 48              ; PKCS#8 Ed25519 is exactly 48 bytes
+    cmp rax, 0
+    jl .fail
+
+    lea rbx, [key_buf]
+    lea r13, [key_buf + rax]
+
+    mov rdi, rbx                    ; SEQUENCE PrivateKeyInfo
+    mov rsi, r13
+    mov edx, 0x30
+    call p256_der_open
+    cmp rax, -1
+    je .fail
+    mov rbx, rax
+    lea r13, [rax + rcx]
+
+    mov rdi, rbx                    ; INTEGER 0
+    mov rsi, r13
+    mov edx, 0x02
+    call p256_der_open
+    cmp rax, -1
+    je .fail
+    cmp rcx, 1
     jne .fail
-    lea rdi, [seed_buf]      ; verify the fixed 16-byte prefix
-    lea rsi, [pkcs8_ed]
-    mov rcx, pkcs8_len
+    cmp byte [rax], 0
+    jne .fail
+    lea rbx, [rax + rcx]
+
+    mov rdi, rbx                    ; SEQUENCE AlgorithmIdentifier
+    mov rsi, r13
+    mov edx, 0x30
+    call p256_der_open
+    cmp rax, -1
+    je .fail
+    lea r12, [rax + rcx]            ; where the next element begins
+    cmp rcx, alg_ec_len
+    jne .fail
+    mov rdi, rax
+    lea rsi, [alg_ec]
+    mov rcx, alg_ec_len
     call bytes_eq
     test eax, eax
     jz .fail
-    lea rax, [seed_buf + 16]
+    mov rbx, r12
+
+    mov rdi, rbx                    ; OCTET STRING privateKey
+    mov rsi, r13
+    mov edx, 0x04
+    call p256_der_open
+    cmp rax, -1
+    je .fail
+    mov rbx, rax
+    lea r13, [rax + rcx]
+
+    mov rdi, rbx                    ; SEQUENCE ECPrivateKey
+    mov rsi, r13
+    mov edx, 0x30
+    call p256_der_open
+    cmp rax, -1
+    je .fail
+    mov rbx, rax
+    lea r13, [rax + rcx]
+
+    mov rdi, rbx                    ; INTEGER 1
+    mov rsi, r13
+    mov edx, 0x02
+    call p256_der_open
+    cmp rax, -1
+    je .fail
+    cmp rcx, 1
+    jne .fail
+    cmp byte [rax], 1
+    jne .fail
+    lea rbx, [rax + rcx]
+
+    mov rdi, rbx                    ; OCTET STRING, the scalar
+    mov rsi, r13
+    mov edx, 0x04
+    call p256_der_open
+    cmp rax, -1
+    je .fail
+    cmp rcx, 32                     ; SEC1 fixes this at ceil(log2 n / 8)
+    jne .fail
+    pop r13
+    pop r12
     pop rbx
     ret
 .fail:
     mov rax, -1
+    pop r13
+    pop r12
     pop rbx
     ret
+
+section .rodata
+; The AlgorithmIdentifier content for a prime256v1 key: OID id-ecPublicKey
+; (1.2.840.10045.2.1) then OID prime256v1 (1.2.840.10045.3.1.7).
+alg_ec:     db 0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01
+            db 0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07
+alg_ec_len  equ $ - alg_ec
+section .text
 
 section .rodata
 pk_name:    db "PRIVATE KEY"

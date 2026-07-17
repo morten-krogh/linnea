@@ -3,7 +3,7 @@
 ; A sans-IO state machine: linnea_tls_hs_input consumes whatever plaintext
 ; bytes have arrived and appends whatever must be sent, so the same code
 ; drives the blocking test server now and the io_uring loop in M6. The
-; profile is fixed — TLS_AES_128_GCM_SHA256, x25519, an Ed25519 leaf
+; profile is fixed — TLS_AES_128_GCM_SHA256, x25519, an ECDSA P-256 leaf
 ; certificate — so there is exactly one path through the schedule and no
 ; HelloRetryRequest: a ClientHello without an x25519 share is a fatal
 ; handshake_failure.
@@ -25,13 +25,14 @@ global linnea_tls_hs_init
 global linnea_tls_hs_input
 global linnea_tls_drain_early
 
+extern linnea_sha256
 extern linnea_sha256_init
 extern linnea_sha256_update
 extern linnea_sha256_final
 extern linnea_hmac_sha256
 extern linnea_hkdf_extract
 extern linnea_x25519
-extern linnea_ed25519_sign
+extern linnea_p256_ecdsa_sign
 extern linnea_tls_derive_secret
 extern linnea_tls_hkdf_expand_label
 extern linnea_tls_keys_init
@@ -70,6 +71,8 @@ section .bss
 
 alignb 8
 cv_msg:       resb cv_prefix_len + 32    ; CertificateVerify signed content
+cv_digest:    resb 32                    ; ...and its SHA-256: ECDSA signs a
+                                         ; digest, not the content
 
 section .text
 
@@ -118,7 +121,7 @@ ct_eq32:
     ret
 
 ; ===================================================================
-; linnea_tls_hs_init(rdi=hs, rsi=cert, rdx=cert_len, rcx=key_seed,
+; linnea_tls_hs_init(rdi=hs, rsi=cert, rdx=cert_len, rcx=key_priv,
 ;                    r8d=flags)
 ; ===================================================================
 linnea_tls_hs_init:
@@ -126,7 +129,7 @@ linnea_tls_hs_init:
     mov [rdi + linnea_tls_hs.flags], r8d
     mov [rdi + linnea_tls_hs.cert], rsi
     mov [rdi + linnea_tls_hs.cert_len], rdx
-    mov [rdi + linnea_tls_hs.key_seed], rcx
+    mov [rdi + linnea_tls_hs.key_priv], rcx
     mov qword [rdi + linnea_tls_hs.out_len], 0
     mov qword [rdi + linnea_tls_hs.consumed], 0
     mov dword [rdi + linnea_tls_hs.msg_len], 0
@@ -590,7 +593,7 @@ parse_ch:
 .sa_loop:
     cmp rsi, rdi
     jae .ext_skip
-    cmp word [rsi], 0x0708      ; ed25519 = 0x0807 big-endian
+    cmp word [rsi], 0x0304      ; ecdsa_secp256r1_sha256 = 0x0403 big-endian
     jne .sa_next
     or r14d, 4
 .sa_next:
@@ -611,7 +614,8 @@ parse_ch:
     jz .protocol_version
     test r14d, 1                ; an x25519 key share present?
     jz .handshake_fail
-    ; signature_algorithms must offer ed25519, unless this is the trace
+    ; signature_algorithms must offer ecdsa_secp256r1_sha256, unless this
+    ; is the trace (which injects its key and diverges after ServerHello)
     test dword [rbp + linnea_tls_hs.flags], LINNEA_TLS_FLAG_TRACE
     jnz .ok
     test r14d, 4
@@ -787,7 +791,10 @@ build_flight:
     mov rdi, rbp
     call tls_absorb
     add rbx, r14
-    ; -- CertificateVerify: Ed25519 over the context + H(CH..Cert) --
+    ; -- CertificateVerify: ECDSA P-256 over the context + H(CH..Cert) --
+    ; ECDSA signs the content's SHA-256 digest rather than the content,
+    ; and its DER signature has no fixed length -- so both length fields
+    ; here are computed rather than written as constants.
     lea rdi, [cv_msg]           ; cv_msg = prefix || transcript hash
     lea rsi, [cv_prefix]
     mov rcx, cv_prefix_len
@@ -795,20 +802,28 @@ build_flight:
     mov rdi, rbp               ; append H(CH..Cert) after the prefix
     lea rsi, [cv_msg + cv_prefix_len]
     call tls_th
-    mov word [rbx], 0x000f      ; 0f 00 (type, high length byte)
-    mov word [rbx + 2], 0x4400  ; 00 44 (length = 68)
-    mov word [rbx + 4], 0x0708  ; scheme ed25519 = 08 07
-    mov word [rbx + 6], 0x4000  ; signature length = 64
-    lea rdi, [rbx + 8]          ; the signature
-    lea rsi, [cv_msg]
-    mov edx, cv_prefix_len + 32
-    mov rcx, [rbp + linnea_tls_hs.key_seed]
-    call linnea_ed25519_sign
+    lea rdi, [cv_msg]
+    mov esi, cv_prefix_len + 32
+    lea rdx, [cv_digest]
+    call linnea_sha256
+    lea rdi, [rbx + 8]          ; the signature itself
+    lea rsi, [cv_digest]
+    mov rdx, [rbp + linnea_tls_hs.key_priv]
+    call linnea_p256_ecdsa_sign
+    mov r15, rax                ; DER signature length, <= MAX_SIG
+    mov byte [rbx], 0x0f        ; type CertificateVerify
+    lea eax, [r15d + 4]         ; body = scheme(2) + sig length(2) + sig
+    mov rdi, rbx
+    call store_u24_1
+    mov word [rbx + 4], 0x0304  ; scheme ecdsa_secp256r1_sha256 = 04 03
+    mov byte [rbx + 6], 0       ; signature length, big-endian; the DER of a
+    mov [rbx + 7], r15b         ; P-256 signature never reaches 256 bytes
+    lea rdx, [r15 + 8]          ; whole message = header(4) + body
     lea rsi, [rbx]
-    mov edx, 72
     mov rdi, rbp
     call tls_absorb
-    add rbx, 72
+    add rbx, r15
+    add rbx, 8
     ; -- Finished: HMAC(server finished key, H(CH..CertificateVerify)) --
     lea rdi, [rbp + linnea_tls_hs.s_hs]      ; finished key -> BF_TH
     lea rsi, [lbl_finished]

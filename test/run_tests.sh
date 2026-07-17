@@ -662,9 +662,9 @@ rm -f "$LOG" test/www/big.txt test/www/huge.bin test/www/enc.txt test/www/enc.tx
 TLSBIN=./bin/linnea-tlstest
 if [ -x "$TLSBIN" ] && command -v openssl >/dev/null 2>&1; then
     tlsdir=$(mktemp -d)
-    if openssl req -x509 -newkey ed25519 -keyout "$tlsdir/k.pem" \
-            -out "$tlsdir/c.pem" -days 1 -nodes -subj /CN=localhost \
-            >/dev/null 2>&1; then
+    if openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout "$tlsdir/k.pem" -out "$tlsdir/c.pem" -days 1 -nodes \
+            -subj /CN=localhost >/dev/null 2>&1; then
         tport=47443
         "$TLSBIN" "$tlsdir/c.pem" "$tlsdir/k.pem" $tport &
         tls_pid=$!
@@ -720,7 +720,7 @@ PYEOF
         kill $tls_pid 2>/dev/null
         wait $tls_pid 2>/dev/null
     else
-        check "tls (openssl could not generate an ed25519 cert — skipped)" 0
+        check "tls (openssl could not generate a P-256 cert — skipped)" 0
     fi
     rm -rf "$tlsdir"
 else

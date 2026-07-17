@@ -262,7 +262,7 @@ linnea_uring_run:
     lea rdi, [r12 + linnea_connection.up_buf]
     mov rsi, [rax + linnea_config_server.cert_der]
     mov rdx, [rax + linnea_config_server.cert_der_len]
-    mov rcx, [rax + linnea_config_server.key_seed]
+    mov rcx, [rax + linnea_config_server.key_priv]
     xor r8d, r8d
     call linnea_tls_hs_init
     mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
