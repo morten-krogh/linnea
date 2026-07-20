@@ -250,6 +250,8 @@ mime_gif:       db "image/gif"
 mime_gif_len    equ $ - mime_gif
 mime_svg:       db "image/svg+xml"
 mime_svg_len    equ $ - mime_svg
+mime_ico:       db "image/x-icon"
+mime_ico_len    equ $ - mime_ico
 mime_default:   db "application/octet-stream"
 mime_default_len equ $ - mime_default
 
@@ -263,6 +265,7 @@ ext_jpg:        db "jpg"
 ext_jpeg:       db "jpeg"
 ext_gif:        db "gif"
 ext_svg:        db "svg"
+ext_ico:        db "ico"
 
 ; entries: ext ptr, ext len, mime ptr, mime len; terminated by a 0 ptr
 mime_table:
@@ -276,6 +279,7 @@ mime_table:
     dq ext_jpeg, 4, mime_jpeg, mime_jpeg_len
     dq ext_gif,  3, mime_gif,  mime_gif_len
     dq ext_svg,  3, mime_svg,  mime_svg_len
+    dq ext_ico,  3, mime_ico,  mime_ico_len
     dq 0
 
 section .bss

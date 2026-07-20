@@ -192,6 +192,8 @@ resp=$(curl -si --max-time 2 "http://127.0.0.1:47090/old/a%20b?x=1&y=2")
 check_http "redirect keeps raw path+query" "Location: https://example.com/old/a%20b?x=1&y=2" "$resp"
 resp=$(curl -si --max-time 2 http://127.0.0.1:47080/style.css)
 check_http "css mime"          "Content-Type: text/css" "$resp"
+resp=$(curl -si --max-time 2 http://127.0.0.1:47080/favicon.ico)
+check_http "ico mime"          "Content-Type: image/x-icon" "$resp"
 resp=$(curl -s --max-time 2 http://127.0.0.1:47090/sub/page.html)
 check_http "subdirectory file" "subdirectory page" "$resp"
 
