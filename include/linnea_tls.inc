@@ -24,6 +24,11 @@ LINNEA_TLS_WAIT_FIN     equ 1
 LINNEA_TLS_DONE         equ 2
 LINNEA_TLS_FAILED       equ 3
 
+; server_name (RFC 6066): the longest host_name kept from a ClientHello.
+; A DNS name is at most 255 octets, so anything longer cannot match a
+; configured hostname and is ignored rather than stored.
+LINNEA_TLS_MAX_SNI      equ 255
+
 ; Test-only: the x25519 private key and the server random are injected by
 ; the caller instead of coming from getrandom(2), and the
 ; signature_algorithms check is skipped. The RFC 8448 trace's ClientHello
@@ -112,6 +117,15 @@ struc linnea_tls_hs
     .sid_len:    resd 1     ; client legacy_session_id, echoed in SH
     .sid:        resb 32
     .client_pub: resb 32    ; client x25519 key share
+    ; SNI vhost selection. The embedder may install a hook after hs_init:
+    ; select_cb(rdi=select_ctx, rsi=sni, rdx=sni_len) -> rax=cert_list
+    ; (with rdx=cert_list_len, rcx=key_priv), or rax=0 to keep the cert
+    ; given to hs_init. Called between the ClientHello parse and the
+    ; server flight; 0 (the hs_init default) means no selection.
+    .select_cb:  resq 1
+    .select_ctx: resq 1
+    .sni_len:    resd 1     ; host_name from the ClientHello, 0 = none
+    .sni:        resb LINNEA_TLS_MAX_SNI
     .transcript: resb linnea_sha256_ctx_size
     .priv:       resb 32    ; ephemeral x25519 private key
     .srand:      resb 32    ; server random

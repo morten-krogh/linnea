@@ -90,9 +90,12 @@ run_test "duplicate hostname" 1 stderr "duplicate hostname DUP.Test on 127.0.0.1
     $BIN test/configs/dup-hostname.json
 
 # --- TLS config: "cert" and "key" are both-or-neither, and servers sharing
-# --- a listener must agree (one listener has one certificate: no SNI yet)
+# --- a listener must agree (SNI picks the cert within a TLS listener,
+# --- but TLS and plaintext cannot share a socket)
 run_test "tls dump"        124 stdout "tls=on cert=test/tls/server.crt" \
     timeout 0.5 $BIN test/configs/tls.json
+run_test "sni dump"        124 stdout "hostname=sni.test tls=on cert=test/tls/sni.crt" \
+    timeout 0.5 $BIN test/configs/tls-sni.json
 run_test "tls cert without key" 1 stderr "server needs both cert and key, or neither" \
     $BIN test/configs/bad-cert-only.json
 run_test "tls listener mismatch" 1 stderr "servers sharing a listener must all set TLS or none" \
@@ -840,6 +843,35 @@ PYEOF
     wait $tls_server_pid 2>/dev/null
     wait $tls_backend_pid 2>/dev/null
     rm -f "$LOG" test/www/big.txt
+
+    # --- SNI: two TLS vhosts share 127.0.0.1:47444, each with its own cert
+    $BIN test/configs/tls-sni.json >/dev/null 2>&1 &
+    sni_server_pid=$!
+    sleep 0.3
+    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 \
+        -servername sni.test 2>/dev/null | openssl x509 -noout -subject)
+    echo "$subj" | grep -q "CN=sni.test"
+    check "sni selects the named vhost cert" $?
+    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 \
+        -servername localhost 2>/dev/null | openssl x509 -noout -subject)
+    echo "$subj" | grep -q "CN=localhost"
+    check "sni selects the owner cert by name" $?
+    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 \
+        -noservername 2>/dev/null | openssl x509 -noout -subject)
+    echo "$subj" | grep -q "CN=localhost"
+    check "no sni falls back to the listener owner" $?
+    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 \
+        -servername unknown.test 2>/dev/null | openssl x509 -noout -subject)
+    echo "$subj" | grep -q "CN=localhost"
+    check "unknown sni falls back to the listener owner" $?
+    # a full request via the SNI vhost: curl verifies against the sni.test
+    # cert AND the Host routing must land on the sni.test docroot
+    resp=$(curl -si --max-time 5 --cacert test/tls/sni.crt \
+        --resolve sni.test:47444:127.0.0.1 https://sni.test:47444/page.html)
+    check_http "sni end to end (cert + vhost routing)" "200 OK" "$resp"
+    kill $sni_server_pid 2>/dev/null
+    wait $sni_server_pid 2>/dev/null
+    rm -f "$LOG"
 fi
 
 echo

@@ -167,7 +167,8 @@ linnea_config_validate:
     test eax, eax
     jz .dup_prior_next
     ; same host:port -> the two servers share a listener; their TLS-ness
-    ; must agree (v1 has no SNI cert selection: one listener, one profile)
+    ; must agree. SNI selects each vhost's certificate within a TLS
+    ; listener, but cannot mix TLS and plaintext on one socket.
     mov eax, [r13 + linnea_config_server.tls]
     cmp eax, [r15 + linnea_config_server.tls]
     jne .tls_mismatch

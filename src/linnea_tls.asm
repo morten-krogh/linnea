@@ -133,6 +133,9 @@ linnea_tls_hs_init:
     mov qword [rdi + linnea_tls_hs.out_len], 0
     mov qword [rdi + linnea_tls_hs.consumed], 0
     mov dword [rdi + linnea_tls_hs.msg_len], 0
+    mov qword [rdi + linnea_tls_hs.select_cb], 0
+    mov qword [rdi + linnea_tls_hs.select_ctx], 0
+    mov dword [rdi + linnea_tls_hs.sni_len], 0
     lea rdi, [rdi + linnea_tls_hs.transcript]
     jmp linnea_sha256_init
 
@@ -206,6 +209,24 @@ linnea_tls_hs_input:
     call parse_ch               ; rax = -1 ok, else alert descriptor
     cmp rax, -1
     jne .ch_alert
+
+    ; SNI vhost selection: if the embedder installed a hook, let it swap
+    ; the certificate for the requested name before the flight is built.
+    ; rax = 0 keeps the hs_init default (the listener owner's cert), the
+    ; RFC 6066 fallback for an absent or unrecognized server_name.
+    mov rax, [rbp + linnea_tls_hs.select_cb]
+    test rax, rax
+    jz .no_select
+    mov rdi, [rbp + linnea_tls_hs.select_ctx]
+    lea rsi, [rbp + linnea_tls_hs.sni]
+    mov edx, [rbp + linnea_tls_hs.sni_len]
+    call rax
+    test rax, rax
+    jz .no_select
+    mov [rbp + linnea_tls_hs.cert_list], rax
+    mov [rbp + linnea_tls_hs.cert_list_len], rdx
+    mov [rbp + linnea_tls_hs.key_priv], rcx
+.no_select:
 
     ; consume the whole record regardless of what follows it
     lea rax, [r13 + 5]
@@ -499,13 +520,15 @@ parse_ch:
     cmp rcx, r13
     ja .decode
     push rcx                    ; body end for after the handler
-    ; dispatch the three extensions we require
+    ; dispatch the three extensions we require, plus server_name
     cmp r12d, 0x2b              ; supported_versions
     je .ext_sv
     cmp r12d, 0x33              ; key_share
     je .ext_ks
     cmp r12d, 0x0d              ; signature_algorithms
     je .ext_sa
+    test r12d, r12d             ; server_name
+    jz .ext_sni
     jmp .ext_skip
 .ext_sv:
     test r14d, 0x200
@@ -599,6 +622,53 @@ parse_ch:
 .sa_next:
     add rsi, 2
     jmp .sa_loop
+.ext_sni:
+    test r14d, 0x800
+    jnz .ext_dup
+    or r14d, 0x800
+    lea rax, [rbx + 2]
+    cmp rax, [rsp]
+    ja .pop_decode
+    movzx eax, byte [rbx]       ; server_name_list length
+    shl eax, 8
+    mov al, [rbx + 1]
+    lea rcx, [rbx + 2 + rax]
+    cmp rcx, [rsp]
+    jne .pop_decode
+    lea rsi, [rbx + 2]          ; cursor over ServerName entries
+    mov r10, rcx                ; list end
+.sni_loop:
+    cmp rsi, r10
+    jae .ext_skip
+    lea rax, [rsi + 3]
+    cmp rax, r10
+    ja .pop_decode
+    movzx eax, byte [rsi + 1]   ; name length
+    shl eax, 8
+    mov al, [rsi + 2]
+    lea rcx, [rsi + 3 + rax]    ; next entry
+    cmp rcx, r10
+    ja .pop_decode
+    cmp byte [rsi], 0           ; name_type host_name
+    jne .sni_next
+    test eax, eax
+    jz .sni_next                ; empty name: nothing to match
+    cmp eax, LINNEA_TLS_MAX_SNI
+    ja .sni_next                ; longer than any DNS name: unmatchable
+    cmp dword [rbp + linnea_tls_hs.sni_len], 0
+    jne .sni_next               ; keep the first host_name
+    mov [rbp + linnea_tls_hs.sni_len], eax
+    push rcx
+    push r10
+    lea rdi, [rbp + linnea_tls_hs.sni]
+    lea rsi, [rsi + 3]
+    mov ecx, eax
+    rep movsb
+    pop r10
+    pop rcx
+.sni_next:
+    mov rsi, rcx
+    jmp .sni_loop
 .ext_skip:
     pop rbx                     ; body end -> continue after this ext
     jmp .ext_loop

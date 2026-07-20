@@ -65,6 +65,7 @@ extern linnea_tls_hs_init
 extern linnea_tls_hs_input
 extern linnea_tls_drain_early
 extern linnea_ktls_enable
+extern linnea_string_iequal
 
 section .rodata
 
@@ -253,7 +254,8 @@ linnea_uring_run:
     call linnea_uring_log_accept
     ; TLS listeners begin a userspace handshake before any HTTP; its state
     ; overlays up_buf (no proxying can be active yet). The accepting server
-    ; is always the listener owner, whose cert this connection serves.
+    ; is the listener owner; its cert is the default until the ClientHello
+    ; names a vhost and the SNI hook below picks that vhost's cert instead.
     mov eax, [r12 + linnea_connection.server]
     imul rax, rax, linnea_config_server_size
     lea rax, [rbx + rax + linnea_config.servers]
@@ -265,6 +267,9 @@ linnea_uring_run:
     mov rcx, [rax + linnea_config_server.key_priv]
     xor r8d, r8d
     call linnea_tls_hs_init
+    lea rax, [linnea_uring_sni_select]
+    mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_cb], rax
+    mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_ctx], r12
     mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
 .accept_recv:
     mov rdi, r12
@@ -1361,6 +1366,68 @@ linnea_uring_arm_up_recv:
     jmp linnea_uring_arm_link_timeout
 
 ; linnea_uring_log_accept(rdi=connection*)
+; linnea_uring_sni_select(rdi=connection*, rsi=sni, rdx=sni_len)
+; -> rax = cert_list (with rdx = cert_list_len, rcx = key_priv), or
+;    rax = 0 to keep the accepting server's cert.
+; Installed as hs.select_cb at accept; the TLS layer calls it between
+; the ClientHello parse and the server flight. The walk mirrors HTTP
+; Host routing: TLS servers sharing the accepting listener, hostnames
+; compared case-insensitively; no server_name or no match falls back to
+; the listener owner (RFC 6066 leaves that choice to the server).
+linnea_uring_sni_select:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    test rdx, rdx
+    jz .none                   ; no server_name offered
+    mov r14, rsi               ; sni ptr
+    mov r15, rdx               ; sni len
+    mov eax, [rdi + linnea_connection.server]
+    imul rax, rax, linnea_config_server_size
+    lea rcx, [linnea_config_instance]
+    lea r12, [rcx + rax + linnea_config.servers]   ; accepting server*
+    lea rcx, [linnea_config_instance]
+    mov r13, [rcx + linnea_config.server_count]
+    xor ebx, ebx               ; candidate index
+.loop:
+    cmp rbx, r13
+    jae .none
+    imul rdx, rbx, linnea_config_server_size
+    lea rcx, [linnea_config_instance]
+    lea rdx, [rcx + rdx + linnea_config.servers]
+    mov eax, [rdx + linnea_config_server.listen_fd]
+    cmp eax, [r12 + linnea_config_server.listen_fd]
+    jne .next
+    cmp dword [rdx + linnea_config_server.tls], 0
+    je .next
+    mov rdi, r14
+    mov rsi, r15
+    mov rcx, [rdx + linnea_config_server.hostname_len]
+    push rdx
+    lea rdx, [rdx + linnea_config_server.hostname]
+    call linnea_string_iequal
+    pop rdx
+    test eax, eax
+    jz .next
+    mov rax, [rdx + linnea_config_server.cert_list]
+    mov rcx, [rdx + linnea_config_server.key_priv]
+    mov rdx, [rdx + linnea_config_server.cert_list_len]
+    jmp .ret
+.next:
+    inc rbx
+    jmp .loop
+.none:
+    xor eax, eax
+.ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; Logs "accepted connection on <host>:<port> from <peer> (fd N)".
 linnea_uring_log_accept:
     push rbx
