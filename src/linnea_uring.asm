@@ -51,6 +51,7 @@ extern linnea_network_peer_format
 extern linnea_connection_alloc
 extern linnea_connection_free
 extern linnea_connection_at
+extern linnea_connection_active
 extern linnea_http_handle
 extern linnea_http_proxy_error
 extern linnea_http_proxy_head
@@ -116,6 +117,16 @@ reason_up_early:    db "upstream closed early"
 reason_up_early_len equ $ - reason_up_early
 reason_up_timeout:  db "upstream timeout"
 reason_up_timeout_len equ $ - reason_up_timeout
+reason_drain:       db "draining"
+reason_drain_len    equ $ - reason_drain
+
+log_drain:          db "worker draining: accepts closed, finishing open connections", 10
+log_drain_len       equ $ - log_drain
+log_drained:        db "worker drained", 10
+log_drained_len     equ $ - log_drained
+
+msg_signalfd:       db "signalfd failed"
+msg_signalfd_len    equ $ - msg_signalfd
 reason_up_recv_err: db "upstream recv error"
 reason_up_recv_err_len equ $ - reason_up_recv_err
 reason_up_closed:   db "upstream closed"
@@ -141,6 +152,10 @@ ring:               resb LINNEA_URING_RING_SIZE
 cqe_ptr:            resq 1
 idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
                                ; tunnel's last_activity comparison
+sig_mask:           resq 1     ; blocked-signal set: SIGTERM
+sig_fd:             resd 1
+drain_flag:         resd 1     ; 1 = draining: no accepts, close after serve
+sig_buf:            resb 128   ; struct signalfd_siginfo
 
 section .text
 
@@ -180,6 +195,34 @@ linnea_uring_run:
     call io_uring_queue_init
     test eax, eax
     js .init_fail
+
+    ; SIGTERM means drain, and arrives as a cqe like everything else:
+    ; block it, open a signalfd for it, and arm a read on the ring. The
+    ; master's death delivers it too (PR_SET_PDEATHSIG in linnea_start).
+    mov qword [sig_mask], 1 << (LINNEA_SIGTERM - 1)
+    mov eax, LINNEA_SYS_RT_SIGPROCMASK
+    mov edi, LINNEA_SIG_BLOCK
+    lea rsi, [sig_mask]
+    xor edx, edx
+    mov r10d, 8
+    syscall
+    mov eax, LINNEA_SYS_SIGNALFD4
+    mov edi, -1
+    lea rsi, [sig_mask]
+    mov edx, 8
+    xor r10d, r10d
+    syscall
+    cmp rax, -4095
+    jae .signalfd_fail
+    mov [sig_fd], eax
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_READ
+    mov ecx, [sig_fd]
+    mov [rax + LINNEA_SQE_FD], ecx
+    lea rcx, [sig_buf]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 128
+    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_SIGNAL
 
     xor r12d, r12d             ; server index
 .arm_loop:
@@ -225,6 +268,10 @@ linnea_uring_run:
     shr r13, 8                 ; index
     cmp eax, LINNEA_UD_TIMEOUT
     je .wait                   ; timeout cqes carry no work
+    cmp eax, LINNEA_UD_CANCEL
+    je .wait                   ; accept-cancel result: nothing to do
+    cmp eax, LINNEA_UD_SIGNAL
+    je .on_signal
     cmp eax, LINNEA_UD_RECV
     je .on_recv
     cmp eax, LINNEA_UD_SEND
@@ -235,9 +282,58 @@ linnea_uring_run:
     je .on_up_send
     cmp eax, LINNEA_UD_UP_RECV
     je .on_up_recv
+    jmp .on_accept             ; tag 0: no longer the textual fall-through
+
+; --- SIGTERM arrived on the signalfd: drain --------------------------
+; Stop taking new work but finish what is open: cancel every armed
+; accept (their completions close our copies of the listener fds, which
+; releases the port once every worker has done the same), let in-flight
+; requests run to their end, close instead of keep-alive afterwards,
+; and exit when the last connection is freed.
+.on_signal:
+    cmp dword [drain_flag], 0
+    jnz .wait                  ; a second SIGTERM changes nothing
+    mov dword [drain_flag], 1
+    call linnea_log_stamp
+    lea rdi, [log_drain]
+    mov esi, log_drain_len
+    call linnea_log_write
+    cmp qword [linnea_connection_active], 0
+    je .drained_exit
+    xor r13d, r13d             ; server index
+.cancel_loop:
+    cmp r13, [rbx + linnea_config.server_count]
+    jae .cancel_submit
+    imul rax, r13, linnea_config_server_size
+    lea rax, [rbx + rax + linnea_config.servers]
+    cmp dword [rax + linnea_config_server.listener_owner], 0
+    je .cancel_next
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_ASYNC_CANCEL
+    mov r14, r13
+    shl r14, 8
+    or r14, LINNEA_UD_ACCEPT
+    mov [rax + LINNEA_SQE_ADDR], r14   ; the accept's user_data
+    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_CANCEL
+.cancel_next:
+    inc r13
+    jmp .cancel_loop
+.cancel_submit:
+    call linnea_uring_submit_now
+    jmp .wait
+.drained_exit:
+    call linnea_log_stamp
+    lea rdi, [log_drained]
+    mov esi, log_drained_len
+    call linnea_log_write
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
 
 ; --- accept completion: r13 = server index, r15d = connection fd ------
 .on_accept:
+    cmp dword [drain_flag], 0
+    jnz .accept_drain
     test r15d, r15d
     js .accept_err
     call linnea_connection_alloc
@@ -281,6 +377,24 @@ linnea_uring_run:
     mov rdi, r13               ; kernel disarmed the multishot: re-arm
     call linnea_uring_arm_accept
     call linnea_uring_submit_now
+    jmp .wait
+.accept_drain:
+    ; draining: refuse a raced-in connection, and once this accept is
+    ; finished (the cancel's -ECANCELED, or any final completion) close
+    ; our copy of the listening socket instead of re-arming
+    test r15d, r15d
+    js .accept_drain_done
+    mov edi, r15d
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    test r14d, LINNEA_IORING_CQE_F_MORE
+    jnz .wait                  ; multishot still armed; the cancel ends it
+.accept_drain_done:
+    imul rax, r13, linnea_config_server_size
+    lea rax, [rbx + rax + linnea_config.servers]
+    mov edi, [rax + linnea_config_server.listen_fd]
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
     jmp .wait
 .accept_err:
     lea rdi, [warn_accept]
@@ -420,10 +534,16 @@ linnea_uring_run:
     mov qword [r12 + linnea_connection.file_base], 0
     mov qword [r12 + linnea_connection.file_size], 0
 .no_unmap:
+    cmp dword [drain_flag], 0
+    jne .drain_close           ; draining: no keep-alive, no pipelining
     cmp qword [r12 + linnea_connection.keep_alive], 0
     jne .keep_alive_continue
     lea r14, [reason_done]
     mov r15d, reason_done_len
+    jmp .conn_close
+.drain_close:
+    lea r14, [reason_drain]
+    mov r15d, reason_drain_len
     jmp .conn_close
 .keep_alive_continue:
     ; keep-alive: drop the consumed head, keep any pipelined bytes
@@ -1096,11 +1216,19 @@ linnea_uring_run:
     syscall
     mov rdi, r12
     call linnea_connection_free
-    jmp .wait
+    cmp dword [drain_flag], 0
+    je .wait
+    cmp qword [linnea_connection_active], 0
+    jne .wait
+    jmp .drained_exit          ; draining and that was the last one
 
 .init_fail:
     lea rdi, [msg_init]
     mov esi, msg_init_len
+    jmp linnea_error_exit
+.signalfd_fail:
+    lea rdi, [msg_signalfd]
+    mov esi, msg_signalfd_len
     jmp linnea_error_exit
 .wait_fail:
     lea rdi, [msg_wait]

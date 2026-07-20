@@ -10,8 +10,10 @@
 #   echo tls | sudo tee /etc/modules-load.d/ktls.conf
 #
 # systemd supervises the master; the master supervises the workers.
-# Stopping the unit SIGTERMs the whole control group, and the workers'
-# PR_SET_PDEATHSIG covers a master that dies on its own.
+# Stopping the unit SIGTERMs the whole control group: workers drain —
+# stop accepting, finish open connections, then exit — and systemd
+# waits for the cgroup (up to TimeoutStopSec, then SIGKILL). The
+# workers' PR_SET_PDEATHSIG covers a master that dies on its own.
 
 [Unit]
 Description=Linnea HTTP/TLS server

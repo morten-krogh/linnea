@@ -10,6 +10,7 @@ global linnea_connections_init
 global linnea_connection_alloc
 global linnea_connection_free
 global linnea_connection_at
+global linnea_connection_active
 
 extern linnea_memory_map
 
@@ -17,6 +18,7 @@ section .bss
 
 pool_base:      resq 1
 free_head:      resq 1         ; pool index of first free slot, -1 = none
+linnea_connection_active: resq 1   ; slots handed out; drains read it
 
 section .text
 
@@ -67,6 +69,7 @@ linnea_connection_alloc:
     mov dword [rdx + linnea_connection.up_fd], -1
     mov qword [rdx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
     mov qword [rdx + linnea_connection.tls_phase], LINNEA_TLS_PHASE_NONE
+    inc qword [linnea_connection_active]
     mov rax, rdx
     ret
 .empty:
@@ -79,6 +82,7 @@ linnea_connection_free:
     mov [rdi + linnea_connection.next_free], rax
     mov rax, [rdi + linnea_connection.index]
     mov [free_head], rax
+    dec qword [linnea_connection_active]
     ret
 
 ; linnea_connection_at(rdi=pool index) -> rax=connection*

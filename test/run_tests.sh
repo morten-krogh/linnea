@@ -679,6 +679,34 @@ wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
 rm -f "$LOG" test/www/big.txt test/www/huge.bin test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
 
+# --- graceful drain: SIGTERM finishes in-flight work, then exits ---
+# A slow download is in flight when the master is killed; the workers
+# must complete it, refuse new connections meanwhile, and exit after.
+python3 -c "open('test/www/drain.bin','w').write('D' * 3000000)"
+rm -f "$LOG"
+$BIN test/configs/listen.json >/dev/null 2>&1 &
+drain_master=$!
+sleep 0.3
+curl -s --max-time 30 --limit-rate 500k http://127.0.0.1:47080/drain.bin -o /tmp/drain_out &
+drain_curl=$!
+sleep 0.5                       # the transfer is under way
+kill $drain_master              # SIGTERM: master dies, workers drain
+wait $drain_master 2>/dev/null
+sleep 0.5                       # accepts cancelled by now
+curl -s --max-time 2 http://127.0.0.1:47080/hello.txt -o /dev/null 2>/dev/null
+[ $? -ne 0 ]
+check "drain refuses new connections" $?
+wait $drain_curl
+n=$(wc -c < /tmp/drain_out)
+[ "$n" -eq 3000000 ]
+check "drain finishes the in-flight response ($n bytes)" $?
+sleep 0.5
+! pgrep -f 'test/configs/listen.json' >/dev/null
+check "drain exits after the last connection" $?
+grep -qF 'worker drained' "$LOG"
+check "drain logged" $?
+rm -f /tmp/drain_out test/www/drain.bin "$LOG"
+
 # --- TLS 1.3: the standalone echo server against real clients ---
 # Needs the openssl CLI (cert generation + s_client) and python3 ssl,
 # both already test-only dependencies. Skips cleanly if either is absent.

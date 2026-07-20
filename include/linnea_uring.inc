@@ -23,8 +23,10 @@ LINNEA_CQE_RES          equ 8    ; s32
 LINNEA_CQE_FLAGS        equ 12   ; u32
 
 LINNEA_IORING_OP_ACCEPT      equ 13
+LINNEA_IORING_OP_ASYNC_CANCEL equ 14
 LINNEA_IORING_OP_LINK_TIMEOUT equ 15
 LINNEA_IORING_OP_CONNECT     equ 16
+LINNEA_IORING_OP_READ        equ 22
 LINNEA_IORING_OP_SEND        equ 26
 LINNEA_IORING_OP_RECV        equ 27
 LINNEA_IORING_ACCEPT_MULTISHOT equ 1   ; set in sqe.ioprio
@@ -40,6 +42,8 @@ LINNEA_UD_TIMEOUT       equ 3          ; linked-timeout cqe, always ignored
 LINNEA_UD_CONNECT       equ 4          ; connect to a proxy upstream
 LINNEA_UD_UP_SEND       equ 5          ; request bytes to the upstream
 LINNEA_UD_UP_RECV       equ 6          ; response bytes from the upstream
+LINNEA_UD_SIGNAL        equ 7          ; signalfd read: SIGTERM = drain
+LINNEA_UD_CANCEL        equ 8          ; accept-cancel cqe, always ignored
 
 ; Idle timeout: a linked timeout is attached to every per-connection op
 ; (recv, send, connect, upstream send/recv). An op that makes no progress
