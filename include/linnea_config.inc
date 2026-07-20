@@ -17,11 +17,13 @@ LINNEA_DEFAULT_WORKERS          equ 0     ; 0 = one worker per online CPU
 LINNEA_MAX_WORKERS              equ 256
 
 ; what a location routes to
-LINNEA_LOC_KIND_ROOT    equ 0        ; serve files from .root
-LINNEA_LOC_KIND_PROXY   equ 1        ; forward to the upstream in .proxy_addr
+LINNEA_LOC_KIND_ROOT     equ 0       ; serve files from .root
+LINNEA_LOC_KIND_PROXY    equ 1       ; forward to the upstream in .proxy_addr
+LINNEA_LOC_KIND_REDIRECT equ 2      ; 301 to .redirect + the request target
 
 ; One routing entry: requests whose normalized path starts with .prefix are
-; served from .root or proxied to .proxy_addr; the longest prefix wins.
+; served from .root, proxied to .proxy_addr, or answered with a 301 to
+; .redirect; the longest prefix wins.
 struc linnea_config_location
     .prefix:        resb LINNEA_MAX_PREFIX + 1    ; NUL-terminated path prefix
     .prefix_len:    resq 1
@@ -32,6 +34,8 @@ struc linnea_config_location
                                                   ; parse time (static: safe SQE addr)
     .proxy_str:     resb LINNEA_MAX_PROXY_STR + 1 ; upstream "ip:port" for dump/log
     .proxy_str_len: resq 1
+    .redirect:      resb LINNEA_MAX_ROOT + 1      ; URL prefix the 301 points at
+    .redirect_len:  resq 1
 endstruc
 
 struc linnea_config_server

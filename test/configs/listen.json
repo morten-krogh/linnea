@@ -16,7 +16,8 @@
       "host": "127.0.0.1", "port": 47090, "hostname": "two.test",
       "locations": [
         { "prefix": "/", "root": "test/www/sub" },
-        { "prefix": "/sub", "root": "test/www" }
+        { "prefix": "/sub", "root": "test/www" },
+        { "prefix": "/old", "redirect": "https://example.com" }
       ]
     },
     {

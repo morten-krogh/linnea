@@ -11,8 +11,9 @@
 ; Server keys are "host" (string), "port" (integer), "hostname" (string),
 ; "locations" (array of location objects), accepted in any order, each
 ; required exactly once. Location keys are "prefix" (string, required)
-; plus exactly one of "root" (string) and "proxy" ("ip:port" string,
-; IPv4 literal only, validated and prebuilt into a sockaddr_in here).
+; plus exactly one of "root" (string), "proxy" ("ip:port" string, IPv4
+; literal only, validated and prebuilt into a sockaddr_in here) and
+; "redirect" (URL prefix a matched request is 301'd to).
 ; JSON subset: whitespace is space/tab/newline/carriage-return; strings
 ; have no escape sequences; numbers are non-negative decimal integers
 ; capped at 65535.
@@ -57,6 +58,8 @@ key_root:               db "root"
 key_root_len            equ $ - key_root
 key_proxy:              db "proxy"
 key_proxy_len           equ $ - key_proxy
+key_redirect:           db "redirect"
+key_redirect_len        equ $ - key_redirect
 key_cert:               db "cert"
 key_cert_len            equ $ - key_cert
 key_key:                db "key"
@@ -82,7 +85,7 @@ msg_dup_key:            db "duplicate key"
 msg_dup_key_len         equ $ - msg_dup_key
 msg_missing_key:        db "server requires host, port, hostname and locations"
 msg_missing_key_len     equ $ - msg_missing_key
-msg_location_keys:      db "location requires prefix and exactly one of root or proxy"
+msg_location_keys:      db "location requires prefix and exactly one of root, proxy or redirect"
 msg_location_keys_len   equ $ - msg_location_keys
 msg_bad_proxy:          db "invalid proxy address (IPv4:port required)"
 msg_bad_proxy_len       equ $ - msg_bad_proxy
@@ -110,6 +113,8 @@ msg_hostname_long:      db "hostname too long"
 msg_hostname_long_len   equ $ - msg_hostname_long
 msg_root_long:          db "root too long"
 msg_root_long_len       equ $ - msg_root_long
+msg_redirect_long:      db "redirect too long"
+msg_redirect_long_len   equ $ - msg_redirect_long
 msg_path_long:          db "cert/key path too long"
 msg_path_long_len       equ $ - msg_path_long
 msg_prefix_long:        db "prefix too long"
@@ -576,7 +581,8 @@ linnea_parse_server:
     jmp linnea_parse_fail
 
 ; linnea_parse_location(rdi=location*) — one location object.
-; Key presence tracked in a bitmask: prefix=1, root=2, proxy=4; a location
+; Key presence tracked in a bitmask: prefix=1, root=2, proxy=4,
+; redirect=8; a location
 ; requires prefix plus exactly one of root and proxy (final mask 3 or 5).
 ; A proxy value is validated here and prebuilt into a sockaddr_in.
 linnea_parse_location:
@@ -618,6 +624,13 @@ linnea_parse_location:
     call linnea_string_equal
     test eax, eax
     jnz .key_proxy
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_redirect]
+    mov ecx, key_redirect_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_redirect
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -648,6 +661,20 @@ linnea_parse_location:
     mov rsi, rax
     call linnea_string_copy
     mov qword [rbx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    jmp .member_sep
+
+.key_redirect:
+    test r12d, 8
+    jnz .dup
+    or r12d, 8
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_ROOT
+    ja .redirect_long
+    mov [rbx + linnea_config_location.redirect_len], rdx
+    lea rdi, [rbx + linnea_config_location.redirect]
+    mov rsi, rax
+    call linnea_string_copy
+    mov qword [rbx + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
     jmp .member_sep
 
 .key_proxy:
@@ -738,6 +765,8 @@ linnea_parse_location:
     je .done
     cmp r12d, 5                ; prefix + proxy
     je .done
+    cmp r12d, 9                ; prefix + redirect
+    je .done
     lea rdi, [msg_location_keys]
     mov esi, msg_location_keys_len
     jmp linnea_parse_fail
@@ -760,6 +789,10 @@ linnea_parse_location:
 .root_long:
     lea rdi, [msg_root_long]
     mov esi, msg_root_long_len
+    jmp linnea_parse_fail
+.redirect_long:
+    lea rdi, [msg_redirect_long]
+    mov esi, msg_redirect_long_len
     jmp linnea_parse_fail
 .proxy_long:
     lea rdi, [msg_proxy_long]

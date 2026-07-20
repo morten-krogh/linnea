@@ -122,6 +122,10 @@ resp_413:       db "HTTP/1.1 413 Content Too Large", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_413_len    equ $ - resp_413
+resp_414:       db "HTTP/1.1 414 URI Too Long", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_414_len    equ $ - resp_414
 resp_431:       db "HTTP/1.1 431 Request Header Fields Too Large", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
@@ -145,6 +149,11 @@ resp_505_len    equ $ - resp_505
 
 status_200:     db "HTTP/1.1 200 OK", 13, 10, "Content-Type: "
 status_200_len  equ $ - status_200
+status_301:     db "HTTP/1.1 301 Moved Permanently", 13, 10, "Location: "
+status_301_len  equ $ - status_301
+hdr_301_tail:   db 13, 10, "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+hdr_301_tail_len equ $ - hdr_301_tail
 status_206:     db "HTTP/1.1 206 Partial Content", 13, 10, "Content-Type: "
 status_206_len  equ $ - status_206
 status_304:     db "HTTP/1.1 304 Not Modified"
@@ -992,6 +1001,8 @@ linnea_http_handle:
     jz .resp_404               ; no location claims this path
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
     je .proxy_start
+    cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
+    je .redirect_start
 
     ; --- static location ---------------------------------------------
     cmp qword [rsp], -1
@@ -1343,6 +1354,44 @@ linnea_http_handle:
     mov [rsp + 32], rax
     jmp .log_request
 
+; --- redirect location: 301, Location = target + the raw request -------
+; The original percent-encoded target (query included) is appended to the
+; configured URL verbatim: the redirect points at the same resource on
+; the other origin, encoding untouched.
+.redirect_start:
+    mov rax, [rsp + 152]       ; the matched location
+    ; the head is assembled unchecked into out_buf, so bound it first: a
+    ; target near in_buf's size plus a long redirect URL can exceed it
+    mov rcx, [rax + linnea_config_location.redirect_len]
+    add rcx, [rsp + 144]       ; raw target length
+    add rcx, status_301_len + hdr_301_tail_len
+    cmp rcx, LINNEA_CONN_OUT_BUF
+    ja .resp_414
+    lea r15, [rbx + linnea_connection.out_buf]
+    lea rdi, [status_301]
+    mov esi, status_301_len
+    call .append
+    mov rax, [rsp + 152]
+    lea rdi, [rax + linnea_config_location.redirect]
+    mov rsi, [rax + linnea_config_location.redirect_len]
+    call .append
+    mov rdi, [rsp + 8]         ; the raw request target, query included
+    mov rsi, [rsp + 144]
+    call .append
+    lea rdi, [hdr_301_tail]
+    mov esi, hdr_301_tail_len
+    call .append
+    lea rax, [rbx + linnea_connection.out_buf]
+    mov [rbx + linnea_connection.out_ptr], rax
+    mov rcx, r15
+    sub rcx, rax
+    mov [rbx + linnea_connection.out_rem], rcx
+    mov qword [rbx + linnea_connection.keep_alive], 0
+    mov qword [rbx + linnea_connection.file_rem], 0
+    mov qword [rsp + 112], 301
+    mov qword [rsp + 32], 0    ; no body
+    jmp .log_request
+
 ; --- 304: the validators, no body, and the connection stays up ---------
 .resp_304:
     mov rdi, [rsp + 56]        ; the file is not going to be read
@@ -1589,6 +1638,11 @@ linnea_http_handle:
     lea rax, [resp_413]
     mov ecx, resp_413_len
     mov qword [rsp + 112], 413
+    jmp .resp_static
+.resp_414:
+    lea rax, [resp_414]
+    mov ecx, resp_414_len
+    mov qword [rsp + 112], 414
     jmp .resp_static
 .resp_431:
     lea rax, [resp_431]

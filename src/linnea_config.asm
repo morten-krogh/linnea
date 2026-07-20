@@ -44,7 +44,14 @@ dump_root:              db " root="
 dump_root_len           equ $ - dump_root
 dump_proxy:             db " proxy="
 dump_proxy_len          equ $ - dump_proxy
+dump_redirect:          db " redirect="
+dump_redirect_len       equ $ - dump_redirect
 newline:                db 10
+
+scheme_http:            db "http://"
+scheme_http_len         equ $ - scheme_http
+scheme_https:           db "https://"
+scheme_https_len        equ $ - scheme_https
 
 msg_no_servers:         db "config must define at least one server"
 msg_no_servers_len      equ $ - msg_no_servers
@@ -60,6 +67,8 @@ msg_bad_prefix:         db "location prefix must start with '/'"
 msg_bad_prefix_len      equ $ - msg_bad_prefix
 msg_empty_root:         db "location root must not be empty"
 msg_empty_root_len      equ $ - msg_empty_root
+msg_bad_redirect:       db "redirect target must start with http:// or https://"
+msg_bad_redirect_len    equ $ - msg_bad_redirect
 msg_empty_log:          db "config log must not be empty"
 msg_empty_log_len       equ $ - msg_empty_log
 msg_cert_key:           db "server needs both cert and key, or neither"
@@ -110,9 +119,49 @@ linnea_config_validate:
     cmp byte [rdx + linnea_config_location.prefix], '/'
     jne .bad_prefix
     cmp qword [rdx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
-    jne .loc_next
+    jne .loc_not_root
     cmp qword [rdx + linnea_config_location.root_len], 0
     je .empty_root
+    jmp .loc_next
+.loc_not_root:
+    cmp qword [rdx + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
+    jne .loc_next
+    ; the target must be an absolute URL: a matched request's raw target
+    ; ("/...") is appended verbatim, so a scheme-less value cannot work.
+    ; The outer loops live in rax/rdi/r8-r11, all of which the compare
+    ; calls (or this block) scratch: save the lot.
+    push rax
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r10, rdx
+    cmp qword [r10 + linnea_config_location.redirect_len], scheme_http_len
+    jb .bad_redirect
+    lea rdi, [r10 + linnea_config_location.redirect]
+    mov esi, scheme_http_len
+    lea rdx, [scheme_http]
+    mov ecx, scheme_http_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .redirect_ok
+    cmp qword [r10 + linnea_config_location.redirect_len], scheme_https_len
+    jb .bad_redirect
+    lea rdi, [r10 + linnea_config_location.redirect]
+    mov esi, scheme_https_len
+    lea rdx, [scheme_https]
+    mov ecx, scheme_https_len
+    call linnea_string_equal
+    test eax, eax
+    jz .bad_redirect
+.redirect_ok:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rax
 .loc_next:
     inc r11
     jmp .loc_loop
@@ -218,6 +267,10 @@ linnea_config_validate:
 .bad_prefix:
     lea rdi, [msg_bad_prefix]
     mov esi, msg_bad_prefix_len
+    jmp linnea_error_exit
+.bad_redirect:
+    lea rdi, [msg_bad_redirect]
+    mov esi, msg_bad_redirect_len
     jmp linnea_error_exit
 .empty_root:
     lea rdi, [msg_empty_root]
@@ -335,11 +388,20 @@ linnea_config_dump:
     call linnea_print_stdout
     cmp qword [r15 + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
     je .loc_proxy
+    cmp qword [r15 + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
+    je .loc_redirect
     lea rdi, [dump_root]
     mov esi, dump_root_len
     call linnea_print_stdout
     lea rdi, [r15 + linnea_config_location.root]
     mov rsi, [r15 + linnea_config_location.root_len]
+    jmp .loc_target
+.loc_redirect:
+    lea rdi, [dump_redirect]
+    mov esi, dump_redirect_len
+    call linnea_print_stdout
+    lea rdi, [r15 + linnea_config_location.redirect]
+    mov rsi, [r15 + linnea_config_location.redirect_len]
     jmp .loc_target
 .loc_proxy:
     lea rdi, [dump_proxy]

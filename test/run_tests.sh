@@ -44,7 +44,7 @@ check() {
 }
 
 # --- config parsing and validation ---
-run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test locations=2" \
+run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test locations=3" \
     timeout 0.5 $BIN test/configs/listen.json
 run_test "config dump"     124 stdout "config: 3 servers timeout=2 max_connections=64" \
     timeout 0.5 $BIN test/configs/listen.json
@@ -74,10 +74,16 @@ run_test "unknown key"     1 stderr "unknown key" \
     $BIN test/configs/unknown-key.json
 run_test "escape sequence" 1 stderr "escape sequences not supported" \
     $BIN test/configs/escape.json
-run_test "location no prefix" 1 stderr "location requires prefix and exactly one of root or proxy" \
+run_test "location no prefix" 1 stderr "location requires prefix and exactly one of root, proxy or redirect" \
     $BIN test/configs/location-missing-prefix.json
-run_test "location root+proxy" 1 stderr "location requires prefix and exactly one of root or proxy" \
+run_test "location root+proxy" 1 stderr "location requires prefix and exactly one of root, proxy or redirect" \
     $BIN test/configs/location-both-kinds.json
+run_test "location root+redirect" 1 stderr "location requires prefix and exactly one of root, proxy or redirect" \
+    $BIN test/configs/location-root-and-redirect.json
+run_test "redirect dump"   124 stdout "prefix=/old redirect=https://example.com" \
+    timeout 0.5 $BIN test/configs/listen.json
+run_test "bad redirect target" 1 stderr "redirect target must start with http:// or https://" \
+    $BIN test/configs/bad-redirect-target.json
 run_test "bad proxy address" 1 stderr "invalid proxy address" \
     $BIN test/configs/bad-proxy-addr.json
 run_test "prefix not absolute" 1 stderr "location prefix must start with '/'" \
@@ -176,6 +182,14 @@ check_http "file txt mime"     "Content-Type: text/plain" "$resp"
 resp=$(curl -si --max-time 2 http://127.0.0.1:47080/)
 check_http "index html body"   "linnea index page" "$resp"
 check_http "index html mime"   "Content-Type: text/html" "$resp"
+
+# --- redirect location: 301 with the raw request target appended ---
+resp=$(curl -si --max-time 2 http://127.0.0.1:47090/old)
+check_http "redirect status"   "301 Moved Permanently" "$resp"
+check_http "redirect location" "Location: https://example.com/old" "$resp"
+check_http "redirect no body"  "Content-Length: 0" "$resp"
+resp=$(curl -si --max-time 2 "http://127.0.0.1:47090/old/a%20b?x=1&y=2")
+check_http "redirect keeps raw path+query" "Location: https://example.com/old/a%20b?x=1&y=2" "$resp"
 resp=$(curl -si --max-time 2 http://127.0.0.1:47080/style.css)
 check_http "css mime"          "Content-Type: text/css" "$resp"
 resp=$(curl -s --max-time 2 http://127.0.0.1:47090/sub/page.html)
