@@ -1,0 +1,13 @@
+{
+  "log": "linnea.log",
+  "timeout": 60,
+  "servers": [
+    {
+      "host": "0.0.0.0", "port": 443, "hostname": "linnea.amberbio.com",
+      "cert": "/home/linnea/certs/fullchain.pem", "key": "/home/linnea/certs/privkey.pem",
+      "locations": [
+        { "prefix": "/", "root": "test/www" }
+      ]
+    }
+  ]
+}
