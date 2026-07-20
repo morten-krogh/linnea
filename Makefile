@@ -74,20 +74,14 @@ clean:
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN)
 	./test/run_tests.sh
 
-# Deploy: install the binary to /usr/local/bin (bin_t under SELinux, so
-# systemd may exec it; the fresh inode install(1) creates picks up the
-# standard label — no setcap or restorecon after rebuilds) and the unit
-# to /etc/systemd/system, then restart. The installed files are real
-# make targets, so each sudo copy — and the daemon-reload — runs only
-# when its source actually changed.
-/usr/local/bin/linnea: $(BIN)
-	sudo install -m 0755 $< $@
+# Install the binary to /usr/local/bin: bin_t under SELinux, so systemd
+# may exec it, and the fresh inode picks up the standard label — no
+# setcap or restorecon after rebuilds. Run as root (`sudo make install`);
+# deliberately not dependent on the build, so root never compiles into
+# the tree. Routine deploy:
+#   make && sudo make install && sudo systemctl restart linnea
+# The systemd unit is a one-time install; see config/linnea.service.
+install:
+	install -m 0755 $(BIN) /usr/local/bin/linnea
 
-/etc/systemd/system/linnea.service: config/linnea.service
-	sudo install -m 0644 $< $@
-	sudo systemctl daemon-reload
-
-deploy: /usr/local/bin/linnea /etc/systemd/system/linnea.service
-	sudo systemctl restart linnea
-
-.PHONY: all clean test selftest tlstest deploy
+.PHONY: all clean test selftest tlstest install
