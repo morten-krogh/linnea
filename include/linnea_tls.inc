@@ -1,6 +1,6 @@
 ; TLS 1.3 (RFC 8446), the linnea profile: TLS_AES_128_GCM_SHA256 with an
-; x25519 key share and an ECDSA P-256 certificate, no HelloRetryRequest, no
-; resumption, no 0-RTT, no client certificates. The handshake runs in
+; x25519 key share and an ECDSA P-256 certificate chain, no
+; HelloRetryRequest, no resumption, no 0-RTT, no client certificates. The handshake runs in
 ; userspace; application-data record protection is handed to the kernel
 ; (kTLS) once it completes.
 
@@ -35,8 +35,11 @@ LINNEA_TLS_FLAG_TRACE   equ 1
 
 ; The whole handshake state overlays a connection's up_buf (no proxying is
 ; active during the handshake), so linnea_tls_hs_size must stay <= up_buf.
-; The flight buffer holds EE + Certificate(DER) + CertificateVerify +
-; Finished; 4096 covers a single P-256 leaf well past any real size.
+; The flight buffer holds EE + Certificate(certificate_list) +
+; CertificateVerify + Finished; 4096 covers an ECDSA leaf plus its
+; intermediates (the four-cert Let's Encrypt long chain is ~3.4 KiB; a
+; chain of large RSA intermediates would not fit, and linnea_tls_setup
+; refuses it at startup).
 LINNEA_TLS_MSG_BUF      equ 4096   ; handshake message reassembly space
 
 ; msg_buf is smaller than the largest record in_buf can hold, so the record
@@ -48,17 +51,18 @@ LINNEA_TLS_MSG_BUF      equ 4096   ; handshake message reassembly space
 ; limit of 2^14+256, which only matters for a Finished padded past 4 KiB.
 LINNEA_TLS_MAX_FRAGMENT equ LINNEA_TLS_MSG_BUF
 
-; build_flight assembles EncryptedExtensions(6) + Certificate(13 + DER) +
-; CertificateVerify(8 + signature) + Finished(36) into msg_buf, so a
-; certificate is bounded by msg_buf minus that framing. linnea_tls_setup
-; refuses a larger one at startup rather than let the flight overrun.
+; build_flight assembles EncryptedExtensions(6) + Certificate(8 + list) +
+; CertificateVerify(8 + signature) + Finished(36) into msg_buf, so the
+; certificate_list is bounded by msg_buf minus that framing.
+; linnea_tls_setup refuses a larger one at startup rather than let the
+; flight overrun.
 ;
 ; The CertificateVerify term must be computed from the signature's MAXIMUM,
 ; not its typical size: an ECDSA signature is DER, so its length varies with
 ; r and s and usually lands a byte or two under the bound. The term is
 ; header(4) + scheme(2) + length(2) + LINNEA_P256_ECDSA_MAX_SIG.
-LINNEA_TLS_FLIGHT_OVERHEAD equ 6 + 13 + (8 + LINNEA_P256_ECDSA_MAX_SIG) + 36
-LINNEA_TLS_MAX_CERT     equ LINNEA_TLS_MSG_BUF - LINNEA_TLS_FLIGHT_OVERHEAD
+LINNEA_TLS_FLIGHT_OVERHEAD equ 6 + 8 + (8 + LINNEA_P256_ECDSA_MAX_SIG) + 36
+LINNEA_TLS_MAX_CERT_LIST equ LINNEA_TLS_MSG_BUF - LINNEA_TLS_FLIGHT_OVERHEAD
 
 ; kTLS handoff (docs.kernel.org/networking/tls.html). After the handshake
 ; the application traffic keys go to the kernel and io_uring send/recv
@@ -98,8 +102,8 @@ LINNEA_TLS_A_INTERNAL_ERROR      equ 80
 struc linnea_tls_hs
     .state:      resd 1
     .flags:      resd 1
-    .cert:       resq 1     ; DER certificate (sent verbatim)
-    .cert_len:   resq 1
+    .cert_list:     resq 1  ; pre-framed TLS certificate_list (sent verbatim)
+    .cert_list_len: resq 1
     .key_priv:   resq 1     ; 32-byte P-256 private scalar
     .out_len:    resq 1     ; bytes placed in out by the last _input call
     .consumed:   resq 1     ; input bytes eaten by the last _input call

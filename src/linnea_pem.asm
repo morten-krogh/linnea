@@ -2,18 +2,23 @@
 ;
 ; linnea_pem_decode finds a "-----BEGIN <name>-----" / "-----END-----"
 ; block and base64-decodes its body (skipping any whitespace) into the
-; caller's buffer. linnea_pem_p256_key decodes a PKCS#8 "PRIVATE KEY"
-; block and walks its DER to the 32-byte P-256 private scalar.
+; caller's buffer. linnea_pem_cert_list decodes every CERTIFICATE block
+; in a file — leaf first, then the chain, the order PEM chain files are
+; written in — into a pre-framed TLS 1.3 certificate_list.
+; linnea_pem_p256_key decodes a PKCS#8 "PRIVATE KEY" block and walks its
+; DER to the 32-byte P-256 private scalar.
 ;
 ; Deliberately not a general PEM/DER parser: linnea only ever loads its
-; own operator-supplied files, one leaf certificate and one key. Errors
-; return -1; the caller turns that into a startup error_exit.
+; own operator-supplied files, one cert chain and one key. Errors are -1
+; (no matching BEGIN block) or -2 (a block that is malformed or overflows
+; the buffer); the caller turns both into a startup error_exit.
 ;
 ; ABI: System V; callee-saved preserved.
 
 default rel
 
 global linnea_pem_decode
+global linnea_pem_cert_list
 global linnea_pem_p256_key
 
 section .rodata
@@ -34,7 +39,10 @@ key_buf_cap equ 256           ; ~138 bytes with the optional public key
 section .text
 
 ; ---- linnea_pem_decode(rdi=src, rsi=srclen, rdx=name, rcx=namelen,
-;                        r8=out, r9=outcap) -> rax = DER length or -1 ---
+;      r8=out, r9=outcap) -> rax = DER length, or -1 when no BEGIN <name>
+;      block exists, -2 when a block is malformed or outgrows outcap.
+;      On success rdx points just past the decoded body (at or before its
+;      END line): the resume point for scanning a multi-block file. -----
 linnea_pem_decode:
     push rbx
     push r12
@@ -54,21 +62,21 @@ linnea_pem_decode:
     mov rsi, begin_len
     call find_bytes
     test rax, rax
-    js .fail
+    js .nofind
     add rbx, begin_len
     mov rdi, rbx             ; the name must follow immediately
     mov rsi, r14
     mov rcx, r15
     call bytes_eq
     test eax, eax
-    jz .fail
+    jz .bad
     add rbx, r15
     mov rdi, rbx             ; ...and then the closing dashes
     lea rsi, [dashes5]
     mov rcx, 5
     call bytes_eq
     test eax, eax
-    jz .fail
+    jz .bad
     add rbx, 5
 
     call build_b64_table
@@ -79,7 +87,7 @@ linnea_pem_decode:
     xor r10d, r10d           ; output length
 .loop:
     cmp rbx, r13
-    jae .fail                ; ran out before the END marker
+    jae .bad                 ; ran out before the END marker
     ; is this the start of the END line? (only meaningful at column-ish
     ; positions, but '-' never appears in base64 so a plain check is safe)
     cmp byte [rbx], '-'
@@ -108,15 +116,19 @@ linnea_pem_decode:
     mov eax, r8d
     shr eax, cl              ; take the top 8 completed bits
     cmp r10, r12
-    jae .fail                ; would overflow the caller's buffer
+    jae .bad                 ; would overflow the caller's buffer
     mov [rbp + r10], al
     inc r10
     jmp .loop
 .done:
     mov rax, r10
+    mov rdx, rbx             ; resume point for the next block
     jmp .ret
-.fail:
+.nofind:
     mov rax, -1
+    jmp .ret
+.bad:
+    mov rax, -2
 .ret:
     pop rbp
     pop r15
@@ -125,6 +137,76 @@ linnea_pem_decode:
     pop r12
     pop rbx
     ret
+
+; ---- linnea_pem_cert_list(rdi=src, rsi=srclen, rdx=out, rcx=outcap)
+;      -> rax = certificate_list length, or -1 / -2 as linnea_pem_decode.
+;
+;      Decodes every CERTIFICATE block and emits each as a TLS 1.3
+;      CertificateEntry (RFC 8446 4.4.2): u24 DER length, the DER, and an
+;      empty (u16 0) extensions block. The result is the certificate_list
+;      body, copied verbatim into the Certificate handshake message. At
+;      least one block is required; the file's order (leaf first, then
+;      the chain) is the order the wire wants. --------------------------
+linnea_pem_cert_list:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi              ; src cursor
+    lea r13, [rdi + rsi]      ; src end
+    mov r14, rdx              ; out
+    mov r15, rcx              ; outcap
+    xor ebx, ebx              ; list length so far
+.next:
+    lea rax, [rbx + 5]        ; this entry's framing: u24 length + u16 ext
+    cmp rax, r15
+    ja .bad
+    mov rdi, r12
+    mov rsi, r13
+    sub rsi, r12              ; source bytes left
+    lea rdx, [cert_name]
+    mov ecx, cert_name_len
+    lea r8, [r14 + rbx + 3]   ; the DER lands after its u24 length
+    mov r9, r15
+    sub r9, rax               ; room left after the framing
+    call linnea_pem_decode
+    test rax, rax
+    js .no_more
+    jz .bad                   ; an empty CERTIFICATE block: malformed (-2)
+    mov r12, rdx              ; resume past this block
+    mov ecx, eax              ; u24 DER length, big-endian
+    shr ecx, 16
+    mov [r14 + rbx], cl
+    mov ecx, eax
+    shr ecx, 8
+    mov [r14 + rbx + 1], cl
+    mov [r14 + rbx + 2], al
+    lea rcx, [r14 + rbx]
+    mov word [rcx + rax + 3], 0    ; per-certificate extensions: none
+    lea rbx, [rbx + rax + 5]
+    jmp .next
+.no_more:
+    cmp rax, -2
+    je .ret                   ; a malformed block: propagate
+    test rbx, rbx
+    jz .ret                   ; no CERTIFICATE block at all: rax = -1
+    mov rax, rbx
+    jmp .ret
+.bad:
+    mov rax, -2
+.ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+section .rodata
+cert_name:    db "CERTIFICATE"
+cert_name_len equ $ - cert_name
+section .text
 
 ; ---- p256_der_open(rdi=p, rsi=end, edx=tag) -> rax = content ptr or -1,
 ;      rcx = content length. Checks the tag, decodes the length, and

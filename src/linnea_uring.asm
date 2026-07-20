@@ -260,8 +260,8 @@ linnea_uring_run:
     cmp dword [rax + linnea_config_server.tls], 0
     je .accept_recv
     lea rdi, [r12 + linnea_connection.up_buf]
-    mov rsi, [rax + linnea_config_server.cert_der]
-    mov rdx, [rax + linnea_config_server.cert_der_len]
+    mov rsi, [rax + linnea_config_server.cert_list]
+    mov rdx, [rax + linnea_config_server.cert_list_len]
     mov rcx, [rax + linnea_config_server.key_priv]
     xor r8d, r8d
     call linnea_tls_hs_init

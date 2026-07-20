@@ -49,8 +49,8 @@ struc linnea_config_server
     .cert_path_len: resq 1
     .key_path:      resb LINNEA_MAX_ROOT + 1      ; PEM PKCS#8 key path
     .key_path_len:  resq 1
-    .cert_der:      resq 1                        ; loaded DER (startup), or 0
-    .cert_der_len:  resq 1
+    .cert_list:     resq 1                        ; TLS certificate_list, pre-framed
+    .cert_list_len: resq 1                        ; at startup, or 0
     .key_priv:      resq 1                        ; P-256 private scalar ptr (startup)
     .location_count: resq 1
     .locations:     resb linnea_config_location_size * LINNEA_MAX_LOCATIONS

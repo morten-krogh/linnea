@@ -121,14 +121,14 @@ ct_eq32:
     ret
 
 ; ===================================================================
-; linnea_tls_hs_init(rdi=hs, rsi=cert, rdx=cert_len, rcx=key_priv,
-;                    r8d=flags)
+; linnea_tls_hs_init(rdi=hs, rsi=cert_list, rdx=cert_list_len,
+;                    rcx=key_priv, r8d=flags)
 ; ===================================================================
 linnea_tls_hs_init:
     mov dword [rdi + linnea_tls_hs.state], LINNEA_TLS_WAIT_CH
     mov [rdi + linnea_tls_hs.flags], r8d
-    mov [rdi + linnea_tls_hs.cert], rsi
-    mov [rdi + linnea_tls_hs.cert_len], rdx
+    mov [rdi + linnea_tls_hs.cert_list], rsi
+    mov [rdi + linnea_tls_hs.cert_list_len], rdx
     mov [rdi + linnea_tls_hs.key_priv], rcx
     mov qword [rdi + linnea_tls_hs.out_len], 0
     mov qword [rdi + linnea_tls_hs.consumed], 0
@@ -767,25 +767,21 @@ build_flight:
     mov rdi, rbp
     call tls_absorb
     add rbx, 6
-    ; -- Certificate --
-    mov r13, [rbp + linnea_tls_hs.cert_len]  ; C
+    ; -- Certificate: the pre-framed certificate_list, sent verbatim --
+    mov r13, [rbp + linnea_tls_hs.cert_list_len]  ; L
     mov byte [rbx], 0x0b
-    lea eax, [r13d + 9]
+    lea eax, [r13d + 4]
     mov rdi, rbx
     call store_u24_1            ; length at [rbx+1..3]
     mov byte [rbx + 4], 0x00    ; cert_request_context length
-    lea eax, [r13d + 5]         ; cert_list length
+    mov eax, r13d               ; certificate_list length
     lea rdi, [rbx + 4]
     call store_u24_1
-    mov eax, r13d               ; cert_data length
-    lea rdi, [rbx + 7]
-    call store_u24_1
-    lea rdi, [rbx + 11]         ; the DER itself
-    mov rsi, [rbp + linnea_tls_hs.cert]
+    lea rdi, [rbx + 8]          ; the CertificateEntry list itself
+    mov rsi, [rbp + linnea_tls_hs.cert_list]
     mov rcx, r13
     rep movsb
-    mov word [rdi], 0x0000      ; per-certificate extensions: none
-    lea r14, [r13 + 13]         ; Certificate message length
+    lea r14, [r13 + 8]          ; Certificate message length
     lea rsi, [rbx]
     mov rdx, r14
     mov rdi, rbp

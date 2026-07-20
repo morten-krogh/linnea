@@ -14,7 +14,7 @@ default rel
 %include "linnea_syscall.inc"
 %include "linnea_tls.inc"
 
-extern linnea_pem_decode
+extern linnea_pem_cert_list
 extern linnea_pem_p256_key
 extern linnea_tls_hs_init
 extern linnea_tls_hs_input
@@ -24,14 +24,12 @@ extern linnea_tls_seal
 global _start
 
 section .rodata
-cert_name:  db "CERTIFICATE"
-cert_name_len equ $ - cert_name
 close_notify: db 1, 0          ; alert level warning, description close_notify
 
 section .bss
 alignb 8
 hs:         resb linnea_tls_hs_size
-der_buf:    resb 8192          ; certificate DER
+list_buf:   resb 8192          ; pre-framed TLS certificate_list
 inbuf:      resb 20000
 plainbuf:   resb 20000
 outbuf:     resb 20000
@@ -48,19 +46,17 @@ _start:
     cmp rax, 4
     jl .usage
 
-    ; --- load the certificate: map the PEM, decode to DER ---
+    ; --- load the certificate chain: map the PEM, frame the list ---
     mov rdi, [rsp + 16]        ; argv[1] cert path
     call map_file              ; rax=ptr, rdx=size
     mov rdi, rax
     mov rsi, rdx
-    lea rdx, [cert_name]
-    mov rcx, cert_name_len
-    lea r8, [der_buf]
-    mov r9, 8192
-    call linnea_pem_decode
+    lea rdx, [list_buf]
+    mov ecx, 8192
+    call linnea_pem_cert_list
     cmp rax, 0
     jle .fail
-    mov r14, rax               ; cert DER length
+    mov r14, rax               ; certificate_list length
 
     ; --- load the private key scalar ---
     mov rdi, [rsp + 24]        ; argv[2] key path
@@ -90,7 +86,7 @@ _start:
 
     ; --- run one handshake ---
     lea rdi, [hs]
-    lea rsi, [der_buf]
+    lea rsi, [list_buf]
     mov rdx, r14
     mov rcx, r15
     xor r8d, r8d               ; no trace flag: real getrandom + sigalg check

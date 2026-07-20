@@ -3,10 +3,11 @@
 ;
 ; linnea_tls_setup runs once at startup: if any server serves TLS it
 ; requires the instructions the record protection is built on (see
-; cpuid_check_aesni), then loads each TLS server's PEM certificate (first
-; CERTIFICATE block, sent as opaque DER) and PKCS#8 P-256 key into
-; persistent buffers, bounding the DER so the handshake flight cannot
-; outgrow the message buffer it is assembled in.
+; cpuid_check_aesni), then loads each TLS server's PEM certificate chain
+; (every CERTIFICATE block, pre-framed as the TLS certificate_list and
+; sent verbatim) and PKCS#8 P-256 key into persistent buffers, bounding
+; the list so the handshake flight cannot outgrow the message buffer it
+; is assembled in.
 ;
 ; linnea_ktls_enable performs the handoff after a handshake completes:
 ; TCP_ULP "tls", then the AES-128-GCM application traffic keys for the
@@ -27,7 +28,7 @@ global linnea_ktls_enable
 
 extern linnea_file_map_readonly
 extern linnea_file_unmap
-extern linnea_pem_decode
+extern linnea_pem_cert_list
 extern linnea_pem_p256_key
 extern linnea_p256_scalar_is_valid
 extern linnea_tls_hkdf_expand_label
@@ -35,30 +36,28 @@ extern linnea_error_exit
 
 section .rodata
 
-cert_name:  db "CERTIFICATE"
-cert_name_len equ $ - cert_name
 ulp_tls:    db "tls", 0
 lbl_key:    db "key"
 lbl_iv:     db "iv"
 
 msg_no_aesni: db "TLS requires a CPU with AES-NI, PCLMULQDQ and SSSE3"
 msg_no_aesni_len equ $ - msg_no_aesni
-msg_bad_cert: db "cannot load TLS certificate (not a PEM CERTIFICATE?)"
+msg_bad_cert: db "cannot load TLS certificate chain (not PEM CERTIFICATEs?)"
 msg_bad_cert_len equ $ - msg_bad_cert
 msg_bad_key:  db "cannot load TLS key (not a PKCS#8 P-256 key in [1, n-1]?)"
 msg_bad_key_len equ $ - msg_bad_key
-msg_cert_big: db "TLS certificate too large to fit the handshake flight"
+msg_cert_big: db "TLS certificate chain too large to fit the handshake flight"
 msg_cert_big_len equ $ - msg_cert_big
 
-; Decode scratch, deliberately looser than LINNEA_TLS_MAX_CERT so that a
-; cert just over the limit is diagnosed as too large rather than as
-; malformed (linnea_pem_decode reports both the same way).
-MAX_CERT_DER equ 8192
+; Decode scratch, deliberately looser than LINNEA_TLS_MAX_CERT_LIST so
+; that a chain just over the limit is diagnosed as too large rather than
+; as malformed (linnea_pem_cert_list reports overflow as any bad block).
+MAX_CERT_LIST equ 8192
 
 section .bss
 
 alignb 8
-cert_pool:  resb LINNEA_MAX_SERVERS * MAX_CERT_DER
+cert_pool:  resb LINNEA_MAX_SERVERS * MAX_CERT_LIST
 key_pool:  resb LINNEA_MAX_SERVERS * 32
 
 section .text
@@ -101,26 +100,25 @@ linnea_tls_setup:
     cmp dword [r13 + linnea_config_server.tls], 0
     je .load_next
 
-    ; certificate: map the PEM, decode the first CERTIFICATE to DER
+    ; certificate chain: map the PEM, frame every CERTIFICATE block
+    ; into this server's slot as a ready-made TLS certificate_list
     lea rdi, [r13 + linnea_config_server.cert_path]
     call linnea_file_map_readonly     ; rax=ptr, rdx=size
     mov r14, rax                      ; mapping ptr
     mov r15, rdx                      ; mapping size
-    imul rax, r12, MAX_CERT_DER
-    lea rax, [cert_pool + rax]         ; this server's DER slot
-    mov [r13 + linnea_config_server.cert_der], rax
+    imul rax, r12, MAX_CERT_LIST
+    lea rax, [cert_pool + rax]         ; this server's list slot
+    mov [r13 + linnea_config_server.cert_list], rax
     mov rdi, r14
     mov rsi, r15
-    lea rdx, [cert_name]
-    mov ecx, cert_name_len
-    mov r8, [r13 + linnea_config_server.cert_der]
-    mov r9, MAX_CERT_DER
-    call linnea_pem_decode
+    mov rdx, [r13 + linnea_config_server.cert_list]
+    mov ecx, MAX_CERT_LIST
+    call linnea_pem_cert_list
     cmp rax, 0
     jle .bad_cert
-    cmp rax, LINNEA_TLS_MAX_CERT   ; must leave room for the rest of the
-    ja .cert_big                   ; flight in msg_buf (see linnea_tls.inc)
-    mov [r13 + linnea_config_server.cert_der_len], rax
+    cmp rax, LINNEA_TLS_MAX_CERT_LIST  ; must leave room for the rest of
+    ja .cert_big                   ; the flight in msg_buf (linnea_tls.inc)
+    mov [r13 + linnea_config_server.cert_list_len], rax
     mov rdi, r14
     mov rsi, r15
     call linnea_file_unmap
