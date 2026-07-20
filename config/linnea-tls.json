@@ -19,12 +19,14 @@
     {
       "host": "0.0.0.0", "port": 80, "hostname": "linnea.amberbio.com",
       "locations": [
+        { "prefix": "/.well-known/acme-challenge", "root": "/home/linnea/acme" },
         { "prefix": "/", "redirect": "https://linnea.amberbio.com" }
       ]
     },
     {
       "host": "0.0.0.0", "port": 80, "hostname": "linnea2.amberbio.com",
       "locations": [
+        { "prefix": "/.well-known/acme-challenge", "root": "/home/linnea/acme" },
         { "prefix": "/", "redirect": "https://linnea2.amberbio.com" }
       ]
     }
