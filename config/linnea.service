@@ -1,7 +1,7 @@
-# Linnea systemd unit. Install:
-#   sudo cp config/linnea.service /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now linnea
+# Linnea systemd unit. Install or update with `make deploy` (copies the
+# binary to /usr/local/bin — bin_t under SELinux, so systemd may exec it
+# — and this unit to /etc/systemd/system, then restarts). First time:
+#   make deploy && sudo systemctl enable linnea
 #
 # kTLS needs the kernel tls module; make it persistent across boots with:
 #   echo tls | sudo tee /etc/modules-load.d/ktls.conf
@@ -21,7 +21,7 @@ User=linnea
 Group=linnea
 # the config's root and log paths are relative to this directory
 WorkingDirectory=/home/linnea/linnea
-ExecStart=/home/linnea/linnea/bin/linnea /home/linnea/linnea/config/linnea-tls.json
+ExecStart=/usr/local/bin/linnea /home/linnea/linnea/config/linnea-tls.json
 Restart=on-failure
 RestartSec=1
 

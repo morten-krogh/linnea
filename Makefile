@@ -74,4 +74,14 @@ clean:
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN)
 	./test/run_tests.sh
 
-.PHONY: all clean test selftest tlstest
+# Install the binary to /usr/local/bin (bin_t under SELinux, so systemd
+# may exec it) and the unit to /etc/systemd/system, then restart. The
+# fresh inode install(1) creates picks up the standard label — no
+# setcap, no chcon, no restorecon after rebuilds.
+deploy: $(BIN)
+	sudo install -m 0755 $(BIN) /usr/local/bin/linnea
+	sudo install -m 0644 config/linnea.service /etc/systemd/system/linnea.service
+	sudo systemctl daemon-reload
+	sudo systemctl restart linnea
+
+.PHONY: all clean test selftest tlstest deploy
