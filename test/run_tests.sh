@@ -942,6 +942,16 @@ PYEOF
     check "tls resumption over kTLS (Reused)" $?
     rm -f "$LOG.sess"
 
+    # ALPN: a client offering h2,http/1.1 gets http/1.1 selected and
+    # echoed (the h2 path is a later milestone); offering nothing gets no
+    # ALPN extension back.
+    echo | timeout 5 openssl s_client -connect 127.0.0.1:47443 -CAfile $CA \
+        -tls1_3 -alpn h2,http/1.1 2>/dev/null | grep -q "ALPN protocol: http/1.1"
+    check "alpn selects http/1.1" $?
+    echo | timeout 5 openssl s_client -connect 127.0.0.1:47443 -CAfile $CA \
+        -tls1_3 2>/dev/null | grep -q "No ALPN negotiated"
+    check "alpn absent when not offered" $?
+
     timeout 30 python3 test/tls/oversized_record.py $CA 47443 \
         test/tls/clienthello_seed.bin >/dev/null 2>&1
     check "tls oversized record refused (msg_buf bound)" $?

@@ -143,6 +143,9 @@ struc linnea_tls_hs
     .binders_off: resq 1    ; truncated-CH length for the binder hash
     .psk_flags:  resd 1     ; bit0 offer recorded, bit1 psk_dhe_ke offered
     .resumed:    resd 1     ; 1 = PSK accepted: no cert, SH carries 0x29
+    ; ALPN (RFC 7301): the selected protocol as a length-prefixed name to
+    ; echo in EncryptedExtensions, or 0 for none. Set by parse_ch.
+    .alpn_name:  resq 1
     .transcript: resb linnea_sha256_ctx_size
     .priv:       resb 32    ; ephemeral x25519 private key
     .srand:      resb 32    ; server random

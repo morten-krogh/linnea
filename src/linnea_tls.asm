@@ -64,6 +64,11 @@ lbl_res_binder: db "res binder"
 lbl_res_master: db "res master"
 lbl_resumption: db "resumption"
 ticket_nonce: db 0, 0          ; one ticket per handshake: a fixed nonce
+; ALPN protocol names, length-prefixed (byte length then the bytes), the
+; form build_ee copies. http/1.1 is the only one selected until the h2
+; connection path exists; h2 is here for the M15+ milestones.
+alpn_http11:  db 8, "http/1.1"
+alpn_http11_name equ alpn_http11 + 1
 
 ; the signed content for CertificateVerify (RFC 8446 4.4.3): 64 spaces,
 ; the context string, a separator, then the transcript hash appended
@@ -169,6 +174,7 @@ linnea_tls_hs_init:
     mov dword [rdi + linnea_tls_hs.sni_len], 0
     mov dword [rdi + linnea_tls_hs.psk_flags], 0
     mov dword [rdi + linnea_tls_hs.resumed], 0
+    mov qword [rdi + linnea_tls_hs.alpn_name], 0
     lea rdi, [rdi + linnea_tls_hs.transcript]
     jmp linnea_sha256_init
 
@@ -578,6 +584,8 @@ parse_ch:
     je .ext_psk
     cmp r12d, 0x2d             ; psk_key_exchange_modes
     je .ext_pskmodes
+    cmp r12d, 0x10             ; application_layer_protocol_negotiation
+    je .ext_alpn
     test r12d, r12d             ; server_name
     jz .ext_sni
     jmp .ext_skip
@@ -803,6 +811,44 @@ parse_ch:
     or dword [rbp + linnea_tls_hs.psk_flags], 1   ; offer recorded
     jmp .ext_skip
 
+; ALPN: pick the first offered protocol we support. Only http/1.1 for
+; now — the h2 connection path lands in a later milestone — so a client
+; offering h2,http/1.1 (curl --http2, browsers) resolves to http/1.1,
+; which build_ee then echoes in EncryptedExtensions.
+.ext_alpn:
+    test r14d, 0x4000
+    jnz .ext_dup
+    or r14d, 0x4000
+    lea rax, [rbx + 2]
+    cmp rax, [rsp]
+    ja .pop_decode
+    movzx eax, byte [rbx]       ; ProtocolNameList length
+    shl eax, 8
+    mov al, [rbx + 1]
+    lea rcx, [rbx + 2 + rax]
+    cmp rcx, [rsp]
+    jne .pop_decode
+    lea rsi, [rbx + 2]          ; cursor over the name list
+    mov r10, rcx                ; list end
+.alpn_loop:
+    cmp rsi, r10
+    jae .ext_skip
+    movzx eax, byte [rsi]       ; protocol name length
+    lea rcx, [rsi + 1 + rax]
+    cmp rcx, r10
+    ja .pop_decode
+    cmp qword [rbp + linnea_tls_hs.alpn_name], 0
+    jne .alpn_next              ; already chose one
+    cmp eax, 8                  ; "http/1.1" is 8 bytes
+    jne .alpn_next
+    mov r8, [rsi + 1]
+    cmp r8, [alpn_http11_name]
+    jne .alpn_next
+    lea rax, [alpn_http11]
+    mov [rbp + linnea_tls_hs.alpn_name], rax
+.alpn_next:
+    mov rsi, rcx
+    jmp .alpn_loop
 .ext_skip:
     pop rbx                     ; body end -> continue after this ext
     jmp .ext_loop
@@ -1208,14 +1254,16 @@ build_flight:
     ; 5. assemble EE || Certificate || CertificateVerify || Finished into
     ;    msg_buf, absorbing each message into the transcript
     lea rbx, [rbp + linnea_tls_hs.msg_buf]   ; flight write cursor
-    ; -- EncryptedExtensions: no extensions --
-    mov dword [rbx], 0x02000008              ; 08 00 00 02 (LE store)
-    mov word [rbx + 4], 0x0000
+    ; -- EncryptedExtensions: empty, or one ALPN extension --
+    mov rdi, rbp
+    mov rsi, rbx
+    call build_ee              ; writes EE at rbx, rax = its length
+    mov r13, rax
     lea rsi, [rbx]
-    mov edx, 6
+    mov rdx, r13
     mov rdi, rbp
     call tls_absorb
-    add rbx, 6
+    add rbx, r13
     ; A resumed handshake authenticates with the PSK binder, so it sends
     ; neither Certificate nor CertificateVerify: skip straight to Finished
     ; (whose tls_th then covers H(CH..EE) instead of H(CH..CertVerify)).
@@ -1425,6 +1473,46 @@ build_sh:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; build_ee(rdi=hs, rsi=dest) -> rax = EncryptedExtensions message length.
+; Empty (6 bytes) unless an ALPN protocol was selected, in which case one
+; ALPN extension echoes it. All fields are < 256 here (one short protocol
+; name), so the 24-bit and 16-bit high bytes are always zero.
+build_ee:
+    mov byte [rsi], 0x08       ; type EncryptedExtensions
+    mov rax, [rdi + linnea_tls_hs.alpn_name]
+    test rax, rax
+    jz .empty
+    movzx ecx, byte [rax]      ; L = protocol name length
+    lea r8d, [ecx + 13]        ; total message length
+    mov byte [rsi + 1], 0
+    mov byte [rsi + 2], 0
+    lea edx, [ecx + 9]
+    mov [rsi + 3], dl          ; handshake body length = L + 9
+    mov byte [rsi + 4], 0
+    lea edx, [ecx + 7]
+    mov [rsi + 5], dl          ; extensions length = L + 7
+    mov byte [rsi + 6], 0x00   ; ext type 0x0010 (ALPN)
+    mov byte [rsi + 7], 0x10
+    mov byte [rsi + 8], 0
+    lea edx, [ecx + 3]
+    mov [rsi + 9], dl          ; ext body length = L + 3
+    mov byte [rsi + 10], 0
+    lea edx, [ecx + 1]
+    mov [rsi + 11], dl         ; ProtocolNameList length = L + 1
+    mov [rsi + 12], cl         ; protocol name length
+    lea rdi, [rsi + 13]        ; copy the name (rcx = L still)
+    lea rsi, [rax + 1]
+    rep movsb
+    mov rax, r8
+    ret
+.empty:
+    mov byte [rsi + 1], 0
+    mov byte [rsi + 2], 0
+    mov byte [rsi + 3], 2      ; body length 2
+    mov word [rsi + 4], 0x0000 ; extensions length 0
+    mov eax, 6
     ret
 
 ; store_u24_1(rdi=base, eax=value) — write value big-endian into
