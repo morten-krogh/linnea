@@ -24,6 +24,7 @@ default rel
 global linnea_tls_hs_init
 global linnea_tls_hs_input
 global linnea_tls_drain_early
+global linnea_tls_ticket_setup
 
 extern linnea_sha256
 extern linnea_sha256_init
@@ -38,6 +39,9 @@ extern linnea_tls_hkdf_expand_label
 extern linnea_tls_keys_init
 extern linnea_tls_seal
 extern linnea_tls_open
+extern linnea_aesgcm_init
+extern linnea_aesgcm_seal
+extern linnea_aesgcm_open
 
 section .rodata
 
@@ -56,6 +60,10 @@ lbl_s_hs:     db "s hs traffic"
 lbl_c_ap:     db "c ap traffic"
 lbl_s_ap:     db "s ap traffic"
 lbl_finished: db "finished"
+lbl_res_binder: db "res binder"
+lbl_res_master: db "res master"
+lbl_resumption: db "resumption"
+ticket_nonce: db 0, 0          ; one ticket per handshake: a fixed nonce
 
 ; the signed content for CertificateVerify (RFC 8446 4.4.3): 64 spaces,
 ; the context string, a separator, then the transcript hash appended
@@ -73,8 +81,31 @@ alignb 8
 cv_msg:       resb cv_prefix_len + 32    ; CertificateVerify signed content
 cv_digest:    resb 32                    ; ...and its SHA-256: ECDSA signs a
                                          ; digest, not the content
+ticket_key:   resb 16                    ; per-run stateless-ticket key
+ticket_ctx:   resb linnea_aesgcm_ctx_size
+nst_pt:       resb 48                    ; ticket plaintext: psk|issued|sni
+nst_msg:      resb 128                   ; the NewSessionTicket message
 
 section .text
+
+; ---- linnea_tls_ticket_setup() — generate the per-run ticket key and
+; build its AES schedule. The server calls this once in the master,
+; before the workers fork, so every worker seals and opens the same
+; tickets and any worker can resume any worker's session. A process
+; that never calls it has an uninitialized (zero) schedule and would
+; neither issue nor accept real tickets — the test harnesses call it.
+linnea_tls_ticket_setup:
+.again:
+    lea rdi, [ticket_key]
+    mov esi, 16
+    xor edx, edx
+    mov eax, LINNEA_SYS_GETRANDOM
+    syscall
+    cmp rax, 16
+    jne .again
+    lea rdi, [ticket_ctx]
+    lea rsi, [ticket_key]
+    jmp linnea_aesgcm_init
 
 ; ===================================================================
 ; helpers
@@ -136,6 +167,8 @@ linnea_tls_hs_init:
     mov qword [rdi + linnea_tls_hs.select_cb], 0
     mov qword [rdi + linnea_tls_hs.select_ctx], 0
     mov dword [rdi + linnea_tls_hs.sni_len], 0
+    mov dword [rdi + linnea_tls_hs.psk_flags], 0
+    mov dword [rdi + linnea_tls_hs.resumed], 0
     lea rdi, [rdi + linnea_tls_hs.transcript]
     jmp linnea_sha256_init
 
@@ -227,6 +260,11 @@ linnea_tls_hs_input:
     mov [rbp + linnea_tls_hs.cert_list_len], rdx
     mov [rbp + linnea_tls_hs.key_priv], rcx
 .no_select:
+
+    ; resumption: if the ClientHello carried an acceptable PSK offer,
+    ; try_resume sets hs.resumed and the flight skips the certificate
+    mov rdi, rbp
+    call try_resume
 
     ; consume the whole record regardless of what follows it
     lea rax, [r13 + 5]
@@ -354,6 +392,14 @@ linnea_tls_hs_input:
     lea rsi, [rbp + linnea_tls_hs.c_ap]
     call linnea_tls_keys_init
     mov dword [rbp + linnea_tls_hs.state], LINNEA_TLS_DONE
+    ; issue one NewSessionTicket if the client offered resumption. It is
+    ; sealed under the just-installed server app key at seq 0, so the
+    ; kernel takes over at seq 1 (see the handoff in linnea_uring).
+    test dword [rbp + linnea_tls_hs.psk_flags], 2
+    jz .ret
+    mov rdi, rbp
+    mov rsi, [rsp + IN_OUT]
+    call build_nst
     jmp .ret
 
 .fin_bad:
@@ -406,6 +452,7 @@ parse_ch:
     push rbp
     mov rbp, rdi
     mov rbx, rsi
+    mov [rbp + linnea_tls_hs.ch_base], rsi   ; raw CH, for the binder hash
     lea r13, [rsi + rdx]
     xor r14d, r14d              ; bit0 x25519 seen, bit1 sv 1.3, bit2 sigalg
     ; also reuse r14 bits 8..10 for duplicate detection of the three
@@ -527,6 +574,10 @@ parse_ch:
     je .ext_ks
     cmp r12d, 0x0d              ; signature_algorithms
     je .ext_sa
+    cmp r12d, 0x29             ; pre_shared_key (must be the last extension)
+    je .ext_psk
+    cmp r12d, 0x2d             ; psk_key_exchange_modes
+    je .ext_pskmodes
     test r12d, r12d             ; server_name
     jz .ext_sni
     jmp .ext_skip
@@ -669,10 +720,96 @@ parse_ch:
 .sni_next:
     mov rsi, rcx
     jmp .sni_loop
+; psk_key_exchange_modes: we only do psk_dhe_ke (mode 1). Record whether
+; the client offered it; without it a pre_shared_key offer is ignored.
+.ext_pskmodes:
+    test r14d, 0x2000
+    jnz .ext_dup
+    or r14d, 0x2000
+    movzx eax, byte [rbx]        ; ke_modes length (1 byte)
+    lea rcx, [rbx + 1 + rax]
+    cmp rcx, [rsp]
+    jne .pop_decode
+    lea rsi, [rbx + 1]
+    lea rdi, [rbx + 1 + rax]
+.pskmodes_loop:
+    cmp rsi, rdi
+    jae .ext_skip
+    cmp byte [rsi], 1           ; psk_dhe_ke
+    jne .pskmodes_next
+    or dword [rbp + linnea_tls_hs.psk_flags], 2
+.pskmodes_next:
+    inc rsi
+    jmp .pskmodes_loop
+
+; pre_shared_key (RFC 8446 4.2.11), which MUST be the ClientHello's last
+; extension. Record the first identity's ticket and binder, and the
+; offset of the binders list (the truncated-CH length the binder is
+; computed over). Selection happens later, in hs_input.
+.ext_psk:
+    test r14d, 0x1000
+    jnz .ext_dup
+    or r14d, 0x1000
+    cmp qword [rsp], r13         ; its body must end the ClientHello
+    jne .pop_illegal
+    lea rax, [rbx + 2]
+    cmp rax, [rsp]
+    ja .pop_decode
+    movzx eax, byte [rbx]        ; identities list length
+    shl eax, 8
+    mov al, [rbx + 1]
+    lea r10, [rbx + 2 + rax]     ; end of identities == binders length field
+    cmp r10, [rsp]
+    jae .pop_decode
+    ; first PskIdentity: opaque identity<1..2^16-1> + uint32 age
+    lea rax, [rbx + 4]
+    cmp rax, r10
+    ja .pop_decode
+    movzx ecx, byte [rbx + 2]    ; identity length
+    shl ecx, 8
+    mov cl, [rbx + 3]
+    lea rax, [rbx + 4 + rcx]     ; end of the identity bytes
+    lea rdx, [rax + 4]           ; ...plus the 4-byte obfuscated age
+    cmp rdx, r10
+    ja .pop_decode
+    cmp ecx, LINNEA_TLS_TICKET_LEN
+    jne .ext_skip                ; not our ticket shape: ignore the offer
+    push rsi
+    push rdi
+    lea rsi, [rbx + 4]           ; copy the ticket out
+    lea rdi, [rbp + linnea_tls_hs.ticket]
+    mov ecx, LINNEA_TLS_TICKET_LEN
+    rep movsb
+    pop rdi
+    pop rsi
+    ; binders_off = distance from the CH start to the binders length field
+    mov rax, r10
+    sub rax, [rbp + linnea_tls_hs.ch_base]
+    mov [rbp + linnea_tls_hs.binders_off], rax
+    ; first binder: 1-byte length (must be 32) then the 32 bytes
+    lea rax, [r10 + 3]
+    cmp rax, [rsp]
+    ja .pop_decode
+    cmp byte [r10 + 2], 32
+    jne .pop_illegal
+    push rsi
+    push rdi
+    lea rsi, [r10 + 3]
+    lea rdi, [rbp + linnea_tls_hs.binder]
+    mov ecx, 32
+    rep movsb
+    pop rdi
+    pop rsi
+    or dword [rbp + linnea_tls_hs.psk_flags], 1   ; offer recorded
+    jmp .ext_skip
+
 .ext_skip:
     pop rbx                     ; body end -> continue after this ext
     jmp .ext_loop
 .ext_dup:
+    pop rcx
+    jmp .illegal
+.pop_illegal:
     pop rcx
     jmp .illegal
 .pop_decode:
@@ -709,6 +846,241 @@ parse_ch:
     mov eax, LINNEA_TLS_A_HANDSHAKE_FAILURE
 .pret:
     pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ===================================================================
+; try_resume(rdi=hs) — decide whether the ClientHello's PSK offer can be
+; accepted, and set hs.resumed + hs.psk if so. Silent no-op otherwise:
+; an unacceptable offer just yields a full handshake, per RFC 8446.
+;
+; Accept requires: psk_dhe_ke offered, the ticket opens under the per-run
+; key, its server_name binding matches the current SNI, and the binder
+; verifies over the truncated ClientHello. Stack: 48-byte ticket
+; plaintext, 32-byte early secret, 32-byte binder-key/scratch, 32-byte
+; truncated-CH hash, 8-byte sni hash.
+; ===================================================================
+%define TR_PT     0            ; psk(32) issued(8) sni_hash(8)
+%define TR_EARLY  48
+%define TR_BKEY   80
+%define TR_FKEY   112
+%define TR_TH     144
+%define TR_EXP    176          ; recomputed binder
+%define TR_SNIH   208          ; hash of the current SNI
+%define TR_FRAME  248          ; keeps rsp 16-aligned at the inner calls
+try_resume:
+    push rbx
+    push rbp
+    sub rsp, TR_FRAME
+    mov rbp, rdi               ; hs
+    mov eax, [rbp + linnea_tls_hs.psk_flags]
+    and eax, 3                 ; offer recorded AND psk_dhe_ke offered
+    cmp eax, 3
+    jne .no
+    ; open the ticket: nonce = ticket[0..12], ct = ticket[12..76]
+    lea rdi, [ticket_ctx]
+    lea rsi, [rbp + linnea_tls_hs.ticket]
+    xor edx, edx               ; no AAD
+    xor ecx, ecx
+    lea r8, [rbp + linnea_tls_hs.ticket + 12]
+    mov r9d, LINNEA_TLS_TICKET_LEN - 12   ; 64 = 48 ct + 16 tag
+    sub rsp, 16
+    lea rax, [rsp + 16 + TR_PT]
+    mov [rsp], rax
+    call linnea_aesgcm_open
+    add rsp, 16
+    test rax, rax
+    js .no                     ; bad tag: forged or wrong-run ticket
+    ; the ticket is bound to the server_name it was issued under
+    lea rdi, [rbp + linnea_tls_hs.sni]
+    mov esi, [rbp + linnea_tls_hs.sni_len]
+    lea rdx, [rsp + TR_SNIH]
+    call sni_hash8
+    lea rdi, [rsp + TR_PT + 40]   ; sni_hash stored in the ticket
+    lea rsi, [rsp + TR_SNIH]
+    mov ecx, 8
+    call bytes_eq8
+    test eax, eax
+    jz .no
+    ; early_secret = HKDF-Extract(0, psk)
+    lea rdi, [zeros32]
+    xor esi, esi
+    lea rdx, [rsp + TR_PT]      ; psk
+    mov ecx, 32
+    lea r8, [rsp + TR_EARLY]
+    call linnea_hkdf_extract
+    ; binder_key = Derive-Secret(early, "res binder", H(""))
+    lea rdi, [rsp + TR_EARLY]
+    lea rsi, [lbl_res_binder]
+    mov edx, 10
+    lea rcx, [empty_hash]
+    lea r8, [rsp + TR_BKEY]
+    call linnea_tls_derive_secret
+    ; finished_key = Expand-Label(binder_key, "finished", "", 32)
+    lea rdi, [rsp + TR_BKEY]
+    lea rsi, [lbl_finished]
+    mov edx, 8
+    xor ecx, ecx
+    xor r8d, r8d
+    lea r9, [rsp + TR_FKEY]
+    sub rsp, 16
+    mov qword [rsp], 32
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    ; th = SHA256(truncated ClientHello)
+    mov rdi, [rbp + linnea_tls_hs.ch_base]
+    mov rsi, [rbp + linnea_tls_hs.binders_off]
+    lea rdx, [rsp + TR_TH]
+    call linnea_sha256
+    ; expected binder = HMAC(finished_key, th)
+    lea rdi, [rsp + TR_FKEY]
+    mov esi, 32
+    lea rdx, [rsp + TR_TH]
+    mov ecx, 32
+    lea r8, [rsp + TR_EXP]
+    call linnea_hmac_sha256
+    lea rdi, [rsp + TR_EXP]
+    lea rsi, [rbp + linnea_tls_hs.binder]
+    call ct_eq32
+    test eax, eax
+    jz .no
+    ; accepted: keep the PSK for the key schedule
+    lea rdi, [rbp + linnea_tls_hs.psk]
+    lea rsi, [rsp + TR_PT]
+    mov ecx, 32
+    rep movsb
+    mov dword [rbp + linnea_tls_hs.resumed], 1
+.no:
+    add rsp, TR_FRAME
+    pop rbp
+    pop rbx
+    ret
+
+; sni_hash8(rdi=ptr, esi=len, rdx=out8) — the first 8 bytes of SHA-256
+; over the server name, so a ticket binds to the name it was issued
+; under. Uses a stack digest; preserves nothing the caller needs.
+sni_hash8:
+    push rbx
+    push r12
+    sub rsp, 56                ; 8 mod 16: rsp 16-aligned at the call
+    mov rbx, rdx
+    movzx esi, si
+    lea rdx, [rsp]
+    call linnea_sha256
+    mov rax, [rsp]
+    mov [rbx], rax
+    add rsp, 56
+    pop r12
+    pop rbx
+    ret
+
+; bytes_eq8(rdi=a, rsi=b, ecx=8) -> eax=1 if equal (fixed 8, non-secret)
+bytes_eq8:
+    mov rax, [rdi]
+    cmp rax, [rsi]
+    sete al
+    movzx eax, al
+    ret
+
+; ===================================================================
+; build_nst(rdi=hs, rsi=outbuf) — derive the resumption PSK, seal it into
+; a stateless ticket, wrap it in a NewSessionTicket handshake message,
+; and seal that as one application_data record under the server app key
+; (hs.wkeys at seq 0). Sets hs.out_len. Call once, after the client
+; Finished is verified and wkeys is re-keyed to s_ap.
+; Stack: [0]=transcript hash, [32]=res_master, [64]=psk, [96]=timespec.
+; ===================================================================
+build_nst:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 128
+    mov rbx, rdi               ; hs
+    mov r14, rsi               ; outbuf
+    ; res_master = Derive-Secret(master, "res master", H(CH..client Fin))
+    mov rdi, rbx
+    lea rsi, [rsp]
+    call tls_th
+    lea rdi, [rbx + linnea_tls_hs.master]
+    lea rsi, [lbl_res_master]
+    mov edx, 10
+    lea rcx, [rsp]
+    lea r8, [rsp + 32]
+    call linnea_tls_derive_secret
+    ; psk = Expand-Label(res_master, "resumption", ticket_nonce, 32)
+    lea rdi, [rsp + 32]
+    lea rsi, [lbl_resumption]
+    mov edx, 10
+    lea rcx, [ticket_nonce]
+    mov r8d, 2
+    lea r9, [rsp + 64]
+    sub rsp, 16
+    mov qword [rsp], 32
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    ; ticket plaintext = psk(32) || issued(8) || sni_hash(8)
+    lea rdi, [nst_pt]
+    lea rsi, [rsp + 64]
+    mov ecx, 32
+    rep movsb
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    xor edi, edi               ; CLOCK_REALTIME
+    lea rsi, [rsp + 96]
+    syscall
+    mov rax, [rsp + 96]        ; tv_sec
+    mov [nst_pt + 32], rax
+    lea rdi, [rbx + linnea_tls_hs.sni]
+    mov esi, [rbx + linnea_tls_hs.sni_len]
+    lea rdx, [nst_pt + 40]
+    call sni_hash8
+    ; ticket = nonce(12) || GCM-seal(plaintext) into the NST message body
+    lea rdi, [nst_msg + 17]
+    mov esi, 12
+    xor edx, edx
+    mov eax, LINNEA_SYS_GETRANDOM
+    syscall
+    lea rdi, [ticket_ctx]
+    lea rsi, [nst_msg + 17]     ; nonce
+    xor edx, edx               ; no AAD
+    xor ecx, ecx
+    lea r8, [nst_pt]
+    mov r9d, 48
+    sub rsp, 16
+    lea rax, [nst_msg + 29]
+    mov [rsp], rax
+    call linnea_aesgcm_seal
+    add rsp, 16
+    ; NewSessionTicket message fields
+    mov byte [nst_msg], 0x04    ; type new_session_ticket
+    mov byte [nst_msg + 1], 0
+    mov word [nst_msg + 2], 0x5b00   ; body length 91, big-endian
+    mov eax, LINNEA_TLS_TICKET_LIFETIME
+    bswap eax
+    mov [nst_msg + 4], eax      ; ticket_lifetime, big-endian
+    lea rdi, [nst_msg + 8]      ; ticket_age_add: 4 random bytes
+    mov esi, 4
+    xor edx, edx
+    mov eax, LINNEA_SYS_GETRANDOM
+    syscall
+    mov byte [nst_msg + 12], 2  ; ticket_nonce length
+    mov word [nst_msg + 13], 0  ; the nonce {0,0}
+    mov word [nst_msg + 15], 0x4c00  ; ticket length 76, big-endian
+    mov word [nst_msg + 93], 0  ; extensions length 0
+    ; seal the 95-byte message as one handshake record under the app key
+    lea rdi, [rbx + linnea_tls_hs.wkeys]
+    mov esi, LINNEA_TLS_CT_HANDSHAKE
+    lea rdx, [nst_msg]
+    mov ecx, 95
+    mov r8, r14
+    call linnea_tls_seal
+    mov [rbx + linnea_tls_hs.out_len], rax
+    add rsp, 128
     pop r15
     pop r14
     pop r13
@@ -761,10 +1133,17 @@ build_flight:
     lea rdx, [rbp + linnea_tls_hs.client_pub]
     call linnea_x25519
 
-    ; 2. schedule up to the handshake secret (no transcript needed yet)
-    lea rdi, [zeros32]          ; early = HKDF-Extract(0, 0)
-    xor esi, esi
+    ; 2. schedule up to the handshake secret (no transcript needed yet).
+    ; early = HKDF-Extract(0, PSK-or-0): resumption seeds the IKM with the
+    ; ticket's PSK, a fresh handshake uses zeros. Everything downstream
+    ; (derived, hs_secret from the ECDHE share) is identical either way.
     lea rdx, [zeros32]
+    cmp dword [rbp + linnea_tls_hs.resumed], 0
+    je .early_ikm
+    lea rdx, [rbp + linnea_tls_hs.psk]
+.early_ikm:
+    lea rdi, [zeros32]
+    xor esi, esi
     mov ecx, 32
     lea r8, [rsp + BF_ES]
     call linnea_hkdf_extract
@@ -837,6 +1216,11 @@ build_flight:
     mov rdi, rbp
     call tls_absorb
     add rbx, 6
+    ; A resumed handshake authenticates with the PSK binder, so it sends
+    ; neither Certificate nor CertificateVerify: skip straight to Finished
+    ; (whose tls_th then covers H(CH..EE) instead of H(CH..CertVerify)).
+    cmp dword [rbp + linnea_tls_hs.resumed], 0
+    jne .flight_finished
     ; -- Certificate: the pre-framed certificate_list, sent verbatim --
     mov r13, [rbp + linnea_tls_hs.cert_list_len]  ; L
     mov byte [rbx], 0x0b
@@ -890,6 +1274,7 @@ build_flight:
     call tls_absorb
     add rbx, r15
     add rbx, 8
+.flight_finished:
     ; -- Finished: HMAC(server finished key, H(CH..CertificateVerify)) --
     lea rdi, [rbp + linnea_tls_hs.s_hs]      ; finished key -> BF_TH
     lea rsi, [lbl_finished]
@@ -1002,7 +1387,13 @@ build_sh:
     rep movsb                  ; rdi -> after the session id
     mov word [rdi], 0x0113     ; cipher_suite 0x1301 (big-endian in memory)
     mov byte [rdi + 2], 0x00   ; legacy_compression_method
-    mov word [rdi + 3], 0x2e00 ; extensions length = 46
+    ; extensions length: key_share(40) + supported_versions(6) = 46, plus
+    ; pre_shared_key(6) when resuming
+    mov word [rdi + 3], 0x2e00 ; = 46
+    cmp dword [rbp + linnea_tls_hs.resumed], 0
+    je .sh_keyshare
+    mov word [rdi + 3], 0x3400 ; = 52
+.sh_keyshare:
     mov word [rdi + 5], 0x3300 ; key_share ext type 0x0033
     mov word [rdi + 7], 0x2400 ; ext length 36
     mov word [rdi + 9], 0x1d00 ; group 0x001d (x25519)
@@ -1017,7 +1408,14 @@ build_sh:
     mov word [rdi + 45], 0x2b00 ; supported_versions ext type 0x002b
     mov word [rdi + 47], 0x0200 ; ext length 2
     mov word [rdi + 49], 0x0403 ; selected_version 0x0304
-    lea rax, [rdi + 51]        ; message end
+    lea rax, [rdi + 51]        ; message end (no PSK)
+    cmp dword [rbp + linnea_tls_hs.resumed], 0
+    je .sh_len
+    mov word [rdi + 51], 0x2900 ; pre_shared_key ext type 0x0029
+    mov word [rdi + 53], 0x0200 ; ext length 2
+    mov word [rdi + 55], 0x0000 ; selected_identity = 0
+    lea rax, [rdi + 57]
+.sh_len:
     sub rax, rbx               ; total length
     ; write the 24-bit handshake length = total - 4
     lea rcx, [rax - 4]

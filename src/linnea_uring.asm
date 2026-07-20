@@ -692,7 +692,9 @@ linnea_uring_run:
     mov edi, [r12 + linnea_connection.fd]
     lea rsi, [r12 + linnea_connection.up_buf + linnea_tls_hs.s_ap]
     lea rdx, [r12 + linnea_connection.up_buf + linnea_tls_hs.c_ap]
-    xor ecx, ecx                   ; server TX sequence starts at 0
+    ; server TX sequence = records already sent under the app key in
+    ; userspace: 0, or 1 when a NewSessionTicket went out after Finished
+    mov rcx, [r12 + linnea_connection.up_buf + linnea_tls_hs.wkeys + linnea_tls_keys.seq]
     mov r8, r10
     call linnea_ktls_enable
     test rax, rax

@@ -30,6 +30,7 @@ extern linnea_file_map_readonly
 extern linnea_file_unmap
 extern linnea_pem_cert_list
 extern linnea_pem_p256_key
+extern linnea_tls_ticket_setup
 extern linnea_p256_scalar_is_valid
 extern linnea_tls_hkdf_expand_label
 extern linnea_error_exit
@@ -89,6 +90,10 @@ linnea_tls_setup:
     test r15d, r15d
     jz .done                   ; no TLS: nothing to check or load
     call cpuid_check_aesni
+    ; one stateless-ticket key for the whole run, generated here in the
+    ; master before the workers fork so every worker resumes every
+    ; worker's sessions (the key is inherited copy-on-write).
+    call linnea_tls_ticket_setup
 
     ; load each TLS server's cert and key
     xor r12d, r12d

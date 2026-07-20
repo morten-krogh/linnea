@@ -745,6 +745,32 @@ with socket.create_connection(("127.0.0.1", port)) as raw:
 PYEOF
         check "tls python ssl (TLSv1.3, AES-128-GCM, 16KB echo)" $?
 
+        # session resumption: a NewSessionTicket from the first handshake
+        # lets the second skip the certificate. python's ssl exposes the
+        # PSK acceptance directly as session_reused.
+        timeout 10 python3 - "$tlsdir/c.pem" $tport <<'PYEOF'
+import ssl, socket, sys
+ca, port = sys.argv[1], int(sys.argv[2])
+ctx = ssl.create_default_context(cafile=ca)
+ctx.check_hostname = False           # the fixture cert is CN=localhost
+# first connection: complete the handshake and collect the ticket
+with socket.create_connection(("127.0.0.1", port)) as raw:
+    s = ctx.wrap_socket(raw, server_hostname="localhost")
+    s.sendall(b"x"); assert s.recv(4) == b"x"
+    sess = s.session               # populated once the NST arrives
+    assert not s.session_reused
+    s.close()
+assert sess is not None, "no NewSessionTicket received"
+# second connection: offer the ticket, expect resumption
+with socket.create_connection(("127.0.0.1", port)) as raw:
+    s = ctx.wrap_socket(raw, server_hostname="localhost", session=sess)
+    assert s.version() == "TLSv1.3", s.version()
+    assert s.session_reused, "server did not resume the session"
+    s.sendall(b"y"); assert s.recv(4) == b"y"
+    s.close()
+PYEOF
+        check "tls session resumption (PSK, session_reused)" $?
+
         # negative: plain HTTP to the TLS port -> a fatal alert record
         alert=$(timeout 3 python3 - $tport <<'PYEOF'
 import socket, sys
@@ -849,6 +875,22 @@ PYEOF
     check "tls close_notify logs as peer closed" $?
     ! grep -q "recv error" "$LOG"
     check "tls orderly close is not a recv error" $?
+
+    # resumption over the real kTLS server: the ticket from connection one
+    # must let connection two resume (openssl prints "Reused"), and a byte
+    # must still flow — proving the app-key handoff used the right sequence
+    # (the NST went out at seq 0, so the kernel starts at seq 1). The first
+    # connection makes a full request and reads to EOF (-ign_eof), so the
+    # post-handshake ticket is received before -sess_out writes it.
+    req=$'GET /hello.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+    printf '%s' "$req" | timeout 5 openssl s_client -connect 127.0.0.1:47443 \
+        -CAfile $CA -tls1_3 -ign_eof -sess_out "$LOG.sess" >/dev/null 2>&1
+    reused=$(printf '%s' "$req" | timeout 5 openssl s_client \
+        -connect 127.0.0.1:47443 -CAfile $CA -tls1_3 -ign_eof \
+        -sess_in "$LOG.sess" 2>/dev/null | grep -c '^Reused')
+    [ "$reused" -eq 1 ]
+    check "tls resumption over kTLS (Reused)" $?
+    rm -f "$LOG.sess"
 
     timeout 30 python3 test/tls/oversized_record.py $CA 47443 \
         test/tls/clienthello_seed.bin >/dev/null 2>&1

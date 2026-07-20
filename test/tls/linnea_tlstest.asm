@@ -16,6 +16,7 @@ default rel
 
 extern linnea_pem_cert_list
 extern linnea_pem_p256_key
+extern linnea_tls_ticket_setup
 extern linnea_tls_hs_init
 extern linnea_tls_hs_input
 extern linnea_tls_open
@@ -45,6 +46,10 @@ _start:
     mov rax, [rsp]             ; argc
     cmp rax, 4
     jl .usage
+
+    ; a per-run ticket key, so this echo server issues real, resumable
+    ; NewSessionTickets (the production key is set up in linnea_tls_setup)
+    call linnea_tls_ticket_setup
 
     ; --- load the certificate chain: map the PEM, frame the list ---
     mov rdi, [rsp + 16]        ; argv[1] cert path

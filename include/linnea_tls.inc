@@ -29,6 +29,15 @@ LINNEA_TLS_FAILED       equ 3
 ; configured hostname and is ignored rather than stored.
 LINNEA_TLS_MAX_SNI      equ 255
 
+; Session resumption (RFC 8446 4.6.1 / 4.2.11, psk_dhe_ke only): the
+; server hands out one stateless NewSessionTicket per handshake. The
+; ticket is the PSK itself, AES-128-GCM-sealed under a per-run key:
+;   nonce(12) || GCM( psk(32) || issued(8) || sni_hash(8) ) || tag(16)
+; sni_hash ties the ticket to the server_name it was issued under, so a
+; ticket only resumes when the client offers the same name again.
+LINNEA_TLS_TICKET_LEN      equ 76
+LINNEA_TLS_TICKET_LIFETIME equ 86400   ; seconds; also advertised in the NST
+
 ; Test-only: the x25519 private key and the server random are injected by
 ; the caller instead of coming from getrandom(2), and the
 ; signature_algorithms check is skipped. The RFC 8448 trace's ClientHello
@@ -126,6 +135,14 @@ struc linnea_tls_hs
     .select_ctx: resq 1
     .sni_len:    resd 1     ; host_name from the ClientHello, 0 = none
     .sni:        resb LINNEA_TLS_MAX_SNI
+    ; resumption offer, recorded by parse_ch and judged in hs_input
+    .ticket:     resb LINNEA_TLS_TICKET_LEN  ; the client's first identity
+    .binder:     resb 32    ; its first binder (SHA-256 sized)
+    .psk:        resb 32    ; the PSK, once the ticket opens
+    .ch_base:    resq 1     ; the raw ClientHello (parse_ch scratch)
+    .binders_off: resq 1    ; truncated-CH length for the binder hash
+    .psk_flags:  resd 1     ; bit0 offer recorded, bit1 psk_dhe_ke offered
+    .resumed:    resd 1     ; 1 = PSK accepted: no cert, SH carries 0x29
     .transcript: resb linnea_sha256_ctx_size
     .priv:       resb 32    ; ephemeral x25519 private key
     .srand:      resb 32    ; server random
