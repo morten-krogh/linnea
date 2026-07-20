@@ -4,14 +4,14 @@
   "servers": [
     {
       "host": "0.0.0.0", "port": 443, "hostname": "linnea.amberbio.com",
-      "cert": "/home/linnea/certs/fullchain.pem", "key": "/home/linnea/certs/privkey.pem",
+      "cert": "/home/linnea/certs/linnea.amberbio.com/fullchain.pem", "key": "/home/linnea/certs/linnea.amberbio.com/privkey.pem",
       "locations": [
         { "prefix": "/", "root": "/home/linnea/www/linnea" }
       ]
     },
     {
       "host": "0.0.0.0", "port": 443, "hostname": "linnea2.amberbio.com",
-      "cert": "/home/linnea/certs-local/linnea2-selfsigned.crt", "key": "/home/linnea/certs-local/linnea2-selfsigned.key",
+      "cert": "/home/linnea/certs/linnea2.amberbio.com/fullchain.pem", "key": "/home/linnea/certs/linnea2.amberbio.com/privkey.pem",
       "locations": [
         { "prefix": "/", "root": "/home/linnea/www/linnea2" }
       ]
