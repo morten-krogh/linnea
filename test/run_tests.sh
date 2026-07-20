@@ -707,6 +707,56 @@ grep -qF 'worker drained' "$LOG"
 check "drain logged" $?
 rm -f /tmp/drain_out test/www/drain.bin "$LOG"
 
+# --- config-check mode: `linnea -t` accepts good, rejects bad ---
+$BIN -t test/configs/listen.json >/dev/null 2>&1
+check "config check accepts a good config" $?
+$BIN -t test/configs/bad-timeout.json >/dev/null 2>&1
+[ $? -ne 0 ]
+check "config check rejects a bad config" $?
+
+# --- zero-downtime binary upgrade (SIGUSR2) ---
+# The master re-execs in place: same PID, listeners adopted (never
+# closed), new workers up, old workers drained. A request in flight when
+# the signal lands must finish, and no new request may be refused.
+rm -f "$LOG"
+python3 -c "open('test/www/up.bin','w').write('U' * 3000000)"
+$BIN test/configs/listen.json >/dev/null 2>&1 &
+up_master=$!
+sleep 0.3
+old_workers=$(pgrep -P $up_master | tr '\n' ' ')
+# a slow download in flight across the upgrade
+curl -s --max-time 30 --limit-rate 500k http://127.0.0.1:47080/up.bin \
+    -o /tmp/up_out &
+up_curl=$!
+# a steady stream of quick requests, counting any refusal
+up_fails=0
+( sleep 0.4; kill -USR2 $up_master ) &
+for i in $(seq 1 60); do
+    curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null \
+        || up_fails=$((up_fails + 1))
+    sleep 0.03
+done
+kill -0 $up_master 2>/dev/null
+check "upgrade keeps the master PID" $?
+wait $up_curl
+n=$(wc -c < /tmp/up_out)
+[ "$n" -eq 3000000 ]
+check "upgrade finishes the in-flight download ($n bytes)" $?
+[ "$up_fails" -eq 0 ]
+check "upgrade refuses no new request ($up_fails failed)" $?
+sleep 1
+gone=1
+for w in $old_workers; do kill -0 "$w" 2>/dev/null && gone=0; done
+[ "$gone" -eq 1 ]
+check "upgrade drains the old workers" $?
+grep -qF 'binary upgrade complete' "$LOG"
+check "upgrade logged" $?
+curl -s --max-time 3 http://127.0.0.1:47080/hello.txt | grep -q "hello from linnea"
+check "upgraded server still serves" $?
+kill $up_master 2>/dev/null
+wait $up_master 2>/dev/null
+rm -f /tmp/up_out test/www/up.bin "$LOG"
+
 # --- TLS 1.3: the standalone echo server against real clients ---
 # Needs the openssl CLI (cert generation + s_client) and python3 ssl,
 # both already test-only dependencies. Skips cleanly if either is absent.

@@ -32,6 +32,8 @@ msg_listen_len      equ $ - msg_listen
 
 log_listen:         db "listening on "
 log_listen_len      equ $ - log_listen
+log_adopt:          db "adopted listener "
+log_adopt_len       equ $ - log_adopt
 log_colon:          db ":"
 log_open:           db " ("
 log_open_len        equ $ - log_open
@@ -43,18 +45,24 @@ sockopt_one:        dd 1
 section .bss
 
 sockaddr_scratch:   resb LINNEA_SOCKADDR_IN_SIZE
+adopt_fds:          resq 1     ; fd array for a hot upgrade, or 0
 
 section .text
 
-; linnea_network_listen_all(rdi=config*) — create every listener or exit.
-; Servers with the same host:port share one listening socket: only the
-; first binds (listener_owner=1); later ones copy its fd (vhosts).
+; linnea_network_listen_all(rdi=config*, rsi=fd_array|0) — set up every
+; listener or exit. Servers with the same host:port share one listening
+; socket: only the first owns it (listener_owner=1); later ones copy its
+; fd (vhosts). With rsi=0 the owner binds a fresh socket. With rsi
+; non-null (a hot binary upgrade) the owner instead adopts the inherited
+; fd fd_array[i] — the listeners never close, so no connection is
+; refused across the exec.
 linnea_network_listen_all:
     push rbx
     push r12
     push r13
     push r14
     push r15
+    mov [adopt_fds], rsi
     mov rbx, rdi
     xor r12d, r12d             ; server index i
 .loop:
@@ -86,9 +94,19 @@ linnea_network_listen_all:
     inc r13
     jmp .scan_prior
 .no_share:
+    cmp qword [adopt_fds], 0
+    jne .adopt
     mov rdi, r14
     call linnea_network_listener_create
     mov dword [r14 + linnea_config_server.listener_owner], 1
+    jmp .next_server
+.adopt:
+    mov rax, [adopt_fds]        ; fd_array[i], inherited across the exec
+    mov ecx, [rax + r12 * 4]
+    mov [r14 + linnea_config_server.listen_fd], ecx
+    mov dword [r14 + linnea_config_server.listener_owner], 1
+    mov rdi, r14
+    call linnea_network_listener_adopt
 .next_server:
     inc r12
     jmp .loop
@@ -206,6 +224,36 @@ linnea_network_listener_create:
     mov esi, msg_listen_len
     mov rdx, rbx
     jmp linnea_error_server
+
+; linnea_network_listener_adopt(rdi=server*) — the listen_fd is already
+; set to an inherited socket; just log "adopted listener host:port
+; (hostname)", mirroring listener_create's line.
+linnea_network_listener_adopt:
+    push rbx
+    mov rbx, rdi
+    call linnea_log_stamp
+    lea rdi, [log_adopt]
+    mov esi, log_adopt_len
+    call linnea_log_write
+    lea rdi, [rbx + linnea_config_server.host]
+    mov rsi, [rbx + linnea_config_server.host_len]
+    call linnea_log_write
+    lea rdi, [log_colon]
+    mov esi, 1
+    call linnea_log_write
+    movzx edi, word [rbx + linnea_config_server.port]
+    call linnea_log_u64
+    lea rdi, [log_open]
+    mov esi, log_open_len
+    call linnea_log_write
+    lea rdi, [rbx + linnea_config_server.hostname]
+    mov rsi, [rbx + linnea_config_server.hostname_len]
+    call linnea_log_write
+    lea rdi, [log_close]
+    mov esi, log_close_len
+    call linnea_log_write
+    pop rbx
+    ret
 
 ; linnea_network_peer_format(rdi=socket fd, rsi=out buffer) -> rax=len
 ; Writes the connected peer as "a.b.c.d:port". The buffer must have room

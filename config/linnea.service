@@ -3,8 +3,13 @@
 #   sudo cp config/linnea.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now linnea
-# Routine deploy after a rebuild:
-#   make && sudo make install && sudo systemctl restart linnea
+# Routine deploy after a rebuild — zero downtime, no dropped connections:
+#   make && sudo make install && sudo systemctl reload linnea
+# reload sends SIGUSR2: the master re-execs the new binary in place (same
+# PID), the new generation adopts the still-open listeners and starts
+# serving, then the old workers drain. If the new binary rejects the
+# config the reload is refused and the old generation keeps serving. A
+# reload cannot change the listener set (host/port); for that use restart.
 #
 # kTLS needs the kernel tls module; make it persistent across boots with:
 #   echo tls | sudo tee /etc/modules-load.d/ktls.conf
@@ -27,6 +32,9 @@ Group=linnea
 # the config's root and log paths are relative to this directory
 WorkingDirectory=/home/linnea/linnea
 ExecStart=/usr/local/bin/linnea /home/linnea/linnea/config/linnea-tls.json
+# reload = zero-downtime binary upgrade (SIGUSR2, re-exec in place). The
+# PID is preserved across the exec, so MainPID tracking survives.
+ExecReload=/bin/kill -USR2 $MAINPID
 Restart=on-failure
 RestartSec=1
 
