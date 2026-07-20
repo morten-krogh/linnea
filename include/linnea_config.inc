@@ -68,6 +68,7 @@ struc linnea_config
     .max_connections: resq 1                      ; connection pool size, per worker
     .workers:       resq 1                        ; worker processes; 0 until the
                                                   ; auto count is resolved at startup
+    .http2:         resq 1                        ; 1 = offer HTTP/2 via ALPN
     .log:           resb LINNEA_MAX_LOG + 1       ; NUL-terminated log file path
     .log_len:       resq 1
     .servers:       resb linnea_config_server_size * LINNEA_MAX_SERVERS

@@ -952,6 +952,16 @@ PYEOF
         -tls1_3 2>/dev/null | grep -q "No ALPN negotiated"
     check "alpn absent when not offered" $?
 
+    # HTTP/2 connection bring-up: a separate http2:1 server. ALPN selects
+    # h2; preface + SETTINGS + PING exchange; a request draws GOAWAY.
+    $BIN test/configs/tls-h2.json >/dev/null 2>&1 &
+    h2_pid=$!
+    sleep 0.3
+    timeout 10 python3 test/tls/h2_bringup.py $CA 47446 >/dev/null 2>&1
+    check "http2 connection bring-up (preface, settings, ping, goaway)" $?
+    kill $h2_pid 2>/dev/null
+    wait $h2_pid 2>/dev/null
+
     timeout 30 python3 test/tls/oversized_record.py $CA 47443 \
         test/tls/clienthello_seed.bin >/dev/null 2>&1
     check "tls oversized record refused (msg_buf bound)" $?

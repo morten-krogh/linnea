@@ -69,6 +69,7 @@ ticket_nonce: db 0, 0          ; one ticket per handshake: a fixed nonce
 ; connection path exists; h2 is here for the M15+ milestones.
 alpn_http11:  db 8, "http/1.1"
 alpn_http11_name equ alpn_http11 + 1
+alpn_h2:      db 2, "h2"
 
 ; the signed content for CertificateVerify (RFC 8446 4.4.3): 64 spaces,
 ; the context string, a separator, then the transcript hash appended
@@ -175,6 +176,8 @@ linnea_tls_hs_init:
     mov dword [rdi + linnea_tls_hs.psk_flags], 0
     mov dword [rdi + linnea_tls_hs.resumed], 0
     mov qword [rdi + linnea_tls_hs.alpn_name], 0
+    mov dword [rdi + linnea_tls_hs.alpn_is_h2], 0
+    mov dword [rdi + linnea_tls_hs.alpn_h2_ok], 0   ; accept path may raise it
     lea rdi, [rdi + linnea_tls_hs.transcript]
     jmp linnea_sha256_init
 
@@ -811,10 +814,9 @@ parse_ch:
     or dword [rbp + linnea_tls_hs.psk_flags], 1   ; offer recorded
     jmp .ext_skip
 
-; ALPN: pick the first offered protocol we support. Only http/1.1 for
-; now — the h2 connection path lands in a later milestone — so a client
-; offering h2,http/1.1 (curl --http2, browsers) resolves to http/1.1,
-; which build_ee then echoes in EncryptedExtensions.
+; ALPN: record which of the protocols we understand the client offered
+; (r14 bit 0x8000 = h2, 0x10000 = http/1.1). The choice is made at
+; .ext_done, where h2 wins if this server offers it (config.http2).
 .ext_alpn:
     test r14d, 0x4000
     jnz .ext_dup
@@ -837,15 +839,19 @@ parse_ch:
     lea rcx, [rsi + 1 + rax]
     cmp rcx, r10
     ja .pop_decode
-    cmp qword [rbp + linnea_tls_hs.alpn_name], 0
-    jne .alpn_next              ; already chose one
-    cmp eax, 8                  ; "http/1.1" is 8 bytes
+    cmp eax, 2                  ; "h2"
+    jne .alpn_not_h2
+    cmp word [rsi + 1], 0x3268  ; 'h','2' little-endian
+    jne .alpn_next
+    or r14d, 0x8000
+    jmp .alpn_next
+.alpn_not_h2:
+    cmp eax, 8                  ; "http/1.1"
     jne .alpn_next
     mov r8, [rsi + 1]
     cmp r8, [alpn_http11_name]
     jne .alpn_next
-    lea rax, [alpn_http11]
-    mov [rbp + linnea_tls_hs.alpn_name], rax
+    or r14d, 0x10000
 .alpn_next:
     mov rsi, rcx
     jmp .alpn_loop
@@ -870,9 +876,25 @@ parse_ch:
     ; signature_algorithms must offer ecdsa_secp256r1_sha256, unless this
     ; is the trace (which injects its key and diverges after ServerHello)
     test dword [rbp + linnea_tls_hs.flags], LINNEA_TLS_FLAG_TRACE
-    jnz .ok
+    jnz .alpn_select
     test r14d, 4
     jz .handshake_fail
+.alpn_select:
+    ; choose the ALPN protocol: h2 when the client offered it and this
+    ; server enables it, else http/1.1 if offered, else none
+    test r14d, 0x8000          ; h2 offered?
+    jz .alpn_try_h11
+    cmp dword [rbp + linnea_tls_hs.alpn_h2_ok], 0
+    je .alpn_try_h11
+    lea rax, [alpn_h2]
+    mov [rbp + linnea_tls_hs.alpn_name], rax
+    mov dword [rbp + linnea_tls_hs.alpn_is_h2], 1
+    jmp .ok
+.alpn_try_h11:
+    test r14d, 0x10000         ; http/1.1 offered?
+    jz .ok
+    lea rax, [alpn_http11]
+    mov [rbp + linnea_tls_hs.alpn_name], rax
 .ok:
     mov rax, -1
     jmp .pret

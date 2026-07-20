@@ -146,6 +146,9 @@ struc linnea_tls_hs
     ; ALPN (RFC 7301): the selected protocol as a length-prefixed name to
     ; echo in EncryptedExtensions, or 0 for none. Set by parse_ch.
     .alpn_name:  resq 1
+    .alpn_is_h2: resd 1     ; 1 = the selection was h2 (vs http/1.1)
+    .alpn_h2_ok: resd 1     ; 1 = this server offers h2 (config.http2), set
+                            ; by the accept path before the ClientHello
     .transcript: resb linnea_sha256_ctx_size
     .priv:       resb 32    ; ephemeral x25519 private key
     .srand:      resb 32    ; server random

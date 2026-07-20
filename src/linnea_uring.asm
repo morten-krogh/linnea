@@ -38,6 +38,7 @@ default rel
 %include "linnea_http.inc"
 %include "linnea_uring.inc"
 %include "linnea_tls.inc"
+%include "linnea_http2.inc"
 
 global linnea_uring_run
 
@@ -66,6 +67,8 @@ extern linnea_tls_hs_init
 extern linnea_tls_hs_input
 extern linnea_tls_drain_early
 extern linnea_ktls_enable
+extern linnea_h2_init
+extern linnea_h2_handle
 extern linnea_string_iequal
 
 section .rodata
@@ -366,6 +369,8 @@ linnea_uring_run:
     lea rax, [linnea_uring_sni_select]
     mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_cb], rax
     mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_ctx], r12
+    mov eax, [rbx + linnea_config.http2]   ; offer h2 in ALPN?
+    mov [r12 + linnea_connection.up_buf + linnea_tls_hs.alpn_h2_ok], eax
     mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
 .accept_recv:
     mov rdi, r12
@@ -451,6 +456,8 @@ linnea_uring_run:
 .recv_data:
     mov eax, r15d
     add [r12 + linnea_connection.in_len], rax
+    cmp qword [r12 + linnea_connection.is_h2], 0
+    jne .h2_process
 .process:
     mov rdi, r12
     call linnea_http_handle
@@ -462,6 +469,22 @@ linnea_uring_run:
     call linnea_uring_arm_send
     call linnea_uring_submit_now
     jmp .wait
+; --- HTTP/2: process buffered frames, then send / read / close --------
+.h2_process:
+    mov rdi, r12
+    call linnea_h2_handle
+    cmp eax, LINNEA_H2_CLOSE
+    je .h2_close
+    test eax, eax              ; LINNEA_H2_MORE
+    jz .recv_more
+    mov rdi, r12               ; LINNEA_H2_SEND: flush response frames
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.h2_close:
+    lea r14, [reason_done]
+    mov r15d, reason_done_len
+    jmp .conn_close
 .proxy_connect:
     mov rdi, r12               ; the request goes to an upstream first
     call linnea_uring_arm_connect
@@ -517,6 +540,20 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .send_drained:
+    ; HTTP/2: a flight of frames finished going out. If we queued a
+    ; GOAWAY, close; otherwise process any frames still buffered, or read
+    ; more (this also picks up the client preface after our SETTINGS).
+    cmp qword [r12 + linnea_connection.is_h2], 0
+    je .not_h2_send
+    cmp qword [r12 + linnea_connection.h2_state], LINNEA_H2_CLOSING
+    je .h2_close
+    cmp qword [r12 + linnea_connection.in_len], 0
+    jne .h2_process
+    mov rdi, r12
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.not_h2_send:
     ; a relayed response continues with the next chunk from the upstream
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_RELAY
     je .relay_next
@@ -700,10 +737,23 @@ linnea_uring_run:
     test rax, rax
     js .tls_ktls_fail
     mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_KTLS
+    cmp dword [r12 + linnea_connection.up_buf + linnea_tls_hs.alpn_is_h2], 0
+    jne .h2_handoff                ; ALPN chose h2: speak frames, not HTTP/1
     cmp qword [r12 + linnea_connection.in_len], 0
     jne .process                   ; HTTP on the pipelined request
     mov rdi, r12
     call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.h2_handoff:
+    ; HTTP/2: send the server's initial SETTINGS; the client preface and
+    ; its SETTINGS (pipelined in in_buf, or arriving next) are processed
+    ; once that send drains (.h2_after_send).
+    mov qword [r12 + linnea_connection.is_h2], 1
+    mov rdi, r12
+    call linnea_h2_init
+    mov rdi, r12
+    call linnea_uring_arm_send
     call linnea_uring_submit_now
     jmp .wait
 .tls_early_more:

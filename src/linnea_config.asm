@@ -26,6 +26,8 @@ dump_maxconn:           db " max_connections="
 dump_maxconn_len        equ $ - dump_maxconn
 dump_workers:           db " workers="
 dump_workers_len        equ $ - dump_workers
+dump_http2:             db " http2="
+dump_http2_len          equ $ - dump_http2
 dump_server:            db "server "
 dump_server_len         equ $ - dump_server
 dump_host:              db ": host="
@@ -320,6 +322,11 @@ linnea_config_dump:
     mov esi, dump_workers_len
     call linnea_print_stdout
     mov rdi, [rbx + linnea_config.workers]
+    call linnea_print_u64_stdout
+    lea rdi, [dump_http2]
+    mov esi, dump_http2_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.http2]
     call linnea_print_u64_stdout
     lea rdi, [newline]
     mov esi, 1

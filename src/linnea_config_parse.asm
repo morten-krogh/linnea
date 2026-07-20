@@ -44,6 +44,8 @@ key_maxconn:            db "max_connections"
 key_maxconn_len         equ $ - key_maxconn
 key_workers:            db "workers"
 key_workers_len         equ $ - key_workers
+key_http2:              db "http2"
+key_http2_len           equ $ - key_http2
 key_host:               db "host"
 key_host_len            equ $ - key_host
 key_port:               db "port"
@@ -107,6 +109,8 @@ msg_maxconn_range:      db "max_connections must be between 1 and 65536"
 msg_maxconn_range_len   equ $ - msg_maxconn_range
 msg_workers_range:      db "workers must be between 1 and 256"
 msg_workers_range_len   equ $ - msg_workers_range
+msg_http2_range:        db "http2 must be 0 or 1"
+msg_http2_range_len     equ $ - msg_http2_range
 msg_host_long:          db "host too long"
 msg_host_long_len       equ $ - msg_host_long
 msg_hostname_long:      db "hostname too long"
@@ -158,6 +162,7 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.timeout], LINNEA_DEFAULT_TIMEOUT
     mov qword [rbx + linnea_config.max_connections], LINNEA_DEFAULT_MAX_CONNECTIONS
     mov qword [rbx + linnea_config.workers], LINNEA_DEFAULT_WORKERS
+    mov qword [rbx + linnea_config.http2], 0
     xor r13d, r13d             ; top-level key mask
 
     mov edi, '{'
@@ -203,6 +208,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_workers
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_http2]
+    mov ecx, key_http2_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_http2
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     jmp linnea_parse_fail
@@ -290,6 +302,16 @@ linnea_config_parse:
     cmp rax, LINNEA_MAX_WORKERS
     ja .workers_range
     mov [rbx + linnea_config.workers], rax
+    jmp .top_sep
+
+.top_http2:
+    test r13d, 32
+    jnz .top_dup
+    or r13d, 32
+    call linnea_parse_u64       ; 0 or 1
+    cmp rax, 1
+    ja .http2_range
+    mov [rbx + linnea_config.http2], rax
 
 .top_sep:
     call linnea_parse_skip_ws
@@ -347,6 +369,10 @@ linnea_config_parse:
 .workers_range:
     lea rdi, [msg_workers_range]
     mov esi, msg_workers_range_len
+    jmp linnea_parse_fail
+.http2_range:
+    lea rdi, [msg_http2_range]
+    mov esi, msg_http2_range_len
     jmp linnea_parse_fail
 .trailing:
     lea rdi, [msg_trailing]

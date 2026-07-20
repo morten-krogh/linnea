@@ -78,6 +78,8 @@ struc linnea_connection
     ; --- TLS: the handshake state overlays up_buf, so only a phase flag
     ; lives here (see LINNEA_TLS_PHASE_* below).
     .tls_phase:     resq 1
+    .is_h2:         resq 1         ; 1 = HTTP/2 connection (post-handoff)
+    .h2_state:      resq 1         ; LINNEA_H2_* connection state
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF
