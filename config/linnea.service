@@ -1,0 +1,43 @@
+# Linnea systemd unit. Install:
+#   sudo cp config/linnea.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now linnea
+#
+# kTLS needs the kernel tls module; make it persistent across boots with:
+#   echo tls | sudo tee /etc/modules-load.d/ktls.conf
+#
+# systemd supervises the master; the master supervises the workers.
+# Stopping the unit SIGTERMs the whole control group, and the workers'
+# PR_SET_PDEATHSIG covers a master that dies on its own.
+
+[Unit]
+Description=Linnea HTTP/TLS server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=linnea
+Group=linnea
+# the config's root and log paths are relative to this directory
+WorkingDirectory=/home/linnea/linnea
+ExecStart=/home/linnea/linnea/bin/linnea /home/linnea/linnea/config/linnea-tls.json
+Restart=on-failure
+RestartSec=1
+
+# Bind 80/443 without root and without file capabilities on the binary —
+# a rebuilt bin/linnea keeps working with no setcap re-run.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# Hardening: read-only /usr /boot /etc, private /tmp, no kernel tunables.
+# /home stays visible: the binary, config, docroot, log and certs live there.
+ProtectSystem=full
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
