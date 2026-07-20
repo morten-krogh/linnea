@@ -52,6 +52,10 @@ run_test "location dump"   124 stdout "location 1: prefix=/sub root=test/www" \
     timeout 0.5 $BIN test/configs/listen.json
 run_test "bad timeout"     1 stderr "timeout must be between 1 and 3600" \
     $BIN test/configs/bad-timeout.json
+run_test "workers dump"    124 stdout "workers=2" \
+    timeout 0.5 $BIN test/configs/listen.json
+run_test "bad workers"     1 stderr "workers must be between 1 and 256" \
+    $BIN test/configs/bad-workers.json
 run_test "invalid host"    1 stderr "invalid host address" \
     $BIN test/configs/bad-host.json
 run_test "missing argv"    1 stderr "usage:" \

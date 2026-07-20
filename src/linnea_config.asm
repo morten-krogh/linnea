@@ -24,6 +24,8 @@ dump_servers:           db " servers timeout="
 dump_servers_len        equ $ - dump_servers
 dump_maxconn:           db " max_connections="
 dump_maxconn_len        equ $ - dump_maxconn
+dump_workers:           db " workers="
+dump_workers_len        equ $ - dump_workers
 dump_server:            db "server "
 dump_server_len         equ $ - dump_server
 dump_host:              db ": host="
@@ -234,7 +236,7 @@ linnea_config_validate:
     jmp linnea_error_exit
 
 ; linnea_config_dump(rdi=config*) — human-readable dump to stdout:
-;   config: 2 servers timeout=5 max_connections=1024
+;   config: 2 servers timeout=5 max_connections=1024 workers=2
 ;   server 0: host=0.0.0.0 port=8080 hostname=example.com locations=2
 ;   location 0: prefix=/ root=test/www
 ;   location 1: prefix=/api proxy=127.0.0.1:3000
@@ -259,6 +261,11 @@ linnea_config_dump:
     mov esi, dump_maxconn_len
     call linnea_print_stdout
     mov rdi, [rbx + linnea_config.max_connections]
+    call linnea_print_u64_stdout
+    lea rdi, [dump_workers]
+    mov esi, dump_workers_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.workers]
     call linnea_print_u64_stdout
     lea rdi, [newline]
     mov esi, 1

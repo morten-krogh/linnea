@@ -25,11 +25,15 @@ section .data
 
 linnea_log_fd:  dd LINNEA_STDOUT
 
+LOG_LINE_CAP equ 2048
+
 section .bss
 
 num_buf:        resb 20
 time_ts:        resq 2         ; struct timespec
 stamp_buf:      resb 24        ; "[YYYY-MM-DD HH:MM:SS] "
+line_buf:       resb LOG_LINE_CAP
+line_len:       resq 1
 
 section .text
 
@@ -52,12 +56,58 @@ linnea_log_open:
     mov rdx, rbx
     jmp linnea_error_open      ; never returns
 
-; linnea_log_write(rdi=ptr, rsi=len)
+; linnea_log_write(rdi=ptr, rsi=len) — append to the pending line and
+; emit it as ONE write once the chunk ends in a newline. A log line is
+; assembled from several calls (stamp, text, numbers); buffering until
+; the newline turns it into a single O_APPEND write, so lines from
+; concurrent worker processes interleave whole, never torn.
 linnea_log_write:
-    mov rdx, rsi
-    mov rsi, rdi
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
+    test r12, r12
+    jz .done
+    cmp r12, LOG_LINE_CAP      ; a chunk the buffer can never hold is
+    ja .direct                 ; written through on its own
+    mov rax, [line_len]
+    lea rcx, [rax + r12]
+    cmp rcx, LOG_LINE_CAP
+    jbe .append
+    call log_flush             ; overlong line: emit what is held first
+.append:
+    lea rdi, [line_buf]
+    add rdi, [line_len]
+    mov rsi, rbx
+    mov rcx, r12
+    rep movsb
+    add [line_len], r12
+    cmp byte [rbx + r12 - 1], 10
+    jne .done
+    call log_flush
+.done:
+    pop r12
+    pop rbx
+    ret
+.direct:
+    call log_flush
     mov edi, [linnea_log_fd]
+    mov rsi, rbx
+    mov rdx, r12
+    call linnea_print_fd
+    jmp .done
+
+; log_flush — write the buffered line bytes, if any, as one write.
+log_flush:
+    mov rdx, [line_len]
+    test rdx, rdx
+    jz .none
+    mov qword [line_len], 0
+    mov edi, [linnea_log_fd]
+    lea rsi, [line_buf]
     jmp linnea_print_fd
+.none:
+    ret
 
 ; linnea_log_u64(rdi=value)
 linnea_log_u64:

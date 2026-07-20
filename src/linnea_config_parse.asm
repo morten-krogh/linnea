@@ -41,6 +41,8 @@ key_timeout:            db "timeout"
 key_timeout_len         equ $ - key_timeout
 key_maxconn:            db "max_connections"
 key_maxconn_len         equ $ - key_maxconn
+key_workers:            db "workers"
+key_workers_len         equ $ - key_workers
 key_host:               db "host"
 key_host_len            equ $ - key_host
 key_port:               db "port"
@@ -100,6 +102,8 @@ msg_timeout_range:      db "timeout must be between 1 and 3600"
 msg_timeout_range_len   equ $ - msg_timeout_range
 msg_maxconn_range:      db "max_connections must be between 1 and 65536"
 msg_maxconn_range_len   equ $ - msg_maxconn_range
+msg_workers_range:      db "workers must be between 1 and 256"
+msg_workers_range_len   equ $ - msg_workers_range
 msg_host_long:          db "host too long"
 msg_host_long_len       equ $ - msg_host_long
 msg_hostname_long:      db "hostname too long"
@@ -132,7 +136,8 @@ section .text
 ; linnea_config_parse(rdi=buf, rsi=len, rdx=config*)
 ; Fills the config from the JSON bytes or exits with a parse error.
 ; Top-level key presence tracked in a bitmask: servers=1, log=2 (required),
-; timeout=4, max_connections=8 (optional, mask bits only for dup detection).
+; timeout=4, max_connections=8, workers=16 (optional, mask bits only for
+; dup detection).
 linnea_config_parse:
     push rbx
     push r12
@@ -147,6 +152,7 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.log_len], 0
     mov qword [rbx + linnea_config.timeout], LINNEA_DEFAULT_TIMEOUT
     mov qword [rbx + linnea_config.max_connections], LINNEA_DEFAULT_MAX_CONNECTIONS
+    mov qword [rbx + linnea_config.workers], LINNEA_DEFAULT_WORKERS
     xor r13d, r13d             ; top-level key mask
 
     mov edi, '{'
@@ -185,6 +191,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_maxconn
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_workers]
+    mov ecx, key_workers_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_workers
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     jmp linnea_parse_fail
@@ -260,6 +273,18 @@ linnea_config_parse:
     cmp rax, 65536
     ja .maxconn_range
     mov [rbx + linnea_config.max_connections], rax
+    jmp .top_sep
+
+.top_workers:
+    test r13d, 16
+    jnz .top_dup
+    or r13d, 16
+    call linnea_parse_u64
+    test rax, rax
+    jz .workers_range
+    cmp rax, LINNEA_MAX_WORKERS
+    ja .workers_range
+    mov [rbx + linnea_config.workers], rax
 
 .top_sep:
     call linnea_parse_skip_ws
@@ -313,6 +338,10 @@ linnea_config_parse:
 .maxconn_range:
     lea rdi, [msg_maxconn_range]
     mov esi, msg_maxconn_range_len
+    jmp linnea_parse_fail
+.workers_range:
+    lea rdi, [msg_workers_range]
+    mov esi, msg_workers_range_len
     jmp linnea_parse_fail
 .trailing:
     lea rdi, [msg_trailing]

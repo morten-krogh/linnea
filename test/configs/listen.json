@@ -2,6 +2,7 @@
   "log": "test/linnea.log",
   "timeout": 2,
   "max_connections": 64,
+  "workers": 2,
   "servers": [
     {
       "host": "127.0.0.1", "port": 47080, "hostname": "one.test",
