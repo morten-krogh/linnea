@@ -19,6 +19,11 @@ default rel
 %include "linnea_hpack_data.inc"
 
 global linnea_hpack_decode
+; shared with the QPACK decoder (same Huffman code and pseudo-header logic)
+global hpack_int
+global hpack_str
+global hpack_huffman
+global emit_field
 
 section .rodata
 pseudo_method:  db ":method"
@@ -97,6 +102,7 @@ linnea_hpack_decode:
     jnz .lit_name_indexed
     mov rsi, r12                    ; literal name string
     mov rdi, r13
+    mov ecx, 7
     call hpack_str                  ; rax=name ptr, rdx=name len
     jc .err
     mov r12, rsi
@@ -118,6 +124,7 @@ linnea_hpack_decode:
 .lit_value:
     mov rsi, r12
     mov rdi, r13
+    mov ecx, 7
     call hpack_str                  ; rax=value ptr, rdx=value len
     jc .err
     mov r12, rsi
@@ -301,17 +308,20 @@ hpack_int:
     stc
     ret
 
-; hpack_str(rsi=cur, rdi=end) -> rax=ptr, rdx=len, rsi advanced. CF on error.
-; Raw literals point into the input block; Huffman literals decode into the
-; req scratch region (req in rbx). Caller-saved only (+ reads/writes rbx).
+; hpack_str(rsi=cur, rdi=end, ecx=N prefix bits) -> rax=ptr, rdx=len, rsi
+; advanced. CF on error. The Huffman flag is the bit just above the N-bit length
+; prefix (mask 1<<N): HPACK values use N=7 (H in bit 7); QPACK's literal name
+; uses N=3 (H in bit 3). Raw literals point into the input block; Huffman
+; literals decode into the req scratch region (req in rbx). Caller-saved only.
 hpack_str:
     cmp rsi, rdi
     jae .serr
-    movzx r8d, byte [rsi]           ; H flag in bit 7
-    and r8d, 0x80
+    mov r10d, 1
+    shl r10d, cl                    ; H-flag mask = 1 << N
+    movzx r8d, byte [rsi]
+    and r8d, r10d                   ; H flag
     push r8
-    mov ecx, 7
-    call hpack_int                  ; rax = string length
+    call hpack_int                  ; rax = string length (ecx = N)
     pop r8
     jc .serr
     mov r9, rdi

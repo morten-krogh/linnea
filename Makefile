@@ -187,13 +187,25 @@ bin/linnea-quichs: test/quic/linnea_quichs.o $(QUICMSG_OBJS)
 
 quichs: bin/linnea-quichs
 
+# --- test-only: QPACK decoder (reads a field section on stdin) ---
+QPACKTEST_BIN  = bin/linnea-qpacktest
+QPACKTEST_OBJS = test/quic/linnea_qpacktest.o src/linnea_qpack.o src/linnea_hpack.o
+
+test/quic/linnea_qpacktest.o: test/quic/linnea_qpacktest.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(QPACKTEST_BIN): $(QPACKTEST_OBJS)
+	$(LD) -o $@ $^
+
+qpacktest: $(QPACKTEST_BIN)
+
 clean:
 	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
 	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
 
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
-      bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs
+      bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs $(QPACKTEST_BIN)
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd

@@ -239,6 +239,15 @@ else
     check "quic handshake-confirm test (skipped: aioquic/binary unavailable)" 0
 fi
 
+# QPACK decode: field sections encoded by pylsqpack (static + literals + Huffman,
+# zero dynamic table) decode to the right HTTP/3 request pseudo-headers.
+if python3 -c 'import pylsqpack' 2>/dev/null && [ -x ./bin/linnea-qpacktest ]; then
+    python3 test/quic/qpack_test.py >/dev/null 2>&1
+    check "qpack: HTTP/3 request headers decode (static, literal, Huffman)" $?
+else
+    check "qpack decode test (skipped: pylsqpack/binary unavailable)" 0
+fi
+
 # QUIC 1-RTT data path: after the handshake, the client sends stream data in a
 # short-header packet; linnea unprotects it with the 1-RTT keys, parses the
 # STREAM frame, and echoes the payload.
