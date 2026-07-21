@@ -12,8 +12,21 @@
 
 %include "linnea_syscall.inc"
 %include "linnea_quic.inc"
+%include "linnea_quic_conn.inc"
 %include "linnea_sha256.inc"
 %include "linnea_hpack.inc"
+
+; Per-connection state lives in the pool slot cur_conn points at. CONNLEA loads
+; the address of one of its fields; CONNGET loads a qword field's value. Both
+; use only the destination register.
+%macro CONNLEA 2                     ; CONNLEA reg, field -> reg = &conn.field
+    mov %1, [cur_conn]
+    add %1, linnea_quic_conn. %+ %2
+%endmacro
+%macro CONNGET 2                     ; CONNGET reg, field -> reg = conn.field
+    mov %1, [cur_conn]
+    mov %1, [%1 + linnea_quic_conn. %+ %2]
+%endmacro
 
 global _start
 
@@ -28,6 +41,8 @@ extern linnea_quic_build_ee
 extern linnea_quic_build_cert
 extern linnea_quic_build_cert_verify
 extern linnea_quic_build_finished
+extern linnea_quic_conn_lookup
+extern linnea_quic_conn_alloc
 extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
 extern linnea_quic_protect
@@ -55,7 +70,6 @@ server_priv:  db 0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x4a,0x4b,0x4
               db 0x50,0x51,0x52,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x5b,0x5c,0x5d,0x5e,0x5f
 server_srand: db 0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6a,0x6b,0x6c,0x6d,0x6e,0x6f
               db 0x70,0x71,0x72,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x7b,0x7c,0x7d,0x7e,0x7f
-server_scid:  db 0x51,0x52,0x53,0x54,0x55,0x56,0x57,0x58
 cert_pem:     incbin "test/tls/server.crt"
 cert_pem_len  equ $ - cert_pem
 key_pem:      incbin "test/tls/server.key"
@@ -70,21 +84,13 @@ sa:          resb 16
 salen:       resq 1
 dgram:       resb 2048
 plaintext:   resb 2048
-ini_server:  resb linnea_quic_keys_size
-ini_client:  resb linnea_quic_keys_size
-hs_skeys:    resb linnea_quic_keys_size
-hs_ckeys:    resb linnea_quic_keys_size
-hs_sec:      resb 96                  ; c_hs || s_hs || handshake_secret
-s_th_cfin:   resb 32                  ; H(CH..server Finished) for the client MAC
+cur_conn:    resq 1                   ; connection this datagram belongs to
 expfin:      resb 64                  ; expected client Finished message
-ap_ckeys:    resb linnea_quic_keys_size
-ap_skeys:    resb linnea_quic_keys_size
 onertt_pay:  resb 32                  ; HANDSHAKE_DONE + PADDING
 onertt_pkt:  resb 4096                ; the protected 1-RTT packet
 strm_pay:    resb 4096                ; STREAM frame carrying the h3 response
 req:         resb linnea_h2_req_size  ; decoded h3 request
 h3scratch:   resb 2048                ; QPACK literal scratch
-s_1rtt_pn:   resq 1                   ; server 1-RTT packet number
 s_pl_ptr:    resq 1
 s_pl_len:    resq 1
 s_sid:       resq 1                   ; stream id of the request being served
@@ -106,9 +112,6 @@ s_ch_ptr:    resq 1
 s_ch_len:    resq 1
 s_odcid_ptr: resq 1
 s_odcid_len: resq 1
-s_cscid_ptr: resq 1
-s_cscid_len: resq 1
-s_cscid_buf: resb 20                  ; stable copy of the client SCID
 s_cert_len:  resq 1
 s_priv:      resq 1
 s_ini_len:   resq 1
@@ -165,10 +168,40 @@ _start:
     jle .loop
     mov r13, rax                     ; datagram length
 
-    ; short-header (1-RTT) packets carry application data once the handshake is
+    ; --- demultiplex: route the datagram to its connection ---
+    ; The peer addresses us by the connection ID we issued, whose first two
+    ; bytes hold the pool index, so the lookup is a bounds check and a compare.
+    ; Short-header (1-RTT) packets carry application data once the handshake is
     ; confirmed; long-header packets are the handshake flights.
     test byte [dgram], 0x80
-    jz .onertt_in
+    jz .demux_short
+    movzx eax, byte [dgram + 5]      ; long header: explicit DCID length
+    cmp eax, LINNEA_QUIC_MAX_CID
+    ja .loop
+    lea rdi, [dgram + 6]
+    mov esi, eax
+    call linnea_quic_conn_lookup
+    test rax, rax
+    jnz .demux_found
+    ; an ID we never issued: treat this as a new connection attempt
+    lea rdi, [sa]
+    mov rsi, [salen]
+    call linnea_quic_conn_alloc
+    test rax, rax
+    jz .loop                         ; pool exhausted: drop the datagram
+    mov [cur_conn], rax
+    jmp .long_in
+.demux_short:
+    lea rdi, [dgram + 1]             ; short header: our ID, fixed length
+    mov esi, LINNEA_QUIC_SCID_LEN
+    call linnea_quic_conn_lookup
+    test rax, rax
+    jz .loop                         ; unknown connection: drop
+    call .refresh_peer
+    jmp .onertt_in
+.demux_found:
+    call .refresh_peer
+.long_in:
 
     ; server Initial keys from the client DCID (also the odcid for transport params)
     lea rdi, [dgram]
@@ -180,8 +213,8 @@ _start:
     mov [s_odcid_len], rdx
     mov rdi, rax
     mov rsi, rdx
-    lea rdx, [ini_client]
-    lea rcx, [ini_server]
+    CONNLEA rdx, ini_client
+    CONNLEA rcx, ini_server
     call linnea_quic_initial_secrets
     ; ClientHello + key_share
     lea rdi, [dgram]
@@ -203,11 +236,10 @@ _start:
     lea rsi, [dgram + 6 + rax]
     movzx ecx, byte [rsi]            ; SCID length
     inc rsi                          ; -> SCID bytes
-    mov [s_cscid_len], rcx
-    lea rdi, [s_cscid_buf]
+    mov rax, [cur_conn]
+    mov [rax + linnea_quic_conn.dcid_len], rcx
+    lea rdi, [rax + linnea_quic_conn.dcid]
     rep movsb                        ; copy the SCID out of dgram
-    lea rax, [s_cscid_buf]
-    mov [s_cscid_ptr], rax
     ; server ephemeral public + ServerHello
     lea rdi, [server_pub]
     lea rsi, [server_priv]
@@ -230,7 +262,7 @@ _start:
     rep movsb                        ; payload length = 99
     call .build_initial_header       ; -> rcx = header length (uses s_cscid_*)
     sub rsp, 16
-    lea rax, [ini_server]
+    CONNLEA rax, ini_server
     mov [rsp], rax
     lea rdi, [outpkt]
     lea rsi, [hdr]
@@ -251,15 +283,15 @@ _start:
     mov rdi, [ch_out + linnea_quic_ch.ks_ptr]
     lea rsi, [server_priv]
     lea rdx, [th_buf]
-    lea rcx, [hs_ckeys]
-    lea r8, [hs_skeys]
-    lea r9, [hs_sec]
+    CONNLEA rcx, hs_ckeys
+    CONNLEA r8, hs_skeys
+    CONNLEA r9, hs_sec
     call linnea_quic_hs_secrets
     ; EE || Cert || CertVerify || Finished into hsmsg
     lea rdi, [hsmsg]
     mov rsi, [s_odcid_ptr]
     mov rdx, [s_odcid_len]
-    lea rcx, [server_scid]
+    CONNLEA rcx, scid
     mov r8d, 8
     call linnea_quic_build_ee        ; rax = EE length
     mov r14, rax                     ; running hsmsg length
@@ -282,7 +314,8 @@ _start:
     mov rdx, r14
     call .transcript
     lea rdi, [hsmsg + r14]
-    lea rsi, [hs_sec + 32]           ; s_hs traffic secret
+    CONNLEA rsi, hs_sec
+    add rsi, 32                      ; s_hs traffic secret
     lea rdx, [th_buf]
     call linnea_quic_build_finished
     add r14, rax
@@ -304,7 +337,7 @@ _start:
     add r15, r14                     ; Handshake payload length
     call .build_hs_header            ; -> rcx = header length, uses r15 for length
     sub rsp, 16
-    lea rax, [hs_skeys]
+    CONNLEA rax, hs_skeys
     mov [rsp], rax
     mov rdi, [s_ini_len]
     lea rdi, [outpkt + rdi]          ; coalesce after the Initial packet
@@ -322,8 +355,8 @@ _start:
     mov edi, r12d
     lea rsi, [outpkt]
     xor r10d, r10d
-    lea r8, [sa]
-    mov r9d, 16
+    CONNLEA r8, peer
+    CONNGET r9, peer_len
     syscall
     ; save the transcript through the server Finished; the client's Finished
     ; MAC covers exactly this (H(CH || SH || EE || Cert || CertVerify || Fin)).
@@ -331,7 +364,7 @@ _start:
     mov rdx, [s_hsmsg_len]
     call .transcript
     lea rsi, [th_buf]
-    lea rdi, [s_th_cfin]
+    CONNLEA rdi, th_cfin
     mov ecx, 32
     rep movsb
     jmp .loop
@@ -374,7 +407,7 @@ _start:
     mov rdi, r15
     lea rsi, [dgram + r13]
     sub rsi, r15                     ; bytes from here to the datagram end
-    lea rdx, [hs_ckeys]
+    CONNLEA rdx, hs_ckeys
     lea rcx, [plaintext]
     call linnea_quic_unprotect_hs
     test rax, rax
@@ -389,8 +422,8 @@ _start:
     mov r14, rax                     ; received Finished message ptr
     ; expected = Finished(c_hs, H(CH..server Finished))
     lea rdi, [expfin]
-    lea rsi, [hs_sec]                ; c_hs traffic secret (offset 0)
-    lea rdx, [s_th_cfin]
+    CONNLEA rsi, hs_sec              ; c_hs traffic secret (offset 0)
+    CONNLEA rdx, th_cfin
     call linnea_quic_build_finished  ; rax = 36
     lea rsi, [expfin]
     mov rdi, r14
@@ -400,10 +433,11 @@ _start:
     ; the client authenticated. Derive the 1-RTT keys (the application traffic
     ; secrets use the same transcript through the server Finished) and confirm
     ; the handshake by sending HANDSHAKE_DONE in a short-header 1-RTT packet.
-    lea rdi, [hs_sec + 64]           ; handshake secret
-    lea rsi, [s_th_cfin]             ; H(CH..server Finished)
-    lea rdx, [ap_ckeys]
-    lea rcx, [ap_skeys]
+    CONNLEA rdi, hs_sec
+    add rdi, 64                      ; handshake secret
+    CONNLEA rsi, th_cfin             ; H(CH..server Finished)
+    CONNLEA rdx, ap_ckeys
+    CONNLEA rcx, ap_skeys
     call linnea_quic_app_secrets
     ; payload: HANDSHAKE_DONE (0x1e), padded so the HP sample has room
     mov byte [onertt_pay], 0x1e
@@ -428,9 +462,9 @@ _start:
 .onertt_in:
     lea rdi, [dgram]
     mov rsi, r13
-    lea rdx, [ap_ckeys]              ; client 1-RTT keys (derived at .do_cfin)
+    CONNLEA rdx, ap_ckeys            ; client 1-RTT keys (derived at .do_cfin)
     lea rcx, [plaintext]
-    mov r8d, 8                       ; our DCID length = server_scid length
+    mov r8d, LINNEA_QUIC_SCID_LEN    ; the connection ID length we issue
     call linnea_quic_unprotect_short
     test rax, rax
     js .loop
@@ -485,6 +519,21 @@ _start:
     call .send_1rtt
     jmp .stream_scan
 
+; .refresh_peer(rax = conn) — make it the current connection and record the
+; address this datagram came from, so replies follow a peer that has migrated.
+.refresh_peer:
+    mov [cur_conn], rax
+    mov rcx, [salen]
+    cmp rcx, 16
+    jbe .rp_len
+    mov ecx, 16
+.rp_len:
+    mov [rax + linnea_quic_conn.peer_len], rcx
+    lea rdi, [rax + linnea_quic_conn.peer]
+    lea rsi, [sa]
+    rep movsb
+    ret
+
 ; .send_1rtt(rsi = payload ptr, rdx = payload len) — build a short-header 1-RTT
 ; packet with the current server packet number, protect it with the server
 ; 1-RTT keys, send it to the client, and advance the packet number.
@@ -493,17 +542,17 @@ _start:
     mov [s_pl_ptr], rsi
     mov [s_pl_len], rdx
     mov byte [hdr], 0x40              ; short header, 1-byte pn, key phase 0
-    mov rcx, [s_cscid_len]
+    CONNGET rcx, dcid_len
     lea rdi, [hdr + 1]
-    mov rsi, [s_cscid_ptr]
-    rep movsb                         ; DCID = client SCID
-    mov rax, [s_1rtt_pn]
+    CONNLEA rsi, dcid
+    rep movsb                         ; DCID = the peer's connection id
+    CONNGET rax, pn_1rtt
     mov [rdi], al                     ; packet number (1 byte)
     inc rdi
-    mov rbx, [s_cscid_len]
+    CONNGET rbx, dcid_len
     add rbx, 2                        ; header length = 1 + DCID + 1
     sub rsp, 16
-    lea rax, [ap_skeys]
+    CONNLEA rax, ap_skeys
     mov [rsp], rax
     lea rdi, [onertt_pkt]
     lea rsi, [hdr]
@@ -518,10 +567,11 @@ _start:
     mov edi, r12d
     lea rsi, [onertt_pkt]
     xor r10d, r10d
-    lea r8, [sa]
-    mov r9d, 16
+    CONNLEA r8, peer
+    CONNGET r9, peer_len
     syscall
-    inc qword [s_1rtt_pn]
+    mov rax, [cur_conn]
+    inc qword [rax + linnea_quic_conn.pn_1rtt]
     pop rbx
     ret
 
@@ -530,15 +580,15 @@ _start:
 .build_initial_header:
     mov byte [hdr], 0xc0
     mov dword [hdr + 1], 0x01000000
-    mov rcx, [s_cscid_len]
+    CONNGET rcx, dcid_len
     mov [hdr + 5], cl
     lea rdi, [hdr + 6]
-    mov rsi, [s_cscid_ptr]
+    CONNLEA rsi, dcid
     rep movsb
-    mov byte [rdi], 8
+    mov byte [rdi], LINNEA_QUIC_SCID_LEN
     inc rdi
-    lea rsi, [server_scid]
-    mov ecx, 8
+    CONNLEA rsi, scid
+    mov ecx, LINNEA_QUIC_SCID_LEN
     rep movsb
     mov byte [rdi], 0x00             ; token length
     mov word [rdi + 1], 0x7440       ; length varint(116)
@@ -553,15 +603,15 @@ _start:
 .build_hs_header:
     mov byte [hdr], 0xe0             ; long, Handshake, 1-byte pn
     mov dword [hdr + 1], 0x01000000
-    mov rcx, [s_cscid_len]
+    CONNGET rcx, dcid_len
     mov [hdr + 5], cl
     lea rdi, [hdr + 6]
-    mov rsi, [s_cscid_ptr]
+    CONNLEA rsi, dcid
     rep movsb
-    mov byte [rdi], 8
+    mov byte [rdi], LINNEA_QUIC_SCID_LEN
     inc rdi
-    lea rsi, [server_scid]
-    mov ecx, 8
+    CONNLEA rsi, scid
+    mov ecx, LINNEA_QUIC_SCID_LEN
     rep movsb
     ; length varint = pn(1) + payload(r15) + tag(16)
     lea rsi, [r15 + 17]

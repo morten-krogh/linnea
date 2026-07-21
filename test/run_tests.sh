@@ -294,6 +294,20 @@ else
     check "h3 multi-stream test (skipped: deps unavailable)" 0
 fi
 
+# Connection pool: two connections whose handshakes and requests are fully
+# interleaved must not share keys, transcript, connection ids or packet numbers.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
+    timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
+    hspid=$!
+    sleep 0.4
+    python3 test/quic/h3_conns_test.py 47501 >/dev/null 2>&1
+    check "quic: two interleaved connections keep separate state (pool demux)" $?
+    kill $hspid 2>/dev/null
+    wait $hspid 2>/dev/null
+else
+    check "quic connection-pool test (skipped: deps unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is
