@@ -29,7 +29,9 @@ extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
 extern linnea_quic_protect
 extern linnea_quic_unprotect_hs
+extern linnea_quic_unprotect_short
 extern linnea_quic_crypto_frame
+extern linnea_quic_stream_frame
 extern linnea_quic_varint_encode
 extern linnea_quic_varint_decode
 extern linnea_x25519
@@ -147,6 +149,11 @@ _start:
     test rax, rax
     jle .loop
     mov r13, rax                     ; datagram length
+
+    ; short-header (1-RTT) packets carry application data once the handshake is
+    ; confirmed; long-header packets are the handshake flights.
+    test byte [dgram], 0x80
+    jz .onertt_in
 
     ; server Initial keys from the client DCID (also the odcid for transport params)
     lea rdi, [dgram]
@@ -417,6 +424,28 @@ _start:
     mov edi, 1
     lea rsi, [cfin_marker]
     mov edx, cfin_marker_len
+    syscall
+    jmp .loop
+
+; --- 1-RTT (short-header) packet: application data on a QUIC stream ---
+.onertt_in:
+    lea rdi, [dgram]
+    mov rsi, r13
+    lea rdx, [ap_ckeys]              ; client 1-RTT keys (derived at .do_cfin)
+    lea rcx, [plaintext]
+    mov r8d, 8                       ; our DCID length = server_scid length
+    call linnea_quic_unprotect_short
+    test rax, rax
+    js .loop
+    lea rdi, [plaintext]
+    mov rsi, rax
+    call linnea_quic_stream_frame    ; skips ACK, returns the first STREAM data
+    test rax, rax
+    jz .loop
+    ; echo the stream payload to stdout (rax = data ptr, rdx = length)
+    mov rsi, rax
+    mov eax, LINNEA_SYS_WRITE
+    mov edi, 1
     syscall
     jmp .loop
 

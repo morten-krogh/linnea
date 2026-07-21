@@ -239,6 +239,26 @@ else
     check "quic handshake-confirm test (skipped: aioquic/binary unavailable)" 0
 fi
 
+# QUIC 1-RTT data path: after the handshake, the client sends stream data in a
+# short-header packet; linnea unprotects it with the 1-RTT keys, parses the
+# STREAM frame, and echoes the payload.
+if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
+    stlog=$(mktemp)
+    timeout 10 ./bin/linnea-quichs >"$stlog" 2>&1 &
+    hspid=$!
+    sleep 0.4
+    python3 test/quic/stream_test.py 47501 >/dev/null 2>&1
+    strc=$?
+    sleep 0.3
+    if [ $strc -eq 0 ] && grep -q linnea-quic-stream-42 "$stlog"; then stok=0; else stok=1; fi
+    check "quic: 1-RTT STREAM frame received and parsed" $stok
+    kill $hspid 2>/dev/null
+    wait $hspid 2>/dev/null
+    rm -f "$stlog"
+else
+    check "quic 1-RTT stream test (skipped: aioquic/binary unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is

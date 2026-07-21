@@ -12,7 +12,9 @@ global linnea_quic_varint_encode
 global linnea_quic_initial_dcid
 global linnea_quic_unprotect
 global linnea_quic_unprotect_hs
+global linnea_quic_unprotect_short
 global linnea_quic_crypto_frame
+global linnea_quic_stream_frame
 global linnea_quic_recv_initial
 global linnea_quic_protect
 global linnea_quic_ch_parse
@@ -219,6 +221,245 @@ unprotect_body:
     pop rbp
     pop r15
     pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_unprotect_short(rdi=packet, rsi=len, rdx=keys, rcx=out, r8=dcid_len)
+;   -> rax = plaintext length, or -1. Removes header protection and AEAD-opens a
+; short-header (1-RTT) packet. The destination connection-id length must be
+; supplied — short headers carry no length field for it. RFC 9001 5.3 / 5.4.
+%define S_AAD    0        ; unprotected header (AAD)
+%define S_NONCE  64
+%define S_MASK   80
+%define S_HLEN   88
+%define S_PNLEN  96
+%define S_PN     104
+%define S_CTX    112
+linnea_quic_unprotect_short:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 312
+    mov rbx, rdi                     ; packet
+    mov rbp, rsi                     ; packet length
+    mov r12, rdx                     ; keys
+    mov r13, rcx                     ; out
+    lea r14, [r8 + 1]                ; pn offset = 1 (first byte) + DCID length
+    ; --- header protection: sample 16 bytes at pn_offset + 4 ---
+    lea rdx, [r14 + 20]
+    cmp rdx, rbp
+    ja .serr
+    lea rdi, [r12 + linnea_quic_keys.hp]
+    lea rsi, [rbx + r14 + 4]
+    lea rdx, [rsp + S_MASK]
+    call linnea_quic_hp_mask
+    ; unprotect the first byte (low 5 bits for a short header)
+    movzx eax, byte [rbx]
+    movzx edx, byte [rsp + S_MASK]
+    and edx, 0x1f
+    xor eax, edx
+    mov r8d, eax                     ; unprotected b0
+    mov ecx, eax
+    and ecx, 3
+    inc ecx                          ; pn length (1..4)
+    mov [rsp + S_PNLEN], rcx
+    lea rax, [r14 + rcx]
+    mov [rsp + S_HLEN], rax          ; header length = pn_offset + pn_len
+    ; --- copy the header into the AAD scratch, then unmask b0 + pn ---
+    lea rsi, [rbx]
+    lea rdi, [rsp + S_AAD]
+    mov rcx, rax
+    rep movsb
+    mov [rsp + S_AAD], r8b
+    mov rcx, [rsp + S_PNLEN]
+    lea rdi, [rsp + S_AAD + r14]
+    lea rsi, [rsp + S_MASK + 1]
+    xor edx, edx
+.s_pnunmask:
+    mov al, [rdi + rdx]
+    xor al, [rsi + rdx]
+    mov [rdi + rdx], al
+    inc edx
+    cmp edx, ecx
+    jb .s_pnunmask
+    ; decode the (truncated) packet number, big-endian
+    xor eax, eax
+    xor edx, edx
+.s_pndecode:
+    shl rax, 8
+    movzx r9d, byte [rdi + rdx]
+    or rax, r9
+    inc edx
+    cmp edx, ecx
+    jb .s_pndecode
+    mov [rsp + S_PN], rax
+    ; --- nonce = iv XOR pn (right-aligned) ---
+    lea rsi, [r12 + linnea_quic_keys.iv]
+    lea rdi, [rsp + S_NONCE]
+    mov ecx, 12
+    rep movsb
+    mov rax, [rsp + S_PN]
+    lea rdi, [rsp + S_NONCE + 11]
+    mov ecx, 8
+.s_nonce:
+    mov dl, al
+    xor [rdi], dl
+    dec rdi
+    shr rax, 8
+    dec ecx
+    jnz .s_nonce
+    ; --- AEAD-open: ct = packet + header_len, ctlen = packet_len - header_len ---
+    lea rdi, [rsp + S_CTX]
+    lea rsi, [r12 + linnea_quic_keys.key]
+    call linnea_aesgcm_init
+    mov r9, rbp
+    sub r9, [rsp + S_HLEN]           ; ctlen (payload incl. 16-byte tag)
+    lea r8, [rbx]
+    add r8, [rsp + S_HLEN]           ; ct pointer
+    lea rdi, [rsp + S_CTX]
+    lea rsi, [rsp + S_NONCE]
+    lea rdx, [rsp + S_AAD]
+    mov rcx, [rsp + S_HLEN]
+    sub rsp, 16
+    mov [rsp], r13                   ; out
+    call linnea_aesgcm_open
+    add rsp, 16
+    test rax, rax
+    js .serr
+    mov rax, rbp
+    sub rax, [rsp + S_HLEN]
+    sub rax, 16                      ; plaintext length = ctlen - tag
+    jmp .sdone
+.serr:
+    mov rax, -1
+.sdone:
+    add rsp, 312
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_stream_frame(rdi=frames, rsi=len) -> rax = STREAM data ptr,
+; rdx = STREAM data length, r8 = stream id (rax = 0 if none). Skips PADDING/
+; PING/ACK and returns the first STREAM frame's data (RFC 9000 19.8). The type
+; byte 0b00001XXX carries OFF (0x04), LEN (0x02) and FIN (0x01) flags.
+linnea_quic_stream_frame:
+    push rbx
+    push r12
+    push r13
+    lea rsi, [rdi + rsi]             ; end (preserved across varint calls)
+.ss_scan:
+    cmp rdi, rsi
+    jae .ss_none
+    movzx ebx, byte [rdi]            ; frame type
+    test bl, bl                      ; PADDING
+    jz .ss_skip1
+    cmp bl, 0x01                     ; PING
+    je .ss_skip1
+    cmp bl, 0x02                     ; ACK
+    je .ss_ack
+    cmp bl, 0x03                     ; ACK w/ ECN
+    je .ss_ack
+    mov eax, ebx
+    and eax, 0xf8
+    cmp eax, 0x08                    ; STREAM (0b00001xxx)
+    je .ss_stream
+    jmp .ss_none                     ; any other frame: stop
+.ss_skip1:
+    inc rdi
+    jmp .ss_scan
+.ss_ack:
+    inc rdi
+    call linnea_quic_varint_decode   ; Largest Acknowledged
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Delay
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Count
+    test rdx, rdx
+    jz .ss_none
+    mov r12, rax
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; First ACK Range
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+.ss_ackr:
+    test r12, r12
+    jz .ss_ackecn
+    call linnea_quic_varint_decode   ; Gap
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Length
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    dec r12
+    jmp .ss_ackr
+.ss_ackecn:
+    cmp bl, 0x03
+    jne .ss_scan
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    jmp .ss_scan
+.ss_stream:
+    inc rdi                          ; past the type
+    call linnea_quic_varint_decode   ; stream id
+    test rdx, rdx
+    jz .ss_none
+    mov r13, rax                     ; stream id
+    add rdi, rdx
+    test bl, 0x04                    ; OFF flag: an offset field is present
+    jz .ss_nooff
+    call linnea_quic_varint_decode   ; offset
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+.ss_nooff:
+    test bl, 0x02                    ; LEN flag: an explicit length field
+    jz .ss_tolen
+    call linnea_quic_varint_decode   ; length
+    test rdx, rdx
+    jz .ss_none
+    mov r12, rax                     ; data length
+    add rdi, rdx
+    jmp .ss_have
+.ss_tolen:
+    mov r12, rsi                     ; no LEN: data runs to the frame's end
+    sub r12, rdi
+.ss_have:
+    mov rax, rdi                     ; data pointer
+    mov rdx, r12                     ; data length
+    mov r8, r13                      ; stream id
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ss_none:
+    xor eax, eax
+    xor edx, edx
     pop r13
     pop r12
     pop rbx
