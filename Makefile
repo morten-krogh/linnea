@@ -71,9 +71,10 @@ tlstest: $(TLSTEST_BIN)
 QUICTEST_BIN  = bin/linnea-quictest
 QUICTEST_OBJS = test/quic/linnea_quictest.o src/linnea_quic_crypto.o \
                 src/linnea_quic.o src/linnea_aesgcm.o src/linnea_sha256.o \
-                src/linnea_tls_kdf.o src/linnea_print.o src/linnea_string.o
+                src/linnea_tls_kdf.o src/linnea_x25519.o src/linnea_fe25519.o \
+                src/linnea_print.o src/linnea_string.o
 
-test/quic/linnea_quictest.o: test/quic/linnea_quictest.asm test/quic/quic_vectors.inc $(INCS)
+test/quic/linnea_quictest.o: test/quic/linnea_quictest.asm test/quic/quic_vectors.inc test/quic/quic_hs_vectors.inc $(INCS)
 	$(NASM) $(NASMFLAGS) -I test/quic/ -o $@ $<
 
 $(QUICTEST_BIN): $(QUICTEST_OBJS)
@@ -86,7 +87,8 @@ quictest: $(QUICTEST_BIN)
 QUICSRV_BIN  = bin/linnea-quicserver
 QUICSRV_OBJS = test/quic/linnea_quicserver.o src/linnea_quic.o \
                src/linnea_quic_crypto.o src/linnea_aesgcm.o src/linnea_sha256.o \
-               src/linnea_tls_kdf.o src/linnea_print.o src/linnea_string.o
+               src/linnea_tls_kdf.o src/linnea_x25519.o src/linnea_fe25519.o \
+               src/linnea_print.o src/linnea_string.o
 
 test/quic/linnea_quicserver.o: test/quic/linnea_quicserver.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<

@@ -16,10 +16,12 @@ extern linnea_quic_varint_encode
 extern linnea_quic_unprotect
 extern linnea_quic_crypto_frame
 extern linnea_quic_protect
+extern linnea_quic_hs_secrets
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 
 %include "quic_vectors.inc"
+%include "quic_hs_vectors.inc"
 
 ; CHECK dst, expected, len — compare and tally into r14d (total) / r15d (pass).
 %macro CHECK 3
@@ -96,6 +98,8 @@ a2_server:   resb linnea_quic_keys_size
 plain_buf:   resb 1500
 plain_len:   resq 1
 prot_buf:    resb 256
+hs_client:   resb linnea_quic_keys_size
+hs_server:   resb linnea_quic_keys_size
 
 section .text
 _start:
@@ -180,6 +184,17 @@ _start:
     inc r15d
 .a3_done:
     CHECK prot_buf, quic_a3_protected, quic_a3_protected_len
+
+    ; --- handshake key derivation: ECDHE + TLS key schedule -> QUIC keys ---
+    ; verified against the Python `cryptography` reference (fixed inputs).
+    lea rdi, [qhs_client_pub]
+    lea rsi, [qhs_server_priv]
+    lea rdx, [qhs_th]
+    lea rcx, [hs_client]
+    lea r8, [hs_server]
+    call linnea_quic_hs_secrets
+    CHECK hs_client, qhs_exp_client, 44
+    CHECK hs_server, qhs_exp_server, 44
 
     ; print "quic-crypto <pass>/<total>\n"
     lea rdi, [msg_head]

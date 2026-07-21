@@ -15,9 +15,12 @@ default rel
 
 global linnea_quic_initial_secrets
 global linnea_quic_hp_mask
+global linnea_quic_hs_secrets
 
 extern linnea_hkdf_extract
 extern linnea_tls_hkdf_expand_label
+extern linnea_tls_derive_secret
+extern linnea_x25519
 extern linnea_aesgcm_init
 extern linnea_aes128_ecb
 
@@ -31,6 +34,14 @@ lbl_server_in: db "server in"
 lbl_quic_key:  db "quic key"
 lbl_quic_iv:   db "quic iv"
 lbl_quic_hp:   db "quic hp"
+lbl_derived:   db "derived"
+lbl_c_hs:      db "c hs traffic"
+lbl_s_hs:      db "s hs traffic"
+zeros32:       times 32 db 0
+; SHA-256 of the empty string (Derive-Secret's context for "derived").
+empty_hash:
+    db 0xe3,0xb0,0xc4,0x42,0x98,0xfc,0x1c,0x14,0x9a,0xfb,0xf4,0xc8,0x99,0x6f,0xb9,0x24
+    db 0x27,0xae,0x41,0xe4,0x64,0x9b,0x93,0x4c,0xa4,0x95,0x99,0x1b,0x78,0x52,0xb8,0x55
 
 section .text
 
@@ -137,6 +148,82 @@ linnea_quic_initial_secrets:
     pop r12
     pop rbx
     pop rbp
+    ret
+
+; linnea_quic_hs_secrets(rdi=client_pub32, rsi=server_priv32, rdx=transcript
+;   hash H(CH..SH), rcx=out client keys, r8=out server keys)
+; TLS 1.3 handshake key schedule (fresh, no PSK) reused for QUIC: ECDHE, then
+; early -> derived -> handshake secret -> c/s hs traffic secrets, and from each
+; the QUIC handshake packet keys. The primitives are the same the TLS handshake
+; uses; only the final key labels ("quic ...") differ.
+linnea_quic_hs_secrets:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 232                     ; [0]shared [32]early [64]derived
+                                     ; [96]hs [128]c_hs [160]s_hs
+    mov rbx, rdi                     ; client_pub
+    mov r12, rsi                     ; server_priv
+    mov r13, rdx                     ; transcript hash
+    mov r14, rcx                     ; out client keys
+    mov r15, r8                      ; out server keys
+    ; shared = X25519(server_priv, client_pub)
+    lea rdi, [rsp]
+    mov rsi, r12
+    mov rdx, rbx
+    call linnea_x25519
+    ; early = HKDF-Extract("", zeros32)
+    lea rdi, [zeros32]
+    xor esi, esi
+    lea rdx, [zeros32]
+    mov ecx, 32
+    lea r8, [rsp + 32]
+    call linnea_hkdf_extract
+    ; derived = Derive-Secret(early, "derived", H(""))
+    lea rdi, [rsp + 32]
+    lea rsi, [lbl_derived]
+    mov edx, 7
+    lea rcx, [empty_hash]
+    lea r8, [rsp + 64]
+    call linnea_tls_derive_secret
+    ; hs_secret = HKDF-Extract(derived, shared)
+    lea rdi, [rsp + 64]
+    mov esi, 32
+    lea rdx, [rsp]
+    mov ecx, 32
+    lea r8, [rsp + 96]
+    call linnea_hkdf_extract
+    ; c_hs = Derive-Secret(hs, "c hs traffic", th)
+    lea rdi, [rsp + 96]
+    lea rsi, [lbl_c_hs]
+    mov edx, 12
+    mov rcx, r13
+    lea r8, [rsp + 128]
+    call linnea_tls_derive_secret
+    ; s_hs = Derive-Secret(hs, "s hs traffic", th)
+    lea rdi, [rsp + 96]
+    lea rsi, [lbl_s_hs]
+    mov edx, 12
+    mov rcx, r13
+    lea r8, [rsp + 160]
+    call linnea_tls_derive_secret
+    ; QUIC handshake packet keys from each traffic secret
+    lea rdi, [rsp + 128]
+    mov rsi, r14
+    call quic_pp_keys
+    lea rdi, [rsp + 160]
+    mov rsi, r15
+    call quic_pp_keys
+    add rsp, 232
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; linnea_quic_hp_mask(rdi=hp key16, rsi=sample16, rdx=out mask5)
