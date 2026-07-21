@@ -20,12 +20,27 @@ global linnea_quic_build_transport_params
 global linnea_quic_build_sh
 global linnea_quic_build_ee
 global linnea_quic_build_cert
+global linnea_quic_build_cert_verify
+global linnea_quic_build_finished
 
 extern linnea_quic_hp_mask
 extern linnea_quic_initial_secrets
 extern linnea_aesgcm_init
 extern linnea_aesgcm_open
 extern linnea_aesgcm_seal
+extern linnea_sha256
+extern linnea_hmac_sha256
+extern linnea_p256_ecdsa_sign
+extern linnea_tls_hkdf_expand_label
+
+section .rodata
+; CertificateVerify signed content prefix (RFC 8446 4.4.3): 64 spaces, the
+; context string, and a 0x00 separator; the transcript hash follows at runtime.
+cv_prefix:    times 64 db 0x20
+              db "TLS 1.3, server CertificateVerify"
+              db 0x00
+cv_prefix_len equ $ - cv_prefix
+lbl_finished: db "finished"
 
 section .text
 
@@ -232,6 +247,91 @@ linnea_quic_crypto_frame:
 .none:
     xor eax, eax
     xor edx, edx
+    ret
+
+; linnea_quic_build_cert_verify(rdi=out, rsi=transcript hash H(CH..Cert),
+;   rdx=P-256 private scalar) -> rax = CertificateVerify message length.
+; ECDSA-P256 over 64 spaces || context || 0x00 || transcript hash (RFC 8446
+; 4.4.3). Identical to TLS; reuses linnea's signer.
+linnea_quic_build_cert_verify:
+    push rbx
+    push r12
+    push r13
+    sub rsp, 176                     ; [0..cv_prefix_len+32) content, [+32) digest
+    mov rbx, rdi                     ; out
+    mov r12, rsi                     ; transcript hash
+    mov r13, rdx                     ; private key
+    lea rdi, [rsp]                   ; content = cv_prefix || transcript hash
+    lea rsi, [cv_prefix]
+    mov rcx, cv_prefix_len
+    rep movsb
+    mov rsi, r12
+    mov rcx, 32
+    rep movsb
+    lea rdi, [rsp]                   ; digest = SHA-256(content)
+    mov esi, cv_prefix_len + 32
+    lea rdx, [rsp + 130]
+    call linnea_sha256
+    lea rdi, [rbx + 8]               ; signature = ECDSA(digest, priv)
+    lea rsi, [rsp + 130]
+    mov rdx, r13
+    call linnea_p256_ecdsa_sign      ; rax = DER signature length
+    mov r12, rax
+    mov byte [rbx], 0x0f             ; CertificateVerify
+    lea rax, [r12 + 4]               ; body = scheme(2) + siglen(2) + sig
+    mov [rbx + 3], al
+    shr rax, 8
+    mov [rbx + 2], al
+    shr rax, 8
+    mov [rbx + 1], al
+    mov word [rbx + 4], 0x0304       ; ecdsa_secp256r1_sha256 (0x0403)
+    mov rax, r12                     ; signature length (16-bit)
+    mov [rbx + 7], al
+    shr rax, 8
+    mov [rbx + 6], al
+    lea rax, [r12 + 8]
+    add rsp, 176
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_build_finished(rdi=out, rsi=s_hs traffic secret, rdx=transcript
+;   hash H(CH..CertVerify)) -> rax = Finished message length (36).
+; verify_data = HMAC(HKDF-Expand-Label(s_hs, "finished"), transcript hash).
+linnea_quic_build_finished:
+    push rbx
+    push r12
+    push r13
+    sub rsp, 48                      ; [0..32) finished key
+    mov rbx, rdi                     ; out
+    mov r12, rsi                     ; s_hs
+    mov r13, rdx                     ; transcript hash
+    mov rdi, r12                     ; finished_key = Expand-Label(s_hs,"finished")
+    lea rsi, [lbl_finished]
+    mov edx, 8
+    xor ecx, ecx
+    xor r8d, r8d
+    lea r9, [rsp]
+    sub rsp, 16
+    mov qword [rsp], 32
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    lea rdi, [rsp]                   ; verify_data = HMAC(finished_key, th)
+    mov esi, 32
+    mov rdx, r13
+    mov ecx, 32
+    lea r8, [rbx + 4]
+    call linnea_hmac_sha256
+    mov byte [rbx], 0x14             ; Finished
+    mov byte [rbx + 1], 0
+    mov byte [rbx + 2], 0
+    mov byte [rbx + 3], 32
+    mov eax, 36
+    add rsp, 48
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; linnea_quic_build_cert(rdi=out, rsi=cert_list, rdx=cert_list len)

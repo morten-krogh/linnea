@@ -67,12 +67,18 @@ $(TLSTEST_BIN): $(TLSTEST_OBJS)
 
 tlstest: $(TLSTEST_BIN)
 
+# The P-256 signer objects several QUIC message binaries need (build_cert_verify
+# reaches into linnea_p256_ecdsa). Defined before first use so prerequisite
+# expansion picks it up.
+QUICP256 = src/linnea_p256_ecdsa.o src/linnea_p256_mont.o src/linnea_p256_fe.o \
+           src/linnea_p256_scalar.o src/linnea_p256_point.o
+
 # --- QUIC crypto known-answer tests (own _start; RFC 9001 vectors) ---
 QUICTEST_BIN  = bin/linnea-quictest
 QUICTEST_OBJS = test/quic/linnea_quictest.o src/linnea_quic_crypto.o \
                 src/linnea_quic.o src/linnea_aesgcm.o src/linnea_sha256.o \
                 src/linnea_tls_kdf.o src/linnea_x25519.o src/linnea_fe25519.o \
-                src/linnea_print.o src/linnea_string.o
+                src/linnea_print.o src/linnea_string.o $(QUICP256)
 
 test/quic/linnea_quictest.o: test/quic/linnea_quictest.asm test/quic/quic_vectors.inc test/quic/quic_hs_vectors.inc $(INCS)
 	$(NASM) $(NASMFLAGS) -I test/quic/ -o $@ $<
@@ -88,7 +94,7 @@ QUICSRV_BIN  = bin/linnea-quicserver
 QUICSRV_OBJS = test/quic/linnea_quicserver.o src/linnea_quic.o \
                src/linnea_quic_crypto.o src/linnea_aesgcm.o src/linnea_sha256.o \
                src/linnea_tls_kdf.o src/linnea_x25519.o src/linnea_fe25519.o \
-               src/linnea_print.o src/linnea_string.o
+               src/linnea_print.o src/linnea_string.o $(QUICP256)
 
 test/quic/linnea_quicserver.o: test/quic/linnea_quicserver.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -102,7 +108,7 @@ quicserver: $(QUICSRV_BIN)
 QUICTP_BIN  = bin/linnea-quictp
 QUICTP_OBJS = test/quic/linnea_quictp.o src/linnea_quic.o src/linnea_quic_crypto.o \
               src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
-              src/linnea_x25519.o src/linnea_fe25519.o
+              src/linnea_x25519.o src/linnea_fe25519.o $(QUICP256)
 
 test/quic/linnea_quictp.o: test/quic/linnea_quictp.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -116,7 +122,7 @@ quictp: $(QUICTP_BIN)
 QUICSH_BIN  = bin/linnea-quicsh
 QUICSH_OBJS = test/quic/linnea_quicsh.o src/linnea_quic.o src/linnea_quic_crypto.o \
               src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
-              src/linnea_x25519.o src/linnea_fe25519.o
+              src/linnea_x25519.o src/linnea_fe25519.o $(QUICP256)
 
 test/quic/linnea_quicsh.o: test/quic/linnea_quicsh.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -130,7 +136,7 @@ quicsh: $(QUICSH_BIN)
 QUICEE_BIN  = bin/linnea-quicee
 QUICEE_OBJS = test/quic/linnea_quicee.o src/linnea_quic.o src/linnea_quic_crypto.o \
               src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
-              src/linnea_x25519.o src/linnea_fe25519.o
+              src/linnea_x25519.o src/linnea_fe25519.o $(QUICP256)
 
 test/quic/linnea_quicee.o: test/quic/linnea_quicee.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -144,7 +150,7 @@ quicee: $(QUICEE_BIN)
 QUICCERT_BIN  = bin/linnea-quiccert
 QUICCERT_OBJS = test/quic/linnea_quiccert.o src/linnea_quic.o src/linnea_quic_crypto.o \
                 src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
-                src/linnea_x25519.o src/linnea_fe25519.o src/linnea_pem.o
+                src/linnea_x25519.o src/linnea_fe25519.o src/linnea_pem.o $(QUICP256)
 
 test/quic/linnea_quiccert.o: test/quic/linnea_quiccert.asm test/tls/server.crt $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -154,12 +160,31 @@ $(QUICCERT_BIN): $(QUICCERT_OBJS)
 
 quiccert: $(QUICCERT_BIN)
 
+# --- test-only: CertificateVerify (signed) and Finished for aioquic ---
+QUICMSG_OBJS = src/linnea_quic.o src/linnea_quic_crypto.o src/linnea_aesgcm.o \
+               src/linnea_sha256.o src/linnea_tls_kdf.o src/linnea_x25519.o \
+               src/linnea_fe25519.o src/linnea_pem.o $(QUICP256)
+
+test/quic/linnea_quiccv.o: test/quic/linnea_quiccv.asm test/tls/server.key $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+test/quic/linnea_quicfin.o: test/quic/linnea_quicfin.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+bin/linnea-quiccv: test/quic/linnea_quiccv.o $(QUICMSG_OBJS)
+	$(LD) -o $@ $^
+bin/linnea-quicfin: test/quic/linnea_quicfin.o $(QUICMSG_OBJS)
+	$(LD) -o $@ $^
+
+quiccv: bin/linnea-quiccv
+quicfin: bin/linnea-quicfin
+
 clean:
 	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
 	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
 
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
-      $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN)
+      $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
+      bin/linnea-quiccv bin/linnea-quicfin
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd

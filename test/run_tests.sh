@@ -187,6 +187,22 @@ else
     check "quic Certificate test (skipped: aioquic/binary unavailable)" 0
 fi
 
+# QUIC CertificateVerify: the ECDSA signature verifies against the test cert.
+if python3 -c 'import aioquic, cryptography' 2>/dev/null && [ -x ./bin/linnea-quiccv ]; then
+    ./bin/linnea-quiccv | python3 test/quic/cv_verify.py >/dev/null 2>&1
+    check "quic: CertificateVerify signature verifies against the cert" $?
+else
+    check "quic CertificateVerify test (skipped: deps unavailable)" 0
+fi
+
+# QUIC Finished: the HMAC verify_data matches an independent computation.
+if python3 -c 'import aioquic, cryptography' 2>/dev/null && [ -x ./bin/linnea-quicfin ]; then
+    ./bin/linnea-quicfin | python3 test/quic/fin_verify.py >/dev/null 2>&1
+    check "quic: Finished verify_data matches the reference HMAC" $?
+else
+    check "quic Finished test (skipped: deps unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is
