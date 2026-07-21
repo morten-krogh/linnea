@@ -1025,6 +1025,10 @@ PYEOF
     timeout 60 python3 test/tls/fuzz_h2.py $CA 47446 120 >/dev/null 2>&1
     check "http2 fuzz (malformed frames + HPACK survive, server serves)" $?
 
+    # M20: strict stream-id validation + honouring SETTINGS_INITIAL_WINDOW_SIZE.
+    timeout 20 python3 test/tls/h2_conformance.py $CA 47446 >/dev/null 2>&1
+    check "http2 conformance (stream-id rules, initial window size)" $?
+
     kill $h2_pid 2>/dev/null
     wait $h2_pid 2>/dev/null
     # (h2 graceful drain — GOAWAY(last-stream) then finish open streams — is

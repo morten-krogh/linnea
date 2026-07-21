@@ -85,8 +85,10 @@ struc linnea_connection
     ; connection-wide bookkeeping is here.
     .h2_cwnd:        resq 1        ; connection send window (signed)
     .h2_rr_cursor:   resq 1        ; round-robin scheduler cursor (slot index)
-    .h2_last_stream: resq 1        ; highest client stream id accepted
+    .h2_last_stream: resq 1        ; highest client stream id seen
     .h2_rst_count:   resq 1        ; RST_STREAMs seen (rapid-reset guard)
+    .h2_done_count:  resq 1        ; streams whose body completed (reset budget)
+    .h2_init_swnd:   resq 1        ; peer's SETTINGS_INITIAL_WINDOW_SIZE
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

@@ -48,6 +48,8 @@ linnea_h2_init:
     mov qword [rdi + linnea_connection.h2_rr_cursor], 0
     mov qword [rdi + linnea_connection.h2_last_stream], 0
     mov qword [rdi + linnea_connection.h2_rst_count], 0
+    mov qword [rdi + linnea_connection.h2_done_count], 0
+    mov qword [rdi + linnea_connection.h2_init_swnd], LINNEA_H2_INIT_WINDOW
     ; zero the stream pool: every slot free (id 0)
     push rdi
     lea rdi, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]
@@ -188,10 +190,16 @@ linnea_h2_handle:
     add [rax + linnea_h2_stream.swnd], rcx
     jmp .f_ignore
 .f_rst:
-    ; RST_STREAM: drop the stream's slot; count resets (rapid-reset guard).
+    ; RST_STREAM: drop the stream's slot. Rate-based rapid-reset guard
+    ; (CVE-2023-44487): resets get a budget of LIMIT plus one token per eight
+    ; streams that completed. A reset flood (few/no completions) still trips
+    ; at ~LIMIT, but a busy, legitimate connection earns proportional headroom.
     inc qword [rbx + linnea_connection.h2_rst_count]
-    cmp qword [rbx + linnea_connection.h2_rst_count], LINNEA_H2_RST_LIMIT
-    ja .goaway_close                 ; CVE-2023-44487: too many resets
+    mov rax, [rbx + linnea_connection.h2_done_count]
+    shr rax, 3                       ; done_count / 8
+    add rax, LINNEA_H2_RST_LIMIT
+    cmp [rbx + linnea_connection.h2_rst_count], rax
+    ja .goaway_close
     movzx edx, byte [rsi + 5]
     and edx, 0x7f
     shl edx, 8
@@ -246,11 +254,55 @@ linnea_h2_handle:
     jmp .frames
 .f_settings:
     test r10b, LINNEA_H2_FLAG_ACK
-    jnz .f_ignore
-    mov dword [r13], 0x04000000      ; SETTINGS, length 0
+    jnz .f_settings_ack
+    ; parse the settings entries [rsi+9 .. rsi+r11) — honour
+    ; SETTINGS_INITIAL_WINDOW_SIZE; the length must be a multiple of 6.
+    lea rax, [rsi + 9]               ; entry cursor
+    lea rcx, [rsi + r11]             ; frame end
+.set_loop:
+    mov rdx, rcx
+    sub rdx, rax
+    jz .set_done
+    cmp rdx, 6
+    jb .goaway_close                 ; FRAME_SIZE_ERROR: partial entry
+    movzx edx, byte [rax]            ; setting id (16-bit)
+    shl edx, 8
+    movzx r8d, byte [rax + 1]
+    or edx, r8d
+    cmp edx, LINNEA_H2_SETTINGS_INITIAL_WINDOW_SIZE
+    jne .set_next
+    movzx r8d, byte [rax + 2]        ; value (32-bit, big-endian)
+    shl r8d, 8
+    movzx edx, byte [rax + 3]
+    or r8d, edx
+    shl r8d, 8
+    movzx edx, byte [rax + 4]
+    or r8d, edx
+    shl r8d, 8
+    movzx edx, byte [rax + 5]
+    or r8d, edx
+    cmp r8d, 0x7fffffff
+    ja .goaway_close                 ; FLOW_CONTROL_ERROR: window too large
+    push rax
+    push rcx
+    mov rdi, rbx
+    mov esi, r8d
+    call h2_apply_init_window        ; adjust init window + open streams
+    pop rcx
+    pop rax
+.set_next:
+    add rax, 6
+    jmp .set_loop
+.set_done:
+    mov dword [r13], 0x04000000      ; SETTINGS ACK, length 0
     mov byte [r13 + 4], LINNEA_H2_FLAG_ACK
     mov dword [r13 + 5], 0
     add r13, 9
+    add r12, r11
+    jmp .frames
+.f_settings_ack:
+    cmp r11, 9                       ; a SETTINGS ACK must carry no payload
+    jne .goaway_close                ; FRAME_SIZE_ERROR
     add r12, r11
     jmp .frames
 .f_ping:
@@ -484,6 +536,16 @@ h2_build_request:
     cmp qword [rsp + REQ + linnea_h2_req.path_ptr], 0
     je .err
 
+    ; stream-id validation (RFC 9113 5.1.1): a client stream must be odd and
+    ; numerically greater than every stream it has opened. Checked here (once
+    ; the block is whole) so a partial-block retry does not double-count.
+    mov r8, [rsp + L_SID]
+    test r8, 1
+    jz .err                          ; even id: connection error
+    cmp r8, [rbx + linnea_connection.h2_last_stream]
+    jbe .err                         ; not strictly increasing
+    mov [rbx + linnea_connection.h2_last_stream], r8
+
     ; --- serve the request: write the response at the out cursor --------
     mov rdi, rbx                     ; conn
     lea rsi, [rsp + REQ]             ; decoded request
@@ -552,7 +614,6 @@ h2_serve:
     ; draining: GOAWAY already went out, refuse this new stream
     cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_DRAINING
     je .drain_refuse
-    mov [rbx + linnea_connection.h2_last_stream], r8   ; last processed stream
     ; is_head = method == "HEAD"
     mov rdi, [r12 + linnea_h2_req.method_ptr]
     mov rsi, [r12 + linnea_h2_req.method_len]
@@ -669,7 +730,8 @@ h2_serve:
     call h2_slot_alloc               ; -> rax = slot* or 0 (pool full)
     test rax, rax
     jz .refused
-    mov qword [rax + linnea_h2_stream.swnd], LINNEA_H2_INIT_WINDOW
+    mov rcx, [rbx + linnea_connection.h2_init_swnd]   ; peer's initial window
+    mov [rax + linnea_h2_stream.swnd], rcx
     mov rcx, [rsp + S_BASE]
     mov [rax + linnea_h2_stream.file_base], rcx
     mov [rax + linnea_h2_stream.body_ptr], rcx
@@ -919,6 +981,7 @@ h2_schedule:
     pop rax
 .reap_free:
     mov qword [rax + linnea_h2_stream.id], 0
+    inc qword [rbx + linnea_connection.h2_done_count]   ; refills the reset budget
 .reap_next:
     inc ecx
     jmp .reap
@@ -1568,6 +1631,26 @@ h2_pool_active:
     add rdx, linnea_h2_stream_size
     dec ecx
     jnz .pa_loop
+    ret
+
+; h2_apply_init_window(rdi=conn, esi=new SETTINGS_INITIAL_WINDOW_SIZE) — record
+; the peer's initial stream send window (used for new streams) and shift every
+; open stream's window by the delta (RFC 9113 6.9.2). A window may go negative;
+; the scheduler simply will not send on it until a WINDOW_UPDATE lifts it > 0.
+h2_apply_init_window:
+    mov r8d, esi
+    sub r8, [rdi + linnea_connection.h2_init_swnd]   ; delta = new - old
+    mov [rdi + linnea_connection.h2_init_swnd], rsi
+    lea rdx, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]
+    mov ecx, LINNEA_H2_MAX_STREAMS
+.aiw_loop:
+    cmp qword [rdx + linnea_h2_stream.id], 0
+    je .aiw_next
+    add [rdx + linnea_h2_stream.swnd], r8
+.aiw_next:
+    add rdx, linnea_h2_stream_size
+    dec ecx
+    jnz .aiw_loop
     ret
 
 section .rodata
