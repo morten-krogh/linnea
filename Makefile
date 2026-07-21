@@ -184,7 +184,8 @@ test/quic/linnea_quichs.o: test/quic/linnea_quichs.asm $(INCS)
 
 bin/linnea-quichs: test/quic/linnea_quichs.o $(QUICMSG_OBJS) \
                    src/linnea_http3.o src/linnea_qpack.o src/linnea_hpack.o \
-                   src/linnea_static.o src/linnea_string.o src/linnea_quic_conn.o
+                   src/linnea_static.o src/linnea_string.o src/linnea_quic_conn.o \
+                   src/linnea_quic_server.o
 	$(LD) -o $@ $^
 
 quichs: bin/linnea-quichs
