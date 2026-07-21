@@ -24,6 +24,7 @@ default rel
 global linnea_aesgcm_init
 global linnea_aesgcm_seal
 global linnea_aesgcm_open
+global linnea_aes128_ecb
 
 section .rodata
 
@@ -80,6 +81,18 @@ linnea_aesgcm_init:
     pand xmm2, [ghash_poly]
     pxor xmm0, xmm2
     movdqu [rbp + linnea_aesgcm_ctx.h], xmm0
+    pop rbp
+    ret
+
+; linnea_aes128_ecb(rdi=ctx (key-expanded via linnea_aesgcm_init),
+;                    rsi=in16, rdx=out16) — a single AES-128 block encrypt.
+; Used for QUIC header protection (AES-ECB of a ciphertext sample).
+linnea_aes128_ecb:
+    push rbp
+    mov rbp, rdi
+    movdqu xmm0, [rsi]
+    call aes_enc_block
+    movdqu [rdx], xmm0
     pop rbp
     ret
 

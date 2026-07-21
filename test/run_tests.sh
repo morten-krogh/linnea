@@ -122,6 +122,19 @@ else
     check "crypto selftest (binary not built — run 'make selftest')" 1
 fi
 
+# QUIC crypto known-answer tests (RFC 9001 / 9000). Built by `make quictest`.
+if [ -x ./bin/linnea-quictest ]; then
+    if ./bin/linnea-quictest >/tmp/linnea_quictest.out 2>&1; then
+        check "quic crypto selftest ($(tr '\n' ' ' </tmp/linnea_quictest.out))" 0
+    else
+        check "quic crypto selftest" 1
+        cat /tmp/linnea_quictest.out
+    fi
+    rm -f /tmp/linnea_quictest.out
+else
+    check "quic crypto selftest (binary not built — run 'make quictest')" 1
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is

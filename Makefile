@@ -67,11 +67,26 @@ $(TLSTEST_BIN): $(TLSTEST_OBJS)
 
 tlstest: $(TLSTEST_BIN)
 
-clean:
-	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) test/crypto/*.o \
-	      test/tls/*.o $(CRYPTO_VECS)
+# --- QUIC crypto known-answer tests (own _start; RFC 9001 vectors) ---
+QUICTEST_BIN  = bin/linnea-quictest
+QUICTEST_OBJS = test/quic/linnea_quictest.o src/linnea_quic_crypto.o \
+                src/linnea_quic.o src/linnea_aesgcm.o src/linnea_sha256.o \
+                src/linnea_tls_kdf.o src/linnea_print.o src/linnea_string.o
 
-test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN)
+test/quic/linnea_quictest.o: test/quic/linnea_quictest.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(QUICTEST_BIN): $(QUICTEST_OBJS)
+	$(LD) -o $@ $^
+
+quictest: $(QUICTEST_BIN)
+	./$(QUICTEST_BIN)
+
+clean:
+	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
+	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
+
+test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN)
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd
