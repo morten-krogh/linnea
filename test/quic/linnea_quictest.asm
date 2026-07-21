@@ -13,8 +13,12 @@ extern linnea_quic_initial_secrets
 extern linnea_quic_hp_mask
 extern linnea_quic_varint_decode
 extern linnea_quic_varint_encode
+extern linnea_quic_unprotect
+extern linnea_quic_crypto_frame
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
+
+%include "quic_vectors.inc"
 
 ; CHECK dst, expected, len — compare and tally into r14d (total) / r15d (pass).
 %macro CHECK 3
@@ -86,6 +90,10 @@ out_client:  resb linnea_quic_keys_size
 out_server:  resb linnea_quic_keys_size
 mask_out:    resb 5
 enc_buf:     resb 8
+a2_client:   resb linnea_quic_keys_size
+a2_server:   resb linnea_quic_keys_size
+plain_buf:   resb 1500
+plain_len:   resq 1
 
 section .text
 _start:
@@ -119,6 +127,37 @@ _start:
     VIENC vi2, 15293, 2
     VIENC vi4, 494878333, 4
     VIENC vi8, 151288809941952652, 8
+
+    ; --- RFC 9001 A.2: unprotect the real client Initial packet ---
+    lea rdi, [quic_a2_dcid]
+    mov esi, 8
+    lea rdx, [a2_client]
+    lea rcx, [a2_server]
+    call linnea_quic_initial_secrets
+    lea rdi, [quic_a2_packet]
+    mov esi, quic_a2_packet_len
+    lea rdx, [a2_client]
+    lea rcx, [plain_buf]
+    call linnea_quic_unprotect
+    mov [plain_len], rax
+    ; the AEAD-open must succeed (a valid tag returns a non-negative length)
+    inc r14d
+    test rax, rax
+    js .a2_done
+    inc r15d
+    ; and the recovered frame bytes match the expected prefix
+    CHECK plain_buf, quic_a2_plain_prefix, quic_a2_plain_prefix_len
+    ; the first CRYPTO frame carries the ClientHello (handshake type 0x01)
+    lea rdi, [plain_buf]
+    mov rsi, [plain_len]
+    call linnea_quic_crypto_frame
+    inc r14d
+    test rax, rax
+    jz .a2_done
+    cmp byte [rax], 0x01
+    jne .a2_done
+    inc r15d
+.a2_done:
 
     ; print "quic-crypto <pass>/<total>\n"
     lea rdi, [msg_head]

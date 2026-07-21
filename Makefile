@@ -73,8 +73,8 @@ QUICTEST_OBJS = test/quic/linnea_quictest.o src/linnea_quic_crypto.o \
                 src/linnea_quic.o src/linnea_aesgcm.o src/linnea_sha256.o \
                 src/linnea_tls_kdf.o src/linnea_print.o src/linnea_string.o
 
-test/quic/linnea_quictest.o: test/quic/linnea_quictest.asm $(INCS)
-	$(NASM) $(NASMFLAGS) -o $@ $<
+test/quic/linnea_quictest.o: test/quic/linnea_quictest.asm test/quic/quic_vectors.inc $(INCS)
+	$(NASM) $(NASMFLAGS) -I test/quic/ -o $@ $<
 
 $(QUICTEST_BIN): $(QUICTEST_OBJS)
 	$(LD) -o $@ $^
