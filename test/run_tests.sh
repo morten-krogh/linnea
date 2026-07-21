@@ -179,6 +179,14 @@ else
     check "quic EncryptedExtensions test (skipped: aioquic/binary unavailable)" 0
 fi
 
+# QUIC Certificate message: the real test chain, framed and parsed by aioquic.
+if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quiccert ]; then
+    ./bin/linnea-quiccert | python3 test/quic/cert_parse.py >/dev/null 2>&1
+    check "quic: Certificate message parses in aioquic" $?
+else
+    check "quic Certificate test (skipped: aioquic/binary unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is

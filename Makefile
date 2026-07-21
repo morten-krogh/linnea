@@ -140,12 +140,26 @@ $(QUICEE_BIN): $(QUICEE_OBJS)
 
 quicee: $(QUICEE_BIN)
 
+# --- test-only: emit a Certificate message (real chain) for aioquic ---
+QUICCERT_BIN  = bin/linnea-quiccert
+QUICCERT_OBJS = test/quic/linnea_quiccert.o src/linnea_quic.o src/linnea_quic_crypto.o \
+                src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
+                src/linnea_x25519.o src/linnea_fe25519.o src/linnea_pem.o
+
+test/quic/linnea_quiccert.o: test/quic/linnea_quiccert.asm test/tls/server.crt $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(QUICCERT_BIN): $(QUICCERT_OBJS)
+	$(LD) -o $@ $^
+
+quiccert: $(QUICCERT_BIN)
+
 clean:
 	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
 	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
 
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
-      $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN)
+      $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN)
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd

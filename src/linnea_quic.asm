@@ -19,6 +19,7 @@ global linnea_quic_alpn_has
 global linnea_quic_build_transport_params
 global linnea_quic_build_sh
 global linnea_quic_build_ee
+global linnea_quic_build_cert
 
 extern linnea_quic_hp_mask
 extern linnea_quic_initial_secrets
@@ -231,6 +232,35 @@ linnea_quic_crypto_frame:
 .none:
     xor eax, eax
     xor edx, edx
+    ret
+
+; linnea_quic_build_cert(rdi=out, rsi=cert_list, rdx=cert_list len)
+;   -> rax = Certificate message length.
+; Wraps a pre-framed certificate_list (from linnea_pem_cert_list) in the TLS
+; Certificate handshake message (RFC 8446 4.4.2): an empty request context,
+; the certificate_list length, then the list. Identical to TLS.
+linnea_quic_build_cert:
+    push rbx
+    mov rbx, rdi                     ; message base
+    mov byte [rbx], 0x0b             ; Certificate
+    lea rax, [rdx + 4]               ; body length = ctx(1) + listlen(3) + list
+    mov [rbx + 3], al
+    shr rax, 8
+    mov [rbx + 2], al
+    shr rax, 8
+    mov [rbx + 1], al
+    mov byte [rbx + 4], 0            ; certificate_request_context length
+    mov rax, rdx                     ; certificate_list length (24-bit)
+    mov [rbx + 7], al
+    shr rax, 8
+    mov [rbx + 6], al
+    shr rax, 8
+    mov [rbx + 5], al
+    lea rdi, [rbx + 8]               ; copy the certificate_list verbatim
+    mov rcx, rdx
+    rep movsb
+    lea rax, [rdx + 8]               ; total message length
+    pop rbx
     ret
 
 ; linnea_quic_build_ee(rdi=out, rsi=odcid, rdx=odcid len, rcx=scid,
