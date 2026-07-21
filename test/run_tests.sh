@@ -144,8 +144,9 @@ if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quicserver ]; th
     python3 test/quic/h3_initial.py 47500 >/dev/null 2>&1
     sleep 0.4
     wait $qsrv 2>/dev/null
-    grep -q "quic-initial clienthello=" /tmp/linnea_quicsrv.out
-    check "quic: receive + decrypt a real aioquic Initial off the wire" $?
+    # decrypt the Initial, recover the ClientHello, and read its SNI + h3 ALPN
+    grep -q "quic-initial sni=localhost alpn-h3=1" /tmp/linnea_quicsrv.out
+    check "quic: decrypt aioquic Initial + parse ClientHello (SNI, h3 ALPN)" $?
     rm -f /tmp/linnea_quicsrv.out
 else
     check "quic wire test (skipped: aioquic or quicserver unavailable)" 0

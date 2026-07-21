@@ -14,6 +14,8 @@ global linnea_quic_unprotect
 global linnea_quic_crypto_frame
 global linnea_quic_recv_initial
 global linnea_quic_protect
+global linnea_quic_ch_parse
+global linnea_quic_alpn_has
 
 extern linnea_quic_hp_mask
 extern linnea_quic_initial_secrets
@@ -226,6 +228,149 @@ linnea_quic_crypto_frame:
 .none:
     xor eax, eax
     xor edx, edx
+    ret
+
+; linnea_quic_ch_parse(rdi=ClientHello, rsi=len, rdx=out linnea_quic_ch)
+; Walks the ClientHello extensions and records the server_name (SNI), the ALPN
+; protocol list, and the QUIC transport parameters. Bounds-checked; missing
+; fields are left zero.
+linnea_quic_ch_parse:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdx                     ; out struct
+    lea r12, [rdi + rsi]             ; ClientHello end
+    mov r15, rdi                     ; save the ClientHello pointer
+    mov rdi, rbx                     ; zero the out struct (6 qwords)
+    xor eax, eax
+    mov ecx, 6
+    rep stosq
+    mov rdi, r15
+    ; skip type(1)+len(3)+version(2)+random(32) = 38, to session_id length
+    lea r13, [rdi + 38]
+    cmp r13, r12
+    jae .chp_done
+    movzx eax, byte [r13]            ; session_id length
+    lea r13, [r13 + 1 + rax]         ; -> cipher_suites length
+    lea rax, [r13 + 2]
+    cmp rax, r12
+    ja .chp_done
+    movzx eax, byte [r13]
+    shl eax, 8
+    movzx ecx, byte [r13 + 1]
+    or eax, ecx                      ; cipher_suites length
+    lea r13, [r13 + 2 + rax]         ; -> compression length
+    cmp r13, r12
+    jae .chp_done
+    movzx eax, byte [r13]
+    lea r13, [r13 + 1 + rax]         ; -> extensions length
+    lea rax, [r13 + 2]
+    cmp rax, r12
+    ja .chp_done
+    add r13, 2                       ; -> first extension
+.chp_ext:
+    lea rax, [r13 + 4]
+    cmp rax, r12
+    ja .chp_done                     ; no room for an extension header
+    movzx eax, byte [r13]            ; extension type
+    shl eax, 8
+    movzx ecx, byte [r13 + 1]
+    or eax, ecx
+    movzx ecx, byte [r13 + 2]        ; extension length
+    shl ecx, 8
+    movzx edx, byte [r13 + 3]
+    or ecx, edx
+    lea r14, [r13 + 4]               ; extension data
+    lea r15, [r14 + rcx]             ; extension end
+    cmp r15, r12
+    ja .chp_done
+    test eax, eax
+    jz .chp_sni                      ; server_name (0x0000)
+    cmp eax, 0x10
+    je .chp_alpn                     ; ALPN (0x0010)
+    cmp eax, 0x39
+    je .chp_tp                       ; QUIC transport parameters (0x0039)
+.chp_next:
+    mov r13, r15
+    jmp .chp_ext
+.chp_sni:
+    ; list_len(2), name_type(1), name_len(2), name — take the first host_name
+    lea rax, [r14 + 5]
+    cmp rax, r15
+    ja .chp_next
+    movzx eax, byte [r14 + 3]        ; name length
+    shl eax, 8
+    movzx ecx, byte [r14 + 4]
+    or eax, ecx
+    lea rdx, [r14 + 5]               ; name pointer
+    lea rcx, [rdx + rax]
+    cmp rcx, r15
+    ja .chp_next
+    mov [rbx + linnea_quic_ch.sni_ptr], rdx
+    mov [rbx + linnea_quic_ch.sni_len], rax
+    jmp .chp_next
+.chp_alpn:
+    lea rax, [r14 + 2]
+    cmp rax, r15
+    ja .chp_next
+    movzx eax, byte [r14]            ; ProtocolNameList length
+    shl eax, 8
+    movzx ecx, byte [r14 + 1]
+    or eax, ecx
+    lea rdx, [r14 + 2]               ; the list itself
+    mov [rbx + linnea_quic_ch.alpn_ptr], rdx
+    mov [rbx + linnea_quic_ch.alpn_len], rax
+    jmp .chp_next
+.chp_tp:
+    mov [rbx + linnea_quic_ch.tp_ptr], r14
+    mov rax, r15
+    sub rax, r14
+    mov [rbx + linnea_quic_ch.tp_len], rax
+    jmp .chp_next
+.chp_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_alpn_has(rdi=list, rsi=list len, rdx=proto, rcx=proto len)
+;   -> rax = 1 if the ALPN protocol list contains proto, else 0.
+; The list is a sequence of length-prefixed names (RFC 7301).
+linnea_quic_alpn_has:
+    lea r8, [rdi + rsi]              ; list end
+.al_loop:
+    cmp rdi, r8
+    jae .al_no
+    movzx r9d, byte [rdi]            ; this protocol's length
+    inc rdi
+    lea rax, [rdi + r9]
+    cmp rax, r8
+    ja .al_no
+    cmp r9, rcx
+    jne .al_skip
+    ; compare r9 bytes at rdi vs proto
+    push rsi
+    push rdi
+    push rcx
+    mov rsi, rdx
+    mov rcx, r9
+    repe cmpsb
+    pop rcx
+    pop rdi
+    pop rsi
+    je .al_yes
+.al_skip:
+    add rdi, r9
+    jmp .al_loop
+.al_yes:
+    mov eax, 1
+    ret
+.al_no:
+    xor eax, eax
     ret
 
 ; linnea_quic_recv_initial(rdi=datagram, rsi=len, rdx=plaintext buf)

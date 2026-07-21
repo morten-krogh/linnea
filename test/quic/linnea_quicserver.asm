@@ -8,10 +8,13 @@
 ; Usage: linnea-quicserver  (binds 127.0.0.1:47500)
 
 %include "linnea_syscall.inc"
+%include "linnea_quic.inc"
 
 global _start
 
 extern linnea_quic_recv_initial
+extern linnea_quic_ch_parse
+extern linnea_quic_alpn_has
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 
@@ -19,16 +22,18 @@ extern linnea_print_u64_stdout
 %define SYS_RECVFROM 45
 
 section .rodata
-msg_ok:   db "quic-initial clienthello="
-msg_ok_len equ $ - msg_ok
-msg_type: db " type="
-msg_type_len equ $ - msg_type
+msg_sni:  db "quic-initial sni="
+msg_sni_len equ $ - msg_sni
+msg_alpn: db " alpn-h3="
+msg_alpn_len equ $ - msg_alpn
+proto_h3: db "h3"
 msg_nl:   db 10
 
 section .bss
 sa:        resb 16
 dgram:     resb 2048
 plaintext: resb 2048
+ch_out:    resb linnea_quic_ch_size
 
 section .text
 _start:
@@ -69,17 +74,31 @@ _start:
     call linnea_quic_recv_initial    ; rax = CH ptr, rdx = CH len
     test rax, rax
     jz .loop                         ; not a decryptable Initial; keep listening
-    mov r14, rax                     ; ClientHello ptr
-    mov r15, rdx                     ; ClientHello length
-    lea rdi, [msg_ok]
-    mov esi, msg_ok_len
+    ; parse the ClientHello for SNI and ALPN
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [ch_out]
+    call linnea_quic_ch_parse
+    ; "quic-initial sni=<sni>"
+    lea rdi, [msg_sni]
+    mov esi, msg_sni_len
     call linnea_print_stdout
-    mov edi, r15d
-    call linnea_print_u64_stdout
-    lea rdi, [msg_type]
-    mov esi, msg_type_len
+    mov rdi, [ch_out + linnea_quic_ch.sni_ptr]
+    mov rsi, [ch_out + linnea_quic_ch.sni_len]
+    test rdi, rdi
+    jz .no_sni
     call linnea_print_stdout
-    movzx edi, byte [r14]            ; the ClientHello handshake type (0x01)
+.no_sni:
+    ; " alpn-h3=<0|1>"
+    lea rdi, [msg_alpn]
+    mov esi, msg_alpn_len
+    call linnea_print_stdout
+    mov rdi, [ch_out + linnea_quic_ch.alpn_ptr]
+    mov rsi, [ch_out + linnea_quic_ch.alpn_len]
+    lea rdx, [proto_h3]
+    mov ecx, 2
+    call linnea_quic_alpn_has
+    mov edi, eax
     call linnea_print_u64_stdout
     lea rdi, [msg_nl]
     mov esi, 1

@@ -8,3 +8,13 @@ struc linnea_quic_keys
 endstruc
 
 LINNEA_QUIC_MAX_CID   equ 20      ; RFC 9000: connection IDs are 0..20 bytes
+
+; The pieces of a ClientHello the QUIC handshake needs.
+struc linnea_quic_ch
+    .sni_ptr:  resq 1      ; server_name (host_name), 0 = none
+    .sni_len:  resq 1
+    .alpn_ptr: resq 1      ; ALPN ProtocolNameList (after the 2-byte list length)
+    .alpn_len: resq 1
+    .tp_ptr:   resq 1      ; QUIC transport parameters (extension 0x39)
+    .tp_len:   resq 1
+endstruc
