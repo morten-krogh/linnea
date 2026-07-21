@@ -152,6 +152,15 @@ else
     check "quic wire test (skipped: aioquic or quicserver unavailable)" 0
 fi
 
+# QUIC transport parameters (for EncryptedExtensions): aioquic parses linnea's
+# encoding and the values round-trip.
+if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quictp ]; then
+    ./bin/linnea-quictp | python3 test/quic/tp_parse.py >/dev/null 2>&1
+    check "quic: transport parameters parse in aioquic" $?
+else
+    check "quic transport-params test (skipped: aioquic/binary unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is

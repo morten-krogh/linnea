@@ -98,11 +98,25 @@ $(QUICSRV_BIN): $(QUICSRV_OBJS)
 
 quicserver: $(QUICSRV_BIN)
 
+# --- test-only: emit encoded QUIC transport parameters for aioquic to parse ---
+QUICTP_BIN  = bin/linnea-quictp
+QUICTP_OBJS = test/quic/linnea_quictp.o src/linnea_quic.o src/linnea_quic_crypto.o \
+              src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
+              src/linnea_x25519.o src/linnea_fe25519.o
+
+test/quic/linnea_quictp.o: test/quic/linnea_quictp.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(QUICTP_BIN): $(QUICTP_OBJS)
+	$(LD) -o $@ $^
+
+quictp: $(QUICTP_BIN)
+
 clean:
 	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
 	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
 
-test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN)
+test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) $(QUICTP_BIN)
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd

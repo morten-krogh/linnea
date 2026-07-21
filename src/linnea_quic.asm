@@ -16,6 +16,7 @@ global linnea_quic_recv_initial
 global linnea_quic_protect
 global linnea_quic_ch_parse
 global linnea_quic_alpn_has
+global linnea_quic_build_transport_params
 
 extern linnea_quic_hp_mask
 extern linnea_quic_initial_secrets
@@ -228,6 +229,151 @@ linnea_quic_crypto_frame:
 .none:
     xor eax, eax
     xor edx, edx
+    ret
+
+; tp_int(rdi=cursor, rsi=param id, rdx=integer value) -> rax = new cursor.
+; Encodes one integer transport parameter: id, then the length of the value's
+; varint, then the value varint (RFC 9000 18).
+tp_int:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r14, rdi                     ; cursor
+    mov r13, rsi                     ; id
+    mov r12, rdx                     ; value
+    mov rdi, r14
+    mov rsi, r13
+    call linnea_quic_varint_encode   ; id
+    add r14, rax
+    sub rsp, 16
+    lea rdi, [rsp]                   ; measure the value varint
+    mov rsi, r12
+    call linnea_quic_varint_encode
+    mov rbx, rax                     ; value byte length
+    mov rdi, r14
+    mov rsi, rbx
+    call linnea_quic_varint_encode   ; length
+    add r14, rax
+    lea rsi, [rsp]                   ; copy the value bytes
+    mov rdi, r14
+    mov rcx, rbx
+    rep movsb
+    add r14, rbx
+    add rsp, 16
+    mov rax, r14
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tp_bytes(rdi=cursor, rsi=param id, rdx=data, rcx=data len) -> rax=new cursor.
+tp_bytes:
+    push rbx
+    push r13
+    push r14
+    push r15
+    mov r14, rdi                     ; cursor
+    mov r13, rsi                     ; id
+    mov r15, rdx                     ; data
+    mov rbx, rcx                     ; data length
+    mov rdi, r14
+    mov rsi, r13
+    call linnea_quic_varint_encode   ; id
+    add r14, rax
+    mov rdi, r14
+    mov rsi, rbx
+    call linnea_quic_varint_encode   ; length
+    add r14, rax
+    mov rsi, r15                     ; data
+    mov rdi, r14
+    mov rcx, rbx
+    rep movsb
+    add r14, rbx
+    mov rax, r14
+    pop r15
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; linnea_quic_build_transport_params(rdi=out, rsi=odcid, rdx=odcid len,
+;   rcx=scid, r8=scid len) -> rax = encoded length.
+; Server transport parameters for EncryptedExtensions (RFC 9000 18.2).
+linnea_quic_build_transport_params:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbx, rdi                     ; out (base)
+    mov r13, rsi                     ; odcid
+    mov r14, rdx                     ; odcid len
+    mov r15, rcx                     ; scid
+    mov rbp, r8                      ; scid len
+    mov r12, rbx                     ; cursor
+    mov rdi, r12                     ; original_destination_connection_id (0x00)
+    xor esi, esi
+    mov rdx, r13
+    mov rcx, r14
+    call tp_bytes
+    mov r12, rax
+    mov rdi, r12                     ; initial_source_connection_id (0x0f)
+    mov esi, 0x0f
+    mov rdx, r15
+    mov rcx, rbp
+    call tp_bytes
+    mov r12, rax
+    mov rdi, r12                     ; max_idle_timeout (0x01) = 30000 ms
+    mov esi, 0x01
+    mov edx, 30000
+    call tp_int
+    mov r12, rax
+    mov rdi, r12                     ; max_udp_payload_size (0x03)
+    mov esi, 0x03
+    mov edx, 1472
+    call tp_int
+    mov r12, rax
+    mov rdi, r12                     ; initial_max_data (0x04)
+    mov esi, 0x04
+    mov edx, 1048576
+    call tp_int
+    mov r12, rax
+    mov rdi, r12                     ; initial_max_stream_data_bidi_local (0x05)
+    mov esi, 0x05
+    mov edx, 262144
+    call tp_int
+    mov r12, rax
+    mov rdi, r12                     ; initial_max_stream_data_bidi_remote (0x06)
+    mov esi, 0x06
+    mov edx, 262144
+    call tp_int
+    mov r12, rax
+    mov rdi, r12                     ; initial_max_stream_data_uni (0x07)
+    mov esi, 0x07
+    mov edx, 262144
+    call tp_int
+    mov r12, rax
+    mov rdi, r12                     ; initial_max_streams_bidi (0x08)
+    mov esi, 0x08
+    mov edx, 100
+    call tp_int
+    mov r12, rax
+    mov rdi, r12                     ; initial_max_streams_uni (0x09)
+    mov esi, 0x09
+    mov edx, 100
+    call tp_int
+    mov r12, rax
+    mov rax, r12
+    sub rax, rbx                     ; total length
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; linnea_quic_ch_parse(rdi=ClientHello, rsi=len, rdx=out linnea_quic_ch)
