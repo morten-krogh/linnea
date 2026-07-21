@@ -959,6 +959,29 @@ PYEOF
     sleep 0.3
     timeout 10 python3 test/tls/h2_bringup.py $CA 47446 >/dev/null 2>&1
     check "http2 connection bring-up (preface, settings, ping, goaway)" $?
+
+    # M16: a real HTTP/2 client (curl's nghttp2, so genuine HPACK — Huffman,
+    # static table) gets its HEADERS decoded. The M16 echo response returns
+    # the decoded method + path, so a correct :path (query included) proves
+    # the decoder end to end.
+    rl="--resolve localhost:47446:127.0.0.1"
+    body=$(curl -s --http2 --cacert $CA $rl "https://localhost:47446/hi/there?q=1")
+    [ "$body" = "linnea h2: GET /hi/there?q=1" ]
+    check "http2 request served over h2 (HPACK decode, method+path)" $?
+    # negotiated protocol really is h2
+    ver=$(curl -s -o /dev/null --http2 --cacert $CA $rl \
+        -w '%{http_version}' "https://localhost:47446/x")
+    [ "$ver" = "2" ]
+    check "http2 request uses HTTP/2 (not downgraded)" $?
+    # two requests on one connection: keep-alive + dynamic-table-size-update,
+    # plus a Huffman-coded custom header the decoder must parse and skip
+    two=$(curl -s --http2 --cacert $CA $rl \
+        -H "x-linnea-probe: huffman-coded-value-98765" \
+        "https://localhost:47446/one" "https://localhost:47446/two/leaf")
+    [ "$two" = "linnea h2: GET /one
+linnea h2: GET /two/leaf" ]
+    check "http2 keep-alive: two requests, one connection" $?
+
     kill $h2_pid 2>/dev/null
     wait $h2_pid 2>/dev/null
 
