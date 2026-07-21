@@ -170,6 +170,15 @@ else
     check "quic ServerHello test (skipped: aioquic/binary unavailable)" 0
 fi
 
+# QUIC EncryptedExtensions (h3 ALPN + transport parameters): aioquic's TLS
+# parser reads the ALPN and the transport-parameters extension decodes.
+if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quicee ]; then
+    ./bin/linnea-quicee | python3 test/quic/ee_parse.py >/dev/null 2>&1
+    check "quic: EncryptedExtensions parse in aioquic (h3 + transport params)" $?
+else
+    check "quic EncryptedExtensions test (skipped: aioquic/binary unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is

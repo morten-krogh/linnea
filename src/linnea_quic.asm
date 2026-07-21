@@ -18,6 +18,7 @@ global linnea_quic_ch_parse
 global linnea_quic_alpn_has
 global linnea_quic_build_transport_params
 global linnea_quic_build_sh
+global linnea_quic_build_ee
 
 extern linnea_quic_hp_mask
 extern linnea_quic_initial_secrets
@@ -230,6 +231,67 @@ linnea_quic_crypto_frame:
 .none:
     xor eax, eax
     xor edx, edx
+    ret
+
+; linnea_quic_build_ee(rdi=out, rsi=odcid, rdx=odcid len, rcx=scid,
+;   r8=scid len) -> rax = EncryptedExtensions message length.
+; Two extensions: ALPN echoing "h3", and the QUIC transport parameters
+; (extension 0x39). The TLS EE builder knows neither, so QUIC has its own.
+linnea_quic_build_ee:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi                     ; out base
+    mov r13, rsi                     ; odcid
+    mov r14, rdx                     ; odcid len
+    mov r15, rcx                     ; scid
+    mov rbp, r8                      ; scid len
+    mov byte [rbx], 0x08             ; EncryptedExtensions (lengths later)
+    lea r12, [rbx + 6]               ; extensions cursor (after type+len+extslen)
+    ; ALPN extension echoing "h3"
+    mov word [r12], 0x1000           ; type 0x0010
+    mov word [r12 + 2], 0x0500       ; ext length 5
+    mov word [r12 + 4], 0x0300       ; ProtocolNameList length 3
+    mov byte [r12 + 6], 2            ; protocol name length
+    mov word [r12 + 7], 0x3368       ; "h3"
+    add r12, 9
+    ; QUIC transport parameters extension (0x0039)
+    mov word [r12], 0x3900
+    lea rdi, [r12 + 4]               ; write the parameters after the ext header
+    mov rsi, r13
+    mov rdx, r14
+    mov rcx, r15
+    mov r8, rbp
+    call linnea_quic_build_transport_params   ; rax = parameters length
+    mov rcx, rax                     ; ext length (big-endian)
+    mov [r12 + 3], cl
+    shr rcx, 8
+    mov [r12 + 2], cl
+    lea r12, [r12 + 4 + rax]         ; end of extensions
+    ; extensions length = r12 - (out + 6)
+    mov rcx, r12
+    lea rdx, [rbx + 6]
+    sub rcx, rdx
+    mov [rbx + 5], cl
+    shr rcx, 8
+    mov [rbx + 4], cl
+    ; handshake message length = total - 4
+    mov rax, r12
+    sub rax, rbx                     ; total message length
+    lea rcx, [rax - 4]
+    mov byte [rbx + 1], 0
+    mov [rbx + 3], cl
+    shr rcx, 8
+    mov [rbx + 2], cl
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
     ret
 
 ; linnea_quic_build_sh(rdi=out, rsi=server_pub32, rdx=server_random32)
