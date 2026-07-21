@@ -87,6 +87,9 @@ h3scratch:   resb 2048                ; QPACK literal scratch
 s_1rtt_pn:   resq 1                   ; server 1-RTT packet number
 s_pl_ptr:    resq 1
 s_pl_len:    resq 1
+s_sid:       resq 1                   ; stream id of the request being served
+s_sdata:     resq 1                   ; that stream's data pointer
+s_slen:      resq 1                   ; and length
 ch_out:      resb linnea_quic_ch_size
 server_pub:  resb 32
 sh_buf:      resb 128
@@ -419,7 +422,9 @@ _start:
     syscall
     jmp .loop
 
-; --- 1-RTT (short-header) packet: an HTTP/3 request on a QUIC stream ---
+; --- 1-RTT (short-header) packet: HTTP/3 requests on QUIC streams ---
+; One packet can carry several STREAM frames (requests on different streams),
+; so walk them all and answer each on the stream it arrived on.
 .onertt_in:
     lea rdi, [dgram]
     mov rsi, r13
@@ -429,15 +434,23 @@ _start:
     call linnea_quic_unprotect_short
     test rax, rax
     js .loop
-    lea rdi, [plaintext]
-    mov rsi, rax
-    call linnea_quic_stream_frame    ; skips ACK, returns the first STREAM data
+    lea r14, [plaintext]             ; scan cursor
+    lea r15, [plaintext + rax]       ; end of the frames
+.stream_scan:
+    cmp r14, r15
+    jae .loop
+    mov rdi, r14
+    mov rsi, r15
+    sub rsi, r14
+    call linnea_quic_stream_frame    ; rax=data, rdx=len, r8=stream id, r9=next
     test rax, rax
-    jz .loop
-    test r8, r8
-    jnz .loop                        ; only the client request stream (0) for now
-    mov r14, rax                     ; stream data ptr
-    mov r15, rdx                     ; stream data len
+    jz .loop                         ; no further STREAM frames
+    mov r14, r9                      ; resume point for the next frame
+    mov [s_sid], r8
+    mov [s_sdata], rax
+    mov [s_slen], rdx
+    test r8, 3
+    jnz .stream_scan                 ; not a client-initiated bidi stream
     ; zero the request struct and point the QPACK scratch at h3scratch
     lea rdi, [req]
     xor eax, eax
@@ -448,25 +461,29 @@ _start:
     lea rax, [h3scratch + 2048]
     mov [req + linnea_h2_req.scratch_end], rax
     ; parse the HTTP/3 request (HEADERS frame -> QPACK decode)
-    mov rdi, r14
-    mov rsi, r15
+    mov rdi, [s_sdata]
+    mov rsi, [s_slen]
     lea rdx, [req]
     call linnea_h3_read_headers
     test rax, rax
-    jnz .loop                        ; not a complete request
-    ; serve the request's :path from the document root into a STREAM frame
-    ; (type 0x09 = STREAM|FIN, stream id 0, then the HTTP/3 response)
+    jnz .stream_scan                 ; not a complete request on this stream
+    ; response STREAM frame: type 0x09 (STREAM|FIN), this stream's id, then the
+    ; HTTP/3 response. Each response rides its own 1-RTT packet, so the frame
+    ; needs no LEN — its data runs to the end of the packet.
     mov byte [strm_pay], 0x09
-    mov byte [strm_pay + 1], 0x00
+    lea rdi, [strm_pay + 1]
+    mov rsi, [s_sid]
+    call linnea_quic_varint_encode   ; rax = stream-id varint length
+    lea rbx, [rax + 1]               ; STREAM frame header length
+    lea rcx, [strm_pay + rbx]
     lea rdi, [req]
     lea rsi, [docroot]
     mov edx, docroot_len
-    lea rcx, [strm_pay + 2]
     call linnea_h3_serve             ; rax = h3 response length
+    lea rdx, [rax + rbx]             ; STREAM frame length
     lea rsi, [strm_pay]
-    lea rdx, [rax + 2]               ; STREAM frame length = header (2) + h3
     call .send_1rtt
-    jmp .loop
+    jmp .stream_scan
 
 ; .send_1rtt(rsi = payload ptr, rdx = payload len) — build a short-header 1-RTT
 ; packet with the current server packet number, protect it with the server

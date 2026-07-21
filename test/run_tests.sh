@@ -280,6 +280,20 @@ else
     check "h3 end-to-end test (skipped: deps unavailable)" 0
 fi
 
+# Several HTTP/3 requests on one connection: three GETs on three streams arrive
+# coalesced in one packet; linnea answers each on its own stream.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
+    timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
+    hspid=$!
+    sleep 0.4
+    python3 test/quic/h3_multi_test.py 47501 >/dev/null 2>&1
+    check "h3: multiple requests on one connection, each on its own stream" $?
+    kill $hspid 2>/dev/null
+    wait $hspid 2>/dev/null
+else
+    check "h3 multi-stream test (skipped: deps unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is
