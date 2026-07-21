@@ -190,6 +190,20 @@ bin/linnea-quichs: test/quic/linnea_quichs.o $(QUICMSG_OBJS) \
 
 quichs: bin/linnea-quichs
 
+# --- test-only: QUIC connection pool (allocation, exhaustion, idle sweep) ---
+POOLTEST_BIN  = bin/linnea-pooltest
+POOLTEST_OBJS = test/quic/linnea_pooltest.o src/linnea_quic_conn.o \
+                src/linnea_print.o src/linnea_string.o
+
+test/quic/linnea_pooltest.o: test/quic/linnea_pooltest.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(POOLTEST_BIN): $(POOLTEST_OBJS)
+	$(LD) -o $@ $^
+
+pooltest: $(POOLTEST_BIN)
+	./$(POOLTEST_BIN)
+
 # --- test-only: QPACK decoder (reads a field section on stdin) ---
 QPACKTEST_BIN  = bin/linnea-qpacktest
 QPACKTEST_OBJS = test/quic/linnea_qpacktest.o src/linnea_qpack.o src/linnea_hpack.o
@@ -239,7 +253,7 @@ clean:
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
       bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs $(QPACKTEST_BIN) \
-      $(H3TEST_BIN) $(H3RESP_BIN)
+      $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN)
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd

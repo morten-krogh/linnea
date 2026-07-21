@@ -58,6 +58,8 @@ extern linnea_quic_unprotect_hs
 extern linnea_quic_unprotect_short
 extern linnea_quic_crypto_frame
 extern linnea_quic_stream_frame
+extern linnea_quic_close_frame
+extern linnea_quic_conn_free
 extern linnea_quic_varint_encode
 extern linnea_quic_varint_decode
 extern linnea_x25519
@@ -462,8 +464,17 @@ linnea_quic_server_datagram:
     call linnea_quic_unprotect_short
     test rax, rax
     js .done
+    ; a peer that closes cleanly gets its slot back at once instead of waiting
+    ; for the idle sweep — this is what keeps rapid connection churn from
+    ; filling the pool.
+    mov r14, rax                     ; frame bytes
+    lea rdi, [plaintext]
+    mov rsi, rax
+    call linnea_quic_close_frame
+    test rax, rax
+    jnz .peer_closed
+    lea r15, [plaintext + r14]       ; end of the frames
     lea r14, [plaintext]             ; scan cursor
-    lea r15, [plaintext + rax]       ; end of the frames
 .stream_scan:
     cmp r14, r15
     jae .done
@@ -512,6 +523,12 @@ linnea_quic_server_datagram:
     lea rsi, [strm_pay]
     call .send_1rtt
     jmp .stream_scan
+
+; the peer said goodbye: release its slot and stop reading this datagram
+.peer_closed:
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
 
 ; .refresh_peer(rax = conn) — make it the current connection and record the
 ; address this datagram came from, so replies follow a peer that has migrated.

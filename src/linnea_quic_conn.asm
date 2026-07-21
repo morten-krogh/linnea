@@ -13,6 +13,8 @@ default rel
 global linnea_quic_conn_lookup
 global linnea_quic_conn_alloc
 global linnea_quic_conn_free
+global linnea_quic_conn_sweep
+global linnea_quic_conn_active
 
 section .bss
 conn_pool: resb LINNEA_QUIC_MAX_CONNS * linnea_quic_conn_size
@@ -37,6 +39,12 @@ linnea_quic_conn_lookup:
     mov rcx, [rdi]
     cmp rcx, [rax + linnea_quic_conn.scid]
     jne .miss
+    ; a packet arrived for it, so it is not idle
+    push rax
+    call conn_now
+    pop rcx
+    mov [rcx + linnea_quic_conn.last_active], rax
+    mov rax, rcx
     ret
 .miss:
     xor eax, eax
@@ -50,6 +58,12 @@ linnea_quic_conn_alloc:
     push r14
     mov r13, rdi                     ; peer
     mov r14, rsi                     ; peer len
+    ; reclaim anything that has gone quiet before looking for a free slot, so
+    ; connections abandoned without a close cannot fill the pool for good
+    call conn_now
+    mov rdi, rax
+    mov esi, LINNEA_QUIC_IDLE_SECS
+    call linnea_quic_conn_sweep
     xor r12d, r12d                   ; index
     lea rbx, [conn_pool]
 .scan:
@@ -91,6 +105,8 @@ linnea_quic_conn_alloc:
     mov rsi, r13
     lea rdi, [rbx + linnea_quic_conn.peer]
     rep movsb
+    call conn_now
+    mov [rbx + linnea_quic_conn.last_active], rax
     mov rax, rbx
     jmp .aret
 .arand_fail:
@@ -101,6 +117,63 @@ linnea_quic_conn_alloc:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; linnea_quic_conn_sweep(rdi=now seconds, rsi=idle seconds) -> rax = slots freed.
+; Frees every slot whose last packet is older than the idle window. The clock is
+; a parameter rather than read here so a test can age connections instantly.
+linnea_quic_conn_sweep:
+    push rbx
+    push r12
+    xor r12d, r12d                   ; freed
+    lea rbx, [conn_pool]
+    mov rcx, LINNEA_QUIC_MAX_CONNS
+.sw_slot:
+    cmp qword [rbx + linnea_quic_conn.in_use], 0
+    je .sw_next
+    mov rax, rdi
+    sub rax, [rbx + linnea_quic_conn.last_active]
+    jb .sw_next                      ; stamped ahead of now: treat as active,
+                                     ; never let the subtraction wrap and
+                                     ; reclaim a live connection
+    cmp rax, rsi
+    jbe .sw_next                     ; still within the idle window
+    mov qword [rbx + linnea_quic_conn.in_use], 0
+    inc r12d
+.sw_next:
+    add rbx, linnea_quic_conn_size
+    dec rcx
+    jnz .sw_slot
+    mov eax, r12d
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_conn_active() -> rax = slots currently in use.
+linnea_quic_conn_active:
+    xor eax, eax
+    lea rdx, [conn_pool]
+    mov ecx, LINNEA_QUIC_MAX_CONNS
+.ac_slot:
+    cmp qword [rdx + linnea_quic_conn.in_use], 0
+    je .ac_next
+    inc eax
+.ac_next:
+    add rdx, linnea_quic_conn_size
+    dec ecx
+    jnz .ac_slot
+    ret
+
+; conn_now() -> rax = CLOCK_MONOTONIC seconds. Monotonic so a clock step cannot
+; make every connection look ancient (or eternally fresh).
+conn_now:
+    sub rsp, 24
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    mov edi, LINNEA_CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    add rsp, 24
     ret
 
 ; linnea_quic_conn_free(rdi=conn) — return the slot to the pool.

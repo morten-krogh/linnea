@@ -16,6 +16,7 @@
 LINNEA_QUIC_MAX_CONNS equ 64        ; connections per worker
 LINNEA_QUIC_RXBUF_SIZE equ 2048     ; linnea_quic_rxbuf, the datagram we read into
 LINNEA_QUIC_SCID_LEN  equ 8         ; every connection ID we issue is 8 bytes
+LINNEA_QUIC_IDLE_SECS equ 30        ; reclaim a slot after this long with no packet
 
 ; Handshake progress, so a packet can be checked against the connection's stage.
 LINNEA_QUIC_ST_NEW       equ 0      ; allocated, nothing processed yet
@@ -28,6 +29,7 @@ struc linnea_quic_conn
     .peer_len:   resq 1              ; sockaddr length
     .state:      resq 1
     .pn_1rtt:    resq 1              ; next 1-RTT packet number we send
+    .last_active: resq 1             ; CLOCK_MONOTONIC seconds of the last packet
     .scid:       resb LINNEA_QUIC_SCID_LEN   ; ours (index || random)
     .dcid:       resb LINNEA_QUIC_MAX_CID    ; the peer's, our DCID when sending
     .peer:       resb 16                     ; sockaddr_in of the client
@@ -43,6 +45,14 @@ struc linnea_quic_conn
 endstruc
 
 ; linnea_quic_conn_lookup(rdi=dcid ptr, rsi=dcid len) -> rax = conn* or 0.
+;   Marks the slot active, so a connection in use never falls to the sweep.
 ; linnea_quic_conn_alloc(rdi=peer ptr, rsi=peer len) -> rax = conn* or 0.
-;   Zeroes the slot, assigns a fresh connection ID and records the peer.
-; linnea_quic_conn_free(rdi=conn) — return the slot to the pool.
+;   Sweeps idle slots first, then zeroes one, assigns a fresh connection ID and
+;   records the peer. Returns 0 only when the pool is genuinely full of live
+;   connections.
+; linnea_quic_conn_free(rdi=conn) — return the slot to the pool. A client that
+;   closes cleanly frees its slot at once; the sweep is the backstop for those
+;   that simply vanish.
+; linnea_quic_conn_sweep(rdi=now seconds, rsi=idle seconds) -> rax = slots freed.
+;   Exposed with an explicit clock so it can be tested without waiting.
+; linnea_quic_conn_active() -> rax = slots currently in use.

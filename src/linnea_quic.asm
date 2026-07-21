@@ -15,6 +15,7 @@ global linnea_quic_unprotect_hs
 global linnea_quic_unprotect_short
 global linnea_quic_crypto_frame
 global linnea_quic_stream_frame
+global linnea_quic_close_frame
 global linnea_quic_recv_initial
 global linnea_quic_protect
 global linnea_quic_ch_parse
@@ -465,6 +466,94 @@ linnea_quic_stream_frame:
     xor eax, eax
     xor edx, edx
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_close_frame(rdi=frames, rsi=len) -> rax = 1 if the packet carries
+; a CONNECTION_CLOSE (0x1c transport, 0x1d application), else 0. A peer closing
+; down sends it alone or straight after an ACK, so the walk only needs to step
+; over PADDING/PING/ACK; anything else ends the scan. Missing a close buried
+; behind other frames costs nothing — the idle sweep still reclaims the slot.
+linnea_quic_close_frame:
+    push rbx
+    push r12
+    lea rsi, [rdi + rsi]             ; end
+.cf_scan:
+    cmp rdi, rsi
+    jae .cf_none
+    movzx ebx, byte [rdi]
+    cmp bl, 0x1c
+    je .cf_yes
+    cmp bl, 0x1d
+    je .cf_yes
+    test bl, bl                      ; PADDING
+    jz .cf_skip1
+    cmp bl, 0x01                     ; PING
+    je .cf_skip1
+    cmp bl, 0x02                     ; ACK
+    je .cf_ack
+    cmp bl, 0x03                     ; ACK with ECN
+    je .cf_ack
+    jmp .cf_none
+.cf_skip1:
+    inc rdi
+    jmp .cf_scan
+.cf_ack:
+    inc rdi
+    call linnea_quic_varint_decode   ; Largest Acknowledged
+    test rdx, rdx
+    jz .cf_none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Delay
+    test rdx, rdx
+    jz .cf_none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Count
+    test rdx, rdx
+    jz .cf_none
+    mov r12, rax
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; First ACK Range
+    test rdx, rdx
+    jz .cf_none
+    add rdi, rdx
+.cf_range:
+    test r12, r12
+    jz .cf_ecn
+    call linnea_quic_varint_decode   ; Gap
+    test rdx, rdx
+    jz .cf_none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Length
+    test rdx, rdx
+    jz .cf_none
+    add rdi, rdx
+    dec r12
+    jmp .cf_range
+.cf_ecn:
+    cmp bl, 0x03
+    jne .cf_scan
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .cf_none
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .cf_none
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .cf_none
+    add rdi, rdx
+    jmp .cf_scan
+.cf_yes:
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.cf_none:
+    xor eax, eax
     pop r12
     pop rbx
     ret

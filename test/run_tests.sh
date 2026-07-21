@@ -239,6 +239,15 @@ else
     check "quic handshake-confirm test (skipped: aioquic/binary unavailable)" 0
 fi
 
+# QUIC connection pool: allocation, exhaustion, the idle sweep and slot reuse.
+if [ -x ./bin/linnea-pooltest ]; then
+    out=$(./bin/linnea-pooltest)
+    rc=$?
+    check "quic pool selftest ($out)" $rc
+else
+    check "quic pool selftest (skipped: binary unavailable)" 0
+fi
+
 # QPACK decode: field sections encoded by pylsqpack (static + literals + Huffman,
 # zero dynamic table) decode to the right HTTP/3 request pseudo-headers.
 if python3 -c 'import pylsqpack' 2>/dev/null && [ -x ./bin/linnea-qpacktest ]; then
@@ -324,6 +333,20 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     wait $h3_pid 2>/dev/null
 else
     check "h3 io_uring tests (skipped: deps unavailable)" 0
+fi
+
+# Connection churn: more connections than the pool has slots, each closing
+# cleanly, must all be served — the slot has to come back on CONNECTION_CLOSE.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
+    timeout 60 ./bin/linnea-quichs >/dev/null 2>&1 &
+    hspid=$!
+    sleep 0.4
+    python3 test/quic/h3_churn_test.py 47501 100 >/dev/null 2>&1
+    check "quic: 100 connections through a 64-slot pool (close frees the slot)" $?
+    kill $hspid 2>/dev/null
+    wait $hspid 2>/dev/null
+else
+    check "quic churn test (skipped: deps unavailable)" 0
 fi
 
 # Connection pool: two connections whose handshakes and requests are fully
