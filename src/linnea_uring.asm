@@ -77,6 +77,8 @@ extern linnea_h2_conn_free
 extern linnea_string_iequal
 extern linnea_network_quic_listener
 extern linnea_quic_server_init
+extern linnea_quic_altsvc_set
+extern linnea_h3_server
 extern linnea_quic_server_datagram
 extern linnea_quic_rxbuf
 
@@ -276,6 +278,12 @@ linnea_uring_run:
     lea rcx, [rcx + linnea_config_location.root]
     mov rdx, [rdx + linnea_config_server.key_priv]
     call linnea_quic_server_init
+    ; advertise HTTP/3 on this port from the TCP responses
+    imul rdx, r12, linnea_config_server_size
+    lea rdx, [rbx + rdx + linnea_config.servers]
+    movzx edi, word [rdx + linnea_config_server.port]
+    mov [linnea_h3_server], r12      ; only this server advertises it
+    call linnea_quic_altsvc_set
     call linnea_uring_arm_qrecv
     jmp .quic_done
 .quic_next:

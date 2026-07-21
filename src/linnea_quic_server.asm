@@ -37,6 +37,10 @@ default rel
 global linnea_quic_server_init
 global linnea_quic_server_datagram
 global linnea_quic_rxbuf
+global linnea_quic_altsvc_set
+global linnea_h3_altsvc
+global linnea_h3_altsvc_len
+global linnea_h3_server
 
 extern linnea_h3_read_headers
 extern linnea_h3_serve
@@ -61,6 +65,7 @@ extern linnea_quic_stream_frame
 extern linnea_quic_close_frame
 extern linnea_quic_ack_record
 extern linnea_quic_build_ack
+extern linnea_string_from_u64
 extern linnea_quic_conn_free
 extern linnea_quic_varint_encode
 extern linnea_quic_varint_decode
@@ -70,6 +75,10 @@ extern linnea_sha256_update
 extern linnea_sha256_final
 
 section .rodata
+altsvc_pre:  db 'h3=":'
+altsvc_pre_len equ $ - altsvc_pre
+altsvc_post: db '"; ma=86400'
+altsvc_post_len equ $ - altsvc_post
 x25519_base:  db 9
               times 31 db 0
 server_priv:  db 0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x4a,0x4b,0x4c,0x4d,0x4e,0x4f
@@ -116,6 +125,9 @@ s_cert_len:  resq 1
 s_priv:      resq 1
 s_ini_len:   resq 1
 s_hsmsg_len: resq 1
+linnea_h3_altsvc:     resb 48    ; Alt-Svc value, e.g. h3=":443"; ma=86400
+linnea_h3_altsvc_len: resq 1     ; 0 until a QUIC listener is bound
+linnea_h3_server:     resq 1     ; index of the server that owns that listener
 s_acklen:      resq 1
 s_docroot_ptr: resq 1
 s_docroot_len: resq 1
@@ -133,6 +145,34 @@ linnea_quic_server_init:
     mov [s_docroot_ptr], rcx
     mov [s_docroot_len], r8
     xor eax, eax
+    ret
+
+; linnea_quic_altsvc_set(rdi=port) — build the Alt-Svc value advertising HTTP/3
+; on this port. HTTP/1.1 and HTTP/2 responses carry it so a client that reached
+; us over TCP learns it can use HTTP/3; without it browsers never try QUIC.
+linnea_quic_altsvc_set:
+    push rbx
+    push r12
+    mov r12, rdi                     ; port
+    lea rbx, [linnea_h3_altsvc]
+    lea rsi, [altsvc_pre]
+    mov rdi, rbx
+    mov ecx, altsvc_pre_len
+    rep movsb
+    mov rbx, rdi
+    mov rdi, r12
+    mov rsi, rbx
+    call linnea_string_from_u64      ; port digits
+    add rbx, rax
+    lea rsi, [altsvc_post]
+    mov rdi, rbx
+    mov ecx, altsvc_post_len
+    rep movsb
+    lea rax, [linnea_h3_altsvc]
+    sub rdi, rax
+    mov [linnea_h3_altsvc_len], rdi
+    pop r12
+    pop rbx
     ret
 
 ; linnea_quic_server_datagram(rdi=length, rsi=peer sockaddr, rdx=peer len,

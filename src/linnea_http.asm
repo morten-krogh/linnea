@@ -73,6 +73,9 @@
 
 default rel
 
+extern linnea_h3_altsvc
+extern linnea_h3_altsvc_len
+extern linnea_h3_server
 %include "linnea_syscall.inc"
 %include "linnea_config.inc"
 %include "linnea_connection.inc"
@@ -171,6 +174,8 @@ hdr_content_enc: db 13, 10, "Content-Encoding: "
 hdr_content_enc_len equ $ - hdr_content_enc
 hdr_vary:       db 13, 10, "Vary: Accept-Encoding"
 hdr_vary_len    equ $ - hdr_vary
+hdr_altsvc:     db 13, 10, "Alt-Svc: "
+hdr_altsvc_len  equ $ - hdr_altsvc
 hdr_accept_ranges: db 13, 10, "Accept-Ranges: bytes"
 hdr_accept_ranges_len equ $ - hdr_accept_ranges
 hdr_content_range: db 13, 10, "Content-Range: bytes "
@@ -1339,6 +1344,20 @@ linnea_http_handle:
     mov esi, hdr_accept_ranges_len
     call .append
     call .append_validators
+    ; Alt-Svc, when a QUIC listener is up: tells the client it can reach this
+    ; origin over HTTP/3 next time.
+    cmp qword [linnea_h3_altsvc_len], 0
+    je .no_altsvc
+    mov eax, [rbx + linnea_connection.server]
+    cmp rax, [linnea_h3_server]
+    jne .no_altsvc                 ; a different origin: not ours to advertise
+    lea rdi, [hdr_altsvc]
+    mov esi, hdr_altsvc_len
+    call .append
+    lea rdi, [linnea_h3_altsvc]
+    mov rsi, [linnea_h3_altsvc_len]
+    call .append
+.no_altsvc:
     cmp qword [rsp + 24], 0
     je .conn_close_hdr
     lea rdi, [hdr_keepalive]

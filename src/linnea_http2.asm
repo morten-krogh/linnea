@@ -23,6 +23,9 @@ global linnea_h2_after_send
 global linnea_h2_conn_free
 
 extern linnea_hpack_decode
+extern linnea_h3_altsvc
+extern linnea_h3_altsvc_len
+extern linnea_h3_server
 ; static-file resolution lives in linnea_static.asm (shared with HTTP/3)
 extern linnea_static_normalize
 extern linnea_static_open
@@ -38,6 +41,8 @@ section .rodata
 h2_preface: db "PRI * HTTP/2.0", 13, 10, 13, 10, "SM", 13, 10, 13, 10
 h2_preface_len equ $ - h2_preface
 
+hdr_altsvc_name: db "alt-svc"
+hdr_altsvc_name_len equ $ - hdr_altsvc_name
 mime_txt_h2:    db "text/plain"
 mime_txt_h2_len equ $ - mime_txt_h2
 
@@ -713,6 +718,18 @@ h2_serve:
     lea rdx, [h2_numbuf]
     mov rcx, [rsp + S_CLEN]
     call h2_enc_hdr
+    ; Alt-Svc, when a QUIC listener is up (name is not in the static table)
+    cmp qword [linnea_h3_altsvc_len], 0
+    je .no_altsvc_h2
+    mov eax, [rbx + linnea_connection.server]
+    cmp rax, [linnea_h3_server]
+    jne .no_altsvc_h2              ; a different origin: not ours to advertise
+    lea rsi, [hdr_altsvc_name]
+    mov rdx, hdr_altsvc_name_len
+    lea rcx, [linnea_h3_altsvc]
+    mov r8, [linnea_h3_altsvc_len]
+    call h2_enc_hdr_lit
+.no_altsvc_h2:
     mov rbp, rdi
     sub rbp, r15                     ; payload length
     ; flags: END_HEADERS, plus END_STREAM when there is no body
@@ -1239,6 +1256,40 @@ h2_enc_int:
     or eax, r8d
     mov [rdi], al
     inc rdi
+    ret
+
+; h2_enc_hdr_lit(rdi=dst, rsi=name ptr, rdx=name len, rcx=value ptr, r8=value
+; len) -> rdi advanced. Literal header field without indexing whose name is
+; also a literal (name index 0), for headers outside the static table.
+h2_enc_hdr_lit:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    mov rbx, rsi                     ; name ptr
+    mov rbp, rdx                     ; name len
+    mov r12, rcx                     ; value ptr
+    mov r13, r8                      ; value len
+    mov byte [rdi], 0                ; literal, name index 0 -> name follows
+    inc rdi
+    mov rsi, rbp                     ; name length: 7-bit prefix, H = 0
+    mov cl, 7
+    xor r8d, r8d
+    call h2_enc_int
+    mov rsi, rbx
+    mov rcx, rbp
+    rep movsb
+    mov rsi, r13                     ; value length: 7-bit prefix, H = 0
+    mov cl, 7
+    xor r8d, r8d
+    call h2_enc_int
+    mov rsi, r12
+    mov rcx, r13
+    rep movsb
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
     ret
 
 ; h2_enc_hdr(rdi=dst, esi=name index, rdx=value ptr, rcx=value len) -> rdi adv.

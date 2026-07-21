@@ -326,6 +326,19 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_ack_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): replies acknowledge received packets" $?
 
+    # Alt-Svc: the TCP responses advertise HTTP/3 on this port, which is how a
+    # browser discovers it at all
+    hdrs=$(curl -si --http1.1 --cacert test/tls/server.crt \
+                --resolve localhost:47452:127.0.0.1 \
+                https://localhost:47452/hello.txt)
+    echo "$hdrs" | grep -qi 'alt-svc: h3=":47452"'
+    check "h3 (io_uring): HTTP/1.1 advertises Alt-Svc for h3" $?
+    hdrs=$(curl -si --http2 --cacert test/tls/server.crt \
+                --resolve localhost:47452:127.0.0.1 \
+                https://localhost:47452/hello.txt)
+    echo "$hdrs" | grep -qi 'alt-svc: h3=":47452"'
+    check "h3 (io_uring): HTTP/2 advertises Alt-Svc for h3" $?
+
     # the UDP listener must not disturb TCP on the same host and port
     body=$(curl -s --http2 --cacert test/tls/server.crt \
                  --resolve localhost:47452:127.0.0.1 \
