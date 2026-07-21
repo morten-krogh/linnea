@@ -19,10 +19,20 @@ default rel
 %include "linnea_qpack_data.inc"
 
 global linnea_qpack_decode
+global linnea_qpack_encode_response
 
 extern hpack_int
 extern hpack_str
 extern emit_field
+
+section .rodata
+; status -> QPACK static-table index (RFC 9204 Appendix A). Statuses not listed
+; are encoded as a literal with the :status name reference (index 24).
+qpack_status_tab:
+    dw 100, 63,  103, 24,  200, 25,  204, 64,  206, 65,  302, 66
+    dw 304, 26,  400, 67,  403, 68,  404, 27,  421, 69,  425, 70
+    dw 500, 71,  503, 28
+qpack_status_end:
 
 section .text
 
@@ -164,6 +174,157 @@ linnea_qpack_decode:
 .err_limit:
     mov rax, -LINNEA_HPACK_ERR_LIMIT
 .ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; qenc_int(rdi=out, rax=value, cl=N prefix bits, dl=pattern) -> rdi advanced.
+; Prefix-integer encoding (RFC 7541 5.1 == RFC 9204 4.1.1). Clobbers rax/r8/r9.
+qenc_int:
+    mov r8d, 1
+    shl r8d, cl
+    dec r8d                          ; max = (1<<N)-1
+    cmp rax, r8
+    jae .qi_big
+    or dl, al                        ; pattern | value (fits in the prefix)
+    mov [rdi], dl
+    inc rdi
+    ret
+.qi_big:
+    mov r9b, dl
+    or r9b, r8b                       ; pattern | max
+    mov [rdi], r9b
+    inc rdi
+    sub rax, r8
+.qi_cont:
+    cmp rax, 128
+    jb .qi_last
+    mov r9, rax
+    and r9b, 0x7f
+    or r9b, 0x80
+    mov [rdi], r9b
+    inc rdi
+    shr rax, 7
+    jmp .qi_cont
+.qi_last:
+    mov [rdi], al
+    inc rdi
+    ret
+
+; qenc_str(rdi=out, rsi=str, rdx=len) -> rdi advanced. Length prefix (N=7, no
+; Huffman) then the raw bytes. Clobbers rax/rcx/r8/r9.
+qenc_str:
+    mov rax, rdx
+    push rsi
+    push rdx
+    mov cl, 7
+    xor edx, edx                     ; pattern 0x00 (H=0)
+    call qenc_int
+    pop rdx
+    pop rsi
+    mov rcx, rdx
+    rep movsb
+    ret
+
+; linnea_qpack_encode_response(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
+;   r8=clen_ptr, r9=clen_len) -> rax = field-section length.
+; Encodes :status (indexed if a static value, else literal with name ref 24),
+; content-type (name ref 44) and content-length (name ref 4) with literal
+; values. No dynamic table — matches a zero-capacity decoder.
+linnea_qpack_encode_response:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 24                      ; [0]=out start, [8..11]=status digits
+    mov rbx, rdi                     ; out cursor
+    mov [rsp], rdi                   ; out start
+    mov r12d, esi                    ; status
+    mov r13, rdx                     ; content-type ptr
+    mov r14, rcx                     ; content-type len
+    mov r15, r8                      ; content-length ptr
+    mov rbp, r9                      ; content-length len
+    ; field section prefix: Required Insert Count = 0, Delta Base = 0
+    mov word [rbx], 0x0000
+    add rbx, 2
+    ; --- :status ---
+    lea rsi, [qpack_status_tab]
+    lea r10, [qpack_status_end]
+.st_loop:
+    cmp rsi, r10
+    jae .st_literal
+    movzx eax, word [rsi]
+    cmp eax, r12d
+    je .st_found
+    add rsi, 4
+    jmp .st_loop
+.st_found:
+    movzx eax, word [rsi + 2]        ; static index
+    mov rdi, rbx
+    mov cl, 6
+    mov dl, 0xc0                     ; indexed field line, static table
+    call qenc_int
+    mov rbx, rdi
+    jmp .after_status
+.st_literal:
+    mov rdi, rbx
+    mov eax, 24                      ; literal w/ name ref :status (static)
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    mov rbx, rdi
+    ; format the status as three ASCII digits
+    mov eax, r12d
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    add al, '0'
+    mov [rsp + 8], al
+    mov eax, edx
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    mov [rsp + 9], al
+    add dl, '0'
+    mov [rsp + 10], dl
+    mov rdi, rbx
+    lea rsi, [rsp + 8]
+    mov rdx, 3
+    call qenc_str
+    mov rbx, rdi
+.after_status:
+    ; --- content-type: literal with name reference (static index 44) ---
+    mov rdi, rbx
+    mov eax, 44
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    mov rdi, rdi                     ; (rdi already advanced)
+    mov rsi, r13
+    mov rdx, r14
+    call qenc_str
+    mov rbx, rdi
+    ; --- content-length: literal with name reference (static index 4) ---
+    mov rdi, rbx
+    mov eax, 4
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    mov rsi, r15
+    mov rdx, rbp
+    call qenc_str
+    mov rbx, rdi
+    ; length = cursor - start
+    mov rax, rbx
+    sub rax, [rsp]
+    add rsp, 24
+    pop rbp
     pop r15
     pop r14
     pop r13

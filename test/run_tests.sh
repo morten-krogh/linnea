@@ -257,6 +257,15 @@ else
     check "h3 framing test (skipped: pylsqpack/binary unavailable)" 0
 fi
 
+# HTTP/3 response building: linnea frames a HEADERS (QPACK-encoded status,
+# content-type, content-length) + DATA response that pylsqpack decodes.
+if python3 -c 'import pylsqpack' 2>/dev/null && [ -x ./bin/linnea-h3resp ]; then
+    python3 test/quic/h3resp_test.py >/dev/null 2>&1
+    check "h3: response HEADERS+DATA built and QPACK-decodes (status/ct/cl)" $?
+else
+    check "h3 response test (skipped: pylsqpack/binary unavailable)" 0
+fi
+
 # QUIC 1-RTT data path: after the handshake, the client sends stream data in a
 # short-header packet; linnea unprotects it with the 1-RTT keys, parses the
 # STREAM frame, and echoes the payload.

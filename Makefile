@@ -214,6 +214,21 @@ $(H3TEST_BIN): $(H3TEST_OBJS)
 
 h3test: $(H3TEST_BIN)
 
+# --- test-only: HTTP/3 response builder (writes a response to stdout) ---
+H3RESP_BIN  = bin/linnea-h3resp
+H3RESP_OBJS = test/quic/linnea_h3resp.o src/linnea_http3.o src/linnea_qpack.o \
+              src/linnea_hpack.o src/linnea_quic.o src/linnea_quic_crypto.o \
+              src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
+              src/linnea_x25519.o src/linnea_fe25519.o $(QUICP256)
+
+test/quic/linnea_h3resp.o: test/quic/linnea_h3resp.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(H3RESP_BIN): $(H3RESP_OBJS)
+	$(LD) -o $@ $^
+
+h3resp: $(H3RESP_BIN)
+
 clean:
 	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
 	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
@@ -221,7 +236,7 @@ clean:
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
       bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs $(QPACKTEST_BIN) \
-      $(H3TEST_BIN)
+      $(H3TEST_BIN) $(H3RESP_BIN)
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd
