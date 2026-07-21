@@ -100,6 +100,7 @@ plain_len:   resq 1
 prot_buf:    resb 256
 hs_client:   resb linnea_quic_keys_size
 hs_server:   resb linnea_quic_keys_size
+hs_secrets_out: resb 64
 
 section .text
 _start:
@@ -192,6 +193,7 @@ _start:
     lea rdx, [qhs_th]
     lea rcx, [hs_client]
     lea r8, [hs_server]
+    lea r9, [hs_secrets_out]
     call linnea_quic_hs_secrets
     CHECK hs_client, qhs_exp_client, 44
     CHECK hs_server, qhs_exp_server, 44

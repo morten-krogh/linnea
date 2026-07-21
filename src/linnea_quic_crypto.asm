@@ -155,7 +155,8 @@ linnea_quic_initial_secrets:
 ; TLS 1.3 handshake key schedule (fresh, no PSK) reused for QUIC: ECDHE, then
 ; early -> derived -> handshake secret -> c/s hs traffic secrets, and from each
 ; the QUIC handshake packet keys. The primitives are the same the TLS handshake
-; uses; only the final key labels ("quic ...") differ.
+; uses; only the final key labels ("quic ...") differ. r9 (out secrets) also
+; receives the c_hs and s_hs traffic secrets (64 bytes) for the Finished MACs.
 linnea_quic_hs_secrets:
     push rbx
     push r12
@@ -170,6 +171,7 @@ linnea_quic_hs_secrets:
     mov r13, rdx                     ; transcript hash
     mov r14, rcx                     ; out client keys
     mov r15, r8                      ; out server keys
+    mov rbp, r9                      ; out traffic secrets (c_hs || s_hs)
     ; shared = X25519(server_priv, client_pub)
     lea rdi, [rsp]
     mov rsi, r12
@@ -210,6 +212,14 @@ linnea_quic_hs_secrets:
     mov rcx, r13
     lea r8, [rsp + 160]
     call linnea_tls_derive_secret
+    ; export the traffic secrets to the caller (c_hs then s_hs)
+    lea rsi, [rsp + 128]
+    mov rdi, rbp
+    mov ecx, 32
+    rep movsb
+    lea rsi, [rsp + 160]
+    mov ecx, 32
+    rep movsb
     ; QUIC handshake packet keys from each traffic secret
     lea rdi, [rsp + 128]
     mov rsi, r14

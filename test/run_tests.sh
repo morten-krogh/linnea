@@ -203,14 +203,15 @@ else
     check "quic Finished test (skipped: deps unavailable)" 0
 fi
 
-# QUIC handshake on the wire: linnea replies to a client Initial with a server
-# Initial (ACK + ServerHello); aioquic decrypts it and processes the SH.
+# QUIC handshake on the wire: linnea replies to a client Initial with a
+# coalesced Initial (ACK + ServerHello) and Handshake packet (EE, Certificate,
+# CertificateVerify, Finished); aioquic completes the TLS 1.3 handshake.
 if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
     timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
     hspid=$!
     sleep 0.4
     python3 test/quic/hs_test.py 47501 >/dev/null 2>&1
-    check "quic: server Initial drives aioquic past the ServerHello" $?
+    check "quic: full handshake completes in aioquic (h3 negotiated)" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
 else
