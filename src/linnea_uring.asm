@@ -70,6 +70,7 @@ extern linnea_ktls_enable
 extern linnea_h2_init
 extern linnea_h2_handle
 extern linnea_h2_after_send
+extern linnea_h2_conn_free
 extern linnea_string_iequal
 
 section .rodata
@@ -1260,6 +1261,12 @@ linnea_uring_run:
     lea rdi, [log_nl]
     mov esi, 1
     call linnea_log_write
+    ; free any in-flight HTTP/2 stream body mappings (M18 pool lives in up_buf)
+    cmp qword [r12 + linnea_connection.is_h2], 0
+    je .close_file
+    mov rdi, r12
+    call linnea_h2_conn_free
+.close_file:
     mov rdi, [r12 + linnea_connection.file_base]
     test rdi, rdi
     jz .close_no_file

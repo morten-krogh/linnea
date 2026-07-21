@@ -1015,6 +1015,11 @@ PYEOF
     [ "$ct400" = "400" ]
     check "http2 path traversal refused (400)" $?
 
+    # M18: multiplexing — concurrent streams with interleaved DATA, the
+    # rapid-reset (CVE-2023-44487) defense, and stream-pool exhaustion.
+    timeout 30 python3 test/tls/h2_multiplex.py $CA 47446 >/dev/null 2>&1
+    check "http2 multiplexing (concurrent streams, rapid-reset, pool cap)" $?
+
     kill $h2_pid 2>/dev/null
     wait $h2_pid 2>/dev/null
 

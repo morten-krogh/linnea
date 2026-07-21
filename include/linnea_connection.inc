@@ -80,13 +80,13 @@ struc linnea_connection
     .tls_phase:     resq 1
     .is_h2:         resq 1         ; 1 = HTTP/2 connection (post-handoff)
     .h2_state:      resq 1         ; LINNEA_H2_* connection state
-    ; --- HTTP/2 single-stream response send state (M17) --------------
-    .h2_send_stream: resq 1        ; stream whose body is streaming (0 = none)
-    .h2_body_ptr:    resq 1        ; next unframed body byte (mmap + offset)
-    .h2_body_rem:    resq 1        ; body bytes not yet framed
-    .h2_end_stream:  resq 1        ; 1 = the final DATA frame sets END_STREAM
-    .h2_swnd:        resq 1        ; per-stream send window (signed)
+    ; --- HTTP/2 multiplexing state (M18) -----------------------------
+    ; Per-stream body state lives in a pool overlaid on up_buf; only
+    ; connection-wide bookkeeping is here.
     .h2_cwnd:        resq 1        ; connection send window (signed)
+    .h2_rr_cursor:   resq 1        ; round-robin scheduler cursor (slot index)
+    .h2_last_stream: resq 1        ; highest client stream id accepted
+    .h2_rst_count:   resq 1        ; RST_STREAMs seen (rapid-reset guard)
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

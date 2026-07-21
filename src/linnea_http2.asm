@@ -20,6 +20,7 @@ default rel
 global linnea_h2_init
 global linnea_h2_handle
 global linnea_h2_after_send
+global linnea_h2_conn_free
 
 extern linnea_hpack_decode
 extern linnea_config_instance
@@ -42,8 +43,17 @@ section .text
 ; preface. The caller sends out_ptr/out_rem, then reads.
 linnea_h2_init:
     mov qword [rdi + linnea_connection.h2_state], LINNEA_H2_PREFACE
-    mov qword [rdi + linnea_connection.h2_send_stream], 0
     mov qword [rdi + linnea_connection.h2_cwnd], LINNEA_H2_INIT_WINDOW
+    mov qword [rdi + linnea_connection.h2_rr_cursor], 0
+    mov qword [rdi + linnea_connection.h2_last_stream], 0
+    mov qword [rdi + linnea_connection.h2_rst_count], 0
+    ; zero the stream pool: every slot free (id 0)
+    push rdi
+    lea rdi, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]
+    xor eax, eax
+    mov ecx, LINNEA_H2_POOL_BYTES / 8
+    rep stosq
+    pop rdi
     lea rax, [rdi + linnea_connection.out_buf]
     ; SETTINGS frame: length 12, type 4, flags 0, stream 0, two settings
     mov byte [rax], 0
@@ -57,11 +67,11 @@ linnea_h2_init:
     mov byte [rax + 9], 0
     mov byte [rax + 10], LINNEA_H2_SETTINGS_HEADER_TABLE_SIZE
     mov dword [rax + 11], 0         ; value 0
-    ; MAX_CONCURRENT_STREAMS = 1: peers serialize streams, so M17 serves one
-    ; request at a time (real multiplexing is M18).
+    ; MAX_CONCURRENT_STREAMS = LINNEA_H2_MAX_STREAMS (16): the size of our
+    ; per-connection body-streaming pool.
     mov byte [rax + 15], 0
     mov byte [rax + 16], LINNEA_H2_SETTINGS_MAX_CONCURRENT_STREAMS
-    mov dword [rax + 17], 0x01000000    ; value 1, big-endian
+    mov dword [rax + 17], 0x10000000    ; value 16, big-endian
     mov [rdi + linnea_connection.out_ptr], rax
     mov qword [rdi + linnea_connection.out_rem], 21
     mov qword [rdi + linnea_connection.file_rem], 0
@@ -134,16 +144,18 @@ linnea_h2_handle:
     je .f_goaway
     cmp r9d, LINNEA_H2_FT_WINDOW_UPDATE
     je .f_window
+    cmp r9d, LINNEA_H2_FT_RST_STREAM
+    je .f_rst
     cmp r9d, LINNEA_H2_FT_PRIORITY
     je .f_ignore
-    cmp r9d, LINNEA_H2_FT_RST_STREAM
-    je .f_ignore
+    cmp r9d, LINNEA_H2_FT_DATA
+    je .f_ignore                     ; request bodies are not served
     cmp r9d, LINNEA_H2_FT_HEADERS
     je .f_headers
-    jmp .goaway_close                ; DATA / stray CONTINUATION / unknown
+    jmp .goaway_close                ; stray CONTINUATION / unknown
 .f_window:
-    ; WINDOW_UPDATE: grow the connection window (stream 0) or the active
-    ; stream's window. A zero increment is a protocol error.
+    ; WINDOW_UPDATE: grow the connection window (stream 0) or a streaming
+    ; response's window. A zero increment is a protocol error.
     mov eax, [rsi + 9]
     bswap eax
     and eax, 0x7fffffff              ; 31-bit increment (top bit reserved)
@@ -165,31 +177,68 @@ linnea_h2_handle:
     add [rbx + linnea_connection.h2_cwnd], rax
     jmp .f_ignore
 .f_window_stream:
-    cmp rdx, [rbx + linnea_connection.h2_send_stream]
-    jne .f_ignore                    ; not the active stream: ignore for M17
-    add [rbx + linnea_connection.h2_swnd], rax
+    push rax                         ; increment
+    mov rdi, rbx
+    mov esi, edx
+    call h2_slot_find                ; -> rax = slot* or 0
+    pop rcx                          ; increment
+    test rax, rax
+    jz .f_ignore                     ; unknown / closed stream: ignore
+    add [rax + linnea_h2_stream.swnd], rcx
     jmp .f_ignore
+.f_rst:
+    ; RST_STREAM: drop the stream's slot; count resets (rapid-reset guard).
+    inc qword [rbx + linnea_connection.h2_rst_count]
+    cmp qword [rbx + linnea_connection.h2_rst_count], LINNEA_H2_RST_LIMIT
+    ja .goaway_close                 ; CVE-2023-44487: too many resets
+    movzx edx, byte [rsi + 5]
+    and edx, 0x7f
+    shl edx, 8
+    movzx ecx, byte [rsi + 6]
+    or edx, ecx
+    shl edx, 8
+    movzx ecx, byte [rsi + 7]
+    or edx, ecx
+    shl edx, 8
+    movzx ecx, byte [rsi + 8]
+    or edx, ecx
+    add r12, r11                     ; consume the frame (munmap clobbers r11)
+    mov rdi, rbx
+    mov esi, edx
+    call h2_slot_find
+    test rax, rax
+    jz .frames
+    mov rdi, [rax + linnea_h2_stream.file_base]
+    test rdi, rdi
+    jz .rst_freed
+    push rax
+    mov rsi, [rax + linnea_h2_stream.file_size]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    pop rax
+.rst_freed:
+    mov qword [rax + linnea_h2_stream.id], 0
+    jmp .frames
 .f_headers:
-    ; While a response body is streaming, defer a new stream (we advertise
-    ; MAX_CONCURRENT_STREAMS=1, so peers serialize; this is the safety net).
-    cmp qword [rbx + linnea_connection.h2_send_stream], 0
-    jne .flush
-    ; A request response uses the whole out_buf, so it must be empty first;
-    ; if anything is queued this round, flush it and resume next round.
-    lea rax, [rbx + linnea_connection.out_buf]
-    cmp r13, rax
-    jne .flush
+    ; Append the response HEADERS at the out cursor; a streaming body (if
+    ; any) is registered in a pool slot and interleaved by the scheduler.
+    ; Ensure room for a HEADERS (+ small inline error DATA) first.
+    lea rax, [rbx + linnea_connection.out_buf + LINNEA_CONN_OUT_BUF]
+    sub rax, r13
+    cmp rax, 300
+    jb .flush                        ; not enough room now; flush and resume
     mov rdi, rbx                     ; conn
     ; rsi already = this frame's header pointer
     mov rdx, r14
     sub rdx, r12                     ; bytes available from the HEADERS frame
+    mov rcx, r13                     ; out cursor
     call h2_build_request
     cmp rax, LINNEA_H2_REQ_MORE
     je .flush                        ; block not fully buffered: return MORE
     cmp rax, LINNEA_H2_REQ_ERR
     je .goaway_close
     add r12, rax                     ; consume the whole HEADERS(+CONT) run
-    add r13, rdx                     ; response frames queued
+    add r13, rdx                     ; response bytes appended at the cursor
     jmp .frames
 .f_ignore:
     add r12, r11
@@ -257,11 +306,11 @@ linnea_h2_handle:
     mov eax, LINNEA_H2_SEND
     jmp .ret
 .no_out:
-    ; nothing queued this round: if a response body is in flight and the
-    ; window now allows, stream the next DATA frame (a WINDOW_UPDATE just
-    ; processed may have unblocked it).
+    ; nothing queued this round: run the scheduler — stream the next DATA
+    ; frame for a ready stream (a WINDOW_UPDATE just processed may have
+    ; unblocked one).
     mov rdi, rbx
-    call h2_try_send_data
+    call h2_schedule
     test eax, eax
     jnz .send_direct                 ; out_ptr/out_rem/file_* already set
     cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_CLOSING
@@ -300,6 +349,7 @@ linnea_h2_handle:
 %define L_START  96
 %define L_SID    104
 %define L_CONT   112
+%define L_OUT    120
 h2_build_request:
     push rbx
     push r12
@@ -309,10 +359,11 @@ h2_build_request:
     push rbp
     sub rsp, 168
     mov rbx, rdi                     ; conn
+    mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
     lea r13, [rsi + rdx]             ; avail end
     mov r12, rsi                     ; current frame header
-    lea r14, [rbx + linnea_connection.up_buf]        ; assembly cursor
+    lea r14, [rbx + linnea_connection.up_buf + LINNEA_H2_ASSEMBLY_OFF]
     lea r15, [r14 + LINNEA_H2_HBLOCK_MAX]            ; assembly limit
     mov qword [rsp + L_CONT], 0
 
@@ -426,7 +477,7 @@ h2_build_request:
     mov [rsp + REQ + linnea_h2_req.scratch], rax
     lea rcx, [rax + LINNEA_H2_HBLOCK_MAX]
     mov [rsp + REQ + linnea_h2_req.scratch_end], rcx
-    lea rdi, [rbx + linnea_connection.up_buf]        ; block ptr
+    lea rdi, [rbx + linnea_connection.up_buf + LINNEA_H2_ASSEMBLY_OFF]  ; block
     mov rsi, r14
     sub rsi, rdi                     ; block length
     lea rdx, [rsp + REQ]
@@ -438,12 +489,13 @@ h2_build_request:
     cmp qword [rsp + REQ + linnea_h2_req.path_ptr], 0
     je .err
 
-    ; --- serve the request: build the response flight into out_buf ------
+    ; --- serve the request: write the response at the out cursor --------
     mov rdi, rbx                     ; conn
     lea rsi, [rsp + REQ]             ; decoded request
     mov r8, [rsp + L_SID]            ; stream id
-    call h2_serve                    ; -> rax = bytes written to out_buf
-    mov rdx, rax                     ; response (HEADERS flight) length
+    mov r9, [rsp + L_OUT]            ; out cursor
+    call h2_serve                    ; -> rax = bytes written at the cursor
+    mov rdx, rax                     ; response length
     mov rax, r12
     sub rax, [rsp + L_START]         ; bytes consumed
     jmp .ret
@@ -471,10 +523,13 @@ h2_build_request:
 ; HTTP/1.1 features deferred for h2; :authority selects the vhost.
 ; =========================================================================
 
-; h2_serve(rdi=conn, rsi=req, r8=stream_id) -> rax = bytes written to out_buf
-; Builds the response HEADERS (and, for errors, an inline DATA) into out_buf.
-; For a 200 with a body it records the send state so the body streams as DATA
-; frames via h2_try_send_data; the return value is only the HEADERS flight.
+; h2_serve(rdi=conn, rsi=req, r8=stream_id, r9=out cursor)
+;   -> rax = bytes written at the out cursor.
+; Writes the response HEADERS (and, for errors, an inline DATA) at the cursor.
+; A 200 with a body allocates a pool slot recording the body-send state, which
+; the round-robin scheduler (h2_schedule) then streams as interleaved DATA; the
+; return value is only the HEADERS bytes. If the pool is full, the stream is
+; refused with RST_STREAM instead.
 %define S_SID   0
 %define S_HEAD  8
 %define S_DIR   16
@@ -486,6 +541,7 @@ h2_build_request:
 %define S_MLEN  64
 %define S_CLEN  72
 %define S_STAT  80
+%define S_OUT   88
 h2_serve:
     push rbx
     push r12
@@ -497,6 +553,7 @@ h2_serve:
     mov rbx, rdi                     ; conn
     mov r12, rsi                     ; req
     mov [rsp + S_SID], r8
+    mov [rsp + S_OUT], r9            ; where the response is written
     ; is_head = method == "HEAD"
     mov rdi, [r12 + linnea_h2_req.method_ptr]
     mov rsi, [r12 + linnea_h2_req.method_len]
@@ -574,7 +631,8 @@ h2_serve:
     call linnea_string_from_u64      ; -> rax = length
     mov [rsp + S_CLEN], rax
     ; --- encode the 200 HEADERS payload (after a 9-byte frame header) ---
-    lea rdi, [rbx + linnea_connection.out_buf + 9]
+    mov rdi, [rsp + S_OUT]
+    add rdi, 9
     mov r15, rdi                     ; payload start
     mov esi, 8                       ; :status
     lea rdx, [status_200_h2]
@@ -590,7 +648,7 @@ h2_serve:
     call h2_enc_hdr
     mov rbp, rdi
     sub rbp, r15                     ; payload length
-    ; frame header flags: END_HEADERS, plus END_STREAM when there is no body
+    ; flags: END_HEADERS, plus END_STREAM when there is no body
     mov r8b, LINNEA_H2_FLAG_END_HEADERS
     cmp qword [rsp + S_HEAD], 0
     jne .no_body
@@ -606,18 +664,23 @@ h2_serve:
     syscall
     jmp .flags
 .with_body:
-    mov rax, [rsp + S_SID]
-    mov [rbx + linnea_connection.h2_send_stream], rax
-    mov rax, [rsp + S_BASE]
-    mov [rbx + linnea_connection.h2_body_ptr], rax
-    mov [rbx + linnea_connection.file_base], rax     ; munmap on completion
-    mov rax, [rsp + S_SIZE]
-    mov [rbx + linnea_connection.h2_body_rem], rax
-    mov [rbx + linnea_connection.file_size], rax
-    mov qword [rbx + linnea_connection.h2_end_stream], 1
-    mov qword [rbx + linnea_connection.h2_swnd], LINNEA_H2_INIT_WINDOW
+    ; register the body in a pool slot; the scheduler streams it as DATA
+    mov rdi, rbx
+    mov esi, [rsp + S_SID]
+    call h2_slot_alloc               ; -> rax = slot* or 0 (pool full)
+    test rax, rax
+    jz .refused
+    mov qword [rax + linnea_h2_stream.swnd], LINNEA_H2_INIT_WINDOW
+    mov rcx, [rsp + S_BASE]
+    mov [rax + linnea_h2_stream.file_base], rcx
+    mov [rax + linnea_h2_stream.body_ptr], rcx
+    mov rcx, [rsp + S_SIZE]
+    mov [rax + linnea_h2_stream.file_size], rcx
+    mov [rax + linnea_h2_stream.body_rem], rcx
+    mov qword [rax + linnea_h2_stream.flags], LINNEA_H2_STREAM_END
+    mov r8b, LINNEA_H2_FLAG_END_HEADERS   ; DATA follows; no END_STREAM here
 .flags:
-    lea rdi, [rbx + linnea_connection.out_buf]
+    mov rdi, [rsp + S_OUT]
     mov rax, rbp
     shr rax, 16
     mov [rdi], al
@@ -641,6 +704,33 @@ h2_serve:
     lea rax, [rbp + 9]               ; HEADERS flight length
     jmp .out
 
+.refused:
+    ; pool full: drop the mapping and refuse the stream with RST_STREAM
+    mov rdi, [rsp + S_BASE]
+    mov rsi, [rsp + S_SIZE]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    mov rdi, [rsp + S_OUT]
+    mov byte [rdi], 0
+    mov byte [rdi + 1], 0
+    mov byte [rdi + 2], 4
+    mov byte [rdi + 3], LINNEA_H2_FT_RST_STREAM
+    mov byte [rdi + 4], 0
+    mov rax, [rsp + S_SID]
+    mov rdx, rax
+    shr rax, 24
+    mov [rdi + 5], al
+    mov rax, rdx
+    shr rax, 16
+    mov [rdi + 6], al
+    mov rax, rdx
+    shr rax, 8
+    mov [rdi + 7], al
+    mov [rdi + 8], dl
+    mov dword [rdi + 9], 0x07000000  ; error code REFUSED_STREAM (7), big-endian
+    mov eax, 13
+    jmp .out
+
 .resp_405:
     lea rax, [status_405_h2]
     lea r14, [body_405]
@@ -657,12 +747,12 @@ h2_serve:
     mov r15d, body_400_len
 .error:
     mov [rsp + S_STAT], rax          ; status string (3 chars)
-    mov qword [rbx + linnea_connection.h2_send_stream], 0
     mov rdi, r15
     lea rsi, [h2_numbuf]
     call linnea_string_from_u64
     mov [rsp + S_CLEN], rax
-    lea rdi, [rbx + linnea_connection.out_buf + 9]
+    mov rdi, [rsp + S_OUT]
+    add rdi, 9
     mov r13, rdi                     ; payload start
     mov esi, 8                       ; :status
     mov rdx, [rsp + S_STAT]
@@ -679,7 +769,7 @@ h2_serve:
     mov rbp, rdi
     sub rbp, r13                     ; payload length
     ; HEADERS frame header (END_HEADERS; a DATA frame follows)
-    lea rdi, [rbx + linnea_connection.out_buf]
+    mov rdi, [rsp + S_OUT]
     mov rax, rbp
     shr rax, 16
     mov [rdi], al
@@ -701,7 +791,8 @@ h2_serve:
     mov [rdi + 7], al
     mov [rdi + 8], dl
     ; DATA frame (the error body), END_STREAM
-    lea rdi, [rbx + linnea_connection.out_buf + 9]
+    mov rdi, [rsp + S_OUT]
+    add rdi, 9
     add rdi, rbp
     mov rax, r15
     shr rax, 16
@@ -727,12 +818,179 @@ h2_serve:
     mov rsi, r14
     mov rcx, r15
     rep movsb
-    lea rax, [rbx + linnea_connection.out_buf]
-    sub rdi, rax                     ; total bytes written
     mov rax, rdi
+    sub rax, [rsp + S_OUT]            ; total bytes written
 .out:
     add rsp, 104
     pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; h2_slot_find(rdi=conn, esi=stream id) -> rax = slot* or 0. Caller-saved only
+; besides reading the pool; preserves the frame-loop's rbx/r12-r15.
+h2_slot_find:
+    lea rax, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]
+    mov ecx, LINNEA_H2_MAX_STREAMS
+.sf_loop:
+    cmp [rax + linnea_h2_stream.id], rsi
+    je .sf_hit
+    add rax, linnea_h2_stream_size
+    dec ecx
+    jnz .sf_loop
+    xor eax, eax
+.sf_hit:
+    ret
+
+; h2_slot_alloc(rdi=conn, esi=stream id) -> rax = slot* or 0 (pool full).
+h2_slot_alloc:
+    lea rax, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]
+    mov ecx, LINNEA_H2_MAX_STREAMS
+.sa_loop:
+    cmp qword [rax + linnea_h2_stream.id], 0
+    je .sa_free
+    add rax, linnea_h2_stream_size
+    dec ecx
+    jnz .sa_loop
+    xor eax, eax
+    ret
+.sa_free:
+    mov [rax + linnea_h2_stream.id], rsi
+    ret
+
+; h2_schedule(rdi=conn) -> rax = 1 if a DATA frame was queued (out_ptr /
+; out_rem / file_ptr / file_rem set), else 0. Reaps finished slots (munmap +
+; free), then round-robins from h2_rr_cursor to the next slot with body bytes
+; and window, emitting one DATA frame capped at 16 KB and the send windows.
+h2_schedule:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi
+    lea r12, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]  ; pool base
+    ; reap slots whose body is fully framed (their last DATA has drained)
+    xor ecx, ecx
+.reap:
+    cmp ecx, LINNEA_H2_MAX_STREAMS
+    jae .reaped
+    mov eax, ecx
+    imul rax, rax, linnea_h2_stream_size
+    lea rax, [r12 + rax]
+    cmp qword [rax + linnea_h2_stream.id], 0
+    je .reap_next
+    cmp qword [rax + linnea_h2_stream.body_rem], 0
+    jne .reap_next
+    mov rdi, [rax + linnea_h2_stream.file_base]
+    test rdi, rdi
+    jz .reap_free
+    push rax
+    push rcx
+    mov rsi, [rax + linnea_h2_stream.file_size]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    pop rcx
+    pop rax
+.reap_free:
+    mov qword [rax + linnea_h2_stream.id], 0
+.reap_next:
+    inc ecx
+    jmp .reap
+.reaped:
+    ; connection window closed -> nobody can send
+    mov rax, [rbx + linnea_connection.h2_cwnd]
+    test rax, rax
+    jle .none
+    ; round-robin scan for a slot with body bytes and a stream window
+    mov r13, [rbx + linnea_connection.h2_rr_cursor]
+    xor r14d, r14d                   ; slots examined
+.scan:
+    cmp r14d, LINNEA_H2_MAX_STREAMS
+    jae .none
+    mov rax, r13
+    and eax, LINNEA_H2_MAX_STREAMS - 1   ; MAX_STREAMS is a power of two (16)
+    imul rax, rax, linnea_h2_stream_size
+    lea r15, [r12 + rax]             ; slot ptr
+    cmp qword [r15 + linnea_h2_stream.id], 0
+    je .scan_next
+    cmp qword [r15 + linnea_h2_stream.body_rem], 0
+    je .scan_next
+    cmp qword [r15 + linnea_h2_stream.swnd], 0
+    jle .scan_next
+    jmp .emit
+.scan_next:
+    inc r13
+    inc r14d
+    jmp .scan
+.emit:
+    ; chunk = min(cwnd, swnd, body_rem, MAX_FRAME)
+    mov rax, [rbx + linnea_connection.h2_cwnd]
+    mov rdx, [r15 + linnea_h2_stream.swnd]
+    cmp rdx, rax
+    jge .m1
+    mov rax, rdx
+.m1:
+    mov rdx, [r15 + linnea_h2_stream.body_rem]
+    cmp rax, rdx
+    jbe .m2
+    mov rax, rdx
+.m2:
+    cmp rax, LINNEA_H2_MAX_FRAME
+    jbe .m3
+    mov eax, LINNEA_H2_MAX_FRAME
+.m3:
+    mov r14, rax                     ; chunk
+    lea rdi, [rbx + linnea_connection.out_buf]
+    mov rax, r14
+    shr rax, 16
+    mov [rdi], al
+    mov rax, r14
+    shr rax, 8
+    mov [rdi + 1], al
+    mov [rdi + 2], r14b
+    mov byte [rdi + 3], LINNEA_H2_FT_DATA
+    ; END_STREAM if this chunk finishes the body and END was requested
+    xor r8d, r8d
+    mov rax, [r15 + linnea_h2_stream.body_rem]
+    cmp rax, r14
+    jne .e_flags
+    test qword [r15 + linnea_h2_stream.flags], LINNEA_H2_STREAM_END
+    jz .e_flags
+    mov r8b, LINNEA_H2_FLAG_END_STREAM
+.e_flags:
+    mov [rdi + 4], r8b
+    mov r9, [r15 + linnea_h2_stream.id]
+    mov rax, r9
+    shr rax, 24
+    mov [rdi + 5], al
+    mov rax, r9
+    shr rax, 16
+    mov [rdi + 6], al
+    mov rax, r9
+    shr rax, 8
+    mov [rdi + 7], al
+    mov [rdi + 8], r9b
+    mov [rbx + linnea_connection.out_ptr], rdi
+    mov qword [rbx + linnea_connection.out_rem], 9
+    mov rax, [r15 + linnea_h2_stream.body_ptr]
+    mov [rbx + linnea_connection.file_ptr], rax
+    mov [rbx + linnea_connection.file_rem], r14
+    add [r15 + linnea_h2_stream.body_ptr], r14
+    sub [r15 + linnea_h2_stream.body_rem], r14
+    sub [r15 + linnea_h2_stream.swnd], r14
+    sub [rbx + linnea_connection.h2_cwnd], r14
+    ; advance the round-robin cursor past this slot
+    inc r13
+    mov [rbx + linnea_connection.h2_rr_cursor], r13
+    mov eax, 1
+    jmp .sched_ret
+.none:
+    xor eax, eax
+.sched_ret:
     pop r15
     pop r14
     pop r13
@@ -1172,104 +1430,42 @@ h2_enc_hdr:
     pop rbx
     ret
 
-; h2_try_send_data(rdi=conn) -> rax = 1 if a DATA frame was queued (out_ptr /
-; out_rem / file_ptr / file_rem set), else 0. When the body is fully framed it
-; munmaps and clears the send state (the connection stays open).
-h2_try_send_data:
-    push rbx
+; linnea_h2_conn_free(rdi=conn) — munmap every active stream slot's body
+; mapping. Called from the io_uring teardown so a connection that closes with
+; responses still in flight does not leak its file mappings. Preserves the
+; teardown path's r12 (conn) and r13 (server*).
+linnea_h2_conn_free:
     push r12
-    mov rbx, rdi
-    cmp qword [rbx + linnea_connection.h2_send_stream], 0
-    je .tnone
-    mov rax, [rbx + linnea_connection.h2_body_rem]
-    test rax, rax
-    jnz .thave
-    mov rdi, [rbx + linnea_connection.file_base]
+    push r13
+    lea r12, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]
+    mov r13d, LINNEA_H2_MAX_STREAMS
+.cf_loop:
+    cmp qword [r12 + linnea_h2_stream.id], 0
+    je .cf_next
+    mov rdi, [r12 + linnea_h2_stream.file_base]
     test rdi, rdi
-    jz .tcleared
-    mov rsi, [rbx + linnea_connection.file_size]
+    jz .cf_clear
+    mov rsi, [r12 + linnea_h2_stream.file_size]
     mov eax, LINNEA_SYS_MUNMAP
     syscall
-.tcleared:
-    mov qword [rbx + linnea_connection.file_base], 0
-    mov qword [rbx + linnea_connection.file_size], 0
-    mov qword [rbx + linnea_connection.h2_send_stream], 0
-    xor eax, eax
-    jmp .tout
-.thave:
-    mov rax, [rbx + linnea_connection.h2_swnd]
-    mov rdx, [rbx + linnea_connection.h2_cwnd]
-    cmp rdx, rax
-    jge .twin
-    mov rax, rdx                     ; window = min(swnd, cwnd)
-.twin:
-    test rax, rax
-    jle .tnone                       ; window closed: wait for WINDOW_UPDATE
-    mov rdx, [rbx + linnea_connection.h2_body_rem]
-    cmp rax, rdx
-    jbe .tcap
-    mov rax, rdx
-.tcap:
-    cmp rax, LINNEA_H2_MAX_FRAME
-    jbe .tchunk
-    mov eax, LINNEA_H2_MAX_FRAME
-.tchunk:
-    mov r12, rax                     ; chunk size
-    lea rdi, [rbx + linnea_connection.out_buf]
-    mov rax, r12
-    shr rax, 16
-    mov [rdi], al
-    mov rax, r12
-    shr rax, 8
-    mov [rdi + 1], al
-    mov [rdi + 2], r12b
-    mov byte [rdi + 3], LINNEA_H2_FT_DATA
-    xor r8d, r8d
-    mov rax, [rbx + linnea_connection.h2_body_rem]
-    cmp rax, r12
-    jne .tflags
-    cmp qword [rbx + linnea_connection.h2_end_stream], 0
-    je .tflags
-    mov r8b, LINNEA_H2_FLAG_END_STREAM
-.tflags:
-    mov [rdi + 4], r8b
-    mov r9, [rbx + linnea_connection.h2_send_stream]
-    mov rax, r9
-    shr rax, 24
-    mov [rdi + 5], al
-    mov rax, r9
-    shr rax, 16
-    mov [rdi + 6], al
-    mov rax, r9
-    shr rax, 8
-    mov [rdi + 7], al
-    mov [rdi + 8], r9b
-    mov [rbx + linnea_connection.out_ptr], rdi
-    mov qword [rbx + linnea_connection.out_rem], 9
-    mov rax, [rbx + linnea_connection.h2_body_ptr]
-    mov [rbx + linnea_connection.file_ptr], rax
-    mov [rbx + linnea_connection.file_rem], r12
-    add [rbx + linnea_connection.h2_body_ptr], r12
-    sub [rbx + linnea_connection.h2_body_rem], r12
-    sub [rbx + linnea_connection.h2_swnd], r12
-    sub [rbx + linnea_connection.h2_cwnd], r12
-    mov eax, 1
-    jmp .tout
-.tnone:
-    xor eax, eax
-.tout:
+.cf_clear:
+    mov qword [r12 + linnea_h2_stream.id], 0
+.cf_next:
+    add r12, linnea_h2_stream_size
+    dec r13d
+    jnz .cf_loop
+    pop r13
     pop r12
-    pop rbx
     ret
 
 ; linnea_h2_after_send(rdi=conn) -> rax = LINNEA_H2_SEND / _MORE / _CLOSE.
-; Called by the io_uring loop when an h2 send drains: continue streaming the
-; response body if one is in flight, else report MORE so the loop processes
-; buffered frames or reads.
+; Called by the io_uring loop when an h2 send drains: run the scheduler to
+; continue streaming response bodies (interleaved across streams); if nothing
+; is ready, report MORE so the loop processes buffered frames or reads.
 linnea_h2_after_send:
     push rbx
     mov rbx, rdi
-    call h2_try_send_data
+    call h2_schedule
     test eax, eax
     jnz .send
     cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_CLOSING
