@@ -17,4 +17,5 @@ struc linnea_quic_ch
     .alpn_len: resq 1
     .tp_ptr:   resq 1      ; QUIC transport parameters (extension 0x39)
     .tp_len:   resq 1
+    .ks_ptr:   resq 1      ; the client's x25519 key_share (32 bytes), 0 = none
 endstruc

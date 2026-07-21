@@ -17,6 +17,7 @@ global linnea_quic_protect
 global linnea_quic_ch_parse
 global linnea_quic_alpn_has
 global linnea_quic_build_transport_params
+global linnea_quic_build_sh
 
 extern linnea_quic_hp_mask
 extern linnea_quic_initial_secrets
@@ -231,6 +232,42 @@ linnea_quic_crypto_frame:
     xor edx, edx
     ret
 
+; linnea_quic_build_sh(rdi=out, rsi=server_pub32, rdx=server_random32)
+;   -> rax = ServerHello message length (90). The QUIC ClientHello carries an
+;   empty legacy_session_id, so the ServerHello echoes an empty one. Fixed
+;   profile: TLS_AES_128_GCM_SHA256, x25519, TLS 1.3.
+linnea_quic_build_sh:
+    push rbx
+    mov rbx, rdi                     ; message base
+    mov byte [rbx], 0x02             ; server_hello (length filled at the end)
+    mov word [rbx + 4], 0x0303       ; legacy_version
+    lea rdi, [rbx + 6]               ; server random
+    mov rcx, 32
+    push rsi
+    mov rsi, rdx
+    rep movsb
+    pop rsi                          ; server_pub
+    mov byte [rbx + 38], 0           ; legacy_session_id length = 0
+    mov word [rbx + 39], 0x0113      ; cipher_suite 0x1301 (big-endian bytes)
+    mov byte [rbx + 41], 0           ; legacy_compression_method
+    mov word [rbx + 42], 0x2e00      ; extensions length = 46
+    mov word [rbx + 44], 0x3300      ; key_share (0x0033)
+    mov word [rbx + 46], 0x2400      ; ext length 36
+    mov word [rbx + 48], 0x1d00      ; group x25519 (0x001d)
+    mov word [rbx + 50], 0x2000      ; key_exchange length 32
+    lea rdi, [rbx + 52]
+    mov rcx, 32
+    rep movsb                        ; server public key share
+    mov word [rbx + 84], 0x2b00      ; supported_versions (0x002b)
+    mov word [rbx + 86], 0x0200      ; ext length 2
+    mov word [rbx + 88], 0x0403      ; selected_version 0x0304
+    mov byte [rbx + 1], 0            ; handshake length = 86
+    mov byte [rbx + 2], 0
+    mov byte [rbx + 3], 86
+    mov eax, 90
+    pop rbx
+    ret
+
 ; tp_int(rdi=cursor, rsi=param id, rdx=integer value) -> rax = new cursor.
 ; Encodes one integer transport parameter: id, then the length of the value's
 ; varint, then the value varint (RFC 9000 18).
@@ -389,9 +426,9 @@ linnea_quic_ch_parse:
     mov rbx, rdx                     ; out struct
     lea r12, [rdi + rsi]             ; ClientHello end
     mov r15, rdi                     ; save the ClientHello pointer
-    mov rdi, rbx                     ; zero the out struct (6 qwords)
+    mov rdi, rbx                     ; zero the out struct (7 qwords)
     xor eax, eax
-    mov ecx, 6
+    mov ecx, 7
     rep stosq
     mov rdi, r15
     ; skip type(1)+len(3)+version(2)+random(32) = 38, to session_id length
@@ -438,9 +475,43 @@ linnea_quic_ch_parse:
     je .chp_alpn                     ; ALPN (0x0010)
     cmp eax, 0x39
     je .chp_tp                       ; QUIC transport parameters (0x0039)
+    cmp eax, 0x33
+    je .chp_ks                       ; key_share (0x0033)
 .chp_next:
     mov r13, r15
     jmp .chp_ext
+.chp_ks:
+    ; client_shares length(2), then entries: group(2), len(2), key_exchange.
+    ; find the x25519 share (group 0x001d) and record its 32-byte key.
+    lea rax, [r14 + 2]
+    cmp rax, r15
+    ja .chp_next
+    lea rsi, [r14 + 2]               ; first KeyShareEntry
+.chp_ks_entry:
+    lea rax, [rsi + 4]
+    cmp rax, r15
+    ja .chp_next
+    movzx eax, byte [rsi]            ; group (16-bit)
+    shl eax, 8
+    movzx ecx, byte [rsi + 1]
+    or eax, ecx
+    movzx ecx, byte [rsi + 2]        ; key_exchange length
+    shl ecx, 8
+    movzx edx, byte [rsi + 3]
+    or ecx, edx
+    lea rdi, [rsi + 4 + rcx]         ; next entry
+    cmp rdi, r15
+    ja .chp_next
+    cmp eax, 0x001d                  ; x25519?
+    jne .chp_ks_skip
+    cmp ecx, 32
+    jne .chp_ks_skip
+    lea rax, [rsi + 4]
+    mov [rbx + linnea_quic_ch.ks_ptr], rax
+    jmp .chp_next
+.chp_ks_skip:
+    mov rsi, rdi
+    jmp .chp_ks_entry
 .chp_sni:
     ; list_len(2), name_type(1), name_len(2), name — take the first host_name
     lea rax, [r14 + 5]

@@ -161,6 +161,15 @@ else
     check "quic transport-params test (skipped: aioquic/binary unavailable)" 0
 fi
 
+# QUIC ServerHello (first message of the handshake flight): aioquic's TLS
+# parser accepts it and the negotiated profile round-trips.
+if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quicsh ]; then
+    ./bin/linnea-quicsh | python3 test/quic/sh_parse.py >/dev/null 2>&1
+    check "quic: ServerHello parses in aioquic (x25519, TLS 1.3)" $?
+else
+    check "quic ServerHello test (skipped: aioquic/binary unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is
