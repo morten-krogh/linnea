@@ -135,6 +135,22 @@ else
     check "quic crypto selftest (binary not built — run 'make quictest')" 1
 fi
 
+# QUIC on the wire: a standalone UDP receiver decrypts a real Initial packet
+# built by aioquic (the QUIC/HTTP-3 reference client).
+if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quicserver ]; then
+    timeout 10 ./bin/linnea-quicserver >/tmp/linnea_quicsrv.out 2>&1 &
+    qsrv=$!
+    sleep 0.4
+    python3 test/quic/h3_initial.py 47500 >/dev/null 2>&1
+    sleep 0.4
+    wait $qsrv 2>/dev/null
+    grep -q "quic-initial clienthello=" /tmp/linnea_quicsrv.out
+    check "quic: receive + decrypt a real aioquic Initial off the wire" $?
+    rm -f /tmp/linnea_quicsrv.out
+else
+    check "quic wire test (skipped: aioquic or quicserver unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is

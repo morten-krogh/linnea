@@ -12,8 +12,10 @@ global linnea_quic_varint_encode
 global linnea_quic_initial_dcid
 global linnea_quic_unprotect
 global linnea_quic_crypto_frame
+global linnea_quic_recv_initial
 
 extern linnea_quic_hp_mask
+extern linnea_quic_initial_secrets
 extern linnea_aesgcm_init
 extern linnea_aesgcm_open
 
@@ -222,6 +224,53 @@ linnea_quic_crypto_frame:
 .none:
     xor eax, eax
     xor edx, edx
+    ret
+
+; linnea_quic_recv_initial(rdi=datagram, rsi=len, rdx=plaintext buf)
+;   -> rax = ClientHello ptr (into the plaintext buf), rdx = length;
+;      rax = 0 if the datagram is not an Initial we can decrypt.
+; Derives the Initial keys from the packet's own DCID, unprotects it, and
+; returns the first CRYPTO frame's data (the TLS ClientHello). Reusable by the
+; real server once the UDP loop is wired in.
+linnea_quic_recv_initial:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 120                     ; client keys [0], server keys [48]
+    mov rbx, rdi                     ; datagram
+    mov r12, rsi                     ; length
+    mov r13, rdx                     ; plaintext buffer
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_initial_dcid    ; rax = DCID ptr, rdx = DCID len
+    test rax, rax
+    jz .fail
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [rsp]                   ; client keys
+    lea rcx, [rsp + 48]              ; server keys
+    call linnea_quic_initial_secrets
+    mov rdi, rbx
+    mov rsi, r12
+    lea rdx, [rsp]                   ; the client encrypts with its Initial keys
+    mov rcx, r13
+    call linnea_quic_unprotect       ; rax = plaintext length
+    test rax, rax
+    js .fail
+    mov rdi, r13
+    mov rsi, rax
+    call linnea_quic_crypto_frame    ; rax = CH ptr, rdx = CH len
+    jmp .rdone
+.fail:
+    xor eax, eax
+    xor edx, edx
+.rdone:
+    add rsp, 120
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; linnea_quic_varint_decode(rdi=ptr, rsi=end) -> rax = value, rdx = bytes

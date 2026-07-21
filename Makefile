@@ -82,11 +82,25 @@ $(QUICTEST_BIN): $(QUICTEST_OBJS)
 quictest: $(QUICTEST_BIN)
 	./$(QUICTEST_BIN)
 
+# --- test-only standalone QUIC UDP receiver (own _start) ---
+QUICSRV_BIN  = bin/linnea-quicserver
+QUICSRV_OBJS = test/quic/linnea_quicserver.o src/linnea_quic.o \
+               src/linnea_quic_crypto.o src/linnea_aesgcm.o src/linnea_sha256.o \
+               src/linnea_tls_kdf.o src/linnea_print.o src/linnea_string.o
+
+test/quic/linnea_quicserver.o: test/quic/linnea_quicserver.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(QUICSRV_BIN): $(QUICSRV_OBJS)
+	$(LD) -o $@ $^
+
+quicserver: $(QUICSRV_BIN)
+
 clean:
 	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
 	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
 
-test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN)
+test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN)
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd
