@@ -162,7 +162,7 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.timeout], LINNEA_DEFAULT_TIMEOUT
     mov qword [rbx + linnea_config.max_connections], LINNEA_DEFAULT_MAX_CONNECTIONS
     mov qword [rbx + linnea_config.workers], LINNEA_DEFAULT_WORKERS
-    mov qword [rbx + linnea_config.http2], 0
+    mov qword [rbx + linnea_config.http2], 1     ; HTTP/2 on by default (M19)
     xor r13d, r13d             ; top-level key mask
 
     mov edi, '{'

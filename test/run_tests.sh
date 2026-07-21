@@ -942,12 +942,12 @@ PYEOF
     check "tls resumption over kTLS (Reused)" $?
     rm -f "$LOG.sess"
 
-    # ALPN: a client offering h2,http/1.1 gets http/1.1 selected and
-    # echoed (the h2 path is a later milestone); offering nothing gets no
-    # ALPN extension back.
+    # ALPN: this server (47443) has a proxy location, and proxy-over-h2 is
+    # not implemented, so it must keep speaking http/1.1 even with h2 on by
+    # default. Offering nothing gets no ALPN extension back.
     echo | timeout 5 openssl s_client -connect 127.0.0.1:47443 -CAfile $CA \
         -tls1_3 -alpn h2,http/1.1 2>/dev/null | grep -q "ALPN protocol: http/1.1"
-    check "alpn selects http/1.1" $?
+    check "alpn: proxy vhost stays http/1.1 (h2 gated off)" $?
     echo | timeout 5 openssl s_client -connect 127.0.0.1:47443 -CAfile $CA \
         -tls1_3 2>/dev/null | grep -q "No ALPN negotiated"
     check "alpn absent when not offered" $?
@@ -1020,8 +1020,19 @@ PYEOF
     timeout 30 python3 test/tls/h2_multiplex.py $CA 47446 >/dev/null 2>&1
     check "http2 multiplexing (concurrent streams, rapid-reset, pool cap)" $?
 
+    # M19: fuzz the frame layer and HPACK decoder — malformed streams must
+    # never crash the worker; a live h2 GET still serves between batches.
+    timeout 60 python3 test/tls/fuzz_h2.py $CA 47446 120 >/dev/null 2>&1
+    check "http2 fuzz (malformed frames + HPACK survive, server serves)" $?
+
     kill $h2_pid 2>/dev/null
     wait $h2_pid 2>/dev/null
+    # (h2 graceful drain — GOAWAY(last-stream) then finish open streams — is
+    # exercised by test/tls/h2_drain.py against a running worker; it is not in
+    # the automated suite because reliably retiring one worker of a forked
+    # multi-process server without the master's supervision reaping the
+    # draining worker is timing-fragile. The hot-upgrade path keeps other
+    # workers alive, so old workers drain cleanly there.)
 
     timeout 30 python3 test/tls/oversized_record.py $CA 47443 \
         test/tls/clienthello_seed.bin >/dev/null 2>&1
@@ -1081,11 +1092,19 @@ PYEOF
         -servername unknown.test 2>/dev/null | openssl x509 -noout -subject)
     echo "$subj" | grep -q "CN=localhost"
     check "unknown sni falls back to the listener owner" $?
+    # h2 is on by default (tls-sni.json sets no "http2" key): a static vhost
+    # negotiates h2.
+    echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 -CAfile test/tls/sni.crt \
+        -servername sni.test -tls1_3 -alpn h2,http/1.1 2>/dev/null \
+        | grep -q "ALPN protocol: h2"
+    check "alpn: h2 on by default (static vhost)" $?
     # a full request via the SNI vhost: curl verifies against the sni.test
-    # cert AND the Host routing must land on the sni.test docroot
-    resp=$(curl -si --max-time 5 --cacert test/tls/sni.crt \
+    # cert AND the Host routing must land on the sni.test docroot (which
+    # holds page.html; the listener owner does not). h2 is on by default now,
+    # so this also exercises SNI vhost routing over HTTP/2.
+    resp=$(curl -s --max-time 5 --cacert test/tls/sni.crt \
         --resolve sni.test:47444:127.0.0.1 https://sni.test:47444/page.html)
-    check_http "sni end to end (cert + vhost routing)" "200 OK" "$resp"
+    check_http "sni end to end (cert + vhost routing)" "subdirectory page" "$resp"
     kill $sni_server_pid 2>/dev/null
     wait $sni_server_pid 2>/dev/null
     rm -f "$LOG"

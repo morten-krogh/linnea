@@ -41,6 +41,7 @@ default rel
 %include "linnea_http2.inc"
 
 global linnea_uring_run
+global drain_flag
 
 extern io_uring_queue_init
 extern io_uring_get_sqe
@@ -371,7 +372,29 @@ linnea_uring_run:
     lea rax, [linnea_uring_sni_select]
     mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_cb], rax
     mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_ctx], r12
-    mov eax, [rbx + linnea_config.http2]   ; offer h2 in ALPN?
+    ; Offer h2 in ALPN only when enabled AND the accepting server has no
+    ; proxy location — proxy-over-h2 is not implemented yet, so a proxy vhost
+    ; must keep speaking HTTP/1.1.
+    mov eax, [rbx + linnea_config.http2]
+    test eax, eax
+    jz .set_alpn
+    mov ecx, [r12 + linnea_connection.server]
+    imul rcx, rcx, linnea_config_server_size
+    lea rdx, [rbx + rcx + linnea_config.servers]
+    mov r8, [rdx + linnea_config_server.location_count]
+    lea r9, [rdx + linnea_config_server.locations]
+    xor ecx, ecx
+.h2_loc_scan:
+    cmp rcx, r8
+    jae .set_alpn                          ; no proxy: eax stays 1
+    cmp qword [r9 + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
+    je .h2_off
+    add r9, linnea_config_location_size
+    inc rcx
+    jmp .h2_loc_scan
+.h2_off:
+    xor eax, eax
+.set_alpn:
     mov [r12 + linnea_connection.up_buf + linnea_tls_hs.alpn_h2_ok], eax
     mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
 .accept_recv:

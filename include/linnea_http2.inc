@@ -6,6 +6,8 @@
 LINNEA_H2_PREFACE   equ 0     ; awaiting the 24-byte client preface
 LINNEA_H2_RUNNING   equ 1     ; preface seen; processing frames
 LINNEA_H2_CLOSING   equ 2     ; a GOAWAY is queued; close once it is sent
+LINNEA_H2_DRAINING  equ 3     ; worker draining: GOAWAY sent, finish open
+                              ; streams then close, refuse new ones
 
 ; linnea_h2_handle return codes (dispatched by the io_uring loop)
 LINNEA_H2_MORE      equ 0     ; need more bytes: arm a recv

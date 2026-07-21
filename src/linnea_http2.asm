@@ -26,6 +26,7 @@ extern linnea_hpack_decode
 extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_iequal
+extern drain_flag
 
 section .rodata
 
@@ -306,20 +307,14 @@ linnea_h2_handle:
     mov eax, LINNEA_H2_SEND
     jmp .ret
 .no_out:
-    ; nothing queued this round: run the scheduler — stream the next DATA
-    ; frame for a ready stream (a WINDOW_UPDATE just processed may have
-    ; unblocked one).
+    ; nothing queued this round: the shared idle decision streams the next
+    ; ready DATA frame (a WINDOW_UPDATE may have unblocked one) or, while
+    ; draining, drives the GOAWAY / finish-then-close sequence.
     mov rdi, rbx
-    call h2_schedule
-    test eax, eax
-    jnz .send_direct                 ; out_ptr/out_rem/file_* already set
-    cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_CLOSING
-    je .close
+    call linnea_h2_after_send        ; -> SEND (out set) / MORE / CLOSE
+    jmp .ret
 .more:
     mov eax, LINNEA_H2_MORE
-    jmp .ret
-.send_direct:
-    mov eax, LINNEA_H2_SEND
     jmp .ret
 .close:
     mov eax, LINNEA_H2_CLOSE
@@ -554,6 +549,10 @@ h2_serve:
     mov r12, rsi                     ; req
     mov [rsp + S_SID], r8
     mov [rsp + S_OUT], r9            ; where the response is written
+    ; draining: GOAWAY already went out, refuse this new stream
+    cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_DRAINING
+    je .drain_refuse
+    mov [rbx + linnea_connection.h2_last_stream], r8   ; last processed stream
     ; is_head = method == "HEAD"
     mov rdi, [r12 + linnea_h2_req.method_ptr]
     mov rsi, [r12 + linnea_h2_req.method_len]
@@ -728,6 +727,29 @@ h2_serve:
     mov [rdi + 7], al
     mov [rdi + 8], dl
     mov dword [rdi + 9], 0x07000000  ; error code REFUSED_STREAM (7), big-endian
+    mov eax, 13
+    jmp .out
+
+.drain_refuse:
+    ; the worker is draining: refuse the new stream (nothing was opened)
+    mov rdi, [rsp + S_OUT]
+    mov byte [rdi], 0
+    mov byte [rdi + 1], 0
+    mov byte [rdi + 2], 4
+    mov byte [rdi + 3], LINNEA_H2_FT_RST_STREAM
+    mov byte [rdi + 4], 0
+    mov rax, [rsp + S_SID]
+    mov rdx, rax
+    shr rax, 24
+    mov [rdi + 5], al
+    mov rax, rdx
+    shr rax, 16
+    mov [rdi + 6], al
+    mov rax, rdx
+    shr rax, 8
+    mov [rdi + 7], al
+    mov [rdi + 8], dl
+    mov dword [rdi + 9], 0x07000000  ; REFUSED_STREAM
     mov eax, 13
     jmp .out
 
@@ -1459,17 +1481,41 @@ linnea_h2_conn_free:
     ret
 
 ; linnea_h2_after_send(rdi=conn) -> rax = LINNEA_H2_SEND / _MORE / _CLOSE.
-; Called by the io_uring loop when an h2 send drains: run the scheduler to
-; continue streaming response bodies (interleaved across streams); if nothing
-; is ready, report MORE so the loop processes buffered frames or reads.
+; The idle decision shared by the io_uring send-drain hook and h2_handle's
+; .no_out: continue streaming response bodies (interleaved), and fold in the
+; drain path — on the worker's SIGTERM/upgrade drain an h2 connection sends
+; GOAWAY(last-stream), finishes its open streams, then closes.
 linnea_h2_after_send:
     push rbx
     mov rbx, rdi
+    cmp dword [drain_flag], 0
+    je .live
+    cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_DRAINING
+    je .drain_sched
+    ; first notice of drain on this connection: announce GOAWAY once
+    mov rdi, rbx
+    call h2_queue_goaway
+    mov eax, LINNEA_H2_SEND
+    jmp .aret
+.drain_sched:
+    ; GOAWAY already sent: keep streaming open bodies; close once drained
+    mov rdi, rbx
+    call h2_schedule
+    test eax, eax
+    jnz .send
+    mov rdi, rbx
+    call h2_pool_active
+    test rax, rax
+    jnz .more                        ; streams remain: recv (WINDOW_UPDATE / idle)
+    jmp .close
+.live:
+    mov rdi, rbx
     call h2_schedule
     test eax, eax
     jnz .send
     cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_CLOSING
     je .close
+.more:
     mov eax, LINNEA_H2_MORE
     jmp .aret
 .send:
@@ -1479,6 +1525,49 @@ linnea_h2_after_send:
     mov eax, LINNEA_H2_CLOSE
 .aret:
     pop rbx
+    ret
+
+; h2_queue_goaway(rdi=conn) — write GOAWAY(last-stream-id, NO_ERROR) into
+; out_buf, arm it as the pending send, and move to the DRAINING state.
+h2_queue_goaway:
+    lea rax, [rdi + linnea_connection.out_buf]
+    mov byte [rax], 0
+    mov byte [rax + 1], 0
+    mov byte [rax + 2], 8            ; payload: last-stream(4) + error(4)
+    mov byte [rax + 3], LINNEA_H2_FT_GOAWAY
+    mov byte [rax + 4], 0
+    mov dword [rax + 5], 0           ; stream 0
+    mov rcx, [rdi + linnea_connection.h2_last_stream]
+    mov rdx, rcx
+    shr rcx, 24
+    mov [rax + 9], cl
+    mov rcx, rdx
+    shr rcx, 16
+    mov [rax + 10], cl
+    mov rcx, rdx
+    shr rcx, 8
+    mov [rax + 11], cl
+    mov [rax + 12], dl
+    mov dword [rax + 13], 0          ; error code NO_ERROR
+    mov [rdi + linnea_connection.out_ptr], rax
+    mov qword [rdi + linnea_connection.out_rem], 17
+    mov qword [rdi + linnea_connection.file_rem], 0
+    mov qword [rdi + linnea_connection.h2_state], LINNEA_H2_DRAINING
+    ret
+
+; h2_pool_active(rdi=conn) -> rax = number of active (non-free) stream slots.
+h2_pool_active:
+    lea rdx, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]
+    xor eax, eax
+    mov ecx, LINNEA_H2_MAX_STREAMS
+.pa_loop:
+    cmp qword [rdx + linnea_h2_stream.id], 0
+    je .pa_next
+    inc eax
+.pa_next:
+    add rdx, linnea_h2_stream_size
+    dec ecx
+    jnz .pa_loop
     ret
 
 section .rodata
