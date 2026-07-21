@@ -3,6 +3,9 @@
 ;   Initial packet   : ACK + CRYPTO(ServerHello)          [server Initial keys]
 ;   Handshake packet : CRYPTO(EE || Cert || CertVerify || Finished) [hs keys]
 ; A real client (aioquic) should decrypt both and complete the TLS handshake.
+; When the client then sends its Handshake packet (client Finished), the server
+; decrypts it with the client handshake keys, verifies the Finished MAC against
+; the transcript through the server Finished, and prints "CFIN-OK" on success.
 ;
 ; Fixed server ephemeral key / random / connection id (deterministic test).
 ; The certificate chain and P-256 key are embedded. Binds 127.0.0.1:47501.
@@ -24,7 +27,10 @@ extern linnea_quic_build_cert_verify
 extern linnea_quic_build_finished
 extern linnea_quic_hs_secrets
 extern linnea_quic_protect
+extern linnea_quic_unprotect_hs
+extern linnea_quic_crypto_frame
 extern linnea_quic_varint_encode
+extern linnea_quic_varint_decode
 extern linnea_x25519
 extern linnea_sha256_init
 extern linnea_sha256_update
@@ -48,6 +54,8 @@ cert_pem:     incbin "test/tls/server.crt"
 cert_pem_len  equ $ - cert_pem
 key_pem:      incbin "test/tls/server.key"
 key_pem_len   equ $ - key_pem
+cfin_marker:  db "CFIN-OK", 10
+cfin_marker_len equ $ - cfin_marker
 
 section .bss
 sa:          resb 16
@@ -58,7 +66,9 @@ ini_server:  resb linnea_quic_keys_size
 ini_client:  resb linnea_quic_keys_size
 hs_skeys:    resb linnea_quic_keys_size
 hs_ckeys:    resb linnea_quic_keys_size
-hs_sec:      resb 64
+hs_sec:      resb 96                  ; c_hs || s_hs || handshake_secret
+s_th_cfin:   resb 32                  ; H(CH..server Finished) for the client MAC
+expfin:      resb 64                  ; expected client Finished message
 ch_out:      resb linnea_quic_ch_size
 server_pub:  resb 32
 sh_buf:      resb 128
@@ -152,7 +162,7 @@ _start:
     lea rdx, [plaintext]
     call linnea_quic_recv_initial
     test rax, rax
-    jz .loop
+    jz .try_handshake                ; no ClientHello — maybe the client Finished
     mov [s_ch_ptr], rax
     mov [s_ch_len], rdx
     mov rdi, rax
@@ -282,6 +292,84 @@ _start:
     xor r10d, r10d
     lea r8, [sa]
     mov r9d, 16
+    syscall
+    ; save the transcript through the server Finished; the client's Finished
+    ; MAC covers exactly this (H(CH || SH || EE || Cert || CertVerify || Fin)).
+    lea rsi, [hsmsg]
+    mov rdx, [s_hsmsg_len]
+    call .transcript
+    lea rsi, [th_buf]
+    lea rdi, [s_th_cfin]
+    mov ecx, 32
+    rep movsb
+    jmp .loop
+
+; --- the datagram had no ClientHello: walk its coalesced packets looking for a
+; Handshake packet (the client Finished). The client acks the server Initial in
+; a leading Initial packet, then carries its Finished in a coalesced Handshake
+; packet, so we must skip past the Initial to reach it.
+.try_handshake:
+    lea r15, [dgram]                 ; cursor over coalesced packets
+.walk:
+    lea rax, [dgram + r13]           ; datagram end
+    cmp r15, rax
+    jae .loop                        ; no Handshake packet in this datagram
+    test byte [r15], 0x80
+    jz .loop                         ; short header (1-RTT): stop
+    movzx eax, byte [r15]
+    and al, 0x30                     ; packet type (not header-protected)
+    mov r10d, eax                    ; 0x00 Initial, 0x20 Handshake
+    movzx eax, byte [r15 + 5]        ; DCID length
+    lea rdi, [r15 + 6 + rax]         ; -> SCID length
+    movzx eax, byte [rdi]
+    lea rdi, [rdi + 1 + rax]         ; -> token-len (Initial) or length (Handshake)
+    lea rsi, [dgram + r13]           ; datagram end (varint bound)
+    cmp r10d, 0x20
+    je .walk_len                     ; Handshake carries no token
+    call linnea_quic_varint_decode   ; token length (Initial only)
+    add rdi, rdx
+    add rdi, rax                     ; skip the token
+.walk_len:
+    call linnea_quic_varint_decode   ; length (pn + payload + tag)
+    lea rdi, [rdi + rdx]             ; -> packet number
+    add rdi, rax                     ; -> next coalesced packet
+    cmp r10d, 0x20
+    je .do_cfin
+    mov r15, rdi                     ; advance past this (Initial) packet
+    jmp .walk
+.do_cfin:
+    ; a Handshake packet at [r15]: unprotect with the client handshake keys
+    mov rdi, r15
+    lea rsi, [dgram + r13]
+    sub rsi, r15                     ; bytes from here to the datagram end
+    lea rdx, [hs_ckeys]
+    lea rcx, [plaintext]
+    call linnea_quic_unprotect_hs
+    test rax, rax
+    js .loop
+    lea rdi, [plaintext]
+    mov rsi, rax
+    call linnea_quic_crypto_frame    ; skips the ACK, returns the Finished
+    test rax, rax
+    jz .loop
+    cmp rdx, 36
+    jb .loop
+    mov r14, rax                     ; received Finished message ptr
+    ; expected = Finished(c_hs, H(CH..server Finished))
+    lea rdi, [expfin]
+    lea rsi, [hs_sec]                ; c_hs traffic secret (offset 0)
+    lea rdx, [s_th_cfin]
+    call linnea_quic_build_finished  ; rax = 36
+    lea rsi, [expfin]
+    mov rdi, r14
+    mov ecx, 36
+    repe cmpsb
+    jne .loop
+    ; the client authenticated: announce it
+    mov eax, LINNEA_SYS_WRITE
+    mov edi, 1
+    lea rsi, [cfin_marker]
+    mov edx, cfin_marker_len
     syscall
     jmp .loop
 

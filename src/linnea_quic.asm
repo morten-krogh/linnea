@@ -11,6 +11,7 @@ global linnea_quic_varint_decode
 global linnea_quic_varint_encode
 global linnea_quic_initial_dcid
 global linnea_quic_unprotect
+global linnea_quic_unprotect_hs
 global linnea_quic_crypto_frame
 global linnea_quic_recv_initial
 global linnea_quic_protect
@@ -75,8 +76,16 @@ linnea_quic_initial_dcid:
 %define U_HLEN   88       ; header length (= AAD length)
 %define U_PNLEN  96       ; packet-number length
 %define U_PN     104      ; decoded packet number
+%define U_HASTOK 304      ; 1 for an Initial (has a token), 0 for a Handshake
 %define U_CTX    112      ; AES-GCM context (192 bytes)
+; Initial packets carry a token; Handshake packets do not. Both entry points
+; share the body; U_HASTOK selects whether the token varint is skipped.
+linnea_quic_unprotect_hs:
+    xor r8d, r8d                     ; no token
+    jmp unprotect_body
 linnea_quic_unprotect:
+    mov r8d, 1                       ; token present
+unprotect_body:
     push rbx
     push r12
     push r13
@@ -88,6 +97,7 @@ linnea_quic_unprotect:
     mov rbp, rsi                     ; packet length
     mov r12, rdx                     ; keys
     mov r13, rcx                     ; out
+    mov [rsp + U_HASTOK], r8         ; token-present flag
     ; --- parse the long header to the packet-number offset ---
     ; rdi is the cursor (varint_decode preserves rdi and rsi).
     movzx eax, byte [rbx + 5]        ; DCID length
@@ -95,13 +105,16 @@ linnea_quic_unprotect:
     add rdi, rax                     ; -> SCID length
     movzx eax, byte [rdi]            ; SCID length
     inc rdi
-    add rdi, rax                     ; -> token-length varint
+    add rdi, rax                     ; -> token-length varint (Initial) or length
     lea rsi, [rbx + rbp]             ; datagram end
+    cmp qword [rsp + U_HASTOK], 0
+    je .no_token
     call linnea_quic_varint_decode   ; token length
     test rdx, rdx
     jz .err
     add rdi, rdx
     add rdi, rax                     ; skip the token
+.no_token:
     call linnea_quic_varint_decode   ; length (pn + payload + tag)
     test rdx, rdx
     jz .err
@@ -212,23 +225,79 @@ linnea_quic_unprotect:
     ret
 
 ; linnea_quic_crypto_frame(rdi=frames, rsi=len) -> rax = CRYPTO data ptr,
-; rdx = CRYPTO data length (rax = 0 if none). Skips PADDING/PING and returns
-; the first CRYPTO frame's data (RFC 9000 19.6); ACK etc. end the scan.
+; rdx = CRYPTO data length (rax = 0 if none). Skips PADDING/PING/ACK and returns
+; the first CRYPTO frame's data (RFC 9000 19.6). ACK (0x02/0x03) is fully
+; skipped so a Handshake packet that acks the server before its Finished still
+; yields the CRYPTO data. Any other frame ends the scan.
 linnea_quic_crypto_frame:
-    lea rsi, [rdi + rsi]             ; end (rsi is preserved across varint calls)
+    push rbx
+    push r12
+    lea rsi, [rdi + rsi]             ; end (rsi preserved across varint calls)
 .scan:
     cmp rdi, rsi
     jae .none
-    movzx eax, byte [rdi]
-    test al, al                      ; PADDING (0x00)
+    movzx ebx, byte [rdi]            ; frame type (kept in bl across varints)
+    test bl, bl                      ; PADDING (0x00)
     jz .skip1
-    cmp al, 0x01                     ; PING
+    cmp bl, 0x01                     ; PING
     je .skip1
-    cmp al, 0x06                     ; CRYPTO
+    cmp bl, 0x06                     ; CRYPTO
     je .crypto
+    cmp bl, 0x02                     ; ACK
+    je .ack
+    cmp bl, 0x03                     ; ACK with ECN counts
+    je .ack
     jmp .none                        ; any other frame: stop
 .skip1:
     inc rdi
+    jmp .scan
+.ack:
+    inc rdi                          ; past the type
+    call linnea_quic_varint_decode   ; Largest Acknowledged
+    test rdx, rdx
+    jz .none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Delay
+    test rdx, rdx
+    jz .none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Count
+    test rdx, rdx
+    jz .none
+    mov r12, rax                     ; number of additional ranges
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; First ACK Range
+    test rdx, rdx
+    jz .none
+    add rdi, rdx
+.ack_range:
+    test r12, r12
+    jz .ack_ecn
+    call linnea_quic_varint_decode   ; Gap
+    test rdx, rdx
+    jz .none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Length
+    test rdx, rdx
+    jz .none
+    add rdi, rdx
+    dec r12
+    jmp .ack_range
+.ack_ecn:
+    cmp bl, 0x03                     ; only 0x03 carries the three ECN counts
+    jne .scan
+    call linnea_quic_varint_decode   ; ECT0
+    test rdx, rdx
+    jz .none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ECT1
+    test rdx, rdx
+    jz .none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ECN-CE
+    test rdx, rdx
+    jz .none
+    add rdi, rdx
     jmp .scan
 .crypto:
     inc rdi                          ; past the type
@@ -239,14 +308,18 @@ linnea_quic_crypto_frame:
     call linnea_quic_varint_decode   ; length
     test rdx, rdx
     jz .none
-    mov r8, rax                      ; CRYPTO data length
+    mov r12, rax                     ; CRYPTO data length
     add rdi, rdx                     ; rdi -> CRYPTO data
     mov rax, rdi
-    mov rdx, r8
+    mov rdx, r12
+    pop r12
+    pop rbx
     ret
 .none:
     xor eax, eax
     xor edx, edx
+    pop r12
+    pop rbx
     ret
 
 ; linnea_quic_build_cert_verify(rdi=out, rsi=transcript hash H(CH..Cert),

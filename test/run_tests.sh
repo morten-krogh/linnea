@@ -218,6 +218,25 @@ else
     check "quic handshake test (skipped: aioquic/binary unavailable)" 0
 fi
 
+# QUIC client Finished: after completing the handshake the client sends its
+# Finished; linnea decrypts the Handshake packet and verifies the MAC (prints
+# CFIN-OK). Confirms server-side handshake authentication.
+if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
+    cfinlog=$(mktemp)
+    timeout 10 ./bin/linnea-quichs >"$cfinlog" 2>&1 &
+    hspid=$!
+    sleep 0.4
+    python3 test/quic/cfin_test.py 47501 >/dev/null 2>&1
+    sleep 0.3
+    grep -q CFIN-OK "$cfinlog"
+    check "quic: server verifies the client Finished" $?
+    kill $hspid 2>/dev/null
+    wait $hspid 2>/dev/null
+    rm -f "$cfinlog"
+else
+    check "quic client-Finished test (skipped: aioquic/binary unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is
