@@ -1,0 +1,28 @@
+; HTTP/3 (RFC 9114) framing constants and interfaces.
+;
+; On a request stream the client sends a sequence of HTTP/3 frames, each a
+; varint Type, a varint Length, and that many payload bytes (7.1). The request
+; is a HEADERS frame whose payload is a QPACK-encoded field section, optionally
+; followed by DATA frames. Unknown frame types are skipped (9). We reuse the
+; QUIC varint decoder for the frame header and the QPACK decoder for HEADERS.
+
+LINNEA_H3_FRAME_DATA        equ 0x00
+LINNEA_H3_FRAME_HEADERS     equ 0x01
+LINNEA_H3_FRAME_CANCEL_PUSH equ 0x03
+LINNEA_H3_FRAME_SETTINGS    equ 0x04
+LINNEA_H3_FRAME_PUSH_PROMISE equ 0x05
+LINNEA_H3_FRAME_GOAWAY      equ 0x07
+LINNEA_H3_FRAME_MAX_PUSH_ID equ 0x0d
+
+; Unidirectional stream types (the first varint on a client uni stream).
+LINNEA_H3_STREAM_CONTROL    equ 0x00
+LINNEA_H3_STREAM_QPACK_ENC  equ 0x02
+LINNEA_H3_STREAM_QPACK_DEC  equ 0x03
+
+; linnea_h3_read_headers(rdi=stream ptr, rsi=stream len, rdx=req *linnea_h2_req)
+;   -> rax = 0 on success (a HEADERS frame was found and QPACK-decoded),
+;      negative on error. Walks the request-stream frames, skips DATA/unknown
+;      frames, and decodes the first HEADERS frame. The caller zeroes the req
+;      and sets .scratch / .scratch_end (as for linnea_qpack_decode).
+LINNEA_H3_ERR          equ 1      ; malformed/truncated frame
+LINNEA_H3_ERR_NOHEADERS equ 2     ; no HEADERS frame in the stream data
