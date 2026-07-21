@@ -30,6 +30,11 @@ struc linnea_quic_conn
     .state:      resq 1
     .pn_1rtt:    resq 1              ; next 1-RTT packet number we send
     .last_active: resq 1             ; CLOCK_MONOTONIC seconds of the last packet
+    ; acknowledgement state for the 1-RTT space (see linnea_quic_ack_record):
+    ; these three must stay adjacent and in this order.
+    .rx_have:    resq 1
+    .rx_largest: resq 1
+    .rx_mask:    resq 1
     .scid:       resb LINNEA_QUIC_SCID_LEN   ; ours (index || random)
     .dcid:       resb LINNEA_QUIC_MAX_CID    ; the peer's, our DCID when sending
     .peer:       resb 16                     ; sockaddr_in of the client

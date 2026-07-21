@@ -323,6 +323,9 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_workers_test.py 47452 8 >/dev/null 2>&1
     check "h3 (io_uring): connections spread across workers are all served" $?
 
+    python3 test/quic/h3_ack_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): replies acknowledge received packets" $?
+
     # the UDP listener must not disturb TCP on the same host and port
     body=$(curl -s --http2 --cacert test/tls/server.crt \
                  --resolve localhost:47452:127.0.0.1 \
@@ -333,6 +336,20 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     wait $h3_pid 2>/dev/null
 else
     check "h3 io_uring tests (skipped: deps unavailable)" 0
+fi
+
+# Acknowledgements: our reply must acknowledge the request packet, or the peer
+# keeps retransmitting work already done.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
+    timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
+    hspid=$!
+    sleep 0.4
+    python3 test/quic/h3_ack_test.py 47501 >/dev/null 2>&1
+    check "quic: replies acknowledge the packets we received" $?
+    kill $hspid 2>/dev/null
+    wait $hspid 2>/dev/null
+else
+    check "quic ack test (skipped: deps unavailable)" 0
 fi
 
 # Connection churn: more connections than the pool has slots, each closing

@@ -59,6 +59,8 @@ extern linnea_quic_unprotect_short
 extern linnea_quic_crypto_frame
 extern linnea_quic_stream_frame
 extern linnea_quic_close_frame
+extern linnea_quic_ack_record
+extern linnea_quic_build_ack
 extern linnea_quic_conn_free
 extern linnea_quic_varint_encode
 extern linnea_quic_varint_decode
@@ -114,6 +116,7 @@ s_cert_len:  resq 1
 s_priv:      resq 1
 s_ini_len:   resq 1
 s_hsmsg_len: resq 1
+s_acklen:      resq 1
 s_docroot_ptr: resq 1
 s_docroot_len: resq 1
 
@@ -436,13 +439,17 @@ linnea_quic_server_datagram:
     CONNLEA rcx, ap_skeys
     call linnea_quic_app_secrets
     ; payload: HANDSHAKE_DONE (0x1e), padded so the HP sample has room
-    mov byte [onertt_pay], 0x1e
-    lea rdi, [onertt_pay + 1]
+    lea rdi, [onertt_pay]
     xor eax, eax
-    mov ecx, 15
-    rep stosb                        ; PADDING to 16 bytes
+    mov ecx, 32
+    rep stosb                        ; zero: trailing bytes are PADDING frames
+    lea rdi, [onertt_pay]
+    CONNLEA rsi, rx_have
+    call linnea_quic_build_ack
+    mov rcx, rax
+    mov byte [onertt_pay + rcx], 0x1e   ; HANDSHAKE_DONE
     lea rsi, [onertt_pay]
-    mov edx, 16
+    mov edx, 32                      ; padded so the sample has room
     call .send_1rtt
     ; announce it
     mov eax, LINNEA_SYS_WRITE
@@ -461,9 +468,16 @@ linnea_quic_server_datagram:
     CONNLEA rdx, ap_ckeys            ; client 1-RTT keys (derived at .do_cfin)
     lea rcx, [plaintext]
     mov r8d, LINNEA_QUIC_SCID_LEN    ; the connection ID length we issue
-    call linnea_quic_unprotect_short
+    call linnea_quic_unprotect_short  ; rax = frame bytes, rdx = packet number
     test rax, rax
     js .done
+    ; note it as received, so our next packet can acknowledge it — otherwise the
+    ; peer keeps retransmitting a request we have already answered
+    push rax
+    mov rsi, rdx
+    CONNLEA rdi, rx_have
+    call linnea_quic_ack_record
+    pop rax
     ; a peer that closes cleanly gets its slot back at once instead of waiting
     ; for the idle sweep — this is what keeps rapid connection churn from
     ; filling the pool.
@@ -509,11 +523,20 @@ linnea_quic_server_datagram:
     ; response STREAM frame: type 0x09 (STREAM|FIN), this stream's id, then the
     ; HTTP/3 response. Each response rides its own 1-RTT packet, so the frame
     ; needs no LEN — its data runs to the end of the packet.
-    mov byte [strm_pay], 0x09
-    lea rdi, [strm_pay + 1]
+    ; acknowledge what we have received first: a STREAM frame carries no LEN,
+    ; so its data runs to the end of the packet and it must come last.
+    lea rdi, [strm_pay]
+    CONNLEA rsi, rx_have
+    call linnea_quic_build_ack       ; rax = 0 if there is nothing to ack yet
+    mov [s_acklen], rax
+    mov rcx, rax
+    mov byte [strm_pay + rcx], 0x09  ; STREAM | FIN
+    lea rdi, [strm_pay + rcx + 1]
     mov rsi, [s_sid]
     call linnea_quic_varint_encode   ; rax = stream-id varint length
-    lea rbx, [rax + 1]               ; STREAM frame header length
+    mov rbx, [s_acklen]
+    add rbx, rax
+    inc rbx                          ; bytes before the HTTP/3 response
     lea rcx, [strm_pay + rbx]
     lea rdi, [req]
     mov rsi, [s_docroot_ptr]

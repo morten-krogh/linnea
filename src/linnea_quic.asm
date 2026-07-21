@@ -16,6 +16,8 @@ global linnea_quic_unprotect_short
 global linnea_quic_crypto_frame
 global linnea_quic_stream_frame
 global linnea_quic_close_frame
+global linnea_quic_ack_record
+global linnea_quic_build_ack
 global linnea_quic_recv_initial
 global linnea_quic_protect
 global linnea_quic_ch_parse
@@ -228,7 +230,7 @@ unprotect_body:
     ret
 
 ; linnea_quic_unprotect_short(rdi=packet, rsi=len, rdx=keys, rcx=out, r8=dcid_len)
-;   -> rax = plaintext length, or -1. Removes header protection and AEAD-opens a
+;   -> rax = plaintext length (or -1), rdx = the packet number. Removes header protection and AEAD-opens a
 ; short-header (1-RTT) packet. The destination connection-id length must be
 ; supplied — short headers carry no length field for it. RFC 9001 5.3 / 5.4.
 %define S_AAD    0        ; unprotected header (AAD)
@@ -335,6 +337,7 @@ linnea_quic_unprotect_short:
     mov rax, rbp
     sub rax, [rsp + S_HLEN]
     sub rax, 16                      ; plaintext length = ctlen - tag
+    mov rdx, [rsp + S_PN]            ; and the packet number, for acknowledging
     jmp .sdone
 .serr:
     mov rax, -1
@@ -465,6 +468,120 @@ linnea_quic_stream_frame:
 .ss_none:
     xor eax, eax
     xor edx, edx
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Acknowledgement state for one packet-number space: three qwords —
+;   [0] have  : 0 until the first packet arrives (0 is a real packet number)
+;   [1] largest: the highest packet number seen
+;   [2] mask  : bit i set = packet (largest - 1 - i) also arrived
+; A 64-packet window behind the largest is plenty to describe what we hold
+; while a peer has anything in flight, and it costs no allocation.
+
+; linnea_quic_ack_record(rdi=state, rsi=packet number) — note a packet as
+; received. Reordering is handled: a packet below the largest sets its bit, and
+; a later packet shifts the window up.
+linnea_quic_ack_record:
+    cmp qword [rdi], 0
+    jne .ar_have
+    mov qword [rdi], 1               ; first packet in this space
+    mov [rdi + 8], rsi
+    mov qword [rdi + 16], 0
+    ret
+.ar_have:
+    mov rax, [rdi + 8]               ; largest
+    cmp rsi, rax
+    ja .ar_newer
+    je .ar_done                      ; duplicate
+    ; older packet: set its bit if it still falls inside the window
+    sub rax, rsi
+    dec rax                          ; offset below largest
+    cmp rax, 64
+    jae .ar_done                     ; too old to describe
+    mov rcx, rax
+    mov rdx, 1
+    shl rdx, cl
+    or [rdi + 16], rdx
+    ret
+.ar_newer:
+    mov rcx, rsi
+    sub rcx, rax                     ; delta
+    cmp rcx, 64
+    jae .ar_reset                    ; the old window falls off entirely
+    mov rdx, [rdi + 16]
+    shl rdx, cl
+    mov rax, 1
+    dec rcx
+    shl rax, cl                      ; the old largest is now delta-1 below
+    or rdx, rax
+    mov [rdi + 16], rdx
+    mov [rdi + 8], rsi
+    ret
+.ar_reset:
+    mov qword [rdi + 16], 0
+    mov [rdi + 8], rsi
+.ar_done:
+    ret
+
+; linnea_quic_build_ack(rdi=out, rsi=state) -> rax = bytes written (0 if
+; nothing has been received yet). Emits one ACK frame covering the largest
+; packet and the unbroken run below it (RFC 9000 19.3). Packets under a gap are
+; left unacknowledged — acknowledging less than we hold is always safe, whereas
+; claiming a packet we never saw would suppress a retransmission we need.
+linnea_quic_build_ack:
+    push rbx
+    push r12
+    push r13
+    push r14
+    cmp qword [rsi], 0
+    je .ba_none
+    mov r14, rdi                     ; out start
+    mov rbx, rdi                     ; out cursor
+    mov r12, [rsi + 8]               ; largest
+    mov r13, [rsi + 16]              ; mask
+    ; the unbroken run below the largest is the set bits from bit 0 up, which
+    ; is where the first zero of the complement sits
+    mov rax, r13
+    not rax
+    bsf rcx, rax
+    jnz .ba_run
+    mov ecx, 64                      ; every bit set: a full window
+.ba_run:
+    cmp rcx, r12
+    jbe .ba_cap                      ; the run cannot reach below packet 0
+    mov rcx, r12
+.ba_cap:
+    mov r13, rcx                     ; First ACK Range
+    mov byte [rbx], 0x02             ; ACK, without ECN counts
+    inc rbx
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_varint_encode   ; Largest Acknowledged
+    add rbx, rax
+    mov rdi, rbx
+    xor esi, esi
+    call linnea_quic_varint_encode   ; ACK Delay (we do not measure one)
+    add rbx, rax
+    mov rdi, rbx
+    xor esi, esi
+    call linnea_quic_varint_encode   ; ACK Range Count: only the first range
+    add rbx, rax
+    mov rdi, rbx
+    mov rsi, r13
+    call linnea_quic_varint_encode   ; First ACK Range
+    add rbx, rax
+    mov rax, rbx
+    sub rax, r14                     ; bytes written
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ba_none:
+    xor eax, eax
+    pop r14
     pop r13
     pop r12
     pop rbx
