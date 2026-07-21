@@ -35,3 +35,25 @@ print(emit("quic_a2_dcid", bytes.fromhex("8394c8f03e515708")))
 print()
 print(emit("quic_a2_plain_prefix", prefix))
 print(f"quic_a2_plain_prefix_len equ {len(prefix)}")
+print()
+
+# --- A.3 Server Initial: the send-side (packet protection) vector. ---
+# Anchor on phrases unique to the A.3 body (the section header also appears
+# in the table of contents, so don't slice on "A.3"/"A.4" directly).
+payload = txt.split("no PADDING frames:", 1)[1].split("The header", 1)[0]
+header = txt.split("packet number of 1:", 1)[1].split("As a result", 1)[0]
+protected = txt.split("The final protected packet is then:", 1)[1].split("A.4", 1)[0]
+hx = lambda s: bytes.fromhex(re.sub(r'[^0-9a-f]', '', s))
+a3_payload, a3_header, a3_protected = hx(payload), hx(header), hx(protected)
+assert a3_header.hex() == "c1000000010008f067a5502a4262b50040750001", a3_header.hex()
+assert len(a3_protected) == len(a3_header) + len(a3_payload) + 16
+
+print(emit("quic_a3_header", a3_header))
+print(f"quic_a3_header_len equ {len(a3_header)}")
+print(f"quic_a3_pn_len equ 2")
+print()
+print(emit("quic_a3_payload", a3_payload))
+print(f"quic_a3_payload_len equ {len(a3_payload)}")
+print()
+print(emit("quic_a3_protected", a3_protected))
+print(f"quic_a3_protected_len equ {len(a3_protected)}")

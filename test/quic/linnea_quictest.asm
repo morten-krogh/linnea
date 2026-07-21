@@ -15,6 +15,7 @@ extern linnea_quic_varint_decode
 extern linnea_quic_varint_encode
 extern linnea_quic_unprotect
 extern linnea_quic_crypto_frame
+extern linnea_quic_protect
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 
@@ -94,6 +95,7 @@ a2_client:   resb linnea_quic_keys_size
 a2_server:   resb linnea_quic_keys_size
 plain_buf:   resb 1500
 plain_len:   resq 1
+prot_buf:    resb 256
 
 section .text
 _start:
@@ -158,6 +160,26 @@ _start:
     jne .a2_done
     inc r15d
 .a2_done:
+
+    ; --- RFC 9001 A.3: protect the server Initial, match the RFC bytes ---
+    ; a2_server holds the server Initial keys (derived from the A.2 DCID).
+    sub rsp, 16
+    lea rax, [a2_server]
+    mov [rsp], rax                   ; keys (stack argument)
+    lea rdi, [prot_buf]
+    lea rsi, [quic_a3_header]
+    mov edx, quic_a3_header_len
+    mov ecx, quic_a3_pn_len
+    lea r8, [quic_a3_payload]
+    mov r9d, quic_a3_payload_len
+    call linnea_quic_protect         ; rax = total protected length
+    add rsp, 16
+    inc r14d
+    cmp rax, quic_a3_protected_len
+    jne .a3_done
+    inc r15d
+.a3_done:
+    CHECK prot_buf, quic_a3_protected, quic_a3_protected_len
 
     ; print "quic-crypto <pass>/<total>\n"
     lea rdi, [msg_head]

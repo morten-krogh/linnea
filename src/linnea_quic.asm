@@ -13,11 +13,13 @@ global linnea_quic_initial_dcid
 global linnea_quic_unprotect
 global linnea_quic_crypto_frame
 global linnea_quic_recv_initial
+global linnea_quic_protect
 
 extern linnea_quic_hp_mask
 extern linnea_quic_initial_secrets
 extern linnea_aesgcm_init
 extern linnea_aesgcm_open
+extern linnea_aesgcm_seal
 
 section .text
 
@@ -270,6 +272,123 @@ linnea_quic_recv_initial:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; linnea_quic_protect(rdi=out, rsi=hdr, rdx=hdr_len, rcx=pn_len,
+;                     r8=payload, r9=payload_len, [stack]=keys) -> rax=total
+; The inverse of unprotect: AEAD-seals the payload (nonce = iv XOR pn, AAD =
+; the unprotected header) after the header in out, copies the header, then
+; applies header protection. hdr already contains the plaintext packet number.
+%define P_CTX    0
+%define P_NONCE  192
+%define P_MASK   208
+%define P_PNOFF  216
+%define P_PN     224
+%define P_KEYS   248
+linnea_quic_protect:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rax, [rsp + 56]              ; keys (caller's stack arg)
+    sub rsp, 264
+    mov [rsp + P_KEYS], rax
+    mov rbx, rdi                     ; out
+    mov rbp, rsi                     ; hdr
+    mov r13, rdx                     ; hdr_len
+    mov r14, rcx                     ; pn_len
+    mov r12, r8                      ; payload
+    mov r15, r9                      ; payload_len
+    ; pn_offset = hdr_len - pn_len
+    mov rax, r13
+    sub rax, r14
+    mov [rsp + P_PNOFF], rax
+    ; read the plaintext packet number from the header (big-endian)
+    lea rdi, [rbp + rax]
+    xor rax, rax
+    xor edx, edx
+.rp_pn:
+    shl rax, 8
+    movzx ecx, byte [rdi + rdx]
+    or rax, rcx
+    inc edx
+    cmp edx, r14d
+    jb .rp_pn
+    mov [rsp + P_PN], rax
+    ; copy the header into out
+    mov rsi, rbp
+    mov rdi, rbx
+    mov rcx, r13
+    rep movsb
+    ; nonce = iv XOR pn (right-aligned)
+    mov rax, [rsp + P_KEYS]
+    lea rsi, [rax + linnea_quic_keys.iv]
+    lea rdi, [rsp + P_NONCE]
+    mov ecx, 12
+    rep movsb
+    mov rax, [rsp + P_PN]
+    lea rdi, [rsp + P_NONCE + 11]
+    mov ecx, 8
+.p_nonce:
+    mov dl, al
+    xor [rdi], dl
+    dec rdi
+    shr rax, 8
+    dec ecx
+    jnz .p_nonce
+    ; AEAD-seal the payload after the header
+    mov rax, [rsp + P_KEYS]
+    lea rdi, [rsp + P_CTX]
+    lea rsi, [rax + linnea_quic_keys.key]
+    call linnea_aesgcm_init
+    lea rdi, [rsp + P_CTX]
+    lea rsi, [rsp + P_NONCE]
+    mov rdx, rbx                     ; AAD = the (unprotected) header in out
+    mov rcx, r13
+    mov r8, r12                      ; payload
+    mov r9, r15
+    lea rax, [rbx + r13]             ; seal destination = out + hdr_len
+    sub rsp, 16
+    mov [rsp], rax
+    call linnea_aesgcm_seal
+    add rsp, 16
+    ; header protection: sample the ciphertext at pn_offset + 4
+    mov rax, [rsp + P_PNOFF]
+    lea rsi, [rbx + rax + 4]
+    mov rax, [rsp + P_KEYS]
+    lea rdi, [rax + linnea_quic_keys.hp]
+    lea rdx, [rsp + P_MASK]
+    call linnea_quic_hp_mask
+    ; mask the first byte (low 4 bits for a long header)
+    movzx eax, byte [rbx]
+    movzx edx, byte [rsp + P_MASK]
+    and edx, 0x0f
+    xor eax, edx
+    mov [rbx], al
+    ; mask the packet-number bytes
+    mov rax, [rsp + P_PNOFF]
+    lea rdi, [rbx + rax]
+    lea rsi, [rsp + P_MASK + 1]
+    xor edx, edx
+.p_mask:
+    mov al, [rdi + rdx]
+    xor al, [rsi + rdx]
+    mov [rdi + rdx], al
+    inc edx
+    cmp edx, r14d
+    jb .p_mask
+    ; total length = header + payload + 16-byte tag
+    lea rax, [r13 + r15]
+    add rax, 16
+    add rsp, 264
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
     pop rbx
     ret
 
