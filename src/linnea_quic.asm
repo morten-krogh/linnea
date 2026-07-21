@@ -907,6 +907,8 @@ linnea_quic_recv_initial:
 ; The inverse of unprotect: AEAD-seals the payload (nonce = iv XOR pn, AAD =
 ; the unprotected header) after the header in out, copies the header, then
 ; applies header protection. hdr already contains the plaintext packet number.
+; Works for long and short headers alike — the header-protection first-byte mask
+; (4 vs 5 low bits) is chosen from the header form bit in hdr[0].
 %define P_CTX    0
 %define P_NONCE  192
 %define P_MASK   208
@@ -989,10 +991,15 @@ linnea_quic_protect:
     lea rdi, [rax + linnea_quic_keys.hp]
     lea rdx, [rsp + P_MASK]
     call linnea_quic_hp_mask
-    ; mask the first byte (low 4 bits for a long header)
+    ; mask the first byte: 4 low bits for a long header, 5 for a short header
     movzx eax, byte [rbx]
+    mov ecx, 0x0f
+    test al, 0x80                    ; long-header form?
+    jnz .p_b0
+    mov ecx, 0x1f                    ; short header masks the 5 low bits
+.p_b0:
     movzx edx, byte [rsp + P_MASK]
-    and edx, 0x0f
+    and edx, ecx
     xor eax, edx
     mov [rbx], al
     ; mask the packet-number bytes

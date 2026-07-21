@@ -218,23 +218,25 @@ else
     check "quic handshake test (skipped: aioquic/binary unavailable)" 0
 fi
 
-# QUIC client Finished: after completing the handshake the client sends its
-# Finished; linnea decrypts the Handshake packet and verifies the MAC (prints
-# CFIN-OK). Confirms server-side handshake authentication.
+# QUIC handshake confirmation: the client sends its Finished; linnea decrypts
+# the Handshake packet, verifies the MAC (prints CFIN-OK), and replies with
+# HANDSHAKE_DONE in a 1-RTT packet. cfin_test.py asserts aioquic accepts it and
+# confirms the handshake — both server-side auth and the 1-RTT keys.
 if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
     cfinlog=$(mktemp)
     timeout 10 ./bin/linnea-quichs >"$cfinlog" 2>&1 &
     hspid=$!
     sleep 0.4
     python3 test/quic/cfin_test.py 47501 >/dev/null 2>&1
+    cfinrc=$?
     sleep 0.3
-    grep -q CFIN-OK "$cfinlog"
-    check "quic: server verifies the client Finished" $?
+    if [ $cfinrc -eq 0 ] && grep -q CFIN-OK "$cfinlog"; then cfinok=0; else cfinok=1; fi
+    check "quic: client Finished verified + HANDSHAKE_DONE confirms handshake" $cfinok
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
     rm -f "$cfinlog"
 else
-    check "quic client-Finished test (skipped: aioquic/binary unavailable)" 0
+    check "quic handshake-confirm test (skipped: aioquic/binary unavailable)" 0
 fi
 
 # --- HTTP tests against a running server ---

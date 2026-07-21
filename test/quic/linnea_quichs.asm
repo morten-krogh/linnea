@@ -26,6 +26,7 @@ extern linnea_quic_build_cert
 extern linnea_quic_build_cert_verify
 extern linnea_quic_build_finished
 extern linnea_quic_hs_secrets
+extern linnea_quic_app_secrets
 extern linnea_quic_protect
 extern linnea_quic_unprotect_hs
 extern linnea_quic_crypto_frame
@@ -69,6 +70,10 @@ hs_ckeys:    resb linnea_quic_keys_size
 hs_sec:      resb 96                  ; c_hs || s_hs || handshake_secret
 s_th_cfin:   resb 32                  ; H(CH..server Finished) for the client MAC
 expfin:      resb 64                  ; expected client Finished message
+ap_ckeys:    resb linnea_quic_keys_size
+ap_skeys:    resb linnea_quic_keys_size
+onertt_pay:  resb 32                  ; HANDSHAKE_DONE + PADDING
+onertt_pkt:  resb 256                 ; the protected 1-RTT packet
 ch_out:      resb linnea_quic_ch_size
 server_pub:  resb 32
 sh_buf:      resb 128
@@ -365,7 +370,49 @@ _start:
     mov ecx, 36
     repe cmpsb
     jne .loop
-    ; the client authenticated: announce it
+    ; the client authenticated. Derive the 1-RTT keys (the application traffic
+    ; secrets use the same transcript through the server Finished) and confirm
+    ; the handshake by sending HANDSHAKE_DONE in a short-header 1-RTT packet.
+    lea rdi, [hs_sec + 64]           ; handshake secret
+    lea rsi, [s_th_cfin]             ; H(CH..server Finished)
+    lea rdx, [ap_ckeys]
+    lea rcx, [ap_skeys]
+    call linnea_quic_app_secrets
+    ; short header: 0x40 | pn_len-1, DCID = client SCID (no length prefix), pn
+    mov byte [hdr], 0x40
+    mov rcx, [s_cscid_len]
+    lea rdi, [hdr + 1]
+    mov rsi, [s_cscid_ptr]
+    rep movsb                        ; DCID = client SCID
+    mov byte [rdi], 0x00             ; packet number 0
+    mov r14, [s_cscid_len]
+    add r14, 2                       ; header length = 1 + DCID + 1
+    ; payload: HANDSHAKE_DONE (0x1e), padded so the HP sample has room
+    mov byte [onertt_pay], 0x1e
+    lea rdi, [onertt_pay + 1]
+    xor eax, eax
+    mov ecx, 15
+    rep stosb                        ; PADDING to 16 bytes
+    sub rsp, 16
+    lea rax, [ap_skeys]
+    mov [rsp], rax
+    lea rdi, [onertt_pkt]
+    lea rsi, [hdr]
+    mov rdx, r14
+    mov ecx, 1
+    lea r8, [onertt_pay]
+    mov r9d, 16
+    call linnea_quic_protect         ; rax = packet length
+    add rsp, 16
+    mov rdx, rax
+    mov eax, SYS_SENDTO
+    mov edi, r12d
+    lea rsi, [onertt_pkt]
+    xor r10d, r10d
+    lea r8, [sa]
+    mov r9d, 16
+    syscall
+    ; announce it
     mov eax, LINNEA_SYS_WRITE
     mov edi, 1
     lea rsi, [cfin_marker]
