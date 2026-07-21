@@ -13,9 +13,12 @@
 %include "linnea_syscall.inc"
 %include "linnea_quic.inc"
 %include "linnea_sha256.inc"
+%include "linnea_hpack.inc"
 
 global _start
 
+extern linnea_h3_read_headers
+extern linnea_h3_build_response
 extern linnea_quic_initial_dcid
 extern linnea_quic_initial_secrets
 extern linnea_quic_recv_initial
@@ -59,6 +62,10 @@ key_pem:      incbin "test/tls/server.key"
 key_pem_len   equ $ - key_pem
 cfin_marker:  db "CFIN-OK", 10
 cfin_marker_len equ $ - cfin_marker
+r_ctype:      db "text/plain"
+r_ctype_len   equ $ - r_ctype
+r_body:       db "served by linnea over http/3", 10
+r_body_len    equ $ - r_body
 
 section .bss
 sa:          resb 16
@@ -75,7 +82,13 @@ expfin:      resb 64                  ; expected client Finished message
 ap_ckeys:    resb linnea_quic_keys_size
 ap_skeys:    resb linnea_quic_keys_size
 onertt_pay:  resb 32                  ; HANDSHAKE_DONE + PADDING
-onertt_pkt:  resb 256                 ; the protected 1-RTT packet
+onertt_pkt:  resb 4096                ; the protected 1-RTT packet
+strm_pay:    resb 4096                ; STREAM frame carrying the h3 response
+req:         resb linnea_h2_req_size  ; decoded h3 request
+h3scratch:   resb 2048                ; QPACK literal scratch
+s_1rtt_pn:   resq 1                   ; server 1-RTT packet number
+s_pl_ptr:    resq 1
+s_pl_len:    resq 1
 ch_out:      resb linnea_quic_ch_size
 server_pub:  resb 32
 sh_buf:      resb 128
@@ -94,6 +107,7 @@ s_odcid_ptr: resq 1
 s_odcid_len: resq 1
 s_cscid_ptr: resq 1
 s_cscid_len: resq 1
+s_cscid_buf: resb 20                  ; stable copy of the client SCID
 s_cert_len:  resq 1
 s_priv:      resq 1
 s_ini_len:   resq 1
@@ -181,13 +195,18 @@ _start:
     mov rsi, rdx
     lea rdx, [ch_out]
     call linnea_quic_ch_parse
-    ; the client's SCID sits after its DCID in the received header
+    ; the client's SCID sits after its DCID in the received header. Copy it to a
+    ; stable buffer: we reuse it as the DCID of every packet we send back, but
+    ; dgram is overwritten by each recvfrom.
     movzx eax, byte [dgram + 5]
     lea rsi, [dgram + 6 + rax]
-    movzx ecx, byte [rsi]
-    lea rsi, [rsi + 1]
-    mov [s_cscid_ptr], rsi
+    movzx ecx, byte [rsi]            ; SCID length
+    inc rsi                          ; -> SCID bytes
     mov [s_cscid_len], rcx
+    lea rdi, [s_cscid_buf]
+    rep movsb                        ; copy the SCID out of dgram
+    lea rax, [s_cscid_buf]
+    mov [s_cscid_ptr], rax
     ; server ephemeral public + ServerHello
     lea rdi, [server_pub]
     lea rsi, [server_priv]
@@ -385,40 +404,15 @@ _start:
     lea rdx, [ap_ckeys]
     lea rcx, [ap_skeys]
     call linnea_quic_app_secrets
-    ; short header: 0x40 | pn_len-1, DCID = client SCID (no length prefix), pn
-    mov byte [hdr], 0x40
-    mov rcx, [s_cscid_len]
-    lea rdi, [hdr + 1]
-    mov rsi, [s_cscid_ptr]
-    rep movsb                        ; DCID = client SCID
-    mov byte [rdi], 0x00             ; packet number 0
-    mov r14, [s_cscid_len]
-    add r14, 2                       ; header length = 1 + DCID + 1
     ; payload: HANDSHAKE_DONE (0x1e), padded so the HP sample has room
     mov byte [onertt_pay], 0x1e
     lea rdi, [onertt_pay + 1]
     xor eax, eax
     mov ecx, 15
     rep stosb                        ; PADDING to 16 bytes
-    sub rsp, 16
-    lea rax, [ap_skeys]
-    mov [rsp], rax
-    lea rdi, [onertt_pkt]
-    lea rsi, [hdr]
-    mov rdx, r14
-    mov ecx, 1
-    lea r8, [onertt_pay]
-    mov r9d, 16
-    call linnea_quic_protect         ; rax = packet length
-    add rsp, 16
-    mov rdx, rax
-    mov eax, SYS_SENDTO
-    mov edi, r12d
-    lea rsi, [onertt_pkt]
-    xor r10d, r10d
-    lea r8, [sa]
-    mov r9d, 16
-    syscall
+    lea rsi, [onertt_pay]
+    mov edx, 16
+    call .send_1rtt
     ; announce it
     mov eax, LINNEA_SYS_WRITE
     mov edi, 1
@@ -427,7 +421,7 @@ _start:
     syscall
     jmp .loop
 
-; --- 1-RTT (short-header) packet: application data on a QUIC stream ---
+; --- 1-RTT (short-header) packet: an HTTP/3 request on a QUIC stream ---
 .onertt_in:
     lea rdi, [dgram]
     mov rsi, r13
@@ -442,12 +436,80 @@ _start:
     call linnea_quic_stream_frame    ; skips ACK, returns the first STREAM data
     test rax, rax
     jz .loop
-    ; echo the stream payload to stdout (rax = data ptr, rdx = length)
-    mov rsi, rax
-    mov eax, LINNEA_SYS_WRITE
-    mov edi, 1
-    syscall
+    test r8, r8
+    jnz .loop                        ; only the client request stream (0) for now
+    mov r14, rax                     ; stream data ptr
+    mov r15, rdx                     ; stream data len
+    ; zero the request struct and point the QPACK scratch at h3scratch
+    lea rdi, [req]
+    xor eax, eax
+    mov ecx, linnea_h2_req_size
+    rep stosb
+    lea rax, [h3scratch]
+    mov [req + linnea_h2_req.scratch], rax
+    lea rax, [h3scratch + 2048]
+    mov [req + linnea_h2_req.scratch_end], rax
+    ; parse the HTTP/3 request (HEADERS frame -> QPACK decode)
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [req]
+    call linnea_h3_read_headers
+    test rax, rax
+    jnz .loop                        ; not a complete request
+    ; build the response STREAM frame: type 0x09 (STREAM|FIN), stream id 0, data
+    mov byte [strm_pay], 0x09
+    mov byte [strm_pay + 1], 0x00
+    lea rdi, [strm_pay + 2]
+    mov esi, 200
+    lea rdx, [r_ctype]
+    mov ecx, r_ctype_len
+    lea r8, [r_body]
+    mov r9, r_body_len
+    call linnea_h3_build_response    ; rax = h3 response length
+    lea rsi, [strm_pay]
+    lea rdx, [rax + 2]               ; STREAM frame length = header (2) + h3
+    call .send_1rtt
     jmp .loop
+
+; .send_1rtt(rsi = payload ptr, rdx = payload len) — build a short-header 1-RTT
+; packet with the current server packet number, protect it with the server
+; 1-RTT keys, send it to the client, and advance the packet number.
+.send_1rtt:
+    push rbx                          ; align the stack (and free reg)
+    mov [s_pl_ptr], rsi
+    mov [s_pl_len], rdx
+    mov byte [hdr], 0x40              ; short header, 1-byte pn, key phase 0
+    mov rcx, [s_cscid_len]
+    lea rdi, [hdr + 1]
+    mov rsi, [s_cscid_ptr]
+    rep movsb                         ; DCID = client SCID
+    mov rax, [s_1rtt_pn]
+    mov [rdi], al                     ; packet number (1 byte)
+    inc rdi
+    mov rbx, [s_cscid_len]
+    add rbx, 2                        ; header length = 1 + DCID + 1
+    sub rsp, 16
+    lea rax, [ap_skeys]
+    mov [rsp], rax
+    lea rdi, [onertt_pkt]
+    lea rsi, [hdr]
+    mov rdx, rbx
+    mov ecx, 1
+    mov r8, [s_pl_ptr]
+    mov r9, [s_pl_len]
+    call linnea_quic_protect          ; rax = packet length
+    add rsp, 16
+    mov rdx, rax
+    mov eax, SYS_SENDTO
+    mov edi, r12d
+    lea rsi, [onertt_pkt]
+    xor r10d, r10d
+    lea r8, [sa]
+    mov r9d, 16
+    syscall
+    inc qword [s_1rtt_pn]
+    pop rbx
+    ret
 
 ; .build_initial_header -> rcx = header length; DCID = client SCID, SCID = ours,
 ; length field = pn(1)+payload(99)+tag(16) = 116, packet number 0.
