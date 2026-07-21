@@ -178,13 +178,22 @@ bin/linnea-quicfin: test/quic/linnea_quicfin.o $(QUICMSG_OBJS)
 quiccv: bin/linnea-quiccv
 quicfin: bin/linnea-quicfin
 
+# --- test-only: a minimal QUIC handshake responder (server Initial) ---
+test/quic/linnea_quichs.o: test/quic/linnea_quichs.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+bin/linnea-quichs: test/quic/linnea_quichs.o $(QUICMSG_OBJS)
+	$(LD) -o $@ $^
+
+quichs: bin/linnea-quichs
+
 clean:
 	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
 	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
 
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
-      bin/linnea-quiccv bin/linnea-quicfin
+      bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd

@@ -203,6 +203,20 @@ else
     check "quic Finished test (skipped: deps unavailable)" 0
 fi
 
+# QUIC handshake on the wire: linnea replies to a client Initial with a server
+# Initial (ACK + ServerHello); aioquic decrypts it and processes the SH.
+if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
+    timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
+    hspid=$!
+    sleep 0.4
+    python3 test/quic/hs_test.py 47501 >/dev/null 2>&1
+    check "quic: server Initial drives aioquic past the ServerHello" $?
+    kill $hspid 2>/dev/null
+    wait $hspid 2>/dev/null
+else
+    check "quic handshake test (skipped: aioquic/binary unavailable)" 0
+fi
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is
