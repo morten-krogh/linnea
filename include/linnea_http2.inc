@@ -31,7 +31,19 @@ LINNEA_H2_FLAG_PADDED      equ 0x08   ; DATA / HEADERS
 LINNEA_H2_FLAG_PRIORITY    equ 0x20   ; HEADERS
 
 ; SETTINGS identifiers we emit / honour
-LINNEA_H2_SETTINGS_HEADER_TABLE_SIZE equ 0x01
+LINNEA_H2_SETTINGS_HEADER_TABLE_SIZE      equ 0x01
+LINNEA_H2_SETTINGS_MAX_CONCURRENT_STREAMS equ 0x03
+
+; Flow control / framing defaults (RFC 9113 6.5.2 / 6.9).
+LINNEA_H2_INIT_WINDOW  equ 65535   ; initial connection + stream send window
+LINNEA_H2_MAX_FRAME    equ 16384    ; DATA payload we cap each frame at
+
+; Static file path assembly (M17): the normalized path is built at
+; LINNEA_HTTP2_PATH_ROOT so a matched location's root can be prepended in
+; place ahead of it (mirrors the HTTP/1.1 handler's path_buf).
+LINNEA_HTTP2_PATH_ROOT equ LINNEA_MAX_ROOT + 1
+LINNEA_HTTP2_PATH_BUF  equ LINNEA_HTTP2_PATH_ROOT + 2560
+LINNEA_HTTP2_MAX_PATH  equ 2048     ; bound on the decoded :path length
 
 ; request assembly (M16): the reassembled header block and the Huffman
 ; decode scratch both live in the connection's up_buf (unused under h2,

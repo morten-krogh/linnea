@@ -69,6 +69,7 @@ extern linnea_tls_drain_early
 extern linnea_ktls_enable
 extern linnea_h2_init
 extern linnea_h2_handle
+extern linnea_h2_after_send
 extern linnea_string_iequal
 
 section .rodata
@@ -540,17 +541,28 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .send_drained:
-    ; HTTP/2: a flight of frames finished going out. If we queued a
-    ; GOAWAY, close; otherwise process any frames still buffered, or read
-    ; more (this also picks up the client preface after our SETTINGS).
+    ; HTTP/2: a flight of frames finished going out. Continue streaming a
+    ; response body if one is in flight (or a WINDOW_UPDATE has unblocked
+    ; it); otherwise, if we queued a GOAWAY close, else process any frames
+    ; still buffered or read more (this also picks up the client preface
+    ; after our SETTINGS).
     cmp qword [r12 + linnea_connection.is_h2], 0
     je .not_h2_send
-    cmp qword [r12 + linnea_connection.h2_state], LINNEA_H2_CLOSING
+    mov rdi, r12
+    call linnea_h2_after_send
+    cmp eax, LINNEA_H2_SEND
+    je .h2_send_more
+    cmp eax, LINNEA_H2_CLOSE
     je .h2_close
     cmp qword [r12 + linnea_connection.in_len], 0
     jne .h2_process
     mov rdi, r12
     call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.h2_send_more:
+    mov rdi, r12
+    call linnea_uring_arm_send
     call linnea_uring_submit_now
     jmp .wait
 .not_h2_send:

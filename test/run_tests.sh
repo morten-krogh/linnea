@@ -960,27 +960,60 @@ PYEOF
     timeout 10 python3 test/tls/h2_bringup.py $CA 47446 >/dev/null 2>&1
     check "http2 connection bring-up (preface, settings, ping, goaway)" $?
 
-    # M16: a real HTTP/2 client (curl's nghttp2, so genuine HPACK — Huffman,
-    # static table) gets its HEADERS decoded. The M16 echo response returns
-    # the decoded method + path, so a correct :path (query included) proves
-    # the decoder end to end.
+    # M16/M17: a real HTTP/2 client (curl's nghttp2 — genuine HPACK with
+    # Huffman + the static table) has its HEADERS decoded and the named
+    # static file served back over h2. Serving the right file end to end is
+    # the proof the :path decoded correctly.
     rl="--resolve localhost:47446:127.0.0.1"
-    body=$(curl -s --http2 --cacert $CA $rl "https://localhost:47446/hi/there?q=1")
-    [ "$body" = "linnea h2: GET /hi/there?q=1" ]
-    check "http2 request served over h2 (HPACK decode, method+path)" $?
-    # negotiated protocol really is h2
+    u="https://localhost:47446"
+    body=$(curl -s --http2 --cacert $CA $rl "$u/hello.txt")
+    [ "$body" = "hello from linnea" ]
+    check "http2 serves a static file (HPACK decode -> file)" $?
+    # status line, content-type and content-length over h2
+    hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null "$u/hello.txt")
+    echo "$hdrs" | grep -qi '^HTTP/2 200' \
+        && echo "$hdrs" | grep -qi '^content-type: text/plain' \
+        && echo "$hdrs" | grep -qi '^content-length: 18'
+    check "http2 response headers (status, content-type, content-length)" $?
     ver=$(curl -s -o /dev/null --http2 --cacert $CA $rl \
-        -w '%{http_version}' "https://localhost:47446/x")
+        -w '%{http_version}' "$u/hello.txt")
     [ "$ver" = "2" ]
     check "http2 request uses HTTP/2 (not downgraded)" $?
-    # two requests on one connection: keep-alive + dynamic-table-size-update,
-    # plus a Huffman-coded custom header the decoder must parse and skip
+    ct=$(curl -s -o /dev/null --http2 --cacert $CA $rl \
+        -w '%{content_type}' "$u/style.css")
+    [ "$ct" = "text/css" ]
+    check "http2 content-type from extension (css)" $?
+    # a body larger than the initial flow-control window (100000 > 65535):
+    # exercises DATA chunking and WINDOW_UPDATE-driven resumption
+    n=$(curl -s --http2 --cacert $CA $rl "$u/big.txt" | wc -c)
+    junk=$(curl -s --http2 --cacert $CA $rl "$u/big.txt" | tr -d 'B' | wc -c)
+    [ "$n" -eq 100000 ] && [ "$junk" -eq 0 ]
+    check "http2 flow control: 100000-byte body, exact + intact" $?
+    # keep-alive with a Huffman-coded custom header (decoder must parse+skip)
     two=$(curl -s --http2 --cacert $CA $rl \
-        -H "x-linnea-probe: huffman-coded-value-98765" \
-        "https://localhost:47446/one" "https://localhost:47446/two/leaf")
-    [ "$two" = "linnea h2: GET /one
-linnea h2: GET /two/leaf" ]
+        -H "x-linnea-probe: a-huffman-coded-header-value-98765" \
+        "$u/hello.txt" "$u/big.txt" | wc -c)
+    [ "$two" -eq 100018 ]
     check "http2 keep-alive: two requests, one connection" $?
+    # HEAD: headers only, no body
+    hb=$(curl -s --http2 -I --cacert $CA $rl "$u/hello.txt" | grep -ci .)
+    hd=$(curl -s --http2 -I --cacert $CA $rl "$u/hello.txt" | grep -qi 'content-length: 18' && echo ok)
+    [ "$hd" = "ok" ]
+    check "http2 HEAD: headers with content-length, no body" $?
+    # a directory maps to index.html
+    dc=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' "$u/")
+    [ "$dc" = "200" ]
+    check "http2 directory serves index.html" $?
+    # missing file -> 404, disallowed method -> 405
+    c404=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' "$u/nope.txt")
+    c405=$(curl -s -o /dev/null --http2 --cacert $CA $rl -X DELETE -w '%{http_code}' "$u/hello.txt")
+    [ "$c404" = "404" ] && [ "$c405" = "405" ]
+    check "http2 error statuses (404 missing, 405 method)" $?
+    # path traversal above the root is refused
+    ct400=$(curl -s -o /dev/null --http2 --cacert $CA $rl --path-as-is \
+        -w '%{http_code}' "$u/../../../etc/passwd")
+    [ "$ct400" = "400" ]
+    check "http2 path traversal refused (400)" $?
 
     kill $h2_pid 2>/dev/null
     wait $h2_pid 2>/dev/null
