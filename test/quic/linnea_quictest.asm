@@ -17,6 +17,7 @@ extern linnea_quic_unprotect
 extern linnea_quic_crypto_frame
 extern linnea_quic_protect
 extern linnea_quic_hs_secrets
+extern linnea_quic_app_secrets
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 
@@ -100,7 +101,9 @@ plain_len:   resq 1
 prot_buf:    resb 256
 hs_client:   resb linnea_quic_keys_size
 hs_server:   resb linnea_quic_keys_size
-hs_secrets_out: resb 64
+hs_secrets_out: resb 96
+ap_client:   resb linnea_quic_keys_size
+ap_server:   resb linnea_quic_keys_size
 
 section .text
 _start:
@@ -197,6 +200,17 @@ _start:
     call linnea_quic_hs_secrets
     CHECK hs_client, qhs_exp_client, 44
     CHECK hs_server, qhs_exp_server, 44
+    ; the handshake secret is exported (bytes 64..96 of the secrets buffer)
+    CHECK hs_secrets_out + 64, qhs_hs_secret, 32
+
+    ; --- 1-RTT (application) key derivation from the handshake secret ---
+    lea rdi, [qhs_hs_secret]
+    lea rsi, [qhs_th_app]
+    lea rdx, [ap_client]
+    lea rcx, [ap_server]
+    call linnea_quic_app_secrets
+    CHECK ap_client, qhs_exp_client_app, 44
+    CHECK ap_server, qhs_exp_server_app, 44
 
     ; print "quic-crypto <pass>/<total>\n"
     lea rdi, [msg_head]

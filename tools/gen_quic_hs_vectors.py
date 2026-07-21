@@ -53,6 +53,17 @@ s_hs = derive_secret(hs, b"s hs traffic", th)
 client_keys = quic_keys(c_hs)     # key(16) iv(12) hp(16) = 44 bytes
 server_keys = quic_keys(s_hs)
 
+# 1-RTT (application) keys: master secret from the handshake secret, then the
+# c/s application traffic secrets over the transcript through the server's
+# Finished (a stand-in hash here), and the QUIC 1-RTT packet keys from each.
+th_app = hashlib.sha256(b"CH..server Finished transcript").digest()
+derived2 = derive_secret(hs, b"derived", hashlib.sha256(b"").digest())
+master = hkdf_extract(derived2, b"\x00" * 32)
+c_ap = derive_secret(master, b"c ap traffic", th_app)
+s_ap = derive_secret(master, b"s ap traffic", th_app)
+client_app_keys = quic_keys(c_ap)
+server_app_keys = quic_keys(s_ap)
+
 
 def emit(name, b):
     out = [f"{name}:"]
@@ -69,3 +80,7 @@ print(emit("qhs_server_priv", server_priv))
 print(emit("qhs_th", th))
 print(emit("qhs_exp_client", client_keys))
 print(emit("qhs_exp_server", server_keys))
+print(emit("qhs_hs_secret", hs))
+print(emit("qhs_th_app", th_app))
+print(emit("qhs_exp_client_app", client_app_keys))
+print(emit("qhs_exp_server_app", server_app_keys))
