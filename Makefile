@@ -183,7 +183,8 @@ test/quic/linnea_quichs.o: test/quic/linnea_quichs.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
 
 bin/linnea-quichs: test/quic/linnea_quichs.o $(QUICMSG_OBJS) \
-                   src/linnea_http3.o src/linnea_qpack.o src/linnea_hpack.o
+                   src/linnea_http3.o src/linnea_qpack.o src/linnea_hpack.o \
+                   src/linnea_static.o src/linnea_string.o
 	$(LD) -o $@ $^
 
 quichs: bin/linnea-quichs

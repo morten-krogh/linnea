@@ -18,7 +18,7 @@
 global _start
 
 extern linnea_h3_read_headers
-extern linnea_h3_build_response
+extern linnea_h3_serve
 extern linnea_quic_initial_dcid
 extern linnea_quic_initial_secrets
 extern linnea_quic_recv_initial
@@ -62,10 +62,8 @@ key_pem:      incbin "test/tls/server.key"
 key_pem_len   equ $ - key_pem
 cfin_marker:  db "CFIN-OK", 10
 cfin_marker_len equ $ - cfin_marker
-r_ctype:      db "text/plain"
-r_ctype_len   equ $ - r_ctype
-r_body:       db "served by linnea over http/3", 10
-r_body_len    equ $ - r_body
+docroot:      db "test/www/"
+docroot_len   equ $ - docroot
 
 section .bss
 sa:          resb 16
@@ -456,16 +454,15 @@ _start:
     call linnea_h3_read_headers
     test rax, rax
     jnz .loop                        ; not a complete request
-    ; build the response STREAM frame: type 0x09 (STREAM|FIN), stream id 0, data
+    ; serve the request's :path from the document root into a STREAM frame
+    ; (type 0x09 = STREAM|FIN, stream id 0, then the HTTP/3 response)
     mov byte [strm_pay], 0x09
     mov byte [strm_pay + 1], 0x00
-    lea rdi, [strm_pay + 2]
-    mov esi, 200
-    lea rdx, [r_ctype]
-    mov ecx, r_ctype_len
-    lea r8, [r_body]
-    mov r9, r_body_len
-    call linnea_h3_build_response    ; rax = h3 response length
+    lea rdi, [req]
+    lea rsi, [docroot]
+    mov edx, docroot_len
+    lea rcx, [strm_pay + 2]
+    call linnea_h3_serve             ; rax = h3 response length
     lea rsi, [strm_pay]
     lea rdx, [rax + 2]               ; STREAM frame length = header (2) + h3
     call .send_1rtt

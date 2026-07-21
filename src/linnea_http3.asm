@@ -5,18 +5,36 @@
 default rel
 
 %include "linnea_http3.inc"
+%include "linnea_hpack.inc"
+%include "linnea_syscall.inc"
 
 global linnea_h3_read_headers
 global linnea_h3_build_response
+global linnea_h3_serve
 
 extern linnea_quic_varint_decode
 extern linnea_quic_varint_encode
 extern linnea_qpack_decode
 extern linnea_qpack_encode_response
+; static-file resolution, shared with the HTTP/2 serve path
+extern linnea_static_normalize
+extern linnea_static_open
+extern linnea_static_mime
+
+section .rodata
+idx_name:      db "index.html"
+idx_name_len   equ $ - idx_name
+txt_plain:     db "text/plain"
+txt_plain_len  equ $ - txt_plain
+body_404:      db "404 Not Found", 10
+body_404_len   equ $ - body_404
+body_400:      db "400 Bad Request", 10
+body_400_len   equ $ - body_400
 
 section .bss
 fs_buf:   resb 512                    ; encoded response field section
 clen_buf: resb 20                     ; content-length as decimal ASCII
+h3_path_buf: resb 4096                ; root ++ decoded path ++ NUL
 
 section .text
 
@@ -139,6 +157,102 @@ linnea_h3_build_response:
     mov r14, rdi
     mov rax, r14
     sub rax, rbx                     ; total length
+    add rsp, 8
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_h3_serve(rdi=req, rsi=root ptr, rdx=root len, rcx=out)
+;   -> rax = response length written to out.
+; Resolves the request's :path under root and serves that file with its MIME
+; type, or a 404 / 400 response. The path normalizer, opener and MIME table are
+; the shared ones, so h3 and h2 resolve and reject paths identically.
+linnea_h3_serve:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 8                       ; keep rsp 16-aligned for the calls
+    mov rbx, rdi                     ; req
+    mov r12, rcx                     ; out
+    ; path buffer = root ++ (decoded path)
+    lea rdi, [h3_path_buf]
+    mov rcx, rdx                     ; root length (rsi = root ptr)
+    rep movsb
+    mov r13, rdi                     ; where the decoded path starts
+    mov rsi, [rbx + linnea_h2_req.path_ptr]
+    test rsi, rsi
+    jz .bad                          ; no :path in the request
+    mov rdx, [rbx + linnea_h2_req.path_len]
+    mov rdi, r13
+    call linnea_static_normalize     ; rax = end ptr (0 = reject), r9 = dir flag
+    test rax, rax
+    jz .bad
+    mov r14, rax                     ; end of the resolved path
+    test r9, r9
+    jz .noindex
+    mov rdi, r14                     ; a directory: serve index.html from it
+    lea rsi, [idx_name]
+    mov ecx, idx_name_len
+    rep movsb
+    mov r14, rdi
+.noindex:
+    mov byte [r14], 0                ; NUL-terminate for open()
+    lea rdi, [h3_path_buf]
+    call linnea_static_open          ; rax = base (0 = missing), rdx = size
+    test rax, rax
+    jz .notfound
+    mov r15, rax                     ; mapped body base (1 = empty file)
+    mov rbp, rdx                     ; body size
+    lea rdi, [h3_path_buf]
+    mov rsi, r14
+    sub rsi, rdi                     ; resolved path length
+    call linnea_static_mime          ; rax = mime ptr, rdx = mime len
+    mov rcx, rdx                     ; mime len
+    mov rdx, rax                     ; mime ptr
+    mov r8, r15
+    mov r9, rbp
+    cmp r15, 1                       ; empty-file sentinel: found, nothing mapped
+    jne .havebody
+    xor r8d, r8d
+    xor r9d, r9d
+.havebody:
+    mov rdi, r12
+    mov esi, 200
+    call linnea_h3_build_response    ; rax = response length
+    cmp r15, 1
+    jbe .sret                        ; nothing was mapped
+    push rax
+    mov rdi, r15
+    mov rsi, rbp
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    pop rax
+    jmp .sret
+.notfound:
+    mov rdi, r12
+    mov esi, 404
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_404]
+    mov r9d, body_404_len
+    call linnea_h3_build_response
+    jmp .sret
+.bad:
+    mov rdi, r12
+    mov esi, 400
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_400]
+    mov r9d, body_400_len
+    call linnea_h3_build_response
+.sret:
     add rsp, 8
     pop rbp
     pop r15

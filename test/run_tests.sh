@@ -273,7 +273,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quich
     hspid=$!
     sleep 0.4
     python3 test/quic/h3_e2e_test.py 47501 >/dev/null 2>&1
-    check "h3: end-to-end GET over QUIC serves a 200 response" $?
+    check "h3: serves real static files over QUIC (MIME, index, 404)" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
 else
