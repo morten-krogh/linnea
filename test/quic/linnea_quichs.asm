@@ -15,6 +15,8 @@ global _start
 extern linnea_quic_server_init
 extern linnea_quic_server_datagram
 extern linnea_quic_rxbuf
+extern linnea_pem_cert_list
+extern linnea_pem_p256_key
 
 %define SOCK_DGRAM   2
 %define SYS_RECVFROM 45
@@ -28,21 +30,32 @@ docroot:      db "test/www/"
 docroot_len   equ $ - docroot
 
 section .bss
-sa:      resb 16
-salen:   resq 1
+sa:        resb 16
+salen:     resq 1
+cert_list: resb 4096
 
 section .text
 _start:
-    ; certificate chain, signing key and document root, once per process
+    ; frame the chain and decode the key, then hand them to the handler
     lea rdi, [cert_pem]
     mov esi, cert_pem_len
-    lea rdx, [key_pem]
-    mov ecx, key_pem_len
-    lea r8, [docroot]
-    mov r9d, docroot_len
-    call linnea_quic_server_init
+    lea rdx, [cert_list]
+    mov ecx, 4096
+    call linnea_pem_cert_list
     test rax, rax
     js .fail
+    mov r13, rax                     ; certificate_list length
+    lea rdi, [key_pem]
+    mov esi, key_pem_len
+    call linnea_pem_p256_key
+    test rax, rax
+    js .fail
+    mov rdx, rax                     ; private scalar
+    lea rdi, [cert_list]
+    mov rsi, r13
+    lea rcx, [docroot]
+    mov r8d, docroot_len
+    call linnea_quic_server_init
     ; udp socket bound to 127.0.0.1:47501
     mov eax, LINNEA_SYS_SOCKET
     mov edi, LINNEA_AF_INET

@@ -68,6 +68,7 @@ LINNEA_S_IFREG       equ 0x8000
 
 LINNEA_AF_INET       equ 2
 LINNEA_SOCK_STREAM   equ 1
+LINNEA_SOCK_DGRAM    equ 2
 LINNEA_SOL_SOCKET    equ 1
 LINNEA_SO_REUSEADDR  equ 2
 LINNEA_SOCKADDR_IN_SIZE equ 16  ; struct sockaddr_in: family u16, port u16 (BE), addr u32 (BE), zero[8]

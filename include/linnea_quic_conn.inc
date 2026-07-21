@@ -14,6 +14,7 @@
 ; Requires linnea_quic.inc (linnea_quic_keys_size, LINNEA_QUIC_MAX_CID).
 
 LINNEA_QUIC_MAX_CONNS equ 64        ; connections per worker
+LINNEA_QUIC_RXBUF_SIZE equ 2048     ; linnea_quic_rxbuf, the datagram we read into
 LINNEA_QUIC_SCID_LEN  equ 8         ; every connection ID we issue is 8 bytes
 
 ; Handshake progress, so a packet can be checked against the connection's stage.

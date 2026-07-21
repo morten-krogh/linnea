@@ -294,6 +294,32 @@ else
     check "h3 multi-stream test (skipped: deps unavailable)" 0
 fi
 
+# HTTP/3 through the real server: linnea binds a UDP listener for its TLS
+# server and drives the QUIC handler from the io_uring loop, so h3 is served by
+# the production binary from the config's document root — while TCP keeps
+# serving HTTP/1.1 and HTTP/2 on the same port.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    $BIN test/configs/tls-h3.json >/dev/null 2>&1 &
+    h3_pid=$!
+    sleep 0.5
+    python3 test/quic/h3_e2e_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): real server serves static files over QUIC" $?
+    python3 test/quic/h3_multi_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): several requests on one connection" $?
+    python3 test/quic/h3_conns_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): two interleaved connections" $?
+    # the UDP listener must not disturb TCP on the same host and port
+    body=$(curl -s --http2 --cacert test/tls/server.crt \
+                 --resolve localhost:47452:127.0.0.1 \
+                 https://localhost:47452/hello.txt)
+    [ "$body" = "hello from linnea" ]
+    check "h3 (io_uring): HTTP/2 over TCP still served on the same port" $?
+    kill $h3_pid 2>/dev/null
+    wait $h3_pid 2>/dev/null
+else
+    check "h3 io_uring tests (skipped: deps unavailable)" 0
+fi
+
 # Connection pool: two connections whose handshakes and requests are fully
 # interleaved must not share keys, transcript, connection ids or packet numbers.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then

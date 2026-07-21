@@ -29,6 +29,7 @@ LINNEA_IORING_OP_CONNECT     equ 16
 LINNEA_IORING_OP_READ        equ 22
 LINNEA_IORING_OP_SEND        equ 26
 LINNEA_IORING_OP_RECV        equ 27
+LINNEA_IORING_OP_RECVMSG     equ 10
 LINNEA_IORING_ACCEPT_MULTISHOT equ 1   ; set in sqe.ioprio
 LINNEA_IORING_CQE_F_MORE     equ 2     ; multishot op is still armed
 LINNEA_IOSQE_IO_LINK         equ 4     ; sqe.flags: link to the next sqe
@@ -44,6 +45,21 @@ LINNEA_UD_UP_SEND       equ 5          ; request bytes to the upstream
 LINNEA_UD_UP_RECV       equ 6          ; response bytes from the upstream
 LINNEA_UD_SIGNAL        equ 7          ; signalfd read: SIGTERM = drain
 LINNEA_UD_CANCEL        equ 8          ; accept-cancel cqe, always ignored
+LINNEA_UD_QRECV         equ 9          ; datagram on the QUIC (UDP) listener
+
+; struct msghdr (x86-64), for the QUIC listener's recvmsg: UDP needs the
+; sender's address, which plain recv does not report.
+LINNEA_MSGHDR_NAME      equ 0    ; void*
+LINNEA_MSGHDR_NAMELEN   equ 8    ; int (kernel updates it with the real length)
+LINNEA_MSGHDR_IOV       equ 16   ; struct iovec*
+LINNEA_MSGHDR_IOVLEN    equ 24   ; size_t
+LINNEA_MSGHDR_CONTROL   equ 32
+LINNEA_MSGHDR_CONTROLLEN equ 40
+LINNEA_MSGHDR_FLAGS     equ 48   ; int
+LINNEA_MSGHDR_SIZE      equ 56
+LINNEA_IOVEC_BASE       equ 0
+LINNEA_IOVEC_LEN        equ 8
+LINNEA_IOVEC_SIZE       equ 16
 
 ; Idle timeout: a linked timeout is attached to every per-connection op
 ; (recv, send, connect, upstream send/recv). An op that makes no progress

@@ -64,8 +64,6 @@ extern linnea_x25519
 extern linnea_sha256_init
 extern linnea_sha256_update
 extern linnea_sha256_final
-extern linnea_pem_cert_list
-extern linnea_pem_p256_key
 
 section .rodata
 x25519_base:  db 9
@@ -80,7 +78,7 @@ cfin_marker_len equ $ - cfin_marker
 section .bss
 sa:          resb 16
 salen:       resq 1
-linnea_quic_rxbuf: resb 2048
+linnea_quic_rxbuf: resb LINNEA_QUIC_RXBUF_SIZE
 plaintext:   resb 2048
 cur_conn:    resq 1                   ; connection this datagram belongs to
 expfin:      resb 64                  ; expected client Finished message
@@ -99,7 +97,7 @@ server_pub:  resb 32
 sh_buf:      resb 128
 th_buf:      resb 32
 hsmsg:       resb 4096
-cert_list:   resb 4096
+s_cert_list_ptr: resq 1
 shactx:      resb linnea_sha256_ctx_size
 hdr:         resb 64
 payload:     resb 256
@@ -119,41 +117,17 @@ s_docroot_len: resq 1
 
 section .text
 
-; linnea_quic_server_init(rdi=cert PEM, rsi=cert len, rdx=key PEM, rcx=key len,
-;   r8=document root, r9=root len) -> rax = 0, or -1 if the material is bad.
-; Frames the certificate chain and loads the signing key once per process.
+; linnea_quic_server_init(rdi=certificate_list, rsi=list len, rdx=P-256 private
+;   scalar, rcx=document root, r8=root len) -> rax = 0.
+; The chain and key are taken already framed/decoded — the config parser does
+; that work for the TLS listeners, and the test driver frames its embedded PEM.
 linnea_quic_server_init:
-    push rbx
-    push r12
-    push r13
-    push r14
-    mov r12, rdx                     ; key PEM
-    mov r13, rcx                     ; key len
-    mov r14, r8                      ; document root
-    mov rbx, r9                      ; root len
-    lea rdx, [cert_list]
-    mov ecx, 4096
-    call linnea_pem_cert_list        ; rdi/rsi are already the cert PEM
-    test rax, rax
-    js .ifail
-    mov [s_cert_len], rax
-    mov rdi, r12
-    mov rsi, r13
-    call linnea_pem_p256_key
-    test rax, rax
-    js .ifail
-    mov [s_priv], rax
-    mov [s_docroot_ptr], r14
-    mov [s_docroot_len], rbx
+    mov [s_cert_list_ptr], rdi
+    mov [s_cert_len], rsi
+    mov [s_priv], rdx
+    mov [s_docroot_ptr], rcx
+    mov [s_docroot_len], r8
     xor eax, eax
-    jmp .iret
-.ifail:
-    mov rax, -1
-.iret:
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
     ret
 
 ; linnea_quic_server_datagram(rdi=length, rsi=peer sockaddr, rdx=peer len,
@@ -307,7 +281,7 @@ linnea_quic_server_datagram:
     call linnea_quic_build_ee        ; rax = EE length
     mov r14, rax                     ; running hsmsg length
     lea rdi, [hsmsg + r14]
-    lea rsi, [cert_list]
+    mov rsi, [s_cert_list_ptr]
     mov rdx, [s_cert_len]
     call linnea_quic_build_cert
     add r14, rax

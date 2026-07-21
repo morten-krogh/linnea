@@ -9,6 +9,7 @@ default rel
 global linnea_network_listen_all
 global linnea_network_peer_format
 global linnea_network_parse_ipv4
+global linnea_network_quic_listener
 
 extern linnea_error_server
 extern linnea_string_equal
@@ -119,6 +120,59 @@ linnea_network_listen_all:
     ret
 
 ; linnea_network_listener_create(rdi=server*)
+; linnea_network_quic_listener(rdi=server*) -> rax = udp fd, or -1 on failure.
+; The HTTP/3 counterpart of the TCP listener: the same host and port, but a
+; datagram socket and no listen(2). Failure is not fatal — the server keeps
+; serving TCP and simply offers no HTTP/3.
+linnea_network_quic_listener:
+    push rbx
+    push r12
+    mov rbx, rdi
+    lea rdi, [rbx + linnea_config_server.host]
+    call linnea_network_parse_ipv4
+    cmp rax, -1
+    je .qfail
+    mov word [sockaddr_scratch], LINNEA_AF_INET
+    movzx ecx, word [rbx + linnea_config_server.port]
+    xchg cl, ch                ; htons
+    mov [sockaddr_scratch + 2], cx
+    mov [sockaddr_scratch + 4], eax
+    mov qword [sockaddr_scratch + 8], 0
+    mov eax, LINNEA_SYS_SOCKET
+    mov edi, LINNEA_AF_INET
+    mov esi, LINNEA_SOCK_DGRAM
+    xor edx, edx
+    syscall
+    cmp rax, -4095
+    jae .qfail
+    mov r12, rax
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, r12
+    mov esi, LINNEA_SOL_SOCKET
+    mov edx, LINNEA_SO_REUSEADDR
+    lea r10, [sockopt_one]
+    mov r8d, 4
+    syscall
+    mov eax, LINNEA_SYS_BIND
+    mov rdi, r12
+    lea rsi, [sockaddr_scratch]
+    mov edx, LINNEA_SOCKADDR_IN_SIZE
+    syscall
+    cmp rax, -4095
+    jae .qclose
+    mov rax, r12
+    jmp .qret
+.qclose:
+    mov rdi, r12
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+.qfail:
+    mov rax, -1
+.qret:
+    pop r12
+    pop rbx
+    ret
+
 ; socket + SO_REUSEADDR + bind + listen. Stores the fd in server.listen_fd
 ; and logs "listening on <host>:<port> (<hostname>)". Exits on any failure.
 linnea_network_listener_create:

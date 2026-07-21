@@ -37,6 +37,8 @@ default rel
 %include "linnea_connection.inc"
 %include "linnea_http.inc"
 %include "linnea_uring.inc"
+%include "linnea_quic.inc"
+%include "linnea_quic_conn.inc"
 %include "linnea_tls.inc"
 %include "linnea_http2.inc"
 
@@ -73,6 +75,10 @@ extern linnea_h2_handle
 extern linnea_h2_after_send
 extern linnea_h2_conn_free
 extern linnea_string_iequal
+extern linnea_network_quic_listener
+extern linnea_quic_server_init
+extern linnea_quic_server_datagram
+extern linnea_quic_rxbuf
 
 section .rodata
 
@@ -161,6 +167,11 @@ idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
 sig_mask:           resq 1     ; blocked-signal set: SIGTERM
 sig_fd:             resd 1
 drain_flag:         resd 1     ; 1 = draining: no accepts, close after serve
+quic_fd:    resd 1
+            resd 1
+qrecv_msg:  resb LINNEA_MSGHDR_SIZE
+qrecv_iov:  resb LINNEA_IOVEC_SIZE
+qrecv_peer: resb LINNEA_SOCKADDR_IN_SIZE
 sig_buf:            resb 128   ; struct signalfd_siginfo
 
 section .text
@@ -230,6 +241,48 @@ linnea_uring_run:
     mov dword [rax + LINNEA_SQE_LEN], 128
     mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_SIGNAL
 
+    ; HTTP/3 listener: the first TLS server with usable key material gets a
+    ; UDP socket on its own host and port. Failure is not fatal — we simply
+    ; serve no HTTP/3.
+    mov dword [quic_fd], -1
+    xor r12d, r12d
+.quic_scan:
+    cmp r12, [rbx + linnea_config.server_count]
+    jae .quic_done
+    imul rdx, r12, linnea_config_server_size
+    lea rdx, [rbx + rdx + linnea_config.servers]
+    cmp dword [rdx + linnea_config_server.tls], 0
+    je .quic_next
+    cmp qword [rdx + linnea_config_server.cert_list], 0
+    je .quic_next
+    cmp qword [rdx + linnea_config_server.location_count], 0
+    je .quic_next
+    lea rcx, [rdx + linnea_config_server.locations]
+    cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    jne .quic_next             ; only a static root is served over h3 so far
+    push rdx
+    push rcx
+    mov rdi, rdx
+    call linnea_network_quic_listener
+    pop rcx
+    pop rdx
+    cmp rax, -1
+    je .quic_next
+    mov [quic_fd], eax
+    ; hand the handler the framed chain, the key and the document root
+    mov rdi, [rdx + linnea_config_server.cert_list]
+    mov rsi, [rdx + linnea_config_server.cert_list_len]
+    mov r8, [rcx + linnea_config_location.root_len]
+    lea rcx, [rcx + linnea_config_location.root]
+    mov rdx, [rdx + linnea_config_server.key_priv]
+    call linnea_quic_server_init
+    call linnea_uring_arm_qrecv
+    jmp .quic_done
+.quic_next:
+    inc r12
+    jmp .quic_scan
+.quic_done:
+
     xor r12d, r12d             ; server index
 .arm_loop:
     cmp r12, [rbx + linnea_config.server_count]
@@ -288,7 +341,27 @@ linnea_uring_run:
     je .on_up_send
     cmp eax, LINNEA_UD_UP_RECV
     je .on_up_recv
+    cmp eax, LINNEA_UD_QRECV
+    je .on_qrecv
     jmp .on_accept             ; tag 0: no longer the textual fall-through
+
+; --- QUIC datagram on the UDP listener: r15d = bytes or -errno ---------
+; The handler owns the receive buffer and replies on the socket itself, so the
+; loop only has to pass on the length and the sender, then re-arm.
+.on_qrecv:
+    test r15d, r15d
+    jle .qrecv_rearm
+    mov edi, r15d
+    lea rsi, [qrecv_peer]
+    mov edx, [qrecv_msg + LINNEA_MSGHDR_NAMELEN]   ; kernel-updated length
+    mov ecx, [quic_fd]
+    call linnea_quic_server_datagram
+.qrecv_rearm:
+    cmp dword [drain_flag], 0
+    jne .wait                  ; draining: take no new datagrams
+    call linnea_uring_arm_qrecv
+    call linnea_uring_submit_now
+    jmp .wait
 
 ; --- SIGTERM arrived on the signalfd: drain --------------------------
 ; Stop taking new work but finish what is open: cancel every armed
@@ -1586,6 +1659,37 @@ linnea_uring_arm_up_recv:
     pop r12
     pop rbx
     jmp linnea_uring_arm_link_timeout
+
+; linnea_uring_arm_qrecv() — queue a recvmsg on the QUIC listener. UDP needs
+; the sender's address to reply, which plain recv does not report, so the
+; msghdr is rebuilt each time: the kernel overwrites msg_namelen with the
+; length it actually filled in. No linked timeout — like an accept, this op
+; stays armed for the life of the listener.
+linnea_uring_arm_qrecv:
+    cmp dword [quic_fd], 0
+    jl .noq
+    lea rcx, [qrecv_peer]
+    mov [qrecv_msg + LINNEA_MSGHDR_NAME], rcx
+    mov dword [qrecv_msg + LINNEA_MSGHDR_NAMELEN], LINNEA_SOCKADDR_IN_SIZE
+    lea rcx, [qrecv_iov]
+    mov [qrecv_msg + LINNEA_MSGHDR_IOV], rcx
+    mov qword [qrecv_msg + LINNEA_MSGHDR_IOVLEN], 1
+    mov qword [qrecv_msg + LINNEA_MSGHDR_CONTROL], 0
+    mov qword [qrecv_msg + LINNEA_MSGHDR_CONTROLLEN], 0
+    mov dword [qrecv_msg + LINNEA_MSGHDR_FLAGS], 0
+    lea rcx, [linnea_quic_rxbuf]
+    mov [qrecv_iov + LINNEA_IOVEC_BASE], rcx
+    mov qword [qrecv_iov + LINNEA_IOVEC_LEN], LINNEA_QUIC_RXBUF_SIZE
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECVMSG
+    mov ecx, [quic_fd]
+    mov [rax + LINNEA_SQE_FD], ecx
+    lea rcx, [qrecv_msg]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1
+    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_QRECV
+.noq:
+    ret
 
 ; linnea_uring_log_accept(rdi=connection*)
 ; linnea_uring_sni_select(rdi=connection*, rsi=sni, rdx=sni_len)
