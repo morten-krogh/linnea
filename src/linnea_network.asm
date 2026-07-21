@@ -153,6 +153,21 @@ linnea_network_quic_listener:
     lea r10, [sockopt_one]
     mov r8d, 4
     syscall
+    ; SO_REUSEPORT: every worker binds this port and the kernel hands each
+    ; datagram to one socket by hashing its 4-tuple, so all packets from a
+    ; given client reach the same worker — the affinity a QUIC connection
+    ; needs, since each worker holds its own connection pool. The TCP
+    ; listener is still bound once, by the master, without SO_REUSEPORT, so
+    ; a second linnea on the same port still fails fast there.
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, r12
+    mov esi, LINNEA_SOL_SOCKET
+    mov edx, LINNEA_SO_REUSEPORT
+    lea r10, [sockopt_one]
+    mov r8d, 4
+    syscall
+    cmp rax, -4095
+    jae .qclose
     mov eax, LINNEA_SYS_BIND
     mov rdi, r12
     lea rsi, [sockaddr_scratch]

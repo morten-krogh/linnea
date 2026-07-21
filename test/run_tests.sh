@@ -297,7 +297,8 @@ fi
 # HTTP/3 through the real server: linnea binds a UDP listener for its TLS
 # server and drives the QUIC handler from the io_uring loop, so h3 is served by
 # the production binary from the config's document root — while TCP keeps
-# serving HTTP/1.1 and HTTP/2 on the same port.
+# serving HTTP/1.1 and HTTP/2 on the same port. The config runs four workers,
+# so this also covers SO_REUSEPORT steering.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     $BIN test/configs/tls-h3.json >/dev/null 2>&1 &
     h3_pid=$!
@@ -308,6 +309,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     check "h3 (io_uring): several requests on one connection" $?
     python3 test/quic/h3_conns_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): two interleaved connections" $?
+    # several workers each bind the QUIC port with SO_REUSEPORT; the kernel
+    # steers by 4-tuple so a connection always reaches the worker holding it
+    python3 test/quic/h3_workers_test.py 47452 8 >/dev/null 2>&1
+    check "h3 (io_uring): connections spread across workers are all served" $?
+
     # the UDP listener must not disturb TCP on the same host and port
     body=$(curl -s --http2 --cacert test/tls/server.crt \
                  --resolve localhost:47452:127.0.0.1 \

@@ -168,7 +168,16 @@ linnea_quic_server_datagram:
     call linnea_quic_conn_lookup
     test rax, rax
     jnz .demux_found
-    ; an ID we never issued: treat this as a new connection attempt
+    ; An id we never issued. Only a client's first flight may open a
+    ; connection, and that always arrives in an Initial packet: the type bits
+    ; sit in the first byte and are not header-protected. Anything else with an
+    ; unknown id belongs to a connection we do not hold — another worker's, or
+    ; one already gone — so it is dropped rather than mistaken for a new
+    ; handshake. With several workers this is what keeps a datagram that landed
+    ; on the wrong one from starting a bogus connection.
+    movzx eax, byte [linnea_quic_rxbuf]
+    and al, 0x30                     ; packet type: Initial is 0
+    jnz .done
     lea rdi, [sa]
     mov rsi, [salen]
     call linnea_quic_conn_alloc

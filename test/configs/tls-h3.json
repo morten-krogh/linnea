@@ -1,7 +1,7 @@
 {
   "log": "test/linnea.log",
   "timeout": 5,
-  "workers": 1,
+  "workers": 4,
   "servers": [
     {
       "host": "127.0.0.1", "port": 47452, "hostname": "localhost",
