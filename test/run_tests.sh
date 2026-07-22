@@ -407,20 +407,25 @@ else
     check "h3 GOAWAY drain test (skipped: deps unavailable)" 0
 fi
 
-# Handshake segmentation + anti-amplification: a real certificate chain makes the
-# server flight both larger than one datagram (QUIC forbids IP fragmentation, so
-# the Certificate CRYPTO is split across <=MTU Handshake packets) and larger than
-# the 3x amplification budget (RFC 9000 s8.1, so the tail is withheld until the
-# client's address is validated, then resumed). The config serves a five-cert
-# chain (~3.7 KB); the test confirms the first burst stays within 3x, no datagram
-# breaches the 1200-byte floor, and the handshake completes once we answer.
+# Large certificate chain (~5.2 KB, seven certs — over the old ~3.9 KB cap) on
+# both transports. On h3 the flight is both larger than one datagram (QUIC forbids
+# IP fragmentation, so the Certificate CRYPTO is split across <=MTU Handshake
+# packets) and larger than the 3x amplification budget (RFC 9000 s8.1, so the tail
+# is withheld until the client's address is validated, then resumed): the test
+# confirms the first burst stays within 3x, no datagram breaches the 1200-byte
+# floor, and the handshake completes. That the server even boots with this chain
+# exercises the raised cap; the curl check confirms the same chain over h2/TCP.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
     $BIN test/configs/tls-h3-bigcert.json >/dev/null 2>&1 &
     bc_pid=$!
-    sleep 0.5
+    sleep 0.6
     python3 test/quic/h3_bigcert_test.py 47454 >/dev/null 2>&1
     check "h3 (io_uring): large flight segmented + held to the 3x amp budget" $?
+    body=$(curl -s --http2 --cacert test/tls/bigchain.crt \
+                --resolve localhost:47454:127.0.0.1 https://localhost:47454/hello.txt)
+    [ "$body" = "hello from linnea" ]
+    check "h2 (kTLS): large certificate chain over TCP (past the old cap)" $?
     kill $bc_pid 2>/dev/null
     wait $bc_pid 2>/dev/null
     rm -f test/linnea.log

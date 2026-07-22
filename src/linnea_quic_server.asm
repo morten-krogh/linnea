@@ -159,6 +159,7 @@ s_hsmsg_len: resq 1
 s_hs_chunk:  resq 1              ; byte length of the flight chunk being framed
 s_cv_off:    resq 1              ; hsmsg offset of CertVerify while staging the tail
 s_fin_off:   resq 1              ; hsmsg offset of Finished while staging the tail
+s_walk_next: resq 1              ; next coalesced packet, so the Finished walk can go on
 linnea_h3_altsvc:     resb 48    ; Alt-Svc value, e.g. h3=":443"; ma=86400
 linnea_h3_altsvc_len: resq 1     ; 0 until a QUIC listener is bound
 linnea_h3_server:     resq 1     ; index of the server that owns that listener
@@ -307,6 +308,14 @@ linnea_quic_server_datagram:
     call linnea_quic_recv_initial
     test rax, rax
     jz .try_handshake                ; no ClientHello — maybe the client Finished
+    ; A ClientHello on a connection that has already sent its flight is a
+    ; retransmitted Initial (the client re-sent it, now addressed to our SCID,
+    ; before our flight's ACK reached it). Rebuilding the flight here would derive
+    ; fresh keys and shatter the handshake in progress, so ignore the retransmit
+    ; and fall through to the Handshake walk (it may coalesce the client Finished).
+    mov rcx, [cur_conn]
+    cmp qword [rcx + linnea_quic_conn.state], LINNEA_QUIC_ST_NEW
+    jne .try_handshake
     mov [s_ch_ptr], rax
     mov [s_ch_len], rdx
     mov rdi, rax
@@ -443,6 +452,10 @@ linnea_quic_server_datagram:
     CONNLEA rdi, th_cfin
     mov ecx, 32
     rep movsb
+    ; the flight is out: leave ST_NEW so a retransmitted ClientHello is recognized
+    ; as a duplicate (above) rather than rebuilding the flight with fresh keys.
+    mov rax, [cur_conn]
+    mov qword [rax + linnea_quic_conn.state], LINNEA_QUIC_ST_HANDSHAKE
     jmp .done
 
 ; --- the datagram had no ClientHello: walk its coalesced packets looking for a
@@ -479,7 +492,11 @@ linnea_quic_server_datagram:
     mov r15, rdi                     ; advance past this (Initial) packet
     jmp .walk
 .do_cfin:
-    ; a Handshake packet at [r15]: unprotect with the client handshake keys
+    ; a Handshake packet at [r15]: unprotect with the client handshake keys. Save
+    ; where the next coalesced packet starts first — a datagram can carry an ACK
+    ; and the Finished as two separate Handshake packets, so if this one holds no
+    ; Finished we keep walking rather than give up (which stalled the handshake).
+    mov [s_walk_next], rdi
     mov rdi, r15
     lea rsi, [linnea_quic_rxbuf + r13]
     sub rsi, r15                     ; bytes from here to the datagram end
@@ -489,22 +506,25 @@ linnea_quic_server_datagram:
     test rax, rax
     js .done
     ; a Handshake packet that decrypts means the peer holds the handshake keys,
-    ; which it could only derive from our flight: its address is validated. Mark
-    ; it and release any part of the flight the amp budget held back on the first
-    ; round trip (the client's ACK arrives here before it can send its Finished).
+    ; which it could only derive from our flight: its address is validated. On the
+    ; first such packet, mark it and release any flight the amp budget held back
+    ; (the client's ACK arrives here before it can send its Finished).
+    mov rcx, [cur_conn]
+    cmp qword [rcx + linnea_quic_conn.amp_valid], 0
+    jne .cfin_finished               ; already validated/resumed on an earlier packet
     sub rsp, 16                      ; keep 16-aligned; save the CRYPTO-frame length
     mov [rsp], rax
-    mov rcx, [cur_conn]
     mov qword [rcx + linnea_quic_conn.amp_valid], 1
     call .recompose_flight           ; hsmsg is stale between datagrams; rebuild it
     call .send_flight
     mov rax, [rsp]
     add rsp, 16
+.cfin_finished:
     lea rdi, [plaintext]
     mov rsi, rax
     call linnea_quic_crypto_frame    ; skips the ACK, returns the Finished
     test rax, rax
-    jz .done
+    jz .cfin_next                    ; no Finished in this packet — try the next
     cmp rdx, 36
     jb .done
     mov r14, rax                     ; received Finished message ptr
@@ -1154,6 +1174,9 @@ linnea_quic_server_datagram:
     pop r15
     pop r14
     ret
+.cfin_next:
+    mov r15, [s_walk_next]           ; resume the coalesced-packet walk
+    jmp .walk
 .done:
     add rsp, 8
     pop rbp

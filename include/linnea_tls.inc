@@ -48,13 +48,18 @@ LINNEA_TLS_TICKET_LIFETIME equ 86400   ; seconds; also advertised in the NST
 LINNEA_TLS_FLAG_TRACE   equ 1
 
 ; The whole handshake state overlays a connection's up_buf (no proxying is
-; active during the handshake), so linnea_tls_hs_size must stay <= up_buf.
-; The flight buffer holds EE + Certificate(certificate_list) +
-; CertificateVerify + Finished; 4096 covers an ECDSA leaf plus its
-; intermediates (the four-cert Let's Encrypt long chain is ~3.4 KiB; a
-; chain of large RSA intermediates would not fit, and linnea_tls_setup
-; refuses it at startup).
-LINNEA_TLS_MSG_BUF      equ 4096   ; handshake message reassembly space
+; active during the handshake), so linnea_tls_hs_size must stay <= up_buf
+; (enforced by a compile-time assert in linnea_uring.asm). The flight buffer
+; both reassembles inbound handshake records and assembles the outbound flight
+; EE + Certificate(certificate_list) + CertificateVerify + Finished, so it
+; bounds the certificate chain: linnea_tls_setup refuses a larger one at
+; startup. 6656 fills the free up_buf slack, covering any classical chain
+; (RSA-4096 leaf + intermediates + a cross-sign) — ~6.5 KiB of certificate.
+; It cannot go much higher without streaming the flight: build_flight writes
+; the whole sealed flight into the ~8.5 KiB out_buf in one shot, so out_buf is
+; the next wall, and a post-quantum-scale chain (tens of KiB) would need the
+; flight generated and drained in pieces rather than all at once.
+LINNEA_TLS_MSG_BUF      equ 6656   ; handshake message reassembly + flight space
 
 ; msg_buf is smaller than the largest record in_buf can hold, so the record
 ; layer must not be handed anything longer than it. This bound is enforced
