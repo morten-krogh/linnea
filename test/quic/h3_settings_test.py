@@ -113,4 +113,25 @@ term = conn._close_event
 assert term is not None, "server did not close the connection"
 assert isinstance(term, ConnectionTerminated) and term.error_code == 0x105, \
     f"{term!r} (want H3_MISSING_SETTINGS 0x105)"
+
+# --- invalid: closing the control stream is H3_CLOSED_CRITICAL_STREAM ---
+# The frame is a valid control stream (SETTINGS first) but carries FIN, which
+# closes a stream that must stay open.
+conn, s = handshake(port)
+uni = conn.get_next_available_stream_id(is_unidirectional=True)
+conn.send_stream_data(uni, b"\x00\x04\x00", end_stream=True)
+flush(conn, s, port, 0.4)
+try:
+    for _ in range(4):
+        r, _ = s.recvfrom(4096)
+        conn.receive_datagram(r, ("127.0.0.1", port), now=0.5)
+        if conn._close_event is not None:
+            break
+except socket.timeout:
+    pass
+s.close()
+term = conn._close_event
+assert term is not None, "server did not close the connection on control-stream FIN"
+assert isinstance(term, ConnectionTerminated) and term.error_code == 0x104, \
+    f"{term!r} (want H3_CLOSED_CRITICAL_STREAM 0x104)"
 print("ok")

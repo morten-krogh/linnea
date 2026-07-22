@@ -355,8 +355,8 @@ linnea_quic_unprotect_short:
 ; linnea_quic_stream_frame(rdi=frames, rsi=len) -> rax = STREAM data ptr,
 ; rdx = STREAM data length, r8 = stream id, r9 = first byte after this frame,
 ; r10 = the stream data offset (0 when no OFF field is present — a stream's type
-; byte is only at offset 0). rax = 0 if none. Skips PADDING/PING/ACK and returns
-; the first STREAM frame's
+; byte is only at offset 0), r11 = 1 if the FIN bit is set (the stream ends here).
+; rax = 0 if none. Skips PADDING/PING/ACK and returns the first STREAM frame's
 ; data (RFC 9000 19.8). The type byte 0b00001XXX carries OFF (0x04), LEN (0x02)
 ; and FIN (0x01) flags. r9 lets the caller resume the scan, so a packet carrying
 ; several STREAM frames (requests on different streams) can be walked in full;
@@ -466,6 +466,8 @@ linnea_quic_stream_frame:
     mov rdx, r12                     ; data length
     mov r8, r13                      ; stream id
     lea r9, [rdi + r12]              ; resume point for the next frame
+    mov r11d, ebx
+    and r11d, 1                      ; FIN flag (bl bit 0) — bl still the type byte
     pop r13
     pop r12
     pop rbx

@@ -23,6 +23,7 @@ LINNEA_H3_STREAM_QPACK_DEC  equ 0x03
 ; when a peer breaks a control-stream rule.
 LINNEA_H3_ERR_MISSING_SETTINGS equ 0x0105  ; control stream opened without SETTINGS
 LINNEA_H3_ERR_STREAM_CREATION  equ 0x0103  ; a second control stream
+LINNEA_H3_ERR_CLOSED_CRITICAL  equ 0x0104  ; a critical stream (control/QPACK) closed
 
 ; linnea_h3_read_headers(rdi=stream ptr, rsi=stream len, rdx=req *linnea_h2_req)
 ;   -> rax = 0 on success (a HEADERS frame was found and QPACK-decoded),
