@@ -140,7 +140,7 @@ ch_out:      resb linnea_quic_ch_size
 server_pub:  resb 32
 sh_buf:      resb 128
 th_buf:      resb 32
-hsmsg:       resb 8192            ; whole handshake (EE..Finished); a large chain fits
+hsmsg:       resb LINNEA_QUIC_HS_FLIGHT_MAX  ; shared scratch: the whole flight (EE..Finished)
 s_cert_list_ptr: resq 1
 shactx:      resb linnea_sha256_ctx_size
 hdr:         resb 64
@@ -157,6 +157,8 @@ s_priv:      resq 1
 s_ini_len:   resq 1
 s_hsmsg_len: resq 1
 s_hs_chunk:  resq 1              ; byte length of the flight chunk being framed
+s_cv_off:    resq 1              ; hsmsg offset of CertVerify while staging the tail
+s_fin_off:   resq 1              ; hsmsg offset of Finished while staging the tail
 linnea_h3_altsvc:     resb 48    ; Alt-Svc value, e.g. h3=":443"; ma=86400
 linnea_h3_altsvc_len: resq 1     ; 0 until a QUIC listener is bound
 linnea_h3_server:     resq 1     ; index of the server that owns that listener
@@ -377,6 +379,8 @@ linnea_quic_server_datagram:
     mov r8d, 8
     call linnea_quic_build_ee        ; rax = EE length
     mov r14, rax                     ; running hsmsg length
+    mov rcx, [cur_conn]
+    mov [rcx + linnea_quic_conn.flight_ee_len], r14   ; Certificate follows EE
     lea rdi, [hsmsg + r14]
     mov rsi, [s_cert_list_ptr]
     mov rdx, [s_cert_len]
@@ -386,15 +390,19 @@ linnea_quic_server_datagram:
     lea rsi, [hsmsg]
     mov rdx, r14
     call .transcript
+    mov [s_cv_off], r14              ; CertVerify starts here
     lea rdi, [hsmsg + r14]
     lea rsi, [th_buf]
     mov rdx, [s_priv]
     call linnea_quic_build_cert_verify
+    mov rcx, [cur_conn]
+    mov [rcx + linnea_quic_conn.flight_cv_len], rax   ; randomized: must be kept
     add r14, rax
     ; th_cv = H(CH || SH || hsmsg[0..r14])
     lea rsi, [hsmsg]
     mov rdx, r14
     call .transcript
+    mov [s_fin_off], r14             ; Finished starts here
     lea rdi, [hsmsg + r14]
     CONNLEA rsi, hs_sec
     add rsi, 32                      ; s_hs traffic secret
@@ -405,19 +413,27 @@ linnea_quic_server_datagram:
 
     ; ===== stage the handshake flight and send it under the amp budget =====
     ; hsmsg[0..s_hsmsg_len] is the handshake (EE || Cert || CertVerify ||
-    ; Finished). A real certificate chain overflows both one datagram and the
-    ; anti-amplification budget, so the whole flight is copied into the connection
-    ; and .send_flight releases it in <=MTU Handshake packets up to what the
-    ; budget allows; the tail waits for the client's address to be validated.
-    mov rax, [cur_conn]
-    mov [rax + linnea_quic_conn.flight_len], r14
-    mov qword [rax + linnea_quic_conn.flight_off], 0
-    mov qword [rax + linnea_quic_conn.flight_pn], 0
-    lea rdi, [rax + linnea_quic_conn.flight_buf]
-    lea rsi, [hsmsg]
-    mov rcx, r14
-    rep movsb                        ; keep the flight for resume
-    call .send_flight
+    ; Finished). .send_flight releases it in <=MTU Handshake packets up to what the
+    ; budget allows; the tail waits for the client's address to be validated. Only
+    ; the small per-connection edge is kept for that resume — the big Certificate
+    ; is re-framed from the shared list in .recompose_flight, not stored per-conn.
+    mov rbx, [cur_conn]
+    lea rdi, [rbx + linnea_quic_conn.flight_tail]
+    lea rsi, [hsmsg]                                  ; EncryptedExtensions
+    mov rcx, [rbx + linnea_quic_conn.flight_ee_len]
+    rep movsb                                         ; -> flight_tail + ee_len
+    mov rsi, [s_cv_off]                               ; CertVerify
+    lea rsi, [hsmsg + rsi]
+    mov rcx, [rbx + linnea_quic_conn.flight_cv_len]
+    rep movsb                                         ; -> flight_tail + ee_len + cv_len
+    mov rsi, [s_fin_off]                              ; Finished (36 bytes)
+    lea rsi, [hsmsg + rsi]
+    mov ecx, 36
+    rep movsb
+    mov [rbx + linnea_quic_conn.flight_len], r14
+    mov qword [rbx + linnea_quic_conn.flight_off], 0
+    mov qword [rbx + linnea_quic_conn.flight_pn], 0
+    call .send_flight                                 ; hsmsg is still the built flight
     ; save the transcript through the server Finished; the client's Finished
     ; MAC covers exactly this (H(CH || SH || EE || Cert || CertVerify || Fin)).
     lea rsi, [hsmsg]
@@ -480,6 +496,7 @@ linnea_quic_server_datagram:
     mov [rsp], rax
     mov rcx, [cur_conn]
     mov qword [rcx + linnea_quic_conn.amp_valid], 1
+    call .recompose_flight           ; hsmsg is stale between datagrams; rebuild it
     call .send_flight
     mov rax, [rsp]
     add rsp, 16
@@ -943,7 +960,7 @@ linnea_quic_server_datagram:
     mov ecx, LINNEA_QUIC_CRYPTO_CHUNK
 .sf_have:
     mov [s_hs_chunk], rcx
-    ; hspay = CRYPTO(0x06, offset r14, length chunk, flight_buf[r14..r14+chunk])
+    ; hspay = CRYPTO(0x06, offset r14, length chunk, hsmsg[r14..r14+chunk])
     mov byte [hspay], 0x06
     lea rdi, [hspay + 1]
     mov rsi, r14
@@ -958,9 +975,7 @@ linnea_quic_server_datagram:
     lea r15, [r10 + rax]
     add r15, 1
     add r15, [s_hs_chunk]
-    mov rsi, [cur_conn]
-    add rsi, linnea_quic_conn.flight_buf
-    add rsi, r14                     ; flight_buf + offset
+    lea rsi, [hsmsg + r14]           ; chunk source: the recomposed flight in hsmsg
     mov rcx, [s_hs_chunk]
     rep movsb                        ; copy the chunk into hspay
     call .build_hs_header            ; rcx = header length; uses r15, conn.flight_pn
@@ -1016,6 +1031,39 @@ linnea_quic_server_datagram:
     pop r15
     pop r14
     pop r13
+    ret
+
+; .recompose_flight — rebuild hsmsg = EE || Certificate || CertVerify || Finished
+; from the per-connection tail and the shared certificate list. hsmsg is shared
+; scratch, clobbered between datagrams, so before a resumed .send_flight can chunk
+; it the flight has to be reassembled. build_cert is deterministic, so this is
+; byte-identical to the original flight — the resumed chunks line up with the
+; offsets the client already holds. The connection is [cur_conn].
+.recompose_flight:
+    ; EncryptedExtensions -> hsmsg[0]
+    mov rax, [cur_conn]
+    lea rsi, [rax + linnea_quic_conn.flight_tail]
+    lea rdi, [hsmsg]
+    mov rcx, [rax + linnea_quic_conn.flight_ee_len]
+    rep movsb
+    ; Certificate -> hsmsg[ee_len], re-framed from the shared list
+    mov rax, [cur_conn]
+    mov rdx, [rax + linnea_quic_conn.flight_ee_len]
+    lea rdi, [hsmsg + rdx]
+    mov rsi, [s_cert_list_ptr]
+    mov rdx, [s_cert_len]
+    call linnea_quic_build_cert       ; rax = Certificate message length
+    ; CertVerify || Finished -> hsmsg[ee_len + cert_len], from the tail after EE
+    mov rcx, [cur_conn]
+    mov rdx, [rcx + linnea_quic_conn.flight_ee_len]
+    add rdx, rax                      ; ee_len + cert_len
+    lea rdi, [hsmsg + rdx]
+    lea rsi, [rcx + linnea_quic_conn.flight_tail]
+    add rsi, [rcx + linnea_quic_conn.flight_ee_len]
+    mov rdx, [rcx + linnea_quic_conn.flight_cv_len]
+    add rdx, 36                       ; CertVerify + Finished
+    mov rcx, rdx
+    rep movsb
     ret
 
 ; .build_initial_header -> rcx = header length; DCID = client SCID, SCID = ours,
