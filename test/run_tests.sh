@@ -376,6 +376,23 @@ else
     check "h3 io_uring tests (skipped: deps unavailable)" 0
 fi
 
+# HTTP/3 GOAWAY on drain: a worker told to drain sends GOAWAY on its control
+# stream so the client opens no new requests, then exits. A single-worker config
+# keeps the signalling deterministic; the test kills the master itself.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    rm -f test/linnea.log
+    $BIN test/configs/tls-h3-drain.json >/dev/null 2>&1 &
+    ga_master=$!
+    sleep 0.5
+    python3 test/quic/h3_goaway_test.py 47453 $ga_master >/dev/null 2>&1
+    check "h3 (io_uring): drain sends GOAWAY on the control stream" $?
+    wait $ga_master 2>/dev/null
+    pkill -f tls-h3-drain 2>/dev/null
+    rm -f test/linnea.log
+else
+    check "h3 GOAWAY drain test (skipped: deps unavailable)" 0
+fi
+
 # Acknowledgements: our reply must acknowledge the request packet, or the peer
 # keeps retransmitting work already done.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then

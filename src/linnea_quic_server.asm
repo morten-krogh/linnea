@@ -38,6 +38,7 @@ default rel
 global linnea_quic_server_init
 global linnea_quic_server_datagram
 global linnea_quic_server_rtx_sweep
+global linnea_quic_server_goaway_all
 global linnea_quic_rxbuf
 global linnea_quic_altsvc_set
 global linnea_h3_altsvc
@@ -108,6 +109,9 @@ h3_uni_setup: db 0x0a, 0x03, 0x07, 0x00, 0x04, 0x04, 0x01, 0x00, 0x07, 0x00
               db 0x0a, 0x07, 0x01, 0x02
               db 0x0a, 0x0b, 0x01, 0x03
 h3_uni_setup_len equ $ - h3_uni_setup
+; Bytes of control-stream data in h3_uni_setup (the 0x00 type + the 6-byte
+; SETTINGS frame) — the offset at which a later GOAWAY continues that stream.
+H3_CTRL_OFF equ 7
 
 section .bss
 sa:          resb 16
@@ -129,6 +133,7 @@ s_slen:      resq 1                   ; and length
 s_soff:      resq 1                   ; and offset (0 = the stream's first bytes)
 s_sfin:      resq 1                   ; and whether its FIN bit is set
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
+goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 ch_out:      resb linnea_quic_ch_size
 server_pub:  resb 32
 sh_buf:      resb 128
@@ -625,6 +630,15 @@ linnea_quic_server_datagram:
     call linnea_h3_read_headers
     test rax, rax
     jnz .stream_scan                 ; not a complete request on this stream
+    ; record it for a graceful GOAWAY: a drain rejects streams past this one, so
+    ; the client knows exactly what it must retry elsewhere
+    mov rax, [cur_conn]
+    mov rdx, [s_sid]
+    add rdx, 4                       ; the next client bidi stream id
+    cmp rdx, [rax + linnea_quic_conn.h3_goaway_id]
+    jbe .no_goaway_bump
+    mov [rax + linnea_quic_conn.h3_goaway_id], rdx
+.no_goaway_bump:
     ; response STREAM frame: type 0x09 (STREAM|FIN), this stream's id, then the
     ; HTTP/3 response. Each response rides its own 1-RTT packet, so the frame
     ; needs no LEN — its data runs to the end of the packet.
@@ -1010,5 +1024,51 @@ linnea_quic_server_rtx_sweep:
     pop r13
     pop r12
     pop rbp
+    pop rbx
+    ret
+
+; linnea_quic_server_goaway_all(edi = UDP socket fd) — the worker is draining:
+; tell every connected h3 peer we are going away with a GOAWAY frame on our
+; control stream, so a client opens no new requests before we exit. The frame's
+; stream id is the lowest request stream this connection would reject (one past
+; the last it served), so the client knows precisely what to retry. Best-effort:
+; sent once, not tracked for retransmission — we are about to exit.
+linnea_quic_server_goaway_all:
+    push rbx
+    push r12
+    push r13                         ; 3 pushes: the call sites are 16-aligned
+    mov r12d, edi                    ; fd
+    xor r13d, r13d                   ; connection index
+.ga_conn:
+    mov edi, r13d
+    call linnea_quic_conn_slot       ; rax = conn* or 0
+    test rax, rax
+    jz .ga_next
+    mov rbx, rax
+    cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
+    jne .ga_next                     ; no control stream before the handshake completes
+    mov [cur_conn], rbx
+    ; a STREAM frame on control stream 3 at offset H3_CTRL_OFF carrying a GOAWAY
+    mov byte [goaway_pay], 0x0e      ; STREAM | OFF | LEN (no FIN — critical stream)
+    mov byte [goaway_pay + 1], 0x03  ; the server control stream id
+    mov byte [goaway_pay + 2], H3_CTRL_OFF
+    mov byte [goaway_pay + 4], LINNEA_H3_FRAME_GOAWAY
+    lea rdi, [goaway_pay + 6]
+    mov rsi, [rbx + linnea_quic_conn.h3_goaway_id]
+    call linnea_quic_varint_encode   ; rax = the id's varint length
+    mov [goaway_pay + 5], al         ; GOAWAY frame length = the id varint length
+    lea rcx, [rax + 2]
+    mov [goaway_pay + 3], cl         ; STREAM data length = type(1) + len(1) + id
+    lea rdx, [rax + 6]               ; total payload = STREAM header(4) + data
+    lea rsi, [goaway_pay]
+    mov [s_pl_ptr], rsi
+    mov [s_pl_len], rdx
+    call emit_1rtt
+.ga_next:
+    inc r13d
+    cmp r13d, LINNEA_QUIC_MAX_CONNS
+    jb .ga_conn
+    pop r13
+    pop r12
     pop rbx
     ret

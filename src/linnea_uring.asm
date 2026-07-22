@@ -81,6 +81,7 @@ extern linnea_quic_altsvc_set
 extern linnea_h3_server
 extern linnea_quic_server_datagram
 extern linnea_quic_server_rtx_sweep
+extern linnea_quic_server_goaway_all
 extern linnea_quic_rxbuf
 
 section .rodata
@@ -405,6 +406,13 @@ linnea_uring_run:
     lea rdi, [log_drain]
     mov esi, log_drain_len
     call linnea_log_write
+    ; tell connected h3 peers we are going away before anything else — even a
+    ; worker with no TCP connections (which exits below) gets the GOAWAY out
+    cmp dword [quic_fd], 0
+    jl .no_goaway
+    mov edi, [quic_fd]
+    call linnea_quic_server_goaway_all
+.no_goaway:
     cmp qword [linnea_connection_active], 0
     je .drained_exit
     xor r13d, r13d             ; server index

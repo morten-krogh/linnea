@@ -58,6 +58,7 @@ struc linnea_quic_conn
     .peer_len:   resq 1              ; sockaddr length
     .state:      resq 1
     .ctrl_id:    resq 1              ; the peer's control stream id, 0 until seen
+    .h3_goaway_id: resq 1            ; lowest request stream a drain would reject
     .pn_1rtt:    resq 1              ; next 1-RTT packet number we send
     .last_active: resq 1             ; CLOCK_MONOTONIC seconds of the last packet
     ; acknowledgement state for the 1-RTT space (see linnea_quic_ack_record):
