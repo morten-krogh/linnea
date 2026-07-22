@@ -15,6 +15,7 @@ global linnea_quic_conn_alloc
 global linnea_quic_conn_free
 global linnea_quic_conn_sweep
 global linnea_quic_conn_active
+global linnea_quic_conn_slot
 
 section .bss
 conn_pool: resb LINNEA_QUIC_MAX_CONNS * linnea_quic_conn_size
@@ -162,6 +163,21 @@ linnea_quic_conn_active:
     add rdx, linnea_quic_conn_size
     dec ecx
     jnz .ac_slot
+    ret
+
+; linnea_quic_conn_slot(rdi=index) -> rax = conn* if that slot is in use, else 0.
+; Lets a caller walk the pool by index (the loss-recovery sweep needs every live
+; connection) without exposing the pool array.
+linnea_quic_conn_slot:
+    cmp rdi, LINNEA_QUIC_MAX_CONNS
+    jae .none
+    imul rax, rdi, linnea_quic_conn_size
+    lea rax, [conn_pool + rax]
+    cmp qword [rax + linnea_quic_conn.in_use], 0
+    je .none
+    ret
+.none:
+    xor eax, eax
     ret
 
 ; conn_now() -> rax = CLOCK_MONOTONIC seconds. Monotonic so a clock step cannot

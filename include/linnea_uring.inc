@@ -22,6 +22,7 @@ LINNEA_CQE_USER_DATA    equ 0    ; u64
 LINNEA_CQE_RES          equ 8    ; s32
 LINNEA_CQE_FLAGS        equ 12   ; u32
 
+LINNEA_IORING_OP_TIMEOUT     equ 11
 LINNEA_IORING_OP_ACCEPT      equ 13
 LINNEA_IORING_OP_ASYNC_CANCEL equ 14
 LINNEA_IORING_OP_LINK_TIMEOUT equ 15
@@ -46,6 +47,7 @@ LINNEA_UD_UP_RECV       equ 6          ; response bytes from the upstream
 LINNEA_UD_SIGNAL        equ 7          ; signalfd read: SIGTERM = drain
 LINNEA_UD_CANCEL        equ 8          ; accept-cancel cqe, always ignored
 LINNEA_UD_QRECV         equ 9          ; datagram on the QUIC (UDP) listener
+LINNEA_UD_QTIMER        equ 10         ; QUIC probe-timeout tick: run the rtx sweep
 
 ; struct msghdr (x86-64), for the QUIC listener's recvmsg: UDP needs the
 ; sender's address, which plain recv does not report.

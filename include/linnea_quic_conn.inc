@@ -33,11 +33,21 @@ LINNEA_QUIC_RTX_SLOTS   equ 8       ; outstanding 1-RTT packets tracked per conn
 LINNEA_QUIC_RTX_PAYLOAD equ 1500    ; frame bytes kept per packet
 LINNEA_QUIC_ACK_MAXR    equ 16      ; ACK ranges decoded from one incoming frame
 
+; Probe timeout: a buffered packet unacknowledged for this long is resent, under
+; a fresh number. The threshold doubles per attempt (a lost reply on a slow or
+; congested path is not lost again just because the first probe was early) up to
+; a cap, and after a maximum number of attempts the packet is abandoned — a peer
+; that has vanished should not be probed until the idle sweep reclaims it.
+LINNEA_QUIC_PTO_MS      equ 250     ; base probe timeout, milliseconds
+LINNEA_QUIC_PTO_CAP     equ 4       ; largest backoff shift (250ms << 4 = 4s)
+LINNEA_QUIC_PTO_MAX     equ 6       ; attempts before a packet is given up on
+
 struc linnea_quic_sent
     .in_use:   resq 1
     .pn:       resq 1               ; packet number it last went out under
     .sent_ms:  resq 1               ; CLOCK_MONOTONIC ms when (re)sent, for the PTO
     .len:      resq 1               ; frame-payload length
+    .tries:    resq 1               ; retransmissions so far (0 = first send)
     .payload:  resb LINNEA_QUIC_RTX_PAYLOAD
     .pad:      resb 4               ; round the record to a multiple of 8
 endstruc

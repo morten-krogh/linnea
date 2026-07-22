@@ -336,6 +336,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_ack_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): replies acknowledge received packets" $?
 
+    # loss recovery: drop the server's reply and it must retransmit (under a
+    # fresh packet number) once its probe timeout fires
+    python3 test/quic/h3_rtx_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): a dropped reply is retransmitted after the PTO" $?
+
     # Alt-Svc: the TCP responses advertise HTTP/3 on this port, which is how a
     # browser discovers it at all
     hdrs=$(curl -si --http1.1 --cacert test/tls/server.crt \

@@ -41,6 +41,7 @@ linnea_quic_rtx_record:
     mov [rax + linnea_quic_sent.pn], rsi
     mov [rax + linnea_quic_sent.sent_ms], r8
     mov [rax + linnea_quic_sent.len], rcx
+    mov qword [rax + linnea_quic_sent.tries], 0
     lea rdi, [rax + linnea_quic_sent.payload]
     mov rsi, rdx
     rep movsb                         ; rcx bytes of frames

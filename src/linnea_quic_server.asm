@@ -36,6 +36,7 @@ default rel
 
 global linnea_quic_server_init
 global linnea_quic_server_datagram
+global linnea_quic_server_rtx_sweep
 global linnea_quic_rxbuf
 global linnea_quic_altsvc_set
 global linnea_h3_altsvc
@@ -68,6 +69,7 @@ extern linnea_quic_build_ack
 extern linnea_quic_ack_ranges
 extern linnea_quic_rtx_record
 extern linnea_quic_rtx_ack_range
+extern linnea_quic_conn_slot
 extern linnea_string_from_u64
 extern linnea_quic_conn_free
 extern linnea_quic_varint_encode
@@ -633,72 +635,23 @@ linnea_quic_server_datagram:
     rep movsb
     ret
 
-; .send_1rtt(rsi = payload ptr, rdx = payload len) — build a short-header 1-RTT
-; packet with the current server packet number, protect it with the server
-; 1-RTT keys, send it to the client, and advance the packet number.
+; .send_1rtt(rsi = payload ptr, rdx = payload len) — send a short-header 1-RTT
+; packet carrying these frames (emit_1rtt) and buffer them for loss recovery, so
+; a lost copy is resent under a fresh number by the sweep. r12d = the UDP socket.
 .send_1rtt:
-    push rbx                          ; align the stack (and free reg)
+    push rbx
     mov [s_pl_ptr], rsi
     mov [s_pl_len], rdx
-    mov byte [hdr], 0x40              ; short header, 1-byte pn, key phase 0
-    CONNGET rcx, dcid_len
-    lea rdi, [hdr + 1]
-    CONNLEA rsi, dcid
-    rep movsb                         ; DCID = the peer's connection id
-    CONNGET rax, pn_1rtt
-    mov [rdi], al                     ; packet number (1 byte)
-    inc rdi
-    CONNGET rbx, dcid_len
-    add rbx, 2                        ; header length = 1 + DCID + 1
-    sub rsp, 16
-    CONNLEA rax, ap_skeys
-    mov [rsp], rax
-    lea rdi, [onertt_pkt]
-    lea rsi, [hdr]
-    mov rdx, rbx
-    mov ecx, 1
-    mov r8, [s_pl_ptr]
-    mov r9, [s_pl_len]
-    call linnea_quic_protect          ; rax = packet length
-    add rsp, 16
-    mov rdx, rax
-    mov eax, SYS_SENDTO
-    mov edi, r12d
-    lea rsi, [onertt_pkt]
-    xor r10d, r10d
-    CONNLEA r8, peer
-    CONNGET r9, peer_len
-    syscall
-    ; buffer these frames for loss recovery under the number we just used, then
-    ; advance it — QUIC requires the retransmission to carry a fresh number.
-    call .now_ms
+    call emit_1rtt                    ; rax = the packet number used
+    mov rbx, rax
+    call now_ms
     mov r8, rax
     mov rdi, [cur_conn]
-    CONNGET rsi, pn_1rtt
+    mov rsi, rbx
     mov rdx, [s_pl_ptr]
     mov rcx, [s_pl_len]
     call linnea_quic_rtx_record
-    mov rax, [cur_conn]
-    inc qword [rax + linnea_quic_conn.pn_1rtt]
     pop rbx
-    ret
-
-; .now_ms -> rax = CLOCK_MONOTONIC milliseconds. Monotonic so the PTO cannot be
-; thrown off by a wall-clock step.
-.now_ms:
-    sub rsp, 24
-    mov eax, LINNEA_SYS_CLOCK_GETTIME
-    mov edi, LINNEA_CLOCK_MONOTONIC
-    mov rsi, rsp
-    syscall
-    mov r8, [rsp]                    ; seconds
-    imul r8, r8, 1000
-    mov rax, [rsp + 8]              ; nanoseconds
-    xor edx, edx
-    mov rcx, 1000000
-    div rcx                          ; rax = ns / 1e6
-    add rax, r8
-    add rsp, 24
     ret
 
 ; .build_initial_header -> rcx = header length; DCID = client SCID, SCID = ours,
@@ -793,5 +746,142 @@ linnea_quic_server_datagram:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; now_ms -> rax = CLOCK_MONOTONIC milliseconds. Monotonic so the probe timeout
+; cannot be thrown off by a wall-clock step. Standalone (not a datagram-local)
+; because the retransmission sweep needs it too.
+now_ms:
+    sub rsp, 24
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    mov edi, LINNEA_CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov r8, [rsp]                     ; seconds
+    imul r8, r8, 1000
+    mov rax, [rsp + 8]                ; nanoseconds
+    xor edx, edx
+    mov rcx, 1000000
+    div rcx                           ; rax = ns / 1e6
+    add rax, r8
+    add rsp, 24
+    ret
+
+; emit_1rtt() -> rax = the packet number the packet went out under.
+; Builds a short-header 1-RTT packet carrying [s_pl_ptr, s_pl_len], protects it
+; with the current connection's server 1-RTT keys, sends it on r12d, and advances
+; the connection's packet number. cur_conn selects the connection, r12d is the
+; UDP socket. Shared by the live reply path (.send_1rtt) and the retransmission
+; sweep, which resends the stored frames under the fresh number this returns.
+; Requires rsp 16-aligned at the call site (rsp % 16 == 8 on entry).
+emit_1rtt:
+    push rbx
+    mov byte [hdr], 0x40              ; short header, 1-byte pn, key phase 0
+    CONNGET rcx, dcid_len
+    lea rdi, [hdr + 1]
+    CONNLEA rsi, dcid
+    rep movsb                         ; DCID = the peer's connection id
+    CONNGET rax, pn_1rtt
+    mov [rdi], al                     ; packet number (1 byte)
+    inc rdi
+    CONNGET rbx, dcid_len
+    add rbx, 2                        ; header length = 1 + DCID + 1
+    sub rsp, 16
+    CONNLEA rax, ap_skeys
+    mov [rsp], rax
+    lea rdi, [onertt_pkt]
+    lea rsi, [hdr]
+    mov rdx, rbx
+    mov ecx, 1
+    mov r8, [s_pl_ptr]
+    mov r9, [s_pl_len]
+    call linnea_quic_protect          ; rax = packet length
+    add rsp, 16
+    mov rdx, rax
+    mov eax, SYS_SENDTO
+    mov edi, r12d
+    lea rsi, [onertt_pkt]
+    xor r10d, r10d
+    CONNLEA r8, peer
+    CONNGET r9, peer_len
+    syscall
+    mov rbx, [cur_conn]
+    mov rax, [rbx + linnea_quic_conn.pn_1rtt]   ; the number just used
+    inc qword [rbx + linnea_quic_conn.pn_1rtt]
+    pop rbx
+    ret
+
+; linnea_quic_server_rtx_sweep(edi = UDP socket fd) — one probe-timeout pass over
+; every live connection. Any buffered 1-RTT packet unacknowledged past its probe
+; timeout is resent under a fresh packet number (the threshold doubles per
+; attempt, up to a cap); one probed too many times is abandoned so a vanished
+; peer is not chased until the idle sweep reclaims its slot. Driven by the event
+; loop's periodic timer — the loop is single-threaded, so no datagram is being
+; processed and the per-datagram send scratch is free to reuse.
+linnea_quic_server_rtx_sweep:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                        ; align the call sites (rsp % 16 == 0)
+    mov r12d, edi                     ; fd
+    call now_ms
+    mov r15, rax                      ; now, ms
+    xor r13d, r13d                    ; connection index
+.sw_conn:
+    mov edi, r13d
+    call linnea_quic_conn_slot        ; rax = conn* or 0
+    test rax, rax
+    jz .sw_conn_next
+    mov rbx, rax                      ; connection
+    lea r14, [rbx + linnea_quic_conn.sent]
+    xor ebp, ebp                      ; slot
+.sw_rec:
+    cmp qword [r14 + linnea_quic_sent.in_use], 0
+    je .sw_rec_next
+    mov rax, r15
+    sub rax, [r14 + linnea_quic_sent.sent_ms]      ; age in ms
+    ; threshold = PTO_MS << min(tries, PTO_CAP)
+    mov rcx, [r14 + linnea_quic_sent.tries]
+    cmp rcx, LINNEA_QUIC_PTO_CAP
+    jbe .sw_shift
+    mov ecx, LINNEA_QUIC_PTO_CAP
+.sw_shift:
+    mov rdx, LINNEA_QUIC_PTO_MS
+    shl rdx, cl
+    cmp rax, rdx
+    jb .sw_rec_next                   ; not yet due
+    cmp qword [r14 + linnea_quic_sent.tries], LINNEA_QUIC_PTO_MAX
+    jb .sw_resend
+    mov qword [r14 + linnea_quic_sent.in_use], 0   ; given up on
+    jmp .sw_rec_next
+.sw_resend:
+    mov [cur_conn], rbx
+    lea rax, [r14 + linnea_quic_sent.payload]
+    mov [s_pl_ptr], rax
+    mov rax, [r14 + linnea_quic_sent.len]
+    mov [s_pl_len], rax
+    call emit_1rtt                    ; rax = the fresh packet number; r12d = fd
+    mov [r14 + linnea_quic_sent.pn], rax
+    mov [r14 + linnea_quic_sent.sent_ms], r15
+    inc qword [r14 + linnea_quic_sent.tries]
+.sw_rec_next:
+    add r14, linnea_quic_sent_size
+    inc ebp
+    cmp ebp, LINNEA_QUIC_RTX_SLOTS
+    jb .sw_rec
+.sw_conn_next:
+    inc r13d
+    cmp r13d, LINNEA_QUIC_MAX_CONNS
+    jb .sw_conn
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
     pop rbx
     ret

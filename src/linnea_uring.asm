@@ -80,6 +80,7 @@ extern linnea_quic_server_init
 extern linnea_quic_altsvc_set
 extern linnea_h3_server
 extern linnea_quic_server_datagram
+extern linnea_quic_server_rtx_sweep
 extern linnea_quic_rxbuf
 
 section .rodata
@@ -159,6 +160,10 @@ reason_tls_ktls_len equ $ - reason_tls_ktls
 section .data
 
 idle_timeout:       dq LINNEA_DEFAULT_TIMEOUT, 0    ; struct __kernel_timespec
+; QUIC probe-timeout tick. A relative one-shot timeout re-armed on every fire;
+; each tick runs the retransmission sweep. 50 ms bounds how late a lost reply is
+; resent past its probe timeout, and how often a worker wakes when idle.
+pto_timer:          dq 0, 50000000                  ; {sec, nsec} = 50 ms
 
 section .bss
 
@@ -285,6 +290,7 @@ linnea_uring_run:
     mov [linnea_h3_server], r12      ; only this server advertises it
     call linnea_quic_altsvc_set
     call linnea_uring_arm_qrecv
+    call linnea_uring_arm_qtimer
     jmp .quic_done
 .quic_next:
     inc r12
@@ -351,6 +357,8 @@ linnea_uring_run:
     je .on_up_recv
     cmp eax, LINNEA_UD_QRECV
     je .on_qrecv
+    cmp eax, LINNEA_UD_QTIMER
+    je .on_qtimer
     jmp .on_accept             ; tag 0: no longer the textual fall-through
 
 ; --- QUIC datagram on the UDP listener: r15d = bytes or -errno ---------
@@ -368,6 +376,18 @@ linnea_uring_run:
     cmp dword [drain_flag], 0
     jne .wait                  ; draining: take no new datagrams
     call linnea_uring_arm_qrecv
+    call linnea_uring_submit_now
+    jmp .wait
+
+; --- QUIC probe-timeout tick: resend anything unacknowledged past its PTO ---
+; The timeout completes (with -ETIME) on every tick; res carries no work. Run
+; the retransmission sweep over the pool, then re-arm unless draining.
+.on_qtimer:
+    mov edi, [quic_fd]
+    call linnea_quic_server_rtx_sweep
+    cmp dword [drain_flag], 0
+    jne .wait                  ; draining: no more ticks
+    call linnea_uring_arm_qtimer
     call linnea_uring_submit_now
     jmp .wait
 
@@ -1697,6 +1717,23 @@ linnea_uring_arm_qrecv:
     mov dword [rax + LINNEA_SQE_LEN], 1
     mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_QRECV
 .noq:
+    ret
+
+; linnea_uring_arm_qtimer() — queue the QUIC probe-timeout tick: a relative
+; one-shot IORING_OP_TIMEOUT that fires after pto_timer and is re-armed on each
+; completion. Only armed when a QUIC listener exists. Caller submits.
+linnea_uring_arm_qtimer:
+    cmp dword [quic_fd], 0
+    jl .noqt
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_TIMEOUT
+    mov dword [rax + LINNEA_SQE_FD], -1
+    lea rcx, [pto_timer]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1        ; one timespec
+    mov qword [rax + LINNEA_SQE_OFF], 0        ; fire on the timer, not a count
+    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_QTIMER
+.noqt:
     ret
 
 ; linnea_uring_log_accept(rdi=connection*)
