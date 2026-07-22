@@ -24,4 +24,5 @@ struc linnea_quic_ch
     .psk_binder_ptr: resq 1 ; first binder's 32 bytes
     .psk_binders_pos: resq 1 ; absolute ptr to the binders-length field (truncated CH end)
     .psk_dhe_ke:    resq 1 ; 1 if the client offered psk_dhe_ke (the only mode we do)
+    .early_data:    resq 1 ; 1 if the client offered early_data (0x2a) for 0-RTT
 endstruc

@@ -66,6 +66,12 @@ LINNEA_QUIC_PTO_MAX     equ 6       ; attempts before a packet is given up on
 ; takes a copy-free fast path. Requests larger than this buffer are not served.
 LINNEA_QUIC_RA_BUF      equ 8192    ; reassembly capacity for one request stream
 
+; 0-RTT (early data): a resuming client can send its request in a 0-RTT packet
+; coalesced with the ClientHello, before the handshake completes. The decrypted
+; early frames are buffered here and served once the 1-RTT keys are up. Small: a
+; 0-RTT request is a single GET (a large early body is neither expected nor kept).
+LINNEA_QUIC_EARLY_BUF   equ 1024
+
 struc linnea_quic_sent
     .in_use:   resq 1
     .pn:       resq 1               ; packet number it last went out under
@@ -102,6 +108,10 @@ struc linnea_quic_conn
     ; issued under, matched on resumption.
     .resumption_psk: resb 32
     .sni_hash:   resb 8
+    ; 0-RTT: the early-data keys and the buffered early request (served at completion)
+    .zrtt_ckeys: resb linnea_quic_keys_size
+    .early_len:  resq 1              ; bytes of buffered early-data frames (0 = none)
+    .early_buf:  resb LINNEA_QUIC_EARLY_BUF
     .ini_client: resb linnea_quic_keys_size
     .ini_server: resb linnea_quic_keys_size
     .hs_ckeys:   resb linnea_quic_keys_size

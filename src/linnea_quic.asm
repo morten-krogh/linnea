@@ -37,6 +37,7 @@ extern linnea_aesgcm_open
 extern linnea_aesgcm_seal
 extern linnea_sha256
 extern linnea_hmac_sha256
+extern linnea_quic_early_ok
 extern linnea_p256_ecdsa_sign
 extern linnea_tls_hkdf_expand_label
 
@@ -1148,6 +1149,13 @@ linnea_quic_build_ee:
     shr rcx, 8
     mov [r12 + 2], cl
     lea r12, [r12 + 4 + rax]         ; end of extensions
+    ; early_data extension (empty) accepts the client's 0-RTT (RFC 8446 4.2.10)
+    cmp qword [linnea_quic_early_ok], 0
+    je .ee_ext_done
+    mov word [r12], 0x2a00           ; early_data (0x002a)
+    mov word [r12 + 2], 0x0000       ; ext length 0
+    add r12, 4
+.ee_ext_done:
     ; extensions length = r12 - (out + 6)
     mov rcx, r12
     lea rdx, [rbx + 6]
@@ -1420,6 +1428,8 @@ linnea_quic_ch_parse:
     je .chp_pskmodes                 ; psk_key_exchange_modes (0x002d)
     cmp eax, 0x29
     je .chp_psk                      ; pre_shared_key (0x0029)
+    cmp eax, 0x2a
+    je .chp_early                    ; early_data (0x002a)
 .chp_next:
     mov r13, r15
     jmp .chp_ext
@@ -1488,6 +1498,10 @@ linnea_quic_ch_parse:
     mov rax, r15
     sub rax, r14
     mov [rbx + linnea_quic_ch.tp_len], rax
+    jmp .chp_next
+.chp_early:
+    ; early_data in a ClientHello is empty; its presence is the 0-RTT request.
+    mov qword [rbx + linnea_quic_ch.early_data], 1
     jmp .chp_next
 .chp_pskmodes:
     ; ke_modes<1..255>: 1-byte list length, then modes. We only do psk_dhe_ke (1).

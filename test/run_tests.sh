@@ -343,6 +343,21 @@ else
     check "h3 resumption test (skipped: deps unavailable)" 0
 fi
 
+# 0-RTT early data: a resuming client sends its GET coalesced with the
+# ClientHello; the server decrypts the 0-RTT packet, accepts (EE early_data),
+# and serves the buffered request once the 1-RTT keys are up.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
+    timeout 12 ./bin/linnea-quichs >/dev/null 2>&1 &
+    hspid=$!
+    sleep 0.4
+    python3 test/quic/h3_0rtt_test.py 47501 >/dev/null 2>&1
+    check "h3: serves a 0-RTT request (early data accepted)" $?
+    kill $hspid 2>/dev/null
+    wait $hspid 2>/dev/null
+else
+    check "h3 0-RTT test (skipped: deps unavailable)" 0
+fi
+
 # HTTP/3 through the real server: linnea binds a UDP listener for its TLS
 # server and drives the QUIC handler from the io_uring loop, so h3 is served by
 # the production binary from the config's document root — while TCP keeps
@@ -394,6 +409,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # the server skips the certificate
     python3 test/quic/h3_resume_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): resumes from a ticket (no certificate re-sent)" $?
+
+    # 0-RTT: a resuming client's GET, sent as early data with the ClientHello, is
+    # decrypted and served
+    python3 test/quic/h3_0rtt_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): serves a 0-RTT request (early data)" $?
 
     # BPF connection-ID steering: a connection survives the client migrating to a
     # fresh source port. Needs CAP_BPF on the binary (a rebuild drops the file

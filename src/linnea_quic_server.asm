@@ -84,7 +84,9 @@ extern linnea_sha256_final
 extern linnea_quic_resumption_psk
 extern linnea_quic_ticket_seal
 extern linnea_quic_ticket_resume
+extern linnea_quic_early_keys
 extern linnea_quic_hs_psk
+extern linnea_quic_early_ok
 
 section .rodata
 altsvc_pre:  db 'h3=":'
@@ -178,6 +180,7 @@ ack_ranges:    resb LINNEA_QUIC_ACK_MAXR * 16   ; decoded [smallest,largest] pai
 ; NewSessionTicket scratch (issued at handshake completion, see .append_nst)
 s_pay_len:   resq 1              ; 1-RTT payload length saved across .append_nst
 s_sh_len:    resq 1              ; ServerHello length (90 fresh, 96 with the PSK ext)
+s_dgram_len: resq 1              ; this datagram's length (r13 may not survive to .early_walk)
 s_resume_psk: resb 32           ; PSK recovered from an accepted resumption ticket
 q_sni32:     resb 32             ; SHA-256(SNI), of which 8 bytes seed the ticket
 q_nst_ts:    resb 16             ; timespec for the ticket's issued time
@@ -239,6 +242,7 @@ linnea_quic_server_datagram:
     push rbp
     sub rsp, 8                       ; keep rsp 16-aligned for the calls
     mov r13, rdi                     ; datagram length
+    mov [s_dgram_len], r13           ; ...also saved: reloaded in the 0-RTT walk
     mov r12d, ecx                    ; udp socket
     ; record the sender: the pool allocator and .refresh_peer read it here
     cmp rdx, 16
@@ -363,6 +367,9 @@ linnea_quic_server_datagram:
     ; then drives the ServerHello's pre_shared_key extension, the early secret in
     ; hs_secrets, and the EE-only flight below; 0 means a full handshake.
     mov qword [linnea_quic_hs_psk], 0
+    mov qword [linnea_quic_early_ok], 0
+    mov rbx, [cur_conn]
+    mov qword [rbx + linnea_quic_conn.early_len], 0
     mov rdi, [ch_out + linnea_quic_ch.psk_id_ptr]
     test rdi, rdi
     jz .no_resume
@@ -385,6 +392,11 @@ linnea_quic_server_datagram:
     jz .no_resume
     lea rax, [s_resume_psk]
     mov [linnea_quic_hs_psk], rax             ; resumed: seed the key schedule
+    ; accept 0-RTT if the client also offered early_data — the EE will echo it and
+    ; we decrypt the coalesced 0-RTT packet below (.early_walk)
+    cmp qword [ch_out + linnea_quic_ch.early_data], 0
+    je .no_resume
+    mov qword [linnea_quic_early_ok], 1
 .no_resume:
     ; fresh ephemeral key + ServerHello random for this handshake. server_priv
     ; and server_srand are adjacent in .bss (32 bytes each), so two getrandom32
@@ -579,6 +591,74 @@ linnea_quic_server_datagram:
     lea rsi, [th_buf]
     lea rdx, [rbx + linnea_quic_conn.resumption_psk]
     call linnea_quic_resumption_psk       ; conn.sni_hash was set at CH time
+    ; --- 0-RTT: if we accepted early data, derive the 0-RTT keys and decrypt the
+    ; client's early request (coalesced with the ClientHello) so it can be served
+    ; once the 1-RTT keys are up. Do this last — it reuses plaintext for the 0-RTT
+    ; payload, and the ClientHello (still in plaintext) is no longer needed.
+    cmp qword [linnea_quic_early_ok], 0
+    je .early_done
+    ; H(ClientHello) -> th_buf, then the 0-RTT keys from the recovered PSK
+    mov rdi, [s_ch_ptr]
+    mov rsi, [s_ch_len]
+    lea rdx, [th_buf]
+    call linnea_sha256
+    lea rdi, [s_resume_psk]
+    lea rsi, [th_buf]
+    mov rbx, [cur_conn]
+    lea rdx, [rbx + linnea_quic_conn.zrtt_ckeys]
+    call linnea_quic_early_keys
+    ; walk the datagram for the coalesced 0-RTT packet (long header, type 0x10)
+    mov r13, [s_dgram_len]           ; r13 may have been clobbered building the flight
+    lea r15, [linnea_quic_rxbuf]
+.ew_loop:
+    lea rax, [linnea_quic_rxbuf + r13]
+    cmp r15, rax
+    jae .early_done                  ; no 0-RTT packet in this datagram
+    test byte [r15], 0x80
+    jz .early_done                   ; short header — stop
+    movzx eax, byte [r15]
+    and al, 0x30
+    mov r10d, eax                    ; 0x00 Initial, 0x10 0-RTT
+    cmp r10d, 0x10
+    je .ew_zrtt
+    ; skip this long-header packet (an Initial ahead of the 0-RTT one)
+    movzx eax, byte [r15 + 5]        ; DCID length
+    lea rdi, [r15 + 6 + rax]
+    movzx eax, byte [rdi]            ; SCID length
+    lea rdi, [rdi + 1 + rax]         ; -> token length (Initial) / length
+    lea rsi, [linnea_quic_rxbuf + r13]
+    test r10d, r10d
+    jnz .ew_len                      ; only an Initial carries a token
+    call linnea_quic_varint_decode
+    add rdi, rdx
+    add rdi, rax                     ; skip the token
+.ew_len:
+    call linnea_quic_varint_decode   ; length (pn + payload + tag)
+    lea rdi, [rdi + rdx]
+    add rdi, rax
+    mov r15, rdi
+    jmp .ew_loop
+.ew_zrtt:
+    ; a 0-RTT packet: unprotect it with the early keys (long header, no token, so
+    ; the Handshake-packet path applies) and buffer its frames for completion.
+    mov rdi, r15
+    lea rsi, [linnea_quic_rxbuf + r13]
+    sub rsi, r15
+    mov rbx, [cur_conn]
+    lea rdx, [rbx + linnea_quic_conn.zrtt_ckeys]
+    lea rcx, [plaintext]
+    call linnea_quic_unprotect_hs    ; rax = frame bytes
+    test rax, rax
+    js .early_done
+    cmp rax, LINNEA_QUIC_EARLY_BUF
+    ja .early_done                   ; oversized early data: drop it (served fresh)
+    mov rbx, [cur_conn]
+    mov [rbx + linnea_quic_conn.early_len], rax
+    lea rdi, [rbx + linnea_quic_conn.early_buf]
+    lea rsi, [plaintext]
+    mov rcx, rax
+    rep movsb
+.early_done:
     ; the flight is out: leave ST_NEW so a retransmitted ClientHello is recognized
     ; as a duplicate (above) rather than rebuilding the flight with fresh keys.
     mov rax, [cur_conn]
@@ -719,7 +799,22 @@ linnea_quic_server_datagram:
     lea rsi, [cfin_marker]
     mov edx, cfin_marker_len
     syscall
-    jmp .done
+    ; 0-RTT: now that the 1-RTT keys are up, serve any early request the client
+    ; sent before the handshake completed. Its frames were buffered at CH time;
+    ; replay them through the ordinary stream path (the response rides 1-RTT).
+    mov rbx, [cur_conn]
+    mov rax, [rbx + linnea_quic_conn.early_len]
+    test rax, rax
+    jz .done
+    mov qword [rbx + linnea_quic_conn.early_len], 0   ; serve once
+    lea rsi, [rbx + linnea_quic_conn.early_buf]
+    lea rdi, [plaintext]
+    mov rcx, rax
+    rep movsb
+    lea r15, [plaintext + rax]       ; frames end
+    lea r14, [plaintext]             ; scan cursor
+    jmp .stream_scan
+    ; (.stream_scan serves the request(s) and jmps .done)
 
 ; --- 1-RTT (short-header) packet: HTTP/3 requests on QUIC streams ---
 ; One packet can carry several STREAM frames (requests on different streams),

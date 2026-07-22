@@ -23,7 +23,9 @@ global linnea_quic_ticket_setup
 global linnea_quic_ticket_seal
 global linnea_quic_ticket_open
 global linnea_quic_ticket_resume
+global linnea_quic_early_keys
 global linnea_quic_hs_psk
+global linnea_quic_early_ok
 
 extern linnea_hkdf_extract
 extern linnea_tls_hkdf_expand_label
@@ -55,6 +57,7 @@ lbl_res_master: db "res master"
 lbl_resumption: db "resumption"
 lbl_res_binder: db "res binder"
 lbl_finished:   db "finished"
+lbl_c_e_traffic: db "c e traffic"
 q_ticket_nonce: db 0, 0          ; the (fixed) resumption ticket_nonce
 zeros32:       times 32 db 0
 ; SHA-256 of the empty string (Derive-Secret's context for "derived").
@@ -615,8 +618,45 @@ linnea_quic_ticket_resume:
     pop rbx
     ret
 
+; linnea_quic_early_keys(rdi=psk32, rsi=H(ClientHello)32, rdx=out linnea_quic_keys)
+; The 0-RTT (early data) packet-protection keys, RFC 9001 5.2: early_secret =
+; HKDF-Extract(0, PSK); client_early_traffic_secret = Derive-Secret(early_secret,
+; "c e traffic", H(CH)); then the QUIC packet keys from that secret. The client
+; derives the same, so the server can decrypt its 0-RTT packets.
+linnea_quic_early_keys:
+    push rbx
+    push r12
+    push r13
+    sub rsp, 80                      ; [0]early [32]c_e (3 pushes+80 keep alignment)
+    mov rbx, rdi                     ; psk
+    mov r12, rsi                     ; H(CH)
+    mov r13, rdx                     ; out keys
+    ; early_secret = HKDF-Extract(0, psk)
+    lea rdi, [zeros32]
+    xor esi, esi
+    mov rdx, rbx
+    mov ecx, 32
+    lea r8, [rsp]
+    call linnea_hkdf_extract
+    ; c_e = Derive-Secret(early, "c e traffic", H(CH))
+    lea rdi, [rsp]
+    lea rsi, [lbl_c_e_traffic]
+    mov edx, 11
+    mov rcx, r12
+    lea r8, [rsp + 32]
+    call linnea_tls_derive_secret
+    lea rdi, [rsp + 32]
+    mov rsi, r13
+    call quic_pp_keys
+    add rsp, 80
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 section .bss
 alignb 16
 q_ticket_key:  resb 16                    ; per-run QUIC stateless-ticket key
 q_ticket_ctx:  resb linnea_aesgcm_ctx_size
 linnea_quic_hs_psk: resq 1                ; resumption PSK ptr for hs_secrets, 0 = fresh
+linnea_quic_early_ok: resq 1              ; 1 when 0-RTT is accepted (drives EE early_data)
