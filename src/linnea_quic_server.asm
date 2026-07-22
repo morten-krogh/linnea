@@ -88,10 +88,6 @@ altsvc_post: db '"; ma=86400'
 altsvc_post_len equ $ - altsvc_post
 x25519_base:  db 9
               times 31 db 0
-server_priv:  db 0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x4a,0x4b,0x4c,0x4d,0x4e,0x4f
-              db 0x50,0x51,0x52,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x5b,0x5c,0x5d,0x5e,0x5f
-server_srand: db 0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6a,0x6b,0x6c,0x6d,0x6e,0x6f
-              db 0x70,0x71,0x72,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x7b,0x7c,0x7d,0x7e,0x7f
 cfin_marker:  db "CFIN-OK", 10
 cfin_marker_len equ $ - cfin_marker
 ; The server's unidirectional streams, opened once the handshake completes.
@@ -137,6 +133,13 @@ s_body_len:  resq 1
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 ch_out:      resb linnea_quic_ch_size
+; Per-connection ephemeral X25519 private key and ServerHello random, refilled
+; from getrandom(2) on every ClientHello. Constant values here would fix the
+; server's key_share across all connections — breaking forward secrecy — and
+; repeat the ServerHello random, so both are (re)generated per handshake. Kept
+; adjacent and in this order so one getrandom32 pair fills them.
+server_priv:  resb 32
+server_srand: resb 32
 server_pub:  resb 32
 sh_buf:      resb 128
 th_buf:      resb 32
@@ -333,6 +336,13 @@ linnea_quic_server_datagram:
     mov [rax + linnea_quic_conn.dcid_len], rcx
     lea rdi, [rax + linnea_quic_conn.dcid]
     rep movsb                        ; copy the SCID out of dgram
+    ; fresh ephemeral key + ServerHello random for this handshake. server_priv
+    ; and server_srand are adjacent in .bss (32 bytes each), so two getrandom32
+    ; calls refill both; a constant key_share would break forward secrecy.
+    lea rdi, [server_priv]
+    call .getrandom32
+    lea rdi, [server_srand]
+    call .getrandom32
     ; server ephemeral public + ServerHello
     lea rdi, [server_pub]
     lea rsi, [server_priv]
@@ -1186,6 +1196,34 @@ linnea_quic_server_datagram:
     pop r12
     pop rbx
     ret
+
+; .getrandom32(rdi=dest) — fill 32 bytes from getrandom(2), retrying a short
+; return. Aborts the process on error: startup entropy is assumed, and serving a
+; handshake with a non-random ephemeral key would be worse than refusing it.
+.getrandom32:
+    push rbx
+    push r12
+    mov rbx, rdi
+    xor r12d, r12d
+.gr_loop:
+    lea rdi, [rbx + r12]
+    mov esi, 32
+    sub rsi, r12                     ; bytes still to fill
+    xor edx, edx                     ; flags
+    mov eax, LINNEA_SYS_GETRANDOM
+    syscall
+    test rax, rax
+    jle .gr_fail
+    add r12, rax
+    cmp r12, 32
+    jb .gr_loop
+    pop r12
+    pop rbx
+    ret
+.gr_fail:
+    mov edi, 1
+    mov eax, LINNEA_SYS_EXIT
+    syscall
 
 ; now_ms -> rax = CLOCK_MONOTONIC milliseconds. Monotonic so the probe timeout
 ; cannot be thrown off by a wall-clock step. Standalone (not a datagram-local)
