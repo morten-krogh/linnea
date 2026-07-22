@@ -21,6 +21,16 @@ LINNEA_QUIC_RXBUF_SIZE equ 2048     ; linnea_quic_rxbuf, the datagram we read in
 LINNEA_QUIC_SCID_LEN  equ 8         ; every connection ID we issue is 8 bytes
 LINNEA_QUIC_IDLE_SECS equ 30        ; reclaim a slot after this long with no packet
 
+; The server handshake flight carries the whole certificate chain in CRYPTO
+; frames, which for a real chain far exceeds one datagram. QUIC forbids IP
+; fragmentation (packets set don't-fragment), so a flight larger than the path
+; MTU must be split: the CRYPTO byte stream is chopped into chunks, each carried
+; by its own Handshake packet (increasing packet number, increasing CRYPTO
+; offset) in its own datagram. This chunk size keeps a datagram — even the first,
+; which coalesces the Initial ahead of the Handshake packet — under the 1200-byte
+; floor every QUIC endpoint must accept (RFC 9000 s14.1).
+LINNEA_QUIC_CRYPTO_CHUNK equ 960    ; max CRYPTO payload per Handshake packet
+
 ; Handshake progress, so a packet can be checked against the connection's stage.
 LINNEA_QUIC_ST_NEW       equ 0      ; allocated, nothing processed yet
 LINNEA_QUIC_ST_HANDSHAKE equ 1      ; server flight sent, awaiting the client

@@ -407,6 +407,25 @@ else
     check "h3 GOAWAY drain test (skipped: deps unavailable)" 0
 fi
 
+# Handshake segmentation: a real certificate chain makes the server flight far
+# larger than one datagram. QUIC forbids IP fragmentation, so the Certificate
+# CRYPTO must be split across several Handshake packets, each in its own <=MTU
+# datagram. The config here serves a four-cert chain; the test confirms the
+# handshake still completes and no datagram breaches the 1200-byte QUIC floor.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    rm -f test/linnea.log
+    $BIN test/configs/tls-h3-bigcert.json >/dev/null 2>&1 &
+    bc_pid=$!
+    sleep 0.5
+    python3 test/quic/h3_bigcert_test.py 47454 >/dev/null 2>&1
+    check "h3 (io_uring): large cert chain flight is segmented under the MTU" $?
+    kill $bc_pid 2>/dev/null
+    wait $bc_pid 2>/dev/null
+    rm -f test/linnea.log
+else
+    check "h3 handshake segmentation test (skipped: deps unavailable)" 0
+fi
+
 # Acknowledgements: our reply must acknowledge the request packet, or the peer
 # keeps retransmitting work already done.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then

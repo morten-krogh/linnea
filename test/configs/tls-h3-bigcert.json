@@ -1,0 +1,14 @@
+{
+  "log": "test/linnea.log",
+  "timeout": 5,
+  "workers": 1,
+  "servers": [
+    {
+      "host": "127.0.0.1", "port": 47454, "hostname": "localhost",
+      "cert": "test/tls/bigchain.crt", "key": "test/tls/server.key",
+      "locations": [
+        { "prefix": "/", "root": "test/www" }
+      ]
+    }
+  ]
+}

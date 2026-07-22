@@ -140,7 +140,7 @@ ch_out:      resb linnea_quic_ch_size
 server_pub:  resb 32
 sh_buf:      resb 128
 th_buf:      resb 32
-hsmsg:       resb 4096
+hsmsg:       resb 8192            ; whole handshake (EE..Finished); a large chain fits
 s_cert_list_ptr: resq 1
 shactx:      resb linnea_sha256_ctx_size
 hdr:         resb 64
@@ -156,6 +156,9 @@ s_cert_len:  resq 1
 s_priv:      resq 1
 s_ini_len:   resq 1
 s_hsmsg_len: resq 1
+s_hs_off:    resq 1              ; CRYPTO offset of the next flight chunk to send
+s_hs_pn:     resq 1              ; packet number of the next Handshake packet
+s_hs_chunk:  resq 1              ; byte length of the chunk currently being framed
 linnea_h3_altsvc:     resb 48    ; Alt-Svc value, e.g. h3=":443"; ma=86400
 linnea_h3_altsvc_len: resq 1     ; 0 until a QUIC listener is bound
 linnea_h3_server:     resq 1     ; index of the server that owns that listener
@@ -392,36 +395,71 @@ linnea_quic_server_datagram:
     add r14, rax
     mov [s_hsmsg_len], r14
 
-    ; ===== Handshake packet: CRYPTO(hsmsg) =====
+    ; ===== Handshake flight: CRYPTO(hsmsg) split across packets =====
+    ; hsmsg[0..s_hsmsg_len] is the handshake (EE || Cert || CertVerify ||
+    ; Finished). A real certificate chain overflows one datagram, so the CRYPTO
+    ; byte stream is chopped into chunks, each in its own Handshake packet with an
+    ; increasing packet number and CRYPTO offset. The first packet is coalesced
+    ; after the Initial in the leading datagram; every later chunk rides its own.
+    ; Each datagram stays under the 1200-byte floor so none is IP-fragmented.
+    mov qword [s_hs_off], 0
+    mov qword [s_hs_pn], 0
+.hs_flight:
+    ; chunk = min(s_hsmsg_len - s_hs_off, LINNEA_QUIC_CRYPTO_CHUNK)
+    mov rax, [s_hsmsg_len]
+    sub rax, [s_hs_off]
+    cmp rax, LINNEA_QUIC_CRYPTO_CHUNK
+    jbe .hs_chunk_set
+    mov eax, LINNEA_QUIC_CRYPTO_CHUNK
+.hs_chunk_set:
+    mov [s_hs_chunk], rax
+    ; hspay = CRYPTO(0x06, offset s_hs_off, length chunk, hsmsg[off..off+chunk])
     mov byte [hspay], 0x06           ; CRYPTO type
-    mov byte [hspay + 1], 0x00       ; offset 0
-    lea rdi, [hspay + 2]
-    mov rsi, r14                     ; hsmsg length
-    call linnea_quic_varint_encode   ; rax = varint bytes
-    lea rdi, [hspay + 2 + rax]
+    lea rdi, [hspay + 1]
+    mov rsi, [s_hs_off]
+    call linnea_quic_varint_encode   ; offset varint -> rax bytes
+    mov r13, rax                     ; offset-varint length
+    lea rdi, [hspay + 1 + r13]
+    mov rsi, [s_hs_chunk]
+    call linnea_quic_varint_encode   ; length varint -> rax bytes
+    lea rdi, [hspay + 1 + r13]
+    add rdi, rax                     ; -> CRYPTO data field
+    push rax                         ; save length-varint size
     lea rsi, [hsmsg]
-    mov rcx, r14
-    push rax
-    rep movsb                        ; copy hsmsg
+    add rsi, [s_hs_off]
+    mov rcx, [s_hs_chunk]
+    rep movsb                        ; copy the chunk
     pop rax
-    lea r15, [rax + 2]
-    add r15, r14                     ; Handshake payload length
-    call .build_hs_header            ; -> rcx = header length, uses r15 for length
+    ; Handshake payload = type(1) + offset-varint + length-varint + chunk
+    lea r15, [r13 + rax]
+    add r15, 1
+    add r15, [s_hs_chunk]
+    call .build_hs_header            ; -> rcx = header length; uses r15, s_hs_pn
     sub rsp, 16
     CONNLEA rax, hs_skeys
     mov [rsp], rax
+    ; the first chunk coalesces behind the Initial; later chunks start fresh
+    cmp qword [s_hs_off], 0
+    jne .hs_alone
     mov rdi, [s_ini_len]
-    lea rdi, [outpkt + rdi]          ; coalesce after the Initial packet
+    lea rdi, [outpkt + rdi]
+    jmp .hs_protect
+.hs_alone:
+    lea rdi, [outpkt]
+.hs_protect:
     lea rsi, [hdr]
     mov rdx, rcx
     mov ecx, 1
     lea r8, [hspay]
     mov r9, r15
-    call linnea_quic_protect         ; rax = Handshake packet length
+    call linnea_quic_protect         ; rax = protected Handshake packet length
     add rsp, 16
-    ; send the coalesced datagram
-    mov rdx, [s_ini_len]
-    add rdx, rax                     ; total datagram length
+    ; datagram = Initial + this packet for the first chunk, else just this packet
+    cmp qword [s_hs_off], 0
+    jne .hs_send
+    add rax, [s_ini_len]
+.hs_send:
+    mov rdx, rax                     ; datagram length
     mov eax, SYS_SENDTO
     mov edi, r12d
     lea rsi, [outpkt]
@@ -429,6 +467,13 @@ linnea_quic_server_datagram:
     CONNLEA r8, peer
     CONNGET r9, peer_len
     syscall
+    ; advance to the next chunk
+    mov rax, [s_hs_chunk]
+    add [s_hs_off], rax
+    inc qword [s_hs_pn]
+    mov rax, [s_hs_off]
+    cmp rax, [s_hsmsg_len]
+    jb .hs_flight
     ; save the transcript through the server Finished; the client's Finished
     ; MAC covers exactly this (H(CH || SH || EE || Cert || CertVerify || Fin)).
     lea rsi, [hsmsg]
@@ -944,7 +989,8 @@ linnea_quic_server_datagram:
     ret
 
 ; .build_hs_header -> rcx = header length; type Handshake, no token; the length
-; field = pn(1)+r15(payload)+tag(16), packet number 0.
+; field = pn(1)+r15(payload)+tag(16). The 1-byte packet number is s_hs_pn (the
+; flight never spans more than a handful of packets, so it never exceeds 0xff).
 .build_hs_header:
     mov byte [hdr], 0xe0             ; long, Handshake, 1-byte pn
     mov dword [hdr + 1], 0x01000000
@@ -964,7 +1010,8 @@ linnea_quic_server_datagram:
     call linnea_quic_varint_encode   ; writes at rdi, rax = varint bytes
     pop rdi
     add rdi, rax                     ; past the length varint
-    mov byte [rdi], 0x00             ; packet number 0
+    mov al, [s_hs_pn]
+    mov [rdi], al                    ; 1-byte packet number
     lea rcx, [rdi + 1]
     lea rax, [hdr]
     sub rcx, rax
