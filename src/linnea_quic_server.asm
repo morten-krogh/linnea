@@ -132,6 +132,8 @@ s_sdata:     resq 1                   ; that stream's data pointer
 s_slen:      resq 1                   ; and length
 s_soff:      resq 1                   ; and offset (0 = the stream's first bytes)
 s_sfin:      resq 1                   ; and whether its FIN bit is set
+s_body_ptr:  resq 1                   ; request body captured by read_headers
+s_body_len:  resq 1
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 ch_out:      resb linnea_quic_ch_size
@@ -627,9 +629,11 @@ linnea_quic_server_datagram:
     mov rdi, [s_sdata]
     mov rsi, [s_slen]
     lea rdx, [req]
-    call linnea_h3_read_headers
+    call linnea_h3_read_headers      ; r8 = body ptr, r9 = body len on success
     test rax, rax
     jnz .stream_scan                 ; not a complete request on this stream
+    mov [s_body_ptr], r8             ; keep the body across the response build
+    mov [s_body_len], r9
     ; record it for a graceful GOAWAY: a drain rejects streams past this one, so
     ; the client knows exactly what it must retry elsewhere
     mov rax, [cur_conn]
@@ -660,6 +664,8 @@ linnea_quic_server_datagram:
     lea rdi, [req]
     mov rsi, [s_docroot_ptr]
     mov rdx, [s_docroot_len]
+    mov r8, [s_body_ptr]             ; the request body, for a POST echo
+    mov r9, [s_body_len]
     call linnea_h3_serve             ; rax = h3 response length
     lea rdx, [rax + rbx]             ; STREAM frame length
     lea rsi, [strm_pay]

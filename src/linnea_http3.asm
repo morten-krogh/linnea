@@ -38,21 +38,33 @@ h3_path_buf: resb 4096                ; root ++ decoded path ++ NUL
 
 section .text
 
-; linnea_h3_read_headers(rdi=stream, rsi=len, rdx=req) -> rax = 0 | -err.
-; Each frame is varint(type) varint(length) payload. Skip DATA and unknown
-; frames; decode the first HEADERS frame's field section into req via QPACK.
+; linnea_h3_read_headers(rdi=stream, rsi=len, rdx=req)
+;   -> rax = 0 | -err, and on success r8 = request-body ptr, r9 = body length
+;   (0 if none). Each frame is varint(type) varint(length) payload. Decode the
+;   first HEADERS frame's field section into req via QPACK, and capture the first
+;   DATA frame after it as the body (r8/r9 point into the stream — the body is
+;   not copied). DATA before HEADERS, and any other frame type, are skipped. Only
+;   a single DATA frame within these stream bytes is captured: a body split
+;   across DATA frames or QUIC packets is not reassembled.
+; Body ptr/len live in stack locals [rsp]/[rsp+8] during the walk (all callee-
+; saved registers are already in use) and move to r8/r9 at return.
 linnea_h3_read_headers:
     push rbx
     push r12
     push r13
     push r14
-    push r15                         ; alignment (unused)
+    push r15
+    push rbp
+    sub rsp, 24                      ; [rsp]=body ptr, [rsp+8]=body len (16-aligned)
     mov r14, rdx                     ; req
     mov r12, rdi                     ; cursor
     lea r13, [rdi + rsi]             ; end
+    xor r15d, r15d                   ; HEADERS seen yet?
+    mov qword [rsp], 0               ; body ptr
+    mov qword [rsp + 8], 0           ; body len
 .frame:
     cmp r12, r13
-    jae .noheaders
+    jae .done
     ; frame type (varint_decode takes rdi=cursor, rsi=end)
     mov rdi, r12
     mov rsi, r13
@@ -75,13 +87,36 @@ linnea_h3_read_headers:
     ja .err
     cmp rbx, LINNEA_H3_FRAME_HEADERS
     je .headers
-    add r12, rax                     ; skip this frame's payload
+    cmp rbx, LINNEA_H3_FRAME_DATA
+    je .data
+    add r12, rax                     ; skip any other frame's payload
     jmp .frame
 .headers:
     mov rdi, r12                     ; QPACK field section
     mov rsi, rax
     mov rdx, r14
+    mov rbp, rax                     ; keep the field-section length
     call linnea_qpack_decode         ; returns 0 | -err
+    test rax, rax
+    js .ret                          ; propagate a decode error
+    mov r15d, 1                      ; HEADERS decoded
+    add r12, rbp                     ; past the field section
+    jmp .frame
+.data:
+    ; capture the first DATA frame after HEADERS as the request body
+    test r15d, r15d
+    jz .data_skip                    ; DATA before HEADERS: not a body, skip it
+    cmp qword [rsp], 0
+    jne .data_skip                   ; a body is already captured
+    mov [rsp], r12                   ; body ptr
+    mov [rsp + 8], rax               ; body len
+.data_skip:
+    add r12, rax
+    jmp .frame
+.done:
+    test r15d, r15d
+    jz .noheaders
+    xor eax, eax                     ; a complete request
     jmp .ret
 .noheaders:
     mov rax, -LINNEA_H3_ERR_NOHEADERS
@@ -89,6 +124,10 @@ linnea_h3_read_headers:
 .err:
     mov rax, -LINNEA_H3_ERR
 .ret:
+    mov r8, [rsp]                    ; body ptr / len out (0 if none)
+    mov r9, [rsp + 8]
+    add rsp, 24
+    pop rbp
     pop r15
     pop r14
     pop r13
@@ -166,11 +205,12 @@ linnea_h3_build_response:
     pop rbx
     ret
 
-; linnea_h3_serve(rdi=req, rsi=root ptr, rdx=root len, rcx=out)
-;   -> rax = response length written to out.
-; Resolves the request's :path under root and serves that file with its MIME
-; type, or a 404 / 400 response. The path normalizer, opener and MIME table are
-; the shared ones, so h3 and h2 resolve and reject paths identically.
+; linnea_h3_serve(rdi=req, rsi=root ptr, rdx=root len, rcx=out, r8=body ptr,
+;   r9=body len) -> rax = response length written to out.
+; A POST echoes its request body (200 text/plain). Otherwise resolves the
+; request's :path under root and serves that file with its MIME type, or a
+; 404 / 400 response. The path normalizer, opener and MIME table are the shared
+; ones, so h3 and h2 resolve and reject paths identically.
 linnea_h3_serve:
     push rbx
     push r12
@@ -181,6 +221,21 @@ linnea_h3_serve:
     sub rsp, 8                       ; keep rsp 16-aligned for the calls
     mov rbx, rdi                     ; req
     mov r12, rcx                     ; out
+    ; a POST echoes its request body back (r8/r9) — the observable proof that
+    ; DATA frames are captured. GET/HEAD (and other methods) fall through to the
+    ; static file path, which ignores any body.
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    cmp qword [rbx + linnea_h2_req.method_len], 4
+    jne .not_post
+    cmp dword [rdi], 0x54534f50      ; "POST", little-endian
+    jne .not_post
+    mov rdi, r12                     ; echo: 200 text/plain, body = r8/r9 (unchanged)
+    mov esi, 200
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    call linnea_h3_build_response
+    jmp .sret
+.not_post:
     ; path buffer = root ++ (decoded path)
     lea rdi, [h3_path_buf]
     mov rcx, rdx                     ; root length (rsi = root ptr)

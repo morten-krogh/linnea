@@ -351,6 +351,10 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_settings_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): client control stream validated (SETTINGS-first enforced)" $?
 
+    # request bodies: a POST's DATA frames are captured and echoed back intact
+    python3 test/quic/h3_body_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): request body captured and echoed (POST)" $?
+
     # Alt-Svc: the TCP responses advertise HTTP/3 on this port, which is how a
     # browser discovers it at all
     hdrs=$(curl -si --http1.1 --cacert test/tls/server.crt \
