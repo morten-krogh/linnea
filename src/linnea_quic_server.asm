@@ -92,6 +92,21 @@ server_srand: db 0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6a,0x6b,0x6
               db 0x70,0x71,0x72,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x7b,0x7c,0x7d,0x7e,0x7f
 cfin_marker:  db "CFIN-OK", 10
 cfin_marker_len equ $ - cfin_marker
+; The server's unidirectional streams, opened once the handshake completes.
+; RFC 9114 6.2.1 requires each side to open a control stream and send SETTINGS as
+; its first frame. Three LEN-prefixed STREAM frames on the fixed server-initiated
+; uni stream ids 3, 7 and 11 (a server opens no others):
+;   - stream 3, type 0x00 (control): a SETTINGS frame advertising
+;     QPACK_MAX_TABLE_CAPACITY=0 and QPACK_BLOCKED_STREAMS=0 — we keep no dynamic
+;     table, so the peer's encoder must not reference one;
+;   - stream 7, type 0x02 (QPACK encoder) and stream 11, type 0x03 (QPACK
+;     decoder): opened empty, since with a zero table neither ever carries data.
+; This is a constant: the stream ids and settings are the same for every
+; connection, so it is coalesced verbatim into the HANDSHAKE_DONE packet.
+h3_uni_setup: db 0x0a, 0x03, 0x07, 0x00, 0x04, 0x04, 0x01, 0x00, 0x07, 0x00
+              db 0x0a, 0x07, 0x01, 0x02
+              db 0x0a, 0x0b, 0x01, 0x03
+h3_uni_setup_len equ $ - h3_uni_setup
 
 section .bss
 sa:          resb 16
@@ -100,7 +115,7 @@ linnea_quic_rxbuf: resb LINNEA_QUIC_RXBUF_SIZE
 plaintext:   resb 2048
 cur_conn:    resq 1                   ; connection this datagram belongs to
 expfin:      resb 64                  ; expected client Finished message
-onertt_pay:  resb 32                  ; HANDSHAKE_DONE + PADDING
+onertt_pay:  resb 64                  ; ACK + HANDSHAKE_DONE + server uni streams
 onertt_pkt:  resb 4096                ; the protected 1-RTT packet
 strm_pay:    resb 4096                ; STREAM frame carrying the h3 response
 req:         resb linnea_h2_req_size  ; decoded h3 request
@@ -475,27 +490,39 @@ linnea_quic_server_datagram:
     mov ecx, 36
     repe cmpsb
     jne .done
-    ; the client authenticated. Derive the 1-RTT keys (the application traffic
-    ; secrets use the same transcript through the server Finished) and confirm
-    ; the handshake by sending HANDSHAKE_DONE in a short-header 1-RTT packet.
+    ; the client authenticated. Complete the handshake exactly once: a repeated
+    ; client Finished (its HANDSHAKE_DONE was lost) is left to the loss-recovery
+    ; timer, which resends the packet below rather than rebuilding it here.
+    mov rax, [cur_conn]
+    cmp qword [rax + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
+    je .done
+    mov qword [rax + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
+    ; derive the 1-RTT keys (the application traffic secrets use the same
+    ; transcript through the server Finished).
     CONNLEA rdi, hs_sec
     add rdi, 64                      ; handshake secret
     CONNLEA rsi, th_cfin             ; H(CH..server Finished)
     CONNLEA rdx, ap_ckeys
     CONNLEA rcx, ap_skeys
     call linnea_quic_app_secrets
-    ; payload: HANDSHAKE_DONE (0x1e), padded so the HP sample has room
-    lea rdi, [onertt_pay]
-    xor eax, eax
-    mov ecx, 32
-    rep stosb                        ; zero: trailing bytes are PADDING frames
+    ; confirm the handshake and open the server's HTTP/3 streams in one packet:
+    ; ACK, HANDSHAKE_DONE (0x1e), then the control + QPACK stream setup. The
+    ; STREAM frames are LEN-prefixed, so all three self-delimit within the packet.
     lea rdi, [onertt_pay]
     CONNLEA rsi, rx_have
-    call linnea_quic_build_ack
+    call linnea_quic_build_ack       ; rax = ACK length (0 if nothing to ack yet)
     mov rcx, rax
     mov byte [onertt_pay + rcx], 0x1e   ; HANDSHAKE_DONE
+    inc rcx
+    lea rdi, [onertt_pay + rcx]
+    lea rsi, [h3_uni_setup]
+    push rcx
+    mov ecx, h3_uni_setup_len
+    rep movsb                        ; append the fixed control/QPACK stream setup
+    pop rcx
+    add rcx, h3_uni_setup_len
     lea rsi, [onertt_pay]
-    mov edx, 32                      ; padded so the sample has room
+    mov rdx, rcx                     ; total payload length
     call .send_1rtt
     ; announce it
     mov eax, LINNEA_SYS_WRITE

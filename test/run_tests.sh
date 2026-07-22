@@ -341,6 +341,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_rtx_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): a dropped reply is retransmitted after the PTO" $?
 
+    # control streams: the server opens its control stream (SETTINGS first) and
+    # the QPACK encoder/decoder streams once the handshake completes
+    python3 test/quic/h3_control_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): server opens control + QPACK streams with SETTINGS" $?
+
     # Alt-Svc: the TCP responses advertise HTTP/3 on this port, which is how a
     # browser discovers it at all
     hdrs=$(curl -si --http1.1 --cacert test/tls/server.crt \
