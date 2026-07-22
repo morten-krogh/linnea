@@ -12,17 +12,24 @@ default rel
 
 %include "linnea_quic.inc"
 %include "linnea_aesgcm.inc"
+%include "linnea_syscall.inc"
 
 global linnea_quic_initial_secrets
 global linnea_quic_hp_mask
 global linnea_quic_hs_secrets
 global linnea_quic_app_secrets
+global linnea_quic_resumption_psk
+global linnea_quic_ticket_setup
+global linnea_quic_ticket_seal
+global linnea_quic_ticket_open
 
 extern linnea_hkdf_extract
 extern linnea_tls_hkdf_expand_label
 extern linnea_tls_derive_secret
 extern linnea_x25519
 extern linnea_aesgcm_init
+extern linnea_aesgcm_seal
+extern linnea_aesgcm_open
 extern linnea_aes128_ecb
 
 section .rodata
@@ -40,6 +47,9 @@ lbl_c_hs:      db "c hs traffic"
 lbl_s_hs:      db "s hs traffic"
 lbl_c_ap:      db "c ap traffic"
 lbl_s_ap:      db "s ap traffic"
+lbl_res_master: db "res master"
+lbl_resumption: db "resumption"
+q_ticket_nonce: db 0, 0          ; the (fixed) resumption ticket_nonce
 zeros32:       times 32 db 0
 ; SHA-256 of the empty string (Derive-Secret's context for "derived").
 empty_hash:
@@ -330,3 +340,152 @@ linnea_quic_hp_mask:
     pop r13
     pop rbx
     ret
+
+; ===================================================================
+; Session resumption (RFC 8446 4.6.1) — QUIC side. The resumption PSK a
+; ticket carries, and the stateless-ticket sealing that stores it.
+; ===================================================================
+
+; linnea_quic_resumption_psk(rdi=handshake_secret32,
+;   rsi=transcript hash through the CLIENT Finished, rdx=out psk32).
+; master = HKDF-Extract(Derive-Secret(hs,"derived",H("")), zeros); res_master =
+; Derive-Secret(master, "res master", th); psk = Expand-Label(res_master,
+; "resumption", ticket_nonce, 32). The client derives the same PSK from its own
+; transcript, so a ticket carrying this value lets it resume / send 0-RTT.
+linnea_quic_resumption_psk:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 104                     ; [0]derived [32]master [64]res_master (aligns)
+    mov rbx, rdi                     ; handshake secret
+    mov r12, rsi                     ; th through client Finished
+    mov r13, rdx                     ; out psk
+    ; derived = Derive-Secret(hs, "derived", H(""))
+    mov rdi, rbx
+    lea rsi, [lbl_derived]
+    mov edx, 7
+    lea rcx, [empty_hash]
+    lea r8, [rsp]
+    call linnea_tls_derive_secret
+    ; master = HKDF-Extract(derived, zeros32)
+    lea rdi, [rsp]
+    mov esi, 32
+    lea rdx, [zeros32]
+    mov ecx, 32
+    lea r8, [rsp + 32]
+    call linnea_hkdf_extract
+    ; res_master = Derive-Secret(master, "res master", th)
+    lea rdi, [rsp + 32]
+    lea rsi, [lbl_res_master]
+    mov edx, 10
+    mov rcx, r12
+    lea r8, [rsp + 64]
+    call linnea_tls_derive_secret
+    ; psk = Expand-Label(res_master, "resumption", ticket_nonce{0,0}, 32)
+    lea rdi, [rsp + 64]
+    lea rsi, [lbl_resumption]
+    mov edx, 10
+    lea rcx, [q_ticket_nonce]
+    mov r8d, 2
+    mov r9, r13
+    sub rsp, 16
+    mov qword [rsp], 32
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    add rsp, 104
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_ticket_setup() — one stateless-ticket key for the whole run, its
+; AES schedule built here. Called in the master before the workers fork, so every
+; worker seals and opens the same tickets (the key is inherited copy-on-write).
+; Separate from the TLS-over-TCP ticket key: a QUIC session never resumes a TCP
+; one (different transport, different ALPN), so they need not share a key.
+linnea_quic_ticket_setup:
+.again:
+    lea rdi, [q_ticket_key]
+    mov esi, 16
+    xor edx, edx
+    mov eax, LINNEA_SYS_GETRANDOM
+    syscall
+    cmp rax, 16
+    jne .again
+    lea rdi, [q_ticket_ctx]
+    lea rsi, [q_ticket_key]
+    jmp linnea_aesgcm_init
+
+; linnea_quic_ticket_seal(rdi=pt, esi=pt_len, rdx=out) -> rax = sealed length.
+; Writes nonce(12) || AES-GCM(pt) [ct || tag(16)] to out. No AAD.
+linnea_quic_ticket_seal:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi                     ; pt
+    mov r12d, esi                    ; pt_len (zero-extended)
+    mov r13, rdx                     ; out
+    lea rdi, [r13]                   ; nonce -> out[0..11]
+    mov esi, 12
+    xor edx, edx
+    mov eax, LINNEA_SYS_GETRANDOM
+    syscall
+    lea rdi, [q_ticket_ctx]
+    mov rsi, r13                     ; nonce
+    xor edx, edx                     ; aad
+    xor ecx, ecx                     ; aadlen
+    mov r8, rbx                      ; pt
+    mov r9d, r12d                    ; pt_len
+    sub rsp, 16
+    lea rax, [r13 + 12]              ; ct||tag -> out[12..]
+    mov [rsp], rax
+    call linnea_aesgcm_seal
+    add rsp, 16
+    lea rax, [r12 + 28]              ; 12 nonce + pt_len + 16 tag
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_ticket_open(rdi=in, esi=in_len, rdx=out_pt) -> rax = plaintext
+; length, or 0 if the ticket is too short or the tag fails (forged/foreign key).
+linnea_quic_ticket_open:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi                     ; in
+    mov r12d, esi                    ; in_len
+    mov r13, rdx                     ; out_pt
+    cmp r12d, 28                     ; nonce(12) + tag(16)
+    jb .open_fail
+    lea rdi, [q_ticket_ctx]
+    mov rsi, rbx                     ; nonce = in[0..11]
+    xor edx, edx
+    xor ecx, ecx
+    lea r8, [rbx + 12]               ; ct||tag
+    mov r9d, r12d
+    sub r9d, 12                      ; ctlen incl. tag
+    sub rsp, 16
+    mov [rsp], r13                   ; out
+    call linnea_aesgcm_open
+    add rsp, 16
+    test rax, rax
+    jnz .open_fail                   ; bad tag
+    lea rax, [r12 - 28]              ; plaintext length
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.open_fail:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+section .bss
+alignb 16
+q_ticket_key:  resb 16                    ; per-run QUIC stateless-ticket key
+q_ticket_ctx:  resb linnea_aesgcm_ctx_size

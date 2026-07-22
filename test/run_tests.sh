@@ -313,6 +313,21 @@ else
     check "h3 multi-stream test (skipped: deps unavailable)" 0
 fi
 
+# NewSessionTicket over QUIC: after the handshake the server sends a ticket (in a
+# CRYPTO frame coalesced with HANDSHAKE_DONE) carrying the early_data extension
+# with max_early_data_size = 0xffffffff, so the client can resume / send 0-RTT.
+if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
+    timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
+    hspid=$!
+    sleep 0.4
+    python3 test/quic/h3_ticket_test.py 47501 >/dev/null 2>&1
+    check "h3: server issues a NewSessionTicket (early_data for 0-RTT)" $?
+    kill $hspid 2>/dev/null
+    wait $hspid 2>/dev/null
+else
+    check "h3 NewSessionTicket test (skipped: deps unavailable)" 0
+fi
+
 # HTTP/3 through the real server: linnea binds a UDP listener for its TLS
 # server and drives the QUIC handler from the io_uring loop, so h3 is served by
 # the production binary from the config's document root — while TCP keeps
@@ -354,6 +369,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # request bodies: a POST's DATA frames are captured and echoed back intact
     python3 test/quic/h3_body_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): request body captured and echoed (POST)" $?
+
+    # session resumption: the real server issues a NewSessionTicket with the
+    # early_data extension once the handshake completes
+    python3 test/quic/h3_ticket_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): server issues a NewSessionTicket (early_data)" $?
 
     # BPF connection-ID steering: a connection survives the client migrating to a
     # fresh source port. Needs CAP_BPF on the binary (a rebuild drops the file

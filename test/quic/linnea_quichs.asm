@@ -14,6 +14,7 @@ global _start
 
 extern linnea_quic_server_init
 extern linnea_quic_server_datagram
+extern linnea_quic_ticket_setup
 extern linnea_quic_rxbuf
 extern linnea_pem_cert_list
 extern linnea_pem_p256_key
@@ -56,6 +57,7 @@ _start:
     lea rcx, [docroot]
     mov r8d, docroot_len
     call linnea_quic_server_init
+    call linnea_quic_ticket_setup    ; session-ticket key for the NewSessionTicket
     ; udp socket bound to 127.0.0.1:47501
     mov eax, LINNEA_SYS_SOCKET
     mov edi, LINNEA_AF_INET

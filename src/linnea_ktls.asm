@@ -31,6 +31,7 @@ extern linnea_file_unmap
 extern linnea_pem_cert_list
 extern linnea_pem_p256_key
 extern linnea_tls_ticket_setup
+extern linnea_quic_ticket_setup
 extern linnea_p256_scalar_is_valid
 extern linnea_tls_hkdf_expand_label
 extern linnea_error_exit
@@ -94,6 +95,9 @@ linnea_tls_setup:
     ; master before the workers fork so every worker resumes every
     ; worker's sessions (the key is inherited copy-on-write).
     call linnea_tls_ticket_setup
+    ; the QUIC session-ticket key shares the same pre-fork lifetime (its own key,
+    ; since a QUIC session never resumes a TCP one)
+    call linnea_quic_ticket_setup
 
     ; load each TLS server's cert and key
     xor r12d, r12d

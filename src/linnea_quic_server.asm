@@ -77,9 +77,12 @@ extern linnea_quic_conn_free
 extern linnea_quic_varint_encode
 extern linnea_quic_varint_decode
 extern linnea_x25519
+extern linnea_sha256
 extern linnea_sha256_init
 extern linnea_sha256_update
 extern linnea_sha256_final
+extern linnea_quic_resumption_psk
+extern linnea_quic_ticket_seal
 
 section .rodata
 altsvc_pre:  db 'h3=":'
@@ -116,7 +119,7 @@ linnea_quic_rxbuf: resb LINNEA_QUIC_RXBUF_SIZE
 plaintext:   resb 2048
 cur_conn:    resq 1                   ; connection this datagram belongs to
 expfin:      resb 64                  ; expected client Finished message
-onertt_pay:  resb 64                  ; ACK + HANDSHAKE_DONE + server uni streams
+onertt_pay:  resb 256                 ; ACK + HANDSHAKE_DONE + uni streams + NST CRYPTO
 onertt_pkt:  resb 4096                ; the protected 1-RTT packet
 strm_pay:    resb 4096                ; STREAM frame carrying the h3 response
 req:         resb linnea_h2_req_size  ; decoded h3 request
@@ -170,6 +173,12 @@ s_acklen:      resq 1
 s_docroot_ptr: resq 1
 s_docroot_len: resq 1
 ack_ranges:    resb LINNEA_QUIC_ACK_MAXR * 16   ; decoded [smallest,largest] pairs
+; NewSessionTicket scratch (issued at handshake completion, see .append_nst)
+s_pay_len:   resq 1              ; 1-RTT payload length saved across .append_nst
+q_sni32:     resb 32             ; SHA-256(SNI), of which 8 bytes seed the ticket
+q_nst_ts:    resb 16             ; timespec for the ticket's issued time
+q_nst_pt:    resb 48             ; ticket plaintext: psk || issued || sni_hash
+q_nst_msg:   resb 128            ; the NewSessionTicket handshake message
 
 section .text
 
@@ -462,6 +471,52 @@ linnea_quic_server_datagram:
     CONNLEA rdi, th_cfin
     mov ecx, 32
     rep movsb
+    ; --- resumption: derive the ticket PSK now, while the transcript scratch is
+    ; still fresh. The client's Finished is deterministic (HMAC(finished_key(c_hs),
+    ; th_cfin)) so we build the same message, extend the transcript through it, and
+    ; derive the resumption PSK. The NewSessionTicket that carries it goes out at
+    ; handshake completion — a later datagram, by when sh_buf/hsmsg are overwritten,
+    ; so the PSK (and the SNI hash binding the ticket) are stashed in the connection.
+    mov rbx, [cur_conn]
+    lea rdi, [expfin]                     ; expected client Finished (36 bytes)
+    lea rsi, [rbx + linnea_quic_conn.hs_sec]           ; c_hs (offset 0)
+    lea rdx, [rbx + linnea_quic_conn.th_cfin]
+    call linnea_quic_build_finished
+    lea rdi, [shactx]                     ; th_cfin_client = H(CH||SH||EE..Fin||cFin)
+    call linnea_sha256_init
+    lea rdi, [shactx]
+    mov rsi, [s_ch_ptr]
+    mov rdx, [s_ch_len]
+    call linnea_sha256_update
+    lea rdi, [shactx]
+    lea rsi, [sh_buf]
+    mov edx, 90
+    call linnea_sha256_update
+    lea rdi, [shactx]
+    lea rsi, [hsmsg]
+    mov rdx, [s_hsmsg_len]
+    call linnea_sha256_update
+    lea rdi, [shactx]
+    lea rsi, [expfin]
+    mov edx, 36
+    call linnea_sha256_update
+    lea rdi, [shactx]
+    lea rsi, [th_buf]
+    call linnea_sha256_final
+    mov rbx, [cur_conn]
+    lea rdi, [rbx + linnea_quic_conn.hs_sec]
+    add rdi, 64                           ; handshake_secret
+    lea rsi, [th_buf]
+    lea rdx, [rbx + linnea_quic_conn.resumption_psk]
+    call linnea_quic_resumption_psk
+    ; sni_hash8 = SHA-256(server_name)[0..7], binding the ticket to the SNI
+    mov rdi, [ch_out + linnea_quic_ch.sni_ptr]
+    mov rsi, [ch_out + linnea_quic_ch.sni_len]
+    lea rdx, [q_sni32]
+    call linnea_sha256
+    mov rax, [q_sni32]
+    mov rbx, [cur_conn]
+    mov [rbx + linnea_quic_conn.sni_hash], rax
     ; the flight is out: leave ST_NEW so a retransmitted ClientHello is recognized
     ; as a duplicate (above) rather than rebuilding the flight with fresh keys.
     mov rax, [cur_conn]
@@ -579,6 +634,13 @@ linnea_quic_server_datagram:
     rep movsb                        ; append the fixed control/QPACK stream setup
     pop rcx
     add rcx, h3_uni_setup_len
+    ; append a NewSessionTicket (post-handshake CRYPTO frame, RFC 9001 4.1.3) so
+    ; the client can resume and, once 0-RTT lands, send early data next time.
+    mov [s_pay_len], rcx
+    lea rdi, [onertt_pay + rcx]
+    call .append_nst                 ; rax = CRYPTO(NST) frame length
+    mov rcx, [s_pay_len]
+    add rcx, rax
     lea rsi, [onertt_pay]
     mov rdx, rcx                     ; total payload length
     call .send_1rtt
@@ -1193,6 +1255,71 @@ linnea_quic_server_datagram:
     pop r15
     pop r14
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; .append_nst(rdi=dest) -> rax = bytes written. Seals the connection's resumption
+; PSK into a stateless ticket, frames a NewSessionTicket (RFC 8446 4.6.1) carrying
+; the QUIC early_data extension (max_early_data_size = 0xffffffff, the value QUIC
+; requires — RFC 9001 4.6.1), and wraps it in a CRYPTO frame at offset 0. The
+; message is a fixed 103 bytes (ticket 76 + early_data ext 8), so the frame header
+; is constant too. The connection is [cur_conn].
+.append_nst:
+    push rbx
+    push r12
+    push r14
+    mov r14, rdi                     ; dest
+    mov rbx, [cur_conn]
+    ; ticket plaintext = psk(32) || issued(8) || sni_hash(8)
+    lea rdi, [q_nst_pt]
+    lea rsi, [rbx + linnea_quic_conn.resumption_psk]
+    mov ecx, 32
+    rep movsb
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    xor edi, edi                     ; CLOCK_REALTIME
+    lea rsi, [q_nst_ts]
+    syscall
+    mov rax, [q_nst_ts]              ; tv_sec
+    mov [q_nst_pt + 32], rax
+    mov rax, [rbx + linnea_quic_conn.sni_hash]
+    mov [q_nst_pt + 40], rax
+    ; ticket = nonce(12) || GCM-seal(plaintext48) -> NST body's ticket field
+    lea rdi, [q_nst_pt]
+    mov esi, 48
+    lea rdx, [q_nst_msg + 17]
+    call linnea_quic_ticket_seal     ; writes 76 bytes at q_nst_msg+17
+    ; NewSessionTicket message fields
+    mov byte [q_nst_msg], 0x04       ; type new_session_ticket
+    mov byte [q_nst_msg + 1], 0
+    mov word [q_nst_msg + 2], 0x6300 ; body length 99, big-endian
+    mov eax, 86400                   ; ticket_lifetime seconds (1 day)
+    bswap eax
+    mov [q_nst_msg + 4], eax         ; ticket_lifetime, big-endian
+    lea rdi, [q_nst_msg + 8]         ; ticket_age_add: 4 random bytes
+    mov esi, 4
+    xor edx, edx
+    mov eax, LINNEA_SYS_GETRANDOM
+    syscall
+    mov byte [q_nst_msg + 12], 2     ; ticket_nonce length
+    mov word [q_nst_msg + 13], 0     ; the nonce {0,0}
+    mov word [q_nst_msg + 15], 0x4c00   ; ticket length 76, big-endian
+    ; ticket bytes already sealed into [17..92]
+    mov word [q_nst_msg + 93], 0x0800   ; extensions length 8, big-endian
+    mov word [q_nst_msg + 95], 0x2a00   ; extension early_data (0x002a), big-endian
+    mov word [q_nst_msg + 97], 0x0400   ; extension length 4, big-endian
+    mov dword [q_nst_msg + 99], 0xffffffff  ; max_early_data_size (QUIC: 0xffffffff)
+    ; CRYPTO frame: type 0x06, offset varint(0), length varint(103), then the 103
+    ; message bytes. 103 needs a 2-byte varint (0x4067).
+    mov byte [r14], 0x06
+    mov byte [r14 + 1], 0x00         ; offset 0
+    mov word [r14 + 2], 0x6740       ; length varint(103) = bytes 0x40, 0x67
+    lea rdi, [r14 + 4]
+    lea rsi, [q_nst_msg]
+    mov ecx, 103
+    rep movsb
+    mov eax, 107                     ; 4-byte frame header + 103-byte message
+    pop r14
     pop r12
     pop rbx
     ret

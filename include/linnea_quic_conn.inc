@@ -95,6 +95,13 @@ struc linnea_quic_conn
     .peer:       resb 16                     ; sockaddr_in of the client
     .hs_sec:     resb 96             ; c_hs || s_hs || handshake_secret
     .th_cfin:    resb 32             ; H(CH..server Finished)
+    ; Session resumption (RFC 8446 4.6.1): the PSK a NewSessionTicket will carry,
+    ; derived at ClientHello time (while the transcript inputs are still in scratch)
+    ; and sealed into the ticket at handshake completion — a later datagram, by when
+    ; that scratch is gone. sni_hash ties the ticket to the server_name it was
+    ; issued under, matched on resumption.
+    .resumption_psk: resb 32
+    .sni_hash:   resb 8
     .ini_client: resb linnea_quic_keys_size
     .ini_server: resb linnea_quic_keys_size
     .hs_ckeys:   resb linnea_quic_keys_size
