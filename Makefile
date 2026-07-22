@@ -206,6 +206,22 @@ $(RTXTEST_BIN): $(RTXTEST_OBJS)
 rtxtest: $(RTXTEST_BIN)
 	./$(RTXTEST_BIN)
 
+# --- 0-RTT anti-replay strike-register unit test ---
+REPLAYTEST_BIN  = bin/linnea-replaytest
+REPLAYTEST_OBJS = test/quic/linnea_replaytest.o src/linnea_quic_crypto.o \
+                  src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
+                  src/linnea_x25519.o src/linnea_fe25519.o src/linnea_print.o \
+                  src/linnea_string.o $(QUICP256)
+
+test/quic/linnea_replaytest.o: test/quic/linnea_replaytest.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(REPLAYTEST_BIN): $(REPLAYTEST_OBJS)
+	$(LD) -o $@ $^
+
+replaytest: $(REPLAYTEST_BIN)
+	./$(REPLAYTEST_BIN)
+
 # --- test-only: QUIC connection pool (allocation, exhaustion, idle sweep) ---
 POOLTEST_BIN  = bin/linnea-pooltest
 POOLTEST_OBJS = test/quic/linnea_pooltest.o src/linnea_quic_conn.o \
@@ -271,7 +287,7 @@ clean:
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
       bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs $(QPACKTEST_BIN) \
-      $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN) $(RTXTEST_BIN)
+      $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN) $(RTXTEST_BIN) $(REPLAYTEST_BIN)
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd

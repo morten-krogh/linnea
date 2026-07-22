@@ -258,6 +258,16 @@ else
     check "quic loss-recovery selftest (skipped: binary unavailable)" 0
 fi
 
+# 0-RTT anti-replay: the strike register accepts a fresh binder, rejects a replay
+# within the window, reuses expired slots, and fails closed when full.
+if [ -x ./bin/linnea-replaytest ]; then
+    out=$(./bin/linnea-replaytest)
+    rc=$?
+    check "quic 0-RTT anti-replay selftest ($out)" $rc
+else
+    check "quic 0-RTT anti-replay selftest (skipped: binary unavailable)" 0
+fi
+
 # QPACK decode: field sections encoded by pylsqpack (static + literals + Huffman,
 # zero dynamic table) decode to the right HTTP/3 request pseudo-headers.
 if python3 -c 'import pylsqpack' 2>/dev/null && [ -x ./bin/linnea-qpacktest ]; then

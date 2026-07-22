@@ -85,8 +85,10 @@ extern linnea_quic_resumption_psk
 extern linnea_quic_ticket_seal
 extern linnea_quic_ticket_resume
 extern linnea_quic_early_keys
+extern linnea_quic_replay_check
 extern linnea_quic_hs_psk
 extern linnea_quic_early_ok
+extern linnea_quic_resume_issued
 
 section .rodata
 altsvc_pre:  db 'h3=":'
@@ -181,6 +183,7 @@ ack_ranges:    resb LINNEA_QUIC_ACK_MAXR * 16   ; decoded [smallest,largest] pai
 s_pay_len:   resq 1              ; 1-RTT payload length saved across .append_nst
 s_sh_len:    resq 1              ; ServerHello length (90 fresh, 96 with the PSK ext)
 s_dgram_len: resq 1              ; this datagram's length (r13 may not survive to .early_walk)
+s_now_sec:   resq 1              ; CLOCK_REALTIME seconds, for the 0-RTT replay window
 s_resume_psk: resb 32           ; PSK recovered from an accepted resumption ticket
 q_sni32:     resb 32             ; SHA-256(SNI), of which 8 bytes seed the ticket
 q_nst_ts:    resb 16             ; timespec for the ticket's issued time
@@ -392,10 +395,26 @@ linnea_quic_server_datagram:
     jz .no_resume
     lea rax, [s_resume_psk]
     mov [linnea_quic_hs_psk], rax             ; resumed: seed the key schedule
-    ; accept 0-RTT if the client also offered early_data — the EE will echo it and
-    ; we decrypt the coalesced 0-RTT packet below (.early_walk)
+    ; accept 0-RTT if the client also offered early_data. First defend against
+    ; replay (RFC 9001 9.2): only within a freshness window (so the strike register
+    ; need remember a binder for a bounded time), and reject a binder seen before.
+    ; A rejection here still resumes — just without early data (1-RTT).
     cmp qword [ch_out + linnea_quic_ch.early_data], 0
     je .no_resume
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    xor edi, edi                             ; CLOCK_REALTIME
+    lea rsi, [q_nst_ts]
+    syscall
+    mov rax, [q_nst_ts]                       ; now (seconds)
+    mov [s_now_sec], rax
+    sub rax, [linnea_quic_resume_issued]      ; ticket age
+    cmp rax, LINNEA_QUIC_REPLAY_WINDOW
+    ja .no_resume                             ; too old for 0-RTT (underflow -> huge -> reject)
+    mov rdi, [ch_out + linnea_quic_ch.psk_binder_ptr]
+    mov esi, [s_now_sec]
+    call linnea_quic_replay_check
+    test rax, rax
+    jz .no_resume                             ; replayed binder or register full
     mov qword [linnea_quic_early_ok], 1
 .no_resume:
     ; fresh ephemeral key + ServerHello random for this handshake. server_priv

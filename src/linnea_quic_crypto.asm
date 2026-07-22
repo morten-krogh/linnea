@@ -24,8 +24,10 @@ global linnea_quic_ticket_seal
 global linnea_quic_ticket_open
 global linnea_quic_ticket_resume
 global linnea_quic_early_keys
+global linnea_quic_replay_check
 global linnea_quic_hs_psk
 global linnea_quic_early_ok
+global linnea_quic_resume_issued
 
 extern linnea_hkdf_extract
 extern linnea_tls_hkdf_expand_label
@@ -599,11 +601,14 @@ linnea_quic_ticket_resume:
     call quic_ct_eq32
     test eax, eax
     jz .rs_rej
-    ; accepted: hand the recovered PSK back for the key schedule
+    ; accepted: hand the recovered PSK back for the key schedule, and publish the
+    ; ticket's issued time (for the 0-RTT freshness / replay window)
     mov rdi, [rsp + RS_OUT]
     lea rsi, [rsp + RS_PT]
     mov ecx, 32
     rep movsb
+    mov rax, [rsp + RS_PT + 32]
+    mov [linnea_quic_resume_issued], rax
     mov eax, 1
     jmp .rs_done
 .rs_rej:
@@ -654,9 +659,57 @@ linnea_quic_early_keys:
     pop rbx
     ret
 
+; linnea_quic_replay_check(rdi=binder(32), esi=now seconds) -> rax = 1 if this
+; 0-RTT is fresh (recorded), 0 if it is a replay or the register is full.
+; 0-RTT is replayable (RFC 9001 9.2): an attacker can resend a captured early
+; flight. This per-worker strike register rejects a binder (a MAC over the
+; ClientHello, so unique to the flight) seen within the replay window. It is
+; best-effort across workers — a replay steered to another worker by a changed
+; 4-tuple is not caught — but linnea serves only idempotent GET/HEAD over 0-RTT,
+; so a replayed early request has no side effect. Fails closed when full.
+%define STRIKE_N 512                      ; entries: key(8) || expiry(8)
+linnea_quic_replay_check:
+    mov rax, [rdi]                        ; key = first 8 bytes of the binder
+    mov r8d, esi                          ; now
+    lea rcx, [strike_reg]
+    xor edx, edx                          ; index
+    mov r9, -1                            ; first free slot (-1 = none yet)
+.sr_loop:
+    mov r10, [rcx]                        ; entry key
+    mov r11, [rcx + 8]                    ; entry expiry
+    cmp r11, r8
+    jbe .sr_free                          ; expired/empty slot
+    cmp r10, rax
+    je .sr_reject                         ; live entry, same binder -> replay
+    jmp .sr_next
+.sr_free:
+    cmp r9, -1
+    jne .sr_next
+    mov r9, rdx                           ; remember the first reusable slot
+.sr_next:
+    add rcx, 16
+    inc edx
+    cmp edx, STRIKE_N
+    jb .sr_loop
+    cmp r9, -1
+    je .sr_reject                         ; register full of live entries: fail closed
+    lea rcx, [strike_reg]
+    shl r9, 4
+    add rcx, r9
+    mov [rcx], rax                        ; record the binder
+    lea r11, [r8 + LINNEA_QUIC_REPLAY_WINDOW]
+    mov [rcx + 8], r11                    ; expiry = now + window
+    mov eax, 1
+    ret
+.sr_reject:
+    xor eax, eax
+    ret
+
 section .bss
 alignb 16
 q_ticket_key:  resb 16                    ; per-run QUIC stateless-ticket key
 q_ticket_ctx:  resb linnea_aesgcm_ctx_size
 linnea_quic_hs_psk: resq 1                ; resumption PSK ptr for hs_secrets, 0 = fresh
 linnea_quic_early_ok: resq 1              ; 1 when 0-RTT is accepted (drives EE early_data)
+linnea_quic_resume_issued: resq 1         ; accepted ticket's issued time (0-RTT freshness)
+strike_reg:    resb STRIKE_N * 16         ; 0-RTT replay strike register (per worker)

@@ -9,6 +9,11 @@ endstruc
 
 LINNEA_QUIC_MAX_CID   equ 20      ; RFC 9000: connection IDs are 0..20 bytes
 
+; 0-RTT is accepted only for a ticket issued within this many seconds, which
+; bounds how long the replay strike register must remember a binder (RFC 9001
+; 9.2). A resuming client past the window still resumes — just at 1-RTT.
+LINNEA_QUIC_REPLAY_WINDOW equ 10
+
 ; The pieces of a ClientHello the QUIC handshake needs.
 struc linnea_quic_ch
     .sni_ptr:  resq 1      ; server_name (host_name), 0 = none
