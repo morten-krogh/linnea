@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-# Large certificate chain over HTTP/3. A real chain (leaf + intermediates) makes
-# the server's handshake flight far larger than one datagram. QUIC forbids IP
-# fragmentation, so linnea must split the Certificate CRYPTO across several
-# Handshake packets, each in its own <=MTU datagram (RFC 9000 s14.1). This test
-# drives aioquic against a config whose chain is four certificates (~2.9 KB of
-# TLS handshake), captures every datagram the server sends, and checks:
-#   * the handshake completes (the client reassembled the split CRYPTO stream),
-#   * the flight really was segmented (more than one substantial datagram), and
-#   * no datagram exceeds the 1200-byte floor every QUIC endpoint must accept.
+# Large certificate chain over HTTP/3, with anti-amplification. A real chain
+# (leaf + intermediates) makes the server's handshake flight far larger than one
+# datagram AND larger than the 3x anti-amplification budget (RFC 9000 s8.1). So
+# linnea must both (a) split the Certificate CRYPTO across several <=MTU Handshake
+# packets, and (b) send no more than 3x the bytes received until the client's
+# address is validated, releasing the withheld tail once the client's first
+# Handshake packet proves it is really there.
+#
+# The test drives aioquic against a six-cert config (~4.5 KB of TLS handshake)
+# and checks, in order:
+#   * the server's first burst (before we answer at all) stays within 3x what we
+#     sent — the amplification limit is enforced;
+#   * no datagram exceeds the 1200-byte floor every QUIC endpoint must accept;
+#   * once we answer (validating our address) the handshake completes — so the
+#     withheld tail was resumed — and the total the server sent exceeds 3x, which
+#     it could only do after validation.
 # Then it issues a GET to confirm the connection is fully usable afterwards.
 # Usage: h3_bigcert_test.py <port>
 import socket
@@ -30,8 +37,35 @@ cfg.server_name = "localhost"
 conn = QuicConnection(configuration=cfg)
 conn.connect(addr, now=0.0)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(2)
+s.settimeout(0.6)
 
+# Send the client Initial and note exactly how many bytes we sent: the server's
+# budget is three times this until it validates our address.
+client_sent = 0
+for d, _ in conn.datagrams_to_send(now=0.0):
+    s.sendto(d, addr)
+    client_sent += len(d)
+
+# Drain the server's first burst WITHOUT feeding aioquic and WITHOUT replying, so
+# the server has no proof of our address and must stop at the amplification limit.
+burst = []
+while True:
+    try:
+        r, _ = s.recvfrom(4096)
+    except socket.timeout:
+        break
+    burst.append(r)
+
+assert burst, "server sent nothing"
+server_burst = sum(len(r) for r in burst)
+assert server_burst <= 3 * client_sent, \
+    f"amplification: server sent {server_burst} > 3x{client_sent} before validation"
+assert max(len(r) for r in burst) <= MTU_FLOOR, \
+    f"datagram over the {MTU_FLOOR} floor: {[len(r) for r in burst]}"
+assert len(burst) >= 2, f"flight not segmented: {[len(r) for r in burst]}"
+
+# Now feed the burst and answer. Our ACK validates the address, so the server
+# releases the part of the flight it held back and the handshake can complete.
 now = [0.0]
 
 
@@ -41,31 +75,27 @@ def flush():
         s.sendto(d, addr)
 
 
-flush()                          # the client Initial (ClientHello), padded to 1200
+for r in burst:
+    now[0] += 0.05
+    conn.receive_datagram(r, addr, now=now[0])
+flush()
 
-# Drain the server's handshake flight. With a real chain it arrives as several
-# datagrams; feed each to aioquic (which reassembles the CRYPTO stream) and keep
-# flushing so the client Finished goes out once the whole chain has landed.
-sizes = []
+server_total = server_burst
 while not conn._handshake_confirmed:
     try:
         r, _ = s.recvfrom(4096)
     except socket.timeout:
         break
-    sizes.append(len(r))
+    server_total += len(r)
     now[0] += 0.05
     conn.receive_datagram(r, addr, now=now[0])
     flush()
 
-assert conn._handshake_confirmed, f"handshake not confirmed; server datagrams={sizes}"
-
-# The flight must have been split: a single ~3 KB datagram would mean linnea did
-# not segment (and would be dropped on a real 1500-MTU path).
-big = [n for n in sizes if n > 200]
-assert len(big) >= 2, f"flight was not segmented across datagrams: {sizes}"
-
-# And no datagram may exceed the QUIC floor, or a real path would fragment/drop it.
-assert max(sizes) <= MTU_FLOOR, f"datagram over the {MTU_FLOOR} floor: {sizes}"
+assert conn._handshake_confirmed, "handshake did not complete after we validated the address"
+# The full flight is larger than the budget, so completing it required the server
+# to send past 3x — which it may only do once validated. That is the resume.
+assert server_total > 3 * client_sent, \
+    f"server never exceeded the budget ({server_total} <= 3x{client_sent}); resume not exercised"
 
 
 def vlq(n):
@@ -84,7 +114,8 @@ def rvlq(b, i):
     return v, i + k
 
 
-# The connection must be fully usable after the segmented handshake: fetch a file.
+# The connection must be fully usable after the segmented, budget-limited
+# handshake: fetch a file.
 while conn.next_event() is not None:
     pass
 enc = pylsqpack.Encoder()
@@ -97,8 +128,7 @@ conn.send_stream_data(0, vlq(1) + vlq(len(fields)) + fields, end_stream=True)
 flush()
 
 resp = b""
-deadline_reads = 0
-while deadline_reads < 6:
+for _ in range(6):
     try:
         r, _ = s.recvfrom(4096)
     except socket.timeout:
@@ -113,7 +143,6 @@ while deadline_reads < 6:
     flush()
     if resp:
         break
-    deadline_reads += 1
 s.close()
 
 frames = []
@@ -131,4 +160,5 @@ headers = dict(headers)
 assert headers.get(b":status") == b"200", headers
 assert body == open("test/www/hello.txt", "rb").read(), body
 
-print(f"ok (flight in {len(sizes)} datagrams, max {max(sizes)} bytes)")
+print(f"ok (burst {server_burst}B <= 3x{client_sent}, total {server_total}B in "
+      f"{len(burst)}+ datagrams, all <= {MTU_FLOOR}B)")

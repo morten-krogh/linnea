@@ -30,6 +30,7 @@ LINNEA_QUIC_IDLE_SECS equ 30        ; reclaim a slot after this long with no pac
 ; which coalesces the Initial ahead of the Handshake packet — under the 1200-byte
 ; floor every QUIC endpoint must accept (RFC 9000 s14.1).
 LINNEA_QUIC_CRYPTO_CHUNK equ 960    ; max CRYPTO payload per Handshake packet
+LINNEA_QUIC_HS_FLIGHT_MAX equ 8192  ; largest handshake flight we store for resume
 
 ; Handshake progress, so a packet can be checked against the connection's stage.
 LINNEA_QUIC_ST_NEW       equ 0      ; allocated, nothing processed yet
@@ -100,6 +101,18 @@ struc linnea_quic_conn
     .ap_ckeys:   resb linnea_quic_keys_size
     .ap_skeys:   resb linnea_quic_keys_size
     .sent:       resb LINNEA_QUIC_RTX_SLOTS * linnea_quic_sent_size ; loss-recovery ring
+    ; anti-amplification (RFC 9000 s8.1) and the resumable handshake flight. Until
+    ; the peer proves its address, we may send at most 3x the bytes it sent us, so
+    ; a spoofed Initial cannot make us flood a third party. A large certificate
+    ; chain overflows that budget on the first round trip, so the flight is stored
+    ; here and the unsent tail is released once the peer's first Handshake packet
+    ; validates the address (only a client that received our flight can produce it).
+    .amp_credit: resq 1             ; bytes we may still send pre-validation (3xrecv - sent)
+    .amp_valid:  resq 1             ; 1 once the peer's address is validated
+    .flight_len: resq 1             ; total handshake-flight (CRYPTO) bytes
+    .flight_off: resq 1             ; bytes of the flight already sent
+    .flight_pn:  resq 1             ; packet number of the next Handshake packet
+    .flight_buf: resb LINNEA_QUIC_HS_FLIGHT_MAX  ; the flight, kept for resume
     ; request-stream reassembly (one stream at a time):
     .ra_active:  resq 1             ; 1 while a multi-packet request is buffering
     .ra_sid:     resq 1             ; the stream id being reassembled
