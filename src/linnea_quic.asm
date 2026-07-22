@@ -382,9 +382,119 @@ linnea_quic_stream_frame:
     and eax, 0xf8
     cmp eax, 0x08                    ; STREAM (0b00001xxx)
     je .ss_stream
-    jmp .ss_none                     ; any other frame: stop
+    ; A STREAM frame can be coalesced after other frames (a peer commonly bundles
+    ; NEW_CONNECTION_ID, flow-control or path frames ahead of stream data), so
+    ; skip any known frame type rather than stopping (RFC 9000 19).
+    cmp bl, 0x1e                     ; HANDSHAKE_DONE (no payload)
+    je .ss_skip1
+    cmp bl, 0x1a                     ; PATH_CHALLENGE (8 bytes)
+    je .ss_skip8
+    cmp bl, 0x1b                     ; PATH_RESPONSE (8 bytes)
+    je .ss_skip8
+    cmp bl, 0x18                     ; NEW_CONNECTION_ID
+    je .ss_ncid
+    cmp bl, 0x06                     ; CRYPTO (offset, length, data)
+    je .ss_crypto
+    cmp bl, 0x07                     ; NEW_TOKEN (length, token)
+    je .ss_token
+    cmp bl, 0x04                     ; RESET_STREAM (3 varints)
+    je .ss_v3
+    cmp bl, 0x05                     ; STOP_SENDING (2 varints)
+    je .ss_v2
+    cmp bl, 0x11                     ; MAX_STREAM_DATA (2 varints)
+    je .ss_v2
+    cmp bl, 0x15                     ; STREAM_DATA_BLOCKED (2 varints)
+    je .ss_v2
+    cmp bl, 0x10                     ; MAX_DATA (1 varint)
+    je .ss_v1
+    cmp bl, 0x12                     ; MAX_STREAMS bidi (1 varint)
+    je .ss_v1
+    cmp bl, 0x13                     ; MAX_STREAMS uni (1 varint)
+    je .ss_v1
+    cmp bl, 0x14                     ; DATA_BLOCKED (1 varint)
+    je .ss_v1
+    cmp bl, 0x16                     ; STREAMS_BLOCKED bidi (1 varint)
+    je .ss_v1
+    cmp bl, 0x17                     ; STREAMS_BLOCKED uni (1 varint)
+    je .ss_v1
+    cmp bl, 0x19                     ; RETIRE_CONNECTION_ID (1 varint)
+    je .ss_v1
+    jmp .ss_none                     ; a frame we do not recognise: stop
 .ss_skip1:
     inc rdi
+    jmp .ss_scan
+.ss_skip8:
+    add rdi, 9                       ; type byte + 8 fixed bytes
+    jmp .ss_scan
+.ss_v1:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    jmp .ss_scan
+.ss_v2:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    jmp .ss_scan
+.ss_v3:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    jmp .ss_scan
+.ss_token:
+    inc rdi
+    call linnea_quic_varint_decode   ; token length
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    add rdi, rax                      ; skip the token bytes
+    jmp .ss_scan
+.ss_crypto:
+    inc rdi
+    call linnea_quic_varint_decode   ; offset
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; length
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    add rdi, rax                      ; skip the crypto data
+    jmp .ss_scan
+.ss_ncid:
+    inc rdi
+    call linnea_quic_varint_decode   ; sequence number
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; retire prior to
+    test rdx, rdx
+    jz .ss_none
+    add rdi, rdx
+    cmp rdi, rsi
+    jae .ss_none
+    movzx eax, byte [rdi]             ; connection id length
+    add rdi, 1
+    add rdi, rax                      ; skip the connection id
+    add rdi, 16                       ; skip the stateless reset token
     jmp .ss_scan
 .ss_ack:
     inc rdi

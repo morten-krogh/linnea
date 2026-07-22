@@ -35,6 +35,7 @@ section .bss
 fs_buf:   resb 512                    ; encoded response field section
 clen_buf: resb 20                     ; content-length as decimal ASCII
 h3_path_buf: resb 4096                ; root ++ decoded path ++ NUL
+post_receipt: resb 64                 ; "<len> <hash>" for a large POST body
 
 section .text
 
@@ -229,10 +230,49 @@ linnea_h3_serve:
     jne .not_post
     cmp dword [rdi], 0x54534f50      ; "POST", little-endian
     jne .not_post
+    cmp r9, LINNEA_H3_ECHO_MAX
+    ja .post_receipt                 ; too large to echo in one packet: a receipt
     mov rdi, r12                     ; echo: 200 text/plain, body = r8/r9 (unchanged)
     mov esi, 200
     lea rdx, [txt_plain]
     mov ecx, txt_plain_len
+    call linnea_h3_build_response
+    jmp .sret
+.post_receipt:
+    ; The echo would overflow one response packet, so reply with a receipt: the
+    ; body's length and a position-sensitive rolling hash (h = h*31 + byte). Both
+    ; require every byte, in order — proof the multi-packet stream reassembled to
+    ; exactly what was sent, in a response that fits one packet.
+    mov rsi, r8                      ; body ptr
+    mov rcx, r9                      ; body len
+    mov r14, r9                      ; keep the length
+    xor eax, eax                     ; hash accumulator
+    test rcx, rcx
+    jz .pr_hashed
+.pr_hash:
+    imul eax, eax, 31
+    movzx edx, byte [rsi]
+    add eax, edx
+    inc rsi
+    dec rcx
+    jnz .pr_hash
+.pr_hashed:
+    mov r13d, eax                    ; keep the hash (u64_to_dec clobbers r8/r9)
+    lea rdi, [post_receipt]
+    mov rax, r14                     ; length as decimal
+    call u64_to_dec
+    mov byte [rdi], ' '
+    inc rdi
+    mov eax, r13d                    ; hash as decimal
+    call u64_to_dec
+    lea rax, [post_receipt]
+    sub rdi, rax                     ; receipt length
+    mov r9, rdi
+    mov rdi, r12
+    mov esi, 200
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [post_receipt]
     call linnea_h3_build_response
     jmp .sret
 .not_post:

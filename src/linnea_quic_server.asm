@@ -611,10 +611,129 @@ linnea_quic_server_datagram:
     mov [s_sfin], r11                ; FIN flag, for the critical-stream check
     mov rax, r8
     and eax, 3
-    jz .serve_bidi                   ; client bidi stream: an HTTP/3 request
+    jz .client_bidi                  ; client bidi stream: an HTTP/3 request
     cmp eax, 2
     je .client_uni                   ; client uni stream: control / QPACK
     jmp .stream_scan                 ; a server-initiated id (never from a client)
+
+; --- a client bidirectional stream: an HTTP/3 request ---
+; A whole request in one STREAM frame (offset 0 with FIN) takes a copy-free fast
+; path and is served straight from the packet. Anything else — a request whose
+; frames span several packets — is reassembled in the connection's buffer, in
+; offset order, and served only once the stream is complete.
+.client_bidi:
+    mov rax, [cur_conn]
+    cmp qword [rax + linnea_quic_conn.ra_active], 0
+    je .cb_fresh
+    mov rdx, [rax + linnea_quic_conn.ra_sid]
+    cmp rdx, [s_sid]
+    je .ra_route                     ; a frame continuing this stream's reassembly
+.cb_fresh:
+    cmp qword [s_soff], 0
+    jne .ra_route                    ; not at offset 0: earlier bytes came elsewhere
+    cmp qword [s_sfin], 0
+    je .ra_route                     ; no FIN: more frames follow
+    jmp .serve_bidi                  ; the whole request is here: serve it directly
+
+; reassemble the request stream into ra_buf, appending each frame at its offset.
+.ra_route:
+    mov rax, [cur_conn]
+    cmp qword [rax + linnea_quic_conn.ra_active], 0
+    je .ra_start
+    mov rdx, [rax + linnea_quic_conn.ra_sid]
+    cmp rdx, [s_sid]
+    je .ra_have
+    jmp .stream_scan                 ; another stream is mid-reassembly: one at a time
+.ra_start:
+    mov qword [rax + linnea_quic_conn.ra_active], 1
+    mov rdx, [s_sid]
+    mov [rax + linnea_quic_conn.ra_sid], rdx
+    mov qword [rax + linnea_quic_conn.ra_len], 0
+    mov qword [rax + linnea_quic_conn.ra_fin], 0
+    ; clear the seen-map up to the previous run's high-water, then reset it
+    mov rcx, [rax + linnea_quic_conn.ra_hi]
+    lea rdi, [rax + linnea_quic_conn.ra_seen]
+    xor al, al
+    rep stosb
+    mov rax, [cur_conn]
+    mov qword [rax + linnea_quic_conn.ra_hi], 0
+.ra_have:
+    ; place the frame at its offset (out-of-order frames are buffered, not
+    ; dropped) and record the bytes as seen; the contiguous prefix advances below.
+    mov r9, [s_soff]                           ; offset
+    mov r10, [s_slen]                          ; length
+    mov r11, r9
+    add r11, r10                               ; frame end = offset + len
+    cmp r11, LINNEA_QUIC_RA_BUF
+    ja .ra_drop                                ; past the buffer: request too large
+    test r10, r10
+    jz .ra_hi_upd                              ; empty frame (e.g. a lone FIN)
+    lea rdi, [rax + linnea_quic_conn.ra_buf]
+    add rdi, r9                                ; dest = ra_buf + offset
+    mov rsi, [s_sdata]
+    mov rcx, r10
+    rep movsb                                  ; copy the frame's bytes
+    lea rdi, [rax + linnea_quic_conn.ra_seen]
+    add rdi, r9                                ; ra_seen + offset
+    mov rcx, r10
+    mov al, 1
+    rep stosb                                  ; mark those bytes seen
+    mov rax, [cur_conn]                        ; stosb wrote al; restore cur_conn
+.ra_hi_upd:
+    mov r10, [rax + linnea_quic_conn.ra_hi]
+    cmp r11, r10
+    jbe .ra_advance
+    mov [rax + linnea_quic_conn.ra_hi], r11
+    mov r10, r11                               ; r10 = ra_hi
+.ra_advance:
+    ; advance the contiguous prefix while the next byte has been seen
+    mov r8, [rax + linnea_quic_conn.ra_len]
+    lea rdi, [rax + linnea_quic_conn.ra_seen]
+.ra_adv_loop:
+    cmp r8, r10                                ; reached the high-water?
+    jae .ra_adv_done
+    cmp byte [rdi + r8], 0
+    je .ra_adv_done                            ; a gap: stop here
+    inc r8
+    jmp .ra_adv_loop
+.ra_adv_done:
+    mov [rax + linnea_quic_conn.ra_len], r8
+    cmp qword [s_sfin], 0
+    je .ra_donecheck
+    mov qword [rax + linnea_quic_conn.ra_fin], 1
+    mov r10, [s_soff]
+    add r10, [s_slen]
+    mov [rax + linnea_quic_conn.ra_final], r10
+.ra_donecheck:
+    cmp qword [rax + linnea_quic_conn.ra_fin], 0
+    je .ra_more
+    mov r10, [rax + linnea_quic_conn.ra_len]
+    cmp r10, [rax + linnea_quic_conn.ra_final]
+    jb .ra_more                                ; a gap remains before the end
+    ; complete: serve the reassembled request from ra_buf
+    lea r10, [rax + linnea_quic_conn.ra_buf]
+    mov [s_sdata], r10
+    mov r10, [rax + linnea_quic_conn.ra_len]
+    mov [s_slen], r10
+    mov qword [rax + linnea_quic_conn.ra_active], 0
+    jmp .serve_bidi
+.ra_drop:
+    mov qword [rax + linnea_quic_conn.ra_active], 0  ; too large: abandon the stream
+    jmp .stream_scan                           ; do not ack data we cannot buffer
+.ra_more:
+    ; This packet was buffered without a reply, so nothing else acknowledges it.
+    ; Send a bare ACK so the peer keeps sending the rest of the request rather
+    ; than retransmitting what we already hold (emit_1rtt: an ACK is not tracked).
+    lea rdi, [strm_pay]
+    CONNLEA rsi, rx_have
+    call linnea_quic_build_ack
+    test rax, rax
+    jz .stream_scan
+    lea rsi, [strm_pay]
+    mov [s_pl_ptr], rsi
+    mov [s_pl_len], rax
+    call emit_1rtt
+    jmp .stream_scan                           ; waiting for more frames
 .serve_bidi:
     ; zero the request struct and point the QPACK scratch at h3scratch
     lea rdi, [req]

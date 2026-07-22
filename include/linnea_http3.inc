@@ -32,3 +32,7 @@ LINNEA_H3_ERR_CLOSED_CRITICAL  equ 0x0104  ; a critical stream (control/QPACK) c
 ;      and sets .scratch / .scratch_end (as for linnea_qpack_decode).
 LINNEA_H3_ERR          equ 1      ; malformed/truncated frame
 LINNEA_H3_ERR_NOHEADERS equ 2     ; no HEADERS frame in the stream data
+
+; Largest POST body echoed back inline; a larger one (whose echo would not fit
+; one response packet) gets a small receipt — its length and a hash — instead.
+LINNEA_H3_ECHO_MAX     equ 1024

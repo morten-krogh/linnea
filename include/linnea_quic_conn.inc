@@ -42,6 +42,15 @@ LINNEA_QUIC_PTO_MS      equ 250     ; base probe timeout, milliseconds
 LINNEA_QUIC_PTO_CAP     equ 4       ; largest backoff shift (250ms << 4 = 4s)
 LINNEA_QUIC_PTO_MAX     equ 6       ; attempts before a packet is given up on
 
+; A request whose frames span several packets is reassembled in a per-connection
+; buffer: each frame is placed at its offset (out-of-order frames are buffered,
+; not dropped), a parallel byte-map records which bytes have arrived, and the
+; contiguous prefix length advances as gaps fill. The request is served once the
+; stream is complete (FIN seen and the prefix covers it). One reassembly is
+; tracked at a time — a whole request in a single packet (the common case) still
+; takes a copy-free fast path. Requests larger than this buffer are not served.
+LINNEA_QUIC_RA_BUF      equ 8192    ; reassembly capacity for one request stream
+
 struc linnea_quic_sent
     .in_use:   resq 1
     .pn:       resq 1               ; packet number it last went out under
@@ -78,6 +87,15 @@ struc linnea_quic_conn
     .ap_ckeys:   resb linnea_quic_keys_size
     .ap_skeys:   resb linnea_quic_keys_size
     .sent:       resb LINNEA_QUIC_RTX_SLOTS * linnea_quic_sent_size ; loss-recovery ring
+    ; request-stream reassembly (one stream at a time):
+    .ra_active:  resq 1             ; 1 while a multi-packet request is buffering
+    .ra_sid:     resq 1             ; the stream id being reassembled
+    .ra_len:     resq 1             ; contiguous bytes received from offset 0
+    .ra_hi:      resq 1             ; highest offset+len seen (extent of ra_seen set)
+    .ra_fin:     resq 1             ; the FIN has been seen
+    .ra_final:   resq 1             ; the stream's total size (valid once ra_fin)
+    .ra_buf:     resb LINNEA_QUIC_RA_BUF
+    .ra_seen:    resb LINNEA_QUIC_RA_BUF   ; byte i = 1 once stream byte i has arrived
     .pad:        resb 4              ; keep the size a multiple of 8
 endstruc
 
