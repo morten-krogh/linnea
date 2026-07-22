@@ -19,6 +19,7 @@ default rel
 %include "linnea_quic_conn.inc"
 %include "linnea_sha256.inc"
 %include "linnea_hpack.inc"
+%include "linnea_http3.inc"
 
 ; Per-connection state lives in the pool slot cur_conn points at. CONNLEA loads
 ; the address of one of its fields; CONNGET loads a qword field's value. Both
@@ -125,6 +126,8 @@ s_pl_len:    resq 1
 s_sid:       resq 1                   ; stream id of the request being served
 s_sdata:     resq 1                   ; that stream's data pointer
 s_slen:      resq 1                   ; and length
+s_soff:      resq 1                   ; and offset (0 = the stream's first bytes)
+cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 ch_out:      resb linnea_quic_ch_size
 server_pub:  resb 32
 sh_buf:      resb 128
@@ -596,8 +599,14 @@ linnea_quic_server_datagram:
     mov [s_sid], r8
     mov [s_sdata], rax
     mov [s_slen], rdx
-    test r8, 3
-    jnz .stream_scan                 ; not a client-initiated bidi stream
+    mov [s_soff], r10                ; data offset, for typing a uni stream
+    mov rax, r8
+    and eax, 3
+    jz .serve_bidi                   ; client bidi stream: an HTTP/3 request
+    cmp eax, 2
+    je .client_uni                   ; client uni stream: control / QPACK
+    jmp .stream_scan                 ; a server-initiated id (never from a client)
+.serve_bidi:
     ; zero the request struct and point the QPACK scratch at h3scratch
     lea rdi, [req]
     xor eax, eax
@@ -640,6 +649,65 @@ linnea_quic_server_datagram:
     lea rsi, [strm_pay]
     call .send_1rtt
     jmp .stream_scan
+
+; --- a client unidirectional stream: control, QPACK encoder/decoder or grease.
+; A stream's type is the first varint, present only at offset 0, so a later
+; frame (offset > 0) is a continuation we do not re-type. RFC 9114 6.2.1 requires
+; the control stream to open with SETTINGS and forbids a second one; a violation
+; ends the connection with the matching HTTP/3 error. QPACK and unknown streams
+; are ignored — with a zero dynamic table their instruction streams carry nothing.
+.client_uni:
+    cmp qword [s_soff], 0
+    jne .stream_scan                 ; a continuation: type already determined
+    mov rsi, [s_slen]
+    test rsi, rsi
+    jz .stream_scan                  ; empty frame: nothing to type yet
+    mov rax, [s_sdata]
+    movzx ecx, byte [rax]            ; the stream type (1 byte for every h3 type)
+    cmp cl, LINNEA_H3_STREAM_CONTROL
+    jne .stream_scan                 ; QPACK/grease: not interpreted
+    ; the client's control stream. Reject a second one on a different id.
+    mov rdx, [cur_conn]
+    mov rax, [rdx + linnea_quic_conn.ctrl_id]
+    test rax, rax
+    jz .uni_ctrl_first
+    cmp rax, [s_sid]
+    je .uni_ctrl_settings            ; the same control stream again
+    mov edi, LINNEA_H3_ERR_STREAM_CREATION
+    jmp .h3_close
+.uni_ctrl_first:
+    mov rax, [s_sid]
+    mov [rdx + linnea_quic_conn.ctrl_id], rax
+.uni_ctrl_settings:
+    ; the first frame on the control stream must be SETTINGS. If only the type
+    ; byte is present it may follow in a later frame, so do not reject that.
+    cmp qword [s_slen], 2
+    jb .stream_scan
+    mov rax, [s_sdata]
+    movzx ecx, byte [rax + 1]        ; first control-stream frame type (0x04 = SETTINGS)
+    cmp cl, LINNEA_H3_FRAME_SETTINGS
+    je .stream_scan                  ; SETTINGS first: accepted (its values ignored)
+    mov edi, LINNEA_H3_ERR_MISSING_SETTINGS
+    ; fall through to .h3_close
+
+; .h3_close(edi = HTTP/3 error code) — end the connection with an application
+; CONNECTION_CLOSE (frame 0x1d) carrying the code, then free the slot. Sent via
+; emit_1rtt (no loss-recovery tracking): the connection is gone the moment this
+; is queued, so a lost close is not worth resending.
+.h3_close:
+    mov byte [cc_pay], 0x1d          ; CONNECTION_CLOSE (application)
+    mov rsi, rdi                     ; error code
+    lea rdi, [cc_pay + 1]
+    call linnea_quic_varint_encode   ; rax = error-code varint length
+    mov byte [cc_pay + 1 + rax], 0x00   ; reason phrase length = 0
+    lea rsi, [cc_pay]
+    mov [s_pl_ptr], rsi
+    lea rdx, [rax + 2]               ; payload = type(1) + code + reason-len(1)
+    mov [s_pl_len], rdx
+    call emit_1rtt
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
 
 ; the peer said goodbye: release its slot and stop reading this datagram
 .peer_closed:

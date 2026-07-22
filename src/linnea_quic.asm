@@ -353,8 +353,10 @@ linnea_quic_unprotect_short:
     ret
 
 ; linnea_quic_stream_frame(rdi=frames, rsi=len) -> rax = STREAM data ptr,
-; rdx = STREAM data length, r8 = stream id, r9 = first byte after this frame
-; (rax = 0 if none). Skips PADDING/PING/ACK and returns the first STREAM frame's
+; rdx = STREAM data length, r8 = stream id, r9 = first byte after this frame,
+; r10 = the stream data offset (0 when no OFF field is present — a stream's type
+; byte is only at offset 0). rax = 0 if none. Skips PADDING/PING/ACK and returns
+; the first STREAM frame's
 ; data (RFC 9000 19.8). The type byte 0b00001XXX carries OFF (0x04), LEN (0x02)
 ; and FIN (0x01) flags. r9 lets the caller resume the scan, so a packet carrying
 ; several STREAM frames (requests on different streams) can be walked in full;
@@ -439,11 +441,13 @@ linnea_quic_stream_frame:
     jz .ss_none
     mov r13, rax                     ; stream id
     add rdi, rdx
+    xor r10d, r10d                   ; offset defaults to 0 (no OFF field)
     test bl, 0x04                    ; OFF flag: an offset field is present
     jz .ss_nooff
     call linnea_quic_varint_decode   ; offset
     test rdx, rdx
     jz .ss_none
+    mov r10, rax                     ; stream data offset (survives the LEN decode)
     add rdi, rdx
 .ss_nooff:
     test bl, 0x02                    ; LEN flag: an explicit length field

@@ -346,6 +346,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_control_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): server opens control + QPACK streams with SETTINGS" $?
 
+    # receive side: a client control stream that opens with SETTINGS is accepted
+    # and served; one whose first frame is not SETTINGS is closed (H3_MISSING_SETTINGS)
+    python3 test/quic/h3_settings_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): client control stream validated (SETTINGS-first enforced)" $?
+
     # Alt-Svc: the TCP responses advertise HTTP/3 on this port, which is how a
     # browser discovers it at all
     hdrs=$(curl -si --http1.1 --cacert test/tls/server.crt \
