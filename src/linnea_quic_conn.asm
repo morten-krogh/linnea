@@ -16,9 +16,14 @@ global linnea_quic_conn_free
 global linnea_quic_conn_sweep
 global linnea_quic_conn_active
 global linnea_quic_conn_slot
+global linnea_worker_index
 
 section .bss
 conn_pool: resb LINNEA_QUIC_MAX_CONNS * linnea_quic_conn_size
+; this worker's index (0-based), stamped into every connection id it issues so
+; the BPF reuseport program can steer the connection's later packets back here.
+; Zero until the master sets it after fork; a single-worker server never changes it.
+linnea_worker_index: resq 1
 
 section .text
 
@@ -26,10 +31,7 @@ section .text
 linnea_quic_conn_lookup:
     cmp rsi, LINNEA_QUIC_SCID_LEN
     jne .miss                        ; not an ID we could have issued
-    movzx eax, byte [rdi]            ; index, big-endian
-    shl eax, 8
-    movzx ecx, byte [rdi + 1]
-    or eax, ecx
+    movzx eax, byte [rdi + 1]        ; pool index (byte 0 is the worker, for steering)
     cmp eax, LINNEA_QUIC_MAX_CONNS
     jae .miss
     imul rax, rax, linnea_quic_conn_size
@@ -84,11 +86,12 @@ linnea_quic_conn_alloc:
     rep stosb
     mov qword [rbx + linnea_quic_conn.in_use], 1
     mov qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_NEW
-    ; connection id = index (big-endian) || 6 random bytes
-    mov eax, r12d
-    mov [rbx + linnea_quic_conn.scid + 1], al
-    shr eax, 8
-    mov [rbx + linnea_quic_conn.scid], al
+    ; connection id = worker index || pool index || 6 random bytes. The worker
+    ; index steers the connection back to this worker (BPF reuseport); the pool
+    ; index locates the slot; the random tail authenticates it.
+    mov [rbx + linnea_quic_conn.scid + 1], r12b       ; pool index
+    mov eax, [linnea_worker_index]
+    mov [rbx + linnea_quic_conn.scid], al             ; worker index
     lea rdi, [rbx + linnea_quic_conn.scid + 2]
     mov esi, LINNEA_QUIC_SCID_LEN - 2
     xor edx, edx

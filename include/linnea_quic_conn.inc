@@ -3,11 +3,14 @@
 ; A QUIC connection is identified by the connection ID the peer puts in the
 ; Destination Connection ID field, which is the ID *we* chose and advertised as
 ; our Source Connection ID during the handshake. We pick that ID, so we encode
-; the pool index in its first two bytes and fill the rest with randomness:
+; routing into its first two bytes and fill the rest with randomness:
 ;
-;     scid = [ index(16, big-endian) ][ 6 random bytes ]
+;     scid = [ worker index(8) ][ pool index(8) ][ 6 random bytes ]
 ;
-; Demultiplexing an incoming packet is then O(1) with no map — read the index,
+; The worker index is the first byte so the BPF reuseport program can read it
+; and steer the connection's packets back to the worker that owns it, even after
+; the client migrates to a new address (see src/linnea_bpf.asm). The pool index
+; demultiplexes to the slot within that worker: O(1), no map — read the index,
 ; bounds-check it, and confirm the slot's full ID matches (the random tail makes
 ; the ID unguessable, so a wrong or spoofed ID fails the compare).
 ;

@@ -83,6 +83,11 @@ extern linnea_quic_server_datagram
 extern linnea_quic_server_rtx_sweep
 extern linnea_quic_server_goaway_all
 extern linnea_quic_rxbuf
+extern linnea_bpf_map_fd
+extern linnea_bpf_prog_fd
+extern linnea_bpf_map_add
+extern linnea_bpf_attach
+extern linnea_worker_index
 
 section .rodata
 
@@ -292,6 +297,19 @@ linnea_uring_run:
     call linnea_quic_altsvc_set
     call linnea_uring_arm_qrecv
     call linnea_uring_arm_qtimer
+    ; if the BPF steering program loaded, register this worker's QUIC socket at
+    ; its index in the reuseport map and attach the program to the group, so a
+    ; connection's later packets are routed here by its id even if the client
+    ; migrates to a new address (which would otherwise re-hash to another worker).
+    ; Done last: it clobbers the scratch the QUIC setup above still needed.
+    cmp qword [linnea_bpf_prog_fd], 0
+    jl .quic_done
+    mov edi, [linnea_worker_index]
+    mov esi, [quic_fd]
+    call linnea_bpf_map_add
+    mov edi, [quic_fd]
+    mov esi, [linnea_bpf_prog_fd]
+    call linnea_bpf_attach
     jmp .quic_done
 .quic_next:
     inc r12

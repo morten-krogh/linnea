@@ -33,6 +33,9 @@ global _start
 
 extern linnea_file_map_readonly
 extern linnea_file_unmap
+extern linnea_bpf_probe
+extern linnea_bpf_reuseport_setup
+extern linnea_worker_index
 extern linnea_config_parse
 extern linnea_config_validate
 extern linnea_config_dump
@@ -120,6 +123,8 @@ _start:
     mov rsi, [rsp + 16]        ; argv[1]
     cmp byte [rsi], '-'
     jne .normal_args
+    cmp byte [rsi + 1], 'b'
+    je .bpf_probe
     cmp byte [rsi + 1], 't'
     jne .normal_args
     cmp byte [rsi + 2], 0
@@ -129,6 +134,14 @@ _start:
     mov rax, [rsp + 24]        ; argv[2]
     mov [config_ptr], rax
     jmp check_config
+.bpf_probe:                    ; `linnea -b`: verify BPF reuseport steering loads
+    cmp byte [rsi + 2], 0
+    jne .normal_args
+    call linnea_bpf_probe
+    mov edi, eax
+    neg edi                    ; exit 0 when the probe returned 0
+    mov eax, LINNEA_SYS_EXIT
+    syscall
 .normal_args:
     mov rax, [rsp + 16]        ; argv[1] = config path
     mov [config_ptr], rax
@@ -172,6 +185,10 @@ _start:
     syscall
     mov [master_pid], rax
     call install_sigusr2       ; catch SIGUSR2 to trigger a hot upgrade
+    ; load the BPF connection-ID steering program before forking so the workers
+    ; inherit the map and program fds. Best-effort: without CAP_BPF it fails and
+    ; the QUIC reuseport group falls back to plain 4-tuple hashing.
+    call linnea_bpf_reuseport_setup
 
     xor r12d, r12d             ; worker slot
 .spawn_loop:
@@ -297,6 +314,7 @@ spawn_worker:
     syscall
     cmp rax, [master_pid]
     jne .orphan
+    mov [linnea_worker_index], rbx        ; this worker's index, stamped into CIDs
     mov rdi, [linnea_config_instance + linnea_config.max_connections]
     call linnea_connections_init
     lea rdi, [linnea_config_instance]
