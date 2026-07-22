@@ -22,10 +22,14 @@ global linnea_quic_resumption_psk
 global linnea_quic_ticket_setup
 global linnea_quic_ticket_seal
 global linnea_quic_ticket_open
+global linnea_quic_ticket_resume
+global linnea_quic_hs_psk
 
 extern linnea_hkdf_extract
 extern linnea_tls_hkdf_expand_label
 extern linnea_tls_derive_secret
+extern linnea_hmac_sha256
+extern linnea_sha256
 extern linnea_x25519
 extern linnea_aesgcm_init
 extern linnea_aesgcm_seal
@@ -49,6 +53,8 @@ lbl_c_ap:      db "c ap traffic"
 lbl_s_ap:      db "s ap traffic"
 lbl_res_master: db "res master"
 lbl_resumption: db "resumption"
+lbl_res_binder: db "res binder"
+lbl_finished:   db "finished"
 q_ticket_nonce: db 0, 0          ; the (fixed) resumption ticket_nonce
 zeros32:       times 32 db 0
 ; SHA-256 of the empty string (Derive-Secret's context for "derived").
@@ -191,10 +197,16 @@ linnea_quic_hs_secrets:
     mov rsi, r12
     mov rdx, rbx
     call linnea_x25519
-    ; early = HKDF-Extract("", zeros32)
+    ; early = HKDF-Extract("", PSK-or-zeros). A resumption handshake seeds the IKM
+    ; with the ticket's PSK (set in linnea_quic_hs_psk); a fresh one uses zeros.
+    ; Everything downstream (derived, the hs secret from the ECDHE share) is
+    ; identical either way.
     lea rdi, [zeros32]
     xor esi, esi
     lea rdx, [zeros32]
+    mov rax, [linnea_quic_hs_psk]
+    test rax, rax
+    cmovnz rdx, rax
     mov ecx, 32
     lea r8, [rsp + 32]
     call linnea_hkdf_extract
@@ -485,7 +497,126 @@ linnea_quic_ticket_open:
     pop rbx
     ret
 
+; quic_ct_eq32(rdi=a, rsi=b) -> eax = 1 if the 32 bytes are equal, in constant
+; time (accumulate the OR of xored bytes).
+quic_ct_eq32:
+    xor eax, eax
+    xor ecx, ecx
+.cte_loop:
+    mov dl, [rdi + rcx]
+    xor dl, [rsi + rcx]
+    or al, dl
+    inc ecx
+    cmp ecx, 32
+    jb .cte_loop
+    sub al, 1                        ; al=0 -> CF set; al!=0 -> CF clear
+    sbb eax, eax
+    and eax, 1
+    ret
+
+; linnea_quic_ticket_resume(rdi=ticket ptr, esi=ticket len, rdx=truncated-CH ptr,
+;   ecx=truncated-CH len, r8=received binder(32), r9=current SNI hash(8),
+;   [stack]=out psk(32)) -> rax = 1 if the offer is accepted, else 0.
+; Opens the ticket under the per-run key, checks its server_name binding matches
+; the resuming ClientHello, and verifies the PSK binder over the truncated CH
+; (RFC 8446 4.2.11.2). On accept, writes the recovered PSK to out and returns 1.
+%define RS_PT    0                   ; psk(32) issued(8) sni_hash(8)
+%define RS_EARLY 48
+%define RS_BKEY  80
+%define RS_FKEY  112
+%define RS_TH    144
+%define RS_EXP   176                 ; recomputed binder (176..207)
+%define RS_OUT   208                 ; saved out-psk pointer (past RS_EXP)
+linnea_quic_ticket_resume:
+    mov rax, [rsp + 8]               ; out psk (caller's 7th arg)
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 216
+    mov [rsp + RS_OUT], rax
+    mov rbx, rdi                     ; ticket ptr
+    mov r12d, esi                    ; ticket len
+    mov r13, rdx                     ; truncated-CH ptr
+    mov r14d, ecx                    ; truncated-CH len
+    mov r15, r8                      ; received binder
+    mov rbp, r9                      ; current SNI hash
+    ; open the ticket -> plaintext(48)
+    mov rdi, rbx
+    mov esi, r12d
+    lea rdx, [rsp + RS_PT]
+    call linnea_quic_ticket_open
+    cmp rax, 48
+    jne .rs_rej                      ; bad tag or unexpected length
+    ; the ticket is bound to the server_name it was issued under
+    mov rax, [rsp + RS_PT + 40]
+    cmp rax, [rbp]
+    jne .rs_rej
+    ; early_secret = HKDF-Extract(0, psk)
+    lea rdi, [zeros32]
+    xor esi, esi
+    lea rdx, [rsp + RS_PT]
+    mov ecx, 32
+    lea r8, [rsp + RS_EARLY]
+    call linnea_hkdf_extract
+    ; binder_key = Derive-Secret(early, "res binder", H(""))
+    lea rdi, [rsp + RS_EARLY]
+    lea rsi, [lbl_res_binder]
+    mov edx, 10
+    lea rcx, [empty_hash]
+    lea r8, [rsp + RS_BKEY]
+    call linnea_tls_derive_secret
+    ; finished_key = Expand-Label(binder_key, "finished", "", 32)
+    lea rdi, [rsp + RS_BKEY]
+    lea rsi, [lbl_finished]
+    mov edx, 8
+    xor ecx, ecx
+    xor r8d, r8d
+    lea r9, [rsp + RS_FKEY]
+    sub rsp, 16
+    mov qword [rsp], 32
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    ; th = SHA256(truncated ClientHello)
+    mov rdi, r13
+    mov esi, r14d
+    lea rdx, [rsp + RS_TH]
+    call linnea_sha256
+    ; expected binder = HMAC(finished_key, th)
+    lea rdi, [rsp + RS_FKEY]
+    mov esi, 32
+    lea rdx, [rsp + RS_TH]
+    mov ecx, 32
+    lea r8, [rsp + RS_EXP]
+    call linnea_hmac_sha256
+    lea rdi, [rsp + RS_EXP]
+    mov rsi, r15
+    call quic_ct_eq32
+    test eax, eax
+    jz .rs_rej
+    ; accepted: hand the recovered PSK back for the key schedule
+    mov rdi, [rsp + RS_OUT]
+    lea rsi, [rsp + RS_PT]
+    mov ecx, 32
+    rep movsb
+    mov eax, 1
+    jmp .rs_done
+.rs_rej:
+    xor eax, eax
+.rs_done:
+    add rsp, 216
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 section .bss
 alignb 16
 q_ticket_key:  resb 16                    ; per-run QUIC stateless-ticket key
 q_ticket_ctx:  resb linnea_aesgcm_ctx_size
+linnea_quic_hs_psk: resq 1                ; resumption PSK ptr for hs_secrets, 0 = fresh

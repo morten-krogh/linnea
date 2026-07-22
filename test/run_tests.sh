@@ -328,6 +328,21 @@ else
     check "h3 NewSessionTicket test (skipped: deps unavailable)" 0
 fi
 
+# Session resumption: a second connection presents the first's ticket as a PSK;
+# the server opens it, verifies the binder, resumes with a pre_shared_key
+# ServerHello and a certificate-free flight (materially fewer bytes).
+if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
+    timeout 12 ./bin/linnea-quichs >/dev/null 2>&1 &
+    hspid=$!
+    sleep 0.4
+    python3 test/quic/h3_resume_test.py 47501 >/dev/null 2>&1
+    check "h3: resumes from a ticket (PSK, binder, no certificate)" $?
+    kill $hspid 2>/dev/null
+    wait $hspid 2>/dev/null
+else
+    check "h3 resumption test (skipped: deps unavailable)" 0
+fi
+
 # HTTP/3 through the real server: linnea binds a UDP listener for its TLS
 # server and drives the QUIC handler from the io_uring loop, so h3 is served by
 # the production binary from the config's document root — while TCP keeps
@@ -374,6 +389,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # early_data extension once the handshake completes
     python3 test/quic/h3_ticket_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): server issues a NewSessionTicket (early_data)" $?
+
+    # and accepts it back: a second connection resumes with the ticket (PSK), so
+    # the server skips the certificate
+    python3 test/quic/h3_resume_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): resumes from a ticket (no certificate re-sent)" $?
 
     # BPF connection-ID steering: a connection survives the client migrating to a
     # fresh source port. Needs CAP_BPF on the binary (a rebuild drops the file

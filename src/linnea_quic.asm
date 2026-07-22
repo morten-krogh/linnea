@@ -1365,9 +1365,9 @@ linnea_quic_ch_parse:
     mov rbx, rdx                     ; out struct
     lea r12, [rdi + rsi]             ; ClientHello end
     mov r15, rdi                     ; save the ClientHello pointer
-    mov rdi, rbx                     ; zero the out struct (7 qwords)
+    mov rdi, rbx                     ; zero the out struct
     xor eax, eax
-    mov ecx, 7
+    mov ecx, linnea_quic_ch_size / 8
     rep stosq
     mov rdi, r15
     ; skip type(1)+len(3)+version(2)+random(32) = 38, to session_id length
@@ -1416,6 +1416,10 @@ linnea_quic_ch_parse:
     je .chp_tp                       ; QUIC transport parameters (0x0039)
     cmp eax, 0x33
     je .chp_ks                       ; key_share (0x0033)
+    cmp eax, 0x2d
+    je .chp_pskmodes                 ; psk_key_exchange_modes (0x002d)
+    cmp eax, 0x29
+    je .chp_psk                      ; pre_shared_key (0x0029)
 .chp_next:
     mov r13, r15
     jmp .chp_ext
@@ -1484,6 +1488,65 @@ linnea_quic_ch_parse:
     mov rax, r15
     sub rax, r14
     mov [rbx + linnea_quic_ch.tp_len], rax
+    jmp .chp_next
+.chp_pskmodes:
+    ; ke_modes<1..255>: 1-byte list length, then modes. We only do psk_dhe_ke (1).
+    lea rax, [r14 + 1]
+    cmp rax, r15
+    ja .chp_next
+    movzx ecx, byte [r14]            ; modes list length
+    lea rsi, [r14 + 1]               ; first mode
+    lea rdi, [rsi + rcx]             ; modes end
+    cmp rdi, r15
+    ja .chp_next
+.chp_pm_loop:
+    cmp rsi, rdi
+    jae .chp_next
+    cmp byte [rsi], 1               ; psk_dhe_ke
+    jne .chp_pm_next
+    mov qword [rbx + linnea_quic_ch.psk_dhe_ke], 1
+    jmp .chp_next
+.chp_pm_next:
+    inc rsi
+    jmp .chp_pm_loop
+.chp_psk:
+    ; OfferedPsks: identities<7..2^16-1> then binders<33..2^16-1>. Record the first
+    ; identity (our ticket) and first binder, and where the binders length field
+    ; sits — the truncated ClientHello the binder is computed over ends there.
+    lea rax, [r14 + 2]
+    cmp rax, r15
+    ja .chp_next
+    movzx eax, byte [r14]            ; identities list length
+    shl eax, 8
+    movzx ecx, byte [r14 + 1]
+    or eax, ecx
+    lea r10, [r14 + 2 + rax]         ; -> binders length field
+    cmp r10, r15
+    jae .chp_next
+    ; first PskIdentity: identity<1..2^16-1> then uint32 obfuscated_ticket_age
+    lea rax, [r14 + 4]
+    cmp rax, r10
+    ja .chp_next
+    movzx ecx, byte [r14 + 2]        ; identity length
+    shl ecx, 8
+    movzx edx, byte [r14 + 3]
+    or ecx, edx
+    lea rax, [r14 + 4 + rcx]         ; end of identity bytes
+    lea rdx, [rax + 4]               ; + obfuscated age
+    cmp rdx, r10
+    ja .chp_next
+    lea rax, [r14 + 4]
+    mov [rbx + linnea_quic_ch.psk_id_ptr], rax
+    mov [rbx + linnea_quic_ch.psk_id_len], rcx
+    mov [rbx + linnea_quic_ch.psk_binders_pos], r10
+    ; first binder: 1-byte length (must be 32) then the 32 bytes
+    lea rax, [r10 + 3]
+    cmp rax, r15
+    ja .chp_next
+    cmp byte [r10 + 2], 32
+    jne .chp_next
+    lea rax, [r10 + 3]
+    mov [rbx + linnea_quic_ch.psk_binder_ptr], rax
     jmp .chp_next
 .chp_done:
     pop r15

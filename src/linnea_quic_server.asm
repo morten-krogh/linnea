@@ -83,6 +83,8 @@ extern linnea_sha256_update
 extern linnea_sha256_final
 extern linnea_quic_resumption_psk
 extern linnea_quic_ticket_seal
+extern linnea_quic_ticket_resume
+extern linnea_quic_hs_psk
 
 section .rodata
 altsvc_pre:  db 'h3=":'
@@ -175,6 +177,8 @@ s_docroot_len: resq 1
 ack_ranges:    resb LINNEA_QUIC_ACK_MAXR * 16   ; decoded [smallest,largest] pairs
 ; NewSessionTicket scratch (issued at handshake completion, see .append_nst)
 s_pay_len:   resq 1              ; 1-RTT payload length saved across .append_nst
+s_sh_len:    resq 1              ; ServerHello length (90 fresh, 96 with the PSK ext)
+s_resume_psk: resb 32           ; PSK recovered from an accepted resumption ticket
 q_sni32:     resb 32             ; SHA-256(SNI), of which 8 bytes seed the ticket
 q_nst_ts:    resb 16             ; timespec for the ticket's issued time
 q_nst_pt:    resb 48             ; ticket plaintext: psk || issued || sni_hash
@@ -345,6 +349,43 @@ linnea_quic_server_datagram:
     mov [rax + linnea_quic_conn.dcid_len], rcx
     lea rdi, [rax + linnea_quic_conn.dcid]
     rep movsb                        ; copy the SCID out of dgram
+    ; SNI hash, computed once: it seeds any ticket we issue and (on a resumption
+    ; offer) checks the presented ticket's server_name binding.
+    mov rdi, [ch_out + linnea_quic_ch.sni_ptr]
+    mov rsi, [ch_out + linnea_quic_ch.sni_len]
+    lea rdx, [q_sni32]
+    call linnea_sha256
+    mov rax, [q_sni32]
+    mov rbx, [cur_conn]
+    mov [rbx + linnea_quic_conn.sni_hash], rax
+    ; --- session resumption: accept the client's PSK offer if it is well-formed
+    ; (psk_dhe_ke, our ticket, matching SNI, verifying binder). linnea_quic_hs_psk
+    ; then drives the ServerHello's pre_shared_key extension, the early secret in
+    ; hs_secrets, and the EE-only flight below; 0 means a full handshake.
+    mov qword [linnea_quic_hs_psk], 0
+    mov rdi, [ch_out + linnea_quic_ch.psk_id_ptr]
+    test rdi, rdi
+    jz .no_resume
+    cmp qword [ch_out + linnea_quic_ch.psk_dhe_ke], 0
+    je .no_resume
+    cmp qword [ch_out + linnea_quic_ch.psk_binder_ptr], 0
+    je .no_resume
+    mov esi, [ch_out + linnea_quic_ch.psk_id_len]
+    mov rdx, [s_ch_ptr]                       ; truncated-CH base
+    mov rcx, [ch_out + linnea_quic_ch.psk_binders_pos]
+    sub rcx, rdx                              ; truncated-CH length
+    mov r8, [ch_out + linnea_quic_ch.psk_binder_ptr]
+    lea r9, [q_sni32]                         ; current SNI hash
+    sub rsp, 16
+    lea rax, [s_resume_psk]
+    mov [rsp], rax
+    call linnea_quic_ticket_resume
+    add rsp, 16
+    test rax, rax
+    jz .no_resume
+    lea rax, [s_resume_psk]
+    mov [linnea_quic_hs_psk], rax             ; resumed: seed the key schedule
+.no_resume:
     ; fresh ephemeral key + ServerHello random for this handshake. server_priv
     ; and server_srand are adjacent in .bss (32 bytes each), so two getrandom32
     ; calls refill both; a constant key_share would break forward secrecy.
@@ -361,17 +402,32 @@ linnea_quic_server_datagram:
     lea rsi, [server_pub]
     lea rdx, [server_srand]
     call linnea_quic_build_sh
+    mov [s_sh_len], rax              ; 90 for a fresh handshake
+    ; resumption: the ServerHello carries pre_shared_key with selected_identity 0,
+    ; appended after supported_versions (RFC 8446 4.2.11). Grows the SH to 96.
+    cmp qword [linnea_quic_hs_psk], 0
+    je .sh_ready
+    mov word [sh_buf + 90], 0x2900   ; pre_shared_key (0x0029)
+    mov word [sh_buf + 92], 0x0200   ; ext length 2
+    mov word [sh_buf + 94], 0x0000   ; selected_identity 0
+    mov word [sh_buf + 42], 0x3400   ; extensions length 52 (was 46)
+    mov byte [sh_buf + 3], 92        ; handshake length 92 (was 86)
+    mov qword [s_sh_len], 96
+.sh_ready:
 
     ; ===== Initial packet: ACK + CRYPTO(ServerHello) =====
     mov byte [payload], 0x02
     mov dword [payload + 1], 0
     mov byte [payload + 5], 0x06
     mov byte [payload + 6], 0x00
-    mov word [payload + 7], 0x5a40   ; CRYPTO length varint(90)
+    mov eax, [s_sh_len]              ; CRYPTO length varint (2-byte: 0x4000 | len)
+    shl eax, 8
+    or eax, 0x40
+    mov [payload + 7], ax
     lea rdi, [payload + 9]
     lea rsi, [sh_buf]
-    mov ecx, 90
-    rep movsb                        ; payload length = 99
+    mov ecx, [s_sh_len]
+    rep movsb                        ; payload length = 9 + SH
     call .build_initial_header       ; -> rcx = header length (uses s_cscid_*)
     sub rsp, 16
     CONNLEA rax, ini_server
@@ -381,7 +437,8 @@ linnea_quic_server_datagram:
     mov rdx, rcx
     mov ecx, 1
     lea r8, [payload]
-    mov r9d, 99
+    mov r9d, [s_sh_len]
+    add r9d, 9                        ; ACK(5) + CRYPTO header(4) + SH
     call linnea_quic_protect         ; rax = Initial packet length
     add rsp, 16
     mov [s_ini_len], rax
@@ -389,7 +446,7 @@ linnea_quic_server_datagram:
     ; ===== handshake keys and messages =====
     ; th = H(CH || SH)
     lea rsi, [sh_buf]
-    mov edx, 90
+    mov edx, [s_sh_len]
     call .transcript                 ; th_buf = H(CH || saved-prefix)? see helper
     ; hs_secrets(client key_share, server_priv, th, hs_ckeys, hs_skeys, hs_sec)
     mov rdi, [ch_out + linnea_quic_ch.ks_ptr]
@@ -409,6 +466,11 @@ linnea_quic_server_datagram:
     mov r14, rax                     ; running hsmsg length
     mov rcx, [cur_conn]
     mov [rcx + linnea_quic_conn.flight_ee_len], r14   ; Certificate follows EE
+    ; resumption authenticates via the PSK, so the flight is EE || Finished — no
+    ; Certificate, no CertificateVerify (RFC 8446 2.2). The tiny flight always fits
+    ; the anti-amplification budget, so it never needs the cert-recompose resume path.
+    cmp qword [linnea_quic_hs_psk], 0
+    jne .flight_resumed
     lea rdi, [hsmsg + r14]
     mov rsi, [s_cert_list_ptr]
     mov rdx, [s_cert_len]
@@ -430,6 +492,14 @@ linnea_quic_server_datagram:
     lea rsi, [hsmsg]
     mov rdx, r14
     call .transcript
+    jmp .flight_finished
+.flight_resumed:
+    mov qword [rcx + linnea_quic_conn.flight_cv_len], 0
+    ; th = H(CH || SH || EE)
+    lea rsi, [hsmsg]
+    mov rdx, r14
+    call .transcript
+.flight_finished:
     mov [s_fin_off], r14             ; Finished starts here
     lea rdi, [hsmsg + r14]
     CONNLEA rsi, hs_sec
@@ -490,7 +560,7 @@ linnea_quic_server_datagram:
     call linnea_sha256_update
     lea rdi, [shactx]
     lea rsi, [sh_buf]
-    mov edx, 90
+    mov edx, [s_sh_len]
     call linnea_sha256_update
     lea rdi, [shactx]
     lea rsi, [hsmsg]
@@ -508,15 +578,7 @@ linnea_quic_server_datagram:
     add rdi, 64                           ; handshake_secret
     lea rsi, [th_buf]
     lea rdx, [rbx + linnea_quic_conn.resumption_psk]
-    call linnea_quic_resumption_psk
-    ; sni_hash8 = SHA-256(server_name)[0..7], binding the ticket to the SNI
-    mov rdi, [ch_out + linnea_quic_ch.sni_ptr]
-    mov rsi, [ch_out + linnea_quic_ch.sni_len]
-    lea rdx, [q_sni32]
-    call linnea_sha256
-    mov rax, [q_sni32]
-    mov rbx, [cur_conn]
-    mov [rbx + linnea_quic_conn.sni_hash], rax
+    call linnea_quic_resumption_psk       ; conn.sni_hash was set at CH time
     ; the flight is out: leave ST_NEW so a retransmitted ClientHello is recognized
     ; as a duplicate (above) rather than rebuilding the flight with fresh keys.
     mov rax, [cur_conn]
@@ -580,8 +642,15 @@ linnea_quic_server_datagram:
     sub rsp, 16                      ; keep 16-aligned; save the CRYPTO-frame length
     mov [rsp], rax
     mov qword [rcx + linnea_quic_conn.amp_valid], 1
+    ; only rebuild and release a flight the budget actually held back. A resumed
+    ; handshake's flight (EE || Finished, no cert) always fit and was sent whole, so
+    ; there is nothing to resume — and .recompose_flight assumes a certificate.
+    mov rax, [rcx + linnea_quic_conn.flight_off]
+    cmp rax, [rcx + linnea_quic_conn.flight_len]
+    jae .cfin_sent
     call .recompose_flight           ; hsmsg is stale between datagrams; rebuild it
     call .send_flight
+.cfin_sent:
     mov rax, [rsp]
     add rsp, 16
 .cfin_finished:
@@ -1174,7 +1243,14 @@ linnea_quic_server_datagram:
     mov ecx, LINNEA_QUIC_SCID_LEN
     rep movsb
     mov byte [rdi], 0x00             ; token length
-    mov word [rdi + 1], 0x7440       ; length varint(116)
+    ; length varint = pn(1) + payload(9 + SH) + tag(16) = 26 + SH; a 2-byte varint
+    mov eax, [s_sh_len]
+    add eax, 26
+    mov edx, eax
+    shr edx, 8
+    or edx, 0x40
+    mov [rdi + 1], dl                ; 0x40 | (len >> 8)
+    mov [rdi + 2], al                ; len & 0xff
     mov byte [rdi + 3], 0x00         ; packet number 0
     lea rcx, [rdi + 4]
     lea rax, [hdr]
@@ -1232,7 +1308,7 @@ linnea_quic_server_datagram:
     je .tr_tail
     lea rdi, [shactx]
     lea rsi, [sh_buf]
-    mov edx, 90
+    mov edx, [s_sh_len]
     call linnea_sha256_update
 .tr_tail:
     lea rdi, [shactx]
