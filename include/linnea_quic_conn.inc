@@ -23,6 +23,25 @@ LINNEA_QUIC_ST_NEW       equ 0      ; allocated, nothing processed yet
 LINNEA_QUIC_ST_HANDSHAKE equ 1      ; server flight sent, awaiting the client
 LINNEA_QUIC_ST_CONNECTED equ 2      ; client Finished verified, 1-RTT keys live
 
+; Loss recovery for the 1-RTT space. Every ack-eliciting packet we send is kept
+; here until the peer acknowledges it, so a lost copy can be resent — under a
+; fresh packet number, since QUIC forbids reusing one (RFC 9002 A.5). The frames
+; are stored, not the protected bytes, so a retransmission is re-encrypted with a
+; new number. The slot count bounds how much can be outstanding at once; the
+; payload cap is far above anything a single reply we build reaches today.
+LINNEA_QUIC_RTX_SLOTS   equ 8       ; outstanding 1-RTT packets tracked per conn
+LINNEA_QUIC_RTX_PAYLOAD equ 1500    ; frame bytes kept per packet
+LINNEA_QUIC_ACK_MAXR    equ 16      ; ACK ranges decoded from one incoming frame
+
+struc linnea_quic_sent
+    .in_use:   resq 1
+    .pn:       resq 1               ; packet number it last went out under
+    .sent_ms:  resq 1               ; CLOCK_MONOTONIC ms when (re)sent, for the PTO
+    .len:      resq 1               ; frame-payload length
+    .payload:  resb LINNEA_QUIC_RTX_PAYLOAD
+    .pad:      resb 4               ; round the record to a multiple of 8
+endstruc
+
 struc linnea_quic_conn
     .in_use:     resq 1
     .dcid_len:   resq 1              ; length of the peer's connection ID
@@ -46,6 +65,7 @@ struc linnea_quic_conn
     .hs_skeys:   resb linnea_quic_keys_size
     .ap_ckeys:   resb linnea_quic_keys_size
     .ap_skeys:   resb linnea_quic_keys_size
+    .sent:       resb LINNEA_QUIC_RTX_SLOTS * linnea_quic_sent_size ; loss-recovery ring
     .pad:        resb 4              ; keep the size a multiple of 8
 endstruc
 

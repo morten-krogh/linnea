@@ -18,6 +18,7 @@ global linnea_quic_stream_frame
 global linnea_quic_close_frame
 global linnea_quic_ack_record
 global linnea_quic_build_ack
+global linnea_quic_ack_ranges
 global linnea_quic_recv_initial
 global linnea_quic_protect
 global linnea_quic_ch_parse
@@ -585,6 +586,112 @@ linnea_quic_build_ack:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; linnea_quic_ack_ranges(rdi=frames, rsi=len, rdx=out, rcx=max pairs)
+;   -> rax = number of acknowledged [smallest, largest] pairs written to out
+;   (0 if the packet carries no ACK frame, or on a malformed one). Each pair is
+;   two qwords. The first ACK frame among the leading frames is decoded (PADDING
+;   and PING are stepped over; any other frame ends the search) into its ranges
+;   (RFC 9000 19.3): the caller frees the buffered packets each range covers.
+;   A peer coalescing an ACK with stream data places the ACK first, so the
+;   leading scan reaches it. ECN counts, if present, follow the ranges and need
+;   not be read — we stop once the ranges are done.
+linnea_quic_ack_ranges:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    lea rsi, [rdi + rsi]             ; end (preserved across varint calls)
+    mov r14, rdx                     ; out cursor
+    mov rbp, rcx                     ; max pairs
+    xor r15d, r15d                   ; pairs written
+.scan:
+    cmp rdi, rsi
+    jae .ret
+    movzx eax, byte [rdi]
+    test al, al                      ; PADDING
+    jz .skip1
+    cmp al, 0x01                     ; PING
+    je .skip1
+    cmp al, 0x02                     ; ACK
+    je .ack
+    cmp al, 0x03                     ; ACK with ECN counts
+    je .ack
+    jmp .ret                         ; any other frame: no leading ACK
+.skip1:
+    inc rdi
+    jmp .scan
+.ack:
+    inc rdi                          ; past the type
+    call linnea_quic_varint_decode   ; Largest Acknowledged
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    mov r12, rax                     ; largest of the current range
+    call linnea_quic_varint_decode   ; ACK Delay
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Count
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    mov r13, rax                     ; additional ranges to follow
+    call linnea_quic_varint_decode   ; First ACK Range
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    ; first range: [largest - first, largest]
+    mov r8, r12
+    sub r8, rax                      ; smallest
+    mov r9, r12                      ; largest
+    mov rbx, r8                      ; remember the smallest for the next gap
+    call .emit
+.rloop:
+    test r13, r13
+    jz .ret
+    call linnea_quic_varint_decode   ; Gap
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    mov r10, rax                     ; gap (r10 survives varint_decode)
+    call linnea_quic_varint_decode   ; ACK Range Length
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    mov r11, rax                     ; length (r11 survives varint_decode)
+    ; next range: largest = prev smallest - gap - 2, smallest = largest - length
+    mov r9, rbx
+    sub r9, r10
+    sub r9, 2
+    mov r8, r9
+    sub r8, r11
+    mov rbx, r8
+    call .emit
+    dec r13
+    jmp .rloop
+.ret:
+    mov rax, r15
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+; .emit(r8=smallest, r9=largest) — append one pair unless the caller's buffer is
+; full. Preserves rdi/rsi (the frame cursor) and the range registers.
+.emit:
+    cmp r15, rbp
+    jae .emit_ret                    ; buffer full: count no more
+    mov [r14], r8
+    mov [r14 + 8], r9
+    add r14, 16
+    inc r15
+.emit_ret:
     ret
 
 ; linnea_quic_close_frame(rdi=frames, rsi=len) -> rax = 1 if the packet carries

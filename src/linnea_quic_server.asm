@@ -65,6 +65,9 @@ extern linnea_quic_stream_frame
 extern linnea_quic_close_frame
 extern linnea_quic_ack_record
 extern linnea_quic_build_ack
+extern linnea_quic_ack_ranges
+extern linnea_quic_rtx_record
+extern linnea_quic_rtx_ack_range
 extern linnea_string_from_u64
 extern linnea_quic_conn_free
 extern linnea_quic_varint_encode
@@ -131,6 +134,7 @@ linnea_h3_server:     resq 1     ; index of the server that owns that listener
 s_acklen:      resq 1
 s_docroot_ptr: resq 1
 s_docroot_len: resq 1
+ack_ranges:    resb LINNEA_QUIC_ACK_MAXR * 16   ; decoded [smallest,largest] pairs
 
 section .text
 
@@ -518,12 +522,33 @@ linnea_quic_server_datagram:
     CONNLEA rdi, rx_have
     call linnea_quic_ack_record
     pop rax
+    mov r14, rax                     ; frame bytes
+    ; ingest the peer's ACK: release every buffered packet it acknowledges, so
+    ; we stop holding (and, once the PTO timer exists, retransmitting) frames
+    ; that have already arrived.
+    lea rdi, [plaintext]
+    mov rsi, r14
+    lea rdx, [ack_ranges]
+    mov ecx, LINNEA_QUIC_ACK_MAXR
+    call linnea_quic_ack_ranges      ; rax = pairs written into ack_ranges
+    test rax, rax
+    jz .acks_done
+    lea rbx, [ack_ranges]
+    mov rbp, rax                     ; pair count
+.ack_free:
+    mov rdi, [cur_conn]
+    mov rsi, [rbx]                   ; smallest
+    mov rdx, [rbx + 8]               ; largest
+    call linnea_quic_rtx_ack_range
+    add rbx, 16
+    dec rbp
+    jnz .ack_free
+.acks_done:
     ; a peer that closes cleanly gets its slot back at once instead of waiting
     ; for the idle sweep — this is what keeps rapid connection churn from
     ; filling the pool.
-    mov r14, rax                     ; frame bytes
     lea rdi, [plaintext]
-    mov rsi, rax
+    mov rsi, r14
     call linnea_quic_close_frame
     test rax, rax
     jnz .peer_closed
@@ -644,9 +669,36 @@ linnea_quic_server_datagram:
     CONNLEA r8, peer
     CONNGET r9, peer_len
     syscall
+    ; buffer these frames for loss recovery under the number we just used, then
+    ; advance it — QUIC requires the retransmission to carry a fresh number.
+    call .now_ms
+    mov r8, rax
+    mov rdi, [cur_conn]
+    CONNGET rsi, pn_1rtt
+    mov rdx, [s_pl_ptr]
+    mov rcx, [s_pl_len]
+    call linnea_quic_rtx_record
     mov rax, [cur_conn]
     inc qword [rax + linnea_quic_conn.pn_1rtt]
     pop rbx
+    ret
+
+; .now_ms -> rax = CLOCK_MONOTONIC milliseconds. Monotonic so the PTO cannot be
+; thrown off by a wall-clock step.
+.now_ms:
+    sub rsp, 24
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    mov edi, LINNEA_CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov r8, [rsp]                    ; seconds
+    imul r8, r8, 1000
+    mov rax, [rsp + 8]              ; nanoseconds
+    xor edx, edx
+    mov rcx, 1000000
+    div rcx                          ; rax = ns / 1e6
+    add rax, r8
+    add rsp, 24
     ret
 
 ; .build_initial_header -> rcx = header length; DCID = client SCID, SCID = ours,

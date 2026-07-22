@@ -248,6 +248,16 @@ else
     check "quic pool selftest (skipped: binary unavailable)" 0
 fi
 
+# QUIC 1-RTT loss recovery: the sent-packet ring (record/ack-range/inflight) and
+# the ACK-frame range decoder, in isolation and together.
+if [ -x ./bin/linnea-rtxtest ]; then
+    out=$(./bin/linnea-rtxtest)
+    rc=$?
+    check "quic loss-recovery selftest ($out)" $rc
+else
+    check "quic loss-recovery selftest (skipped: binary unavailable)" 0
+fi
+
 # QPACK decode: field sections encoded by pylsqpack (static + literals + Huffman,
 # zero dynamic table) decode to the right HTTP/3 request pseudo-headers.
 if python3 -c 'import pylsqpack' 2>/dev/null && [ -x ./bin/linnea-qpacktest ]; then

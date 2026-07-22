@@ -185,10 +185,26 @@ test/quic/linnea_quichs.o: test/quic/linnea_quichs.asm $(INCS)
 bin/linnea-quichs: test/quic/linnea_quichs.o $(QUICMSG_OBJS) \
                    src/linnea_http3.o src/linnea_qpack.o src/linnea_hpack.o \
                    src/linnea_static.o src/linnea_string.o src/linnea_quic_conn.o \
-                   src/linnea_quic_server.o
+                   src/linnea_quic_rtx.o src/linnea_quic_server.o
 	$(LD) -o $@ $^
 
 quichs: bin/linnea-quichs
+
+# --- test-only: 1-RTT loss-recovery bookkeeping and ACK-range parsing ---
+RTXTEST_BIN  = bin/linnea-rtxtest
+RTXTEST_OBJS = test/quic/linnea_rtxtest.o src/linnea_quic_rtx.o src/linnea_quic.o \
+               src/linnea_quic_crypto.o src/linnea_aesgcm.o src/linnea_sha256.o \
+               src/linnea_tls_kdf.o src/linnea_x25519.o src/linnea_fe25519.o \
+               src/linnea_print.o src/linnea_string.o $(QUICP256)
+
+test/quic/linnea_rtxtest.o: test/quic/linnea_rtxtest.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(RTXTEST_BIN): $(RTXTEST_OBJS)
+	$(LD) -o $@ $^
+
+rtxtest: $(RTXTEST_BIN)
+	./$(RTXTEST_BIN)
 
 # --- test-only: QUIC connection pool (allocation, exhaustion, idle sweep) ---
 POOLTEST_BIN  = bin/linnea-pooltest
@@ -221,7 +237,8 @@ H3TEST_BIN  = bin/linnea-h3test
 H3TEST_OBJS = test/quic/linnea_h3test.o src/linnea_http3.o src/linnea_qpack.o \
               src/linnea_hpack.o src/linnea_quic.o src/linnea_quic_crypto.o \
               src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
-              src/linnea_x25519.o src/linnea_fe25519.o $(QUICP256)
+              src/linnea_x25519.o src/linnea_fe25519.o src/linnea_static.o \
+              src/linnea_string.o $(QUICP256)
 
 test/quic/linnea_h3test.o: test/quic/linnea_h3test.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -236,7 +253,8 @@ H3RESP_BIN  = bin/linnea-h3resp
 H3RESP_OBJS = test/quic/linnea_h3resp.o src/linnea_http3.o src/linnea_qpack.o \
               src/linnea_hpack.o src/linnea_quic.o src/linnea_quic_crypto.o \
               src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
-              src/linnea_x25519.o src/linnea_fe25519.o $(QUICP256)
+              src/linnea_x25519.o src/linnea_fe25519.o src/linnea_static.o \
+              src/linnea_string.o $(QUICP256)
 
 test/quic/linnea_h3resp.o: test/quic/linnea_h3resp.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -253,7 +271,7 @@ clean:
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
       bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs $(QPACKTEST_BIN) \
-      $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN)
+      $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN) $(RTXTEST_BIN)
 	./test/run_tests.sh
 
 # Install the binary to /usr/local/bin: bin_t under SELinux, so systemd
