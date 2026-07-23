@@ -446,6 +446,19 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_matrix_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): size/boundary/HEAD/concurrent matrix all terminate" $?
 
+    # connection reuse: far more than the advertised 100 bidi streams on ONE
+    # connection (a browser reusing it across refreshes) — the server must raise
+    # the peer's limit with MAX_STREAMS or new requests can't be sent (images stop
+    # loading, h2 fallback after ~30s).
+    python3 test/quic/h3_reuse_test.py 47452 250 >/dev/null 2>&1
+    check "h3 (io_uring): reused connection past 100 streams (MAX_STREAMS)" $?
+
+    # under load: many concurrent connections (browser tabs / refreshes) plus a
+    # burst of open-load-close churn — every request completes and the workers stay
+    # alive with no descriptor leak.
+    python3 test/quic/h3_load_test.py 47452 12 4 >/dev/null 2>&1
+    check "h3 (io_uring): concurrent connections + churn under load" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1

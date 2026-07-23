@@ -157,6 +157,7 @@ s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK f
 fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow scan
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
+maxstreams_pay: resb 16               ; a MAX_STREAMS frame raising the peer's limit
 ch_out:      resb linnea_quic_ch_size
 ; Per-connection ephemeral X25519 private key and ServerHello random, refilled
 ; from getrandom(2) on every ClientHello. Constant values here would fix the
@@ -453,6 +454,7 @@ linnea_quic_server_datagram:
     mov qword [rbx + linnea_quic_conn.fc_stream_init], 0
     mov qword [rbx + linnea_quic_conn.fc_conn_max], 0
     mov qword [rbx + linnea_quic_conn.fc_conn_sent], 0
+    mov qword [rbx + linnea_quic_conn.ms_bidi_max], LINNEA_QUIC_MS_INIT
     mov rdi, [ch_out + linnea_quic_ch.tp_ptr]
     test rdi, rdi
     jz .tp_recorded
@@ -1237,6 +1239,29 @@ linnea_quic_server_datagram:
     jbe .no_goaway_bump
     mov [rax + linnea_quic_conn.h3_goaway_id], rdx
 .no_goaway_bump:
+    ; Raise the peer's bidi-stream limit as it opens streams (RFC 9000 19.11), so a
+    ; reused connection never runs out. ordinal = the count of client bidi streams
+    ; opened so far (client bidi ids are 0,4,8,... = 4*(n-1)); when it comes within
+    ; MS_THRESH of what we have granted, grant a fresh window ahead and tell the
+    ; peer with a MAX_STREAMS frame (sent reliably, ahead of the response packet).
+    mov rax, [cur_conn]
+    mov rdx, [s_sid]
+    shr rdx, 2
+    inc rdx                          ; ordinal (streams opened so far)
+    mov rcx, rdx
+    add rcx, LINNEA_QUIC_MS_THRESH
+    cmp rcx, [rax + linnea_quic_conn.ms_bidi_max]
+    jb .no_maxstreams
+    add rdx, LINNEA_QUIC_MS_WINDOW    ; new granted limit
+    mov [rax + linnea_quic_conn.ms_bidi_max], rdx
+    mov byte [maxstreams_pay], 0x12   ; MAX_STREAMS (bidirectional)
+    lea rdi, [maxstreams_pay + 1]
+    mov rsi, rdx
+    call linnea_quic_varint_encode    ; rax = varint length
+    lea rsi, [maxstreams_pay]
+    lea rdx, [rax + 1]                ; frame length = type byte + varint
+    call .send_1rtt                   ; sent and buffered for loss recovery
+.no_maxstreams:
     ; response STREAM frame: type 0x09 (STREAM|FIN), this stream's id, then the
     ; HTTP/3 response. Each response rides its own 1-RTT packet, so the frame
     ; needs no LEN — its data runs to the end of the packet.

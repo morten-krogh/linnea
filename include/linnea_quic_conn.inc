@@ -102,6 +102,14 @@ LINNEA_QUIC_EARLY_BUF   equ 1024
 LINNEA_QUIC_TX_CHUNK    equ 1100    ; stream bytes per 1-RTT packet
 LINNEA_QUIC_TX_HDR      equ 128     ; HEADERS frame + DATA frame header prefix cap
 LINNEA_QUIC_TXSTREAMS   equ 100     ; = advertised initial_max_streams_bidi
+; Bidi-stream flow control (RFC 9000 4.6). We advertise this many streams up front,
+; then raise the peer's limit with MAX_STREAMS as it opens streams, so a long-lived
+; (reused) connection never runs out — without this a browser that refreshes enough
+; times exhausts the limit, can open no more request streams (images stop loading),
+; and falls back to h2 after ~30 s. Grant a fresh window once within THRESH of it.
+LINNEA_QUIC_MS_INIT     equ 100     ; initial_max_streams_bidi we advertise
+LINNEA_QUIC_MS_WINDOW   equ 128     ; streams granted ahead of the peer's highest
+LINNEA_QUIC_MS_THRESH   equ 64      ; regrant when the peer is within this of the limit
 
 ; Congestion control (RFC 9002 NewReno). The response is ack-clocked, but by a
 ; congestion window that GROWS rather than the fixed 8-packet loss ring — without
@@ -168,6 +176,7 @@ struc linnea_quic_conn
     .state:      resq 1
     .ctrl_id:    resq 1              ; the peer's control stream id, 0 until seen
     .h3_goaway_id: resq 1            ; lowest request stream a drain would reject
+    .ms_bidi_max:  resq 1            ; bidi stream count granted to the peer (MAX_STREAMS)
     .pn_1rtt:    resq 1              ; next 1-RTT packet number we send
     .last_active: resq 1             ; CLOCK_MONOTONIC seconds of the last packet
     ; acknowledgement state for the 1-RTT space (see linnea_quic_ack_record):
