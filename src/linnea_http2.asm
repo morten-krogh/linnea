@@ -403,12 +403,19 @@ linnea_h2_handle:
 ; path — into out_buf. The echo proves the decode end to end; M17 replaces
 ; it with the real static/proxy response path and HPACK encoder.
 ;
-; Stack locals (below the req struct):
+; Stack locals: the req struct occupies [rsp+REQ, rsp+REQ+linnea_h2_req_size), the
+; rest follow it. Deriving the offsets from linnea_h2_req_size (rather than hard-
+; coding them) keeps a later field added to the struct from silently overwriting a
+; local — e.g. the RFC 9218 `priority` fields once clobbered L_SID (the stream id),
+; so a `priority` header from a browser broke every h2 request.
 %define REQ      0
-%define L_START  96
-%define L_SID    104
-%define L_CONT   112
-%define L_OUT    120
+%define L_START  linnea_h2_req_size
+%define L_SID    linnea_h2_req_size + 8
+%define L_CONT   linnea_h2_req_size + 16
+%define L_OUT    linnea_h2_req_size + 24
+%if L_OUT + 8 > 168
+  %error "h2_build_request stack frame (sub rsp,168) too small for req + locals"
+%endif
 h2_build_request:
     push rbx
     push r12

@@ -1463,6 +1463,32 @@ PYEOF
         "$u/hello.txt" "$u/big.txt" | wc -c)
     [ "$two" -eq 100018 ]
     check "http2 keep-alive: two requests, one connection" $?
+    # RFC 9218 `priority` request header (u=, i): a browser sends it on EVERY
+    # request, so capturing it must not corrupt the request. It once overwrote the
+    # h2 stream-id stack local, resetting the connection — every browser page blank.
+    pc=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
+        -H 'priority: u=3, i' "$u/big.txt")
+    [ "$pc" = "200" ]
+    check "http2 priority header served (RFC 9218, no stream-id corruption)" $?
+    # a full browser-like header set (many headers, incl. priority + sec-fetch-*)
+    bc=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
+        -H 'user-agent: Mozilla/5.0 Firefox/128.0' -H 'accept: text/html,*/*' \
+        -H 'accept-language: en-US' -H 'accept-encoding: gzip, br' \
+        -H 'priority: u=0, i' -H 'sec-fetch-dest: document' \
+        -H 'sec-fetch-mode: navigate' -H 'te: trailers' "$u/hello.txt")
+    [ "$bc" = "200" ]
+    check "http2 browser-like header set served" $?
+    # several resources multiplexed on one connection (a page load), each with a
+    # priority header, all 200 (per-URL -o so bodies do not leak into -w output)
+    mpd=$(mktemp -d)
+    mc=$(curl -s --http2 --cacert $CA $rl --parallel -H 'priority: u=3, i' \
+        -w '%{http_code}\n' \
+        "$u/hello.txt" -o "$mpd/a" \
+        "$u/big.txt" -o "$mpd/b" \
+        "$u/style.css" -o "$mpd/c" | sort -u | tr -d '\n')
+    rm -rf "$mpd"
+    [ "$mc" = "200" ]
+    check "http2 concurrent multiplexed requests with priority (page load)" $?
     # HEAD: headers only, no body
     hb=$(curl -s --http2 -I --cacert $CA $rl "$u/hello.txt" | grep -ci .)
     hd=$(curl -s --http2 -I --cacert $CA $rl "$u/hello.txt" | grep -qi 'content-length: 18' && echo ok)
