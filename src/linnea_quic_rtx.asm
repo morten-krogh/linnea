@@ -30,16 +30,18 @@ section .text
 ; to size for a real congestion window (hundreds of packets). bytes_in_flight is
 ; maintained here so the pump can gate on cwnd without scanning.
 
-; linnea_quic_txchunk_record(rdi=conn, rsi=pn, rdx=offset, rcx=len, r8=now ms)
-;   -> rax = 1 recorded, 0 = table full (the pump checks room before sending).
+; linnea_quic_txchunk_record(rdi=conn, rsi=pn, rdx=offset, rcx=len, r8=now ms,
+;   r9=stream index) -> rax = 1 recorded, 0 = table full (the pump checks room
+;   before sending). len is added to both the connection-wide in-flight total and
+;   the recording stream's own counter, so each stream knows when it is drained.
 linnea_quic_txchunk_record:
     lea rax, [rdi + linnea_quic_conn.tx_infl]
-    mov r9d, LINNEA_QUIC_TXINFL_SLOTS
+    mov r10d, LINNEA_QUIC_TXINFL_SLOTS
 .scan:
     cmp qword [rax + linnea_quic_txchunk.in_use], 0
     je .free
     add rax, linnea_quic_txchunk_size
-    dec r9d
+    dec r10d
     jnz .scan
     xor eax, eax
     ret
@@ -50,7 +52,11 @@ linnea_quic_txchunk_record:
     mov [rax + linnea_quic_txchunk.off], rdx
     mov [rax + linnea_quic_txchunk.len], rcx
     mov qword [rax + linnea_quic_txchunk.tries], 0
+    mov [rax + linnea_quic_txchunk.ctx], r9
     add [rdi + linnea_quic_conn.bytes_in_flight], rcx
+    imul r9, r9, linnea_quic_txstream_size
+    add r9, rdi
+    add [r9 + linnea_quic_conn.tx_streams + linnea_quic_txstream.inflight], rcx
     mov eax, 1
     ret
 
@@ -73,6 +79,10 @@ linnea_quic_txchunk_ack:
     mov rax, [r8 + linnea_quic_txchunk.len]
     add r9, rax
     sub [rdi + linnea_quic_conn.bytes_in_flight], rax
+    mov r10, [r8 + linnea_quic_txchunk.ctx]        ; and its stream's own counter
+    imul r10, r10, linnea_quic_txstream_size
+    add r10, rdi
+    sub [r10 + linnea_quic_conn.tx_streams + linnea_quic_txstream.inflight], rax
 .next:
     add r8, linnea_quic_txchunk_size
     dec ecx

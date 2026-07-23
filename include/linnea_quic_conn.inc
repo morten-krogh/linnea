@@ -85,10 +85,14 @@ LINNEA_QUIC_EARLY_BUF   equ 1024
 ; every QUIC path must carry (RFC 9000 s14.1): short header (11) + chunk + the
 ; STREAM header and a leading ACK (~30) + AEAD tag (16) stays comfortably under.
 ; The stream's first bytes are the HTTP/3 HEADERS frame and the DATA frame
-; header, kept per connection in tx_hdr; the body bytes come straight from the
-; file mapping. One response stream is in flight at a time.
+; header, kept per stream in its slot's hdr; the body bytes come straight from
+; the file mapping. Up to LINNEA_QUIC_TXSTREAMS responses stream at once (a
+; browser page load fires several large requests concurrently), interleaved
+; chunk by chunk by the pump; a request that arrives with every slot busy is
+; refused with a retryable 503.
 LINNEA_QUIC_TX_CHUNK    equ 1100    ; stream bytes per 1-RTT packet
 LINNEA_QUIC_TX_HDR      equ 128     ; HEADERS frame + DATA frame header prefix cap
+LINNEA_QUIC_TXSTREAMS   equ 8       ; response streams in flight at once
 
 ; Congestion control (RFC 9002 NewReno). The response is ack-clocked, but by a
 ; congestion window that GROWS rather than the fixed 8-packet loss ring — without
@@ -112,6 +116,25 @@ struc linnea_quic_txchunk
     .off:      resq 1               ; the chunk's stream offset (to rebuild it)
     .len:      resq 1               ; chunk length (stream bytes; for bytes_in_flight)
     .tries:    resq 1               ; retransmissions so far
+    .ctx:      resq 1               ; which response stream (index into tx_streams)
+endstruc
+
+; One open response stream. A body too large for one packet stays mmap'd here and
+; is sent as STREAM-frame chunks. Stream byte i is hdr[i] while i < hlen (the
+; HTTP/3 HEADERS frame and DATA frame header), and file byte i - hlen after that.
+; fc_max is the client's per-stream window (initial_max_stream_data, grown by
+; MAX_STREAM_DATA); inflight is this stream's own unacknowledged chunk bytes, so
+; its mapping is released the moment it is both fully sent and fully acknowledged.
+struc linnea_quic_txstream
+    .active:   resq 1
+    .sid:      resq 1               ; the request stream being answered
+    .base:     resq 1               ; the response file's mapping
+    .size:     resq 1               ; and its size
+    .hlen:     resq 1               ; stream bytes held in hdr
+    .off:      resq 1               ; next stream offset to send
+    .fc_max:   resq 1               ; max stream offset the client will accept
+    .inflight: resq 1               ; this stream's unacknowledged chunk bytes
+    .hdr:      resb LINNEA_QUIC_TX_HDR
 endstruc
 
 struc linnea_quic_sent
@@ -188,32 +211,27 @@ struc linnea_quic_conn
     .ra_final:   resq 1             ; the stream's total size (valid once ra_fin)
     .ra_buf:     resb LINNEA_QUIC_RA_BUF
     .ra_seen:    resb LINNEA_QUIC_RA_BUF   ; byte i = 1 once stream byte i has arrived
-    ; the open response stream (one at a time): a body too large for one packet
-    ; stays mmap'd here and is sent as STREAM-frame chunks, ack-clocked by the
-    ; sent ring above. Stream byte i is tx_hdr[i] while i < tx_hlen (the HTTP/3
-    ; HEADERS frame and DATA frame header), and file byte i - tx_hlen after that.
-    .tx_active:  resq 1             ; 1 while a chunked response is in flight
-    .tx_sid:     resq 1             ; the request stream being answered
-    .tx_base:    resq 1             ; the response file's mapping
-    .tx_size:    resq 1             ; and its size
-    .tx_hlen:    resq 1             ; stream bytes held in tx_hdr
-    .tx_off:     resq 1             ; next stream offset to send
+    ; the open response streams (up to LINNEA_QUIC_TXSTREAMS at once): each slot
+    ; holds one large response's mapping, head and progress; the pump interleaves
+    ; their chunks over the shared congestion window and in-flight table below.
+    .tx_streams: resb LINNEA_QUIC_TXSTREAMS * linnea_quic_txstream_size
     ; Flow control (RFC 9000 s4). The client caps how much stream data we may send:
-    ; per stream by initial_max_stream_data_bidi_local, grown by MAX_STREAM_DATA;
-    ; per connection by initial_max_data, grown by MAX_DATA. We send only up to
-    ; those limits and wait for the client to raise them as it consumes — so a
-    ; response larger than the initial window streams within it rather than being
-    ; refused. fc_conn_sent is the running total of response-stream bytes sent.
-    .fc_stream_max: resq 1          ; max stream offset the client will accept
+    ; per stream by initial_max_stream_data_bidi_local (grown by MAX_STREAM_DATA,
+    ; held per slot in .fc_max); per connection by initial_max_data, grown by
+    ; MAX_DATA. We send only up to those limits and wait for the client to raise
+    ; them as it consumes — so a response larger than the initial window streams
+    ; within it rather than being refused. fc_stream_init is the per-stream initial
+    ; applied to each new slot; fc_conn_sent is the running total sent conn-wide.
+    .fc_stream_init: resq 1         ; the initial per-stream window (new slots start here)
     .fc_conn_max:   resq 1          ; max total data the client will accept
     .fc_conn_sent:  resq 1          ; response-stream bytes sent against fc_conn_max
-    ; congestion control for the open response stream (RFC 9002 NewReno)
+    ; congestion control shared by the open response streams (RFC 9002 NewReno):
+    ; one packet-number space and one path, so one window over all of them.
     .cwnd:       resq 1             ; congestion window in bytes (0 = uninitialised)
     .ssthresh:   resq 1             ; slow-start threshold in bytes
-    .bytes_in_flight: resq 1        ; stream-chunk bytes sent but not yet acknowledged
+    .bytes_in_flight: resq 1        ; unacknowledged stream-chunk bytes across all streams
     .cc_recovery_pn: resq 1         ; largest pn when recovery began (loss dedup)
     .tx_infl:    resb LINNEA_QUIC_TXINFL_SLOTS * linnea_quic_txchunk_size
-    .tx_hdr:     resb LINNEA_QUIC_TX_HDR
     ; ClientHello reassembly (RFC 9000 7.5): the client's original DCID identifies
     ; the handshake before we have issued our own connection id, so every Initial
     ; of one handshake — including the later packets of a ClientHello too large

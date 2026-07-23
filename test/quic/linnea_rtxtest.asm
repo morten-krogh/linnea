@@ -172,6 +172,7 @@ _start:
     mov edx, 0                      ; offset
     mov ecx, 1100                   ; len
     xor r8d, r8d
+    xor r9d, r9d                    ; stream index 0
     call linnea_quic_txchunk_record
     EXPECT rax, 1
     lea rdi, [conn]
@@ -179,6 +180,7 @@ _start:
     mov edx, 1100
     mov ecx, 1100
     xor r8d, r8d
+    xor r9d, r9d
     call linnea_quic_txchunk_record
     EXPECT rax, 1
     mov rax, [conn + linnea_quic_conn.bytes_in_flight]
@@ -210,6 +212,7 @@ _start:
     mov edx, 0
     mov ecx, 1100
     xor r8d, r8d
+    xor r9d, r9d
     call linnea_quic_txchunk_record
     inc r12d
     cmp r12d, LINNEA_QUIC_TXINFL_SLOTS
@@ -219,6 +222,7 @@ _start:
     mov edx, 0
     mov ecx, 1100
     xor r8d, r8d
+    xor r9d, r9d
     call linnea_quic_txchunk_record
     EXPECT rax, 0                    ; full: caller must wait for acks
     lea rdi, [conn]

@@ -418,6 +418,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_big_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): large response streamed in chunks (loss + interleave + 503)" $?
 
+    # four large (chunked) responses requested at once: all stream concurrently,
+    # interleaved by the pump over the shared congestion window, none refused —
+    # each arrives byte-exact. This is a full browser page load (a 503 on a
+    # concurrent large request made Firefox abandon h3 for h2).
+    python3 test/quic/h3_queue_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): four concurrent large responses, all intact" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1
