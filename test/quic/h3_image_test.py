@@ -46,8 +46,21 @@ s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(0.5)
 
 
+# A virtual clock that advances on every use. aioquic decides when to send ACKs
+# from the time it is told, so a real-time clock over fast loopback (where a loop
+# iteration is microseconds) makes it defer ACKs and starve the transfer — an
+# artefact of this drive loop, not the server. Advancing the clock deliberately,
+# as a real event loop effectively does, makes it acknowledge promptly.
+vt = [0.0]
+
+
+def clk():
+    vt[0] += 0.02
+    return vt[0]
+
+
 def flush():
-    for d, _ in conn.datagrams_to_send(now=time.time()):
+    for d, _ in conn.datagrams_to_send(now=clk()):
         s.sendto(d, ADDR)
 
 
@@ -55,13 +68,10 @@ flush()
 while not conn._handshake_confirmed:
     try:
         r, _ = s.recvfrom(4096)
-        conn.receive_datagram(r, ADDR, now=time.time())
+        conn.receive_datagram(r, ADDR, now=clk())
     except socket.timeout:
-        pass
+        conn.handle_timer(now=clk())
     flush()
-    t = conn.get_timer()
-    if t and t <= time.time():
-        conn.handle_timer(now=time.time())
 while conn.next_event():
     pass
 
@@ -80,11 +90,9 @@ while not fin and time.time() < deadline:
     try:
         r, _ = s.recvfrom(4096)
     except socket.timeout:
-        t = conn.get_timer()
-        if t and t <= time.time():
-            conn.handle_timer(now=time.time())
+        conn.handle_timer(now=clk())
         continue
-    conn.receive_datagram(r, ADDR, now=time.time())
+    conn.receive_datagram(r, ADDR, now=clk())
     ev = conn.next_event()
     while ev:
         if isinstance(ev, StreamDataReceived) and ev.stream_id == sid:

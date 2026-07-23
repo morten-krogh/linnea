@@ -13,11 +13,11 @@ default rel
 global _start
 
 extern linnea_quic_rtx_record
-extern linnea_quic_rtx_record_ref
 extern linnea_quic_rtx_ack_range
 extern linnea_quic_rtx_inflight
-extern linnea_quic_rtx_ref_count
-extern linnea_quic_rtx_ref_clear
+extern linnea_quic_txchunk_record
+extern linnea_quic_txchunk_ack
+extern linnea_quic_txchunk_clear
 extern linnea_quic_ack_ranges
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
@@ -163,72 +163,66 @@ _start:
     INFLIGHT
     EXPECT rax, 0
 
-    ; --- stream-ref records: a chunked response's loss bookkeeping ---
-    ; record two chunks by reference and one small reply by copy
+    ; --- response-stream in-flight table (the congestion-controlled window) ---
+    lea rdi, [conn]                 ; start clean
+    call linnea_quic_txchunk_clear
+    ; record two chunks; bytes_in_flight tracks their lengths
     lea rdi, [conn]
-    mov esi, 20                      ; pn
-    mov edx, 0                       ; stream offset
-    mov ecx, 1100                    ; chunk length
+    mov esi, 40                     ; pn
+    mov edx, 0                      ; offset
+    mov ecx, 1100                   ; len
     xor r8d, r8d
-    call linnea_quic_rtx_record_ref
-    EXPECT rax, 1                    ; tracked
+    call linnea_quic_txchunk_record
+    EXPECT rax, 1
     lea rdi, [conn]
-    mov esi, 21
+    mov esi, 41
     mov edx, 1100
     mov ecx, 1100
     xor r8d, r8d
-    call linnea_quic_rtx_record_ref
+    call linnea_quic_txchunk_record
     EXPECT rax, 1
-    RECORD 22
-    INFLIGHT
-    EXPECT rax, 3                    ; both kinds share the ring
+    mov rax, [conn + linnea_quic_conn.bytes_in_flight]
+    EXPECT rax, 2200
+    ; ack the first chunk: returns its bytes, drops bytes_in_flight
     lea rdi, [conn]
-    call linnea_quic_rtx_ref_count
-    EXPECT rax, 2                    ; but only the chunks are stream refs
-    ; the offset and length drive a rebuild — they must round-trip
-    mov rax, [conn + linnea_quic_conn.sent + linnea_quic_sent_size + linnea_quic_sent.s_off]
+    mov esi, 40
+    mov edx, 40
+    call linnea_quic_txchunk_ack
+    EXPECT rax, 1100                ; bytes acknowledged
+    mov rax, [conn + linnea_quic_conn.bytes_in_flight]
     EXPECT rax, 1100
-    mov rax, [conn + linnea_quic_conn.sent + linnea_quic_sent_size + linnea_quic_sent.len]
-    EXPECT rax, 1100
-    ; acknowledging a chunk releases its slot like any packet
-    ACKRANGE 20, 20
+    ; acking a pn not in flight frees nothing
     lea rdi, [conn]
-    call linnea_quic_rtx_ref_count
-    EXPECT rax, 1
-    ; aborting the stream drops the remaining refs but not the copied reply
-    lea rdi, [conn]
-    call linnea_quic_rtx_ref_clear
-    lea rdi, [conn]
-    call linnea_quic_rtx_ref_count
+    mov esi, 99
+    mov edx, 99
+    call linnea_quic_txchunk_ack
     EXPECT rax, 0
-    INFLIGHT
-    EXPECT rax, 1                    ; the small reply is still tracked
-    ACKRANGE 22, 22
-    INFLIGHT
+    ; clear zeroes bytes_in_flight
+    lea rdi, [conn]
+    call linnea_quic_txchunk_clear
+    mov rax, [conn + linnea_quic_conn.bytes_in_flight]
     EXPECT rax, 0
-    ; a full ring refuses a ref (the pump treats that as a closed window)
+    ; the table is bounded: filling it, one more record is refused
     xor r12d, r12d
-.rfill:
+.tcfill:
     lea rdi, [conn]
-    lea rsi, [r12 + 200]
+    lea rsi, [r12 + 500]            ; distinct pns
     mov edx, 0
-    mov ecx, 100
+    mov ecx, 1100
     xor r8d, r8d
-    call linnea_quic_rtx_record_ref
+    call linnea_quic_txchunk_record
     inc r12d
-    cmp r12d, LINNEA_QUIC_RTX_SLOTS
-    jb .rfill
+    cmp r12d, LINNEA_QUIC_TXINFL_SLOTS
+    jb .tcfill
     lea rdi, [conn]
-    mov esi, 300
+    mov esi, 9000
     mov edx, 0
-    mov ecx, 100
+    mov ecx, 1100
     xor r8d, r8d
-    call linnea_quic_rtx_record_ref
-    EXPECT rax, 0                    ; ring full: not tracked, caller must wait
+    call linnea_quic_txchunk_record
+    EXPECT rax, 0                    ; full: caller must wait for acks
     lea rdi, [conn]
-    call linnea_quic_rtx_ref_clear
-    INFLIGHT
-    EXPECT rax, 0
+    call linnea_quic_txchunk_clear
 
     ; print "quic-rtx <pass>/<total>\n"
     lea rdi, [msg_head]

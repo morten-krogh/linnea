@@ -71,11 +71,10 @@ extern linnea_quic_ack_record
 extern linnea_quic_build_ack
 extern linnea_quic_ack_ranges
 extern linnea_quic_rtx_record
-extern linnea_quic_rtx_record_ref
 extern linnea_quic_rtx_ack_range
-extern linnea_quic_rtx_inflight
-extern linnea_quic_rtx_ref_count
-extern linnea_quic_rtx_ref_clear
+extern linnea_quic_txchunk_record
+extern linnea_quic_txchunk_ack
+extern linnea_quic_txchunk_clear
 extern linnea_quic_tp_parse
 extern linnea_quic_conn_free_hook
 extern linnea_h3_tx_cap
@@ -148,6 +147,7 @@ s_body_ptr:  resq 1                   ; request body captured by read_headers
 s_body_len:  resq 1
 s_txc_pn:    resq 1                   ; packet number a chunk just went out under
 s_ini_pn:    resq 1                   ; the Initial packet number being reassembled
+s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK freed
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 ch_out:      resb linnea_quic_ch_size
@@ -974,14 +974,25 @@ linnea_quic_server_datagram:
     jz .acks_done
     lea rbx, [ack_ranges]
     mov rbp, rax                     ; pair count
+    mov qword [s_cc_acked], 0        ; response-stream bytes this ACK releases
 .ack_free:
     mov rdi, [cur_conn]
     mov rsi, [rbx]                   ; smallest
     mov rdx, [rbx + 8]               ; largest
-    call linnea_quic_rtx_ack_range
+    call linnea_quic_rtx_ack_range   ; the small-reply / control loss ring
+    mov rdi, [cur_conn]
+    mov rsi, [rbx]
+    mov rdx, [rbx + 8]
+    call linnea_quic_txchunk_ack     ; the response-stream in-flight table
+    add [s_cc_acked], rax
     add rbx, 16
     dec rbp
     jnz .ack_free
+    ; grow the congestion window by the response-stream bytes just acknowledged
+    mov rdi, [s_cc_acked]
+    test rdi, rdi
+    jz .acks_done
+    call cc_on_ack
 .acks_done:
     ; a peer that closes cleanly gets its slot back at once instead of waiting
     ; for the idle sweep — this is what keeps rapid connection churn from
@@ -1956,6 +1967,12 @@ tx_pump:
     push r15
     sub rsp, 8                        ; align the call sites
     mov rbx, [cur_conn]
+    ; initialise the congestion window the first time this connection sends a
+    ; chunked response (it persists and adapts across later responses).
+    cmp qword [rbx + linnea_quic_conn.cwnd], 0
+    jne .tp_loop
+    mov qword [rbx + linnea_quic_conn.cwnd], LINNEA_QUIC_INIT_CWND
+    mov qword [rbx + linnea_quic_conn.ssthresh], LINNEA_QUIC_MAX_CWND
 .tp_loop:
     cmp qword [rbx + linnea_quic_conn.tx_active], 0
     je .tp_ret
@@ -1964,11 +1981,9 @@ tx_pump:
     mov r14, [rbx + linnea_quic_conn.tx_off]
     cmp r14, r13
     jb .tp_more
-    ; everything has been sent; delivered once nothing is still buffered
-    mov rdi, rbx
-    call linnea_quic_rtx_ref_count
-    test rax, rax
-    jnz .tp_ret                       ; chunks still awaiting acknowledgement
+    ; everything has been sent; delivered once nothing is still in flight
+    cmp qword [rbx + linnea_quic_conn.bytes_in_flight], 0
+    jne .tp_ret                       ; chunks still awaiting acknowledgement
     mov rdi, [rbx + linnea_quic_conn.tx_base]
     mov rsi, [rbx + linnea_quic_conn.tx_size]
     mov eax, LINNEA_SYS_MUNMAP
@@ -1976,16 +1991,19 @@ tx_pump:
     mov qword [rbx + linnea_quic_conn.tx_active], 0
     jmp .tp_ret
 .tp_more:
-    mov rdi, rbx
-    call linnea_quic_rtx_inflight
-    cmp rax, LINNEA_QUIC_RTX_SLOTS
-    jae .tp_ret                       ; window full: wait for acknowledgements
+    ; next chunk length = min(TX_CHUNK, remaining)
     mov r15, r13
     sub r15, r14                      ; stream bytes left
     cmp r15, LINNEA_QUIC_TX_CHUNK
     jbe .tp_len
     mov r15, LINNEA_QUIC_TX_CHUNK
 .tp_len:
+    ; congestion gate: send only while bytes_in_flight + this chunk <= cwnd.
+    ; cwnd is capped at the in-flight table size, so a slot is always free here.
+    mov rax, [rbx + linnea_quic_conn.bytes_in_flight]
+    add rax, r15
+    cmp rax, [rbx + linnea_quic_conn.cwnd]
+    ja .tp_ret                        ; window full: wait for acknowledgements
     mov rdi, r14
     mov rsi, r15
     call tx_emit_chunk                ; rax = the packet number it went out under
@@ -1994,9 +2012,9 @@ tx_pump:
     mov r8, rax
     mov rdi, rbx
     mov rsi, [s_txc_pn]
-    mov rdx, r14
-    mov rcx, r15
-    call linnea_quic_rtx_record_ref   ; cannot fail: a slot was free above
+    mov rdx, r14                      ; stream offset
+    mov rcx, r15                      ; chunk length
+    call linnea_quic_txchunk_record   ; records it and adds to bytes_in_flight
     add r14, r15
     mov [rbx + linnea_quic_conn.tx_off], r14
     jmp .tp_loop
@@ -2006,6 +2024,51 @@ tx_pump:
     pop r14
     pop r13
     pop rbx
+    ret
+
+; cc_on_ack(rdi = bytes newly acknowledged) — grow the congestion window
+; (RFC 9002 7.3). Slow start (cwnd < ssthresh): cwnd += acked, doubling per round
+; trip. Congestion avoidance: cwnd += MTU * acked / cwnd, about a packet per round
+; trip. Capped at the in-flight table's capacity. cur_conn is the connection.
+cc_on_ack:
+    mov rcx, [cur_conn]
+    mov rax, [rcx + linnea_quic_conn.cwnd]
+    cmp rax, [rcx + linnea_quic_conn.ssthresh]
+    jae .cc_avoid
+    add rax, rdi                      ; slow start: += bytes acked
+    jmp .cc_cap
+.cc_avoid:
+    mov r8, rax                       ; keep cwnd (the divisor)
+    mov rax, LINNEA_QUIC_TX_CHUNK
+    mul rdi                           ; rdx:rax = MTU * acked
+    div r8                            ; rax = MTU*acked / cwnd
+    add rax, r8                       ; cwnd += that
+.cc_cap:
+    cmp rax, LINNEA_QUIC_MAX_CWND
+    jbe .cc_store
+    mov rax, LINNEA_QUIC_MAX_CWND
+.cc_store:
+    mov [rcx + linnea_quic_conn.cwnd], rax
+    ret
+
+; cc_on_loss(rdi = conn, rsi = the lost chunk's pn) — a chunk timed out; treat it
+; as congestion and halve the window (RFC 9002 7.3.2). Reduced at most once per
+; round trip: a loss whose packet was sent before the current recovery window
+; began does not reduce cwnd again. cc_recovery_pn marks where recovery started.
+cc_on_loss:
+    cmp rsi, [rdi + linnea_quic_conn.cc_recovery_pn]
+    jbe .clo_ret                      ; already in recovery for a later packet
+    mov rax, [rdi + linnea_quic_conn.cwnd]
+    shr rax, 1                        ; cwnd / 2
+    cmp rax, LINNEA_QUIC_MIN_CWND
+    jae .clo_floor
+    mov eax, LINNEA_QUIC_MIN_CWND
+.clo_floor:
+    mov [rdi + linnea_quic_conn.ssthresh], rax
+    mov [rdi + linnea_quic_conn.cwnd], rax
+    mov rax, [rdi + linnea_quic_conn.pn_1rtt]   ; recovery covers all sent so far
+    mov [rdi + linnea_quic_conn.cc_recovery_pn], rax
+.clo_ret:
     ret
 
 ; tx_abort(rdi=conn) — the response stream cannot continue (its peer stopped
@@ -2024,7 +2087,7 @@ tx_abort:
     syscall
     mov qword [rbx + linnea_quic_conn.tx_active], 0
     mov rdi, rbx
-    call linnea_quic_rtx_ref_clear
+    call linnea_quic_txchunk_clear
 .ta_ret:
     pop rbx
     ret
@@ -2079,34 +2142,15 @@ linnea_quic_server_rtx_sweep:
     jb .sw_rec_next                   ; not yet due
     cmp qword [r14 + linnea_quic_sent.tries], LINNEA_QUIC_PTO_MAX
     jb .sw_resend
-    ; given up on. A stream-ref chunk cannot be dropped alone — the stream
-    ; would keep a permanent hole — so its whole response is aborted (unmapped,
-    ; every buffered chunk dropped); the idle sweep will reclaim the peer.
-    cmp qword [r14 + linnea_quic_sent.kind], LINNEA_QUIC_KIND_STREAM_REF
-    jne .sw_giveup
-    mov rdi, rbx
-    call tx_abort
-    jmp .sw_rec_next
-.sw_giveup:
-    mov qword [r14 + linnea_quic_sent.in_use], 0
+    mov qword [r14 + linnea_quic_sent.in_use], 0    ; a small reply given up on
     jmp .sw_rec_next
 .sw_resend:
     mov [cur_conn], rbx
-    cmp qword [r14 + linnea_quic_sent.kind], LINNEA_QUIC_KIND_STREAM_REF
-    je .sw_ref
     lea rax, [r14 + linnea_quic_sent.payload]
     mov [s_pl_ptr], rax
     mov rax, [r14 + linnea_quic_sent.len]
     mov [s_pl_len], rax
     call emit_1rtt                    ; rax = the fresh packet number; r12d = fd
-    jmp .sw_sent
-.sw_ref:
-    ; rebuild the chunk from the connection's tx state (the stream bytes at an
-    ; offset never change) and re-encrypt under a fresh number
-    mov rdi, [r14 + linnea_quic_sent.s_off]
-    mov rsi, [r14 + linnea_quic_sent.len]
-    call tx_emit_chunk                ; rax = the fresh packet number
-.sw_sent:
     mov [r14 + linnea_quic_sent.pn], rax
     mov [r14 + linnea_quic_sent.sent_ms], r15
     inc qword [r14 + linnea_quic_sent.tries]
@@ -2115,6 +2159,46 @@ linnea_quic_server_rtx_sweep:
     inc ebp
     cmp ebp, LINNEA_QUIC_RTX_SLOTS
     jb .sw_rec
+    ; --- the open response stream's chunks (the congestion-controlled table) ---
+    cmp qword [rbx + linnea_quic_conn.bytes_in_flight], 0
+    je .sw_conn_next                  ; nothing streaming: skip the scan
+    lea r14, [rbx + linnea_quic_conn.tx_infl]
+    xor ebp, ebp
+.sw_tc:
+    cmp qword [r14 + linnea_quic_txchunk.in_use], 0
+    je .sw_tc_next
+    mov rax, r15
+    sub rax, [r14 + linnea_quic_txchunk.sent_ms]      ; age in ms
+    mov rcx, [r14 + linnea_quic_txchunk.tries]
+    cmp rcx, LINNEA_QUIC_PTO_CAP
+    jbe .sw_tc_shift
+    mov ecx, LINNEA_QUIC_PTO_CAP
+.sw_tc_shift:
+    mov rdx, LINNEA_QUIC_PTO_MS
+    shl rdx, cl
+    cmp rax, rdx
+    jb .sw_tc_next                    ; not yet due
+    cmp qword [r14 + linnea_quic_txchunk.tries], LINNEA_QUIC_PTO_MAX
+    jb .sw_tc_resend
+    mov rdi, rbx                      ; given up: abort the whole response
+    call tx_abort                     ; (unmaps the file, clears the table)
+    jmp .sw_conn_next
+.sw_tc_resend:
+    mov [cur_conn], rbx
+    mov rdi, rbx                      ; a timeout is a congestion signal
+    mov rsi, [r14 + linnea_quic_txchunk.pn]
+    call cc_on_loss
+    mov rdi, [r14 + linnea_quic_txchunk.off]      ; rebuild from the file, fresh pn
+    mov rsi, [r14 + linnea_quic_txchunk.len]
+    call tx_emit_chunk                ; rax = the fresh packet number
+    mov [r14 + linnea_quic_txchunk.pn], rax
+    mov [r14 + linnea_quic_txchunk.sent_ms], r15
+    inc qword [r14 + linnea_quic_txchunk.tries]
+.sw_tc_next:
+    add r14, linnea_quic_txchunk_size
+    inc ebp
+    cmp ebp, LINNEA_QUIC_TXINFL_SLOTS
+    jb .sw_tc
 .sw_conn_next:
     inc r13d
     cmp r13d, LINNEA_QUIC_MAX_CONNS

@@ -45,24 +45,16 @@ LINNEA_QUIC_ST_NEW       equ 0      ; allocated, nothing processed yet
 LINNEA_QUIC_ST_HANDSHAKE equ 1      ; server flight sent, awaiting the client
 LINNEA_QUIC_ST_CONNECTED equ 2      ; client Finished verified, 1-RTT keys live
 
-; Loss recovery for the 1-RTT space. Every ack-eliciting packet we send is kept
-; here until the peer acknowledges it, so a lost copy can be resent — under a
-; fresh packet number, since QUIC forbids reusing one (RFC 9002 A.5). The frames
-; are stored, not the protected bytes, so a retransmission is re-encrypted with a
-; new number. The slot count bounds how much can be outstanding at once; the
-; payload cap is far above anything a single reply we build reaches today.
-; A record is one of two kinds: KIND_FRAMES keeps a copy of the frames it sent
-; (small replies); KIND_STREAM_REF keeps only a [stream offset, length) window
-; into the connection's open response stream (large bodies stay mmap'd once, not
-; copied per packet) — a retransmission rebuilds the STREAM frame from the file.
-; The ring is also the send window for a large response: chunks go out only
-; while a slot is free to track them, and acknowledgements free slots, so
-; delivery is ack-clocked and the outstanding data is bounded by the ring.
-LINNEA_QUIC_RTX_SLOTS   equ 8       ; outstanding 1-RTT packets tracked per conn
+; Loss recovery for the small-reply / control 1-RTT space. Every ack-eliciting
+; packet we send here is kept until the peer acknowledges it, so a lost copy can
+; be resent — under a fresh packet number, since QUIC forbids reusing one (RFC
+; 9002 A.5). The frames are stored, not the protected bytes, so a retransmission
+; is re-encrypted with a new number. Bulk response bodies are tracked separately
+; in the in-flight table below; this ring only holds the handshake completion,
+; control-stream setup and small inline responses, which are few.
+LINNEA_QUIC_RTX_SLOTS   equ 8       ; outstanding small-reply packets per conn
 LINNEA_QUIC_RTX_PAYLOAD equ 1500    ; frame bytes kept per packet
 LINNEA_QUIC_ACK_MAXR    equ 16      ; ACK ranges decoded from one incoming frame
-LINNEA_QUIC_KIND_FRAMES equ 0       ; record holds a copy of the frames
-LINNEA_QUIC_KIND_STREAM_REF equ 1   ; record references the open response stream
 
 ; Probe timeout: a buffered packet unacknowledged for this long is resent, under
 ; a fresh number. The threshold doubles per attempt (a lost reply on a slow or
@@ -98,14 +90,36 @@ LINNEA_QUIC_EARLY_BUF   equ 1024
 LINNEA_QUIC_TX_CHUNK    equ 1100    ; stream bytes per 1-RTT packet
 LINNEA_QUIC_TX_HDR      equ 128     ; HEADERS frame + DATA frame header prefix cap
 
+; Congestion control (RFC 9002 NewReno). The response is ack-clocked, but by a
+; congestion window that GROWS rather than the fixed 8-packet loss ring — without
+; this a bulk transfer is pinned at ~8.8 KB per round trip (600 KB took ~1 s on a
+; 15 ms path vs ~68 ms over TCP/h2). cwnd is in bytes; sending is allowed while
+; bytes_in_flight < cwnd. In slow start (cwnd < ssthresh) cwnd grows by the bytes
+; acknowledged (doubling per round trip); in congestion avoidance it grows about
+; one packet per round trip; a loss (a chunk given up to the PTO) halves it.
+; The window can't exceed what the in-flight table can track, so it is capped at
+; the table size. The table is lightweight — a stream chunk is rebuilt from the
+; file on retransmission, so only {pn, offset, length} is kept, not the bytes.
+LINNEA_QUIC_TXINFL_SLOTS equ 256    ; stream chunks trackable in flight at once
+LINNEA_QUIC_INIT_CWND    equ 11000  ; ~10 packets (RFC 9002 initial window)
+LINNEA_QUIC_MIN_CWND     equ 2200   ; 2 packets, the floor after a loss
+LINNEA_QUIC_MAX_CWND     equ LINNEA_QUIC_TXINFL_SLOTS * LINNEA_QUIC_TX_CHUNK
+
+struc linnea_quic_txchunk
+    .in_use:   resq 1
+    .pn:       resq 1               ; packet number it last went out under
+    .sent_ms:  resq 1               ; CLOCK_MONOTONIC ms when (re)sent, for the PTO
+    .off:      resq 1               ; the chunk's stream offset (to rebuild it)
+    .len:      resq 1               ; chunk length (stream bytes; for bytes_in_flight)
+    .tries:    resq 1               ; retransmissions so far
+endstruc
+
 struc linnea_quic_sent
     .in_use:   resq 1
     .pn:       resq 1               ; packet number it last went out under
     .sent_ms:  resq 1               ; CLOCK_MONOTONIC ms when (re)sent, for the PTO
-    .len:      resq 1               ; frame-payload length (or the chunk's length)
+    .len:      resq 1               ; frame-payload length
     .tries:    resq 1               ; retransmissions so far (0 = first send)
-    .kind:     resq 1               ; LINNEA_QUIC_KIND_FRAMES / _STREAM_REF
-    .s_off:    resq 1               ; KIND_STREAM_REF: the chunk's stream offset
     .payload:  resb LINNEA_QUIC_RTX_PAYLOAD
     .pad:      resb 4               ; round the record to a multiple of 8
 endstruc
@@ -189,6 +203,12 @@ struc linnea_quic_conn
                                     ; initial_max_stream_data_bidi_local) from its
                                     ; transport parameters. A larger response is
                                     ; refused (503) rather than overrun the window.
+    ; congestion control for the open response stream (RFC 9002 NewReno)
+    .cwnd:       resq 1             ; congestion window in bytes (0 = uninitialised)
+    .ssthresh:   resq 1             ; slow-start threshold in bytes
+    .bytes_in_flight: resq 1        ; stream-chunk bytes sent but not yet acknowledged
+    .cc_recovery_pn: resq 1         ; largest pn when recovery began (loss dedup)
+    .tx_infl:    resb LINNEA_QUIC_TXINFL_SLOTS * linnea_quic_txchunk_size
     .tx_hdr:     resb LINNEA_QUIC_TX_HDR
     ; ClientHello reassembly (RFC 9000 7.5): the client's original DCID identifies
     ; the handshake before we have issued our own connection id, so every Initial
