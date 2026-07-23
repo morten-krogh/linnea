@@ -438,6 +438,14 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_priority_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): responses scheduled by RFC 9218 priority" $?
 
+    # a size/boundary/request-style matrix: every response, from 0 bytes through
+    # the inline/chunked threshold and exact chunk multiples to 200 KB, must
+    # terminate (deliver a FIN) — sequentially reusing one connection, all at once
+    # under the priority scheduler, and as a HEAD. A request that never finishes
+    # fails here.
+    python3 test/quic/h3_matrix_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): size/boundary/HEAD/concurrent matrix all terminate" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1

@@ -2471,7 +2471,8 @@ linnea_quic_server_rtx_sweep:
     jb .sw_rec
     ; --- the open response stream's chunks (the congestion-controlled table) ---
     cmp qword [rbx + linnea_quic_conn.bytes_in_flight], 0
-    je .sw_conn_next                  ; nothing streaming: skip the scan
+    je .sw_pump                       ; nothing in flight: no chunks to probe, but the
+                                      ; pump may still need to run (below)
     lea r14, [rbx + linnea_quic_conn.tx_infl]
     xor ebp, ebp
 .sw_tc:
@@ -2516,6 +2517,14 @@ linnea_quic_server_rtx_sweep:
     inc ebp
     cmp ebp, LINNEA_QUIC_TXINFL_SLOTS
     jb .sw_tc
+.sw_pump:
+    ; drive the pump on the timer, not only on incoming acks. A response otherwise
+    ; stalls whenever no ack will arrive to run it: after a stalled head is given up
+    ; (tx_abort_one) nothing is in flight and the peer has nothing to ack, so the
+    ; next queued stream would never start. The pump is congestion-window gated, so
+    ; on a healthy connection it sends nothing here; on a stalled one it heals it.
+    mov [cur_conn], rbx
+    call tx_pump                      ; preserves rbx/rbp/r12/r13/r14/r15
 .sw_conn_next:
     inc r13d
     cmp r13d, LINNEA_QUIC_MAX_CONNS
