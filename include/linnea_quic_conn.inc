@@ -74,10 +74,15 @@ LINNEA_QUIC_LOSS_THRESH equ 3
 ; buffer: each frame is placed at its offset (out-of-order frames are buffered,
 ; not dropped), a parallel byte-map records which bytes have arrived, and the
 ; contiguous prefix length advances as gaps fill. The request is served once the
-; stream is complete (FIN seen and the prefix covers it). One reassembly is
-; tracked at a time — a whole request in a single packet (the common case) still
-; takes a copy-free fast path. Requests larger than this buffer are not served.
+; stream is complete (FIN seen and the prefix covers it). A whole request in a
+; single packet (the common case) still takes a copy-free fast path. Several
+; requests reassemble at once (LINNEA_QUIC_RA_CTXS contexts): under a burst,
+; frames from different streams interleave in one flight, and a single context
+; would drop all but one (the packet is already acknowledged, so the dropped
+; request is never retransmitted — it is lost, and the page stalls). Requests
+; larger than the buffer, or a burst deeper than the contexts, are still dropped.
 LINNEA_QUIC_RA_BUF      equ 8192    ; reassembly capacity for one request stream
+LINNEA_QUIC_RA_CTXS     equ 6       ; requests that can reassemble concurrently
 
 ; 0-RTT (early data): a resuming client can send its request in a 0-RTT packet
 ; coalesced with the ClientHello, before the handshake completes. The decrypted
@@ -159,6 +164,21 @@ struc linnea_quic_txstream
     .hdr:      resb LINNEA_QUIC_TX_HDR
 endstruc
 
+; One in-progress request-stream reassembly (see LINNEA_QUIC_RA_CTXS). A frame's
+; bytes go to buf at their stream offset, seen[i] marks byte i arrived, len is the
+; contiguous prefix from 0, hi the high-water of seen, and once fin is set final is
+; the total. The request is served when fin && len >= final.
+struc linnea_quic_ra
+    .active:   resq 1               ; 1 while this context is buffering a stream
+    .sid:      resq 1               ; the stream id it is reassembling
+    .len:      resq 1               ; contiguous bytes received from offset 0
+    .hi:       resq 1               ; highest offset+len seen (extent of the seen set)
+    .fin:      resq 1               ; the FIN has been seen
+    .final:    resq 1               ; the stream's total size (valid once fin)
+    .buf:      resb LINNEA_QUIC_RA_BUF
+    .seen:     resb LINNEA_QUIC_RA_BUF   ; byte i = 1 once stream byte i has arrived
+endstruc
+
 struc linnea_quic_sent
     .in_use:   resq 1
     .pn:       resq 1               ; packet number it last went out under
@@ -225,15 +245,8 @@ struc linnea_quic_conn
     .flight_ee_len: resq 1          ; EncryptedExtensions length (Certificate follows it)
     .flight_cv_len: resq 1          ; CertificateVerify length (Finished's 36 follow it)
     .flight_tail: resb LINNEA_QUIC_FLIGHT_TAIL   ; EE || CertVerify || Finished
-    ; request-stream reassembly (one stream at a time):
-    .ra_active:  resq 1             ; 1 while a multi-packet request is buffering
-    .ra_sid:     resq 1             ; the stream id being reassembled
-    .ra_len:     resq 1             ; contiguous bytes received from offset 0
-    .ra_hi:      resq 1             ; highest offset+len seen (extent of ra_seen set)
-    .ra_fin:     resq 1             ; the FIN has been seen
-    .ra_final:   resq 1             ; the stream's total size (valid once ra_fin)
-    .ra_buf:     resb LINNEA_QUIC_RA_BUF
-    .ra_seen:    resb LINNEA_QUIC_RA_BUF   ; byte i = 1 once stream byte i has arrived
+    ; request-stream reassembly: LINNEA_QUIC_RA_CTXS streams reassemble at once
+    .ra_ctx:     resb LINNEA_QUIC_RA_CTXS * linnea_quic_ra_size
     ; the open response streams (up to LINNEA_QUIC_TXSTREAMS at once): each slot
     ; holds one large response's mapping, head and progress; the pump interleaves
     ; their chunks over the shared congestion window and in-flight table below.

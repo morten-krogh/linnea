@@ -67,38 +67,37 @@ def req(sid):
     conn.send_stream_data(sid, vlq(1) + vlq(len(f)) + f, end_stream=True)
 
 
-# Issue the requests in small batches over the connection's life (as page loads /
-# refreshes do), draining each before the next. This opens far more than the
-# advertised 100 bidi streams on ONE connection, so it fails unless the server
-# raises the limit with MAX_STREAMS. (Small batches also keep each request within a
-# single packet, isolating this from the separate multi-packet-request reassembly
-# path.)
-done = set()
-opened = 0
-deadline = time.time() + 60
-while opened < N and time.time() < deadline:
-    batch = []
-    for _ in range(min(8, N - opened)):
-        sid = conn.get_next_available_stream_id()
-        req(sid)
-        batch.append(sid)
-        opened += 1
-    target = done | set(batch)
-    while not target <= done and time.time() < deadline:
-        flush()
-        try:
-            r, _ = s.recvfrom(4096)
-        except socket.timeout:
-            conn.handle_timer(now=clk())
-            continue
-        conn.receive_datagram(r, ("127.0.0.1", port), now=clk())
-        ev = conn.next_event()
-        while ev:
-            if isinstance(ev, StreamDataReceived) and ev.end_stream:
-                done.add(ev.stream_id)
-            ev = conn.next_event()
+# Fire all N requests at once — far more than the advertised 100 bidi streams on
+# ONE connection. This needs BOTH fixes together: the server must raise the peer's
+# limit with MAX_STREAMS (or the client can't open past ~100), and it must
+# reassemble the concurrent requests that split across packet boundaries in the
+# burst (or those are dropped and never retransmitted). Every one must complete.
+sids = []
+for _ in range(N):
+    sid = conn.get_next_available_stream_id()
+    req(sid)
+    sids.append(sid)
 
-assert len(done) >= N, (
-    f"only {len(done)}/{N} requests completed on one connection — the peer's bidi "
-    f"stream limit was not raised (MAX_STREAMS); a reused connection stalls past ~100")
-print(f"ok ({N} requests on one reused connection, all completed)")
+done = set()
+deadline = time.time() + 60
+while len(done) < N and time.time() < deadline:
+    flush()
+    try:
+        r, _ = s.recvfrom(4096)
+    except socket.timeout:
+        conn.handle_timer(now=clk())
+        continue
+    conn.receive_datagram(r, ("127.0.0.1", port), now=clk())
+    ev = conn.next_event()
+    while ev:
+        if isinstance(ev, StreamDataReceived) and ev.stream_id in sids and ev.end_stream:
+            done.add(ev.stream_id)
+        ev = conn.next_event()
+
+missing = [x for x in sids if x not in done]
+assert not missing, (
+    f"{len(missing)}/{N} requests did not complete on one connection "
+    f"(missing ordinals {[m // 4 + 1 for m in missing[:8]]}) — either the bidi "
+    f"stream limit was not raised (MAX_STREAMS) or concurrent requests that split "
+    f"across packets were dropped (reassembly).")
+print(f"ok ({N} concurrent requests on one reused connection, all completed)")
