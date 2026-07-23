@@ -423,6 +423,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_bigch_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): multi-packet ClientHello reassembled; no-x25519 refused" $?
 
+    # ngtcp2/curl fragments the ClientHello into many small CRYPTO frames sent out
+    # of offset order, several per packet; the reassembly must place each at its
+    # offset, not assume order (this is what made real browsers fall back to h2)
+    python3 test/quic/h3_frag_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): out-of-order multi-frame ClientHello reassembled" $?
+
     # session resumption: the real server issues a NewSessionTicket with the
     # early_data extension once the handshake completes
     python3 test/quic/h3_ticket_test.py 47452 >/dev/null 2>&1

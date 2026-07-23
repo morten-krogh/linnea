@@ -200,8 +200,13 @@ struc linnea_quic_conn
     .odcid_len:  resq 1
     .ch_len:     resq 1              ; contiguous ClientHello bytes reassembled
     .ch_total:   resq 1              ; full ClientHello size, 0 until the header lands
+    .ch_hi:      resq 1              ; highest offset+len seen (extent of ch_seen)
     .ch_maxpn:   resq 1              ; largest Initial packet number seen (for the ACK)
     .ch_buf:     resb LINNEA_QUIC_CH_BUF
+    ; A CRYPTO fragment can arrive out of order (ngtcp2 does this), so each is
+    ; placed at its offset and its bytes marked here; the contiguous prefix
+    ; (ch_len) advances as gaps fill, exactly like the request-stream reassembly.
+    .ch_seen:    resb LINNEA_QUIC_CH_BUF
     .pad:        resb 4              ; keep the size a multiple of 8
 endstruc
 

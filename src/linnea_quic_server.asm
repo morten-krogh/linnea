@@ -49,7 +49,6 @@ extern linnea_h3_read_headers
 extern linnea_h3_serve
 extern linnea_quic_initial_dcid
 extern linnea_quic_initial_secrets
-extern linnea_quic_recv_initial
 extern linnea_quic_ch_parse
 extern linnea_quic_build_sh
 extern linnea_quic_build_ee
@@ -62,6 +61,7 @@ extern linnea_quic_conn_alloc
 extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
 extern linnea_quic_protect
+extern linnea_quic_unprotect
 extern linnea_quic_unprotect_hs
 extern linnea_quic_unprotect_short
 extern linnea_quic_crypto_frame
@@ -97,7 +97,6 @@ extern linnea_quic_replay_check
 extern linnea_quic_hs_psk
 extern linnea_quic_early_ok
 extern linnea_quic_resume_issued
-
 section .rodata
 altsvc_pre:  db 'h3=":'
 altsvc_pre_len equ $ - altsvc_pre
@@ -148,6 +147,7 @@ s_sfin:      resq 1                   ; and whether its FIN bit is set
 s_body_ptr:  resq 1                   ; request body captured by read_headers
 s_body_len:  resq 1
 s_txc_pn:    resq 1                   ; packet number a chunk just went out under
+s_ini_pn:    resq 1                   ; the Initial packet number being reassembled
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 ch_out:      resb linnea_quic_ch_size
@@ -366,18 +366,37 @@ linnea_quic_server_datagram:
     CONNLEA rdx, ini_client
     CONNLEA rcx, ini_server
     call linnea_quic_initial_secrets
-    ; ClientHello CRYPTO fragment from this Initial
+    ; decrypt the Initial and fold every CRYPTO fragment it carries into the
+    ; connection's reassembly buffer. A packet can hold several CRYPTO frames and
+    ; a client (ngtcp2) may send them out of offset order, so we walk them all;
+    ; a ClientHello too large for one Initial completes across several packets.
     lea rdi, [linnea_quic_rxbuf]
     mov rsi, r13
-    lea rdx, [plaintext]
-    call linnea_quic_recv_initial    ; rax=frag, rdx=len, r8=offset, r9=pn
+    CONNLEA rdx, ini_client
+    lea rcx, [plaintext]
+    call linnea_quic_unprotect       ; rax = plaintext length, rdx = pn
     test rax, rax
-    jz .try_handshake                ; no ClientHello CRYPTO — maybe the Finished
-    ; fold the fragment into the connection's reassembly buffer; a ClientHello too
-    ; large for one Initial completes only once its later packets arrive.
-    call .ch_reassemble              ; rax = 1 if the ClientHello is now whole
+    js .try_handshake                ; not decryptable — maybe the client Finished
+    mov [s_ini_pn], rdx
+    lea r15, [plaintext]             ; walk cursor
+    lea r14, [plaintext + rax]       ; frames end
+.crypto_walk:
+    mov rdi, r15
+    mov rsi, r14
+    sub rsi, r15
+    jbe .crypto_none
+    call linnea_quic_crypto_frame    ; rax=CRYPTO ptr, rdx=len, r8=offset
     test rax, rax
-    jz .done                         ; still partial: wait for the next Initial
+    jz .crypto_none                  ; no further CRYPTO frame
+    lea r15, [rax + rdx]             ; resume past this frame's data
+    mov r9, [s_ini_pn]
+    call .ch_reassemble              ; rax = 1 once the ClientHello is whole
+    test rax, rax
+    jz .crypto_walk
+    jmp .ch_complete
+.crypto_none:
+    jmp .done                        ; still partial: wait for the next Initial
+.ch_complete:
     ; parse the reassembled ClientHello
     mov rcx, [cur_conn]
     lea rax, [rcx + linnea_quic_conn.ch_buf]
@@ -1323,14 +1342,16 @@ linnea_quic_server_datagram:
     rep movsb
     ret
 
+
 ; .ch_reassemble(rax = CRYPTO fragment ptr, rdx = length, r8 = offset,
 ;   r9 = Initial packet number) -> rax = 1 once the ClientHello is complete, else
-;   0. Folds one Initial's CRYPTO fragment into the connection's ch_buf in offset
-; order: a fragment starting past the contiguous end is a gap and is left for the
-; client to retransmit (Initial CRYPTO is normally in order). The full size is the
-; TLS handshake length in the offset-0 fragment; completion is ch_len >= ch_total.
-; The largest Initial packet number is tracked so the ServerHello can acknowledge
-; every Initial received, not just packet 0. The connection is [cur_conn].
+;   0. Places the fragment at its offset in ch_buf and marks its bytes in ch_seen;
+; the contiguous prefix (ch_len) then advances as far as the seen-map allows, so
+; fragments that arrive out of order (ngtcp2 sends the ClientHello's CRYPTO
+; fragments in a different order than their offsets) are buffered, not dropped.
+; The full size is the TLS handshake length in the offset-0 bytes; completion is
+; ch_len >= ch_total. The largest Initial packet number is tracked so the
+; ServerHello can acknowledge every Initial received. The connection is [cur_conn].
 .ch_reassemble:
     push rbx
     push r12
@@ -1349,26 +1370,43 @@ linnea_quic_server_datagram:
     lea rax, [r14 + r13]             ; fragment end
     cmp rax, LINNEA_QUIC_CH_BUF
     ja .cr_incomplete                ; past the buffer: refuse (ClientHello too big)
-    mov r15, [rbx + linnea_quic_conn.ch_len]
-    cmp r14, r15
-    ja .cr_incomplete                ; a gap before this fragment: wait for the filler
     test r13, r13
-    jz .cr_extent                    ; empty fragment
+    jz .cr_hi                        ; empty fragment: nothing to place
+    ; place the fragment at ch_buf[offset] and mark ch_seen[offset..+len]
     lea rdi, [rbx + linnea_quic_conn.ch_buf]
-    add rdi, r14                     ; ch_buf + offset
+    add rdi, r14
     mov rsi, r12
     mov rcx, r13
     rep movsb
-    mov rbx, [cur_conn]              ; rep movsb advanced rdi/rsi; rbx is untouched
-.cr_extent:
-    lea rax, [r14 + r13]             ; fragment end
-    cmp rax, r15
-    jbe .cr_haslen
-    mov [rbx + linnea_quic_conn.ch_len], rax
-    mov r15, rax                     ; new contiguous length
-.cr_haslen:
-    ; learn the full ClientHello size from the offset-0 fragment: the TLS
-    ; handshake header is type(1) + length(3), so total = 4 + that length.
+    mov rbx, [cur_conn]              ; rep movsb advanced rdi/rsi; rbx untouched
+    lea rdi, [rbx + linnea_quic_conn.ch_seen]
+    add rdi, r14
+    mov rcx, r13
+    mov al, 1
+    rep stosb
+    mov rbx, [cur_conn]
+.cr_hi:
+    ; extend the high-water mark to this fragment's end
+    lea rax, [r14 + r13]
+    cmp rax, [rbx + linnea_quic_conn.ch_hi]
+    jbe .cr_adv
+    mov [rbx + linnea_quic_conn.ch_hi], rax
+.cr_adv:
+    ; advance the contiguous prefix while the next byte has been seen
+    mov r15, [rbx + linnea_quic_conn.ch_len]
+    mov r10, [rbx + linnea_quic_conn.ch_hi]
+    lea rdi, [rbx + linnea_quic_conn.ch_seen]
+.cr_adv_loop:
+    cmp r15, r10
+    jae .cr_adv_done
+    cmp byte [rdi + r15], 0
+    je .cr_adv_done
+    inc r15
+    jmp .cr_adv_loop
+.cr_adv_done:
+    mov [rbx + linnea_quic_conn.ch_len], r15
+    ; learn the full ClientHello size once the offset-0 header is contiguous: the
+    ; TLS handshake header is type(1) + length(3), so total = 4 + that length.
     cmp qword [rbx + linnea_quic_conn.ch_total], 0
     jne .cr_check
     cmp r15, 4
