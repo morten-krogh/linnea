@@ -40,6 +40,14 @@ pay_len    equ $ - pay
 ; (covers 5..7), then one range with Gap=0, Length=0 (covers 3). Two ranges out.
 ackframe:  db 0x00, 0x01, 0x02, 0x07, 0x00, 0x01, 0x02, 0x00, 0x00
 ackframe_len equ $ - ackframe
+; the same ACK, but coalesced BEHIND a NEW_CONNECTION_ID and a MAX_DATA — as a
+; real browser sends it. ack_ranges must skip past them to the ACK, or the
+; in-flight chunks are never freed and the response stalls with its window full.
+ackframe_ncid: db 0x18, 0x01, 0x00, 0x04, 0xAA, 0xBB, 0xCC, 0xDD
+               db 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0
+               db 0x10, 0x41, 0x2C
+               db 0x02, 0x07, 0x00, 0x01, 0x02, 0x00, 0x00
+ackframe_ncid_len equ $ - ackframe_ncid
 ; flow_scan must reach flow-control credit bundled behind other frames, as a real
 ; browser sends it. NEW_CONNECTION_ID(seq 1, retire 0, cid len 4, 16-byte token),
 ; then MAX_DATA=300 (0x412c), then MAX_STREAM_DATA(stream 0)=500 (0x41f4).
@@ -151,6 +159,22 @@ _start:
     EXPECT rax, 3                     ; pair 1 smallest
     mov rax, [pairs + 24]
     EXPECT rax, 3                     ; pair 1 largest
+
+    ; --- the same ACK behind NEW_CONNECTION_ID + MAX_DATA is still decoded ---
+    lea rdi, [ackframe_ncid]
+    mov esi, ackframe_ncid_len
+    lea rdx, [pairs]
+    mov ecx, LINNEA_QUIC_ACK_MAXR
+    call linnea_quic_ack_ranges
+    EXPECT rax, 2                     ; both ranges reached past the leading frames
+    mov rax, [pairs]
+    EXPECT rax, 5
+    mov rax, [pairs + 8]
+    EXPECT rax, 7
+    mov rax, [pairs + 16]
+    EXPECT rax, 3
+    mov rax, [pairs + 24]
+    EXPECT rax, 3
 
     ; --- the two together: buffer 3,5,7; ingest the ACK; all released ---
     RECORD 3

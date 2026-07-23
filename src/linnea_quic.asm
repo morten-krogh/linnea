@@ -777,9 +777,147 @@ linnea_quic_ack_ranges:
     je .ack
     cmp al, 0x03                     ; ACK with ECN counts
     je .ack
-    jmp .ret                         ; any other frame: no leading ACK
+    ; A real peer coalesces its ACK BEHIND other frames (NEW_CONNECTION_ID, a
+    ; MAX_DATA, a retransmitted STREAM, ...), not always first, so skip every known
+    ; frame to reach it rather than giving up — a missed ACK never frees the buffered
+    ; packets or the in-flight response chunks, and the transfer stalls with its
+    ; congestion window full. Same complete walk as linnea_quic_stream_frame.
+    mov edx, eax
+    and edx, 0xf8
+    cmp edx, 0x08                    ; STREAM (0x08-0x0f)
+    je .astream
+    cmp al, 0x1e                     ; HANDSHAKE_DONE (no payload)
+    je .skip1
+    cmp al, 0x1a                     ; PATH_CHALLENGE (8 bytes)
+    je .askip8
+    cmp al, 0x1b                     ; PATH_RESPONSE (8 bytes)
+    je .askip8
+    cmp al, 0x18                     ; NEW_CONNECTION_ID
+    je .ancid
+    cmp al, 0x06                     ; CRYPTO (offset, length, data)
+    je .acrypto
+    cmp al, 0x07                     ; NEW_TOKEN (length, token)
+    je .atoken
+    cmp al, 0x04                     ; RESET_STREAM (3 varints)
+    je .av3
+    cmp al, 0x05                     ; STOP_SENDING (2 varints)
+    je .av2
+    cmp al, 0x11                     ; MAX_STREAM_DATA (2 varints)
+    je .av2
+    cmp al, 0x15                     ; STREAM_DATA_BLOCKED (2 varints)
+    je .av2
+    cmp al, 0x10                     ; MAX_DATA (1 varint)
+    je .av1
+    cmp al, 0x12                     ; MAX_STREAMS bidi (1 varint)
+    je .av1
+    cmp al, 0x13                     ; MAX_STREAMS uni (1 varint)
+    je .av1
+    cmp al, 0x14                     ; DATA_BLOCKED (1 varint)
+    je .av1
+    cmp al, 0x16                     ; STREAMS_BLOCKED bidi (1 varint)
+    je .av1
+    cmp al, 0x17                     ; STREAMS_BLOCKED uni (1 varint)
+    je .av1
+    cmp al, 0x19                     ; RETIRE_CONNECTION_ID (1 varint)
+    je .av1
+    jmp .ret                         ; truly unknown (e.g. CONNECTION_CLOSE): stop
 .skip1:
     inc rdi
+    jmp .scan
+.askip8:
+    add rdi, 9                       ; type byte + 8 fixed bytes
+    jmp .scan
+.av1:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    jmp .scan
+.av2:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    jmp .scan
+.av3:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    jmp .scan
+.atoken:
+    inc rdi
+    call linnea_quic_varint_decode   ; token length
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    add rdi, rax                      ; skip the token bytes
+    jmp .scan
+.acrypto:
+    inc rdi
+    call linnea_quic_varint_decode   ; offset
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; length
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    add rdi, rax                      ; skip the crypto data
+    jmp .scan
+.ancid:
+    inc rdi
+    call linnea_quic_varint_decode   ; sequence number
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; retire prior to
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    cmp rdi, rsi
+    jae .ret
+    movzx eax, byte [rdi]             ; connection id length
+    add rdi, 1
+    add rdi, rax                      ; skip the connection id
+    add rdi, 16                       ; skip the stateless reset token
+    jmp .scan
+.astream:
+    mov r12d, eax                    ; save the STREAM type bits (OFF/LEN/FIN)
+    inc rdi
+    call linnea_quic_varint_decode   ; stream id
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    test r12b, 0x04                  ; OFF present?
+    jz .astream_len
+    call linnea_quic_varint_decode   ; offset
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+.astream_len:
+    test r12b, 0x02                  ; LEN present?
+    jz .ret                          ; no LEN: data runs to the packet end — stop
+    call linnea_quic_varint_decode   ; length
+    test rdx, rdx
+    jz .ret
+    add rdi, rdx
+    add rdi, rax                      ; skip the stream data
     jmp .scan
 .ack:
     inc rdi                          ; past the type

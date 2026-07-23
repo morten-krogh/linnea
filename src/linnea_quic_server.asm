@@ -149,6 +149,7 @@ s_body_len:  resq 1
 s_txc_pn:    resq 1                   ; packet number a chunk just went out under
 s_tp_off:    resq 1                   ; a chunk's stream offset, held across the emit call
 s_tp_len:    resq 1                   ; and its length, for the in-flight record
+s_tp_seen:   resq 1                   ; slots visited this pump pass (round-robin bound)
 s_ini_pn:    resq 1                   ; the Initial packet number being reassembled
 s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK freed
 fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow scan
@@ -997,8 +998,13 @@ linnea_quic_server_datagram:
     ; grow the congestion window by the response-stream bytes just acknowledged
     mov rdi, [s_cc_acked]
     test rdi, rdi
-    jz .acks_done
+    jz .ack_detect
     call cc_on_ack
+.ack_detect:
+    ; then presume-lost and retransmit anything left far behind the largest acked
+    ; (RFC 9002 6.1.1) — prompt recovery instead of waiting out the PTO backoff.
+    mov rdi, [ack_ranges + 8]        ; largest acknowledged (pair 0 is the highest)
+    call tx_detect_loss
 .acks_done:
     ; a peer that closes cleanly gets its slot back at once instead of waiting
     ; for the idle sweep — this is what keeps rapid connection churn from
@@ -2054,9 +2060,13 @@ tx_pump:
     mov qword [rbx + linnea_quic_conn.ssthresh], LINNEA_QUIC_MAX_CWND
 .tp_scan:
     xor r15d, r15d                    ; r15b = progress made this pass
-    xor r14d, r14d                    ; r14 = stream index
-    lea rbp, [rbx + linnea_quic_conn.tx_streams]
+    mov r14, [rbx + linnea_quic_conn.tx_rr]   ; r14 = current slot index, from the
+    mov qword [s_tp_seen], 0                   ; round-robin cursor; visit all N once
 .tp_each:
+    mov rax, r14                      ; rbp = &tx_streams[r14]
+    imul rax, rax, linnea_quic_txstream_size
+    lea rbp, [rbx + linnea_quic_conn.tx_streams]
+    add rbp, rax
     cmp qword [rbp + linnea_quic_txstream.active], 0
     je .tp_next
     mov r13, [rbp + linnea_quic_txstream.hlen]
@@ -2117,13 +2127,27 @@ tx_pump:
     add [rbp + linnea_quic_txstream.off], rcx
     mov r15b, 1                        ; progress: another pass may send more
 .tp_next:
-    add rbp, linnea_quic_txstream_size
-    inc r14d
-    cmp r14d, LINNEA_QUIC_TXSTREAMS
+    inc r14                            ; next slot, wrapping round the ring
+    cmp r14, LINNEA_QUIC_TXSTREAMS
+    jb .tp_seen
+    xor r14d, r14d
+.tp_seen:
+    inc qword [s_tp_seen]
+    cmp qword [s_tp_seen], LINNEA_QUIC_TXSTREAMS
     jb .tp_each
     test r15b, r15b
     jnz .tp_scan                      ; a chunk went out this pass: sweep again
 .tp_ret:
+    ; advance the round-robin cursor one slot, so the next pump starts elsewhere —
+    ; a window too small to reach every stream in one pass then rotates who it feeds
+    ; rather than always starving the higher slots.
+    mov rax, [rbx + linnea_quic_conn.tx_rr]
+    inc rax
+    cmp rax, LINNEA_QUIC_TXSTREAMS
+    jb .tp_rr_store
+    xor eax, eax
+.tp_rr_store:
+    mov [rbx + linnea_quic_conn.tx_rr], rax
     pop r15
     pop r14
     pop r13
@@ -2174,6 +2198,65 @@ cc_on_loss:
     mov rax, [rdi + linnea_quic_conn.pn_1rtt]   ; recovery covers all sent so far
     mov [rdi + linnea_quic_conn.cc_recovery_pn], rax
 .clo_ret:
+    ret
+
+; tx_detect_loss(rdi = largest acknowledged pn) — ACK-based loss detection
+; (RFC 9002 6.1.1). Called on every incoming ACK: any in-flight response chunk
+; whose packet number is at least LINNEA_QUIC_LOSS_THRESH below the largest
+; acknowledged is presumed lost (that many later packets already arrived) and
+; retransmitted at once under a fresh packet number — so recovery takes ~1 RTT
+; instead of the growing PTO, which is what left tail loss stalling for seconds
+; under reordering. A chunk that has already exhausted its attempts is left for the
+; PTO sweep to abandon. cur_conn = conn, r12d = the UDP socket.
+tx_detect_loss:
+    push rbx
+    push rbp
+    push r13
+    push r14
+    push r15
+    mov rbx, [cur_conn]
+    cmp qword [rbx + linnea_quic_conn.bytes_in_flight], 0
+    je .dl_ret                        ; nothing streaming
+    mov r13, rdi                      ; largest acked (saved before now_ms clobbers rdi)
+    call now_ms
+    mov r15, rax                      ; now, for the resent chunk's sent_ms
+    cmp r13, LINNEA_QUIC_LOSS_THRESH
+    jb .dl_ret                        ; too few packets to declare anything lost
+    sub r13, LINNEA_QUIC_LOSS_THRESH  ; a chunk with pn <= this is lost
+    lea r14, [rbx + linnea_quic_conn.tx_infl]
+    xor ebp, ebp
+.dl_scan:
+    cmp qword [r14 + linnea_quic_txchunk.in_use], 0
+    je .dl_next
+    mov rax, [r14 + linnea_quic_txchunk.pn]
+    cmp rax, r13
+    ja .dl_next                       ; still within the reorder window: not lost
+    cmp qword [r14 + linnea_quic_txchunk.tries], LINNEA_QUIC_PTO_MAX
+    jae .dl_next                      ; out of attempts: the sweep will abandon it
+    mov rdi, rbx                      ; a loss is a congestion signal
+    mov rsi, rax
+    call cc_on_loss
+    mov rdi, [r14 + linnea_quic_txchunk.ctx]   ; rebuild from its stream's slot
+    imul rdi, rdi, linnea_quic_txstream_size
+    add rdi, rbx
+    lea rdi, [rdi + linnea_quic_conn.tx_streams]
+    mov rsi, [r14 + linnea_quic_txchunk.off]
+    mov rdx, [r14 + linnea_quic_txchunk.len]
+    call tx_emit_chunk                ; rax = the fresh packet number
+    mov [r14 + linnea_quic_txchunk.pn], rax
+    mov [r14 + linnea_quic_txchunk.sent_ms], r15
+    inc qword [r14 + linnea_quic_txchunk.tries]
+.dl_next:
+    add r14, linnea_quic_txchunk_size
+    inc ebp
+    cmp ebp, LINNEA_QUIC_TXINFL_SLOTS
+    jb .dl_scan
+.dl_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop rbp
+    pop rbx
     ret
 
 ; tx_abort(rdi=conn) — the response stream cannot continue (its peer stopped

@@ -64,6 +64,11 @@ LINNEA_QUIC_ACK_MAXR    equ 16      ; ACK ranges decoded from one incoming frame
 LINNEA_QUIC_PTO_MS      equ 250     ; base probe timeout, milliseconds
 LINNEA_QUIC_PTO_CAP     equ 4       ; largest backoff shift (250ms << 4 = 4s)
 LINNEA_QUIC_PTO_MAX     equ 6       ; attempts before a packet is given up on
+; ACK-based loss detection (RFC 9002 6.1.1): a response chunk left at least this
+; many packet numbers behind the largest acknowledged is treated as lost and
+; retransmitted at once, rather than waiting out the growing PTO — prompt recovery
+; under loss/reordering. 3 is the RFC's kPacketThreshold (tolerates 3-deep reorder).
+LINNEA_QUIC_LOSS_THRESH equ 3
 
 ; A request whose frames span several packets is reassembled in a per-connection
 ; buffer: each frame is placed at its offset (out-of-order frames are buffered,
@@ -235,6 +240,9 @@ struc linnea_quic_conn
     .ssthresh:   resq 1             ; slow-start threshold in bytes
     .bytes_in_flight: resq 1        ; unacknowledged stream-chunk bytes across all streams
     .cc_recovery_pn: resq 1         ; largest pn when recovery began (loss dedup)
+    .tx_rr:      resq 1             ; round-robin cursor: the slot the pump starts at
+                                    ; next, so a small (loss-shrunk) window is shared
+                                    ; fairly rather than starving the higher slots
     .tx_infl:    resb LINNEA_QUIC_TXINFL_SLOTS * linnea_quic_txchunk_size
     ; ClientHello reassembly (RFC 9000 7.5): the client's original DCID identifies
     ; the handshake before we have issued our own connection id, so every Initial

@@ -425,6 +425,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_queue_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): four concurrent large responses, all intact" $?
 
+    # concurrent large responses through an emulated lossy, REORDERING network
+    # (both directions), across several seeds — the conditions a real browser hits
+    # and that lockstep tests miss. Exercises ack-based fast retransmit and the
+    # round-robin pump; every stream must arrive byte-exact on every seed.
+    python3 test/quic/h3_stress_test.py 47452 6 6 3 >/dev/null 2>&1
+    check "h3 (io_uring): concurrent responses survive loss + reordering" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1
