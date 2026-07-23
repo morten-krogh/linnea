@@ -19,6 +19,7 @@ extern linnea_quic_txchunk_record
 extern linnea_quic_txchunk_ack
 extern linnea_quic_txchunk_clear
 extern linnea_quic_flow_scan
+extern linnea_quic_parse_priority
 extern linnea_quic_ack_ranges
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
@@ -62,6 +63,17 @@ fs_stream: db 0x12, 0x10
            db 0x0A, 0x03, 0x02, 0xAB, 0xCD
            db 0x11, 0x04, 0x42, 0xBC
 fs_stream_len equ $ - fs_stream
+; RFC 9218 priority field values (u = urgency 0-7, i = incremental)
+prio_ui:   db "u=1, i"
+prio_ui_len equ $ - prio_ui
+prio_u5:   db "u=5"
+prio_u5_len equ $ - prio_u5
+prio_i0:   db "i=?0, u=2"
+prio_i0_len equ $ - prio_i0
+prio_bare_i: db "i"
+prio_bare_i_len equ $ - prio_bare_i
+prio_bad:  db "u=9"                   ; out of range: falls back to the default
+prio_bad_len equ $ - prio_bad
 msg_head:  db "quic-rtx "
 msg_head_len equ $ - msg_head
 msg_slash: db "/"
@@ -304,6 +316,38 @@ _start:
     EXPECT rax, 0                    ; MAX_STREAM_DATA(0) is not for stream 7
     mov rax, [flow_out]
     EXPECT rax, 300                 ; but the connection MAX_DATA is still absorbed
+
+    ; --- RFC 9218 priority parse: urgency + incremental, with defaults ---
+    lea rdi, [prio_ui]
+    mov esi, prio_ui_len
+    call linnea_quic_parse_priority     ; "u=1, i"
+    EXPECT rax, 1
+    EXPECT rdx, 1
+    lea rdi, [prio_u5]
+    mov esi, prio_u5_len
+    call linnea_quic_parse_priority     ; "u=5" -> urgency 5, non-incremental
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_i0]
+    mov esi, prio_i0_len
+    call linnea_quic_parse_priority     ; "i=?0, u=2" -> urgency 2, incremental off
+    EXPECT rax, 2
+    EXPECT rdx, 0
+    lea rdi, [prio_bare_i]
+    mov esi, prio_bare_i_len
+    call linnea_quic_parse_priority     ; bare "i" -> default urgency, incremental
+    EXPECT rax, 3
+    EXPECT rdx, 1
+    lea rdi, [prio_bad]
+    mov esi, prio_bad_len
+    call linnea_quic_parse_priority     ; "u=9" out of range -> defaults
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    xor edi, edi                        ; no priority header (len 0) -> defaults
+    xor esi, esi
+    call linnea_quic_parse_priority
+    EXPECT rax, 3
+    EXPECT rdx, 0
 
     ; print "quic-rtx <pass>/<total>\n"
     lea rdi, [msg_head]

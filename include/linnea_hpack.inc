@@ -36,4 +36,6 @@ struc linnea_h2_req
     .listsize:    resq 1        ; running RFC 7541 4.1 size (bound guard)
     .scratch:     resq 1        ; bump cursor for Huffman output
     .scratch_end: resq 1        ; end of the scratch region
+    .prio_ptr:    resq 1        ; the `priority` field value (RFC 9218), 0 if absent
+    .prio_len:    resq 1
 endstruc

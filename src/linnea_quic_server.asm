@@ -77,6 +77,7 @@ extern linnea_quic_txchunk_ack
 extern linnea_quic_txchunk_clear
 extern linnea_quic_tp_parse
 extern linnea_quic_flow_scan
+extern linnea_quic_parse_priority
 extern linnea_quic_conn_free_hook
 extern linnea_h3_tx_cap
 extern linnea_quic_conn_slot
@@ -149,7 +150,8 @@ s_body_len:  resq 1
 s_txc_pn:    resq 1                   ; packet number a chunk just went out under
 s_tp_off:    resq 1                   ; a chunk's stream offset, held across the emit call
 s_tp_len:    resq 1                   ; and its length, for the in-flight record
-s_tp_seen:   resq 1                   ; slots visited this pump pass (round-robin bound)
+s_prio_u:    resq 1                   ; a request's parsed urgency (0-7)
+s_prio_i:    resq 1                   ; and incremental flag (0/1), for the slot fill
 s_ini_pn:    resq 1                   ; the Initial packet number being reassembled
 s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK freed
 fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow scan
@@ -1291,10 +1293,31 @@ linnea_quic_server_datagram:
 .serve_large:
     ; the response is a stream, not a packet: place its head and file mapping in a
     ; free response-stream slot and let the pump send it — chunk by chunk, shared
-    ; congestion- and flow-controlled, interleaved with the other open streams. The
-    ; head (HEADERS frame + DATA frame header, rax bytes at strm_pay + rbx) is
-    ; bounded by LINNEA_H3_HEAD_MAX, which fits the slot's hdr. tx_cap guaranteed a
-    ; free slot when it let linnea_h3_serve return a chunked response.
+    ; congestion- and flow-controlled, scheduled against the other open streams by
+    ; priority. The head (HEADERS frame + DATA frame header, rax bytes at strm_pay +
+    ; rbx) is bounded by LINNEA_H3_HEAD_MAX, which fits the slot's hdr. tx_cap
+    ; guaranteed a free slot when it let linnea_h3_serve return a chunked response.
+    ; First resolve the client's RFC 9218 priority (default urgency 3, non-
+    ; incremental), before the serve registers are reused for the slot fill.
+    mov qword [s_prio_u], 3
+    mov qword [s_prio_i], 0
+    mov r10, [req + linnea_h2_req.prio_ptr]
+    test r10, r10
+    jz .sl_find
+    push rax                          ; head length
+    push rbx                          ; head offset in strm_pay
+    push r8                           ; file base
+    push r9                           ; file size (4 pushes: 16-aligned for the call)
+    mov rdi, r10
+    mov rsi, [req + linnea_h2_req.prio_len]
+    call linnea_quic_parse_priority   ; rax = urgency, rdx = incremental
+    mov [s_prio_u], rax
+    mov [s_prio_i], rdx
+    pop r9
+    pop r8
+    pop rbx
+    pop rax
+.sl_find:
     mov rcx, [cur_conn]
     lea rdx, [rcx + linnea_quic_conn.tx_streams]
     mov r10d, LINNEA_QUIC_TXSTREAMS
@@ -1315,6 +1338,10 @@ linnea_quic_server_datagram:
     mov qword [rdx + linnea_quic_txstream.inflight], 0
     mov r10, [rcx + linnea_quic_conn.fc_stream_init]   ; this stream's own window
     mov [rdx + linnea_quic_txstream.fc_max], r10
+    mov r10, [s_prio_u]                                 ; the client's priority signal
+    mov [rdx + linnea_quic_txstream.urgency], r10
+    mov r10, [s_prio_i]
+    mov [rdx + linnea_quic_txstream.incremental], r10
     mov qword [rdx + linnea_quic_txstream.active], 1
     lea rsi, [strm_pay + rbx]
     lea rdi, [rdx + linnea_quic_txstream.hdr]
@@ -2035,16 +2062,16 @@ tx_emit_chunk:
     pop rbx
     ret
 
-; tx_pump — advance every open response stream, interleaving their chunks. One
-; pass over the slots sends at most one chunk per active stream (round-robin
-; fairness), then repeats while any pass made progress; sending stops the instant
-; the shared congestion window is full (wait for acks) or the connection flow
-; window is exhausted (wait for MAX_DATA). A stream blocked only on its own
-; per-stream window is skipped so the others keep flowing. A stream fully sent AND
-; fully acknowledged (its own inflight == 0) is closed out here: its file is
-; unmapped and its slot freed. The pump never sends what the in-flight table
-; cannot track — cwnd is capped at the table size, so a slot is always free below.
-; cur_conn is the connection, r12d the socket.
+; tx_pump — advance the open response streams by RFC 9218 priority. First it
+; reaps any stream fully sent AND fully acknowledged (unmap, free slot). Then it
+; repeatedly picks the highest-priority servable stream and sends it one chunk:
+; lowest urgency value wins; within an urgency, a non-incremental stream (lowest
+; stream id) is served to completion before the next — so a page's images arrive
+; one at a time, usable sooner — while incremental streams share the window in
+; rotation. Sending stops when the shared congestion window is full (wait for
+; acks) or the connection flow window is exhausted (wait for MAX_DATA); a stream
+; blocked only on its own window is simply not picked. cwnd is capped at the
+; in-flight table size, so a slot is always free. cur_conn = conn, r12d = socket.
 tx_pump:
     push rbx
     push rbp
@@ -2052,61 +2079,112 @@ tx_pump:
     push r14
     push r15
     mov rbx, [cur_conn]
-    ; initialise the congestion window the first time this connection sends a
-    ; chunked response (it persists and adapts across later responses).
     cmp qword [rbx + linnea_quic_conn.cwnd], 0
-    jne .tp_scan
+    jne .tp_reap
     mov qword [rbx + linnea_quic_conn.cwnd], LINNEA_QUIC_INIT_CWND
     mov qword [rbx + linnea_quic_conn.ssthresh], LINNEA_QUIC_MAX_CWND
-.tp_scan:
-    xor r15d, r15d                    ; r15b = progress made this pass
-    mov r14, [rbx + linnea_quic_conn.tx_rr]   ; r14 = current slot index, from the
-    mov qword [s_tp_seen], 0                   ; round-robin cursor; visit all N once
-.tp_each:
-    mov rax, r14                      ; rbp = &tx_streams[r14]
-    imul rax, rax, linnea_quic_txstream_size
+.tp_reap:
+    ; release every stream fully sent and fully acknowledged
+    xor r14d, r14d
     lea rbp, [rbx + linnea_quic_conn.tx_streams]
-    add rbp, rax
+.tp_reap_each:
     cmp qword [rbp + linnea_quic_txstream.active], 0
-    je .tp_next
-    mov r13, [rbp + linnea_quic_txstream.hlen]
-    add r13, [rbp + linnea_quic_txstream.size]   ; this stream's total length
-    mov rax, [rbp + linnea_quic_txstream.off]
-    cmp rax, r13
-    jb .tp_more
-    ; fully sent; released once this stream's own chunks are all acknowledged
+    je .tp_reap_next
+    mov rax, [rbp + linnea_quic_txstream.hlen]
+    add rax, [rbp + linnea_quic_txstream.size]
+    cmp qword [rbp + linnea_quic_txstream.off], rax
+    jb .tp_reap_next                  ; not fully sent
     cmp qword [rbp + linnea_quic_txstream.inflight], 0
-    jne .tp_next                      ; still awaiting acks: keep the slot
+    jne .tp_reap_next                 ; still awaiting acks
     mov rdi, [rbp + linnea_quic_txstream.base]
     mov rsi, [rbp + linnea_quic_txstream.size]
     mov eax, LINNEA_SYS_MUNMAP
     syscall
     mov qword [rbp + linnea_quic_txstream.active], 0
-    jmp .tp_next
-.tp_more:
-    ; next chunk length = min(TX_CHUNK, remaining). rax still holds this off,
-    ; r13 the stream total.
-    sub r13, rax                      ; stream bytes left
+.tp_reap_next:
+    add rbp, linnea_quic_txstream_size
+    inc r14d
+    cmp r14d, LINNEA_QUIC_TXSTREAMS
+    jb .tp_reap_each
+.tp_send:
+    ; --- pick the best-priority servable slot: r15 = its index (-1 = none) ---
+    mov r15, -1
+    mov r13, 0x7FFFFFFFFFFFFFFF        ; best priority key so far (lower = better)
+    xor r14d, r14d
+    lea rbp, [rbx + linnea_quic_conn.tx_streams]
+.tp_pick:
+    cmp qword [rbp + linnea_quic_txstream.active], 0
+    je .tp_pick_next
+    mov rax, [rbp + linnea_quic_txstream.hlen]
+    add rax, [rbp + linnea_quic_txstream.size]
+    cmp qword [rbp + linnea_quic_txstream.off], rax
+    jae .tp_pick_next                 ; fully sent
+    mov rax, [rbp + linnea_quic_txstream.off]
+    cmp rax, [rbp + linnea_quic_txstream.fc_max]
+    jae .tp_pick_next                 ; stream window full: not servable now
+    ; priority key = urgency<<40 | incremental<<39 | tiebreak, lower wins.
+    ; tiebreak: non-incremental -> stream id (arrival order, sequential); incremental
+    ; -> distance past the round-robin cursor (so equal-urgency peers rotate).
+    mov rax, [rbp + linnea_quic_txstream.urgency]
+    shl rax, 40
+    mov rcx, [rbp + linnea_quic_txstream.incremental]
+    shl rcx, 39
+    or rax, rcx
+    cmp qword [rbp + linnea_quic_txstream.incremental], 0
+    jne .tp_pick_incr
+    mov rcx, [rbp + linnea_quic_txstream.sid]
+    jmp .tp_pick_key
+.tp_pick_incr:
+    mov rcx, r14
+    sub rcx, [rbx + linnea_quic_conn.tx_rr]
+    jns .tp_pick_key
+    add rcx, LINNEA_QUIC_TXSTREAMS
+.tp_pick_key:
+    mov rdx, 0x7FFFFFFFFF              ; keep the tiebreak within its 39-bit field
+    and rcx, rdx
+    or rax, rcx
+    cmp rax, r13
+    jae .tp_pick_next                 ; not better than the current best
+    mov r13, rax
+    mov r15, r14
+.tp_pick_next:
+    add rbp, linnea_quic_txstream_size
+    inc r14d
+    cmp r14d, LINNEA_QUIC_TXSTREAMS
+    jb .tp_pick
+    test r15, r15
+    js .tp_ret                        ; nothing servable
+    ; rbp = &tx_streams[r15], r14 = the chosen index (the in-flight record's ctx)
+    mov rax, r15
+    imul rax, rax, linnea_quic_txstream_size
+    lea rbp, [rbx + linnea_quic_conn.tx_streams]
+    add rbp, rax
+    mov r14, r15
+    ; chunk length = min(TX_CHUNK, total-off, stream-window-room)
+    mov r13, [rbp + linnea_quic_txstream.hlen]
+    add r13, [rbp + linnea_quic_txstream.size]
+    mov rax, [rbp + linnea_quic_txstream.off]
+    sub r13, rax                      ; bytes left in the stream (>= 1)
     cmp r13, LINNEA_QUIC_TX_CHUNK
-    jbe .tp_len
+    jbe .tp_cap_win
     mov r13, LINNEA_QUIC_TX_CHUNK
-.tp_len:
-    ; per-stream flow control: skip this stream if the chunk would overrun the
-    ; window it has granted (others may still have room).
-    mov rcx, rax
-    add rcx, r13                      ; stream offset this chunk reaches
-    cmp rcx, [rbp + linnea_quic_txstream.fc_max]
-    ja .tp_next                       ; this stream blocked: wait for MAX_STREAM_DATA
-    ; connection flow control: exhausted means no stream can send — stop the pump.
+.tp_cap_win:
+    mov rcx, [rbp + linnea_quic_txstream.fc_max]
+    sub rcx, rax                      ; stream-window room (>= 1, picked servable)
+    cmp r13, rcx
+    jbe .tp_gates
+    mov r13, rcx
+.tp_gates:
+    ; connection flow control: exhausted means no stream can send — stop.
     mov rcx, [rbx + linnea_quic_conn.fc_conn_sent]
     add rcx, r13
     cmp rcx, [rbx + linnea_quic_conn.fc_conn_max]
-    ja .tp_ret                        ; connection window full: wait for MAX_DATA
-    ; congestion: bytes_in_flight is shared, so a full window stops the pump.
+    ja .tp_ret
+    ; congestion window: shared, so a full window stops the pump.
     mov rcx, [rbx + linnea_quic_conn.bytes_in_flight]
     add rcx, r13
     cmp rcx, [rbx + linnea_quic_conn.cwnd]
-    ja .tp_ret                        ; window full: wait for acknowledgements
+    ja .tp_ret
     mov [s_tp_off], rax               ; hold offset and length across the emit call
     mov [s_tp_len], r13
     mov rdi, rbp                      ; stream ctx
@@ -2125,22 +2203,10 @@ tx_pump:
     mov rcx, [s_tp_len]
     add [rbx + linnea_quic_conn.fc_conn_sent], rcx   ; against the conn window
     add [rbp + linnea_quic_txstream.off], rcx
-    mov r15b, 1                        ; progress: another pass may send more
-.tp_next:
-    inc r14                            ; next slot, wrapping round the ring
-    cmp r14, LINNEA_QUIC_TXSTREAMS
-    jb .tp_seen
-    xor r14d, r14d
-.tp_seen:
-    inc qword [s_tp_seen]
-    cmp qword [s_tp_seen], LINNEA_QUIC_TXSTREAMS
-    jb .tp_each
-    test r15b, r15b
-    jnz .tp_scan                      ; a chunk went out this pass: sweep again
-.tp_ret:
-    ; advance the round-robin cursor one slot, so the next pump starts elsewhere —
-    ; a window too small to reach every stream in one pass then rotates who it feeds
-    ; rather than always starving the higher slots.
+    ; an incremental stream just sent: rotate the cursor so its equal-urgency peers
+    ; take the next turn (non-incremental streams stay put and run to completion).
+    cmp qword [rbp + linnea_quic_txstream.incremental], 0
+    je .tp_send
     mov rax, [rbx + linnea_quic_conn.tx_rr]
     inc rax
     cmp rax, LINNEA_QUIC_TXSTREAMS
@@ -2148,6 +2214,8 @@ tx_pump:
     xor eax, eax
 .tp_rr_store:
     mov [rbx + linnea_quic_conn.tx_rr], rax
+    jmp .tp_send
+.tp_ret:
     pop r15
     pop r14
     pop r13

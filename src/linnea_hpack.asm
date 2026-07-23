@@ -31,6 +31,7 @@ pseudo_path:    db ":path"
 pseudo_scheme:  db ":scheme"
 pseudo_auth:    db ":authority"
 hdr_host:       db "host"
+hdr_priority:   db "priority"
 
 section .text
 
@@ -242,6 +243,20 @@ emit_field:
     clc
     ret
 .not_auth:
+    cmp rdx, 8                       ; "priority" (RFC 9218) — capture its value
+    jne .not_prio
+    push rsi
+    push rdi
+    lea r9, [hdr_priority]
+    call name_eq
+    pop rdi
+    pop rsi
+    jnz .not_prio
+    mov [rbx + linnea_h2_req.prio_ptr], rsi
+    mov [rbx + linnea_h2_req.prio_len], rdi
+    clc
+    ret
+.not_prio:
     cmp rdx, 4
     jne .done
     push rsi

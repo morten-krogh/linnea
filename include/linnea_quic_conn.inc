@@ -143,6 +143,11 @@ struc linnea_quic_txstream
     .off:      resq 1               ; next stream offset to send
     .fc_max:   resq 1               ; max stream offset the client will accept
     .inflight: resq 1               ; this stream's unacknowledged chunk bytes
+    ; RFC 9218 priority the client signalled (priority header): the pump serves
+    ; lower urgency first; within one urgency, non-incremental streams run to
+    ; completion in arrival order while incremental ones share the window.
+    .urgency:     resq 1            ; 0 (highest) .. 7 (lowest), default 3
+    .incremental: resq 1            ; 1 = deliver progressively (share the window)
     .hdr:      resb LINNEA_QUIC_TX_HDR
 endstruc
 

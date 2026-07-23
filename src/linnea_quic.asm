@@ -26,6 +26,7 @@ global linnea_quic_alpn_has
 global linnea_quic_build_transport_params
 global linnea_quic_tp_parse
 global linnea_quic_flow_scan
+global linnea_quic_parse_priority
 global linnea_quic_build_sh
 global linnea_quic_build_ee
 global linnea_quic_build_cert
@@ -1615,6 +1616,75 @@ linnea_quic_tp_parse:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; linnea_quic_parse_priority(rdi = value ptr, rsi = value len)
+;   -> rax = urgency (0-7), rdx = incremental (0/1).
+; Parses an RFC 9218 priority field value, an RFC 8941 dictionary of members
+; separated by commas, e.g. "u=1, i" or "u=5" or "i=?0". Recognises the two keys
+; that matter: u=<0..7> (urgency; default 3) and i (incremental boolean; bare or
+; "i=?1" is true, "i=?0" false; default false). Unknown members and malformed
+; values are ignored, leaving the defaults — a request with no priority header
+; (ptr callers pass len 0) gets urgency 3, non-incremental.
+linnea_quic_parse_priority:
+    mov r8d, 3                       ; default urgency
+    xor r9d, r9d                     ; default incremental = false
+    lea r10, [rdi + rsi]             ; end
+.pp_member:
+    cmp rdi, r10
+    jae .pp_done
+    movzx eax, byte [rdi]
+    cmp al, ' '                      ; skip spaces and empty members
+    je .pp_skip
+    cmp al, ','
+    je .pp_skip
+    cmp al, 'u'
+    je .pp_u
+    cmp al, 'i'
+    je .pp_i
+    jmp .pp_adv                      ; unknown key: skip to the next member
+.pp_skip:
+    inc rdi
+    jmp .pp_member
+.pp_u:
+    lea rcx, [rdi + 2]               ; need "u=" then a digit
+    cmp rcx, r10
+    ja .pp_adv
+    cmp byte [rdi + 1], '='
+    jne .pp_adv
+    movzx eax, byte [rdi + 2]
+    sub al, '0'
+    cmp al, 7                        ; unsigned: rejects non-digits and >7
+    ja .pp_adv
+    mov r8d, eax
+    jmp .pp_adv
+.pp_i:
+    ; bare 'i' (or 'i' ending the string) is true; only "i=?0" is false
+    mov r9d, 1
+    lea rcx, [rdi + 1]
+    cmp rcx, r10
+    jae .pp_adv                      ; 'i' at end: bare, true
+    cmp byte [rdi + 1], '='
+    jne .pp_adv                      ; 'i' then ',' or ' ': bare, true
+    lea rcx, [rdi + 4]               ; "i=?0" needs 4 bytes
+    cmp rcx, r10
+    ja .pp_adv
+    cmp byte [rdi + 3], '0'
+    jne .pp_adv
+    xor r9d, r9d                     ; i=?0 → false
+.pp_adv:
+    cmp rdi, r10                     ; advance to the next comma
+    jae .pp_done
+    cmp byte [rdi], ','
+    je .pp_next
+    inc rdi
+    jmp .pp_adv
+.pp_next:
+    inc rdi
+    jmp .pp_member
+.pp_done:
+    mov eax, r8d
+    mov edx, r9d
     ret
 
 ; linnea_quic_flow_scan(rdi=frames, rsi=len, rdx=tx_sid, rcx=out) — record the
