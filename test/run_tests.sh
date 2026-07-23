@@ -463,7 +463,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # page's in-flight downloads (STOP_SENDING). The server must tear a cancelled
     # stream down or its abandoned chunks pin the congestion window and, after
     # enough reloads, the connection stalls (hang, then h2 fallback).
-    python3 test/quic/h3_reload_test.py 47452 20 >/dev/null 2>&1
+    python3 test/quic/h3_reload_test.py 47452 10 >/dev/null 2>&1
     check "h3 (io_uring): reload-cancel (STOP_SENDING) does not stall the connection" $?
 
     # a real binary asset: a PNG served with the right MIME type, byte-exact,

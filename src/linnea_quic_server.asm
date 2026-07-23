@@ -158,6 +158,7 @@ s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK f
 fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow scan
 LINNEA_QUIC_RESET_MAX equ 16
 reset_ids:   resq LINNEA_QUIC_RESET_MAX  ; stream ids the peer cancelled this packet
+reset_pay:   resb 32                  ; a RESET_STREAM frame we send back on cancel
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 maxstreams_pay: resb 16               ; a MAX_STREAMS frame raising the peer's limit
@@ -2468,51 +2469,97 @@ tx_abort_one:
 ; reset_teardown(rdi=conn, rsi=stream id) — the peer cancelled this stream
 ; (STOP_SENDING / RESET_STREAM). Abort its open response (free the slot, unmap, and
 ; drop its in-flight chunks so they stop holding the shared congestion window) and
-; free any reassembly context buffering its request. Idempotent: a stream with
-; neither does nothing.
+; free any reassembly context buffering its request. If we were still sending the
+; response, reply with a RESET_STREAM carrying its final size (RFC 9000 3.5): the
+; peer needs it to finalise the stream and release the connection flow-control
+; window it reserved — without it that credit is never returned and, after many
+; cancellations, the connection stops being granted MAX_DATA and stalls.
+; Idempotent: a stream with neither a response nor a reassembly does nothing.
+; cur_conn is the connection, r12d the socket.
+; r12d stays the UDP socket throughout (emit_1rtt needs it); the stream id lives
+; in r13 and slot/context addresses are computed from an index, so r12 is untouched.
 reset_teardown:
     push rbx
-    push r12
     push r13
     push r14
-    push r15                          ; 5 pushes: keep the call site 16-aligned
+    push r15
+    sub rsp, 8                        ; 4 pushes + 8: keep the call site 16-aligned
     mov rbx, rdi                      ; conn
-    mov r12, rsi                      ; stream id
-    lea r13, [rbx + linnea_quic_conn.tx_streams]
-    xor r14d, r14d
+    mov r13, rsi                      ; stream id
+    mov r15, -1                       ; final size (-1 = no active response to reset)
+    xor r14d, r14d                    ; slot index
 .rt_tx:
-    cmp qword [r13 + linnea_quic_txstream.active], 0
+    mov rax, r14
+    imul rax, rax, linnea_quic_txstream_size
+    lea rcx, [rbx + linnea_quic_conn.tx_streams]
+    add rax, rcx                      ; rax = slot
+    cmp qword [rax + linnea_quic_txstream.active], 0
     je .rt_tx_next
-    cmp qword [r13 + linnea_quic_txstream.sid], r12
+    cmp qword [rax + linnea_quic_txstream.sid], r13
     jne .rt_tx_next
+    mov r15, [rax + linnea_quic_txstream.off]    ; final size = stream bytes sent
     mov rdi, rbx
     mov rsi, r14
     call tx_abort_one                 ; unmap, free the slot, drop its in-flight chunks
-    jmp .rt_ra                        ; at most one response slot per stream
+    jmp .rt_reset                     ; at most one response slot per stream
 .rt_tx_next:
-    add r13, linnea_quic_txstream_size
     inc r14d
     cmp r14d, LINNEA_QUIC_TXSTREAMS
     jb .rt_tx
+    jmp .rt_ra                        ; no open response: nothing to RESET_STREAM
+.rt_reset:
+    ; RESET_STREAM = type 0x04, stream id, app error code, final size (RFC 9000 19.4)
+    lea r14, [reset_pay]
+    mov byte [r14], 0x04
+    inc r14
+    mov rdi, r14
+    mov rsi, r13                      ; stream id
+    call linnea_quic_varint_encode
+    add r14, rax
+    mov rdi, r14
+    mov esi, 0x10c                    ; H3_REQUEST_CANCELLED
+    call linnea_quic_varint_encode
+    add r14, rax
+    mov rdi, r14
+    mov rsi, r15                      ; final size (bytes we sent)
+    call linnea_quic_varint_encode
+    add r14, rax
+    lea rax, [reset_pay]
+    sub r14, rax                      ; frame length
+    lea rsi, [reset_pay]
+    mov [s_pl_ptr], rsi
+    mov [s_pl_len], r14
+    call emit_1rtt                    ; send it on r12d; rax = the packet number used
+    mov r15, rax
+    call now_ms                       ; buffer it for loss recovery — it must arrive
+    mov r8, rax
+    mov rdi, [cur_conn]
+    mov rsi, r15
+    lea rdx, [reset_pay]
+    mov rcx, [s_pl_len]
+    call linnea_quic_rtx_record
 .rt_ra:
-    lea r13, [rbx + linnea_quic_conn.ra_ctx]
-    mov r14d, LINNEA_QUIC_RA_CTXS
+    xor r14d, r14d                    ; context index
 .rt_ra_loop:
-    cmp qword [r13 + linnea_quic_ra.active], 0
+    mov rax, r14
+    imul rax, rax, linnea_quic_ra_size
+    lea rcx, [rbx + linnea_quic_conn.ra_ctx]
+    add rax, rcx                      ; rax = context
+    cmp qword [rax + linnea_quic_ra.active], 0
     je .rt_ra_next
-    cmp qword [r13 + linnea_quic_ra.sid], r12
+    cmp qword [rax + linnea_quic_ra.sid], r13
     jne .rt_ra_next
-    mov qword [r13 + linnea_quic_ra.active], 0
+    mov qword [rax + linnea_quic_ra.active], 0
     jmp .rt_done
 .rt_ra_next:
-    add r13, linnea_quic_ra_size
-    dec r14d
-    jnz .rt_ra_loop
+    inc r14d
+    cmp r14d, LINNEA_QUIC_RA_CTXS
+    jb .rt_ra_loop
 .rt_done:
+    add rsp, 8
     pop r15
     pop r14
     pop r13
-    pop r12
     pop rbx
     ret
 
