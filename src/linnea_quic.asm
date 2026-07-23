@@ -25,6 +25,7 @@ global linnea_quic_ch_parse
 global linnea_quic_alpn_has
 global linnea_quic_build_transport_params
 global linnea_quic_tp_parse
+global linnea_quic_flow_scan
 global linnea_quic_build_sh
 global linnea_quic_build_ee
 global linnea_quic_build_cert
@@ -1473,6 +1474,122 @@ linnea_quic_tp_parse:
     pop rbp
     pop r15
     pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_flow_scan(rdi=frames, rsi=len, rdx=tx_sid, rcx=out) — record the
+; largest MAX_DATA into out[0] and the largest MAX_STREAM_DATA for tx_sid into
+; out[1] (the caller pre-zeroes out). Handles the frames a client sends while
+; consuming a download — PADDING/PING/ACK and the two flow-control frames — and
+; stops at any other type. Flow-control credit is cumulative and re-sent, so a
+; frame sitting behind an unhandled type is picked up from a later packet.
+linnea_quic_flow_scan:
+    push rbx
+    push r12
+    push r13
+    push r15
+    lea rsi, [rdi + rsi]             ; end (preserved across varint_decode)
+    mov r12, rdx                     ; tx_sid
+    mov r13, rcx                     ; out
+.fw_scan:
+    cmp rdi, rsi
+    jae .fw_done
+    movzx ebx, byte [rdi]
+    test bl, bl
+    jz .fw_skip1                     ; PADDING
+    cmp bl, 0x01
+    je .fw_skip1                     ; PING
+    cmp bl, 0x02
+    je .fw_ack
+    cmp bl, 0x03
+    je .fw_ack
+    cmp bl, 0x10
+    je .fw_maxdata
+    cmp bl, 0x11
+    je .fw_maxstreamdata
+    jmp .fw_done                     ; another frame type: stop, retry next packet
+.fw_skip1:
+    inc rdi
+    jmp .fw_scan
+.fw_maxdata:
+    inc rdi
+    call linnea_quic_varint_decode   ; Maximum Data
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    cmp rax, [r13]
+    jbe .fw_scan
+    mov [r13], rax
+    jmp .fw_scan
+.fw_maxstreamdata:
+    inc rdi
+    call linnea_quic_varint_decode   ; Stream ID
+    test rdx, rdx
+    jz .fw_done
+    mov rbx, rax
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; Maximum Stream Data
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    cmp rbx, r12                     ; is it for our response stream?
+    jne .fw_scan
+    cmp rax, [r13 + 8]
+    jbe .fw_scan
+    mov [r13 + 8], rax
+    jmp .fw_scan
+.fw_ack:
+    inc rdi
+    call linnea_quic_varint_decode   ; Largest Acknowledged
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Delay
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Count
+    test rdx, rdx
+    jz .fw_done
+    mov r15, rax                     ; additional ranges
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; First ACK Range
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+.fw_ack_range:
+    test r15, r15
+    jz .fw_ack_ecn
+    call linnea_quic_varint_decode   ; Gap
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Length
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    dec r15
+    jmp .fw_ack_range
+.fw_ack_ecn:
+    cmp bl, 0x03                     ; only 0x03 carries the ECN counts
+    jne .fw_scan
+    call linnea_quic_varint_decode   ; ECT0
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ECT1
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ECN-CE
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    jmp .fw_scan
+.fw_done:
+    pop r15
     pop r13
     pop r12
     pop rbx

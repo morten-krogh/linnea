@@ -166,10 +166,48 @@ for d, _ in conn.datagrams_to_send(now=clock[0]):
     s.sendto(d, ("127.0.0.1", port))
 s.close()
 
-# --- 4: a window too small for the file is refused with a 503 ---
+# --- 4: a client whose initial flow-control window is far smaller than the file
+# still gets the whole thing — the server streams within the window and continues
+# as the client raises it with MAX_STREAM_DATA / MAX_DATA while consuming.
 conn, s = connect(max_stream_data=4096)
 sid = conn.get_next_available_stream_id()
 get(conn, sid, b"/h3big.bin")
+resp = b""
+fin = False
+s.settimeout(0.5)
+deadline = time.time() + 20
+while not fin and time.time() < deadline:
+    for d, _ in conn.datagrams_to_send(now=clock[0]):
+        s.sendto(d, ("127.0.0.1", port))
+    clock[0] += 0.05
+    try:
+        r, _ = s.recvfrom(4096)
+    except socket.timeout:
+        continue
+    conn.receive_datagram(r, ("127.0.0.1", port), now=clock[0])
+    ev = conn.next_event()
+    while ev is not None:
+        if isinstance(ev, StreamDataReceived) and ev.stream_id == sid:
+            resp += ev.data
+            fin = fin or ev.end_stream
+        ev = conn.next_event()
+assert fin, "small-window request never completed"
+hd, data = parse_h3(resp)
+assert hd.get(b":status") == b"200", hd
+assert len(data) == len(BIG), f"got {len(data)} of {len(BIG)} through a 4 KB window"
+conn.close()
+for d, _ in conn.datagrams_to_send(now=clock[0]):
+    s.sendto(d, ("127.0.0.1", port))
+s.close()
+
+# --- 5: HEAD returns the headers (with content-length) and no body ---
+conn, s = connect()
+sid = conn.get_next_available_stream_id()
+enc = pylsqpack.Encoder()
+enc.apply_settings(max_table_capacity=0, blocked_streams=0)
+_, fields = enc.encode(sid, [(b":method", b"HEAD"), (b":path", b"/h3big.bin"),
+                             (b":scheme", b"https"), (b":authority", b"h3.test")])
+conn.send_stream_data(sid, vlq(1) + vlq(len(fields)) + fields, end_stream=True)
 resp = b""
 fin = False
 s.settimeout(0.5)
@@ -189,9 +227,11 @@ while not fin and time.time() < deadline:
             resp += ev.data
             fin = fin or ev.end_stream
         ev = conn.next_event()
-assert fin, "no response to the over-window request"
+assert fin, "no response to HEAD"
 hd, data = parse_h3(resp)
-assert hd.get(b":status") == b"503", hd
+assert hd.get(b":status") == b"200", hd
+assert hd.get(b"content-length") == str(len(BIG)).encode(), hd
+assert data == b"", f"HEAD returned a {len(data)}-byte body"
 conn.close()
 for d, _ in conn.datagrams_to_send(now=clock[0]):
     s.sendto(d, ("127.0.0.1", port))

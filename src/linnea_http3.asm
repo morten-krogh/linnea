@@ -147,27 +147,20 @@ linnea_h3_read_headers:
     pop rbx
     ret
 
-; linnea_h3_build_response_head(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
-;   r8=body_len) -> rax = length written.
-; Emits a HEADERS frame (0x01) wrapping the QPACK-encoded response fields
-; (:status, content-type, content-length = body_len) then the DATA frame's
-; type and length varint — everything of the response that precedes the body
-; bytes. A caller that inlines the body appends it right after; a chunked
-; response keeps this head per connection and streams the body from its file
-; mapping, so the head and body never share a buffer.
-linnea_h3_build_response_head:
+; linnea_h3_build_headers(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
+;   r8=content_length) -> rax = length written.
+; Emits only the HEADERS frame (0x01) wrapping the QPACK-encoded response fields
+; (:status, content-type, content-length). A HEAD response is exactly this — no
+; DATA frame follows — and it is the first half of a full response head.
+linnea_h3_build_headers:
     push rbx
-    push r12
-    push r13
     push r14
     push r15
     push rbp
-    sub rsp, 8                       ; keep rsp 16-aligned for the calls
     mov rbx, rdi                     ; out start
     mov r14, rdi                     ; out cursor
     mov r15d, esi                    ; status
-    mov r13, r8                      ; body len
-    ; content-length text = decimal(body_len)
+    ; content-length text = decimal(content_length)
     push rdx
     push rcx
     lea rdi, [clen_buf]
@@ -196,7 +189,29 @@ linnea_h3_build_response_head:
     mov rcx, rbp
     rep movsb
     mov r14, rdi
-    ; DATA frame: type 0x00 and its length varint (the body is the caller's)
+    mov rax, r14
+    sub rax, rbx                     ; headers length
+    pop rbp
+    pop r15
+    pop r14
+    pop rbx
+    ret
+
+; linnea_h3_build_response_head(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
+;   r8=body_len) -> rax = length written.
+; The HEADERS frame (content-length = body_len) followed by the DATA frame's
+; type and length varint — everything of the response that precedes the body
+; bytes. A caller that inlines the body appends it right after; a chunked
+; response keeps this head per connection and streams the body from its file
+; mapping, so the head and body never share a buffer.
+linnea_h3_build_response_head:
+    push rbx
+    push r13
+    push r14
+    mov rbx, rdi                     ; out start
+    mov r13, r8                      ; body len
+    call linnea_h3_build_headers     ; rax = headers length (args unchanged)
+    lea r14, [rbx + rax]             ; cursor after the HEADERS frame
     mov byte [r14], LINNEA_H3_FRAME_DATA
     inc r14
     mov rdi, r14
@@ -204,13 +219,9 @@ linnea_h3_build_response_head:
     call linnea_quic_varint_encode
     add r14, rax
     mov rax, r14
-    sub rax, rbx                     ; head length
-    add rsp, 8
-    pop rbp
-    pop r15
+    sub rax, rbx                     ; total head length
     pop r14
     pop r13
-    pop r12
     pop rbx
     ret
 
@@ -350,6 +361,27 @@ linnea_h3_serve:
     call linnea_static_mime          ; rax = mime ptr, rdx = mime len
     mov rcx, rdx                     ; mime len
     mov rdx, rax                     ; mime ptr
+    ; a HEAD request: emit only the headers (content-length = the file size) and
+    ; no body — whatever the size. A bodiless response is not flow-controlled.
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    cmp qword [rbx + linnea_h2_req.method_len], 4
+    jne .body_serve
+    cmp dword [rdi], 0x44414548      ; "HEAD", little-endian
+    jne .body_serve
+    mov rdi, r12                     ; out
+    mov esi, 200
+    mov r8, rbp                      ; content-length = file size
+    call linnea_h3_build_headers     ; rax = response length (headers only)
+    cmp r15, 1
+    jbe .sret                        ; empty-file sentinel: nothing was mapped
+    push rax
+    mov rdi, r15
+    mov rsi, rbp
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    pop rax
+    jmp .sret
+.body_serve:
     cmp rbp, LINNEA_H3_INLINE_MAX
     ja .large                        ; too big for one packet: stream it
     mov r8, r15
@@ -372,12 +404,12 @@ linnea_h3_serve:
     pop rax
     jmp .sret
 .large:
-    ; will head + body fit the client's allowance? (rdx/rcx = MIME, kept live)
-    mov rax, [linnea_h3_tx_cap]
-    sub rax, LINNEA_H3_HEAD_MAX      ; the head's worst case
-    jb .refuse                       ; no allowance at all
-    cmp rbp, rax
-    ja .refuse                       ; the body alone would overrun the window
+    ; may we start a chunked response? Only one is in flight at a time; a
+    ; concurrent large request is refused (503). The body itself streams within
+    ; the client's flow-control window, enforced by the pump, so its size is not
+    ; checked here. (rdx/rcx = MIME, kept live.)
+    cmp qword [linnea_h3_tx_cap], 0
+    je .refuse
     mov rdi, r12
     mov esi, 200
     mov r8, rbp                      ; body length (for content-length + DATA len)

@@ -198,11 +198,15 @@ struc linnea_quic_conn
     .tx_size:    resq 1             ; and its size
     .tx_hlen:    resq 1             ; stream bytes held in tx_hdr
     .tx_off:     resq 1             ; next stream offset to send
-    .tx_limit:   resq 1             ; the client's flow-control allowance for one
-                                    ; response stream: min(initial_max_data,
-                                    ; initial_max_stream_data_bidi_local) from its
-                                    ; transport parameters. A larger response is
-                                    ; refused (503) rather than overrun the window.
+    ; Flow control (RFC 9000 s4). The client caps how much stream data we may send:
+    ; per stream by initial_max_stream_data_bidi_local, grown by MAX_STREAM_DATA;
+    ; per connection by initial_max_data, grown by MAX_DATA. We send only up to
+    ; those limits and wait for the client to raise them as it consumes — so a
+    ; response larger than the initial window streams within it rather than being
+    ; refused. fc_conn_sent is the running total of response-stream bytes sent.
+    .fc_stream_max: resq 1          ; max stream offset the client will accept
+    .fc_conn_max:   resq 1          ; max total data the client will accept
+    .fc_conn_sent:  resq 1          ; response-stream bytes sent against fc_conn_max
     ; congestion control for the open response stream (RFC 9002 NewReno)
     .cwnd:       resq 1             ; congestion window in bytes (0 = uninitialised)
     .ssthresh:   resq 1             ; slow-start threshold in bytes
