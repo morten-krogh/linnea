@@ -374,6 +374,7 @@ fi
 # serving HTTP/1.1 and HTTP/2 on the same port. The config runs four workers,
 # so this also covers SO_REUSEPORT steering.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    python3 test/mk_test_image.py test/www/linnea.png >/dev/null    # served over h3
     $BIN test/configs/tls-h3.json >/dev/null 2>&1 &
     h3_pid=$!
     sleep 0.5
@@ -416,6 +417,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # client whose flow-control window cannot take the file gets a 503
     python3 test/quic/h3_big_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): large response streamed in chunks (loss + interleave + 503)" $?
+
+    # a real binary asset: a PNG served with the right MIME type, byte-exact,
+    # over the chunked h3 path
+    python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1
+    check "h3 (io_uring): PNG image served intact (image/png, chunked)" $?
 
     # a ClientHello too large for one Initial packet (as a browser's post-quantum
     # key share makes it) is reassembled across Initials by the client's original
