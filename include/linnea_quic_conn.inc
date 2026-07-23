@@ -44,9 +44,18 @@ LINNEA_QUIC_ST_CONNECTED equ 2      ; client Finished verified, 1-RTT keys live
 ; are stored, not the protected bytes, so a retransmission is re-encrypted with a
 ; new number. The slot count bounds how much can be outstanding at once; the
 ; payload cap is far above anything a single reply we build reaches today.
+; A record is one of two kinds: KIND_FRAMES keeps a copy of the frames it sent
+; (small replies); KIND_STREAM_REF keeps only a [stream offset, length) window
+; into the connection's open response stream (large bodies stay mmap'd once, not
+; copied per packet) — a retransmission rebuilds the STREAM frame from the file.
+; The ring is also the send window for a large response: chunks go out only
+; while a slot is free to track them, and acknowledgements free slots, so
+; delivery is ack-clocked and the outstanding data is bounded by the ring.
 LINNEA_QUIC_RTX_SLOTS   equ 8       ; outstanding 1-RTT packets tracked per conn
 LINNEA_QUIC_RTX_PAYLOAD equ 1500    ; frame bytes kept per packet
 LINNEA_QUIC_ACK_MAXR    equ 16      ; ACK ranges decoded from one incoming frame
+LINNEA_QUIC_KIND_FRAMES equ 0       ; record holds a copy of the frames
+LINNEA_QUIC_KIND_STREAM_REF equ 1   ; record references the open response stream
 
 ; Probe timeout: a buffered packet unacknowledged for this long is resent, under
 ; a fresh number. The threshold doubles per attempt (a lost reply on a slow or
@@ -72,12 +81,24 @@ LINNEA_QUIC_RA_BUF      equ 8192    ; reassembly capacity for one request stream
 ; 0-RTT request is a single GET (a large early body is neither expected nor kept).
 LINNEA_QUIC_EARLY_BUF   equ 1024
 
+; A response too large for one packet is sent as a sequence of STREAM-frame
+; chunks, each in its own 1-RTT packet, each datagram under the 1200-byte floor
+; every QUIC path must carry (RFC 9000 s14.1): short header (11) + chunk + the
+; STREAM header and a leading ACK (~30) + AEAD tag (16) stays comfortably under.
+; The stream's first bytes are the HTTP/3 HEADERS frame and the DATA frame
+; header, kept per connection in tx_hdr; the body bytes come straight from the
+; file mapping. One response stream is in flight at a time.
+LINNEA_QUIC_TX_CHUNK    equ 1100    ; stream bytes per 1-RTT packet
+LINNEA_QUIC_TX_HDR      equ 128     ; HEADERS frame + DATA frame header prefix cap
+
 struc linnea_quic_sent
     .in_use:   resq 1
     .pn:       resq 1               ; packet number it last went out under
     .sent_ms:  resq 1               ; CLOCK_MONOTONIC ms when (re)sent, for the PTO
-    .len:      resq 1               ; frame-payload length
+    .len:      resq 1               ; frame-payload length (or the chunk's length)
     .tries:    resq 1               ; retransmissions so far (0 = first send)
+    .kind:     resq 1               ; LINNEA_QUIC_KIND_FRAMES / _STREAM_REF
+    .s_off:    resq 1               ; KIND_STREAM_REF: the chunk's stream offset
     .payload:  resb LINNEA_QUIC_RTX_PAYLOAD
     .pad:      resb 4               ; round the record to a multiple of 8
 endstruc
@@ -146,6 +167,22 @@ struc linnea_quic_conn
     .ra_final:   resq 1             ; the stream's total size (valid once ra_fin)
     .ra_buf:     resb LINNEA_QUIC_RA_BUF
     .ra_seen:    resb LINNEA_QUIC_RA_BUF   ; byte i = 1 once stream byte i has arrived
+    ; the open response stream (one at a time): a body too large for one packet
+    ; stays mmap'd here and is sent as STREAM-frame chunks, ack-clocked by the
+    ; sent ring above. Stream byte i is tx_hdr[i] while i < tx_hlen (the HTTP/3
+    ; HEADERS frame and DATA frame header), and file byte i - tx_hlen after that.
+    .tx_active:  resq 1             ; 1 while a chunked response is in flight
+    .tx_sid:     resq 1             ; the request stream being answered
+    .tx_base:    resq 1             ; the response file's mapping
+    .tx_size:    resq 1             ; and its size
+    .tx_hlen:    resq 1             ; stream bytes held in tx_hdr
+    .tx_off:     resq 1             ; next stream offset to send
+    .tx_limit:   resq 1             ; the client's flow-control allowance for one
+                                    ; response stream: min(initial_max_data,
+                                    ; initial_max_stream_data_bidi_local) from its
+                                    ; transport parameters. A larger response is
+                                    ; refused (503) rather than overrun the window.
+    .tx_hdr:     resb LINNEA_QUIC_TX_HDR
     .pad:        resb 4              ; keep the size a multiple of 8
 endstruc
 
@@ -161,3 +198,9 @@ endstruc
 ; linnea_quic_conn_sweep(rdi=now seconds, rsi=idle seconds) -> rax = slots freed.
 ;   Exposed with an explicit clock so it can be tested without waiting.
 ; linnea_quic_conn_active() -> rax = slots currently in use.
+;
+; linnea_quic_conn_free_hook — a function pointer (0 = none) called with
+;   rdi = conn on every path that returns a slot to the pool (explicit free and
+;   the idle sweep), before the slot is reused. The QUIC server registers a hook
+;   that unmaps an open response stream's file, so a connection reclaimed
+;   mid-transfer cannot leak the mapping. The pool itself knows nothing of mmap.

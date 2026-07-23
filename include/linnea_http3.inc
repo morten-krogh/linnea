@@ -36,3 +36,14 @@ LINNEA_H3_ERR_NOHEADERS equ 2     ; no HEADERS frame in the stream data
 ; Largest POST body echoed back inline; a larger one (whose echo would not fit
 ; one response packet) gets a small receipt — its length and a hash — instead.
 LINNEA_H3_ECHO_MAX     equ 1024
+
+; A response body up to this size is written into the response packet directly
+; (one packet, as ever). A larger body is not copied at all: linnea_h3_serve
+; hands back the file mapping and writes only the stream's head — the HEADERS
+; frame and the DATA frame header — and the QUIC layer sends the body as
+; STREAM-frame chunks straight from the mapping.
+LINNEA_H3_INLINE_MAX   equ 1024
+; Upper bound on that head (status + content-type + content-length QPACK fields
+; plus framing come to well under half this). Must not exceed the per-connection
+; head buffer it is copied into (LINNEA_QUIC_TX_HDR in linnea_quic_conn.inc).
+LINNEA_H3_HEAD_MAX     equ 128

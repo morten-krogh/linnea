@@ -13,8 +13,11 @@ default rel
 global _start
 
 extern linnea_quic_rtx_record
+extern linnea_quic_rtx_record_ref
 extern linnea_quic_rtx_ack_range
 extern linnea_quic_rtx_inflight
+extern linnea_quic_rtx_ref_count
+extern linnea_quic_rtx_ref_clear
 extern linnea_quic_ack_ranges
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
@@ -157,6 +160,73 @@ _start:
     dec r12
     jmp .free
 .freed:
+    INFLIGHT
+    EXPECT rax, 0
+
+    ; --- stream-ref records: a chunked response's loss bookkeeping ---
+    ; record two chunks by reference and one small reply by copy
+    lea rdi, [conn]
+    mov esi, 20                      ; pn
+    mov edx, 0                       ; stream offset
+    mov ecx, 1100                    ; chunk length
+    xor r8d, r8d
+    call linnea_quic_rtx_record_ref
+    EXPECT rax, 1                    ; tracked
+    lea rdi, [conn]
+    mov esi, 21
+    mov edx, 1100
+    mov ecx, 1100
+    xor r8d, r8d
+    call linnea_quic_rtx_record_ref
+    EXPECT rax, 1
+    RECORD 22
+    INFLIGHT
+    EXPECT rax, 3                    ; both kinds share the ring
+    lea rdi, [conn]
+    call linnea_quic_rtx_ref_count
+    EXPECT rax, 2                    ; but only the chunks are stream refs
+    ; the offset and length drive a rebuild — they must round-trip
+    mov rax, [conn + linnea_quic_conn.sent + linnea_quic_sent_size + linnea_quic_sent.s_off]
+    EXPECT rax, 1100
+    mov rax, [conn + linnea_quic_conn.sent + linnea_quic_sent_size + linnea_quic_sent.len]
+    EXPECT rax, 1100
+    ; acknowledging a chunk releases its slot like any packet
+    ACKRANGE 20, 20
+    lea rdi, [conn]
+    call linnea_quic_rtx_ref_count
+    EXPECT rax, 1
+    ; aborting the stream drops the remaining refs but not the copied reply
+    lea rdi, [conn]
+    call linnea_quic_rtx_ref_clear
+    lea rdi, [conn]
+    call linnea_quic_rtx_ref_count
+    EXPECT rax, 0
+    INFLIGHT
+    EXPECT rax, 1                    ; the small reply is still tracked
+    ACKRANGE 22, 22
+    INFLIGHT
+    EXPECT rax, 0
+    ; a full ring refuses a ref (the pump treats that as a closed window)
+    xor r12d, r12d
+.rfill:
+    lea rdi, [conn]
+    lea rsi, [r12 + 200]
+    mov edx, 0
+    mov ecx, 100
+    xor r8d, r8d
+    call linnea_quic_rtx_record_ref
+    inc r12d
+    cmp r12d, LINNEA_QUIC_RTX_SLOTS
+    jb .rfill
+    lea rdi, [conn]
+    mov esi, 300
+    mov edx, 0
+    mov ecx, 100
+    xor r8d, r8d
+    call linnea_quic_rtx_record_ref
+    EXPECT rax, 0                    ; ring full: not tracked, caller must wait
+    lea rdi, [conn]
+    call linnea_quic_rtx_ref_clear
     INFLIGHT
     EXPECT rax, 0
 

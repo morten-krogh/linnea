@@ -17,9 +17,14 @@ global linnea_quic_conn_sweep
 global linnea_quic_conn_active
 global linnea_quic_conn_slot
 global linnea_worker_index
+global linnea_quic_conn_free_hook
 
 section .bss
 conn_pool: resb LINNEA_QUIC_MAX_CONNS * linnea_quic_conn_size
+; called with rdi = conn on every path that frees a slot (0 = no hook). The QUIC
+; server hangs per-connection resource release here (an open response stream's
+; file mapping); the pool itself stays free of mmap knowledge.
+linnea_quic_conn_free_hook: resq 1
 ; this worker's index (0-based), stamped into every connection id it issues so
 ; the BPF reuseport program can steer the connection's later packets back here.
 ; Zero until the master sets it after fork; a single-worker server never changes it.
@@ -142,6 +147,17 @@ linnea_quic_conn_sweep:
                                      ; reclaim a live connection
     cmp rax, rsi
     jbe .sw_next                     ; still within the idle window
+    cmp qword [linnea_quic_conn_free_hook], 0
+    je .sw_reclaim
+    push rdi                         ; the hook must not disturb the walk
+    push rsi
+    push rcx
+    mov rdi, rbx
+    call [linnea_quic_conn_free_hook]
+    pop rcx
+    pop rsi
+    pop rdi
+.sw_reclaim:
     mov qword [rbx + linnea_quic_conn.in_use], 0
     inc r12d
 .sw_next:
@@ -199,6 +215,12 @@ conn_now:
 linnea_quic_conn_free:
     test rdi, rdi
     jz .fret
+    cmp qword [linnea_quic_conn_free_hook], 0
+    je .f_reclaim
+    push rdi
+    call [linnea_quic_conn_free_hook]
+    pop rdi
+.f_reclaim:
     mov qword [rdi + linnea_quic_conn.in_use], 0
 .fret:
     ret

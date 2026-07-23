@@ -70,7 +70,14 @@ extern linnea_quic_ack_record
 extern linnea_quic_build_ack
 extern linnea_quic_ack_ranges
 extern linnea_quic_rtx_record
+extern linnea_quic_rtx_record_ref
 extern linnea_quic_rtx_ack_range
+extern linnea_quic_rtx_inflight
+extern linnea_quic_rtx_ref_count
+extern linnea_quic_rtx_ref_clear
+extern linnea_quic_tp_parse
+extern linnea_quic_conn_free_hook
+extern linnea_h3_tx_cap
 extern linnea_quic_conn_slot
 extern linnea_string_from_u64
 extern linnea_quic_conn_free
@@ -139,6 +146,7 @@ s_soff:      resq 1                   ; and offset (0 = the stream's first bytes
 s_sfin:      resq 1                   ; and whether its FIN bit is set
 s_body_ptr:  resq 1                   ; request body captured by read_headers
 s_body_len:  resq 1
+s_txc_pn:    resq 1                   ; packet number a chunk just went out under
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 ch_out:      resb linnea_quic_ch_size
@@ -202,6 +210,10 @@ linnea_quic_server_init:
     mov [s_priv], rdx
     mov [s_docroot_ptr], rcx
     mov [s_docroot_len], r8
+    ; a reclaimed connection may hold an open response stream's file mapping;
+    ; the pool calls this back on every free so the mapping cannot leak
+    lea rax, [quic_tx_free_hook]
+    mov [linnea_quic_conn_free_hook], rax
     xor eax, eax
     ret
 
@@ -365,6 +377,22 @@ linnea_quic_server_datagram:
     mov rax, [q_sni32]
     mov rbx, [cur_conn]
     mov [rbx + linnea_quic_conn.sni_hash], rax
+    ; the client's flow-control allowance for a response stream, from its
+    ; transport parameters: what it will accept on a connection (initial_max_data)
+    ; and on one stream it opened (initial_max_stream_data_bidi_local). The lower
+    ; bounds any chunked response; absent parameters mean zero (RFC 9000 18.2),
+    ; so such a client is never sent a multi-packet body.
+    mov qword [rbx + linnea_quic_conn.tx_limit], 0
+    mov rdi, [ch_out + linnea_quic_ch.tp_ptr]
+    test rdi, rdi
+    jz .tp_recorded
+    mov rsi, [ch_out + linnea_quic_ch.tp_len]
+    call linnea_quic_tp_parse        ; rax = max_data, rdx = max_stream_data
+    cmp rax, rdx
+    cmovbe rdx, rax                  ; the smaller window governs
+    mov rbx, [cur_conn]
+    mov [rbx + linnea_quic_conn.tx_limit], rdx
+.tp_recorded:
     ; --- session resumption: accept the client's PSK offer if it is well-formed
     ; (psk_dhe_ke, our ticket, matching SNI, verifying binder). linnea_quic_hs_psk
     ; then drives the ServerHello's pre_shared_key extension, the early secret in
@@ -839,6 +867,16 @@ linnea_quic_server_datagram:
 ; One packet can carry several STREAM frames (requests on different streams),
 ; so walk them all and answer each on the stream it arrived on.
 .onertt_in:
+    ; the next packet number expected from the peer (largest received + 1, 0
+    ; before anything arrives): the wire carries only the number's low bits,
+    ; and unprotect expands them against this before forming the nonce
+    mov rax, [cur_conn]
+    xor r9d, r9d
+    cmp qword [rax + linnea_quic_conn.rx_have], 0
+    je .exp_pn_ready
+    mov r9, [rax + linnea_quic_conn.rx_largest]
+    inc r9
+.exp_pn_ready:
     lea rdi, [linnea_quic_rxbuf]
     mov rsi, r13
     CONNLEA rdx, ap_ckeys            ; client 1-RTT keys (derived at .do_cfin)
@@ -884,6 +922,14 @@ linnea_quic_server_datagram:
     call linnea_quic_close_frame
     test rax, rax
     jnz .peer_closed
+    ; an open response stream is ack-clocked: the acknowledgements just ingested
+    ; freed ring slots, so more chunks may go out (and a fully acknowledged
+    ; stream is closed out — its mapping released)
+    mov rax, [cur_conn]
+    cmp qword [rax + linnea_quic_conn.tx_active], 0
+    je .no_pump
+    call tx_pump
+.no_pump:
     lea r15, [plaintext + r14]       ; end of the frames
     lea r14, [plaintext]             ; scan cursor
 .stream_scan:
@@ -1077,10 +1123,44 @@ linnea_quic_server_datagram:
     mov rdx, [s_docroot_len]
     mov r8, [s_body_ptr]             ; the request body, for a POST echo
     mov r9, [s_body_len]
-    call linnea_h3_serve             ; rax = h3 response length
+    ; the client's allowance for a chunked response: zero while one is already
+    ; in flight (one response stream at a time — a concurrent large request is
+    ; refused with a 503 and can be retried), else what its transport
+    ; parameters permit
+    mov rax, [cur_conn]
+    mov r11, [rax + linnea_quic_conn.tx_limit]
+    cmp qword [rax + linnea_quic_conn.tx_active], 0
+    je .tx_cap_set
+    xor r11d, r11d
+.tx_cap_set:
+    mov [linnea_h3_tx_cap], r11
+    call linnea_h3_serve             ; rax = h3 response length (or the head's);
+                                     ; r9 != 0: chunked — r8/r9 = file mapping
+    test r9, r9
+    jnz .serve_large
     lea rdx, [rax + rbx]             ; STREAM frame length
     lea rsi, [strm_pay]
     call .send_1rtt
+    jmp .stream_scan
+.serve_large:
+    ; the response is a stream, not a packet: keep its head and the file
+    ; mapping on the connection and let the pump send it — chunk by chunk,
+    ; ack-clocked by the loss ring. The head (HEADERS frame + DATA frame
+    ; header, rax bytes at strm_pay + rbx) is bounded by LINNEA_H3_HEAD_MAX,
+    ; which fits tx_hdr by construction.
+    mov rcx, [cur_conn]
+    mov [rcx + linnea_quic_conn.tx_base], r8
+    mov [rcx + linnea_quic_conn.tx_size], r9
+    mov [rcx + linnea_quic_conn.tx_hlen], rax
+    mov rdx, [s_sid]
+    mov [rcx + linnea_quic_conn.tx_sid], rdx
+    mov qword [rcx + linnea_quic_conn.tx_off], 0
+    mov qword [rcx + linnea_quic_conn.tx_active], 1
+    lea rsi, [strm_pay + rbx]
+    lea rdi, [rcx + linnea_quic_conn.tx_hdr]
+    mov rcx, rax
+    rep movsb
+    call tx_pump
     jmp .stream_scan
 
 ; --- a client unidirectional stream: control, QPACK encoder/decoder or grease.
@@ -1570,23 +1650,27 @@ now_ms:
 ; Requires rsp 16-aligned at the call site (rsp % 16 == 8 on entry).
 emit_1rtt:
     push rbx
-    mov byte [hdr], 0x40              ; short header, 1-byte pn, key phase 0
+    mov byte [hdr], 0x41              ; short header, 2-byte pn, key phase 0
     CONNGET rcx, dcid_len
     lea rdi, [hdr + 1]
     CONNLEA rsi, dcid
     rep movsb                         ; DCID = the peer's connection id
+    ; two packet-number bytes: a chunked response spends numbers fast, and one
+    ; byte capped a connection near 256 packets before the truncated number
+    ; (which is also what the nonce takes) became ambiguous. Two carry 65536.
     CONNGET rax, pn_1rtt
-    mov [rdi], al                     ; packet number (1 byte)
-    inc rdi
+    mov [rdi], ah                     ; packet number, big-endian
+    mov [rdi + 1], al
+    add rdi, 2
     CONNGET rbx, dcid_len
-    add rbx, 2                        ; header length = 1 + DCID + 1
+    add rbx, 3                        ; header length = 1 + DCID + 2
     sub rsp, 16
     CONNLEA rax, ap_skeys
     mov [rsp], rax
     lea rdi, [onertt_pkt]
     lea rsi, [hdr]
     mov rdx, rbx
-    mov ecx, 1
+    mov ecx, 2
     mov r8, [s_pl_ptr]
     mov r9, [s_pl_len]
     call linnea_quic_protect          ; rax = packet length
@@ -1604,6 +1688,184 @@ emit_1rtt:
     inc qword [rbx + linnea_quic_conn.pn_1rtt]
     pop rbx
     ret
+
+; tx_emit_chunk(rdi=stream offset, rsi=length) -> rax = packet number used.
+; Build and send one packet of the connection's open response stream: a leading
+; ACK, then a STREAM frame (OFF always, no LEN — its data runs to the packet's
+; end — and FIN on the chunk that ends the stream) whose bytes come from the
+; head buffer below tx_hlen and the file mapping above it. Shared by the pump
+; (first send) and the PTO sweep (retransmission): the stream bytes at an offset
+; never change, so a rebuilt chunk is identical to the lost one.
+; cur_conn is the connection, r12d the UDP socket.
+tx_emit_chunk:
+    push rbx
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                        ; align the call sites
+    mov rbx, [cur_conn]
+    mov r13, rdi                      ; stream offset
+    mov r14, rsi                      ; chunk length
+    ; lead with the current ACK state — idempotent, and it keeps the peer's
+    ; view of what we received fresh throughout a long transfer
+    lea rdi, [strm_pay]
+    lea rsi, [rbx + linnea_quic_conn.rx_have]
+    call linnea_quic_build_ack        ; rax = ACK length (0 = nothing to ack)
+    mov r15, rax                      ; write cursor into strm_pay
+    ; STREAM frame type
+    mov rcx, [rbx + linnea_quic_conn.tx_hlen]
+    add rcx, [rbx + linnea_quic_conn.tx_size]   ; the stream's total length
+    lea rdx, [r13 + r14]
+    mov al, 0x0c                      ; STREAM | OFF
+    cmp rdx, rcx
+    jne .tc_typed
+    or al, 0x01                       ; this chunk ends the stream: FIN
+.tc_typed:
+    mov [strm_pay + r15], al
+    inc r15
+    lea rdi, [strm_pay + r15]         ; stream id
+    mov rsi, [rbx + linnea_quic_conn.tx_sid]
+    call linnea_quic_varint_encode
+    add r15, rax
+    lea rdi, [strm_pay + r15]         ; stream offset
+    mov rsi, r13
+    call linnea_quic_varint_encode
+    add r15, rax
+    ; the chunk's bytes: stream byte i is tx_hdr[i] while i < tx_hlen, then
+    ; file byte i - tx_hlen. A chunk can straddle the boundary.
+    mov rax, [rbx + linnea_quic_conn.tx_hlen]
+    mov rdx, r13                      ; running stream offset
+    mov r9, r14                       ; bytes still to place
+    cmp rdx, rax
+    jae .tc_body
+    mov r8, rax
+    sub r8, rdx                       ; head bytes from here to tx_hlen
+    cmp r8, r9
+    jbe .tc_hcopy
+    mov r8, r9
+.tc_hcopy:
+    lea rsi, [rbx + linnea_quic_conn.tx_hdr]
+    add rsi, rdx
+    lea rdi, [strm_pay + r15]
+    mov rcx, r8
+    rep movsb
+    add r15, r8
+    add rdx, r8
+    sub r9, r8
+.tc_body:
+    test r9, r9
+    jz .tc_send
+    mov rsi, [rbx + linnea_quic_conn.tx_base]
+    add rsi, rdx
+    sub rsi, rax                      ; file bytes start at stream offset tx_hlen
+    lea rdi, [strm_pay + r15]
+    mov rcx, r9
+    rep movsb
+    add r15, r9
+.tc_send:
+    lea rsi, [strm_pay]
+    mov [s_pl_ptr], rsi
+    mov [s_pl_len], r15
+    call emit_1rtt                    ; rax = the packet number used
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; tx_pump — advance the connection's open response stream: send chunks while
+; the loss ring has a free slot to track them (the ring is the send window —
+; acknowledgements free slots, so delivery is ack-clocked and the outstanding
+; data stays bounded), and close the stream out once everything is sent AND
+; acknowledged: unmap the file, tx_active = 0. The pump never sends what it
+; cannot track — an untracked chunk would never be retransmitted, leaving a
+; permanent hole in the stream. cur_conn is the connection, r12d the socket.
+tx_pump:
+    push rbx
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                        ; align the call sites
+    mov rbx, [cur_conn]
+.tp_loop:
+    cmp qword [rbx + linnea_quic_conn.tx_active], 0
+    je .tp_ret
+    mov r13, [rbx + linnea_quic_conn.tx_hlen]
+    add r13, [rbx + linnea_quic_conn.tx_size]   ; stream total
+    mov r14, [rbx + linnea_quic_conn.tx_off]
+    cmp r14, r13
+    jb .tp_more
+    ; everything has been sent; delivered once nothing is still buffered
+    mov rdi, rbx
+    call linnea_quic_rtx_ref_count
+    test rax, rax
+    jnz .tp_ret                       ; chunks still awaiting acknowledgement
+    mov rdi, [rbx + linnea_quic_conn.tx_base]
+    mov rsi, [rbx + linnea_quic_conn.tx_size]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    mov qword [rbx + linnea_quic_conn.tx_active], 0
+    jmp .tp_ret
+.tp_more:
+    mov rdi, rbx
+    call linnea_quic_rtx_inflight
+    cmp rax, LINNEA_QUIC_RTX_SLOTS
+    jae .tp_ret                       ; window full: wait for acknowledgements
+    mov r15, r13
+    sub r15, r14                      ; stream bytes left
+    cmp r15, LINNEA_QUIC_TX_CHUNK
+    jbe .tp_len
+    mov r15, LINNEA_QUIC_TX_CHUNK
+.tp_len:
+    mov rdi, r14
+    mov rsi, r15
+    call tx_emit_chunk                ; rax = the packet number it went out under
+    mov [s_txc_pn], rax
+    call now_ms
+    mov r8, rax
+    mov rdi, rbx
+    mov rsi, [s_txc_pn]
+    mov rdx, r14
+    mov rcx, r15
+    call linnea_quic_rtx_record_ref   ; cannot fail: a slot was free above
+    add r14, r15
+    mov [rbx + linnea_quic_conn.tx_off], r14
+    jmp .tp_loop
+.tp_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; tx_abort(rdi=conn) — the response stream cannot continue (its peer stopped
+; acknowledging, or the connection is being reclaimed): unmap the file, drop
+; every buffered chunk reference — a surviving one would rebuild a chunk from
+; memory that is no longer mapped — and close the stream. The peer never sees
+; a FIN; an abandoned client re-requests, a vanished one is gone anyway.
+tx_abort:
+    push rbx
+    mov rbx, rdi
+    cmp qword [rbx + linnea_quic_conn.tx_active], 0
+    je .ta_ret
+    mov rdi, [rbx + linnea_quic_conn.tx_base]
+    mov rsi, [rbx + linnea_quic_conn.tx_size]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    mov qword [rbx + linnea_quic_conn.tx_active], 0
+    mov rdi, rbx
+    call linnea_quic_rtx_ref_clear
+.ta_ret:
+    pop rbx
+    ret
+
+; quic_tx_free_hook(rdi=conn) — registered as the pool's free hook: any path
+; that reclaims a slot (clean close, idle sweep, handshake failure) releases an
+; open response stream's mapping through tx_abort first.
+quic_tx_free_hook:
+    jmp tx_abort
 
 ; linnea_quic_server_rtx_sweep(edi = UDP socket fd) — one probe-timeout pass over
 ; every live connection. Any buffered 1-RTT packet unacknowledged past its probe
@@ -1649,15 +1911,34 @@ linnea_quic_server_rtx_sweep:
     jb .sw_rec_next                   ; not yet due
     cmp qword [r14 + linnea_quic_sent.tries], LINNEA_QUIC_PTO_MAX
     jb .sw_resend
-    mov qword [r14 + linnea_quic_sent.in_use], 0   ; given up on
+    ; given up on. A stream-ref chunk cannot be dropped alone — the stream
+    ; would keep a permanent hole — so its whole response is aborted (unmapped,
+    ; every buffered chunk dropped); the idle sweep will reclaim the peer.
+    cmp qword [r14 + linnea_quic_sent.kind], LINNEA_QUIC_KIND_STREAM_REF
+    jne .sw_giveup
+    mov rdi, rbx
+    call tx_abort
+    jmp .sw_rec_next
+.sw_giveup:
+    mov qword [r14 + linnea_quic_sent.in_use], 0
     jmp .sw_rec_next
 .sw_resend:
     mov [cur_conn], rbx
+    cmp qword [r14 + linnea_quic_sent.kind], LINNEA_QUIC_KIND_STREAM_REF
+    je .sw_ref
     lea rax, [r14 + linnea_quic_sent.payload]
     mov [s_pl_ptr], rax
     mov rax, [r14 + linnea_quic_sent.len]
     mov [s_pl_len], rax
     call emit_1rtt                    ; rax = the fresh packet number; r12d = fd
+    jmp .sw_sent
+.sw_ref:
+    ; rebuild the chunk from the connection's tx state (the stream bytes at an
+    ; offset never change) and re-encrypt under a fresh number
+    mov rdi, [r14 + linnea_quic_sent.s_off]
+    mov rsi, [r14 + linnea_quic_sent.len]
+    call tx_emit_chunk                ; rax = the fresh packet number
+.sw_sent:
     mov [r14 + linnea_quic_sent.pn], rax
     mov [r14 + linnea_quic_sent.sent_ms], r15
     inc qword [r14 + linnea_quic_sent.tries]

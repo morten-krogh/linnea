@@ -410,6 +410,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_body_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): request body captured and echoed (POST)" $?
 
+    # large responses: a 600 KB file streams as ack-clocked STREAM-frame chunks
+    # (each datagram under the 1200-byte floor); one dropped chunk is rebuilt
+    # from the file after the PTO; a small GET is answered mid-transfer; a
+    # client whose flow-control window cannot take the file gets a 503
+    python3 test/quic/h3_big_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): large response streamed in chunks (loss + interleave + 503)" $?
+
     # session resumption: the real server issues a NewSessionTicket with the
     # early_data extension once the handshake completes
     python3 test/quic/h3_ticket_test.py 47452 >/dev/null 2>&1

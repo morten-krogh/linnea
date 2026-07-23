@@ -15,8 +15,11 @@ default rel
 %include "linnea_quic_conn.inc"
 
 global linnea_quic_rtx_record
+global linnea_quic_rtx_record_ref
 global linnea_quic_rtx_ack_range
 global linnea_quic_rtx_inflight
+global linnea_quic_rtx_ref_count
+global linnea_quic_rtx_ref_clear
 
 section .text
 
@@ -42,10 +45,76 @@ linnea_quic_rtx_record:
     mov [rax + linnea_quic_sent.sent_ms], r8
     mov [rax + linnea_quic_sent.len], rcx
     mov qword [rax + linnea_quic_sent.tries], 0
+    mov qword [rax + linnea_quic_sent.kind], LINNEA_QUIC_KIND_FRAMES
+    mov qword [rax + linnea_quic_sent.s_off], 0
     lea rdi, [rax + linnea_quic_sent.payload]
     mov rsi, rdx
     rep movsb                         ; rcx bytes of frames
 .done:
+    ret
+
+; linnea_quic_rtx_record_ref(rdi=conn, rsi=pn, rdx=stream offset, rcx=len,
+;   r8=now ms) -> rax = 1 recorded, 0 = ring full. Buffer a chunk of the open
+; response stream by reference: only [offset, offset+len) is kept — a
+; retransmission rebuilds the STREAM frame from the connection's tx state, so a
+; large body is never copied per packet. The caller checks the ring has room
+; BEFORE sending (linnea_quic_rtx_inflight): an untracked chunk would leave a
+; permanent hole in the stream, unlike a small reply, which the peer re-requests.
+linnea_quic_rtx_record_ref:
+    lea rax, [rdi + linnea_quic_conn.sent]
+    mov r9d, LINNEA_QUIC_RTX_SLOTS
+.rscan:
+    cmp qword [rax + linnea_quic_sent.in_use], 0
+    je .rfree
+    add rax, linnea_quic_sent_size
+    dec r9d
+    jnz .rscan
+    xor eax, eax                      ; ring full
+    ret
+.rfree:
+    mov qword [rax + linnea_quic_sent.in_use], 1
+    mov [rax + linnea_quic_sent.pn], rsi
+    mov [rax + linnea_quic_sent.sent_ms], r8
+    mov [rax + linnea_quic_sent.len], rcx
+    mov qword [rax + linnea_quic_sent.tries], 0
+    mov qword [rax + linnea_quic_sent.kind], LINNEA_QUIC_KIND_STREAM_REF
+    mov [rax + linnea_quic_sent.s_off], rdx
+    mov eax, 1
+    ret
+
+; linnea_quic_rtx_ref_count(rdi=conn) -> rax = buffered stream-ref chunks. Zero,
+; with the whole stream sent, means every chunk was acknowledged: the response
+; is delivered and the file mapping can be released.
+linnea_quic_rtx_ref_count:
+    lea rdx, [rdi + linnea_quic_conn.sent]
+    xor eax, eax
+    mov ecx, LINNEA_QUIC_RTX_SLOTS
+.cscan:
+    cmp qword [rdx + linnea_quic_sent.in_use], 0
+    je .cnext
+    cmp qword [rdx + linnea_quic_sent.kind], LINNEA_QUIC_KIND_STREAM_REF
+    jne .cnext
+    inc eax
+.cnext:
+    add rdx, linnea_quic_sent_size
+    dec ecx
+    jnz .cscan
+    ret
+
+; linnea_quic_rtx_ref_clear(rdi=conn) — drop every stream-ref record. Called
+; when the response stream is aborted (its file unmapped): a surviving reference
+; would rebuild a chunk from memory that is no longer mapped.
+linnea_quic_rtx_ref_clear:
+    lea rdx, [rdi + linnea_quic_conn.sent]
+    mov ecx, LINNEA_QUIC_RTX_SLOTS
+.xscan:
+    cmp qword [rdx + linnea_quic_sent.kind], LINNEA_QUIC_KIND_STREAM_REF
+    jne .xnext
+    mov qword [rdx + linnea_quic_sent.in_use], 0
+.xnext:
+    add rdx, linnea_quic_sent_size
+    dec ecx
+    jnz .xscan
     ret
 
 ; linnea_quic_rtx_ack_range(rdi=conn, rsi=lo, rdx=hi) — release every buffered

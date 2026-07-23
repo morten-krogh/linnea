@@ -10,7 +10,9 @@ default rel
 
 global linnea_h3_read_headers
 global linnea_h3_build_response
+global linnea_h3_build_response_head
 global linnea_h3_serve
+global linnea_h3_tx_cap
 
 extern linnea_quic_varint_decode
 extern linnea_quic_varint_encode
@@ -30,12 +32,21 @@ body_404:      db "404 Not Found", 10
 body_404_len   equ $ - body_404
 body_400:      db "400 Bad Request", 10
 body_400_len   equ $ - body_400
+body_503:      db "503 Service Unavailable", 10
+body_503_len   equ $ - body_503
 
 section .bss
 fs_buf:   resb 512                    ; encoded response field section
 clen_buf: resb 20                     ; content-length as decimal ASCII
 h3_path_buf: resb 4096                ; root ++ decoded path ++ NUL
 post_receipt: resb 64                 ; "<len> <hash>" for a large POST body
+; The caller's flow-control allowance for one chunked response: the most stream
+; bytes (head + body) the requesting client can accept, set by the QUIC server
+; per request before linnea_h3_serve — 0 while another chunked response is in
+; flight on the connection. A body that will not fit is refused with a 503
+; rather than overrun the client's window (a flow-control violation kills the
+; connection; a 503 is retryable).
+linnea_h3_tx_cap: resq 1
 
 section .text
 
@@ -136,12 +147,15 @@ linnea_h3_read_headers:
     pop rbx
     ret
 
-; linnea_h3_build_response(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
-;   r8=body_ptr, r9=body_len) -> rax = total length written.
+; linnea_h3_build_response_head(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
+;   r8=body_len) -> rax = length written.
 ; Emits a HEADERS frame (0x01) wrapping the QPACK-encoded response fields
-; (:status, content-type, content-length = body_len) then a DATA frame (0x00)
-; carrying the body. The out buffer must hold the field section + body + framing.
-linnea_h3_build_response:
+; (:status, content-type, content-length = body_len) then the DATA frame's
+; type and length varint — everything of the response that precedes the body
+; bytes. A caller that inlines the body appends it right after; a chunked
+; response keeps this head per connection and streams the body from its file
+; mapping, so the head and body never share a buffer.
+linnea_h3_build_response_head:
     push rbx
     push r12
     push r13
@@ -152,13 +166,12 @@ linnea_h3_build_response:
     mov rbx, rdi                     ; out start
     mov r14, rdi                     ; out cursor
     mov r15d, esi                    ; status
-    mov r12, r8                      ; body ptr
-    mov r13, r9                      ; body len
+    mov r13, r8                      ; body len
     ; content-length text = decimal(body_len)
     push rdx
     push rcx
     lea rdi, [clen_buf]
-    mov rax, r9
+    mov rax, r8
     call u64_to_dec                  ; rax = digit count
     pop rcx
     pop rdx
@@ -183,20 +196,15 @@ linnea_h3_build_response:
     mov rcx, rbp
     rep movsb
     mov r14, rdi
-    ; DATA frame: type 0x00, length varint, body
+    ; DATA frame: type 0x00 and its length varint (the body is the caller's)
     mov byte [r14], LINNEA_H3_FRAME_DATA
     inc r14
     mov rdi, r14
     mov rsi, r13
     call linnea_quic_varint_encode
     add r14, rax
-    mov rsi, r12
-    mov rdi, r14
-    mov rcx, r13
-    rep movsb
-    mov r14, rdi
     mov rax, r14
-    sub rax, rbx                     ; total length
+    sub rax, rbx                     ; head length
     add rsp, 8
     pop rbp
     pop r15
@@ -206,12 +214,43 @@ linnea_h3_build_response:
     pop rbx
     ret
 
+; linnea_h3_build_response(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
+;   r8=body_ptr, r9=body_len) -> rax = total length written.
+; The head (HEADERS frame + DATA frame header) followed by the body bytes.
+; The out buffer must hold the field section + body + framing.
+linnea_h3_build_response:
+    push r12
+    push r13
+    push r14
+    mov r12, r8                      ; body ptr
+    mov r13, r9                      ; body len
+    mov r14, rdi                     ; out
+    mov r8, r9                       ; the head takes the body's length
+    call linnea_h3_build_response_head
+    lea rdi, [r14 + rax]
+    mov rsi, r12
+    mov rcx, r13
+    rep movsb
+    add rax, r13                     ; head + body
+    pop r14
+    pop r13
+    pop r12
+    ret
+
 ; linnea_h3_serve(rdi=req, rsi=root ptr, rdx=root len, rcx=out, r8=body ptr,
-;   r9=body len) -> rax = response length written to out.
+;   r9=body len) -> rax = response length written to out, and r8/r9 = the
+; response file's mapping base/size when the body was too large to inline
+; (r9 = 0 otherwise: out holds the complete response, nothing stays mapped).
 ; A POST echoes its request body (200 text/plain). Otherwise resolves the
 ; request's :path under root and serves that file with its MIME type, or a
 ; 404 / 400 response. The path normalizer, opener and MIME table are the shared
 ; ones, so h3 and h2 resolve and reject paths identically.
+; A body over LINNEA_H3_INLINE_MAX is not copied: out receives only the head
+; (HEADERS frame + DATA frame header), the file stays mapped, and the caller
+; streams the body as chunks — unless head + body exceeds the caller's
+; flow-control allowance (linnea_h3_tx_cap), which is refused with a 503: the
+; client's window cannot take the response, and overrunning it would kill the
+; connection instead of the request.
 linnea_h3_serve:
     push rbx
     push r12
@@ -311,6 +350,8 @@ linnea_h3_serve:
     call linnea_static_mime          ; rax = mime ptr, rdx = mime len
     mov rcx, rdx                     ; mime len
     mov rdx, rax                     ; mime ptr
+    cmp rbp, LINNEA_H3_INLINE_MAX
+    ja .large                        ; too big for one packet: stream it
     mov r8, r15
     mov r9, rbp
     cmp r15, 1                       ; empty-file sentinel: found, nothing mapped
@@ -330,6 +371,35 @@ linnea_h3_serve:
     syscall
     pop rax
     jmp .sret
+.large:
+    ; will head + body fit the client's allowance? (rdx/rcx = MIME, kept live)
+    mov rax, [linnea_h3_tx_cap]
+    sub rax, LINNEA_H3_HEAD_MAX      ; the head's worst case
+    jb .refuse                       ; no allowance at all
+    cmp rbp, rax
+    ja .refuse                       ; the body alone would overrun the window
+    mov rdi, r12
+    mov esi, 200
+    mov r8, rbp                      ; body length (for content-length + DATA len)
+    call linnea_h3_build_response_head ; rax = head length written to out
+    mov r8, r15                      ; the mapping is the caller's to stream + unmap
+    mov r9, rbp
+    jmp .sret_large
+.refuse:
+    ; unmap the file and answer 503: refused, not broken — the client may retry
+    ; (e.g. once the connection's open response stream finishes)
+    mov rdi, r15
+    mov rsi, rbp
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    mov rdi, r12
+    mov esi, 503
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_503]
+    mov r9d, body_503_len
+    call linnea_h3_build_response
+    jmp .sret
 .notfound:
     mov rdi, r12
     mov esi, 404
@@ -348,6 +418,9 @@ linnea_h3_serve:
     mov r9d, body_400_len
     call linnea_h3_build_response
 .sret:
+    xor r8d, r8d                     ; complete response in out, nothing mapped
+    xor r9d, r9d
+.sret_large:
     add rsp, 8
     pop rbp
     pop r15

@@ -24,6 +24,7 @@ global linnea_quic_protect
 global linnea_quic_ch_parse
 global linnea_quic_alpn_has
 global linnea_quic_build_transport_params
+global linnea_quic_tp_parse
 global linnea_quic_build_sh
 global linnea_quic_build_ee
 global linnea_quic_build_cert
@@ -231,10 +232,16 @@ unprotect_body:
     pop rbx
     ret
 
-; linnea_quic_unprotect_short(rdi=packet, rsi=len, rdx=keys, rcx=out, r8=dcid_len)
-;   -> rax = plaintext length (or -1), rdx = the packet number. Removes header protection and AEAD-opens a
-; short-header (1-RTT) packet. The destination connection-id length must be
-; supplied — short headers carry no length field for it. RFC 9001 5.3 / 5.4.
+; linnea_quic_unprotect_short(rdi=packet, rsi=len, rdx=keys, rcx=out, r8=dcid_len,
+;   r9=expected pn) -> rax = plaintext length (or -1), rdx = the packet number.
+; Removes header protection and AEAD-opens a short-header (1-RTT) packet. The
+; destination connection-id length must be supplied — short headers carry no
+; length field for it. RFC 9001 5.3 / 5.4.
+; The wire carries only the packet number's low bits, so the true number is
+; recovered against r9 = the next number the caller expects from this peer
+; (largest received + 1; 0 when nothing has been received). Without the
+; expansion a peer whose number outgrows its truncation window would XOR the
+; wrong value into the nonce and every later packet would fail to open.
 %define S_AAD    0        ; unprotected header (AAD)
 %define S_NONCE  64
 %define S_MASK   80
@@ -242,6 +249,7 @@ unprotect_body:
 %define S_PNLEN  96
 %define S_PN     104
 %define S_CTX    112
+%define S_EXP    312      ; expected packet number (r9 at entry)
 linnea_quic_unprotect_short:
     push rbx
     push r12
@@ -249,7 +257,8 @@ linnea_quic_unprotect_short:
     push r14
     push r15
     push rbp
-    sub rsp, 312
+    sub rsp, 328
+    mov [rsp + S_EXP], r9
     mov rbx, rdi                     ; packet
     mov rbp, rsi                     ; packet length
     mov r12, rdx                     ; keys
@@ -302,6 +311,35 @@ linnea_quic_unprotect_short:
     inc edx
     cmp edx, ecx
     jb .s_pndecode
+    ; expand against the expected number (RFC 9000 A.3): the true number is the
+    ; candidate with these low bits closest to it. The expansion happens before
+    ; the nonce is formed — the nonce takes the full number, not the wire bits.
+    mov r9, [rsp + S_EXP]            ; expected
+    mov ecx, [rsp + S_PNLEN]
+    shl ecx, 3                       ; bits carried on the wire
+    mov rdx, 1
+    shl rdx, cl                      ; win  = 1 << bits
+    mov r10, rdx
+    shr r10, 1                       ; hwin = win / 2
+    lea r11, [rdx - 1]               ; mask = win - 1
+    not r11
+    mov r8, r9
+    and r8, r11                      ; expected & ~mask
+    or r8, rax                       ; candidate
+    lea rcx, [r8 + r10]
+    cmp rcx, r9
+    ja .s_pn_nolow
+    add r8, rdx                      ; candidate <= expected - hwin: next window
+    jmp .s_pn_expanded
+.s_pn_nolow:
+    lea rcx, [r9 + r10]
+    cmp r8, rcx
+    jbe .s_pn_expanded
+    cmp r8, rdx
+    jb .s_pn_expanded
+    sub r8, rdx                      ; candidate > expected + hwin: previous window
+.s_pn_expanded:
+    mov rax, r8
     mov [rsp + S_PN], rax
     ; --- nonce = iv XOR pn (right-aligned) ---
     lea rsi, [r12 + linnea_quic_keys.iv]
@@ -344,7 +382,7 @@ linnea_quic_unprotect_short:
 .serr:
     mov rax, -1
 .sdone:
-    add rsp, 312
+    add rsp, 328
     pop rbp
     pop r15
     pop r14
@@ -1352,6 +1390,80 @@ linnea_quic_build_transport_params:
     mov r12, rax
     mov rax, r12
     sub rax, rbx                     ; total length
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_tp_parse(rdi=params, rsi=len) -> rax = initial_max_data (0x04),
+; rdx = initial_max_stream_data_bidi_local (0x05); zero when absent — which is
+; also what RFC 9000 18.2 says an omitted parameter means. These two bound what
+; we may send on a client-initiated bidirectional stream (its response), so the
+; server reads them from the client's transport parameters before it commits to
+; a chunked response. The parameters are a sequence of varint id, varint length,
+; then that many bytes; both values are themselves varints. Anything malformed
+; stops the walk with whatever was gathered.
+linnea_quic_tp_parse:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 8
+    mov rbx, rdi                     ; cursor
+    lea r12, [rdi + rsi]             ; end
+    xor r13d, r13d                   ; initial_max_data
+    xor r14d, r14d                   ; initial_max_stream_data_bidi_local
+.tp_next:
+    cmp rbx, r12
+    jae .tp_done
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_varint_decode   ; parameter id
+    test rdx, rdx
+    jz .tp_done
+    mov r15, rax
+    add rbx, rdx
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_varint_decode   ; parameter length
+    test rdx, rdx
+    jz .tp_done
+    add rbx, rdx
+    mov rbp, rax                     ; parameter length
+    mov rcx, r12
+    sub rcx, rbx
+    cmp rbp, rcx
+    ja .tp_done                      ; runs past the extension
+    cmp r15, 0x04
+    je .tp_value
+    cmp r15, 0x05
+    je .tp_value
+    add rbx, rbp                     ; not one we read: skip its payload
+    jmp .tp_next
+.tp_value:
+    mov rdi, rbx
+    lea rsi, [rbx + rbp]
+    call linnea_quic_varint_decode   ; the value
+    test rdx, rdx
+    jz .tp_skip
+    cmp r15, 0x04
+    jne .tp_val05
+    mov r13, rax
+    jmp .tp_skip
+.tp_val05:
+    mov r14, rax
+.tp_skip:
+    add rbx, rbp
+    jmp .tp_next
+.tp_done:
+    mov rax, r13
+    mov rdx, r14
+    add rsp, 8
     pop rbp
     pop r15
     pop r14
