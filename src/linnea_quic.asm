@@ -1481,10 +1481,14 @@ linnea_quic_tp_parse:
 
 ; linnea_quic_flow_scan(rdi=frames, rsi=len, rdx=tx_sid, rcx=out) — record the
 ; largest MAX_DATA into out[0] and the largest MAX_STREAM_DATA for tx_sid into
-; out[1] (the caller pre-zeroes out). Handles the frames a client sends while
-; consuming a download — PADDING/PING/ACK and the two flow-control frames — and
-; stops at any other type. Flow-control credit is cumulative and re-sent, so a
-; frame sitting behind an unhandled type is picked up from a later packet.
+; out[1] (the caller pre-zeroes out). A real browser bundles NEW_CONNECTION_ID,
+; MAX_STREAMS, QPACK STREAM data and the like into the same 1-RTT packets as its
+; flow-control credit, so this must SKIP every frame type it does not record —
+; not stop at the first unrecognised one — or a MAX_DATA sitting behind such a
+; frame is never absorbed and the response stalls when the window fills (the very
+; bug that made a multi-image page stall over the real internet: one image fits a
+; browser's large initial window, but ten exhaust it and depend on MAX_DATA). Same
+; complete frame walk as linnea_quic_stream_frame; only truly unknown types stop.
 linnea_quic_flow_scan:
     push rbx
     push r12
@@ -1509,9 +1513,139 @@ linnea_quic_flow_scan:
     je .fw_maxdata
     cmp bl, 0x11
     je .fw_maxstreamdata
-    jmp .fw_done                     ; another frame type: stop, retry next packet
+    ; skip every other known frame so credit bundled behind it is still reached
+    mov eax, ebx
+    and eax, 0xf8
+    cmp eax, 0x08                    ; STREAM (0x08-0x0f)
+    je .fw_stream
+    cmp bl, 0x1e                     ; HANDSHAKE_DONE (no payload)
+    je .fw_skip1
+    cmp bl, 0x1a                     ; PATH_CHALLENGE (8 bytes)
+    je .fw_skip8
+    cmp bl, 0x1b                     ; PATH_RESPONSE (8 bytes)
+    je .fw_skip8
+    cmp bl, 0x18                     ; NEW_CONNECTION_ID
+    je .fw_ncid
+    cmp bl, 0x06                     ; CRYPTO (offset, length, data)
+    je .fw_crypto
+    cmp bl, 0x07                     ; NEW_TOKEN (length, token)
+    je .fw_token
+    cmp bl, 0x04                     ; RESET_STREAM (3 varints)
+    je .fw_v3
+    cmp bl, 0x05                     ; STOP_SENDING (2 varints)
+    je .fw_v2
+    cmp bl, 0x15                     ; STREAM_DATA_BLOCKED (2 varints)
+    je .fw_v2
+    cmp bl, 0x12                     ; MAX_STREAMS bidi (1 varint)
+    je .fw_v1
+    cmp bl, 0x13                     ; MAX_STREAMS uni (1 varint)
+    je .fw_v1
+    cmp bl, 0x14                     ; DATA_BLOCKED (1 varint)
+    je .fw_v1
+    cmp bl, 0x16                     ; STREAMS_BLOCKED bidi (1 varint)
+    je .fw_v1
+    cmp bl, 0x17                     ; STREAMS_BLOCKED uni (1 varint)
+    je .fw_v1
+    cmp bl, 0x19                     ; RETIRE_CONNECTION_ID (1 varint)
+    je .fw_v1
+    jmp .fw_done                     ; unknown (e.g. CONNECTION_CLOSE): stop
 .fw_skip1:
     inc rdi
+    jmp .fw_scan
+.fw_skip8:
+    add rdi, 9                       ; type byte + 8 fixed bytes
+    jmp .fw_scan
+.fw_v1:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    jmp .fw_scan
+.fw_v2:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    jmp .fw_scan
+.fw_v3:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    jmp .fw_scan
+.fw_token:
+    inc rdi
+    call linnea_quic_varint_decode   ; token length
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    add rdi, rax                      ; skip the token bytes
+    jmp .fw_scan
+.fw_crypto:
+    inc rdi
+    call linnea_quic_varint_decode   ; offset
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; length
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    add rdi, rax                      ; skip the crypto data
+    jmp .fw_scan
+.fw_ncid:
+    inc rdi
+    call linnea_quic_varint_decode   ; sequence number
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; retire prior to
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    cmp rdi, rsi
+    jae .fw_done
+    movzx eax, byte [rdi]             ; connection id length
+    add rdi, 1
+    add rdi, rax                      ; skip the connection id
+    add rdi, 16                       ; skip the stateless reset token
+    jmp .fw_scan
+.fw_stream:
+    mov r15d, ebx                    ; save the STREAM type bits (OFF/LEN/FIN)
+    inc rdi
+    call linnea_quic_varint_decode   ; stream id
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    test r15b, 0x04                  ; OFF present?
+    jz .fw_stream_len
+    call linnea_quic_varint_decode   ; offset
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+.fw_stream_len:
+    test r15b, 0x02                  ; LEN present?
+    jz .fw_done                      ; no LEN: data runs to the packet end — stop
+    call linnea_quic_varint_decode   ; length
+    test rdx, rdx
+    jz .fw_done
+    add rdi, rdx
+    add rdi, rax                      ; skip the stream data
     jmp .fw_scan
 .fw_maxdata:
     inc rdi

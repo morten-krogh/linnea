@@ -18,6 +18,7 @@ extern linnea_quic_rtx_inflight
 extern linnea_quic_txchunk_record
 extern linnea_quic_txchunk_ack
 extern linnea_quic_txchunk_clear
+extern linnea_quic_flow_scan
 extern linnea_quic_ack_ranges
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
@@ -39,6 +40,20 @@ pay_len    equ $ - pay
 ; (covers 5..7), then one range with Gap=0, Length=0 (covers 3). Two ranges out.
 ackframe:  db 0x00, 0x01, 0x02, 0x07, 0x00, 0x01, 0x02, 0x00, 0x00
 ackframe_len equ $ - ackframe
+; flow_scan must reach flow-control credit bundled behind other frames, as a real
+; browser sends it. NEW_CONNECTION_ID(seq 1, retire 0, cid len 4, 16-byte token),
+; then MAX_DATA=300 (0x412c), then MAX_STREAM_DATA(stream 0)=500 (0x41f4).
+fs_ncid:   db 0x18, 0x01, 0x00, 0x04, 0xAA, 0xBB, 0xCC, 0xDD
+           db 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0
+           db 0x10, 0x41, 0x2C
+           db 0x11, 0x00, 0x41, 0xF4
+fs_ncid_len equ $ - fs_ncid
+; MAX_STREAMS bidi=16, a STREAM|LEN frame (stream 3, 2 bytes of data), then
+; MAX_STREAM_DATA(stream 4)=700 (0x42bc) — credit behind a data-carrying frame.
+fs_stream: db 0x12, 0x10
+           db 0x0A, 0x03, 0x02, 0xAB, 0xCD
+           db 0x11, 0x04, 0x42, 0xBC
+fs_stream_len equ $ - fs_stream
 msg_head:  db "quic-rtx "
 msg_head_len equ $ - msg_head
 msg_slash: db "/"
@@ -47,6 +62,7 @@ msg_nl:    db 10
 section .bss
 conn:      resb linnea_quic_conn_size
 pairs:     resb LINNEA_QUIC_ACK_MAXR * 16
+flow_out:  resb 16                 ; [max_data, max_stream_data] from a flow scan
 
 section .text
 
@@ -227,6 +243,43 @@ _start:
     EXPECT rax, 0                    ; full: caller must wait for acks
     lea rdi, [conn]
     call linnea_quic_txchunk_clear
+
+    ; --- flow_scan: credit bundled behind other frames must still be absorbed ---
+    ; (the multi-image page stalled over the real internet because a browser sends
+    ; MAX_DATA behind NEW_CONNECTION_ID / STREAM frames that the scan used to stop at)
+    mov qword [flow_out], 0
+    mov qword [flow_out + 8], 0
+    lea rdi, [fs_ncid]
+    mov esi, fs_ncid_len
+    xor edx, edx                    ; our stream id = 0
+    lea rcx, [flow_out]
+    call linnea_quic_flow_scan
+    mov rax, [flow_out]
+    EXPECT rax, 300                 ; MAX_DATA reached past NEW_CONNECTION_ID
+    mov rax, [flow_out + 8]
+    EXPECT rax, 500                 ; MAX_STREAM_DATA(0) reached too
+    ; credit behind MAX_STREAMS + a data-carrying STREAM frame
+    mov qword [flow_out], 0
+    mov qword [flow_out + 8], 0
+    lea rdi, [fs_stream]
+    mov esi, fs_stream_len
+    mov edx, 4                       ; our stream id = 4
+    lea rcx, [flow_out]
+    call linnea_quic_flow_scan
+    mov rax, [flow_out + 8]
+    EXPECT rax, 700                 ; MAX_STREAM_DATA(4) reached past the STREAM frame
+    ; MAX_STREAM_DATA for another stream is not credited to ours, MAX_DATA still is
+    mov qword [flow_out], 0
+    mov qword [flow_out + 8], 0
+    lea rdi, [fs_ncid]
+    mov esi, fs_ncid_len
+    mov edx, 7                       ; a stream not named in the packet
+    lea rcx, [flow_out]
+    call linnea_quic_flow_scan
+    mov rax, [flow_out + 8]
+    EXPECT rax, 0                    ; MAX_STREAM_DATA(0) is not for stream 7
+    mov rax, [flow_out]
+    EXPECT rax, 300                 ; but the connection MAX_DATA is still absorbed
 
     ; print "quic-rtx <pass>/<total>\n"
     lea rdi, [msg_head]

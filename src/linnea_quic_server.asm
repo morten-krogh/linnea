@@ -2209,8 +2209,50 @@ tx_abort:
     pop rbx
     ret
 
+; tx_abort_one(rdi=conn, rsi=stream index) — one response stream cannot continue
+; (a chunk of it exhausted its retransmits), but the others on the connection can:
+; unmap just this stream's file, free its slot, and drop only its chunks from the
+; shared in-flight table (a surviving one would rebuild from unmapped memory). The
+; peer sees no FIN on this stream and re-requests it; the rest keep streaming.
+; Uses only caller-saved scratch beyond rbx/r12, so the sweep's registers survive.
+tx_abort_one:
+    push rbx
+    push r12
+    mov rbx, rdi                      ; conn
+    mov r12, rsi                      ; stream index
+    mov rcx, r12
+    imul rcx, rcx, linnea_quic_txstream_size
+    lea rax, [rbx + linnea_quic_conn.tx_streams]
+    add rax, rcx                      ; rax = the slot
+    cmp qword [rax + linnea_quic_txstream.active], 0
+    je .ta1_table
+    mov rdi, [rax + linnea_quic_txstream.base]
+    mov rsi, [rax + linnea_quic_txstream.size]
+    mov qword [rax + linnea_quic_txstream.active], 0
+    mov qword [rax + linnea_quic_txstream.inflight], 0
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+.ta1_table:
+    lea rax, [rbx + linnea_quic_conn.tx_infl]
+    mov ecx, LINNEA_QUIC_TXINFL_SLOTS
+.ta1_scan:
+    cmp qword [rax + linnea_quic_txchunk.in_use], 0
+    je .ta1_next
+    cmp qword [rax + linnea_quic_txchunk.ctx], r12
+    jne .ta1_next
+    mov qword [rax + linnea_quic_txchunk.in_use], 0
+    mov r8, [rax + linnea_quic_txchunk.len]
+    sub [rbx + linnea_quic_conn.bytes_in_flight], r8
+.ta1_next:
+    add rax, linnea_quic_txchunk_size
+    dec ecx
+    jnz .ta1_scan
+    pop r12
+    pop rbx
+    ret
+
 ; quic_tx_free_hook(rdi=conn) — registered as the pool's free hook: any path
-; that reclaims a slot (clean close, idle sweep, handshake failure) releases an
+; that reclaims a slot (clean close, idle sweep, handshake failure) releases every
 ; open response stream's mapping through tx_abort first.
 quic_tx_free_hook:
     jmp tx_abort
@@ -2297,9 +2339,10 @@ linnea_quic_server_rtx_sweep:
     jb .sw_tc_next                    ; not yet due
     cmp qword [r14 + linnea_quic_txchunk.tries], LINNEA_QUIC_PTO_MAX
     jb .sw_tc_resend
-    mov rdi, rbx                      ; given up: abort the whole response
-    call tx_abort                     ; (unmaps the file, clears the table)
-    jmp .sw_conn_next
+    mov rdi, rbx                      ; given up: drop just this stream, not the
+    mov rsi, [r14 + linnea_quic_txchunk.ctx]   ; whole connection's other transfers
+    call tx_abort_one
+    jmp .sw_tc_next                   ; keep sweeping the remaining streams' chunks
 .sw_tc_resend:
     mov [cur_conn], rbx
     mov rdi, rbx                      ; a timeout is a congestion signal
