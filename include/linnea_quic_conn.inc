@@ -21,6 +21,13 @@ LINNEA_QUIC_RXBUF_SIZE equ 2048     ; linnea_quic_rxbuf, the datagram we read in
 LINNEA_QUIC_SCID_LEN  equ 8         ; every connection ID we issue is 8 bytes
 LINNEA_QUIC_IDLE_SECS equ 30        ; reclaim a slot after this long with no packet
 
+; A ClientHello too large for one Initial packet (a browser offering a
+; post-quantum key share runs to ~1.6 KB, well over the ~1200-byte Initial) is
+; split across several Initial packets, each carrying a CRYPTO frame at an
+; increasing offset. The fragments are reassembled here, keyed on the client's
+; original DCID so every Initial of one handshake lands on the same slot.
+LINNEA_QUIC_CH_BUF    equ 4096       ; largest ClientHello we reassemble
+
 ; The server handshake flight carries the whole certificate chain in CRYPTO
 ; frames, which for a real chain far exceeds one datagram. QUIC forbids IP
 ; fragmentation (packets set don't-fragment), so a flight larger than the path
@@ -183,6 +190,18 @@ struc linnea_quic_conn
                                     ; transport parameters. A larger response is
                                     ; refused (503) rather than overrun the window.
     .tx_hdr:     resb LINNEA_QUIC_TX_HDR
+    ; ClientHello reassembly (RFC 9000 7.5): the client's original DCID identifies
+    ; the handshake before we have issued our own connection id, so every Initial
+    ; of one handshake — including the later packets of a ClientHello too large
+    ; for one Initial — routes here by it. The CRYPTO fragments are folded into
+    ; ch_buf in offset order; ch_total is learned from the TLS handshake length in
+    ; the offset-0 fragment, and the ClientHello is parsed once ch_len reaches it.
+    .odcid:      resb LINNEA_QUIC_MAX_CID   ; the client's original DCID
+    .odcid_len:  resq 1
+    .ch_len:     resq 1              ; contiguous ClientHello bytes reassembled
+    .ch_total:   resq 1              ; full ClientHello size, 0 until the header lands
+    .ch_maxpn:   resq 1              ; largest Initial packet number seen (for the ACK)
+    .ch_buf:     resb LINNEA_QUIC_CH_BUF
     .pad:        resb 4              ; keep the size a multiple of 8
 endstruc
 

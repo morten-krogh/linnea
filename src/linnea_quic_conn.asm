@@ -11,6 +11,7 @@ default rel
 %include "linnea_quic_conn.inc"
 
 global linnea_quic_conn_lookup
+global linnea_quic_conn_lookup_odcid
 global linnea_quic_conn_alloc
 global linnea_quic_conn_free
 global linnea_quic_conn_sweep
@@ -55,6 +56,58 @@ linnea_quic_conn_lookup:
     mov rax, rcx
     ret
 .miss:
+    xor eax, eax
+    ret
+
+; linnea_quic_conn_lookup_odcid(rdi=dcid ptr, rsi=dcid len) -> rax = conn* or 0.
+; Finds the connection whose recorded original DCID matches, by a linear scan of
+; the pool. This is the handshake-phase demux: before the client has processed
+; our ServerHello it still addresses us by the DCID it chose, so a second Initial
+; (the rest of a large ClientHello, or a retransmission) must reach the slot the
+; first one opened. A zero-length id never matches — it would alias every slot
+; whose original DCID is not yet recorded.
+linnea_quic_conn_lookup_odcid:
+    test rsi, rsi
+    jz .lo_miss
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi                     ; dcid ptr
+    mov r13, rsi                     ; dcid len
+    lea rbx, [conn_pool]
+    mov r14d, LINNEA_QUIC_MAX_CONNS
+.lo_slot:
+    cmp qword [rbx + linnea_quic_conn.in_use], 0
+    je .lo_next
+    cmp [rbx + linnea_quic_conn.odcid_len], r13
+    jne .lo_next
+    xor ecx, ecx                     ; compare r13 bytes of the original DCID
+.lo_cmp:
+    cmp rcx, r13
+    jae .lo_hit
+    mov al, [r12 + rcx]
+    lea rdx, [rbx + linnea_quic_conn.odcid]
+    cmp al, [rdx + rcx]
+    jne .lo_next
+    inc rcx
+    jmp .lo_cmp
+.lo_hit:
+    mov rax, rbx
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.lo_next:
+    add rbx, linnea_quic_conn_size
+    dec r14d
+    jnz .lo_slot
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+.lo_miss:
     xor eax, eax
     ret
 

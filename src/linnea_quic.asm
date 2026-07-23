@@ -75,7 +75,7 @@ linnea_quic_initial_dcid:
     ret
 
 ; linnea_quic_unprotect(rdi=packet, rsi=len, rdx=keys, rcx=out)
-;   -> rax = plaintext length, or -1 on a parse/AEAD failure.
+;   -> rax = plaintext length (or -1), rdx = the packet number.
 ; Removes header protection and AEAD-opens an Initial (long-header) packet,
 ; writing the frame bytes to out. RFC 9001 5.3 / 5.4.
 %define U_AAD    0        ; unprotected header (AAD), <= 64 bytes
@@ -219,6 +219,7 @@ unprotect_body:
     mov rax, r15
     sub rax, [rsp + U_PNLEN]
     sub rax, 16                      ; plaintext length = ctlen - tag
+    mov rdx, [rsp + U_PN]            ; and the packet number, for acknowledging
     jmp .done
 .err:
     mov rax, -1
@@ -938,10 +939,12 @@ linnea_quic_close_frame:
     ret
 
 ; linnea_quic_crypto_frame(rdi=frames, rsi=len) -> rax = CRYPTO data ptr,
-; rdx = CRYPTO data length (rax = 0 if none). Skips PADDING/PING/ACK and returns
-; the first CRYPTO frame's data (RFC 9000 19.6). ACK (0x02/0x03) is fully
-; skipped so a Handshake packet that acks the server before its Finished still
-; yields the CRYPTO data. Any other frame ends the scan.
+; rdx = CRYPTO data length, r8 = CRYPTO offset (rax = 0 if none). Skips
+; PADDING/PING/ACK and returns the first CRYPTO frame's data (RFC 9000 19.6).
+; ACK (0x02/0x03) is fully skipped so a Handshake packet that acks the server
+; before its Finished still yields the CRYPTO data. Any other frame ends the
+; scan. The offset lets the caller reassemble a CRYPTO stream (a ClientHello too
+; large for one Initial packet) across packets.
 linnea_quic_crypto_frame:
     push rbx
     push r12
@@ -1017,8 +1020,10 @@ linnea_quic_crypto_frame:
     call linnea_quic_varint_decode   ; offset (rdi=cursor, rsi=end preserved)
     test rdx, rdx
     jz .none
+    push rax                         ; keep the offset across the length varint
     add rdi, rdx
     call linnea_quic_varint_decode   ; length
+    pop r8                           ; r8 = CRYPTO offset
     test rdx, rdx
     jz .none
     mov r12, rax                     ; CRYPTO data length
@@ -1031,6 +1036,7 @@ linnea_quic_crypto_frame:
 .none:
     xor eax, eax
     xor edx, edx
+    xor r8d, r8d
     pop r12
     pop rbx
     ret
@@ -1719,11 +1725,13 @@ linnea_quic_alpn_has:
     ret
 
 ; linnea_quic_recv_initial(rdi=datagram, rsi=len, rdx=plaintext buf)
-;   -> rax = ClientHello ptr (into the plaintext buf), rdx = length;
+;   -> rax = ClientHello CRYPTO ptr (into the plaintext buf), rdx = length,
+;      r8 = CRYPTO offset, r9 = the Initial packet number;
 ;      rax = 0 if the datagram is not an Initial we can decrypt.
 ; Derives the Initial keys from the packet's own DCID, unprotects it, and
-; returns the first CRYPTO frame's data (the TLS ClientHello). Reusable by the
-; real server once the UDP loop is wired in.
+; returns the first CRYPTO frame's data. The offset and packet number let the
+; caller reassemble a ClientHello split across several Initial packets and
+; acknowledge each Initial it received.
 linnea_quic_recv_initial:
     push rbx
     push r12
@@ -1747,16 +1755,20 @@ linnea_quic_recv_initial:
     mov rsi, r12
     lea rdx, [rsp]                   ; the client encrypts with its Initial keys
     mov rcx, r13
-    call linnea_quic_unprotect       ; rax = plaintext length
+    call linnea_quic_unprotect       ; rax = plaintext length, rdx = packet number
     test rax, rax
     js .fail
+    mov r14, rdx                     ; keep the Initial packet number
     mov rdi, r13
     mov rsi, rax
-    call linnea_quic_crypto_frame    ; rax = CH ptr, rdx = CH len
+    call linnea_quic_crypto_frame    ; rax = CRYPTO ptr, rdx = len, r8 = offset
+    mov r9, r14                      ; r9 = Initial packet number
     jmp .rdone
 .fail:
     xor eax, eax
     xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
 .rdone:
     add rsp, 120
     pop r14

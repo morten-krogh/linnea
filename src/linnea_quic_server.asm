@@ -57,6 +57,7 @@ extern linnea_quic_build_cert
 extern linnea_quic_build_cert_verify
 extern linnea_quic_build_finished
 extern linnea_quic_conn_lookup
+extern linnea_quic_conn_lookup_odcid
 extern linnea_quic_conn_alloc
 extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
@@ -284,13 +285,28 @@ linnea_quic_server_datagram:
     call linnea_quic_conn_lookup
     test rax, rax
     jnz .demux_found
-    ; An id we never issued. Only a client's first flight may open a
-    ; connection, and that always arrives in an Initial packet: the type bits
-    ; sit in the first byte and are not header-protected. Anything else with an
-    ; unknown id belongs to a connection we do not hold — another worker's, or
-    ; one already gone — so it is dropped rather than mistaken for a new
-    ; handshake. With several workers this is what keeps a datagram that landed
-    ; on the wrong one from starting a bogus connection.
+    ; Not one of our issued ids. During the handshake the client still addresses
+    ; us by the original DCID it chose — until it has our ServerHello it has no
+    ; other id for us — so a further Initial of the same handshake (the rest of a
+    ; ClientHello too large for one Initial, or a retransmission) must route to
+    ; the slot the first Initial opened. Match it by that original DCID.
+    movzx eax, byte [linnea_quic_rxbuf + 5]
+    lea rdi, [linnea_quic_rxbuf + 6]
+    mov esi, eax
+    call linnea_quic_conn_lookup_odcid
+    test rax, rax
+    jz .demux_new
+    mov [cur_conn], rax
+    call .refresh_peer
+    jmp .long_in
+.demux_new:
+    ; An id we never issued and no handshake in progress for it. Only a client's
+    ; first flight may open a connection, and that always arrives in an Initial
+    ; packet: the type bits sit in the first byte and are not header-protected.
+    ; Anything else with an unknown id belongs to a connection we do not hold —
+    ; another worker's, or one already gone — so it is dropped rather than
+    ; mistaken for a new handshake. With several workers this is what keeps a
+    ; datagram that landed on the wrong one from starting a bogus connection.
     movzx eax, byte [linnea_quic_rxbuf]
     and al, 0x30                     ; packet type: Initial is 0
     jnz .done
@@ -300,6 +316,12 @@ linnea_quic_server_datagram:
     test rax, rax
     jz .done                         ; pool exhausted: drop the datagram
     mov [cur_conn], rax
+    ; record the client's original DCID so its later Initials find this slot
+    movzx ecx, byte [linnea_quic_rxbuf + 5]
+    mov [rax + linnea_quic_conn.odcid_len], rcx
+    lea rdi, [rax + linnea_quic_conn.odcid]
+    lea rsi, [linnea_quic_rxbuf + 6]
+    rep movsb
     jmp .long_in
 .demux_short:
     lea rdi, [linnea_quic_rxbuf + 1]             ; short header: our ID, fixed length
@@ -322,6 +344,14 @@ linnea_quic_server_datagram:
     lea rcx, [r13 + r13*2]                       ; 3 * datagram length
     add [rax + linnea_quic_conn.amp_credit], rcx
 .amp_credited:
+    ; A long-header packet on a connection that has already sent its flight is a
+    ; retransmitted Initial (the client re-sent it before our flight's ACK
+    ; reached it) or its Handshake flight. Rebuilding here would derive fresh
+    ; keys and shatter the handshake in progress, so hand it to the Handshake
+    ; walk (which may find the client Finished) rather than the ClientHello path.
+    mov rcx, [cur_conn]
+    cmp qword [rcx + linnea_quic_conn.state], LINNEA_QUIC_ST_NEW
+    jne .try_handshake
 
     ; server Initial keys from the client DCID (also the odcid for transport params)
     lea rdi, [linnea_quic_rxbuf]
@@ -336,27 +366,38 @@ linnea_quic_server_datagram:
     CONNLEA rdx, ini_client
     CONNLEA rcx, ini_server
     call linnea_quic_initial_secrets
-    ; ClientHello + key_share
+    ; ClientHello CRYPTO fragment from this Initial
     lea rdi, [linnea_quic_rxbuf]
     mov rsi, r13
     lea rdx, [plaintext]
-    call linnea_quic_recv_initial
+    call linnea_quic_recv_initial    ; rax=frag, rdx=len, r8=offset, r9=pn
     test rax, rax
-    jz .try_handshake                ; no ClientHello — maybe the client Finished
-    ; A ClientHello on a connection that has already sent its flight is a
-    ; retransmitted Initial (the client re-sent it, now addressed to our SCID,
-    ; before our flight's ACK reached it). Rebuilding the flight here would derive
-    ; fresh keys and shatter the handshake in progress, so ignore the retransmit
-    ; and fall through to the Handshake walk (it may coalesce the client Finished).
+    jz .try_handshake                ; no ClientHello CRYPTO — maybe the Finished
+    ; fold the fragment into the connection's reassembly buffer; a ClientHello too
+    ; large for one Initial completes only once its later packets arrive.
+    call .ch_reassemble              ; rax = 1 if the ClientHello is now whole
+    test rax, rax
+    jz .done                         ; still partial: wait for the next Initial
+    ; parse the reassembled ClientHello
     mov rcx, [cur_conn]
-    cmp qword [rcx + linnea_quic_conn.state], LINNEA_QUIC_ST_NEW
-    jne .try_handshake
+    lea rax, [rcx + linnea_quic_conn.ch_buf]
     mov [s_ch_ptr], rax
+    mov rdx, [rcx + linnea_quic_conn.ch_total]
     mov [s_ch_len], rdx
     mov rdi, rax
     mov rsi, rdx
     lea rdx, [ch_out]
     call linnea_quic_ch_parse
+    ; A ClientHello with no usable x25519 key_share cannot key the ECDHE. Never
+    ; hand a null share to x25519 (it would dereference address 0 and crash the
+    ; worker); drop the datagram and reclaim the slot. This is the one client we
+    ; cannot serve — every browser and QUIC library offers x25519.
+    cmp qword [ch_out + linnea_quic_ch.ks_ptr], 0
+    jne .ks_ok
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
+.ks_ok:
     ; the client's SCID sits after its DCID in the received header. Copy it to a
     ; stable buffer: we reuse it as the DCID of every packet we send back, but
     ; dgram is overwritten by each recvfrom.
@@ -475,8 +516,17 @@ linnea_quic_server_datagram:
 .sh_ready:
 
     ; ===== Initial packet: ACK + CRYPTO(ServerHello) =====
+    ; ACK the client's Initials: Largest Acknowledged and First ACK Range both the
+    ; largest Initial packet number we received (they are 0..N contiguous — we
+    ; needed every fragment). A single-packet ClientHello leaves this at 0. The
+    ; number is tiny (one Initial per ClientHello fragment), so each varint is one
+    ; byte and the ACK frame stays five bytes.
     mov byte [payload], 0x02
     mov dword [payload + 1], 0
+    mov rax, [cur_conn]
+    movzx ecx, byte [rax + linnea_quic_conn.ch_maxpn]
+    mov [payload + 1], cl            ; Largest Acknowledged
+    mov [payload + 4], cl            ; First ACK Range (covers 0..largest)
     mov byte [payload + 5], 0x06
     mov byte [payload + 6], 0x00
     mov eax, [s_sh_len]              ; CRYPTO length varint (2-byte: 0x4000 | len)
@@ -1271,6 +1321,86 @@ linnea_quic_server_datagram:
     lea rdi, [rax + linnea_quic_conn.peer]
     lea rsi, [sa]
     rep movsb
+    ret
+
+; .ch_reassemble(rax = CRYPTO fragment ptr, rdx = length, r8 = offset,
+;   r9 = Initial packet number) -> rax = 1 once the ClientHello is complete, else
+;   0. Folds one Initial's CRYPTO fragment into the connection's ch_buf in offset
+; order: a fragment starting past the contiguous end is a gap and is left for the
+; client to retransmit (Initial CRYPTO is normally in order). The full size is the
+; TLS handshake length in the offset-0 fragment; completion is ch_len >= ch_total.
+; The largest Initial packet number is tracked so the ServerHello can acknowledge
+; every Initial received, not just packet 0. The connection is [cur_conn].
+.ch_reassemble:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, [cur_conn]
+    mov r12, rax                     ; fragment ptr
+    mov r13, rdx                     ; fragment length
+    mov r14, r8                      ; fragment offset
+    ; track the largest Initial packet number, for the completion ACK
+    cmp r9, [rbx + linnea_quic_conn.ch_maxpn]
+    jbe .cr_pn_done
+    mov [rbx + linnea_quic_conn.ch_maxpn], r9
+.cr_pn_done:
+    lea rax, [r14 + r13]             ; fragment end
+    cmp rax, LINNEA_QUIC_CH_BUF
+    ja .cr_incomplete                ; past the buffer: refuse (ClientHello too big)
+    mov r15, [rbx + linnea_quic_conn.ch_len]
+    cmp r14, r15
+    ja .cr_incomplete                ; a gap before this fragment: wait for the filler
+    test r13, r13
+    jz .cr_extent                    ; empty fragment
+    lea rdi, [rbx + linnea_quic_conn.ch_buf]
+    add rdi, r14                     ; ch_buf + offset
+    mov rsi, r12
+    mov rcx, r13
+    rep movsb
+    mov rbx, [cur_conn]              ; rep movsb advanced rdi/rsi; rbx is untouched
+.cr_extent:
+    lea rax, [r14 + r13]             ; fragment end
+    cmp rax, r15
+    jbe .cr_haslen
+    mov [rbx + linnea_quic_conn.ch_len], rax
+    mov r15, rax                     ; new contiguous length
+.cr_haslen:
+    ; learn the full ClientHello size from the offset-0 fragment: the TLS
+    ; handshake header is type(1) + length(3), so total = 4 + that length.
+    cmp qword [rbx + linnea_quic_conn.ch_total], 0
+    jne .cr_check
+    cmp r15, 4
+    jb .cr_incomplete                ; header not fully arrived yet
+    lea rsi, [rbx + linnea_quic_conn.ch_buf]
+    cmp byte [rsi], 0x01             ; ClientHello handshake type
+    jne .cr_incomplete
+    movzx eax, byte [rsi + 1]
+    shl eax, 8
+    movzx ecx, byte [rsi + 2]
+    or eax, ecx
+    shl eax, 8
+    movzx ecx, byte [rsi + 3]
+    or eax, ecx                      ; 24-bit handshake length
+    add rax, 4
+    mov [rbx + linnea_quic_conn.ch_total], rax
+.cr_check:
+    mov rax, [rbx + linnea_quic_conn.ch_total]
+    test rax, rax
+    jz .cr_incomplete
+    cmp r15, rax
+    jb .cr_incomplete
+    mov eax, 1                        ; ch_len reached ch_total: complete
+    jmp .cr_ret
+.cr_incomplete:
+    xor eax, eax
+.cr_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; .send_1rtt(rsi = payload ptr, rdx = payload len) — send a short-header 1-RTT

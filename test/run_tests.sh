@@ -417,6 +417,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_big_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): large response streamed in chunks (loss + interleave + 503)" $?
 
+    # a ClientHello too large for one Initial packet (as a browser's post-quantum
+    # key share makes it) is reassembled across Initials by the client's original
+    # DCID; a ClientHello with no x25519 share is refused without crashing
+    python3 test/quic/h3_bigch_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): multi-packet ClientHello reassembled; no-x25519 refused" $?
+
     # session resumption: the real server issues a NewSessionTicket with the
     # early_data extension once the handshake completes
     python3 test/quic/h3_ticket_test.py 47452 >/dev/null 2>&1
