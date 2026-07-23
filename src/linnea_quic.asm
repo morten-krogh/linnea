@@ -27,6 +27,7 @@ global linnea_quic_build_transport_params
 global linnea_quic_tp_parse
 global linnea_quic_flow_scan
 global linnea_quic_parse_priority
+global linnea_quic_reset_scan
 global linnea_quic_build_sh
 global linnea_quic_build_ee
 global linnea_quic_build_cert
@@ -1932,6 +1933,249 @@ linnea_quic_flow_scan:
     jmp .fw_scan
 .fw_done:
     pop r15
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_reset_scan(rdi=frames, rsi=len, rdx=out, rcx=max) -> rax = count.
+; Records the stream id of every STOP_SENDING (0x05) and RESET_STREAM (0x04) frame
+; into out (one qword each, up to max). A peer sends these to cancel a stream — a
+; browser does it to abandon a page's downloads on reload — and the caller must
+; then tear that stream's response and reassembly down, or the abandoned chunks
+; keep holding the congestion window and the connection stalls. Skips every other
+; frame type (same complete walk as linnea_quic_stream_frame); stops at an unknown
+; type or a malformed frame with whatever was gathered.
+linnea_quic_reset_scan:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    lea rsi, [rdi + rsi]             ; end
+    mov r13, rdx                     ; out cursor
+    mov r14, rcx                     ; max
+    xor r15d, r15d                   ; count
+.rs_scan:
+    cmp rdi, rsi
+    jae .rs_done
+    movzx ebx, byte [rdi]
+    cmp bl, 0x04                     ; RESET_STREAM: stream id, app err, final size
+    je .rs_reset
+    cmp bl, 0x05                     ; STOP_SENDING: stream id, app err
+    je .rs_stop
+    test bl, bl                      ; PADDING
+    jz .rs_skip1
+    cmp bl, 0x01                     ; PING
+    je .rs_skip1
+    cmp bl, 0x02                     ; ACK
+    je .rs_ack
+    cmp bl, 0x03
+    je .rs_ack
+    mov eax, ebx
+    and eax, 0xf8
+    cmp eax, 0x08                    ; STREAM (0x08-0x0f)
+    je .rs_stream
+    cmp bl, 0x1e                     ; HANDSHAKE_DONE
+    je .rs_skip1
+    cmp bl, 0x1a                     ; PATH_CHALLENGE (8 bytes)
+    je .rs_skip8
+    cmp bl, 0x1b                     ; PATH_RESPONSE (8 bytes)
+    je .rs_skip8
+    cmp bl, 0x18                     ; NEW_CONNECTION_ID
+    je .rs_ncid
+    cmp bl, 0x06                     ; CRYPTO
+    je .rs_crypto
+    cmp bl, 0x07                     ; NEW_TOKEN
+    je .rs_token
+    cmp bl, 0x11                     ; MAX_STREAM_DATA (2 varints)
+    je .rs_v2
+    cmp bl, 0x15                     ; STREAM_DATA_BLOCKED (2 varints)
+    je .rs_v2
+    cmp bl, 0x10                     ; MAX_DATA (1 varint)
+    je .rs_v1
+    cmp bl, 0x12                     ; MAX_STREAMS bidi
+    je .rs_v1
+    cmp bl, 0x13                     ; MAX_STREAMS uni
+    je .rs_v1
+    cmp bl, 0x14                     ; DATA_BLOCKED
+    je .rs_v1
+    cmp bl, 0x16                     ; STREAMS_BLOCKED bidi
+    je .rs_v1
+    cmp bl, 0x17                     ; STREAMS_BLOCKED uni
+    je .rs_v1
+    cmp bl, 0x19                     ; RETIRE_CONNECTION_ID
+    je .rs_v1
+    jmp .rs_done                     ; unknown (e.g. CONNECTION_CLOSE): stop
+.rs_skip1:
+    inc rdi
+    jmp .rs_scan
+.rs_skip8:
+    add rdi, 9
+    jmp .rs_scan
+.rs_v1:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    jmp .rs_scan
+.rs_v2:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    jmp .rs_scan
+.rs_token:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    add rdi, rax
+    jmp .rs_scan
+.rs_crypto:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    add rdi, rax
+    jmp .rs_scan
+.rs_ncid:
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    cmp rdi, rsi
+    jae .rs_done
+    movzx eax, byte [rdi]
+    add rdi, 1
+    add rdi, rax
+    add rdi, 16
+    jmp .rs_scan
+.rs_stream:
+    mov r12d, ebx                    ; STREAM type bits (OFF/LEN/FIN)
+    inc rdi
+    call linnea_quic_varint_decode   ; stream id
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    test r12b, 0x04                  ; OFF present?
+    jz .rs_stream_len
+    call linnea_quic_varint_decode   ; offset
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+.rs_stream_len:
+    test r12b, 0x02                  ; LEN present?
+    jz .rs_done                      ; no LEN: runs to the packet end — stop
+    call linnea_quic_varint_decode   ; length
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    add rdi, rax
+    jmp .rs_scan
+.rs_ack:
+    inc rdi
+    call linnea_quic_varint_decode   ; Largest Acknowledged
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Delay
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Count
+    test rdx, rdx
+    jz .rs_done
+    mov r12, rax
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; First ACK Range
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+.rs_ack_range:
+    test r12, r12
+    jz .rs_ack_ecn
+    call linnea_quic_varint_decode   ; Gap
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Length
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    dec r12
+    jmp .rs_ack_range
+.rs_ack_ecn:
+    cmp bl, 0x03
+    jne .rs_scan
+    call linnea_quic_varint_decode   ; ECT0
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ECT1
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ECN-CE
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    jmp .rs_scan
+.rs_stop:
+    inc rdi
+    call linnea_quic_varint_decode   ; stream id
+    test rdx, rdx
+    jz .rs_done
+    mov r12, rax
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; application error code
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    jmp .rs_record
+.rs_reset:
+    inc rdi
+    call linnea_quic_varint_decode   ; stream id
+    test rdx, rdx
+    jz .rs_done
+    mov r12, rax
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; application error code
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; final size
+    test rdx, rdx
+    jz .rs_done
+    add rdi, rdx
+.rs_record:
+    cmp r15, r14
+    jae .rs_scan                     ; out of room: skip, but keep walking
+    mov [r13], r12
+    add r13, 8
+    inc r15
+    jmp .rs_scan
+.rs_done:
+    mov rax, r15
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx

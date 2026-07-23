@@ -78,6 +78,7 @@ extern linnea_quic_txchunk_clear
 extern linnea_quic_tp_parse
 extern linnea_quic_flow_scan
 extern linnea_quic_parse_priority
+extern linnea_quic_reset_scan
 extern linnea_quic_conn_free_hook
 extern linnea_h3_tx_cap
 extern linnea_quic_conn_slot
@@ -155,6 +156,8 @@ s_prio_i:    resq 1                   ; and incremental flag (0/1), for the slot
 s_ini_pn:    resq 1                   ; the Initial packet number being reassembled
 s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK freed
 fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow scan
+LINNEA_QUIC_RESET_MAX equ 16
+reset_ids:   resq LINNEA_QUIC_RESET_MAX  ; stream ids the peer cancelled this packet
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 maxstreams_pay: resb 16               ; a MAX_STREAMS frame raising the peer's limit
@@ -1018,6 +1021,27 @@ linnea_quic_server_datagram:
     call linnea_quic_close_frame
     test rax, rax
     jnz .peer_closed
+    ; STOP_SENDING / RESET_STREAM: the peer cancelled streams (a browser abandons a
+    ; page's downloads on reload). Tear each one down BEFORE the pump runs, so its
+    ; abandoned chunks stop holding the shared congestion window — otherwise, after
+    ; enough reloads, the window fills with dead chunks and the connection stalls.
+    lea rdi, [plaintext]
+    mov rsi, r14
+    lea rdx, [reset_ids]
+    mov ecx, LINNEA_QUIC_RESET_MAX
+    call linnea_quic_reset_scan       ; rax = number of cancelled stream ids
+    test rax, rax
+    jz .no_resets
+    mov rbx, rax                      ; count
+    xor ebp, ebp                      ; index
+.reset_loop:
+    mov rdi, [cur_conn]
+    mov rsi, [reset_ids + rbp * 8]
+    call reset_teardown
+    inc rbp
+    cmp rbp, rbx
+    jb .reset_loop
+.no_resets:
     ; open response streams are ack-clocked and flow-controlled: the acks just
     ; ingested, plus any MAX_DATA / MAX_STREAM_DATA the peer sent as it consumed
     ; the responses, may let more chunks go out (and a fully acknowledged stream is
@@ -2220,7 +2244,6 @@ tx_pump:
     add rcx, r13
     cmp rcx, [rbx + linnea_quic_conn.fc_conn_max]
     ja .tp_ret
-    ; congestion window: shared, so a full window stops the pump.
     mov rcx, [rbx + linnea_quic_conn.bytes_in_flight]
     add rcx, r13
     cmp rcx, [rbx + linnea_quic_conn.cwnd]
@@ -2438,6 +2461,57 @@ tx_abort_one:
     add rax, linnea_quic_txchunk_size
     dec ecx
     jnz .ta1_scan
+    pop r12
+    pop rbx
+    ret
+
+; reset_teardown(rdi=conn, rsi=stream id) — the peer cancelled this stream
+; (STOP_SENDING / RESET_STREAM). Abort its open response (free the slot, unmap, and
+; drop its in-flight chunks so they stop holding the shared congestion window) and
+; free any reassembly context buffering its request. Idempotent: a stream with
+; neither does nothing.
+reset_teardown:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15                          ; 5 pushes: keep the call site 16-aligned
+    mov rbx, rdi                      ; conn
+    mov r12, rsi                      ; stream id
+    lea r13, [rbx + linnea_quic_conn.tx_streams]
+    xor r14d, r14d
+.rt_tx:
+    cmp qword [r13 + linnea_quic_txstream.active], 0
+    je .rt_tx_next
+    cmp qword [r13 + linnea_quic_txstream.sid], r12
+    jne .rt_tx_next
+    mov rdi, rbx
+    mov rsi, r14
+    call tx_abort_one                 ; unmap, free the slot, drop its in-flight chunks
+    jmp .rt_ra                        ; at most one response slot per stream
+.rt_tx_next:
+    add r13, linnea_quic_txstream_size
+    inc r14d
+    cmp r14d, LINNEA_QUIC_TXSTREAMS
+    jb .rt_tx
+.rt_ra:
+    lea r13, [rbx + linnea_quic_conn.ra_ctx]
+    mov r14d, LINNEA_QUIC_RA_CTXS
+.rt_ra_loop:
+    cmp qword [r13 + linnea_quic_ra.active], 0
+    je .rt_ra_next
+    cmp qword [r13 + linnea_quic_ra.sid], r12
+    jne .rt_ra_next
+    mov qword [r13 + linnea_quic_ra.active], 0
+    jmp .rt_done
+.rt_ra_next:
+    add r13, linnea_quic_ra_size
+    dec r14d
+    jnz .rt_ra_loop
+.rt_done:
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret

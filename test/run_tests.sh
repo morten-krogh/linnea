@@ -459,6 +459,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_load_test.py 47452 12 4 >/dev/null 2>&1
     check "h3 (io_uring): concurrent connections + churn under load" $?
 
+    # browser reloads on one reused connection: each reload cancels the previous
+    # page's in-flight downloads (STOP_SENDING). The server must tear a cancelled
+    # stream down or its abandoned chunks pin the congestion window and, after
+    # enough reloads, the connection stalls (hang, then h2 fallback).
+    python3 test/quic/h3_reload_test.py 47452 20 >/dev/null 2>&1
+    check "h3 (io_uring): reload-cancel (STOP_SENDING) does not stall the connection" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1
