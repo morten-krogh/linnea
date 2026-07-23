@@ -87,12 +87,16 @@ LINNEA_QUIC_EARLY_BUF   equ 1024
 ; The stream's first bytes are the HTTP/3 HEADERS frame and the DATA frame
 ; header, kept per stream in its slot's hdr; the body bytes come straight from
 ; the file mapping. Up to LINNEA_QUIC_TXSTREAMS responses stream at once (a
-; browser page load fires several large requests concurrently), interleaved
-; chunk by chunk by the pump; a request that arrives with every slot busy is
-; refused with a retryable 503.
+; browser page load fires many large requests concurrently — a page of ten 0.6 MB
+; images plus a chunked HTML and favicon is a dozen at once), interleaved chunk by
+; chunk by the pump over the shared congestion window. The slot count matches the
+; initial_max_streams_bidi we advertise (linnea_quic.asm), so a client can never
+; open more request streams than we have response slots — a large response is
+; therefore never refused for lack of a slot. Slots cost only fixed memory (they
+; share one congestion window), not bandwidth.
 LINNEA_QUIC_TX_CHUNK    equ 1100    ; stream bytes per 1-RTT packet
 LINNEA_QUIC_TX_HDR      equ 128     ; HEADERS frame + DATA frame header prefix cap
-LINNEA_QUIC_TXSTREAMS   equ 8       ; response streams in flight at once
+LINNEA_QUIC_TXSTREAMS   equ 100     ; = advertised initial_max_streams_bidi
 
 ; Congestion control (RFC 9002 NewReno). The response is ack-clocked, but by a
 ; congestion window that GROWS rather than the fixed 8-packet loss ring — without
