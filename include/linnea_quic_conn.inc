@@ -207,6 +207,9 @@ struc linnea_quic_conn
     .ms_bidi_max:  resq 1            ; bidi stream count granted to the peer (MAX_STREAMS)
     .vhost:        resq 1            ; index into the vhost table, chosen by the SNI:
                                      ; selects the cert, signing key and document root
+    .is_v2:      resq 1              ; 1 if this connection negotiated QUIC v2 (RFC 9369):
+                                     ; selects the Initial salt, packet-protection HKDF
+                                     ; labels and long-header packet-type codes
     .pn_1rtt:    resq 1              ; next 1-RTT packet number we send
     .last_active: resq 1             ; CLOCK_MONOTONIC seconds of the last packet
     ; acknowledgement state for the 1-RTT space (see linnea_quic_ack_record):

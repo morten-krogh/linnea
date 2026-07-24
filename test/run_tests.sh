@@ -501,6 +501,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_version_negotiation_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): unsupported version draws Version Negotiation" $?
 
+    # a full QUIC v2 (RFC 9369) handshake — different Initial salt, "quicv2" labels
+    # and remapped long-header packet types — serving HTTP/3 byte-exact.
+    python3 test/quic/h3_v2_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): QUIC v2 handshake serves HTTP/3" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1

@@ -103,6 +103,7 @@ extern linnea_quic_path_seen
 extern linnea_quic_path_data
 extern linnea_quic_reset_token
 extern linnea_worker_index
+extern quic_v2_active
 extern linnea_quic_conn_free_hook
 extern linnea_h3_tx_cap
 extern linnea_quic_conn_slot
@@ -189,6 +190,7 @@ s_tp_len:    resq 1                   ; and its length, for the in-flight record
 s_prio_u:    resq 1                   ; a request's parsed urgency (0-7)
 s_prio_i:    resq 1                   ; and incremental flag (0/1), for the slot fill
 s_ini_pn:    resq 1                   ; the Initial packet number being reassembled
+s_hs_type:   resq 1                   ; long-header Handshake type bits for this version
 s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK freed
 fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow scan
 LINNEA_QUIC_RESET_MAX equ 16
@@ -447,30 +449,46 @@ linnea_quic_server_datagram:
     ; never sends one to us; responding could loop). Only for a datagram large enough
     ; to be a real Initial, so a tiny packet cannot make us reflect a larger reply.
     mov eax, [linnea_quic_rxbuf + 1]         ; version (little-endian read of the wire)
-    cmp eax, 0x01000000                       ; QUIC v1 (wire 00 00 00 01)
-    je .demux_version_ok
+    cmp eax, 0x01000000                       ; QUIC v1  (wire 00 00 00 01)
+    je .demux_known_ver
+    cmp eax, 0xcf43336b                        ; QUIC v2  (wire 6b 33 43 cf, RFC 9369)
+    je .demux_known_ver
     test eax, eax                             ; version 0 = a Version Negotiation packet
     jz .done
     cmp r13, 1200
     jb .done
     call send_version_negotiation
     jmp .done
-.demux_version_ok:
+.demux_known_ver:
     ; Only a client's first flight may open a connection, and that always arrives in
-    ; an Initial packet: the type bits sit in the first byte and are not header
-    ; protected. Anything else with an unknown id belongs to a connection we do not
-    ; hold — another worker's, or one already gone — so it is dropped rather than
-    ; mistaken for a new handshake. With several workers this is what keeps a datagram
-    ; that landed on the wrong one from starting a bogus connection.
-    movzx eax, byte [linnea_quic_rxbuf]
-    and al, 0x30                     ; packet type: Initial is 0
+    ; an Initial packet. The long-header packet type is in the first byte (not header
+    ; protected); v1 encodes Initial as type bits 00, v2 remaps it to 01 (RFC 9369).
+    ; Anything else with an unknown id belongs to a connection we do not hold, so it
+    ; is dropped — with several workers this keeps a datagram that landed on the wrong
+    ; one from starting a bogus handshake. (eax still holds the version.)
+    movzx ecx, byte [linnea_quic_rxbuf]
+    and cl, 0x30                              ; packet-type bits
+    cmp eax, 0x01000000
+    je .dn_want_v1_initial
+    cmp cl, 0x10                              ; v2 Initial
+    jne .done
+    jmp .dn_alloc
+.dn_want_v1_initial:
+    test cl, cl                               ; v1 Initial = type 0
     jnz .done
+.dn_alloc:
     lea rdi, [sa]
     mov rsi, [salen]
     call linnea_quic_conn_alloc
     test rax, rax
     jz .done                         ; pool exhausted: drop the datagram
     mov [cur_conn], rax
+    ; record the negotiated version (v2 = the only supported version that is not v1)
+    mov qword [rax + linnea_quic_conn.is_v2], 0
+    cmp dword [linnea_quic_rxbuf + 1], 0x01000000
+    je .dn_odcid
+    mov qword [rax + linnea_quic_conn.is_v2], 1
+.dn_odcid:
     ; record the client's original DCID so its later Initials find this slot
     movzx ecx, byte [linnea_quic_rxbuf + 5]
     mov [rax + linnea_quic_conn.odcid_len], rcx
@@ -511,6 +529,11 @@ linnea_quic_server_datagram:
 .demux_found:
     call .refresh_peer
 .long_in:
+    ; select this connection's QUIC version for every key derivation below (Initial,
+    ; Handshake, 0-RTT, 1-RTT): v2 uses a different salt and different labels.
+    mov rax, [cur_conn]
+    mov al, [rax + linnea_quic_conn.is_v2]
+    mov [quic_v2_active], al
     ; anti-amplification (RFC 9000 s8.1): credit 3x the bytes just received. Until
     ; the peer proves it is really at this address (by producing a Handshake
     ; packet, in .do_cfin below), we may send it no more than this, so a spoofed
@@ -980,6 +1003,14 @@ linnea_quic_server_datagram:
 ; a leading Initial packet, then carries its Finished in a coalesced Handshake
 ; packet, so we must skip past the Initial to reach it.
 .try_handshake:
+    ; the long-header type bits for a Handshake packet are 0x20 in v1, but v2 (RFC
+    ; 9369) shifts every long-header type up by one, so 0x30. Compute the value for
+    ; this connection's version once and match against it while walking the datagram.
+    mov qword [s_hs_type], 0x20
+    cmp byte [quic_v2_active], 0
+    je .th_type_set
+    mov qword [s_hs_type], 0x30
+.th_type_set:
     lea r15, [linnea_quic_rxbuf]                 ; cursor over coalesced packets
 .walk:
     lea rax, [linnea_quic_rxbuf + r13]           ; datagram end
@@ -995,7 +1026,7 @@ linnea_quic_server_datagram:
     movzx eax, byte [rdi]
     lea rdi, [rdi + 1 + rax]         ; -> token-len (Initial) or length (Handshake)
     lea rsi, [linnea_quic_rxbuf + r13]           ; datagram end (varint bound)
-    cmp r10d, 0x20
+    cmp r10d, [s_hs_type]
     je .walk_len                     ; Handshake carries no token
     call linnea_quic_varint_decode   ; token length (Initial only)
     add rdi, rdx
@@ -1004,7 +1035,7 @@ linnea_quic_server_datagram:
     call linnea_quic_varint_decode   ; length (pn + payload + tag)
     lea rdi, [rdi + rdx]             ; -> packet number
     add rdi, rax                     ; -> next coalesced packet
-    cmp r10d, 0x20
+    cmp r10d, [s_hs_type]
     je .do_cfin
     mov r15, rdi                     ; advance past this (Initial) packet
     jmp .walk
@@ -1134,6 +1165,11 @@ linnea_quic_server_datagram:
 ; One packet can carry several STREAM frames (requests on different streams),
 ; so walk them all and answer each on the stream it arrived on.
 .onertt_in:
+    ; select this connection's QUIC version, so a 1-RTT key update (ku_next) derives
+    ; the next generation with the right labels.
+    mov rax, [cur_conn]
+    mov al, [rax + linnea_quic_conn.is_v2]
+    mov [quic_v2_active], al
     ; the next packet number expected from the peer (largest received + 1, 0
     ; before anything arrives): the wire carries only the number's low bits,
     ; and unprotect expands them against this before forming the nonce
@@ -2067,8 +2103,13 @@ linnea_quic_server_datagram:
 ; .build_initial_header -> rcx = header length; DCID = client SCID, SCID = ours,
 ; length field = pn(1)+payload(99)+tag(16) = 116, packet number 0.
 .build_initial_header:
-    mov byte [hdr], 0xc0
-    mov dword [hdr + 1], 0x01000000
+    mov byte [hdr], 0xc0             ; v1: long Initial (type bits 00, 1-byte pn),
+    mov dword [hdr + 1], 0x01000000  ; version 0x00000001
+    cmp byte [quic_v2_active], 0
+    je .bih_ver
+    mov byte [hdr], 0xd0             ; v2 (RFC 9369): Initial type bits 01,
+    mov dword [hdr + 1], 0xcf43336b  ; version 0x6b3343cf (wire 6b 33 43 cf)
+.bih_ver:
     CONNGET rcx, dcid_len
     mov [hdr + 5], cl
     lea rdi, [hdr + 6]
@@ -2098,8 +2139,13 @@ linnea_quic_server_datagram:
 ; field = pn(1)+r15(payload)+tag(16). The 1-byte packet number is conn.flight_pn
 ; (a flight never spans more than a handful of packets, so it never exceeds 0xff).
 .build_hs_header:
-    mov byte [hdr], 0xe0             ; long, Handshake, 1-byte pn
-    mov dword [hdr + 1], 0x01000000
+    mov byte [hdr], 0xe0             ; v1: long Handshake (type bits 10), 1-byte pn,
+    mov dword [hdr + 1], 0x01000000  ; version 0x00000001
+    cmp byte [quic_v2_active], 0
+    je .bhh_ver
+    mov byte [hdr], 0xf0             ; v2 (RFC 9369): Handshake type bits 11,
+    mov dword [hdr + 1], 0xcf43336b  ; version 0x6b3343cf
+.bhh_ver:
     CONNGET rcx, dcid_len
     mov [hdr + 5], cl
     lea rdi, [hdr + 6]
@@ -2487,7 +2533,8 @@ send_version_negotiation:
     mov rcx, r8
     rep movsb
     mov dword [rdi], 0x01000000                ; supported version: QUIC v1
-    add rdi, 4
+    mov dword [rdi + 4], 0xcf43336b            ; supported version: QUIC v2 (wire 6b3343cf)
+    add rdi, 8
     ; --- send it to the source ---
     mov rdx, rdi
     lea rax, [vneg_buf]

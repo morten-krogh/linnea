@@ -21,6 +21,7 @@ global linnea_quic_app_secrets
 global linnea_quic_ku_next
 global linnea_quic_reset_secret_init
 global linnea_quic_reset_token
+global quic_v2_active
 global linnea_quic_resumption_psk
 global linnea_quic_ticket_setup
 global linnea_quic_ticket_seal
@@ -48,12 +49,22 @@ section .rodata
 quic_initial_salt:
     db 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17
     db 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
+; QUIC v2 Initial salt (RFC 9369 3.3.1)
+quic_v2_initial_salt:
+    db 0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93
+    db 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9
 lbl_client_in: db "client in"
 lbl_server_in: db "server in"
 lbl_quic_key:  db "quic key"
 lbl_quic_iv:   db "quic iv"
 lbl_quic_hp:   db "quic hp"
 lbl_quic_ku:   db "quic ku"
+; QUIC v2 (RFC 9369 3.3.2) uses the same key schedule with different labels — each
+; is the v1 label plus the "v2" infix (so exactly 2 bytes longer).
+lbl_quicv2_key: db "quicv2 key"
+lbl_quicv2_iv:  db "quicv2 iv"
+lbl_quicv2_hp:  db "quicv2 hp"
+lbl_quicv2_ku:  db "quicv2 ku"
 lbl_derived:   db "derived"
 lbl_c_hs:      db "c hs traffic"
 lbl_s_hs:      db "s hs traffic"
@@ -73,6 +84,20 @@ empty_hash:
 
 section .text
 
+; QLABEL v1label, v2label, v1len -> rsi = label ptr, edx = its length, chosen by
+; quic_v2_active. Every v2 packet-protection label is its v1 form + 2 bytes ("v2 ").
+%macro QLABEL 3
+    cmp byte [quic_v2_active], 0
+    je %%v1
+    lea rsi, [%2]
+    mov edx, %3 + 2
+    jmp %%done
+%%v1:
+    lea rsi, [%1]
+    mov edx, %3
+%%done:
+%endmacro
+
 ; quic_pp_keys(rdi=secret32, rsi=out linnea_quic_keys) — derive the packet
 ; key (16), iv (12) and header-protection key (16) from a traffic secret.
 quic_pp_keys:
@@ -81,10 +106,9 @@ quic_pp_keys:
     mov rbx, rdi                     ; secret
     mov r12, rsi                     ; out
     sub rsp, 8                       ; keep rsp 16-aligned before the calls
-    ; key = HKDF-Expand-Label(secret, "quic key", "", 16)
+    ; key = HKDF-Expand-Label(secret, "quic key" / "quicv2 key", "", 16)
     mov rdi, rbx
-    lea rsi, [lbl_quic_key]
-    mov edx, 8
+    QLABEL lbl_quic_key, lbl_quicv2_key, 8
     xor ecx, ecx
     xor r8d, r8d
     lea r9, [r12 + linnea_quic_keys.key]
@@ -92,10 +116,9 @@ quic_pp_keys:
     mov qword [rsp], 16
     call linnea_tls_hkdf_expand_label
     add rsp, 16
-    ; iv = HKDF-Expand-Label(secret, "quic iv", "", 12)
+    ; iv = HKDF-Expand-Label(secret, "quic iv" / "quicv2 iv", "", 12)
     mov rdi, rbx
-    lea rsi, [lbl_quic_iv]
-    mov edx, 7
+    QLABEL lbl_quic_iv, lbl_quicv2_iv, 7
     xor ecx, ecx
     xor r8d, r8d
     lea r9, [r12 + linnea_quic_keys.iv]
@@ -103,10 +126,9 @@ quic_pp_keys:
     mov qword [rsp], 12
     call linnea_tls_hkdf_expand_label
     add rsp, 16
-    ; hp = HKDF-Expand-Label(secret, "quic hp", "", 16)
+    ; hp = HKDF-Expand-Label(secret, "quic hp" / "quicv2 hp", "", 16)
     mov rdi, rbx
-    lea rsi, [lbl_quic_hp]
-    mov edx, 7
+    QLABEL lbl_quic_hp, lbl_quicv2_hp, 7
     xor ecx, ecx
     xor r8d, r8d
     lea r9, [r12 + linnea_quic_keys.hp]
@@ -131,10 +153,9 @@ linnea_quic_ku_next:
     mov rbx, rdi                     ; current secret
     mov r12, rsi                     ; out next secret
     mov r13, rdx                     ; keys (in/out)
-    ; next = HKDF-Expand-Label(current, "quic ku", "", 32)
+    ; next = HKDF-Expand-Label(current, "quic ku" / "quicv2 ku", "", 32)
     mov rdi, rbx
-    lea rsi, [lbl_quic_ku]
-    mov edx, 7
+    QLABEL lbl_quic_ku, lbl_quicv2_ku, 7
     xor ecx, ecx
     xor r8d, r8d
     mov r9, r12
@@ -226,8 +247,12 @@ linnea_quic_initial_secrets:
     mov r12, rsi                     ; dcid len
     mov r14, rdx                     ; out client
     mov r15, rcx                     ; out server
-    ; initial_secret = HKDF-Extract(initial_salt, dcid)
+    ; initial_secret = HKDF-Extract(initial_salt, dcid) — v2 uses a different salt
     lea rdi, [quic_initial_salt]
+    cmp byte [quic_v2_active], 0
+    je .is_v1_salt
+    lea rdi, [quic_v2_initial_salt]
+.is_v1_salt:
     mov esi, 20
     mov rdx, rbx
     mov rcx, r12
@@ -826,6 +851,11 @@ q_ticket_ctx:  resb linnea_aesgcm_ctx_size
 ; derived from a connection id. Generated once BEFORE the workers fork so every
 ; worker computes the same token for a given id.
 linnea_quic_reset_secret: resb 32
+; Set to 1 while deriving keys for a QUIC v2 connection, 0 for v1 (the default, so
+; the RFC 9001 v1 test vectors are unaffected). The server sets it from the
+; connection's negotiated version before each key derivation; the crypto helpers
+; read it to pick the v2 Initial salt and the "quicv2" packet-protection labels.
+quic_v2_active: resb 1
 linnea_quic_hs_psk: resq 1                ; resumption PSK ptr for hs_secrets, 0 = fresh
 linnea_quic_early_ok: resq 1              ; 1 when 0-RTT is accepted (drives EE early_data)
 linnea_quic_resume_issued: resq 1         ; accepted ticket's issued time (0-RTT freshness)
