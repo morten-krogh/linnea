@@ -2501,30 +2501,27 @@ linnea_quic_protect:
     push r14
     push r15
     mov rax, [rsp + 56]              ; keys (caller's stack arg)
+    mov r11, [rsp + 64]             ; full packet number (2nd stack arg), for the nonce
     sub rsp, 264
     mov [rsp + P_KEYS], rax
+    ; The AEAD nonce uses the FULL packet number, NOT the value the header carries.
+    ; The header truncates the pn to pn_len bytes (2 for 1-RTT), so it wraps at
+    ; 65536; the peer reconstructs the full pn (RFC 9000 A.3) and builds its nonce
+    ; from that. Deriving our nonce from the truncated header value matched only
+    ; while pn < 65536 — past that every 1-RTT packet failed the peer's AEAD and the
+    ; connection died at ~65536 packets (~72 MB). So take the full pn from the caller.
+    mov [rsp + P_PN], r11
     mov rbx, rdi                     ; out
     mov rbp, rsi                     ; hdr
     mov r13, rdx                     ; hdr_len
     mov r14, rcx                     ; pn_len
     mov r12, r8                      ; payload
     mov r15, r9                      ; payload_len
-    ; pn_offset = hdr_len - pn_len
+    ; pn_offset = hdr_len - pn_len (for header protection; the pn value itself is
+    ; the caller's full pn above, not re-read from the header)
     mov rax, r13
     sub rax, r14
     mov [rsp + P_PNOFF], rax
-    ; read the plaintext packet number from the header (big-endian)
-    lea rdi, [rbp + rax]
-    xor rax, rax
-    xor edx, edx
-.rp_pn:
-    shl rax, 8
-    movzx ecx, byte [rdi + rdx]
-    or rax, rcx
-    inc edx
-    cmp edx, r14d
-    jb .rp_pn
-    mov [rsp + P_PN], rax
     ; copy the header into out
     mov rsi, rbp
     mov rdi, rbx

@@ -694,6 +694,7 @@ linnea_quic_server_datagram:
     sub rsp, 16
     CONNLEA rax, ini_server
     mov [rsp], rax
+    mov qword [rsp + 8], 0           ; Initial packet number is 0 (full pn for the nonce)
     lea rdi, [outpkt]
     lea rsi, [hdr]
     mov rdx, rcx
@@ -1837,6 +1838,9 @@ linnea_quic_server_datagram:
     sub rsp, 16
     CONNLEA rax, hs_skeys
     mov [rsp], rax
+    mov rax, [cur_conn]              ; full pn for the nonce = the flight packet number
+    movzx eax, byte [rax + linnea_quic_conn.flight_pn]
+    mov [rsp + 8], rax
     test r14, r14                    ; the first chunk coalesces behind the Initial
     jnz .sf_alone
     mov rdi, [s_ini_len]
@@ -2168,6 +2172,7 @@ emit_1rtt:
     CONNGET rbx, dcid_len
     add rbx, 3                        ; header length = 1 + DCID + 2
     sub rsp, 16
+    mov [rsp + 8], rax                ; full pn_1rtt (still in rax) for the AEAD nonce
     CONNLEA rax, ap_skeys
     mov [rsp], rax
     lea rdi, [onertt_pkt]

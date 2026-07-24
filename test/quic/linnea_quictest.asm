@@ -14,6 +14,7 @@ extern linnea_quic_hp_mask
 extern linnea_quic_varint_decode
 extern linnea_quic_varint_encode
 extern linnea_quic_unprotect
+extern linnea_quic_unprotect_short
 extern linnea_quic_crypto_frame
 extern linnea_quic_protect
 extern linnea_quic_hs_secrets
@@ -104,6 +105,10 @@ hs_server:   resb linnea_quic_keys_size
 hs_secrets_out: resb 96
 ap_client:   resb linnea_quic_keys_size
 ap_server:   resb linnea_quic_keys_size
+rt_hdr:      resb 16
+rt_pay:      resb 32
+rt_out:      resb 64
+rt_protlen:  resq 1
 
 section .text
 _start:
@@ -174,6 +179,7 @@ _start:
     sub rsp, 16
     lea rax, [a2_server]
     mov [rsp], rax                   ; keys (stack argument)
+    mov qword [rsp + 8], 1           ; full pn for the nonce (A.3 server Initial pn = 1)
     lea rdi, [prot_buf]
     lea rsi, [quic_a3_header]
     mov edx, quic_a3_header_len
@@ -188,6 +194,48 @@ _start:
     inc r15d
 .a3_done:
     CHECK prot_buf, quic_a3_protected, quic_a3_protected_len
+
+    ; --- 1-RTT nonce past the 2-byte pn truncation (regression for the ~65536-
+    ; packet death). Protect a short-header packet at pn 65537, then unprotect it:
+    ; the header carries only the low 16 bits (0x0001), so the nonce must be built
+    ; from the FULL pn on both sides or the AEAD fails to open. Before the fix,
+    ; protect used the truncated header value (1) while unprotect expands to 65537
+    ; -> nonce mismatch -> open fails, which is exactly how a real connection died
+    ; once its packet number crossed 65536.
+    mov byte [rt_hdr], 0x41                    ; short header, 2-byte pn
+    mov qword [rt_hdr + 1], 0x1122334455667788 ; 8-byte DCID
+    mov byte [rt_hdr + 9], 0x00                ; pn low 16 bits of 65537 = 0x0001,
+    mov byte [rt_hdr + 10], 0x01               ; big-endian
+    mov qword [rt_pay], 0x0102030405060708
+    mov qword [rt_pay + 8], 0x1112131415161718
+    mov qword [rt_pay + 16], 0x2122232425262728
+    sub rsp, 16
+    lea rax, [a2_server]
+    mov [rsp], rax                             ; keys
+    mov qword [rsp + 8], 65537                 ; FULL pn for the nonce
+    lea rdi, [prot_buf]
+    lea rsi, [rt_hdr]
+    mov edx, 11                                ; hdr_len = 1 + 8 + 2
+    mov ecx, 2                                 ; pn_len
+    lea r8, [rt_pay]
+    mov r9d, 24                                ; payload_len
+    call linnea_quic_protect
+    add rsp, 16
+    mov [rt_protlen], rax
+    lea rdi, [prot_buf]
+    mov rsi, [rt_protlen]
+    lea rdx, [a2_server]
+    lea rcx, [rt_out]
+    mov r8d, 8                                 ; dcid_len
+    mov r9d, 65537                             ; expected pn (A.3 recovers 65537)
+    call linnea_quic_unprotect_short           ; rax = plaintext len, rdx = pn
+    inc r14d
+    cmp rax, 24                                ; opened: nonce matched at pn > 65536
+    jne .rt_done
+    cmp rdx, 65537                             ; recovered the full packet number
+    jne .rt_done
+    inc r15d
+.rt_done:
 
     ; --- handshake key derivation: ECDHE + TLS key schedule -> QUIC keys ---
     ; verified against the Python `cryptography` reference (fixed inputs).
