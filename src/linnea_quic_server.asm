@@ -446,8 +446,11 @@ linnea_quic_server_datagram:
     ; not one we support, answer with a Version Negotiation packet (RFC 9000 6.1)
     ; listing our versions, so the client retries with one we speak rather than
     ; failing silently. A version of 0 is itself a VN packet — ignore it (a client
-    ; never sends one to us; responding could loop). Only for a datagram large enough
-    ; to be a real Initial, so a tiny packet cannot make us reflect a larger reply.
+    ; never sends one to us; responding could loop). We do NOT require a large
+    ; datagram here: version scanners and reachability probes send small unpadded
+    ; packets, and our VN reply is tiny (~31 bytes), so the reflection factor stays
+    ; under the RFC's 3x amplification bound. send_version_negotiation drops a
+    ; datagram too short to even hold the connection ids.
     mov eax, [linnea_quic_rxbuf + 1]         ; version (little-endian read of the wire)
     cmp eax, 0x01000000                       ; QUIC v1  (wire 00 00 00 01)
     je .demux_known_ver
@@ -455,8 +458,6 @@ linnea_quic_server_datagram:
     je .demux_known_ver
     test eax, eax                             ; version 0 = a Version Negotiation packet
     jz .done
-    cmp r13, 1200
-    jb .done
     call send_version_negotiation
     jmp .done
 .demux_known_ver:

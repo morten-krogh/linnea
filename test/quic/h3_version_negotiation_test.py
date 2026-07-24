@@ -15,10 +15,12 @@ V1 = 0x00000001
 dcid = os.urandom(8)
 scid = os.urandom(8)
 
-# long header: first byte (top bit set), version, DCID len+DCID, SCID len+SCID, pad
+# long header: first byte (top bit set), version, DCID len+DCID, SCID len+SCID.
+# Deliberately small and UNPADDED: version scanners and reachability probes send
+# tiny packets, and the server must still answer them (the VN reply is ~31 bytes,
+# so there is no amplification). A 1200-byte floor here silently drops such probes.
 pkt = (bytes([0xc0]) + struct.pack(">I", BOGUS)
        + bytes([len(dcid)]) + dcid + bytes([len(scid)]) + scid)
-pkt += b"\x00" * (1200 - len(pkt))            # pad to a real Initial size
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(3.0)
