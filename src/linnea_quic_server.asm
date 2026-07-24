@@ -198,6 +198,7 @@ path_resp_pay: resb 16                ; a PATH_RESPONSE frame (0x1b + 8 echoed b
 LINNEA_QUIC_SRST_MAX equ 64           ; largest stateless reset we send
 srst_buf:    resb LINNEA_QUIC_SRST_MAX ; the stateless-reset packet we build
 srst_len:    resq 1
+vneg_buf:    resb 64                   ; a Version Negotiation packet we build
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 maxstreams_pay: resb 16               ; a MAX_STREAMS frame raising the peer's limit
@@ -439,13 +440,28 @@ linnea_quic_server_datagram:
     call .refresh_peer
     jmp .long_in
 .demux_new:
-    ; An id we never issued and no handshake in progress for it. Only a client's
-    ; first flight may open a connection, and that always arrives in an Initial
-    ; packet: the type bits sit in the first byte and are not header-protected.
-    ; Anything else with an unknown id belongs to a connection we do not hold —
-    ; another worker's, or one already gone — so it is dropped rather than
-    ; mistaken for a new handshake. With several workers this is what keeps a
-    ; datagram that landed on the wrong one from starting a bogus connection.
+    ; An unknown connection id with a long header. Check the version first: if it is
+    ; not one we support, answer with a Version Negotiation packet (RFC 9000 6.1)
+    ; listing our versions, so the client retries with one we speak rather than
+    ; failing silently. A version of 0 is itself a VN packet — ignore it (a client
+    ; never sends one to us; responding could loop). Only for a datagram large enough
+    ; to be a real Initial, so a tiny packet cannot make us reflect a larger reply.
+    mov eax, [linnea_quic_rxbuf + 1]         ; version (little-endian read of the wire)
+    cmp eax, 0x01000000                       ; QUIC v1 (wire 00 00 00 01)
+    je .demux_version_ok
+    test eax, eax                             ; version 0 = a Version Negotiation packet
+    jz .done
+    cmp r13, 1200
+    jb .done
+    call send_version_negotiation
+    jmp .done
+.demux_version_ok:
+    ; Only a client's first flight may open a connection, and that always arrives in
+    ; an Initial packet: the type bits sit in the first byte and are not header
+    ; protected. Anything else with an unknown id belongs to a connection we do not
+    ; hold — another worker's, or one already gone — so it is dropped rather than
+    ; mistaken for a new handshake. With several workers this is what keeps a datagram
+    ; that landed on the wrong one from starting a bogus connection.
     movzx eax, byte [linnea_quic_rxbuf]
     and al, 0x30                     ; packet type: Initial is 0
     jnz .done
@@ -2433,6 +2449,57 @@ send_stateless_reset:
     lea r8, [sa]
     mov r9, [salen]
     syscall
+    ret
+
+; send_version_negotiation — a long-header packet arrived (r13 = its length) with a
+; version we do not support. Reply with a Version Negotiation packet (RFC 9000
+; 17.2.1): a long header with version 0, the client's Source CID as our Destination
+; CID and its Destination CID as our Source CID, then the list of versions we speak.
+; r12d = UDP socket; sa/salen = the source; linnea_quic_rxbuf = the received packet.
+send_version_negotiation:
+    movzx r8d, byte [linnea_quic_rxbuf + 5]    ; client DCID length
+    cmp r8d, LINNEA_QUIC_MAX_CID
+    ja .vn_ret                                 ; malformed: drop
+    lea r9, [linnea_quic_rxbuf + 6]            ; -> client DCID
+    lea rax, [r9 + r8]                         ; -> client SCID length byte
+    movzx r10d, byte [rax]                     ; client SCID length
+    cmp r10d, LINNEA_QUIC_MAX_CID
+    ja .vn_ret
+    lea r11, [rax + 1]                         ; -> client SCID
+    lea rax, [r11 + r10]                       ; end of the two CIDs in the packet
+    lea rcx, [linnea_quic_rxbuf]
+    add rcx, r13                               ; end of the received datagram
+    cmp rax, rcx
+    ja .vn_ret                                 ; header runs past the packet: drop
+    ; --- build the VN packet ---
+    lea rdi, [vneg_buf]
+    mov byte [rdi], 0xc0                       ; long header (top bit set)
+    mov dword [rdi + 1], 0x00000000            ; version 0 = Version Negotiation
+    add rdi, 5
+    mov [rdi], r10b                            ; our DCID length = client SCID length
+    inc rdi
+    mov rsi, r11                               ; our DCID = client SCID
+    mov rcx, r10
+    rep movsb
+    mov [rdi], r8b                             ; our SCID length = client DCID length
+    inc rdi
+    mov rsi, r9                                ; our SCID = client DCID
+    mov rcx, r8
+    rep movsb
+    mov dword [rdi], 0x01000000                ; supported version: QUIC v1
+    add rdi, 4
+    ; --- send it to the source ---
+    mov rdx, rdi
+    lea rax, [vneg_buf]
+    sub rdx, rax                               ; total length
+    mov eax, LINNEA_SYS_SENDTO
+    mov edi, r12d
+    lea rsi, [vneg_buf]
+    xor r10d, r10d
+    lea r8, [sa]
+    mov r9, [salen]
+    syscall
+.vn_ret:
     ret
 
 ; tx_emit_chunk(rdi=stream ctx ptr, rsi=stream offset, rdx=length)

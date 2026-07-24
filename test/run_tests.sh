@@ -496,6 +496,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_flow_violation_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): flow-control violation closes with a transport error" $?
 
+    # a long-header packet with an unsupported version draws a Version Negotiation
+    # packet listing the versions we speak (RFC 9000 §6.1), so the client can retry.
+    python3 test/quic/h3_version_negotiation_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): unsupported version draws Version Negotiation" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1
