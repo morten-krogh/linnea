@@ -236,6 +236,15 @@ struc linnea_quic_conn
     .hs_skeys:   resb linnea_quic_keys_size
     .ap_ckeys:   resb linnea_quic_keys_size
     .ap_skeys:   resb linnea_quic_keys_size
+    ; 1-RTT key update (RFC 9001 6). The peer may flip the key-phase bit and switch
+    ; to next-generation keys at any time; we must follow. Keep the CURRENT client
+    ; and server application traffic secrets so the next generation can be derived
+    ; (secret_next = HKDF-Expand-Label(secret, "quic ku", "", 32)), plus the phase we
+    ; are currently on. The header-protection key is NOT rotated by an update, so the
+    ; keys' .hp is preserved across a rekey — only .key and .iv change.
+    .ap_csecret: resb 32
+    .ap_ssecret: resb 32
+    .key_phase:  resq 1
     .sent:       resb LINNEA_QUIC_RTX_SLOTS * linnea_quic_sent_size ; loss-recovery ring
     ; anti-amplification (RFC 9000 s8.1) and the resumable handshake flight. Until
     ; the peer proves its address, we may send at most 3x the bytes it sent us, so

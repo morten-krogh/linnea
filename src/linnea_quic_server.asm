@@ -79,6 +79,7 @@ extern linnea_quic_conn_lookup_odcid
 extern linnea_quic_conn_alloc
 extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
+extern linnea_quic_ku_next
 extern linnea_quic_protect
 extern linnea_quic_unprotect
 extern linnea_quic_unprotect_hs
@@ -173,6 +174,12 @@ s_sfin:      resq 1                   ; and whether its FIN bit is set
 s_body_ptr:  resq 1                   ; request body captured by read_headers
 s_body_len:  resq 1
 s_txc_pn:    resq 1                   ; packet number a chunk just went out under
+; 1-RTT key-update trial scratch (RFC 9001 6): next-generation client keys/secret
+; are derived here and the packet is opened with them before anything is committed.
+ku_ckeys:    resb linnea_quic_keys_size
+ku_csecret:  resb 32
+ku_ssecret:  resb 32
+ku_exp:      resq 1                   ; expected packet number, held across the calls
 s_tp_off:    resq 1                   ; a chunk's stream offset, held across the emit call
 s_tp_len:    resq 1                   ; and its length, for the in-flight record
 s_prio_u:    resq 1                   ; a request's parsed urgency (0-7)
@@ -1027,7 +1034,11 @@ linnea_quic_server_datagram:
     CONNLEA rsi, th_cfin             ; H(CH..server Finished)
     CONNLEA rdx, ap_ckeys
     CONNLEA rcx, ap_skeys
+    CONNLEA r8, ap_csecret           ; keep the traffic secrets for key updates
+    CONNLEA r9, ap_ssecret
     call linnea_quic_app_secrets
+    mov rax, [cur_conn]
+    mov qword [rax + linnea_quic_conn.key_phase], 0   ; start on key phase 0
     ; confirm the handshake and open the server's HTTP/3 streams in one packet:
     ; ACK, HANDSHAKE_DONE (0x1e), then the control + QPACK stream setup. The
     ; STREAM frames are LEN-prefixed, so all three self-delimit within the packet.
@@ -1096,9 +1107,33 @@ linnea_quic_server_datagram:
     CONNLEA rdx, ap_ckeys            ; client 1-RTT keys (derived at .do_cfin)
     lea rcx, [plaintext]
     mov r8d, LINNEA_QUIC_SCID_LEN    ; the connection ID length we issue
-    call linnea_quic_unprotect_short  ; rax = frame bytes, rdx = packet number
+    call linnea_quic_unprotect_short  ; rax = frame bytes, rdx = pn, r8 = key phase
+    test rax, rax
+    jns .oi_ok
+    ; Failed to open with the current keys. A peer-initiated key update (RFC 9001 6)
+    ; flips the key-phase bit, so if this packet carries the OTHER phase, derive the
+    ; next key generation and retry. r8 = -1 for a too-short packet never equals the
+    ; other phase, so that just drops; and a spoofed phase flip cannot force a rekey
+    ; because ku_try only commits when the AEAD actually opens.
+    mov rcx, [cur_conn]
+    mov r9, [rcx + linnea_quic_conn.key_phase]
+    xor r9, 1
+    cmp r8, r9
+    jne .done
+    mov rdi, rcx                     ; conn
+    lea rsi, [linnea_quic_rxbuf]     ; packet
+    mov rdx, r13                     ; len
+    lea rcx, [plaintext]             ; out
+    xor r8d, r8d                     ; expected pn = rx_largest + 1 (0 if none yet)
+    cmp qword [rdi + linnea_quic_conn.rx_have], 0
+    je .oi_ku_call
+    mov r8, [rdi + linnea_quic_conn.rx_largest]
+    inc r8
+.oi_ku_call:
+    call ku_try                      ; rax = frame bytes (or -1), rdx = pn
     test rax, rax
     js .done
+.oi_ok:
     ; The packet authenticated: only now adopt its source as the peer address, so a
     ; migrated client's replies follow it. A spoofed 1-RTT packet cannot produce a
     ; valid AEAD tag, so it never reaches here and can no longer redirect our sends
@@ -2179,7 +2214,12 @@ now_ms:
 ; Requires rsp 16-aligned at the call site (rsp % 16 == 8 on entry).
 emit_1rtt:
     push rbx
-    mov byte [hdr], 0x41              ; short header, 2-byte pn, key phase 0
+    mov al, 0x41                      ; short header, 2-byte pn; key phase in bit 0x04
+    mov rcx, [cur_conn]
+    mov rcx, [rcx + linnea_quic_conn.key_phase]
+    shl ecx, 2                        ; current phase -> 0x04
+    or al, cl
+    mov [hdr], al
     CONNGET rcx, dcid_len
     lea rdi, [hdr + 1]
     CONNLEA rsi, dcid
@@ -2216,6 +2256,82 @@ emit_1rtt:
     mov rbx, [cur_conn]
     mov rax, [rbx + linnea_quic_conn.pn_1rtt]   ; the number just used
     inc qword [rbx + linnea_quic_conn.pn_1rtt]
+    pop rbx
+    ret
+
+; ku_try(rdi=conn, rsi=packet, rdx=len, rcx=out plaintext, r8=expected pn)
+;   -> rax = plaintext length (or -1), rdx = packet number.
+; A short-header packet arrived carrying the opposite key phase and did not open
+; with the current keys: derive the NEXT key generation (RFC 9001 6.1) and try to
+; open with it. On success install the new client AND server keys (re-deriving the
+; server keys in place, header-protection key preserved) and flip our key phase, so
+; our own sends move to the new phase too. On failure nothing changes — a spoofed
+; phase flip cannot force a rekey because the AEAD must actually open.
+ku_try:
+    push rbx
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                        ; align the calls (rsp % 16 == 0)
+    mov rbx, rdi                      ; conn
+    mov r13, rsi                      ; packet
+    mov r14, rdx                      ; len
+    mov r15, rcx                      ; out
+    mov [ku_exp], r8                  ; expected pn
+    ; trial client keys = a copy of the current ones (for the un-rotated hp key),
+    ; with key+iv re-derived from the next client secret.
+    lea rdi, [ku_ckeys]
+    lea rsi, [rbx + linnea_quic_conn.ap_ckeys]
+    mov ecx, linnea_quic_keys_size
+    rep movsb
+    lea rdi, [rbx + linnea_quic_conn.ap_csecret]
+    lea rsi, [ku_csecret]
+    lea rdx, [ku_ckeys]
+    call linnea_quic_ku_next
+    ; try to open the packet with the trial keys
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [ku_ckeys]
+    mov rcx, r15
+    mov r8d, LINNEA_QUIC_SCID_LEN
+    mov r9, [ku_exp]
+    call linnea_quic_unprotect_short  ; rax = len (or -1), rdx = pn
+    test rax, rax
+    js .kt_fail
+    ; it opened: this IS a key update. Commit it. Keep len+pn across the copies.
+    push rax
+    push rdx
+    lea rdi, [rbx + linnea_quic_conn.ap_ckeys]
+    lea rsi, [ku_ckeys]
+    mov ecx, linnea_quic_keys_size
+    rep movsb
+    lea rdi, [rbx + linnea_quic_conn.ap_csecret]
+    lea rsi, [ku_csecret]
+    mov ecx, 32
+    rep movsb
+    ; re-derive the server keys in place from the next server secret (hp preserved)
+    lea rdi, [rbx + linnea_quic_conn.ap_ssecret]
+    lea rsi, [ku_ssecret]
+    lea rdx, [rbx + linnea_quic_conn.ap_skeys]
+    call linnea_quic_ku_next
+    lea rdi, [rbx + linnea_quic_conn.ap_ssecret]
+    lea rsi, [ku_ssecret]
+    mov ecx, 32
+    rep movsb
+    ; flip our key phase so emit_1rtt sends under the new phase and server keys
+    mov rax, [rbx + linnea_quic_conn.key_phase]
+    xor rax, 1
+    mov [rbx + linnea_quic_conn.key_phase], rax
+    pop rdx
+    pop rax
+    jmp .kt_done
+.kt_fail:
+    mov rax, -1
+.kt_done:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
     pop rbx
     ret
 

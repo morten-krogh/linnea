@@ -255,6 +255,7 @@ unprotect_body:
 %define S_PN     104
 %define S_CTX    112
 %define S_EXP    312      ; expected packet number (r9 at entry)
+%define S_PHASE  320      ; key-phase bit read after header protection (-1 if too short)
 linnea_quic_unprotect_short:
     push rbx
     push r12
@@ -264,6 +265,7 @@ linnea_quic_unprotect_short:
     push rbp
     sub rsp, 328
     mov [rsp + S_EXP], r9
+    mov qword [rsp + S_PHASE], -1    ; until header protection is removed (below)
     mov rbx, rdi                     ; packet
     mov rbp, rsi                     ; packet length
     mov r12, rdx                     ; keys
@@ -283,6 +285,12 @@ linnea_quic_unprotect_short:
     and edx, 0x1f
     xor eax, edx
     mov r8d, eax                     ; unprotected b0
+    ; capture the key-phase bit (0x04) for the caller: a key update flips it, and
+    ; it is only readable now that header protection has been removed.
+    mov r9d, r8d
+    and r9d, 0x04
+    shr r9d, 2                       ; 0 or 1
+    mov [rsp + S_PHASE], r9
     mov ecx, eax
     and ecx, 3
     inc ecx                          ; pn length (1..4)
@@ -387,6 +395,7 @@ linnea_quic_unprotect_short:
 .serr:
     mov rax, -1
 .sdone:
+    mov r8, [rsp + S_PHASE]          ; key-phase bit (or -1 if the packet was too short)
     add rsp, 328
     pop rbp
     pop r15

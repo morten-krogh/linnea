@@ -309,6 +309,8 @@ _start:
     lea rsi, [qhs_th_app]
     lea rdx, [ap_client]
     lea rcx, [ap_server]
+    xor r8d, r8d                     ; no traffic-secret export needed here
+    xor r9d, r9d
     call linnea_quic_app_secrets
     CHECK ap_client, qhs_exp_client_app, 44
     CHECK ap_server, qhs_exp_server_app, 44

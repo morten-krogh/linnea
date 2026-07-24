@@ -18,6 +18,7 @@ global linnea_quic_initial_secrets
 global linnea_quic_hp_mask
 global linnea_quic_hs_secrets
 global linnea_quic_app_secrets
+global linnea_quic_ku_next
 global linnea_quic_resumption_psk
 global linnea_quic_ticket_setup
 global linnea_quic_ticket_seal
@@ -50,6 +51,7 @@ lbl_server_in: db "server in"
 lbl_quic_key:  db "quic key"
 lbl_quic_iv:   db "quic iv"
 lbl_quic_hp:   db "quic hp"
+lbl_quic_ku:   db "quic ku"
 lbl_derived:   db "derived"
 lbl_c_hs:      db "c hs traffic"
 lbl_s_hs:      db "s hs traffic"
@@ -111,6 +113,56 @@ quic_pp_keys:
     call linnea_tls_hkdf_expand_label
     add rsp, 16
     add rsp, 8
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_ku_next(rdi = current traffic secret32, rsi = out next secret32,
+;   rdx = keys to re-key in place) — one 1-RTT key-update generation (RFC 9001 6.1):
+;   next = HKDF-Expand-Label(current, "quic ku", "", 32), then the packet key and iv
+;   are re-derived from it. The header-protection key is NOT rotated by an update,
+;   so keys.hp is deliberately left untouched.
+linnea_quic_ku_next:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi                     ; current secret
+    mov r12, rsi                     ; out next secret
+    mov r13, rdx                     ; keys (in/out)
+    ; next = HKDF-Expand-Label(current, "quic ku", "", 32)
+    mov rdi, rbx
+    lea rsi, [lbl_quic_ku]
+    mov edx, 7
+    xor ecx, ecx
+    xor r8d, r8d
+    mov r9, r12
+    sub rsp, 16
+    mov qword [rsp], 32
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    ; key = HKDF-Expand-Label(next, "quic key", "", 16)
+    mov rdi, r12
+    lea rsi, [lbl_quic_key]
+    mov edx, 8
+    xor ecx, ecx
+    xor r8d, r8d
+    lea r9, [r13 + linnea_quic_keys.key]
+    sub rsp, 16
+    mov qword [rsp], 16
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    ; iv = HKDF-Expand-Label(next, "quic iv", "", 12)
+    mov rdi, r12
+    lea rsi, [lbl_quic_iv]
+    mov edx, 7
+    xor ecx, ecx
+    xor r8d, r8d
+    lea r9, [r13 + linnea_quic_keys.iv]
+    sub rsp, 16
+    mov qword [rsp], 12
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    pop r13
     pop r12
     pop rbx
     ret
@@ -280,7 +332,9 @@ linnea_quic_app_secrets:
     push r13
     push r14
     push r15
-    sub rsp, 144                     ; [0]derived [32]master [64]c_ap [96]s_ap
+    sub rsp, 160                     ; [0]derived [32]master [64]c_ap [96]s_ap
+    mov [rsp + 144], r8              ; out client traffic secret (0 = skip)
+    mov [rsp + 152], r9              ; out server traffic secret (0 = skip)
     mov rbx, rdi                     ; handshake secret
     mov r13, rsi                     ; transcript hash
     mov r14, rdx                     ; out client keys
@@ -313,6 +367,21 @@ linnea_quic_app_secrets:
     mov rcx, r13
     lea r8, [rsp + 96]
     call linnea_tls_derive_secret
+    ; export the application traffic secrets for later key updates (if requested)
+    mov rdi, [rsp + 144]
+    test rdi, rdi
+    jz .as_no_csecret
+    lea rsi, [rsp + 64]
+    mov ecx, 32
+    rep movsb
+.as_no_csecret:
+    mov rdi, [rsp + 152]
+    test rdi, rdi
+    jz .as_no_ssecret
+    lea rsi, [rsp + 96]
+    mov ecx, 32
+    rep movsb
+.as_no_ssecret:
     ; QUIC 1-RTT packet keys from each traffic secret
     lea rdi, [rsp + 64]
     mov rsi, r14
@@ -320,7 +389,7 @@ linnea_quic_app_secrets:
     lea rdi, [rsp + 96]
     mov rsi, r15
     call quic_pp_keys
-    add rsp, 144
+    add rsp, 160
     pop r15
     pop r14
     pop r13

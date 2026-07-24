@@ -479,6 +479,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_migration_spoof_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): unauthenticated source does not redirect the connection" $?
 
+    # the client initiates a 1-RTT key update mid-transfer (RFC 9001 §6); the server
+    # must derive the next key generation and follow, or it can no longer decrypt the
+    # client's packets and the transfer wedges.
+    python3 test/quic/h3_key_update_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): follows a client-initiated 1-RTT key update" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1
