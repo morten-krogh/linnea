@@ -1457,8 +1457,13 @@ linnea_quic_server_datagram:
     mov qword [rax + linnea_quic_ra.active], 0
     jmp .serve_bidi
 .ra_drop:
-    mov qword [rax + linnea_quic_ra.active], 0  ; too large: abandon the stream
-    jmp .stream_scan                           ; do not ack data we cannot buffer
+    mov qword [rax + linnea_quic_ra.active], 0  ; abandon the over-long stream
+    ; the peer sent more stream data than the window we advertised
+    ; (initial_max_stream_data_bidi_remote == the reassembly buffer): a flow-control
+    ; violation, so close the connection (RFC 9000 4.1: FLOW_CONTROL_ERROR = 0x03).
+    mov edi, 0x03                               ; FLOW_CONTROL_ERROR
+    mov esi, 0x08                               ; a STREAM frame triggered it
+    jmp .transport_close
 .ra_more:
     ; This packet was buffered without a reply, so nothing else acknowledges it.
     ; Send a bare ACK so the peer keeps sending the rest of the request rather
@@ -1745,6 +1750,25 @@ linnea_quic_server_datagram:
     mov [s_pl_ptr], rsi
     lea rdx, [rax + 2]               ; payload = type(1) + code + reason-len(1)
     mov [s_pl_len], rdx
+    call emit_1rtt
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
+
+; .transport_close(edi = transport error code, esi = triggering frame type) — end
+; the connection with a TRANSPORT CONNECTION_CLOSE (frame 0x1c, RFC 9000 19.19):
+; the error code, the frame type that caused it, and an empty reason phrase, then
+; free the slot. Our transport error codes and frame types are all < 64, so each is
+; a one-byte varint. Like .h3_close, sent via emit_1rtt with no loss tracking — the
+; connection is gone the moment this is queued.
+.transport_close:
+    mov byte [cc_pay], 0x1c
+    mov [cc_pay + 1], dil             ; transport error code
+    mov [cc_pay + 2], sil             ; triggering frame type
+    mov byte [cc_pay + 3], 0x00       ; reason phrase length = 0
+    lea rsi, [cc_pay]
+    mov [s_pl_ptr], rsi
+    mov qword [s_pl_len], 4
     call emit_1rtt
     mov rdi, [cur_conn]
     call linnea_quic_conn_free

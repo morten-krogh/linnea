@@ -490,6 +490,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_stateless_reset_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): stateless reset for an unknown connection id" $?
 
+    # a peer that sends more request-stream data than the advertised window commits a
+    # flow-control violation; the server closes with a transport CONNECTION_CLOSE
+    # (FLOW_CONTROL_ERROR) rather than silently dropping (RFC 9000 §4.1 / §10.2).
+    python3 test/quic/h3_flow_violation_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): flow-control violation closes with a transport error" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1
