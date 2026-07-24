@@ -101,6 +101,9 @@ extern linnea_quic_reset_scan
 extern linnea_quic_conn_free_hook
 extern linnea_h3_tx_cap
 extern linnea_quic_conn_slot
+extern linnea_quic_dbg_tick
+extern linnea_quic_dbg_conn
+extern qdbg_pass
 extern linnea_string_from_u64
 extern linnea_quic_conn_free
 extern linnea_quic_varint_encode
@@ -2702,6 +2705,7 @@ linnea_quic_server_rtx_sweep:
     mov r12d, edi                     ; fd
     call now_ms
     mov r15, rax                      ; now, ms
+    call linnea_quic_dbg_tick         ; opt-in tracing: sets qdbg_pass for this pass
     xor r13d, r13d                    ; connection index
 .sw_conn:
     mov edi, r13d
@@ -2709,6 +2713,11 @@ linnea_quic_server_rtx_sweep:
     test rax, rax
     jz .sw_conn_next
     mov rbx, rax                      ; connection
+    cmp byte [qdbg_pass], 0           ; trace this live connection's state (dark unless
+    je .sw_no_dbg                     ; the /tmp/linnea-qdbg trigger file exists)
+    mov rdi, rbx
+    call linnea_quic_dbg_conn
+.sw_no_dbg:
     lea r14, [rbx + linnea_quic_conn.sent]
     xor ebp, ebp                      ; slot
 .sw_rec:
