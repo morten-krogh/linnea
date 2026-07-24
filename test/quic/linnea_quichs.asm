@@ -9,10 +9,12 @@
 ; test/www.
 
 %include "linnea_syscall.inc"
+%include "linnea_config.inc"
 
 global _start
 
 extern linnea_quic_server_init
+extern linnea_quic_add_vhost
 extern linnea_quic_server_datagram
 extern linnea_quic_ticket_setup
 extern linnea_quic_rxbuf
@@ -29,11 +31,17 @@ key_pem:      incbin "test/tls/server.key"
 key_pem_len   equ $ - key_pem
 docroot:      db "test/www/"
 docroot_len   equ $ - docroot
+host_name:    db "localhost"
+host_name_len equ $ - host_name
 
 section .bss
 sa:        resb 16
 salen:     resq 1
 cert_list: resb 4096
+; a minimal config server + root location, just enough for the vhost
+; registration the real config parser would provide
+fake_srv:  resb linnea_config_server_size
+fake_loc:  resb linnea_config_location_size
 
 section .text
 _start:
@@ -51,12 +59,26 @@ _start:
     call linnea_pem_p256_key
     test rax, rax
     js .fail
-    mov rdx, rax                     ; private scalar
-    lea rdi, [cert_list]
-    mov rsi, r13
-    lea rcx, [docroot]
-    mov r8d, docroot_len
+    mov r14, rax                     ; private scalar
+    ; fill the minimal config server + location and register the vhost
+    lea rdi, [fake_srv + linnea_config_server.hostname]
+    lea rsi, [host_name]
+    mov ecx, host_name_len
+    rep movsb
+    mov qword [fake_srv + linnea_config_server.hostname_len], host_name_len
+    lea rax, [cert_list]
+    mov [fake_srv + linnea_config_server.cert_list], rax
+    mov [fake_srv + linnea_config_server.cert_list_len], r13
+    mov [fake_srv + linnea_config_server.key_priv], r14
+    lea rdi, [fake_loc + linnea_config_location.root]
+    lea rsi, [docroot]
+    mov ecx, docroot_len
+    rep movsb
+    mov qword [fake_loc + linnea_config_location.root_len], docroot_len
     call linnea_quic_server_init
+    lea rdi, [fake_srv]
+    lea rsi, [fake_loc]
+    call linnea_quic_add_vhost
     call linnea_quic_ticket_setup    ; session-ticket key for the NewSessionTicket
     ; udp socket bound to 127.0.0.1:47501
     mov eax, LINNEA_SYS_SOCKET
