@@ -16,6 +16,7 @@ default rel
 %include "linnea_connection.inc"
 %include "linnea_http2.inc"
 %include "linnea_hpack.inc"
+%include "linnea_time.inc"
 
 global linnea_h2_init
 global linnea_h2_handle
@@ -31,6 +32,14 @@ extern linnea_h3_advert
 extern linnea_static_normalize
 extern linnea_static_open
 extern linnea_static_mime
+extern linnea_static_validators
+extern linnea_static_mtime
+extern linnea_static_etag
+extern linnea_static_etag_len
+extern linnea_static_lastmod
+extern linnea_http_inm_match
+extern linnea_time_parse_http_date
+extern linnea_time_http_now
 extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_iequal
@@ -247,7 +256,7 @@ linnea_h2_handle:
     ; Ensure room for a HEADERS (+ small inline error DATA) first.
     lea rax, [rbx + linnea_connection.out_buf + LINNEA_CONN_OUT_BUF]
     sub rax, r13
-    cmp rax, 300
+    cmp rax, 400
     jb .flush                        ; not enough room now; flush and resume
     mov rdi, rbx                     ; conn
     ; rsi already = this frame's header pointer
@@ -414,8 +423,8 @@ linnea_h2_handle:
 %define L_SID    linnea_h2_req_size + 8
 %define L_CONT   linnea_h2_req_size + 16
 %define L_OUT    linnea_h2_req_size + 24
-%if L_OUT + 8 > 168
-  %error "h2_build_request stack frame (sub rsp,168) too small for req + locals"
+%if L_OUT + 8 > 200
+  %error "h2_build_request stack frame (sub rsp,200) too small for req + locals"
 %endif
 h2_build_request:
     push rbx
@@ -424,7 +433,7 @@ h2_build_request:
     push r14
     push r15
     push rbp
-    sub rsp, 168
+    sub rsp, 200
     mov rbx, rdi                     ; conn
     mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
@@ -535,10 +544,12 @@ h2_build_request:
     jmp .frame_loop
 
 .assembled:
-    ; zero the req struct (12 qwords)
+    ; zero the whole req struct — a count derived from the struct size, so a
+    ; field added later (like the conditional-request pointers) cannot be left
+    ; holding stale stack bytes
     lea rdi, [rsp + REQ]
     xor eax, eax
-    mov ecx, 12
+    mov ecx, linnea_h2_req_size / 8
     rep stosq
     lea rax, [rbx + linnea_connection.up_buf + LINNEA_H2_SCRATCH_OFF]
     mov [rsp + REQ + linnea_h2_req.scratch], rax
@@ -583,7 +594,7 @@ h2_build_request:
 .err:
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
-    add rsp, 168
+    add rsp, 200
     pop rbp
     pop r15
     pop r14
@@ -596,8 +607,11 @@ h2_build_request:
 ; HTTP/2 response path (M17): serve a static file over h2 with a real HPACK
 ; encoder and connection/stream flow control. The proven HTTP/1.1 handler is
 ; left untouched; this is a parallel static path that reuses only the mmap
-; syscall pattern. Ranges, conditionals and content-encoding negotiation are
-; HTTP/1.1 features deferred for h2; :authority selects the vhost.
+; syscall pattern. Responses carry the validators (ETag/Last-Modified, via
+; the shared linnea_static helpers) plus Date and Server, and a conditional
+; request revalidates to a bodiless 304 (Q83). Ranges and content-encoding
+; negotiation remain HTTP/1.1 features deferred for h2; :authority selects
+; the vhost.
 ; =========================================================================
 
 ; h2_serve(rdi=conn, rsi=req, r8=stream_id, r9=out cursor)
@@ -699,6 +713,33 @@ h2_serve:
     jz .resp_404
     mov [rsp + S_BASE], rax
     mov [rsp + S_SIZE], rdx
+    ; validators for this file, then the request's conditionals: If-None-Match
+    ; wins over If-Modified-Since, and an INM mismatch answers 200 whatever
+    ; If-Modified-Since says (RFC 9110 13.2.2)
+    mov rdi, [linnea_static_mtime]
+    mov rsi, rdx
+    call linnea_static_validators
+    mov rdi, [r12 + linnea_h2_req.inm_ptr]
+    test rdi, rdi
+    jz .chk_ims
+    mov rsi, [r12 + linnea_h2_req.inm_len]
+    lea rdx, [linnea_static_etag]
+    mov rcx, [linnea_static_etag_len]
+    call linnea_http_inm_match
+    test eax, eax
+    jnz .h2_304
+    jmp .cond_done
+.chk_ims:
+    mov rdi, [r12 + linnea_h2_req.ims_ptr]
+    test rdi, rdi
+    jz .cond_done
+    mov rsi, [r12 + linnea_h2_req.ims_len]
+    call linnea_time_parse_http_date
+    cmp rax, -1
+    je .cond_done              ; unparseable: the RFC says ignore it
+    cmp [linnea_static_mtime], rax
+    jbe .h2_304                ; not modified since the client's copy
+.cond_done:
     mov rdi, [rsp + S_JOIN]
     mov rsi, r14
     sub rsi, [rsp + S_JOIN]          ; joined path length
@@ -726,6 +767,15 @@ h2_serve:
     lea rdx, [h2_numbuf]
     mov rcx, [rsp + S_CLEN]
     call h2_enc_hdr
+    mov esi, 34                      ; etag
+    lea rdx, [linnea_static_etag]
+    mov rcx, [linnea_static_etag_len]
+    call h2_enc_hdr
+    mov esi, 44                      ; last-modified
+    lea rdx, [linnea_static_lastmod]
+    mov ecx, LINNEA_HTTP_DATE_LEN
+    call h2_enc_hdr
+    call h2_enc_date_server
     ; Alt-Svc, when a QUIC listener is up (name is not in the static table)
     cmp qword [linnea_h3_altsvc_len], 0
     je .no_altsvc_h2
@@ -847,6 +897,37 @@ h2_serve:
     mov eax, 13
     jmp .out
 
+.h2_304:
+    ; the client's copy is current: unmap the file and answer a bodiless 304
+    ; carrying the validators it will compare next time
+    cmp qword [rsp + S_SIZE], 0
+    je .h2_304_nomap                 ; empty file: sentinel base, nothing mapped
+    mov rdi, [rsp + S_BASE]
+    mov rsi, [rsp + S_SIZE]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+.h2_304_nomap:
+    mov rdi, [rsp + S_OUT]
+    add rdi, 9
+    mov r15, rdi                     ; payload start
+    mov esi, 8                       ; :status
+    lea rdx, [status_304_h2]
+    mov ecx, 3
+    call h2_enc_hdr
+    mov esi, 34                      ; etag
+    lea rdx, [linnea_static_etag]
+    mov rcx, [linnea_static_etag_len]
+    call h2_enc_hdr
+    mov esi, 44                      ; last-modified
+    lea rdx, [linnea_static_lastmod]
+    mov ecx, LINNEA_HTTP_DATE_LEN
+    call h2_enc_hdr
+    call h2_enc_date_server
+    mov rbp, rdi
+    sub rbp, r15                     ; payload length
+    mov r8b, LINNEA_H2_FLAG_END_HEADERS | LINNEA_H2_FLAG_END_STREAM
+    jmp .flags
+
 .resp_405:
     lea rax, [status_405_h2]
     lea r14, [body_405]
@@ -882,6 +963,7 @@ h2_serve:
     lea rdx, [h2_numbuf]
     mov rcx, [rsp + S_CLEN]
     call h2_enc_hdr
+    call h2_enc_date_server
     mov rbp, rdi
     sub rbp, r13                     ; payload length
     ; HEADERS frame header (END_HEADERS; a DATA frame follows)
@@ -1300,6 +1382,24 @@ h2_enc_hdr_lit:
     pop rbx
     ret
 
+; h2_enc_date_server(rdi=dst) -> rdi advanced. The date and server response
+; fields every response carries (static-table names 33 and 54).
+h2_enc_date_server:
+    push rbx
+    mov rbx, rdi
+    call linnea_time_http_now        ; rax = current IMF-fixdate text
+    mov rdi, rbx
+    mov esi, 33                      ; date
+    mov rdx, rax
+    mov ecx, LINNEA_HTTP_DATE_LEN
+    call h2_enc_hdr
+    mov esi, 54                      ; server
+    lea rdx, [srv_linnea]
+    mov ecx, srv_linnea_len
+    call h2_enc_hdr
+    pop rbx
+    ret
+
 ; h2_enc_hdr(rdi=dst, esi=name index, rdx=value ptr, rcx=value len) -> rdi adv.
 ; Literal header field without indexing (RFC 7541 6.2.2), name by static
 ; index, value as a raw (non-Huffman) string.
@@ -1465,9 +1565,12 @@ method_get_h2:   db "GET"
 method_head_h2:  db "HEAD"
 index_html_h2:   db "index.html"
 status_200_h2:   db "200"
+status_304_h2:   db "304"
 status_400_h2:   db "400"
 status_404_h2:   db "404"
 status_405_h2:   db "405"
+srv_linnea:      db "linnea"
+srv_linnea_len   equ $ - srv_linnea
 body_400: db "400 Bad Request", 10
 body_400_len equ $ - body_400
 body_404: db "404 Not Found", 10

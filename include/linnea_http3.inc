@@ -43,7 +43,8 @@ LINNEA_H3_ECHO_MAX     equ 1024
 ; frame and the DATA frame header — and the QUIC layer sends the body as
 ; STREAM-frame chunks straight from the mapping.
 LINNEA_H3_INLINE_MAX   equ 1024
-; Upper bound on that head (status + content-type + content-length QPACK fields
-; plus framing come to well under half this). Must not exceed the per-connection
-; head buffer it is copied into (LINNEA_QUIC_TX_HDR in linnea_quic_conn.inc).
-LINNEA_H3_HEAD_MAX     equ 128
+; Upper bound on that head (status, content-type, content-length, the
+; validators, date and server QPACK fields plus framing come to well under
+; this). Must not exceed the per-connection head buffer it is copied into
+; (LINNEA_QUIC_TX_HDR in linnea_quic_conn.inc).
+LINNEA_H3_HEAD_MAX     equ 256

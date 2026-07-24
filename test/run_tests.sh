@@ -380,6 +380,9 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     sleep 0.5
     python3 test/quic/h3_e2e_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): real server serves static files over QUIC" $?
+
+    python3 test/quic/h3_etag_test.py 47452 >/dev/null 2>&1
+    check "h3 validators, date + server headers, conditional 304s" $?
     python3 test/quic/h3_multi_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): several requests on one connection" $?
     python3 test/quic/h3_conns_test.py 47452 >/dev/null 2>&1
@@ -794,7 +797,13 @@ printf '%s' "$resp" | grep -qE '^ETag: "[0-9a-f]+-12"'
 check "etag is mtime-size in hex" $?
 printf '%s' "$resp" | grep -qE '^Last-Modified: [A-Z][a-z]{2}, [0-9]{2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT'
 check "last-modified is an HTTP date" $?
+check_http "server header"       "Server: linnea" "$resp"
+printf '%s' "$resp" | grep -qE '^Date: [A-Z][a-z]{2}, [0-9]{2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT'
+check "date is an HTTP date" $?
+resp=$(curl -si --max-time 2 http://127.0.0.1:47080/no-such-file)
+check_http "404 server header"   "Server: linnea" "$resp"
 
+resp=$(curl -si --max-time 2 http://127.0.0.1:47080/hello.txt)
 etag=$(printf '%s' "$resp" | grep -i '^etag:' | tr -d '\r' | cut -d' ' -f2)
 lastmod=$(printf '%s' "$resp" | grep -i '^last-modified:' | tr -d '\r' | cut -d' ' -f2-)
 
@@ -802,6 +811,8 @@ resp=$(curl -si --max-time 2 -H "If-None-Match: $etag" http://127.0.0.1:47080/he
 check_http "if-none-match 304"   "304 Not Modified" "$resp"
 check_http "304 repeats etag"    "ETag: $etag" "$resp"
 check_http "304 keeps alive"     "Connection: keep-alive" "$resp"
+check_http "304 server header"   "Server: linnea" "$resp"
+check_http "304 date header"     "Date: " "$resp"
 printf '%s' "$resp" | grep -qF "hello from linnea"
 [ $? -ne 0 ]
 check "304 carries no body" $?
@@ -1541,6 +1552,29 @@ PYEOF
         && echo "$hdrs" | grep -qi '^content-type: text/plain' \
         && echo "$hdrs" | grep -qi '^content-length: 18'
     check "http2 response headers (status, content-type, content-length)" $?
+    # validators, date and server over h2 — and revalidation draws a 304
+    h2etag=$(echo "$hdrs" | grep -i '^etag:' | tr -d '\r' | cut -d' ' -f2)
+    echo "$hdrs" | grep -qiE '^etag: "[0-9a-f]+-12"' \
+        && echo "$hdrs" | grep -qiE '^last-modified: [A-Z][a-z]{2}, [0-9]{2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT' \
+        && echo "$hdrs" | grep -qiE '^date: [A-Z][a-z]{2}, [0-9]{2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT' \
+        && echo "$hdrs" | grep -qi '^server: linnea'
+    check "http2 validators, date and server headers" $?
+    hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null \
+        -H "If-None-Match: $h2etag" "$u/hello.txt")
+    echo "$hdrs" | grep -qi '^HTTP/2 304' \
+        && echo "$hdrs" | grep -qi "^etag: $h2etag" \
+        && ! echo "$hdrs" | grep -qi '^content-length:'
+    check "http2 if-none-match 304 (etag repeated, no body)" $?
+    sc=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
+        -H 'If-None-Match: "stale"' "$u/hello.txt")
+    [ "$sc" = "200" ]
+    check "http2 stale etag 200" $?
+    h2lm=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null "$u/hello.txt" \
+        | grep -i '^last-modified:' | tr -d '\r' | cut -d' ' -f2-)
+    sc=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
+        -H "If-Modified-Since: $h2lm" "$u/hello.txt")
+    [ "$sc" = "304" ]
+    check "http2 if-modified-since 304" $?
     ver=$(curl -s -o /dev/null --http2 --cacert $CA $rl \
         -w '%{http_version}' "$u/hello.txt")
     [ "$ver" = "2" ]

@@ -87,6 +87,7 @@ global linnea_http_handle
 global linnea_http_proxy_error
 global linnea_http_proxy_head
 global linnea_http_proxy_log
+global linnea_http_inm_match
 
 LINNEA_HTTP_MAX_METHOD  equ 32
 LINNEA_HTTP_MAX_TARGET  equ 2048
@@ -103,6 +104,7 @@ extern linnea_string_equal
 extern linnea_string_iequal
 extern linnea_time_http_date
 extern linnea_time_parse_http_date
+extern linnea_time_http_now
 extern linnea_log_write
 extern linnea_log_u64
 extern linnea_log_stamp
@@ -110,43 +112,53 @@ extern linnea_log_stamp
 section .rodata
 
 resp_400:       db "HTTP/1.1 400 Bad Request", 13, 10
+                db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_400_len    equ $ - resp_400
 resp_404:       db "HTTP/1.1 404 Not Found", 13, 10
+                db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_404_len    equ $ - resp_404
 resp_405:       db "HTTP/1.1 405 Method Not Allowed", 13, 10
                 db "Allow: GET, HEAD", 13, 10
+                db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_405_len    equ $ - resp_405
 resp_413:       db "HTTP/1.1 413 Content Too Large", 13, 10
+                db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_413_len    equ $ - resp_413
 resp_414:       db "HTTP/1.1 414 URI Too Long", 13, 10
+                db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_414_len    equ $ - resp_414
 resp_431:       db "HTTP/1.1 431 Request Header Fields Too Large", 13, 10
+                db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_431_len    equ $ - resp_431
 resp_501:       db "HTTP/1.1 501 Not Implemented", 13, 10
+                db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_501_len    equ $ - resp_501
 resp_502:       db "HTTP/1.1 502 Bad Gateway", 13, 10
+                db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_502_len    equ $ - resp_502
 resp_504:       db "HTTP/1.1 504 Gateway Timeout", 13, 10
+                db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_504_len    equ $ - resp_504
 resp_505:       db "HTTP/1.1 505 HTTP Version Not Supported", 13, 10
+                db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_505_len    equ $ - resp_505
@@ -179,6 +191,10 @@ hdr_altsvc:     db 13, 10, "Alt-Svc: "
 hdr_altsvc_len  equ $ - hdr_altsvc
 hdr_accept_ranges: db 13, 10, "Accept-Ranges: bytes"
 hdr_accept_ranges_len equ $ - hdr_accept_ranges
+hdr_server:     db 13, 10, "Server: linnea"
+hdr_server_len  equ $ - hdr_server
+hdr_date:       db 13, 10, "Date: "
+hdr_date_len    equ $ - hdr_date
 hdr_content_range: db 13, 10, "Content-Range: bytes "
 hdr_content_range_len equ $ - hdr_content_range
 
@@ -1345,6 +1361,7 @@ linnea_http_handle:
     mov esi, hdr_accept_ranges_len
     call .append
     call .append_validators
+    call .append_server_date
     ; Alt-Svc, when a QUIC listener is up: tells the client it can reach this
     ; origin over HTTP/3 next time.
     cmp qword [linnea_h3_altsvc_len], 0
@@ -1388,7 +1405,7 @@ linnea_http_handle:
     ; target near in_buf's size plus a long redirect URL can exceed it
     mov rcx, [rax + linnea_config_location.redirect_len]
     add rcx, [rsp + 144]       ; raw target length
-    add rcx, status_301_len + hdr_301_tail_len
+    add rcx, status_301_len + hdr_301_tail_len + hdr_server_len + hdr_date_len + LINNEA_HTTP_DATE_LEN
     cmp rcx, LINNEA_CONN_OUT_BUF
     ja .resp_414
     lea r15, [rbx + linnea_connection.out_buf]
@@ -1402,6 +1419,7 @@ linnea_http_handle:
     mov rdi, [rsp + 8]         ; the raw request target, query included
     mov rsi, [rsp + 144]
     call .append
+    call .append_server_date
     lea rdi, [hdr_301_tail]
     mov esi, hdr_301_tail_len
     call .append
@@ -1432,6 +1450,7 @@ linnea_http_handle:
     mov esi, hdr_vary_len      ; encoding itself is metadata it should not
     call .append               ; restate
     call .append_validators
+    call .append_server_date
     cmp qword [rsp + 24], 0
     je .conn_close_304
     lea rdi, [hdr_keepalive]
@@ -1478,6 +1497,7 @@ linnea_http_handle:
     lea rdi, [zero_ch]
     mov esi, 1
     call .append
+    call .append_server_date
     cmp qword [rsp + 24], 0
     je .conn_close_416
     lea rdi, [hdr_keepalive]
@@ -1939,6 +1959,20 @@ linnea_http_handle:
     mov esi, hdr_last_mod_len
     call .append
     lea rdi, [date_buf]
+    mov esi, LINNEA_HTTP_DATE_LEN
+    jmp .append
+
+; .append_server_date() — the Server line and a Date line naming the current
+; time (RFC 9110 6.6.1), shared by every dynamically assembled head.
+.append_server_date:
+    lea rdi, [hdr_server]
+    mov esi, hdr_server_len
+    call .append
+    lea rdi, [hdr_date]
+    mov esi, hdr_date_len
+    call .append
+    call linnea_time_http_now
+    mov rdi, rax
     mov esi, LINNEA_HTTP_DATE_LEN
     jmp .append
 

@@ -18,10 +18,17 @@ extern linnea_quic_varint_decode
 extern linnea_quic_varint_encode
 extern linnea_qpack_decode
 extern linnea_qpack_encode_response
+extern linnea_qpack_send_validators
 ; static-file resolution, shared with the HTTP/2 serve path
 extern linnea_static_normalize
 extern linnea_static_open
 extern linnea_static_mime
+extern linnea_static_validators
+extern linnea_static_mtime
+extern linnea_static_etag
+extern linnea_static_etag_len
+extern linnea_http_inm_match
+extern linnea_time_parse_http_date
 
 section .rodata
 idx_name:      db "index.html"
@@ -149,9 +156,11 @@ linnea_h3_read_headers:
 
 ; linnea_h3_build_headers(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
 ;   r8=content_length) -> rax = length written.
-; Emits only the HEADERS frame (0x01) wrapping the QPACK-encoded response fields
-; (:status, content-type, content-length). A HEAD response is exactly this — no
-; DATA frame follows — and it is the first half of a full response head.
+; Emits only the HEADERS frame (0x01) wrapping the QPACK-encoded response
+; fields — :status, content-type, content-length (both omitted for a 304),
+; plus whatever linnea_qpack_encode_response adds (validators when armed,
+; then date and server). A HEAD response is exactly this — no DATA frame
+; follows — and it is the first half of a full response head.
 linnea_h3_build_headers:
     push rbx
     push r14
@@ -175,6 +184,11 @@ linnea_h3_build_headers:
     ; rdx = ct_ptr, rcx = ct_len already
     lea r8, [clen_buf]
     mov r9, rbp
+    cmp r15d, 304                    ; a 304 restates only the validators, not
+    jne .enc                         ; the representation's type or length
+    xor edx, edx
+    xor r8d, r8d
+.enc:
     call linnea_qpack_encode_response ; rax = field-section length
     mov rbp, rax                     ; field-section length
     ; HEADERS frame: type 0x01, length varint, field section
@@ -272,6 +286,8 @@ linnea_h3_serve:
     sub rsp, 8                       ; keep rsp 16-aligned for the calls
     mov rbx, rdi                     ; req
     mov r12, rcx                     ; out
+    ; no validators until a file is opened and its conditionals evaluated
+    mov qword [linnea_qpack_send_validators], 0
     ; a POST echoes its request body back (r8/r9) — the observable proof that
     ; DATA frames are captured. GET/HEAD (and other methods) fall through to the
     ; static file path, which ignores any body.
@@ -355,6 +371,34 @@ linnea_h3_serve:
     jz .notfound
     mov r15, rax                     ; mapped body base (1 = empty file)
     mov rbp, rdx                     ; body size
+    ; validators for this file, then the request's conditionals: If-None-Match
+    ; wins over If-Modified-Since, and an INM mismatch answers 200 whatever
+    ; If-Modified-Since says (RFC 9110 13.2.2)
+    mov rdi, [linnea_static_mtime]
+    mov rsi, rbp
+    call linnea_static_validators
+    mov qword [linnea_qpack_send_validators], 1
+    mov rdi, [rbx + linnea_h2_req.inm_ptr]
+    test rdi, rdi
+    jz .chk_ims
+    mov rsi, [rbx + linnea_h2_req.inm_len]
+    lea rdx, [linnea_static_etag]
+    mov rcx, [linnea_static_etag_len]
+    call linnea_http_inm_match
+    test eax, eax
+    jnz .h3_304
+    jmp .cond_done
+.chk_ims:
+    mov rdi, [rbx + linnea_h2_req.ims_ptr]
+    test rdi, rdi
+    jz .cond_done
+    mov rsi, [rbx + linnea_h2_req.ims_len]
+    call linnea_time_parse_http_date
+    cmp rax, -1
+    je .cond_done                    ; unparseable: the RFC says ignore it
+    cmp [linnea_static_mtime], rax
+    jbe .h3_304                      ; not modified since the client's copy
+.cond_done:
     lea rdi, [h3_path_buf]
     mov rsi, r14
     sub rsi, rdi                     ; resolved path length
@@ -417,9 +461,28 @@ linnea_h3_serve:
     mov r8, r15                      ; the mapping is the caller's to stream + unmap
     mov r9, rbp
     jmp .sret_large
+.h3_304:
+    ; the client's copy is current: unmap the file and answer a bodiless 304
+    ; carrying the validators it will compare next time. Like a HEAD response,
+    ; a 304 is headers-only and so never flow-controlled.
+    cmp r15, 1
+    jbe .h3_304_nomap                ; empty-file sentinel: nothing was mapped
+    mov rdi, r15
+    mov rsi, rbp
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+.h3_304_nomap:
+    mov rdi, r12                     ; out
+    mov esi, 304
+    xor r8d, r8d                     ; no content-length (none is encoded)
+    call linnea_h3_build_headers     ; rax = response length (headers only)
+    jmp .sret
+
 .refuse:
     ; unmap the file and answer 503: refused, not broken — the client may retry
-    ; (e.g. once the connection's open response stream finishes)
+    ; (e.g. once the connection's open response stream finishes). The 503
+    ; describes no file: drop the validators computed for the mapping.
+    mov qword [linnea_qpack_send_validators], 0
     mov rdi, r15
     mov rsi, rbp
     mov eax, LINNEA_SYS_MUNMAP

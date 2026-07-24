@@ -17,13 +17,19 @@ default rel
 
 %include "linnea_hpack.inc"
 %include "linnea_qpack_data.inc"
+%include "linnea_time.inc"
 
 global linnea_qpack_decode
 global linnea_qpack_encode_response
+global linnea_qpack_send_validators
 
 extern hpack_int
 extern hpack_str
 extern emit_field
+extern linnea_static_etag
+extern linnea_static_etag_len
+extern linnea_static_lastmod
+extern linnea_time_http_now
 
 section .rodata
 ; status -> QPACK static-table index (RFC 9204 Appendix A). Statuses not listed
@@ -33,6 +39,15 @@ qpack_status_tab:
     dw 304, 26,  400, 67,  403, 68,  404, 27,  421, 69,  425, 70
     dw 500, 71,  503, 28
 qpack_status_end:
+
+qpack_srv_name: db "linnea"
+qpack_srv_name_len equ $ - qpack_srv_name
+
+section .bss
+; set by the h3 serve path once it has computed the opened file's validators
+; (linnea_static_etag / linnea_static_lastmod); cleared for every response
+; that describes no file. Read by linnea_qpack_encode_response.
+linnea_qpack_send_validators: resq 1
 
 section .text
 
@@ -233,7 +248,11 @@ qenc_str:
 ;   r8=clen_ptr, r9=clen_len) -> rax = field-section length.
 ; Encodes :status (indexed if a static value, else literal with name ref 24),
 ; content-type (name ref 44) and content-length (name ref 4) with literal
-; values. No dynamic table — matches a zero-capacity decoder.
+; values — either is skipped when its pointer is 0 (a 304 carries neither).
+; When linnea_qpack_send_validators is set (the serve path computed them for
+; the file it opened), etag (name ref 7) and last-modified (name ref 10)
+; follow. Every response ends with date (name ref 6) and server (name ref
+; 92). No dynamic table — matches a zero-capacity decoder.
 linnea_qpack_encode_response:
     push rbx
     push r12
@@ -300,17 +319,21 @@ linnea_qpack_encode_response:
     mov rbx, rdi
 .after_status:
     ; --- content-type: literal with name reference (static index 44) ---
+    test r13, r13
+    jz .no_ct
     mov rdi, rbx
     mov eax, 44
     mov cl, 4
     mov dl, 0x50
     call qenc_int
-    mov rdi, rdi                     ; (rdi already advanced)
     mov rsi, r13
     mov rdx, r14
     call qenc_str
     mov rbx, rdi
+.no_ct:
     ; --- content-length: literal with name reference (static index 4) ---
+    test r15, r15
+    jz .no_clen
     mov rdi, rbx
     mov eax, 4
     mov cl, 4
@@ -318,6 +341,46 @@ linnea_qpack_encode_response:
     call qenc_int
     mov rsi, r15
     mov rdx, rbp
+    call qenc_str
+    mov rbx, rdi
+.no_clen:
+    ; --- validators, when the serve path computed them for this response ---
+    cmp qword [linnea_qpack_send_validators], 0
+    je .no_validators
+    mov rdi, rbx
+    mov eax, 7                       ; etag: literal with name reference
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    lea rsi, [linnea_static_etag]
+    mov rdx, [linnea_static_etag_len]
+    call qenc_str
+    mov eax, 10                      ; last-modified
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    lea rsi, [linnea_static_lastmod]
+    mov edx, LINNEA_HTTP_DATE_LEN
+    call qenc_str
+    mov rbx, rdi
+.no_validators:
+    ; --- date and server, on every response ---
+    call linnea_time_http_now        ; rax = current IMF-fixdate text
+    mov r13, rax
+    mov rdi, rbx
+    mov eax, 6                       ; date
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    mov rsi, r13
+    mov edx, LINNEA_HTTP_DATE_LEN
+    call qenc_str
+    mov eax, 92                      ; server
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    lea rsi, [qpack_srv_name]
+    mov edx, qpack_srv_name_len
     call qenc_str
     mov rbx, rdi
     ; length = cursor - start

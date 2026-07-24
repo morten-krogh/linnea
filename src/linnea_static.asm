@@ -13,8 +13,17 @@ LINNEA_STATIC_MAX_PATH equ 2048     ; bound on the decoded path length
 global linnea_static_normalize
 global linnea_static_open
 global linnea_static_mime
+global linnea_static_mtime
+global linnea_static_validators
+global linnea_static_etag
+global linnea_static_etag_len
+global linnea_static_lastmod
 
 extern linnea_string_iequal
+extern linnea_string_from_hex_u64
+extern linnea_time_http_date
+
+%include "linnea_time.inc"
 
 section .text
 ; linnea_static_normalize(rdi=dst, rsi=raw, rdx=raw len) -> rax = end ptr (0 = 400),
@@ -181,6 +190,8 @@ linnea_static_open:
     and eax, LINNEA_S_IFMT
     cmp eax, LINNEA_S_IFREG
     jne .oreject
+    mov rax, [static_statbuf + LINNEA_STAT_ST_MTIME]
+    mov [linnea_static_mtime], rax   ; for the caller's validators (ETag/Last-Modified)
     mov r12, [static_statbuf + LINNEA_STAT_ST_SIZE]
     test r12, r12
     jz .oempty
@@ -219,6 +230,43 @@ linnea_static_open:
 .omiss:
     xor eax, eax
     xor edx, edx
+    pop r12
+    pop rbx
+    ret
+
+; linnea_static_validators(rdi=mtime, rsi=size) — format the response validators
+; for the file just opened into linnea_static_etag / linnea_static_lastmod,
+; setting linnea_static_etag_len. The ETag is "<hex mtime>-<hex size>" in
+; quotes, the same recipe as the HTTP/1.1 handler's, so a client that switches
+; protocols revalidates against an identical tag. Single-threaded per worker,
+; like every other response scratch buffer here.
+linnea_static_validators:
+    push rbx
+    push r12
+    mov rbx, rsi                     ; size
+    mov r12, rdi                     ; mtime
+    lea rax, [linnea_static_etag]
+    mov byte [rax], '"'
+    lea rsi, [linnea_static_etag + 1]
+    call linnea_string_from_hex_u64  ; rax = digits written
+    lea rcx, [linnea_static_etag + 1]
+    add rcx, rax
+    mov byte [rcx], '-'
+    inc rcx
+    push rcx
+    mov rdi, rbx                     ; size
+    mov rsi, rcx
+    call linnea_string_from_hex_u64
+    pop rcx
+    add rcx, rax
+    mov byte [rcx], '"'
+    inc rcx
+    lea rax, [linnea_static_etag]
+    sub rcx, rax
+    mov [linnea_static_etag_len], rcx
+    mov rdi, r12                     ; mtime
+    lea rsi, [linnea_static_lastmod]
+    call linnea_time_http_date
     pop r12
     pop rbx
     ret
@@ -330,3 +378,7 @@ mime_table_h2:
 
 section .bss
 static_statbuf:  resb LINNEA_STAT_SIZE
+linnea_static_mtime:    resq 1       ; st_mtime of the last linnea_static_open
+linnea_static_etag:     resb 48      ; '"' + 16 + '-' + 16 + '"' fits well inside
+linnea_static_etag_len: resq 1
+linnea_static_lastmod:  resb LINNEA_HTTP_DATE_LEN

@@ -14,6 +14,7 @@ global linnea_time_civil
 global linnea_time_days_from_civil
 global linnea_time_http_date
 global linnea_time_parse_http_date
+global linnea_time_http_now
 
 section .rodata
 
@@ -246,6 +247,27 @@ linnea_time_http_date:
     mov [rdi + 1], dl
     ret
 
+; linnea_time_http_now() -> rax = pointer to the current time as an IMF-fixdate
+; (LINNEA_HTTP_DATE_LEN bytes, no NUL) — the Date header's value. The text is
+; reformatted only when the second changes, so a burst of responses within one
+; second pays for one clock_gettime each and one formatting in total.
+linnea_time_http_now:
+    sub rsp, 24                ; timespec (16) + alignment
+    mov edi, LINNEA_CLOCK_REALTIME
+    mov rsi, rsp
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    syscall
+    mov rdi, [rsp]             ; seconds
+    cmp rdi, [now_date_sec]
+    je .cached
+    mov [now_date_sec], rdi
+    lea rsi, [now_date_buf]
+    call linnea_time_http_date
+.cached:
+    lea rax, [now_date_buf]
+    add rsp, 24
+    ret
+
 ; linnea_time_parse_http_date(rdi=ptr, rsi=len) -> rax = unix seconds, or -1
 ; Accepts only IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT"), the format
 ; every client sends today and the only one linnea hands out. The obsolete
@@ -381,3 +403,7 @@ linnea_time_parse_http_date:
 .num_bad:
     mov eax, -1
     ret
+
+section .bss
+now_date_sec: resq 1                  ; the second now_date_buf was formatted for
+now_date_buf: resb LINNEA_HTTP_DATE_LEN

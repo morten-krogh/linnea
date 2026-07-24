@@ -38,4 +38,8 @@ struc linnea_h2_req
     .scratch_end: resq 1        ; end of the scratch region
     .prio_ptr:    resq 1        ; the `priority` field value (RFC 9218), 0 if absent
     .prio_len:    resq 1
+    .inm_ptr:     resq 1        ; if-none-match value, 0 if absent
+    .inm_len:     resq 1
+    .ims_ptr:     resq 1        ; if-modified-since value, 0 if absent
+    .ims_len:     resq 1
 endstruc

@@ -32,6 +32,8 @@ pseudo_scheme:  db ":scheme"
 pseudo_auth:    db ":authority"
 hdr_host:       db "host"
 hdr_priority:   db "priority"
+hdr_inm:        db "if-none-match"
+hdr_ims:        db "if-modified-since"
 
 section .text
 
@@ -257,6 +259,34 @@ emit_field:
     clc
     ret
 .not_prio:
+    cmp rdx, 13                      ; "if-none-match"
+    jne .not_inm
+    push rsi
+    push rdi
+    lea r9, [hdr_inm]
+    call name_eq
+    pop rdi
+    pop rsi
+    jnz .not_inm
+    mov [rbx + linnea_h2_req.inm_ptr], rsi
+    mov [rbx + linnea_h2_req.inm_len], rdi
+    clc
+    ret
+.not_inm:
+    cmp rdx, 17                      ; "if-modified-since"
+    jne .not_ims
+    push rsi
+    push rdi
+    lea r9, [hdr_ims]
+    call name_eq
+    pop rdi
+    pop rsi
+    jnz .not_ims
+    mov [rbx + linnea_h2_req.ims_ptr], rsi
+    mov [rbx + linnea_h2_req.ims_len], rdi
+    clc
+    ret
+.not_ims:
     cmp rdx, 4
     jne .done
     push rsi
