@@ -31,6 +31,7 @@ extern linnea_h3_advert
 ; static-file resolution lives in linnea_static.asm (shared with HTTP/3)
 extern linnea_static_normalize
 extern linnea_static_open
+extern linnea_static_open_enc
 extern linnea_static_mime
 extern linnea_static_validators
 extern linnea_static_mtime
@@ -425,8 +426,8 @@ linnea_h2_handle:
 %define L_SID    linnea_h2_req_size + 8
 %define L_CONT   linnea_h2_req_size + 16
 %define L_OUT    linnea_h2_req_size + 24
-%if L_OUT + 8 > 216
-  %error "h2_build_request stack frame (sub rsp,216) too small for req + locals"
+%if L_OUT + 8 > 232
+  %error "h2_build_request stack frame (sub rsp,232) too small for req + locals"
 %endif
 h2_build_request:
     push rbx
@@ -435,7 +436,7 @@ h2_build_request:
     push r14
     push r15
     push rbp
-    sub rsp, 216
+    sub rsp, 232
     mov rbx, rdi                     ; conn
     mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
@@ -596,7 +597,7 @@ h2_build_request:
 .err:
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
-    add rsp, 216
+    add rsp, 232
     pop rbp
     pop r15
     pop r14
@@ -613,8 +614,9 @@ h2_build_request:
 ; the shared linnea_static helpers) plus Date, Server and any configured
 ; Cache-Control; a conditional request revalidates to a bodiless 304 (Q83);
 ; a single bytes= range gets a 206 slice, gated by If-Range, with the 416
-; fallback (Q84). Content-encoding negotiation remains an HTTP/1.1 feature
-; deferred for h2; :authority selects the vhost.
+; fallback (Q84); a pre-compressed .br/.gz beside the file is served when
+; Accept-Encoding allows it, with Content-Encoding and Vary (Q85). The h1
+; static feature set is fully mirrored; :authority selects the vhost.
 ; =========================================================================
 
 ; h2_serve(rdi=conn, rsi=req, r8=stream_id, r9=out cursor)
@@ -639,6 +641,7 @@ h2_build_request:
 %define S_ROFF  96              ; range offset into the file (0 when unranged)
 %define S_RLEN  104             ; bytes to send (the range's, or the whole file's)
 %define S_CRLEN 112             ; content-range value length (0 = not a 206)
+%define S_ENC   120             ; coding served (0 plain, 1 gzip, 2 br)
 h2_serve:
     push rbx
     push r12
@@ -646,7 +649,7 @@ h2_serve:
     push r14
     push r15
     push rbp
-    sub rsp, 120
+    sub rsp, 136
     mov rbx, rdi                     ; conn
     mov r12, rsi                     ; req
     mov [rsp + S_SID], r8
@@ -712,9 +715,15 @@ h2_serve:
     rep movsb
     mov r14, rdi
 .named:
-    mov byte [r14], 0                ; NUL-terminate the joined path
+    ; open the file — negotiating a pre-compressed variant when the client's
+    ; Accept-Encoding allows one (open_enc writes the suffix and NUL at r14;
+    ; the MIME lookup below keeps using the name before it)
     mov rdi, [rsp + S_JOIN]
-    call linnea_static_open                ; -> rax = base (0 = miss), rdx = size
+    mov rsi, r14
+    mov rdx, [r12 + linnea_h2_req.ae_ptr]
+    mov rcx, [r12 + linnea_h2_req.ae_len]
+    call linnea_static_open_enc            ; -> rax = base, rdx = size, r8 = coding
+    mov [rsp + S_ENC], r8
     test rax, rax
     jz .resp_404
     mov [rsp + S_BASE], rax
@@ -851,6 +860,22 @@ h2_serve:
     mov esi, 18                      ; accept-ranges: bytes
     lea rdx, [h2_bytes]
     mov ecx, h2_bytes_len
+    call h2_enc_hdr
+    cmp qword [rsp + S_ENC], 0
+    je .no_cenc_h2
+    mov esi, 26                      ; content-encoding: the coding served
+    lea rdx, [enc_gzip_h2]
+    mov ecx, enc_gzip_h2_len
+    cmp qword [rsp + S_ENC], 2
+    jne .cenc_emit
+    lea rdx, [enc_br_h2]
+    mov ecx, enc_br_h2_len
+.cenc_emit:
+    call h2_enc_hdr
+.no_cenc_h2:
+    mov esi, 59                      ; vary: accept-encoding — serving depends
+    lea rdx, [h2_ae_name]            ; on it whether or not a variant was found
+    mov ecx, h2_ae_name_len
     call h2_enc_hdr
     mov esi, 34                      ; etag
     lea rdx, [linnea_static_etag]
@@ -1026,6 +1051,10 @@ h2_serve:
     lea rdx, [rax + linnea_config_location.cache_control]
     call h2_enc_hdr
 .no_cc_304:
+    mov esi, 59                      ; a 304 must carry the Vary of its 200
+    lea rdx, [h2_ae_name]
+    mov ecx, h2_ae_name_len
+    call h2_enc_hdr
     mov rbp, rdi
     sub rbp, r15                     ; payload length
     mov r8b, LINNEA_H2_FLAG_END_HEADERS | LINNEA_H2_FLAG_END_STREAM
@@ -1162,7 +1191,7 @@ h2_serve:
     mov rax, rdi
     sub rax, [rsp + S_OUT]            ; total bytes written
 .out:
-    add rsp, 120
+    add rsp, 136
     pop rbp
     pop r15
     pop r14
@@ -1719,6 +1748,12 @@ srv_linnea:      db "linnea"
 srv_linnea_len   equ $ - srv_linnea
 h2_bytes:        db "bytes"
 h2_bytes_len     equ $ - h2_bytes
+enc_br_h2:       db "br"
+enc_br_h2_len    equ $ - enc_br_h2
+enc_gzip_h2:     db "gzip"
+enc_gzip_h2_len  equ $ - enc_gzip_h2
+h2_ae_name:      db "Accept-Encoding"
+h2_ae_name_len   equ $ - h2_ae_name
 body_400: db "400 Bad Request", 10
 body_400_len equ $ - body_400
 body_404: db "404 Not Found", 10

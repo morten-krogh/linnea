@@ -26,6 +26,7 @@ global linnea_qpack_crange_ptr
 global linnea_qpack_crange_len
 global linnea_qpack_ccontrol_ptr
 global linnea_qpack_ccontrol_len
+global linnea_qpack_cenc
 
 extern hpack_int
 extern hpack_str
@@ -62,6 +63,9 @@ linnea_qpack_crange_len: resq 1
 ; the QUIC server before the serve, emitted only alongside the validators
 linnea_qpack_ccontrol_ptr: resq 1
 linnea_qpack_ccontrol_len: resq 1
+; the coding of the variant served (0 plain, 1 gzip, 2 br); set per response
+; by the h3 serve path, emitted as an indexed content-encoding line
+linnea_qpack_cenc: resq 1
 
 section .text
 
@@ -391,6 +395,28 @@ linnea_qpack_encode_response:
     inc rdi
     mov rbx, rdi
 .no_aranges:
+    ; vary: accept-encoding (indexed 59) — a file response always varies on
+    ; it, whether or not a compressed variant was found
+    mov rdi, rbx
+    mov byte [rdi], 0xc0 | 59
+    inc rdi
+    mov rbx, rdi
+    ; content-encoding for a compressed variant — coding metadata a 304
+    ; should not restate (like the h1 handler)
+    cmp r12d, 304
+    je .no_cenc
+    mov rax, [linnea_qpack_cenc]
+    test rax, rax
+    jz .no_cenc
+    mov rdi, rbx
+    mov byte [rdi], 0xc0 | 43        ; content-encoding: gzip — indexed, static
+    cmp rax, 2
+    jne .cenc_put
+    mov byte [rdi], 0xc0 | 42        ; content-encoding: br
+.cenc_put:
+    inc rdi
+    mov rbx, rdi
+.no_cenc:
     mov rdi, rbx
     mov eax, 7                       ; etag: literal with name reference
     mov cl, 4

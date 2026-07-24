@@ -386,6 +386,9 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
 
     python3 test/quic/h3_range_test.py 47452 >/dev/null 2>&1
     check "h3 range 206/416, if-range, cache-control, chunked slice" $?
+
+    python3 test/quic/h3_enc_test.py 47452 >/dev/null 2>&1
+    check "h3 pre-compressed variants (br/gzip, vary, variant etag 304)" $?
     python3 test/quic/h3_multi_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): several requests on one connection" $?
     python3 test/quic/h3_conns_test.py 47452 >/dev/null 2>&1
@@ -1628,6 +1631,38 @@ print(hashlib.md5(open('test/www/h2range.bin','rb').read()[25000:75000]).hexdige
     echo "$hdrs" | grep -qi '^HTTP/2 304' \
         && echo "$hdrs" | grep -qi '^cache-control: max-age=60'
     check "http2 304 repeats cache-control" $?
+    # pre-compressed variants: enc.txt has both a .br and a .gz beside it
+    python3 - <<'PY'
+import gzip
+open('test/www/enc.txt', 'w').write('plain payload')
+with gzip.open('test/www/enc.txt.gz', 'wb') as f:
+    f.write(b'gzip payload')
+open('test/www/enc.txt.br', 'wb').write(b'br payload')
+PY
+    hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null \
+        -H 'Accept-Encoding: gzip, br' "$u/enc.txt")
+    body=$(curl -s --http2 --cacert $CA $rl -H 'Accept-Encoding: gzip, br' "$u/enc.txt")
+    echo "$hdrs" | grep -qi '^content-encoding: br' \
+        && echo "$hdrs" | grep -qi '^vary: Accept-Encoding' \
+        && [ "$body" = "br payload" ]
+    check "http2 pre-compressed br preferred (+ vary)" $?
+    gz=$(curl -s --http2 --compressed --cacert $CA $rl -H 'Accept-Encoding: gzip' "$u/enc.txt")
+    [ "$gz" = "gzip payload" ]
+    check "http2 gzip variant (curl decodes it)" $?
+    body=$(curl -s --http2 --cacert $CA $rl "$u/enc.txt")
+    hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null "$u/enc.txt")
+    [ "$body" = "plain payload" ] && ! echo "$hdrs" | grep -qi '^content-encoding' \
+        && echo "$hdrs" | grep -qi '^vary: Accept-Encoding'
+    check "http2 no accept-encoding: plain, vary still set" $?
+    # the variant's etag revalidates: 304 keeps vary, no content-encoding
+    enctag=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null \
+        -H 'Accept-Encoding: br' "$u/enc.txt" | grep -i '^etag:' | tr -d '\r' | cut -d' ' -f2)
+    hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null \
+        -H 'Accept-Encoding: br' -H "If-None-Match: $enctag" "$u/enc.txt")
+    echo "$hdrs" | grep -qi '^HTTP/2 304' \
+        && echo "$hdrs" | grep -qi '^vary: Accept-Encoding' \
+        && ! echo "$hdrs" | grep -qi '^content-encoding'
+    check "http2 variant etag 304 (vary kept, coding not restated)" $?
     ver=$(curl -s -o /dev/null --http2 --cacert $CA $rl \
         -w '%{http_version}' "$u/hello.txt")
     [ "$ver" = "2" ]

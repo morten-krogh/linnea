@@ -12,6 +12,7 @@ LINNEA_STATIC_MAX_PATH equ 2048     ; bound on the decoded path length
 
 global linnea_static_normalize
 global linnea_static_open
+global linnea_static_open_enc
 global linnea_static_mime
 global linnea_static_mtime
 global linnea_static_validators
@@ -236,6 +237,68 @@ linnea_static_open:
 .omiss:
     xor eax, eax
     xor edx, edx
+    pop r12
+    pop rbx
+    ret
+
+; linnea_static_open_enc(rdi=path start, rsi=path end, rdx=Accept-Encoding
+;   value ptr (0 = none), rcx=its len) -> rax = base (0 = miss, 1 = empty),
+;   rdx = size, r8 = coding served (0 plain, 1 gzip, 2 br).
+; Content-encoding negotiation, the h1 recipe shared: a pre-compressed file
+; sitting beside the plain one is the whole opt-in — when the client's
+; Accept-Encoding allows the coding and "<path>.br" (tried first: it
+; compresses better) or "<path>.gz" is there, that variant is served.
+; The suffix and NUL are written at path end (the caller's buffer has room);
+; the caller's MIME lookup keeps using the name before the suffix, and the
+; validators describe the variant actually opened.
+linnea_static_open_enc:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rsi                     ; path end
+    mov r12, rdx                     ; ae ptr
+    mov r13, rcx                     ; ae len
+    mov r14, rdi                     ; path start
+    test r12, r12
+    jz .oe_plain                     ; no Accept-Encoding: nothing to negotiate
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [enc_br_st]
+    mov ecx, enc_br_st_len
+    call linnea_http_ae_accepts
+    test eax, eax
+    jz .oe_try_gz
+    mov dword [rbx], '.br'           ; three bytes and the NUL
+    mov rdi, r14
+    call linnea_static_open
+    test rax, rax
+    jz .oe_try_gz
+    mov r8d, 2
+    jmp .oe_ret
+.oe_try_gz:
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [enc_gzip_st]
+    mov ecx, enc_gzip_st_len
+    call linnea_http_ae_accepts
+    test eax, eax
+    jz .oe_plain
+    mov dword [rbx], '.gz'
+    mov rdi, r14
+    call linnea_static_open
+    test rax, rax
+    jz .oe_plain
+    mov r8d, 1
+    jmp .oe_ret
+.oe_plain:
+    mov byte [rbx], 0                ; drop whichever suffix was tried
+    mov rdi, r14
+    call linnea_static_open
+    xor r8d, r8d
+.oe_ret:
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
@@ -768,6 +831,10 @@ linnea_http_range_parse:
     ret
 
 section .rodata
+enc_br_st:    db "br"
+enc_br_st_len equ $ - enc_br_st
+enc_gzip_st:  db "gzip"
+enc_gzip_st_len equ $ - enc_gzip_st
 ext_html_h2: db "html"
 ext_css_h2:  db "css"
 ext_js_h2:   db "js"

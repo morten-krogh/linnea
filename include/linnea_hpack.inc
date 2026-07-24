@@ -46,4 +46,6 @@ struc linnea_h2_req
     .rng_len:     resq 1
     .ifr_ptr:     resq 1        ; if-range value, 0 if absent
     .ifr_len:     resq 1
+    .ae_ptr:      resq 1        ; accept-encoding value, 0 if absent
+    .ae_len:      resq 1
 endstruc

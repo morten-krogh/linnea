@@ -36,6 +36,7 @@ hdr_inm:        db "if-none-match"
 hdr_ims:        db "if-modified-since"
 hdr_range:      db "range"
 hdr_ifr:        db "if-range"
+hdr_ae:         db "accept-encoding"
 
 section .text
 
@@ -317,6 +318,20 @@ emit_field:
     clc
     ret
 .not_ifr:
+    cmp rdx, 15                      ; "accept-encoding"
+    jne .not_ae
+    push rsi
+    push rdi
+    lea r9, [hdr_ae]
+    call name_eq
+    pop rdi
+    pop rsi
+    jnz .not_ae
+    mov [rbx + linnea_h2_req.ae_ptr], rsi
+    mov [rbx + linnea_h2_req.ae_len], rdi
+    clc
+    ret
+.not_ae:
     cmp rdx, 4
     jne .done
     push rsi

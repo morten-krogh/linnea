@@ -21,9 +21,11 @@ extern linnea_qpack_encode_response
 extern linnea_qpack_send_validators
 extern linnea_qpack_crange_ptr
 extern linnea_qpack_crange_len
+extern linnea_qpack_cenc
 ; static-file resolution, shared with the HTTP/2 serve path
 extern linnea_static_normalize
 extern linnea_static_open
+extern linnea_static_open_enc
 extern linnea_static_mime
 extern linnea_static_validators
 extern linnea_static_mtime
@@ -305,6 +307,7 @@ linnea_h3_serve:
     ; conditionals and range are evaluated
     mov qword [linnea_qpack_send_validators], 0
     mov qword [linnea_qpack_crange_ptr], 0
+    mov qword [linnea_qpack_cenc], 0
     ; a POST echoes its request body back (r8/r9) — the observable proof that
     ; DATA frames are captured. GET/HEAD (and other methods) fall through to the
     ; static file path, which ignores any body.
@@ -381,9 +384,15 @@ linnea_h3_serve:
     rep movsb
     mov r14, rdi
 .noindex:
-    mov byte [r14], 0                ; NUL-terminate for open()
+    ; open the file — negotiating a pre-compressed variant when the client's
+    ; Accept-Encoding allows one (open_enc writes the suffix and NUL at r14;
+    ; the MIME lookup below keeps using the name before it)
     lea rdi, [h3_path_buf]
-    call linnea_static_open          ; rax = base (0 = missing), rdx = size
+    mov rsi, r14
+    mov rdx, [rbx + linnea_h2_req.ae_ptr]
+    mov rcx, [rbx + linnea_h2_req.ae_len]
+    call linnea_static_open_enc      ; rax = base (0 = missing), rdx = size,
+    mov [linnea_qpack_cenc], r8      ; r8 = the coding served
     test rax, rax
     jz .notfound
     mov r15, rax                     ; mapped body base (1 = empty file)
