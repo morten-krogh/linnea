@@ -133,7 +133,15 @@ LINNEA_QUIC_MAX_CWND     equ LINNEA_QUIC_TXINFL_SLOTS * LINNEA_QUIC_TX_CHUNK
 
 struc linnea_quic_txchunk
     .in_use:   resq 1
-    .pn:       resq 1               ; packet number it last went out under
+    .pn:       resq 1               ; packet number it LAST went out under
+    .pn0:      resq 1               ; packet number it FIRST went out under. A QUIC
+                                    ; ACK carries cumulative ranges, so a peer keeps
+                                    ; acking a delivered packet in every ACK. If the
+                                    ; original was delivered but its ack was lost or
+                                    ; delayed past our PTO, we resend under a new pn
+                                    ; and .pn moves on; a later cumulative ack still
+                                    ; covers the original, so we must match .pn0 too
+                                    ; or the chunk never frees and pins the window.
     .sent_ms:  resq 1               ; CLOCK_MONOTONIC ms when (re)sent, for the PTO
     .off:      resq 1               ; the chunk's stream offset (to rebuild it)
     .len:      resq 1               ; chunk length (stream bytes; for bytes_in_flight)

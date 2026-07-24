@@ -256,6 +256,64 @@ _start:
     call linnea_quic_txchunk_clear
     mov rax, [conn + linnea_quic_conn.bytes_in_flight]
     EXPECT rax, 0
+
+    ; --- retransmit, then a cumulative ack of the ORIGINAL pn must free the chunk.
+    ; A resend moves .pn to a fresh number; QUIC acks are cumulative, so the peer
+    ; keeps acking the delivered original. Matching only .pn would miss that ack and
+    ; pin the window forever (the real-browser tail-chunk wedge). .pn0 fixes it.
+    lea rdi, [conn]
+    call linnea_quic_txchunk_clear
+    lea rdi, [conn]
+    mov esi, 40                     ; original pn
+    mov edx, 0
+    mov ecx, 1100
+    xor r8d, r8d
+    xor r9d, r9d
+    call linnea_quic_txchunk_record
+    EXPECT rax, 1
+    mov qword [conn + linnea_quic_conn.tx_infl + linnea_quic_txchunk.pn], 50 ; PTO resend
+    lea rdi, [conn]                 ; ack covers the original (40), not the resend (50)
+    mov esi, 38
+    mov edx, 45
+    call linnea_quic_txchunk_ack
+    EXPECT rax, 1100                ; freed via .pn0
+    mov rax, [conn + linnea_quic_conn.bytes_in_flight]
+    EXPECT rax, 0
+    ; symmetric case: an ack covering only the resend pn frees it via .pn
+    lea rdi, [conn]
+    call linnea_quic_txchunk_clear
+    lea rdi, [conn]
+    mov esi, 60
+    mov edx, 0
+    mov ecx, 1100
+    xor r8d, r8d
+    xor r9d, r9d
+    call linnea_quic_txchunk_record
+    mov qword [conn + linnea_quic_conn.tx_infl + linnea_quic_txchunk.pn], 70
+    lea rdi, [conn]
+    mov esi, 68
+    mov edx, 72
+    call linnea_quic_txchunk_ack
+    EXPECT rax, 1100
+    ; a range covering neither the original nor the resend frees nothing
+    lea rdi, [conn]
+    call linnea_quic_txchunk_clear
+    lea rdi, [conn]
+    mov esi, 80
+    mov edx, 0
+    mov ecx, 1100
+    xor r8d, r8d
+    xor r9d, r9d
+    call linnea_quic_txchunk_record
+    mov qword [conn + linnea_quic_conn.tx_infl + linnea_quic_txchunk.pn], 90
+    lea rdi, [conn]
+    mov esi, 100
+    mov edx, 110
+    call linnea_quic_txchunk_ack
+    EXPECT rax, 0
+    lea rdi, [conn]
+    call linnea_quic_txchunk_clear
+
     ; the table is bounded: filling it, one more record is refused
     xor r12d, r12d
 .tcfill:

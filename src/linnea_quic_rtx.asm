@@ -48,6 +48,7 @@ linnea_quic_txchunk_record:
 .free:
     mov qword [rax + linnea_quic_txchunk.in_use], 1
     mov [rax + linnea_quic_txchunk.pn], rsi
+    mov [rax + linnea_quic_txchunk.pn0], rsi        ; original pn (never overwritten)
     mov [rax + linnea_quic_txchunk.sent_ms], r8
     mov [rax + linnea_quic_txchunk.off], rdx
     mov [rax + linnea_quic_txchunk.len], rcx
@@ -70,11 +71,21 @@ linnea_quic_txchunk_ack:
 .scan:
     cmp qword [r8 + linnea_quic_txchunk.in_use], 0
     je .next
+    ; free if EITHER the latest (.pn) or the original (.pn0) pn is in [lo,hi]: a
+    ; cumulative ack covering the delivered original must release the chunk even
+    ; after a retransmission moved .pn on — otherwise it pins the window forever.
     mov rax, [r8 + linnea_quic_txchunk.pn]
+    cmp rax, rsi
+    jb .try_pn0
+    cmp rax, rdx
+    jbe .free_chunk
+.try_pn0:
+    mov rax, [r8 + linnea_quic_txchunk.pn0]
     cmp rax, rsi
     jb .next
     cmp rax, rdx
     ja .next
+.free_chunk:
     mov qword [r8 + linnea_quic_txchunk.in_use], 0
     mov rax, [r8 + linnea_quic_txchunk.len]
     add r9, rax
