@@ -42,4 +42,8 @@ struc linnea_h2_req
     .inm_len:     resq 1
     .ims_ptr:     resq 1        ; if-modified-since value, 0 if absent
     .ims_len:     resq 1
+    .rng_ptr:     resq 1        ; range value, 0 if absent
+    .rng_len:     resq 1
+    .ifr_ptr:     resq 1        ; if-range value, 0 if absent
+    .ifr_len:     resq 1
 endstruc

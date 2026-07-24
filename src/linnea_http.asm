@@ -88,6 +88,8 @@ global linnea_http_proxy_error
 global linnea_http_proxy_head
 global linnea_http_proxy_log
 global linnea_http_inm_match
+global linnea_http_range_parse
+global linnea_http_ifrange_match
 
 LINNEA_HTTP_MAX_METHOD  equ 32
 LINNEA_HTTP_MAX_TARGET  equ 2048
@@ -193,6 +195,8 @@ hdr_accept_ranges: db 13, 10, "Accept-Ranges: bytes"
 hdr_accept_ranges_len equ $ - hdr_accept_ranges
 hdr_server:     db 13, 10, "Server: linnea"
 hdr_server_len  equ $ - hdr_server
+hdr_cache_control: db 13, 10, "Cache-Control: "
+hdr_cache_control_len equ $ - hdr_cache_control
 hdr_date:       db 13, 10, "Date: "
 hdr_date_len    equ $ - hdr_date
 hdr_content_range: db 13, 10, "Content-Range: bytes "
@@ -1171,28 +1175,10 @@ linnea_http_handle:
     je .range_eval
     mov rdi, [rsp + 256]
     mov rsi, [rsp + 264]
-    test rsi, rsi
-    jz .range_done
-    movzx eax, byte [rdi]
-    cmp al, '"'
-    je .range_ifr_etag
-    cmp al, 'W'                ; "W/..." is a weak tag, which can never
-    jne .range_ifr_date        ; strong-match — but "Wed, ..." is a date
-    cmp rsi, 2
-    jb .range_done
-    cmp byte [rdi + 1], '/'
-    je .range_done
-.range_ifr_date:
-    call linnea_time_parse_http_date
-    cmp rax, -1
-    je .range_done             ; unparseable: not a match
-    cmp [statbuf + LINNEA_STAT_ST_MTIME], rax
-    jne .range_done            ; strong: the exact instant only
-    jmp .range_eval
-.range_ifr_etag:
     lea rdx, [etag_buf]
     mov rcx, [etag_len]
-    call linnea_string_equal   ; strong: byte-identical, case included
+    mov r8, [statbuf + LINNEA_STAT_ST_MTIME]
+    call linnea_http_ifrange_match
     test eax, eax
     jz .range_done
 .range_eval:
@@ -1362,6 +1348,8 @@ linnea_http_handle:
     call .append
     call .append_validators
     call .append_server_date
+    mov rdi, [rsp + 152]       ; the matched location's Cache-Control, if set
+    call .append_cache_control
     ; Alt-Svc, when a QUIC listener is up: tells the client it can reach this
     ; origin over HTTP/3 next time.
     cmp qword [linnea_h3_altsvc_len], 0
@@ -1451,6 +1439,8 @@ linnea_http_handle:
     call .append               ; restate
     call .append_validators
     call .append_server_date
+    mov rdi, [rsp + 152]       ; the matched location's Cache-Control, if set
+    call .append_cache_control
     cmp qword [rsp + 24], 0
     je .conn_close_304
     lea rdi, [hdr_keepalive]
@@ -1962,6 +1952,24 @@ linnea_http_handle:
     mov esi, LINNEA_HTTP_DATE_LEN
     jmp .append
 
+; .append_cache_control(rdi=location*, may be 0) — the location's configured
+; Cache-Control line, when there is one. A 304 carries it too: like Vary, it
+; is metadata the client's cache must refresh on revalidation.
+.append_cache_control:
+    test rdi, rdi
+    jz .acc_done
+    cmp qword [rdi + linnea_config_location.cache_control_len], 0
+    je .acc_done
+    mov r8, rdi                ; the location, across .append (which keeps r8)
+    lea rdi, [hdr_cache_control]
+    mov esi, hdr_cache_control_len
+    call .append
+    lea rdi, [r8 + linnea_config_location.cache_control]
+    mov rsi, [r8 + linnea_config_location.cache_control_len]
+    jmp .append
+.acc_done:
+    ret
+
 ; .append_server_date() — the Server line and a Date line naming the current
 ; time (RFC 9110 6.6.1), shared by every dynamically assembled head.
 .append_server_date:
@@ -2258,6 +2266,54 @@ linnea_http_inm_match:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; linnea_http_range_parse(rdi=value, rsi=len, rdx=file size) -> rax, rdx.
+; The single-byte-range parser, shared with the h2/h3 serve paths — the
+; implementation lives inside the h1 handler's label scope (see .range_parse
+; there for the contract: rax = offset, rdx = count; rax = -1 ignore, -2
+; unsatisfiable).
+linnea_http_range_parse:
+    jmp linnea_http_handle.range_parse
+
+; linnea_http_ifrange_match(rdi=value, rsi=len, rdx=etag, rcx=etag len,
+;   r8=mtime) -> rax = 1 when the If-Range validator STRONG-matches our
+; representation (the range may be applied), else 0 (serve the full file —
+; always safe; patching a stale copy with fresh bytes would corrupt it).
+; RFC 9110 13.1.5: an entity-tag must match byte-identically and must not be
+; weak; a date matches only the exact instant.
+linnea_http_ifrange_match:
+    push rbx
+    test rsi, rsi
+    jz .ifr_no
+    movzx eax, byte [rdi]
+    cmp al, '"'
+    je .ifr_etag
+    cmp al, 'W'                ; "W/..." is a weak tag, which can never
+    jne .ifr_date              ; strong-match — but "Wed, ..." is a date
+    cmp rsi, 2
+    jb .ifr_no
+    cmp byte [rdi + 1], '/'
+    je .ifr_no
+.ifr_date:
+    mov rbx, r8                ; mtime, across the parse
+    call linnea_time_parse_http_date
+    cmp rax, -1
+    je .ifr_no                 ; unparseable: not a match
+    cmp rbx, rax
+    jne .ifr_no                ; strong: the exact instant only
+    jmp .ifr_yes
+.ifr_etag:
+    call linnea_string_equal   ; strong: byte-identical, case included
+    test eax, eax
+    jz .ifr_no
+.ifr_yes:
+    mov eax, 1
+    pop rbx
+    ret
+.ifr_no:
+    xor eax, eax
     pop rbx
     ret
 

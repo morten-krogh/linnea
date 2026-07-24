@@ -22,6 +22,10 @@ default rel
 global linnea_qpack_decode
 global linnea_qpack_encode_response
 global linnea_qpack_send_validators
+global linnea_qpack_crange_ptr
+global linnea_qpack_crange_len
+global linnea_qpack_ccontrol_ptr
+global linnea_qpack_ccontrol_len
 
 extern hpack_int
 extern hpack_str
@@ -42,12 +46,22 @@ qpack_status_end:
 
 qpack_srv_name: db "linnea"
 qpack_srv_name_len equ $ - qpack_srv_name
+crange_name:    db "content-range"
+crange_name_len equ $ - crange_name
 
 section .bss
 ; set by the h3 serve path once it has computed the opened file's validators
 ; (linnea_static_etag / linnea_static_lastmod); cleared for every response
 ; that describes no file. Read by linnea_qpack_encode_response.
 linnea_qpack_send_validators: resq 1
+; content-range value for a 206/416 (0 = absent); set/cleared per response
+; by the h3 serve path
+linnea_qpack_crange_ptr: resq 1
+linnea_qpack_crange_len: resq 1
+; the vhost's configured Cache-Control value (0 = none); set per request by
+; the QUIC server before the serve, emitted only alongside the validators
+linnea_qpack_ccontrol_ptr: resq 1
+linnea_qpack_ccontrol_len: resq 1
 
 section .text
 
@@ -249,10 +263,14 @@ qenc_str:
 ; Encodes :status (indexed if a static value, else literal with name ref 24),
 ; content-type (name ref 44) and content-length (name ref 4) with literal
 ; values — either is skipped when its pointer is 0 (a 304 carries neither).
-; When linnea_qpack_send_validators is set (the serve path computed them for
-; the file it opened), etag (name ref 7) and last-modified (name ref 10)
-; follow. Every response ends with date (name ref 6) and server (name ref
-; 92). No dynamic table — matches a zero-capacity decoder.
+; When linnea_qpack_crange_ptr is set, content-range follows (a literal name:
+; RFC 9204's static table has no content-range entry). When
+; linnea_qpack_send_validators is set (the serve path computed them for the
+; file it opened), accept-ranges (indexed 32, skipped on a 304), etag (name
+; ref 7), last-modified (name ref 10) and — when linnea_qpack_ccontrol_ptr
+; is set — cache-control (name ref 36) follow. Every response ends with date
+; (name ref 6) and server (name ref 92). No dynamic table — matches a
+; zero-capacity decoder.
 linnea_qpack_encode_response:
     push rbx
     push r12
@@ -344,9 +362,35 @@ linnea_qpack_encode_response:
     call qenc_str
     mov rbx, rdi
 .no_clen:
+    ; --- content-range, when the serve path set one (206 / 416). The QPACK
+    ; static table has no content-range entry, so the name is a literal. ---
+    cmp qword [linnea_qpack_crange_ptr], 0
+    je .no_crange
+    mov rdi, rbx
+    mov rax, crange_name_len         ; literal field line with literal name
+    mov cl, 3                        ; (001 N H namelen(3)), name not Huffman
+    mov dl, 0x20
+    call qenc_int
+    lea rsi, [crange_name]
+    mov rdx, crange_name_len
+    mov rcx, rdx
+    rep movsb
+    mov rsi, [linnea_qpack_crange_ptr]
+    mov rdx, [linnea_qpack_crange_len]
+    call qenc_str
+    mov rbx, rdi
+.no_crange:
     ; --- validators, when the serve path computed them for this response ---
     cmp qword [linnea_qpack_send_validators], 0
     je .no_validators
+    cmp r12d, 304
+    je .no_aranges                   ; a 304 restates no accept-ranges
+    mov rdi, rbx
+    mov al, 0xc0 | 32                ; accept-ranges: bytes — indexed, static
+    mov [rdi], al
+    inc rdi
+    mov rbx, rdi
+.no_aranges:
     mov rdi, rbx
     mov eax, 7                       ; etag: literal with name reference
     mov cl, 4
@@ -363,6 +407,19 @@ linnea_qpack_encode_response:
     mov edx, LINNEA_HTTP_DATE_LEN
     call qenc_str
     mov rbx, rdi
+    ; --- cache-control, when the vhost's location configures one ---
+    cmp qword [linnea_qpack_ccontrol_ptr], 0
+    je .no_ccontrol
+    mov rdi, rbx
+    mov eax, 36                      ; cache-control: name reference
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    mov rsi, [linnea_qpack_ccontrol_ptr]
+    mov rdx, [linnea_qpack_ccontrol_len]
+    call qenc_str
+    mov rbx, rdi
+.no_ccontrol:
 .no_validators:
     ; --- date and server, on every response ---
     call linnea_time_http_now        ; rax = current IMF-fixdate text

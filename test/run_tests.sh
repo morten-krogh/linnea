@@ -383,6 +383,9 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
 
     python3 test/quic/h3_etag_test.py 47452 >/dev/null 2>&1
     check "h3 validators, date + server headers, conditional 304s" $?
+
+    python3 test/quic/h3_range_test.py 47452 >/dev/null 2>&1
+    check "h3 range 206/416, if-range, cache-control, chunked slice" $?
     python3 test/quic/h3_multi_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): several requests on one connection" $?
     python3 test/quic/h3_conns_test.py 47452 >/dev/null 2>&1
@@ -800,6 +803,7 @@ check "last-modified is an HTTP date" $?
 check_http "server header"       "Server: linnea" "$resp"
 printf '%s' "$resp" | grep -qE '^Date: [A-Z][a-z]{2}, [0-9]{2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT'
 check "date is an HTTP date" $?
+check_http "cache-control from config" "Cache-Control: max-age=60" "$resp"
 resp=$(curl -si --max-time 2 http://127.0.0.1:47080/no-such-file)
 check_http "404 server header"   "Server: linnea" "$resp"
 
@@ -813,6 +817,7 @@ check_http "304 repeats etag"    "ETag: $etag" "$resp"
 check_http "304 keeps alive"     "Connection: keep-alive" "$resp"
 check_http "304 server header"   "Server: linnea" "$resp"
 check_http "304 date header"     "Date: " "$resp"
+check_http "304 repeats cache-control" "Cache-Control: max-age=60" "$resp"
 printf '%s' "$resp" | grep -qF "hello from linnea"
 [ $? -ne 0 ]
 check "304 carries no body" $?
@@ -1254,7 +1259,7 @@ check "termination idle timeout" $?
 kill $server_pid $backend_pid 2>/dev/null
 wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
-rm -f "$LOG" test/www/big.txt test/www/huge.bin test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
+rm -f "$LOG" test/www/big.txt test/www/h2range.bin test/www/huge.bin test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
 
 # --- graceful drain: SIGTERM finishes in-flight work, then exits ---
 # A slow download is in flight when the master is killed; the workers
@@ -1575,6 +1580,54 @@ PYEOF
         -H "If-Modified-Since: $h2lm" "$u/hello.txt")
     [ "$sc" = "304" ]
     check "http2 if-modified-since 304" $?
+    # accept-ranges + configured cache-control on the 200
+    hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null "$u/hello.txt")
+    echo "$hdrs" | grep -qi '^accept-ranges: bytes' \
+        && echo "$hdrs" | grep -qi '^cache-control: max-age=60'
+    check "http2 accept-ranges + cache-control headers" $?
+    # a single byte range: 206, the exact slice, content-range names it
+    hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null -r 5-9 "$u/hello.txt")
+    body=$(curl -s --http2 --cacert $CA $rl -r 5-9 "$u/hello.txt")
+    echo "$hdrs" | grep -qi '^HTTP/2 206' \
+        && echo "$hdrs" | grep -qi '^content-range: bytes 5-9/18' \
+        && echo "$hdrs" | grep -qi '^content-length: 5' \
+        && [ "$body" = " from" ]
+    check "http2 range 206 (slice + content-range)" $?
+    # suffix and open-ended forms
+    b1=$(curl -s --http2 --cacert $CA $rl -r -5 "$u/hello.txt")
+    b2=$(curl -s --http2 --cacert $CA $rl -r 12- "$u/hello.txt")
+    [ "$b1" = "nnea" ] && [ "$b2" = "innea" ]
+    check "http2 range suffix + open-ended" $?
+    # a large mid-file slice streams through flow control byte-exact
+    python3 -c "
+d = bytearray()
+i = 0
+while len(d) < 100000: d += (b'%07d\n' % i); i += 1
+open('test/www/h2range.bin','wb').write(d[:100000])"
+    want=$(python3 -c "
+import hashlib
+print(hashlib.md5(open('test/www/h2range.bin','rb').read()[25000:75000]).hexdigest())")
+    got=$(curl -s --http2 --cacert $CA $rl -r 25000-74999 "$u/h2range.bin" | md5sum | cut -d' ' -f1)
+    [ "$got" = "$want" ]
+    check "http2 range: 50000-byte mid-file slice byte-exact" $?
+    # unsatisfiable: bodiless 416 naming the actual length
+    hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null -r 999999-1000000 "$u/hello.txt")
+    echo "$hdrs" | grep -qi '^HTTP/2 416' \
+        && echo "$hdrs" | grep -qi '^content-range: bytes \*/18'
+    check "http2 unsatisfiable range 416" $?
+    # If-Range: strong match applies the range; a stale validator serves it all
+    sc=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
+        -r 5-9 -H "If-Range: $h2etag" "$u/hello.txt")
+    sc2=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
+        -r 5-9 -H 'If-Range: "stale"' "$u/hello.txt")
+    [ "$sc" = "206" ] && [ "$sc2" = "200" ]
+    check "http2 if-range gates the 206" $?
+    # a 304 repeats the cache policy
+    hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null \
+        -H "If-None-Match: $h2etag" "$u/hello.txt")
+    echo "$hdrs" | grep -qi '^HTTP/2 304' \
+        && echo "$hdrs" | grep -qi '^cache-control: max-age=60'
+    check "http2 304 repeats cache-control" $?
     ver=$(curl -s -o /dev/null --http2 --cacert $CA $rl \
         -w '%{http_version}' "$u/hello.txt")
     [ "$ver" = "2" ]

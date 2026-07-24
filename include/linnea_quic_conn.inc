@@ -151,15 +151,18 @@ endstruc
 
 ; One open response stream. A body too large for one packet stays mmap'd here and
 ; is sent as STREAM-frame chunks. Stream byte i is hdr[i] while i < hlen (the
-; HTTP/3 HEADERS frame and DATA frame header), and file byte i - hlen after that.
+; HTTP/3 HEADERS frame and DATA frame header), and file byte foff + (i - hlen)
+; after that; the stream carries hlen + flen bytes in all (flen < size for a 206).
 ; fc_max is the client's per-stream window (initial_max_stream_data, grown by
 ; MAX_STREAM_DATA); inflight is this stream's own unacknowledged chunk bytes, so
 ; its mapping is released the moment it is both fully sent and fully acknowledged.
 struc linnea_quic_txstream
     .active:   resq 1
     .sid:      resq 1               ; the request stream being answered
-    .base:     resq 1               ; the response file's mapping
-    .size:     resq 1               ; and its size
+    .base:     resq 1               ; the response file's mapping (munmap wants
+    .size:     resq 1               ; base/size — always the WHOLE mapping)
+    .foff:     resq 1               ; body start within the mapping (a 206's
+    .flen:     resq 1               ; range offset, 0 otherwise) and body length
     .hlen:     resq 1               ; stream bytes held in hdr
     .off:      resq 1               ; next stream offset to send
     .fc_max:   resq 1               ; max stream offset the client will accept

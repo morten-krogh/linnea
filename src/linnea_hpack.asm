@@ -34,6 +34,8 @@ hdr_host:       db "host"
 hdr_priority:   db "priority"
 hdr_inm:        db "if-none-match"
 hdr_ims:        db "if-modified-since"
+hdr_range:      db "range"
+hdr_ifr:        db "if-range"
 
 section .text
 
@@ -287,6 +289,34 @@ emit_field:
     clc
     ret
 .not_ims:
+    cmp rdx, 5                       ; "range"
+    jne .not_range
+    push rsi
+    push rdi
+    lea r9, [hdr_range]
+    call name_eq
+    pop rdi
+    pop rsi
+    jnz .not_range
+    mov [rbx + linnea_h2_req.rng_ptr], rsi
+    mov [rbx + linnea_h2_req.rng_len], rdi
+    clc
+    ret
+.not_range:
+    cmp rdx, 8                       ; "if-range"
+    jne .not_ifr
+    push rsi
+    push rdi
+    lea r9, [hdr_ifr]
+    call name_eq
+    pop rdi
+    pop rsi
+    jnz .not_ifr
+    mov [rbx + linnea_h2_req.ifr_ptr], rsi
+    mov [rbx + linnea_h2_req.ifr_len], rdi
+    clc
+    ret
+.not_ifr:
     cmp rdx, 4
     jne .done
     push rsi

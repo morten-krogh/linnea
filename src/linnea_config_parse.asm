@@ -62,6 +62,8 @@ key_proxy:              db "proxy"
 key_proxy_len           equ $ - key_proxy
 key_redirect:           db "redirect"
 key_redirect_len        equ $ - key_redirect
+key_cache_control:      db "cache_control"
+key_cache_control_len   equ $ - key_cache_control
 key_cert:               db "cert"
 key_cert_len            equ $ - key_cert
 key_key:                db "key"
@@ -119,6 +121,8 @@ msg_root_long:          db "root too long"
 msg_root_long_len       equ $ - msg_root_long
 msg_redirect_long:      db "redirect too long"
 msg_redirect_long_len   equ $ - msg_redirect_long
+msg_cc_long:            db "cache_control too long"
+msg_cc_long_len         equ $ - msg_cc_long
 msg_path_long:          db "cert/key path too long"
 msg_path_long_len       equ $ - msg_path_long
 msg_prefix_long:        db "prefix too long"
@@ -607,10 +611,11 @@ linnea_parse_server:
     jmp linnea_parse_fail
 
 ; linnea_parse_location(rdi=location*) — one location object.
-; Key presence tracked in a bitmask: prefix=1, root=2, proxy=4,
-; redirect=8; a location
-; requires prefix plus exactly one of root and proxy (final mask 3 or 5).
-; A proxy value is validated here and prebuilt into a sockaddr_in.
+; Key presence tracked in a bitmask: prefix=1, root=2, proxy=4, redirect=8,
+; cache_control=16; a location requires prefix plus exactly one of root,
+; proxy and redirect; cache_control is optional (a Cache-Control value sent
+; on static responses). A proxy value is validated here and prebuilt into a
+; sockaddr_in.
 linnea_parse_location:
     push rbx
     push r12
@@ -657,6 +662,13 @@ linnea_parse_location:
     call linnea_string_equal
     test eax, eax
     jnz .key_redirect
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_cache_control]
+    mov ecx, key_cache_control_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_cache_control
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -701,6 +713,19 @@ linnea_parse_location:
     mov rsi, rax
     call linnea_string_copy
     mov qword [rbx + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
+    jmp .member_sep
+
+.key_cache_control:
+    test r12d, 16
+    jnz .dup
+    or r12d, 16
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_ROOT
+    ja .cc_long
+    mov [rbx + linnea_config_location.cache_control_len], rdx
+    lea rdi, [rbx + linnea_config_location.cache_control]
+    mov rsi, rax
+    call linnea_string_copy
     jmp .member_sep
 
 .key_proxy:
@@ -787,6 +812,7 @@ linnea_parse_location:
     jmp .member_loop
 .end_object:
     call linnea_parse_advance
+    and r12d, ~16              ; cache_control is optional, any kind
     cmp r12d, 3                ; prefix + root
     je .done
     cmp r12d, 5                ; prefix + proxy
@@ -819,6 +845,10 @@ linnea_parse_location:
 .redirect_long:
     lea rdi, [msg_redirect_long]
     mov esi, msg_redirect_long_len
+    jmp linnea_parse_fail
+.cc_long:
+    lea rdi, [msg_cc_long]
+    mov esi, msg_cc_long_len
     jmp linnea_parse_fail
 .proxy_long:
     lea rdi, [msg_proxy_long]

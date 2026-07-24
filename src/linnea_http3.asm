@@ -19,6 +19,8 @@ extern linnea_quic_varint_encode
 extern linnea_qpack_decode
 extern linnea_qpack_encode_response
 extern linnea_qpack_send_validators
+extern linnea_qpack_crange_ptr
+extern linnea_qpack_crange_len
 ; static-file resolution, shared with the HTTP/2 serve path
 extern linnea_static_normalize
 extern linnea_static_open
@@ -28,7 +30,12 @@ extern linnea_static_mtime
 extern linnea_static_etag
 extern linnea_static_etag_len
 extern linnea_http_inm_match
+extern linnea_http_range_parse
+extern linnea_http_ifrange_match
 extern linnea_time_parse_http_date
+
+global linnea_h3_body_off
+global linnea_h3_body_len
 
 section .rodata
 idx_name:      db "index.html"
@@ -54,6 +61,13 @@ post_receipt: resb 64                 ; "<len> <hash>" for a large POST body
 ; rather than overrun the client's window (a flow-control violation kills the
 ; connection; a 503 is retryable).
 linnea_h3_tx_cap: resq 1
+; For a chunked (large-body) response: where the body starts within the file
+; mapping linnea_h3_serve hands back, and how many bytes of it to stream — a
+; 206's range slice, or 0 / the whole size. The caller copies these into the
+; response-stream slot beside the mapping.
+linnea_h3_body_off: resq 1
+linnea_h3_body_len: resq 1
+h3_crange_buf: resb 80                ; "bytes first-last/size" / "bytes */size"
 
 section .text
 
@@ -283,11 +297,14 @@ linnea_h3_serve:
     push r14
     push r15
     push rbp
-    sub rsp, 8                       ; keep rsp 16-aligned for the calls
+    sub rsp, 40                      ; [0/8] mime ptr/len, [16/24] range
+    ;                                ; offset/length, [32] ranged flag
     mov rbx, rdi                     ; req
     mov r12, rcx                     ; out
-    ; no validators until a file is opened and its conditionals evaluated
+    ; no validators or content-range until a file is opened and the request's
+    ; conditionals and range are evaluated
     mov qword [linnea_qpack_send_validators], 0
+    mov qword [linnea_qpack_crange_ptr], 0
     ; a POST echoes its request body back (r8/r9) — the observable proof that
     ; DATA frames are captured. GET/HEAD (and other methods) fall through to the
     ; static file path, which ignores any body.
@@ -403,8 +420,68 @@ linnea_h3_serve:
     mov rsi, r14
     sub rsi, rdi                     ; resolved path length
     call linnea_static_mime          ; rax = mime ptr, rdx = mime len
-    mov rcx, rdx                     ; mime len
-    mov rdx, rax                     ; mime ptr
+    mov [rsp], rax                   ; keep the MIME across the range work
+    mov [rsp + 8], rdx
+    mov qword [rsp + 16], 0          ; whole file until a range narrows it
+    mov [rsp + 24], rbp
+    mov qword [rsp + 32], 0          ; not a 206
+    ; --- Range: a single bytes= range on a GET, evaluated after the
+    ; conditionals as RFC 9110 orders and gated by If-Range (strong match
+    ; only). Anything not understood serves the full 200, which is always
+    ; safe; a valid but unsatisfiable range earns the 416.
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    cmp qword [rbx + linnea_h2_req.method_len], 4
+    jne .range_chk
+    cmp dword [rdi], 0x44414548      ; "HEAD": ranges apply to GET alone
+    je .range_done
+.range_chk:
+    mov rdi, [rbx + linnea_h2_req.rng_ptr]
+    test rdi, rdi
+    jz .range_done
+    mov rdi, [rbx + linnea_h2_req.ifr_ptr]
+    test rdi, rdi
+    jz .range_eval
+    mov rsi, [rbx + linnea_h2_req.ifr_len]
+    lea rdx, [linnea_static_etag]
+    mov rcx, [linnea_static_etag_len]
+    mov r8, [linnea_static_mtime]
+    call linnea_http_ifrange_match
+    test eax, eax
+    jz .range_done                   ; stale validator: the whole file
+.range_eval:
+    mov rdi, [rbx + linnea_h2_req.rng_ptr]
+    mov rsi, [rbx + linnea_h2_req.rng_len]
+    mov rdx, rbp
+    call linnea_http_range_parse     ; rax = offset, rdx = count | -1 | -2
+    cmp rax, -1
+    je .range_done
+    cmp rax, -2
+    je .h3_416
+    mov [rsp + 16], rax
+    mov [rsp + 24], rdx
+    mov qword [rsp + 32], 1
+    ; content-range value: "bytes first-last/size"
+    lea rdi, [h3_crange_buf]
+    mov dword [rdi], 'byte'
+    mov word [rdi + 4], 's '
+    add rdi, 6
+    mov rax, [rsp + 16]              ; first
+    call u64_to_dec
+    mov byte [rdi], '-'
+    inc rdi
+    mov rax, [rsp + 16]
+    add rax, [rsp + 24]
+    dec rax                          ; last = first + count - 1
+    call u64_to_dec
+    mov byte [rdi], '/'
+    inc rdi
+    mov rax, rbp                     ; the representation's whole size
+    call u64_to_dec
+    lea rax, [h3_crange_buf]
+    sub rdi, rax
+    mov [linnea_qpack_crange_len], rdi
+    mov [linnea_qpack_crange_ptr], rax
+.range_done:
     ; a HEAD request: emit only the headers (content-length = the file size) and
     ; no body — whatever the size. A bodiless response is not flow-controlled.
     mov rdi, [rbx + linnea_h2_req.method_ptr]
@@ -414,6 +491,8 @@ linnea_h3_serve:
     jne .body_serve
     mov rdi, r12                     ; out
     mov esi, 200
+    mov rdx, [rsp]                   ; mime ptr / len
+    mov rcx, [rsp + 8]
     mov r8, rbp                      ; content-length = file size
     call linnea_h3_build_headers     ; rax = response length (headers only)
     cmp r15, 1
@@ -426,17 +505,25 @@ linnea_h3_serve:
     pop rax
     jmp .sret
 .body_serve:
-    cmp rbp, LINNEA_H3_INLINE_MAX
+    mov esi, 200                     ; 206 when a range narrowed the body
+    cmp qword [rsp + 32], 0
+    je .st_sel
+    mov esi, 206
+.st_sel:
+    mov rdx, [rsp]                   ; mime ptr / len
+    mov rcx, [rsp + 8]
+    mov rax, [rsp + 24]              ; body length: the slice's
+    cmp rax, LINNEA_H3_INLINE_MAX
     ja .large                        ; too big for one packet: stream it
     mov r8, r15
-    mov r9, rbp
+    add r8, [rsp + 16]               ; the slice, or the whole file
+    mov r9, [rsp + 24]
     cmp r15, 1                       ; empty-file sentinel: found, nothing mapped
     jne .havebody
     xor r8d, r8d
     xor r9d, r9d
 .havebody:
     mov rdi, r12
-    mov esi, 200
     call linnea_h3_build_response    ; rax = response length
     cmp r15, 1
     jbe .sret                        ; nothing was mapped
@@ -451,16 +538,49 @@ linnea_h3_serve:
     ; may we start a chunked response? Only one is in flight at a time; a
     ; concurrent large request is refused (503). The body itself streams within
     ; the client's flow-control window, enforced by the pump, so its size is not
-    ; checked here. (rdx/rcx = MIME, kept live.)
+    ; checked here. (esi = status, rdx/rcx = MIME, kept live.)
     cmp qword [linnea_h3_tx_cap], 0
     je .refuse
     mov rdi, r12
-    mov esi, 200
-    mov r8, rbp                      ; body length (for content-length + DATA len)
+    mov r8, [rsp + 24]               ; body length (for content-length + DATA len)
     call linnea_h3_build_response_head ; rax = head length written to out
+    mov rcx, [rsp + 16]              ; where the body starts in the mapping,
+    mov [linnea_h3_body_off], rcx    ; and how much of it the pump streams
+    mov rcx, [rsp + 24]
+    mov [linnea_h3_body_len], rcx
     mov r8, r15                      ; the mapping is the caller's to stream + unmap
     mov r9, rbp
     jmp .sret_large
+.h3_416:
+    ; the single range is valid but unsatisfiable: unmap the file and answer
+    ; a bodiless 416 whose Content-Range names the actual length ("bytes
+    ; */size") so the client can retry sensibly. It describes no
+    ; representation, so the validators are dropped again.
+    cmp r15, 1
+    jbe .h3_416_nomap                ; empty-file sentinel: nothing was mapped
+    mov rdi, r15
+    mov rsi, rbp
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+.h3_416_nomap:
+    mov qword [linnea_qpack_send_validators], 0
+    lea rdi, [h3_crange_buf]         ; content-range value: "bytes */size"
+    mov dword [rdi], 'byte'
+    mov dword [rdi + 4], 's */'
+    add rdi, 8
+    mov rax, rbp
+    call u64_to_dec
+    lea rax, [h3_crange_buf]
+    sub rdi, rax
+    mov [linnea_qpack_crange_len], rdi
+    mov [linnea_qpack_crange_ptr], rax
+    mov rdi, r12                     ; out
+    mov esi, 416
+    xor edx, edx                     ; no content-type
+    xor r8d, r8d                     ; content-length: 0, and no DATA frame
+    call linnea_h3_build_headers     ; rax = response length (headers only)
+    jmp .sret
+
 .h3_304:
     ; the client's copy is current: unmap the file and answer a bodiless 304
     ; carrying the validators it will compare next time. Like a HEAD response,
@@ -516,7 +636,7 @@ linnea_h3_serve:
     xor r8d, r8d                     ; complete response in out, nothing mapped
     xor r9d, r9d
 .sret_large:
-    add rsp, 8
+    add rsp, 40
     pop rbp
     pop r15
     pop r14

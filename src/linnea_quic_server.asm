@@ -36,6 +36,8 @@ struc linnea_quic_vhost
     .priv:     resq 1               ; P-256 private scalar
     .root_ptr: resq 1               ; document root
     .root_len: resq 1
+    .cc_ptr:   resq 1               ; the location's Cache-Control value
+    .cc_len:   resq 1               ; (len 0 = none configured)
 endstruc
 
 ; Per-connection state lives in the pool slot cur_conn points at. CONNLEA loads
@@ -66,6 +68,10 @@ global linnea_h3_advert
 
 extern linnea_h3_read_headers
 extern linnea_h3_serve
+extern linnea_h3_body_off
+extern linnea_h3_body_len
+extern linnea_qpack_ccontrol_ptr
+extern linnea_qpack_ccontrol_len
 extern linnea_quic_initial_dcid
 extern linnea_quic_initial_secrets
 extern linnea_quic_ch_parse
@@ -296,6 +302,10 @@ linnea_quic_add_vhost:
     mov [rdx + linnea_quic_vhost.root_ptr], r8
     mov r8, [rsi + linnea_config_location.root_len]
     mov [rdx + linnea_quic_vhost.root_len], r8
+    lea r8, [rsi + linnea_config_location.cache_control]
+    mov [rdx + linnea_quic_vhost.cc_ptr], r8
+    mov r8, [rsi + linnea_config_location.cache_control_len]
+    mov [rdx + linnea_quic_vhost.cc_len], r8
     inc qword [vhost_count]
 .av_full:
     xor eax, eax
@@ -1632,6 +1642,15 @@ linnea_quic_server_datagram:
     call vhost_slot
     mov rsi, [rax + linnea_quic_vhost.root_ptr]
     mov rdx, [rax + linnea_quic_vhost.root_len]
+    ; this vhost's Cache-Control for the QPACK encoder (ptr 0 = none)
+    mov r10, [rax + linnea_quic_vhost.cc_len]
+    mov [linnea_qpack_ccontrol_len], r10
+    mov r11, [rax + linnea_quic_vhost.cc_ptr]
+    test r10, r10
+    jnz .h3_cc_set
+    xor r11d, r11d
+.h3_cc_set:
+    mov [linnea_qpack_ccontrol_ptr], r11
     mov r8, [s_body_ptr]             ; the request body, for a POST echo
     mov r9, [s_body_len]
     ; may we start a chunked response? Yes while any of the LINNEA_QUIC_TXSTREAMS
@@ -1705,6 +1724,10 @@ linnea_quic_server_datagram:
 .sl_found:
     mov [rdx + linnea_quic_txstream.base], r8
     mov [rdx + linnea_quic_txstream.size], r9
+    mov r10, [linnea_h3_body_off]     ; the slice the serve chose (a 206's
+    mov [rdx + linnea_quic_txstream.foff], r10   ; range, or 0 / the whole file)
+    mov r10, [linnea_h3_body_len]
+    mov [rdx + linnea_quic_txstream.flen], r10
     mov [rdx + linnea_quic_txstream.hlen], rax
     mov r10, [s_sid]
     mov [rdx + linnea_quic_txstream.sid], r10
@@ -2587,7 +2610,7 @@ tx_emit_chunk:
     mov r15, rax                      ; write cursor into strm_pay
     ; STREAM frame type
     mov rcx, [rbp + linnea_quic_txstream.hlen]
-    add rcx, [rbp + linnea_quic_txstream.size]   ; the stream's total length
+    add rcx, [rbp + linnea_quic_txstream.flen]   ; the stream's total length
     lea rdx, [r13 + r14]
     mov al, 0x0c                      ; STREAM | OFF
     cmp rdx, rcx
@@ -2629,6 +2652,7 @@ tx_emit_chunk:
     test r9, r9
     jz .tc_send
     mov rsi, [rbp + linnea_quic_txstream.base]
+    add rsi, [rbp + linnea_quic_txstream.foff]   ; the body's start in the mapping
     add rsi, rdx
     sub rsi, rax                      ; file bytes start at stream offset hlen
     lea rdi, [strm_pay + r15]
@@ -2676,7 +2700,7 @@ tx_pump:
     cmp qword [rbp + linnea_quic_txstream.active], 0
     je .tp_reap_next
     mov rax, [rbp + linnea_quic_txstream.hlen]
-    add rax, [rbp + linnea_quic_txstream.size]
+    add rax, [rbp + linnea_quic_txstream.flen]
     cmp qword [rbp + linnea_quic_txstream.off], rax
     jb .tp_reap_next                  ; not fully sent
     cmp qword [rbp + linnea_quic_txstream.inflight], 0
@@ -2701,7 +2725,7 @@ tx_pump:
     cmp qword [rbp + linnea_quic_txstream.active], 0
     je .tp_pick_next
     mov rax, [rbp + linnea_quic_txstream.hlen]
-    add rax, [rbp + linnea_quic_txstream.size]
+    add rax, [rbp + linnea_quic_txstream.flen]
     cmp qword [rbp + linnea_quic_txstream.off], rax
     jae .tp_pick_next                 ; fully sent
     mov rax, [rbp + linnea_quic_txstream.off]
@@ -2747,7 +2771,7 @@ tx_pump:
     mov r14, r15
     ; chunk length = min(TX_CHUNK, total-off, stream-window-room)
     mov r13, [rbp + linnea_quic_txstream.hlen]
-    add r13, [rbp + linnea_quic_txstream.size]
+    add r13, [rbp + linnea_quic_txstream.flen]
     mov rax, [rbp + linnea_quic_txstream.off]
     sub r13, rax                      ; bytes left in the stream (>= 1)
     cmp r13, LINNEA_QUIC_TX_CHUNK

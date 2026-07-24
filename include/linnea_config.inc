@@ -36,6 +36,8 @@ struc linnea_config_location
     .proxy_str_len: resq 1
     .redirect:      resb LINNEA_MAX_ROOT + 1      ; URL prefix the 301 points at
     .redirect_len:  resq 1
+    .cache_control: resb LINNEA_MAX_ROOT + 1      ; Cache-Control value for static
+    .cache_control_len: resq 1                    ; responses (0 = header not sent)
 endstruc
 
 struc linnea_config_server

@@ -7,7 +7,7 @@
       "host": "127.0.0.1", "port": 47452, "hostname": "localhost",
       "cert": "test/tls/server.crt", "key": "test/tls/server.key",
       "locations": [
-        { "prefix": "/", "root": "test/www" }
+        { "prefix": "/", "root": "test/www", "cache_control": "max-age=60" }
       ]
     }
   ]

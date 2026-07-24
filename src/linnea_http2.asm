@@ -38,6 +38,8 @@ extern linnea_static_etag
 extern linnea_static_etag_len
 extern linnea_static_lastmod
 extern linnea_http_inm_match
+extern linnea_http_range_parse
+extern linnea_http_ifrange_match
 extern linnea_time_parse_http_date
 extern linnea_time_http_now
 extern linnea_config_instance
@@ -256,7 +258,7 @@ linnea_h2_handle:
     ; Ensure room for a HEADERS (+ small inline error DATA) first.
     lea rax, [rbx + linnea_connection.out_buf + LINNEA_CONN_OUT_BUF]
     sub rax, r13
-    cmp rax, 400
+    cmp rax, 600
     jb .flush                        ; not enough room now; flush and resume
     mov rdi, rbx                     ; conn
     ; rsi already = this frame's header pointer
@@ -423,8 +425,8 @@ linnea_h2_handle:
 %define L_SID    linnea_h2_req_size + 8
 %define L_CONT   linnea_h2_req_size + 16
 %define L_OUT    linnea_h2_req_size + 24
-%if L_OUT + 8 > 200
-  %error "h2_build_request stack frame (sub rsp,200) too small for req + locals"
+%if L_OUT + 8 > 216
+  %error "h2_build_request stack frame (sub rsp,216) too small for req + locals"
 %endif
 h2_build_request:
     push rbx
@@ -433,7 +435,7 @@ h2_build_request:
     push r14
     push r15
     push rbp
-    sub rsp, 200
+    sub rsp, 216
     mov rbx, rdi                     ; conn
     mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
@@ -594,7 +596,7 @@ h2_build_request:
 .err:
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
-    add rsp, 200
+    add rsp, 216
     pop rbp
     pop r15
     pop r14
@@ -608,10 +610,11 @@ h2_build_request:
 ; encoder and connection/stream flow control. The proven HTTP/1.1 handler is
 ; left untouched; this is a parallel static path that reuses only the mmap
 ; syscall pattern. Responses carry the validators (ETag/Last-Modified, via
-; the shared linnea_static helpers) plus Date and Server, and a conditional
-; request revalidates to a bodiless 304 (Q83). Ranges and content-encoding
-; negotiation remain HTTP/1.1 features deferred for h2; :authority selects
-; the vhost.
+; the shared linnea_static helpers) plus Date, Server and any configured
+; Cache-Control; a conditional request revalidates to a bodiless 304 (Q83);
+; a single bytes= range gets a 206 slice, gated by If-Range, with the 416
+; fallback (Q84). Content-encoding negotiation remains an HTTP/1.1 feature
+; deferred for h2; :authority selects the vhost.
 ; =========================================================================
 
 ; h2_serve(rdi=conn, rsi=req, r8=stream_id, r9=out cursor)
@@ -633,6 +636,9 @@ h2_build_request:
 %define S_CLEN  72
 %define S_STAT  80
 %define S_OUT   88
+%define S_ROFF  96              ; range offset into the file (0 when unranged)
+%define S_RLEN  104             ; bytes to send (the range's, or the whole file's)
+%define S_CRLEN 112             ; content-range value length (0 = not a 206)
 h2_serve:
     push rbx
     push r12
@@ -640,7 +646,7 @@ h2_serve:
     push r14
     push r15
     push rbp
-    sub rsp, 104
+    sub rsp, 120
     mov rbx, rdi                     ; conn
     mov r12, rsi                     ; req
     mov [rsp + S_SID], r8
@@ -713,6 +719,9 @@ h2_serve:
     jz .resp_404
     mov [rsp + S_BASE], rax
     mov [rsp + S_SIZE], rdx
+    mov qword [rsp + S_ROFF], 0      ; whole file until a range narrows it
+    mov [rsp + S_RLEN], rdx
+    mov qword [rsp + S_CRLEN], 0
     ; validators for this file, then the request's conditionals: If-None-Match
     ; wins over If-Modified-Since, and an INM mismatch answers 200 whatever
     ; If-Modified-Since says (RFC 9110 13.2.2)
@@ -740,23 +749,88 @@ h2_serve:
     cmp [linnea_static_mtime], rax
     jbe .h2_304                ; not modified since the client's copy
 .cond_done:
+    ; --- Range: a single bytes= range on a GET, evaluated after the
+    ; conditionals as RFC 9110 orders and gated by If-Range (strong match
+    ; only). Anything not understood serves the full 200, which is always
+    ; safe; a valid but unsatisfiable range earns the 416.
+    cmp qword [rsp + S_HEAD], 0
+    jne .range_done_h2               ; ranges apply to GET alone
+    mov rdi, [r12 + linnea_h2_req.rng_ptr]
+    test rdi, rdi
+    jz .range_done_h2
+    mov rdi, [r12 + linnea_h2_req.ifr_ptr]
+    test rdi, rdi
+    jz .range_eval_h2
+    mov rsi, [r12 + linnea_h2_req.ifr_len]
+    lea rdx, [linnea_static_etag]
+    mov rcx, [linnea_static_etag_len]
+    mov r8, [linnea_static_mtime]
+    call linnea_http_ifrange_match
+    test eax, eax
+    jz .range_done_h2                ; stale validator: the whole file
+.range_eval_h2:
+    mov rdi, [r12 + linnea_h2_req.rng_ptr]
+    mov rsi, [r12 + linnea_h2_req.rng_len]
+    mov rdx, [rsp + S_SIZE]
+    call linnea_http_range_parse     ; rax = offset, rdx = count | -1 | -2
+    cmp rax, -1
+    je .range_done_h2
+    cmp rax, -2
+    je .h2_416
+    mov [rsp + S_ROFF], rax
+    mov [rsp + S_RLEN], rdx
+    ; content-range value: "bytes first-last/size"
+    lea rcx, [h2_crbuf]
+    mov dword [rcx], 'byte'
+    mov word [rcx + 4], 's '
+    mov rdi, rax                     ; first
+    lea rsi, [h2_crbuf + 6]
+    call linnea_string_from_u64
+    lea rcx, [h2_crbuf + 6]
+    add rcx, rax
+    mov byte [rcx], '-'
+    inc rcx
+    mov [rsp + S_STAT], rcx          ; write cursor, across the formatters
+    mov rdi, [rsp + S_ROFF]
+    add rdi, [rsp + S_RLEN]
+    dec rdi                          ; last = first + count - 1
+    mov rsi, rcx
+    call linnea_string_from_u64
+    mov rcx, [rsp + S_STAT]
+    add rcx, rax
+    mov byte [rcx], '/'
+    inc rcx
+    mov [rsp + S_STAT], rcx
+    mov rdi, [rsp + S_SIZE]
+    mov rsi, rcx
+    call linnea_string_from_u64
+    mov rcx, [rsp + S_STAT]
+    add rcx, rax
+    lea rax, [h2_crbuf]
+    sub rcx, rax
+    mov [rsp + S_CRLEN], rcx         ; nonzero: this response is a 206
+.range_done_h2:
     mov rdi, [rsp + S_JOIN]
     mov rsi, r14
     sub rsi, [rsp + S_JOIN]          ; joined path length
     call linnea_static_mime                     ; -> rax = mime ptr, rdx = mime len
     mov [rsp + S_MIME], rax
     mov [rsp + S_MLEN], rdx
-    ; content-length string
-    mov rdi, [rsp + S_SIZE]
+    ; content-length string: the range's length, or the whole file's
+    mov rdi, [rsp + S_RLEN]
     lea rsi, [h2_numbuf]
     call linnea_string_from_u64      ; -> rax = length
     mov [rsp + S_CLEN], rax
-    ; --- encode the 200 HEADERS payload (after a 9-byte frame header) ---
+    ; --- encode the 200/206 HEADERS payload (after a 9-byte frame header) ---
     mov rdi, [rsp + S_OUT]
     add rdi, 9
     mov r15, rdi                     ; payload start
     mov esi, 8                       ; :status
     lea rdx, [status_200_h2]
+    cmp qword [rsp + S_CRLEN], 0
+    je .st_sel
+    lea rdx, [status_206_h2]
+.st_sel:
     mov ecx, 3
     call h2_enc_hdr
     mov esi, 31                      ; content-type
@@ -767,6 +841,17 @@ h2_serve:
     lea rdx, [h2_numbuf]
     mov rcx, [rsp + S_CLEN]
     call h2_enc_hdr
+    cmp qword [rsp + S_CRLEN], 0
+    je .no_crange_h2
+    mov esi, 30                      ; content-range: bytes first-last/size
+    lea rdx, [h2_crbuf]
+    mov rcx, [rsp + S_CRLEN]
+    call h2_enc_hdr
+.no_crange_h2:
+    mov esi, 18                      ; accept-ranges: bytes
+    lea rdx, [h2_bytes]
+    mov ecx, h2_bytes_len
+    call h2_enc_hdr
     mov esi, 34                      ; etag
     lea rdx, [linnea_static_etag]
     mov rcx, [linnea_static_etag_len]
@@ -776,6 +861,14 @@ h2_serve:
     mov ecx, LINNEA_HTTP_DATE_LEN
     call h2_enc_hdr
     call h2_enc_date_server
+    mov rax, [rsp + S_LOC]           ; the location's Cache-Control, if set
+    mov rcx, [rax + linnea_config_location.cache_control_len]
+    test rcx, rcx
+    jz .no_cc_h2
+    mov esi, 24                      ; cache-control
+    lea rdx, [rax + linnea_config_location.cache_control]
+    call h2_enc_hdr
+.no_cc_h2:
     ; Alt-Svc, when a QUIC listener is up (name is not in the static table)
     cmp qword [linnea_h3_altsvc_len], 0
     je .no_altsvc_h2
@@ -794,7 +887,7 @@ h2_serve:
     mov r8b, LINNEA_H2_FLAG_END_HEADERS
     cmp qword [rsp + S_HEAD], 0
     jne .no_body
-    cmp qword [rsp + S_SIZE], 0
+    cmp qword [rsp + S_RLEN], 0
     jne .with_body
 .no_body:
     or r8b, LINNEA_H2_FLAG_END_STREAM
@@ -816,9 +909,11 @@ h2_serve:
     mov [rax + linnea_h2_stream.swnd], rcx
     mov rcx, [rsp + S_BASE]
     mov [rax + linnea_h2_stream.file_base], rcx
+    add rcx, [rsp + S_ROFF]          ; the requested slice, or the whole file
     mov [rax + linnea_h2_stream.body_ptr], rcx
-    mov rcx, [rsp + S_SIZE]
+    mov rcx, [rsp + S_SIZE]          ; munmap needs the whole mapping
     mov [rax + linnea_h2_stream.file_size], rcx
+    mov rcx, [rsp + S_RLEN]
     mov [rax + linnea_h2_stream.body_rem], rcx
     mov qword [rax + linnea_h2_stream.flags], LINNEA_H2_STREAM_END
     mov r8b, LINNEA_H2_FLAG_END_HEADERS   ; DATA follows; no END_STREAM here
@@ -923,6 +1018,54 @@ h2_serve:
     mov ecx, LINNEA_HTTP_DATE_LEN
     call h2_enc_hdr
     call h2_enc_date_server
+    mov rax, [rsp + S_LOC]           ; a 304 carries the 200's Cache-Control:
+    mov rcx, [rax + linnea_config_location.cache_control_len]
+    test rcx, rcx                    ; it is metadata the client's cache must
+    jz .no_cc_304                    ; refresh on revalidation
+    mov esi, 24                      ; cache-control
+    lea rdx, [rax + linnea_config_location.cache_control]
+    call h2_enc_hdr
+.no_cc_304:
+    mov rbp, rdi
+    sub rbp, r15                     ; payload length
+    mov r8b, LINNEA_H2_FLAG_END_HEADERS | LINNEA_H2_FLAG_END_STREAM
+    jmp .flags
+
+.h2_416:
+    ; the single range is valid but unsatisfiable: unmap the file and answer
+    ; a bodiless 416 whose Content-Range names the actual length ("bytes
+    ; */size") so the client can retry sensibly
+    cmp qword [rsp + S_SIZE], 0
+    je .h2_416_nomap                 ; empty file: sentinel base, nothing mapped
+    mov rdi, [rsp + S_BASE]
+    mov rsi, [rsp + S_SIZE]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+.h2_416_nomap:
+    lea rcx, [h2_crbuf]              ; content-range value: "bytes */size"
+    mov dword [rcx], 'byte'
+    mov dword [rcx + 4], 's */'
+    mov rdi, [rsp + S_SIZE]
+    lea rsi, [h2_crbuf + 8]
+    call linnea_string_from_u64
+    lea rcx, [rax + 8]               ; value length
+    mov [rsp + S_CRLEN], rcx
+    mov rdi, [rsp + S_OUT]
+    add rdi, 9
+    mov r15, rdi                     ; payload start
+    mov esi, 8                       ; :status
+    lea rdx, [status_416_h2]
+    mov ecx, 3
+    call h2_enc_hdr
+    mov esi, 30                      ; content-range
+    lea rdx, [h2_crbuf]
+    mov rcx, [rsp + S_CRLEN]
+    call h2_enc_hdr
+    mov esi, 28                      ; content-length: 0
+    lea rdx, [zero_h2]
+    mov ecx, 1
+    call h2_enc_hdr
+    call h2_enc_date_server
     mov rbp, rdi
     sub rbp, r15                     ; payload length
     mov r8b, LINNEA_H2_FLAG_END_HEADERS | LINNEA_H2_FLAG_END_STREAM
@@ -1019,7 +1162,7 @@ h2_serve:
     mov rax, rdi
     sub rax, [rsp + S_OUT]            ; total bytes written
 .out:
-    add rsp, 104
+    add rsp, 120
     pop rbp
     pop r15
     pop r14
@@ -1565,12 +1708,17 @@ method_get_h2:   db "GET"
 method_head_h2:  db "HEAD"
 index_html_h2:   db "index.html"
 status_200_h2:   db "200"
+status_206_h2:   db "206"
 status_304_h2:   db "304"
 status_400_h2:   db "400"
 status_404_h2:   db "404"
 status_405_h2:   db "405"
+status_416_h2:   db "416"
+zero_h2:         db "0"
 srv_linnea:      db "linnea"
 srv_linnea_len   equ $ - srv_linnea
+h2_bytes:        db "bytes"
+h2_bytes_len     equ $ - h2_bytes
 body_400: db "400 Bad Request", 10
 body_400_len equ $ - body_400
 body_404: db "404 Not Found", 10
@@ -1581,3 +1729,4 @@ body_405_len equ $ - body_405
 section .bss
 h2_path_buf:  resb LINNEA_HTTP2_PATH_BUF
 h2_numbuf:    resb 24
+h2_crbuf:     resb 80                ; "bytes first-last/size" / "bytes */size"
