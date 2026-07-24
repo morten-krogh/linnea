@@ -158,7 +158,7 @@ h3_uni_setup_len equ $ - h3_uni_setup
 H3_CTRL_OFF equ 7
 
 section .bss
-sa:          resb 16
+sa:          resb 28
 salen:       resq 1
 linnea_quic_rxbuf: resb LINNEA_QUIC_RXBUF_SIZE
 plaintext:   resb 2048
@@ -392,9 +392,9 @@ linnea_quic_server_datagram:
     mov [s_dgram_len], r13           ; ...also saved: reloaded in the 0-RTT walk
     mov r12d, ecx                    ; udp socket
     ; record the sender: the pool allocator and .refresh_peer read it here
-    cmp rdx, 16
+    cmp rdx, 28
     jbe .dg_plen
-    mov edx, 16
+    mov edx, 28
 .dg_plen:
     mov [salen], rdx
     mov rcx, rdx
@@ -1227,9 +1227,9 @@ linnea_quic_server_datagram:
     mov r10, rax                     ; hold the frame-byte count across the copy
     mov rax, [cur_conn]
     mov rcx, [salen]
-    cmp rcx, 16
+    cmp rcx, 28
     jbe .oi_plen
-    mov ecx, 16
+    mov ecx, 28
 .oi_plen:
     mov [rax + linnea_quic_conn.peer_len], rcx
     lea rdi, [rax + linnea_quic_conn.peer]
@@ -1843,9 +1843,9 @@ linnea_quic_server_datagram:
 .refresh_peer:
     mov [cur_conn], rax
     mov rcx, [salen]
-    cmp rcx, 16
+    cmp rcx, 28
     jbe .rp_len
-    mov ecx, 16
+    mov ecx, 28
 .rp_len:
     mov [rax + linnea_quic_conn.peer_len], rcx
     lea rdi, [rax + linnea_quic_conn.peer]

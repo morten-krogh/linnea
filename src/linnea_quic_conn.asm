@@ -157,11 +157,11 @@ linnea_quic_conn_alloc:
     syscall
     cmp rax, LINNEA_QUIC_SCID_LEN - 2
     jne .arand_fail
-    ; record the peer address
+    ; record the peer address (sockaddr_in6; IPv4 arrives as ::ffff:x)
     mov rcx, r14
-    cmp rcx, 16
+    cmp rcx, 28
     jbe .acplen
-    mov ecx, 16
+    mov ecx, 28
 .acplen:
     mov [rbx + linnea_quic_conn.peer_len], rcx
     mov rsi, r13

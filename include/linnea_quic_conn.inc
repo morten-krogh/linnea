@@ -219,7 +219,7 @@ struc linnea_quic_conn
     .rx_mask:    resq 1
     .scid:       resb LINNEA_QUIC_SCID_LEN   ; ours (index || random)
     .dcid:       resb LINNEA_QUIC_MAX_CID    ; the peer's, our DCID when sending
-    .peer:       resb 16                     ; sockaddr_in of the client
+    .peer:       resb 28                     ; sockaddr_in6 of the client (IPv4 as ::ffff:x)
     .hs_sec:     resb 96             ; c_hs || s_hs || handshake_secret
     .th_cfin:    resb 32             ; H(CH..server Finished)
     ; Session resumption (RFC 8446 4.6.1): the PSK a NewSessionTicket will carry,

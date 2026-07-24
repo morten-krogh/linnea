@@ -579,6 +579,30 @@ else
     check "h3 io_uring tests (skipped: deps unavailable)" 0
 fi
 
+# Dual-stack IPv6: one AF_INET6 listener (host "::", IPV6_V6ONLY off) serves both
+# families. A full h3 GET must complete over native IPv6 (::1) AND over IPv4
+# (127.0.0.1) against that single listener — the native-v6 peer also exercises the
+# 28-byte sockaddr_in6 handling on the receive, conn.peer and sendto-reply paths.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    rm -f test/linnea.log
+    $BIN test/configs/tls-h3-v6.json >/dev/null 2>&1 &
+    v6_pid=$!
+    sleep 0.5
+    python3 test/quic/h3_ipv6_test.py 47455 >/dev/null 2>&1
+    check "h3 (io_uring): dual-stack — served over native IPv6 (::1) and IPv4" $?
+    # TCP too: the same dual-stack socket answers HTTP/2 over native IPv6
+    body=$(curl -s --http2 --cacert test/tls/server.crt \
+                 --resolve localhost:47455:[::1] \
+                 https://localhost:47455/hello.txt)
+    [ "$body" = "hello from linnea" ]
+    check "h3 (io_uring): dual-stack — HTTP/2 over TCP served on native IPv6" $?
+    kill $v6_pid 2>/dev/null
+    wait $v6_pid 2>/dev/null
+    rm -f test/linnea.log
+else
+    check "dual-stack IPv6 test (skipped: deps unavailable)" 0
+fi
+
 # HTTP/3 GOAWAY on drain: a worker told to drain sends GOAWAY on its control
 # stream so the client opens no new requests, then exits. A single-worker config
 # keeps the signalling deterministic; the test kills the master itself.

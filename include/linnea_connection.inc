@@ -49,8 +49,8 @@ struc linnea_connection
     .file_size:     resq 1         ; full mapping size, for munmap
     .file_ptr:      resq 1         ; bytes queued behind the header send
     .file_rem:      resq 1         ; (the file body, or a proxied request body)
-    .peer:          resb 48        ; peer as "a.b.c.d:port" (sized for the
-    .peer_len:      resq 1         ; number formatter's 20-byte scratch)
+    .peer:          resb 80        ; peer as "a.b.c.d:port" or "[v6]:port"
+    .peer_len:      resq 1         ; (sized for the number formatter's 20-byte scratch)
     ; --- proxying ---------------------------------------------------
     .up_fd:         resd 1         ; upstream socket, -1 = none
     .up_pad:        resd 1

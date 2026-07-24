@@ -1,5 +1,8 @@
 ; linnea_network.asm — listening sockets, one per configured server.
-; IPv4 literal addresses only for now; hostnames and IPv6 are rejected.
+; Every listener is a dual-stack AF_INET6 socket with IPV6_V6ONLY cleared, so a
+; single socket serves both IPv6 clients and IPv4 clients (the latter arriving
+; as IPv4-mapped ::ffff:a.b.c.d). The configured host is still an IPv4 literal,
+; "0.0.0.0", or "::"; hostnames are rejected.
 
 default rel
 
@@ -42,10 +45,11 @@ log_close:          db ")", 10
 log_close_len       equ $ - log_close
 
 sockopt_one:        dd 1
+sockopt_zero:       dd 0
 
 section .bss
 
-sockaddr_scratch:   resb LINNEA_SOCKADDR_IN_SIZE
+sockaddr_scratch:   resb LINNEA_SOCKADDR_IN6_SIZE
 adopt_fds:          resq 1     ; fd array for a hot upgrade, or 0
 
 section .text
@@ -128,24 +132,27 @@ linnea_network_quic_listener:
     push rbx
     push r12
     mov rbx, rdi
-    lea rdi, [rbx + linnea_config_server.host]
-    call linnea_network_parse_ipv4
+    mov rdi, rbx
+    lea rsi, [sockaddr_scratch]
+    call linnea_network_fill_sockaddr6
     cmp rax, -1
     je .qfail
-    mov word [sockaddr_scratch], LINNEA_AF_INET
-    movzx ecx, word [rbx + linnea_config_server.port]
-    xchg cl, ch                ; htons
-    mov [sockaddr_scratch + 2], cx
-    mov [sockaddr_scratch + 4], eax
-    mov qword [sockaddr_scratch + 8], 0
     mov eax, LINNEA_SYS_SOCKET
-    mov edi, LINNEA_AF_INET
+    mov edi, LINNEA_AF_INET6
     mov esi, LINNEA_SOCK_DGRAM
     xor edx, edx
     syscall
     cmp rax, -4095
     jae .qfail
     mov r12, rax
+    ; IPV6_V6ONLY = 0: accept IPv4 (as ::ffff:x) on this AF_INET6 socket too.
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, r12
+    mov esi, LINNEA_IPPROTO_IPV6
+    mov edx, LINNEA_IPV6_V6ONLY
+    lea r10, [sockopt_zero]
+    mov r8d, 4
+    syscall
     mov eax, LINNEA_SYS_SETSOCKOPT
     mov rdi, r12
     mov esi, LINNEA_SOL_SOCKET
@@ -171,7 +178,7 @@ linnea_network_quic_listener:
     mov eax, LINNEA_SYS_BIND
     mov rdi, r12
     lea rsi, [sockaddr_scratch]
-    mov edx, LINNEA_SOCKADDR_IN_SIZE
+    mov edx, LINNEA_SOCKADDR_IN6_SIZE
     syscall
     cmp rax, -4095
     jae .qclose
@@ -194,24 +201,27 @@ linnea_network_listener_create:
     push rbx
     push r12
     mov rbx, rdi
-    lea rdi, [rbx + linnea_config_server.host]
-    call linnea_network_parse_ipv4
+    mov rdi, rbx
+    lea rsi, [sockaddr_scratch]
+    call linnea_network_fill_sockaddr6
     cmp rax, -1
     je .bad_host
-    mov word [sockaddr_scratch], LINNEA_AF_INET
-    movzx ecx, word [rbx + linnea_config_server.port]
-    xchg cl, ch                ; htons
-    mov [sockaddr_scratch + 2], cx
-    mov [sockaddr_scratch + 4], eax
-    mov qword [sockaddr_scratch + 8], 0
     mov eax, LINNEA_SYS_SOCKET
-    mov edi, LINNEA_AF_INET
+    mov edi, LINNEA_AF_INET6
     mov esi, LINNEA_SOCK_STREAM
     xor edx, edx
     syscall
     cmp rax, -4095
     jae .socket_fail
     mov r12, rax               ; fd
+    ; IPV6_V6ONLY = 0: accept IPv4 (as ::ffff:x) on this AF_INET6 socket too.
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, r12
+    mov esi, LINNEA_IPPROTO_IPV6
+    mov edx, LINNEA_IPV6_V6ONLY
+    lea r10, [sockopt_zero]
+    mov r8d, 4
+    syscall
     mov eax, LINNEA_SYS_SETSOCKOPT
     mov rdi, r12
     mov esi, LINNEA_SOL_SOCKET
@@ -224,7 +234,7 @@ linnea_network_listener_create:
     mov eax, LINNEA_SYS_BIND
     mov rdi, r12
     lea rsi, [sockaddr_scratch]
-    mov edx, LINNEA_SOCKADDR_IN_SIZE
+    mov edx, LINNEA_SOCKADDR_IN6_SIZE
     syscall
     cmp rax, -4095
     jae .bind_fail
@@ -325,46 +335,112 @@ linnea_network_listener_adopt:
     ret
 
 ; linnea_network_peer_format(rdi=socket fd, rsi=out buffer) -> rax=len
-; Writes the connected peer as "a.b.c.d:port". The buffer must have room
-; for linnea_string_from_u64's 20-byte scratch past the write cursor
-; (48 bytes is plenty). On any failure writes "-" and returns 1.
+; Writes the connected peer. An IPv4 or IPv4-mapped peer is "a.b.c.d:port"; a
+; native IPv6 peer is "[h:h:h:h:h:h:h:h]:port" (eight hex groups, minimal
+; digits). The port shares offset 2 in sockaddr_in and sockaddr_in6. The buffer
+; must have room for linnea_string_from_u64's 20-byte scratch past the write
+; cursor (72 bytes is plenty). On any failure writes "-" and returns 1.
 linnea_network_peer_format:
     push rbx
     push r12
-    sub rsp, 40                ; sockaddr (16) + socklen (8); keeps calls aligned
+    push r13
+    sub rsp, 48                ; sockaddr (28) + socklen (8); keeps calls aligned
     mov rbx, rsi               ; out buffer
     mov eax, LINNEA_SYS_GETPEERNAME
     mov rsi, rsp
-    lea rdx, [rsp + 16]
-    mov qword [rsp + 16], LINNEA_SOCKADDR_IN_SIZE
+    lea rdx, [rsp + 32]
+    mov qword [rsp + 32], LINNEA_SOCKADDR_IN6_SIZE
     syscall
     cmp rax, -4095
     jae .unknown
-    cmp word [rsp], LINNEA_AF_INET
-    jne .unknown
     mov r12, rbx               ; write cursor
-    movzx edi, byte [rsp + 4]
+    movzx eax, word [rsp]
+    cmp eax, LINNEA_AF_INET6
+    je .v6maybe
+    cmp eax, LINNEA_AF_INET
+    jne .unknown
+    lea r13, [rsp + 4]         ; native IPv4: octets at offset 4
+    jmp .fmt_v4
+.v6maybe:
+    ; IPv4-mapped ::ffff:a.b.c.d has addr bytes 0..9 = 0, 10,11 = 0xff
+    cmp qword [rsp + 8], 0
+    jne .v6
+    cmp dword [rsp + 16], 0xffff0000
+    jne .v6
+    lea r13, [rsp + 20]        ; the mapped IPv4 octets
+    ; fall through
+.fmt_v4:
+    movzx edi, byte [r13]
     mov rsi, r12
     call linnea_string_from_u64
     add r12, rax
     mov byte [r12], '.'
     inc r12
-    movzx edi, byte [rsp + 5]
+    movzx edi, byte [r13 + 1]
     mov rsi, r12
     call linnea_string_from_u64
     add r12, rax
     mov byte [r12], '.'
     inc r12
-    movzx edi, byte [rsp + 6]
+    movzx edi, byte [r13 + 2]
     mov rsi, r12
     call linnea_string_from_u64
     add r12, rax
     mov byte [r12], '.'
     inc r12
-    movzx edi, byte [rsp + 7]
+    movzx edi, byte [r13 + 3]
     mov rsi, r12
     call linnea_string_from_u64
     add r12, rax
+    jmp .port
+.v6:
+    ; "[h:h:h:h:h:h:h:h]" — eight big-endian 16-bit groups, minimal hex digits
+    mov byte [r12], '['
+    inc r12
+    lea r13, [rsp + 8]         ; 16 address bytes
+    xor r9d, r9d               ; group index 0..7
+.v6_group:
+    test r9d, r9d
+    jz .v6_nocolon
+    mov byte [r12], ':'
+    inc r12
+.v6_nocolon:
+    movzx eax, byte [r13]      ; high byte
+    shl eax, 8
+    movzx ecx, byte [r13 + 1]
+    or eax, ecx                ; 16-bit group value
+    mov ecx, 12                ; shift of the top nibble
+.v6_skip:
+    test ecx, ecx
+    jz .v6_emit                ; keep the last nibble even if zero
+    mov edx, eax
+    shr edx, cl
+    and edx, 0xf
+    jnz .v6_emit
+    sub ecx, 4
+    jmp .v6_skip
+.v6_emit:
+    mov edx, eax
+    shr edx, cl
+    and edx, 0xf
+    cmp edx, 10
+    jb .v6_dec
+    add edx, 'a' - 10
+    jmp .v6_put
+.v6_dec:
+    add edx, '0'
+.v6_put:
+    mov [r12], dl
+    inc r12
+    sub ecx, 4
+    jns .v6_emit
+    add r13, 2
+    inc r9d
+    cmp r9d, 8
+    jb .v6_group
+    mov byte [r12], ']'
+    inc r12
+.port:
     mov byte [r12], ':'
     inc r12
     movzx eax, word [rsp + 2]
@@ -375,15 +451,63 @@ linnea_network_peer_format:
     add r12, rax
     mov rax, r12
     sub rax, rbx
-    add rsp, 40
+    add rsp, 48
+    pop r13
     pop r12
     pop rbx
     ret
 .unknown:
     mov byte [rbx], '-'
     mov eax, 1
-    add rsp, 40
+    add rsp, 48
+    pop r13
     pop r12
+    pop rbx
+    ret
+
+; linnea_network_fill_sockaddr6(rdi=server*, rsi=out sockaddr_in6) -> rax 0/-1
+; Builds a 28-byte sockaddr_in6 for a dual-stack listener bind. "0.0.0.0" and
+; "::" become the unspecified address (::), which — with IPV6_V6ONLY cleared —
+; accepts native IPv6 and IPv4 (as ::ffff:x); a specific IPv4 literal binds that
+; address IPv4-mapped (::ffff:a.b.c.d). Returns -1 for anything else.
+linnea_network_fill_sockaddr6:
+    push rbx
+    mov rbx, rsi               ; out
+    xor eax, eax
+    mov [rbx], rax             ; zero all 28 bytes
+    mov [rbx + 8], rax
+    mov [rbx + 16], rax
+    mov [rbx + 24], eax
+    mov word [rbx], LINNEA_AF_INET6
+    movzx ecx, word [rdi + linnea_config_server.port]
+    xchg cl, ch                ; htons
+    mov [rbx + 2], cx
+    push rdi                    ; parse_ipv4 walks rdi; keep server*
+    lea rdi, [rdi + linnea_config_server.host]
+    call linnea_network_parse_ipv4
+    pop rdi
+    cmp rax, -1
+    je .maybe_v6any
+    test eax, eax
+    jz .anyaddr                ; "0.0.0.0" -> unspecified (::)
+    ; specific IPv4 -> ::ffff:a.b.c.d  (addr at rbx+8: bytes 10,11=0xff, 12..15=octets)
+    mov word [rbx + 18], 0xffff
+    mov [rbx + 20], eax
+    jmp .ok
+.maybe_v6any:
+    ; the only non-IPv4 host we accept is the literal "::" (unspecified)
+    cmp qword [rdi + linnea_config_server.host_len], 2
+    jne .bad
+    cmp word [rdi + linnea_config_server.host], 0x3a3a   ; "::"
+    jne .bad
+.anyaddr:
+    ; unspecified address :: — the 16 addr bytes are already zero
+.ok:
+    xor eax, eax
+    pop rbx
+    ret
+.bad:
+    mov rax, -1
     pop rbx
     ret
 

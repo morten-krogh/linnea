@@ -186,7 +186,7 @@ quic_fd:    resd 1
             resd 1
 qrecv_msg:  resb LINNEA_MSGHDR_SIZE
 qrecv_iov:  resb LINNEA_IOVEC_SIZE
-qrecv_peer: resb LINNEA_SOCKADDR_IN_SIZE
+qrecv_peer: resb LINNEA_SOCKADDR_IN6_SIZE
 sig_buf:            resb 128   ; struct signalfd_siginfo
 
 section .text
@@ -1753,7 +1753,7 @@ linnea_uring_arm_qrecv:
     jl .noq
     lea rcx, [qrecv_peer]
     mov [qrecv_msg + LINNEA_MSGHDR_NAME], rcx
-    mov dword [qrecv_msg + LINNEA_MSGHDR_NAMELEN], LINNEA_SOCKADDR_IN_SIZE
+    mov dword [qrecv_msg + LINNEA_MSGHDR_NAMELEN], LINNEA_SOCKADDR_IN6_SIZE
     lea rcx, [qrecv_iov]
     mov [qrecv_msg + LINNEA_MSGHDR_IOV], rcx
     mov qword [qrecv_msg + LINNEA_MSGHDR_IOVLEN], 1

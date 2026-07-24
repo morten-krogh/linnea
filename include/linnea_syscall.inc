@@ -69,10 +69,14 @@ LINNEA_S_IFMT        equ 0xF000
 LINNEA_S_IFREG       equ 0x8000
 
 LINNEA_AF_INET       equ 2
+LINNEA_AF_INET6      equ 10
 LINNEA_SOCK_STREAM   equ 1
 LINNEA_SOCK_DGRAM    equ 2
 LINNEA_SOL_SOCKET    equ 1
 LINNEA_SO_REUSEADDR  equ 2
 LINNEA_SO_REUSEPORT  equ 15
+LINNEA_IPPROTO_IPV6  equ 41
+LINNEA_IPV6_V6ONLY   equ 26
 LINNEA_SOCKADDR_IN_SIZE equ 16  ; struct sockaddr_in: family u16, port u16 (BE), addr u32 (BE), zero[8]
+LINNEA_SOCKADDR_IN6_SIZE equ 28 ; struct sockaddr_in6: family u16, port u16 (BE), flowinfo u32, addr[16], scope_id u32
 LINNEA_BACKLOG       equ 128
