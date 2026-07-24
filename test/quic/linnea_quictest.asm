@@ -16,6 +16,7 @@ extern linnea_quic_varint_encode
 extern linnea_quic_unprotect
 extern linnea_quic_unprotect_short
 extern linnea_quic_crypto_frame
+extern linnea_quic_stream_frame
 extern linnea_quic_protect
 extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
@@ -85,6 +86,15 @@ vi1: db 0x25, 0,0,0,0,0,0,0
 vi2: db 0x7b,0xbd, 0,0,0,0,0,0
 vi4: db 0x9d,0x7f,0x3e,0x7d, 0,0,0,0
 vi8: db 0xc2,0x19,0x7c,0x5e,0xff,0x14,0xe8,0x8c
+; Frame-length bounds tests. A STREAM|LEN frame (type 0x0a: STREAM 0x08 | LEN
+; 0x02) and a CRYPTO frame (0x06), each declaring 8 data bytes after a 3-byte
+; header. Passed with the honest length (11) the parser returns the frame; passed
+; a shorter buffer length (7) the declared 8 bytes overrun it and the frame must
+; be rejected (rax = 0) rather than read past the buffer.
+tf_stream:   db 0x0a, 0x00, 0x08, 0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88
+tf_stream_len equ $ - tf_stream
+tf_crypto:   db 0x06, 0x00, 0x08, 0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88
+tf_crypto_len equ $ - tf_crypto
 msg_head:    db "quic-crypto "
 msg_head_len equ $ - msg_head
 msg_slash:   db "/"
@@ -236,6 +246,49 @@ _start:
     jne .rt_done
     inc r15d
 .rt_done:
+
+    ; --- frame Length must be clamped to the packet (OOB-read regression) ---
+    ; STREAM|LEN, honest length: the frame is returned with data length 8.
+    lea rdi, [tf_stream]
+    mov esi, tf_stream_len                     ; 11 = 3 header + 8 data
+    call linnea_quic_stream_frame
+    inc r14d
+    test rax, rax                              ; a frame was returned
+    jz .fl1_done
+    cmp rdx, 8                                 ; with the declared data length
+    jne .fl1_done
+    inc r15d
+.fl1_done:
+    ; STREAM|LEN declaring 8 bytes but only 4 present: must be REJECTED, not read
+    ; past the buffer (before the fix this returned a length running 4 bytes over).
+    lea rdi, [tf_stream]
+    mov esi, 7                                 ; header(3) + only 4 data bytes
+    call linnea_quic_stream_frame
+    inc r14d
+    test rax, rax
+    jnz .fl2_done                              ; non-zero = accepted = BUG
+    inc r15d
+.fl2_done:
+    ; CRYPTO, honest length: returned with data length 8.
+    lea rdi, [tf_crypto]
+    mov esi, tf_crypto_len
+    call linnea_quic_crypto_frame
+    inc r14d
+    test rax, rax
+    jz .fl3_done
+    cmp rdx, 8
+    jne .fl3_done
+    inc r15d
+.fl3_done:
+    ; CRYPTO declaring 8 bytes but only 4 present: must be rejected.
+    lea rdi, [tf_crypto]
+    mov esi, 7
+    call linnea_quic_crypto_frame
+    inc r14d
+    test rax, rax
+    jnz .fl4_done
+    inc r15d
+.fl4_done:
 
     ; --- handshake key derivation: ECDHE + TLS key schedule -> QUIC keys ---
     ; verified against the Python `cryptography` reference (fixed inputs).

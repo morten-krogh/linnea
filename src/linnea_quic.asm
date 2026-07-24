@@ -615,6 +615,14 @@ linnea_quic_stream_frame:
     mov r12, rsi                     ; no LEN: data runs to the frame's end
     sub r12, rdi
 .ss_have:
+    ; the declared data length must stay within the packet (RFC 9000 19.8): with an
+    ; explicit LEN a peer can claim more bytes than the datagram holds, and the
+    ; length is used as a copy/parse size downstream — reject the frame rather than
+    ; read past the plaintext buffer. (The no-LEN branch above set r12 = end - rdi,
+    ; so it lands exactly on the end and passes.)
+    lea rax, [rdi + r12]
+    cmp rax, rsi
+    ja .ss_none
     mov rax, rdi                     ; data pointer
     mov rdx, r12                     ; data length
     mov r8, r13                      ; stream id
@@ -1169,6 +1177,12 @@ linnea_quic_crypto_frame:
     jz .none
     mov r12, rax                     ; CRYPTO data length
     add rdi, rdx                     ; rdi -> CRYPTO data
+    ; the declared length must stay within the packet (RFC 9000 19.6): it is used
+    ; as a copy size into the ClientHello reassembly buffer, so reject an
+    ; overrunning frame rather than read past the plaintext.
+    lea rax, [rdi + r12]
+    cmp rax, rsi
+    ja .none
     mov rax, rdi
     mov rdx, r12
     pop r12
