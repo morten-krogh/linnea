@@ -20,6 +20,23 @@ default rel
 %include "linnea_sha256.inc"
 %include "linnea_hpack.inc"
 %include "linnea_http3.inc"
+%include "linnea_config.inc"
+
+; A TLS virtual host reachable over HTTP/3: the ClientHello's SNI selects one, and
+; the handshake serves its certificate, signs CertVerify with its key, and answers
+; requests from its document root. All the TLS servers sharing the QUIC listener's
+; address are registered (a page for one origin cannot be served under another's
+; certificate). host_ptr/root_ptr point into the parsed config, which outlives us.
+LINNEA_QUIC_MAX_VHOSTS equ 16
+struc linnea_quic_vhost
+    .host_ptr: resq 1
+    .host_len: resq 1
+    .cert_ptr: resq 1               ; framed certificate_list
+    .cert_len: resq 1
+    .priv:     resq 1               ; P-256 private scalar
+    .root_ptr: resq 1               ; document root
+    .root_len: resq 1
+endstruc
 
 ; Per-connection state lives in the pool slot cur_conn points at. CONNLEA loads
 ; the address of one of its fields; CONNGET loads a qword field's value. Both
@@ -36,6 +53,7 @@ default rel
 %define SYS_SENDTO   44
 
 global linnea_quic_server_init
+global linnea_quic_add_vhost
 global linnea_quic_server_datagram
 global linnea_quic_server_rtx_sweep
 global linnea_quic_server_goaway_all
@@ -174,6 +192,8 @@ server_pub:  resb 32
 sh_buf:      resb 128
 th_buf:      resb 32
 hsmsg:       resb LINNEA_QUIC_HS_FLIGHT_MAX  ; shared scratch: the whole flight (EE..Finished)
+vhost_tab:   resb LINNEA_QUIC_MAX_VHOSTS * linnea_quic_vhost_size  ; SNI -> cert/key/root
+vhost_count: resq 1
 s_cert_list_ptr: resq 1
 shactx:      resb linnea_sha256_ctx_size
 hdr:         resb 64
@@ -213,21 +233,93 @@ q_nst_msg:   resb 128            ; the NewSessionTicket handshake message
 
 section .text
 
-; linnea_quic_server_init(rdi=certificate_list, rsi=list len, rdx=P-256 private
-;   scalar, rcx=document root, r8=root len) -> rax = 0.
-; The chain and key are taken already framed/decoded — the config parser does
-; that work for the TLS listeners, and the test driver frames its embedded PEM.
+; linnea_quic_server_init() -> rax = 0. Begin QUIC vhost registration: install the
+; connection-free hook and clear the vhost table. linnea_quic_add_vhost is then
+; called once per TLS server that shares the listener's address.
 linnea_quic_server_init:
-    mov [s_cert_list_ptr], rdi
-    mov [s_cert_len], rsi
-    mov [s_priv], rdx
-    mov [s_docroot_ptr], rcx
-    mov [s_docroot_len], r8
     ; a reclaimed connection may hold an open response stream's file mapping;
     ; the pool calls this back on every free so the mapping cannot leak
     lea rax, [quic_tx_free_hook]
     mov [linnea_quic_conn_free_hook], rax
+    mov qword [vhost_count], 0
     xor eax, eax
+    ret
+
+; linnea_quic_add_vhost(rdi = config server, rsi = its root location) -> rax = 0.
+; Register the server's hostname, certificate_list, key and document root as a QUIC
+; vhost; the SNI matches one of these at handshake time. Extra vhosts past the
+; table cap are ignored (the first, the default, is always kept).
+linnea_quic_add_vhost:
+    mov rax, [vhost_count]
+    cmp rax, LINNEA_QUIC_MAX_VHOSTS
+    jae .av_full
+    imul rcx, rax, linnea_quic_vhost_size
+    lea rdx, [vhost_tab + rcx]        ; the new slot
+    lea r8, [rdi + linnea_config_server.hostname]
+    mov [rdx + linnea_quic_vhost.host_ptr], r8
+    mov r8, [rdi + linnea_config_server.hostname_len]
+    mov [rdx + linnea_quic_vhost.host_len], r8
+    mov r8, [rdi + linnea_config_server.cert_list]
+    mov [rdx + linnea_quic_vhost.cert_ptr], r8
+    mov r8, [rdi + linnea_config_server.cert_list_len]
+    mov [rdx + linnea_quic_vhost.cert_len], r8
+    mov r8, [rdi + linnea_config_server.key_priv]
+    mov [rdx + linnea_quic_vhost.priv], r8
+    lea r8, [rsi + linnea_config_location.root]
+    mov [rdx + linnea_quic_vhost.root_ptr], r8
+    mov r8, [rsi + linnea_config_location.root_len]
+    mov [rdx + linnea_quic_vhost.root_len], r8
+    inc qword [vhost_count]
+.av_full:
+    xor eax, eax
+    ret
+
+; select_vhost(rdi = SNI ptr, rsi = SNI len) -> rax = vhost index. The vhost whose
+; hostname exactly matches the SNI, else 0 (the default) for an absent, unknown or
+; malformed SNI. cur_conn is left pointing at the selected slot's fields elsewhere.
+select_vhost:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi                     ; SNI ptr
+    mov r13, rsi                     ; SNI len
+    test r13, r13
+    jz .sv_default                   ; no SNI: default vhost
+    xor r14d, r14d                   ; index
+.sv_loop:
+    cmp r14, [vhost_count]
+    jae .sv_default
+    imul rax, r14, linnea_quic_vhost_size
+    lea rbx, [vhost_tab + rax]
+    cmp r13, [rbx + linnea_quic_vhost.host_len]
+    jne .sv_next                     ; length differs
+    mov rsi, r12                     ; compare SNI to this vhost's hostname
+    mov rdi, [rbx + linnea_quic_vhost.host_ptr]
+    mov rcx, r13
+    repe cmpsb
+    jne .sv_next
+    mov rax, r14                     ; matched
+    jmp .sv_ret
+.sv_next:
+    inc r14
+    jmp .sv_loop
+.sv_default:
+    xor eax, eax
+.sv_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; vhost_slot(rax = vhost index) -> rax = &vhost_tab[index]. A tiny leaf used where
+; the flight/serve paths need the connection's selected cert, key or root.
+vhost_slot:
+    imul rax, rax, linnea_quic_vhost_size
+    lea rax, [vhost_tab + rax]
     ret
 
 ; linnea_quic_altsvc_set(rdi=port) — build the Alt-Svc value advertising HTTP/3
@@ -429,6 +521,13 @@ linnea_quic_server_datagram:
     call linnea_quic_conn_free
     jmp .done
 .ks_ok:
+    ; select the vhost by SNI — it fixes the certificate, signing key and document
+    ; root this connection is served under, so a name gets its own origin's cert.
+    mov rdi, [ch_out + linnea_quic_ch.sni_ptr]
+    mov rsi, [ch_out + linnea_quic_ch.sni_len]
+    call select_vhost
+    mov rcx, [cur_conn]
+    mov [rcx + linnea_quic_conn.vhost], rax
     ; the client's SCID sits after its DCID in the received header. Copy it to a
     ; stable buffer: we reuse it as the DCID of every packet we send back, but
     ; dgram is overwritten by each recvfrom.
@@ -615,8 +714,11 @@ linnea_quic_server_datagram:
     cmp qword [linnea_quic_hs_psk], 0
     jne .flight_resumed
     lea rdi, [hsmsg + r14]
-    mov rsi, [s_cert_list_ptr]
-    mov rdx, [s_cert_len]
+    mov rax, [cur_conn]
+    mov rax, [rax + linnea_quic_conn.vhost]
+    call vhost_slot                  ; the SNI-selected vhost's certificate and key
+    mov rsi, [rax + linnea_quic_vhost.cert_ptr]
+    mov rdx, [rax + linnea_quic_vhost.cert_len]
     call linnea_quic_build_cert
     add r14, rax
     ; th_cert = H(CH || SH || hsmsg[0..r14])
@@ -626,7 +728,10 @@ linnea_quic_server_datagram:
     mov [s_cv_off], r14              ; CertVerify starts here
     lea rdi, [hsmsg + r14]
     lea rsi, [th_buf]
-    mov rdx, [s_priv]
+    mov rax, [cur_conn]
+    mov rax, [rax + linnea_quic_conn.vhost]
+    call vhost_slot
+    mov rdx, [rax + linnea_quic_vhost.priv]
     call linnea_quic_build_cert_verify
     mov rcx, [cur_conn]
     mov [rcx + linnea_quic_conn.flight_cv_len], rax   ; randomized: must be kept
@@ -1321,8 +1426,11 @@ linnea_quic_server_datagram:
     inc rbx                          ; bytes before the HTTP/3 response
     lea rcx, [strm_pay + rbx]
     lea rdi, [req]
-    mov rsi, [s_docroot_ptr]
-    mov rdx, [s_docroot_len]
+    mov rax, [cur_conn]
+    mov rax, [rax + linnea_quic_conn.vhost]   ; serve from this vhost's document root
+    call vhost_slot
+    mov rsi, [rax + linnea_quic_vhost.root_ptr]
+    mov rdx, [rax + linnea_quic_vhost.root_len]
     mov r8, [s_body_ptr]             ; the request body, for a POST echo
     mov r9, [s_body_len]
     ; may we start a chunked response? Yes while any of the LINNEA_QUIC_TXSTREAMS
@@ -1752,12 +1860,15 @@ linnea_quic_server_datagram:
     lea rdi, [hsmsg]
     mov rcx, [rax + linnea_quic_conn.flight_ee_len]
     rep movsb
-    ; Certificate -> hsmsg[ee_len], re-framed from the shared list
+    ; Certificate -> hsmsg[ee_len], re-framed from this vhost's list
     mov rax, [cur_conn]
     mov rdx, [rax + linnea_quic_conn.flight_ee_len]
     lea rdi, [hsmsg + rdx]
-    mov rsi, [s_cert_list_ptr]
-    mov rdx, [s_cert_len]
+    mov rax, [cur_conn]
+    mov rax, [rax + linnea_quic_conn.vhost]
+    call vhost_slot
+    mov rsi, [rax + linnea_quic_vhost.cert_ptr]
+    mov rdx, [rax + linnea_quic_vhost.cert_len]
     call linnea_quic_build_cert       ; rax = Certificate message length
     ; CertVerify || Finished -> hsmsg[ee_len + cert_len], from the tail after EE
     mov rcx, [cur_conn]

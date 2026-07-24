@@ -77,6 +77,7 @@ extern linnea_h2_conn_free
 extern linnea_string_iequal
 extern linnea_network_quic_listener
 extern linnea_quic_server_init
+extern linnea_quic_add_vhost
 extern linnea_quic_altsvc_set
 extern linnea_h3_server
 extern linnea_quic_server_datagram
@@ -282,13 +283,39 @@ linnea_uring_run:
     cmp rax, -1
     je .quic_next
     mov [quic_fd], eax
-    ; hand the handler the framed chain, the key and the document root
-    mov rdi, [rdx + linnea_config_server.cert_list]
-    mov rsi, [rdx + linnea_config_server.cert_list_len]
-    mov r8, [rcx + linnea_config_location.root_len]
-    lea rcx, [rcx + linnea_config_location.root]
-    mov rdx, [rdx + linnea_config_server.key_priv]
-    call linnea_quic_server_init
+    ; Register every TLS vhost sharing this listener's port so the SNI can select
+    ; the right certificate, key and document root. The one that owns the socket is
+    ; registered first, as the default for an absent or unknown SNI.
+    push r13
+    push r14
+    call linnea_quic_server_init                        ; clears the vhost table
+    movzx r13d, word [rdx + linnea_config_server.port]  ; the QUIC listener's port
+    xor r14d, r14d
+.quic_vhost:
+    cmp r14, [rbx + linnea_config.server_count]
+    jae .quic_vhost_done
+    imul rax, r14, linnea_config_server_size
+    lea rax, [rbx + rax + linnea_config.servers]
+    cmp dword [rax + linnea_config_server.tls], 0
+    je .quic_vhost_next
+    cmp qword [rax + linnea_config_server.cert_list], 0
+    je .quic_vhost_next
+    cmp qword [rax + linnea_config_server.location_count], 0
+    je .quic_vhost_next
+    cmp word [rax + linnea_config_server.port], r13w
+    jne .quic_vhost_next                                ; a vhost on another port
+    lea rcx, [rax + linnea_config_server.locations]
+    cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    jne .quic_vhost_next                                ; only a static root over h3
+    mov rdi, rax
+    mov rsi, rcx
+    call linnea_quic_add_vhost
+.quic_vhost_next:
+    inc r14
+    jmp .quic_vhost
+.quic_vhost_done:
+    pop r14
+    pop r13
     ; advertise HTTP/3 on this port from the TCP responses
     imul rdx, r12, linnea_config_server_size
     lea rdx, [rbx + rdx + linnea_config.servers]

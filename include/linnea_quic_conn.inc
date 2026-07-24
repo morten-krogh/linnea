@@ -197,6 +197,8 @@ struc linnea_quic_conn
     .ctrl_id:    resq 1              ; the peer's control stream id, 0 until seen
     .h3_goaway_id: resq 1            ; lowest request stream a drain would reject
     .ms_bidi_max:  resq 1            ; bidi stream count granted to the peer (MAX_STREAMS)
+    .vhost:        resq 1            ; index into the vhost table, chosen by the SNI:
+                                     ; selects the cert, signing key and document root
     .pn_1rtt:    resq 1              ; next 1-RTT packet number we send
     .last_active: resq 1             ; CLOCK_MONOTONIC seconds of the last packet
     ; acknowledgement state for the 1-RTT space (see linnea_quic_ack_record):

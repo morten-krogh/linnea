@@ -1618,6 +1618,15 @@ PYEOF
         -servername unknown.test 2>/dev/null | openssl x509 -noout -subject)
     echo "$subj" | grep -q "CN=localhost"
     check "unknown sni falls back to the listener owner" $?
+    # the SAME must hold over HTTP/3: the QUIC listener on this port registers both
+    # vhosts, and the ClientHello SNI selects the certificate (before this, h3 always
+    # served the first vhost's cert, so a second name got the wrong one).
+    if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+        python3 test/quic/h3_sni_cert_test.py 47444 sni.test sni.test >/dev/null 2>&1
+        check "h3 sni selects the named vhost cert" $?
+        python3 test/quic/h3_sni_cert_test.py 47444 localhost localhost >/dev/null 2>&1
+        check "h3 sni selects the owner cert by name" $?
+    fi
     # h2 is on by default (tls-sni.json sets no "http2" key): a static vhost
     # negotiates h2.
     echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 -CAfile test/tls/sni.crt \
