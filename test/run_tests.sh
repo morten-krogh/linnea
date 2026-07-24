@@ -506,6 +506,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_v2_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): QUIC v2 handshake serves HTTP/3" $?
 
+    # a client whose Initials start above packet number 0 (Chrome starts at 1): the
+    # ServerHello ACK must cover the real [min,max] range, not [0,max] — acking an
+    # unsent packet is invalid and a strict client aborts to h2 (QUIC_INVALID_ACK_DATA).
+    python3 test/quic/h3_pn_offset_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): ACK covers only received Initials (Chrome starts pn at 1)" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1

@@ -484,6 +484,7 @@ linnea_quic_server_datagram:
     test rax, rax
     jz .done                         ; pool exhausted: drop the datagram
     mov [cur_conn], rax
+    mov qword [rax + linnea_quic_conn.ch_minpn], -1    ; sentinel: no Initial pn seen yet
     ; record the negotiated version (v2 = the only supported version that is not v1)
     mov qword [rax + linnea_quic_conn.is_v2], 0
     cmp dword [linnea_quic_rxbuf + 1], 0x01000000
@@ -747,16 +748,20 @@ linnea_quic_server_datagram:
 
     ; ===== Initial packet: ACK + CRYPTO(ServerHello) =====
     ; ACK the client's Initials: Largest Acknowledged and First ACK Range both the
-    ; largest Initial packet number we received (they are 0..N contiguous — we
-    ; needed every fragment). A single-packet ClientHello leaves this at 0. The
-    ; number is tiny (one Initial per ClientHello fragment), so each varint is one
-    ; byte and the ACK frame stays five bytes.
+    ; ACK the Initials we received: Largest Acknowledged is the largest packet
+    ; number, First ACK Range is (largest - smallest) so the range covers exactly
+    ; [smallest, largest] — NOT [0, largest]. A client may start its Initials above 0
+    ; (Chrome begins at 1), and acking a packet it never sent (e.g. 0) is an invalid
+    ; ACK the client rejects (QUIC_INVALID_ACK_DATA). The numbers are tiny (a handful
+    ; of Initials per ClientHello), so each varint is one byte and the ACK stays five.
     mov byte [payload], 0x02
     mov dword [payload + 1], 0
     mov rax, [cur_conn]
     movzx ecx, byte [rax + linnea_quic_conn.ch_maxpn]
     mov [payload + 1], cl            ; Largest Acknowledged
-    mov [payload + 4], cl            ; First ACK Range (covers 0..largest)
+    mov rdx, [rax + linnea_quic_conn.ch_maxpn]
+    sub rdx, [rax + linnea_quic_conn.ch_minpn]
+    mov [payload + 4], dl            ; First ACK Range = largest - smallest
     mov byte [payload + 5], 0x06
     mov byte [payload + 6], 0x00
     mov eax, [s_sh_len]              ; CRYPTO length varint (2-byte: 0x4000 | len)
@@ -1868,10 +1873,15 @@ linnea_quic_server_datagram:
     mov r12, rax                     ; fragment ptr
     mov r13, rdx                     ; fragment length
     mov r14, r8                      ; fragment offset
-    ; track the largest Initial packet number, for the completion ACK
+    ; track the smallest and largest Initial packet numbers, for the completion ACK
+    ; (the range may start above 0 — Chrome's Initials begin at packet number 1)
     cmp r9, [rbx + linnea_quic_conn.ch_maxpn]
-    jbe .cr_pn_done
+    jbe .cr_max_done
     mov [rbx + linnea_quic_conn.ch_maxpn], r9
+.cr_max_done:
+    cmp r9, [rbx + linnea_quic_conn.ch_minpn]
+    jae .cr_pn_done
+    mov [rbx + linnea_quic_conn.ch_minpn], r9
 .cr_pn_done:
     lea rax, [r14 + r13]             ; fragment end
     cmp rax, LINNEA_QUIC_CH_BUF

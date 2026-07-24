@@ -305,6 +305,11 @@ struc linnea_quic_conn
     .ch_total:   resq 1              ; full ClientHello size, 0 until the header lands
     .ch_hi:      resq 1              ; highest offset+len seen (extent of ch_seen)
     .ch_maxpn:   resq 1              ; largest Initial packet number seen (for the ACK)
+    .ch_minpn:   resq 1              ; smallest Initial packet number seen. A client may
+                                     ; start its Initials above 0 (Chrome starts at 1 to
+                                     ; resist ossification), so the ACK must cover the
+                                     ; real [min,max] range, not assume it begins at 0 —
+                                     ; acking a packet the peer never sent is invalid.
     .ch_buf:     resb LINNEA_QUIC_CH_BUF
     ; A CRYPTO fragment can arrive out of order (ngtcp2 does this), so each is
     ; placed at its offset and its bytes marked here; the contiguous prefix
