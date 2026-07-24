@@ -103,7 +103,9 @@ extern linnea_h3_tx_cap
 extern linnea_quic_conn_slot
 extern linnea_quic_dbg_tick
 extern linnea_quic_dbg_conn
+extern linnea_quic_dbg_rx
 extern qdbg_pass
+extern qdbg_on
 extern linnea_string_from_u64
 extern linnea_quic_conn_free
 extern linnea_quic_varint_encode
@@ -380,6 +382,17 @@ linnea_quic_server_datagram:
     mov rcx, rdx
     lea rdi, [sa]
     rep movsb                        ; rsi = peer sockaddr
+
+    ; opt-in receive trace: log every arriving datagram (target connection id +
+    ; source), so a connection whose dump shows la frozen can be told apart —
+    ; peer datagrams arriving but not matching, versus the peer truly silent.
+    cmp byte [qdbg_on], 0
+    je .no_rxlog
+    lea rdi, [linnea_quic_rxbuf]
+    mov rsi, r13
+    lea rdx, [sa]
+    call linnea_quic_dbg_rx
+.no_rxlog:
 
     ; --- demultiplex: route the datagram to its connection ---
     ; The peer addresses us by the connection ID we issued, whose first two

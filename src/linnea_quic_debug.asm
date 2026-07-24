@@ -22,6 +22,7 @@ default rel
 
 global linnea_quic_dbg_tick
 global linnea_quic_dbg_conn
+global linnea_quic_dbg_rx
 global qdbg_on
 global qdbg_pass
 
@@ -80,6 +81,16 @@ s_hi:    db " hi="
 s_hi_len    equ $ - s_hi
 s_fin:   db " fin="
 s_fin_len   equ $ - s_fin
+s_rx:    db "qrx dcid="
+s_rx_len   equ $ - s_rx
+s_rxsrc: db " src="
+s_rxsrc_len equ $ - s_rxsrc
+s_rxport: db " port="
+s_rxport_len equ $ - s_rxport
+s_rxlen: db " len="
+s_rxlen_len equ $ - s_rxlen
+s_rxhf:  db " hf="
+s_rxhf_len equ $ - s_rxhf
 
 section .bss
 qdbg_on:   resb 1               ; 1 while tracing is enabled (readable by others)
@@ -254,5 +265,61 @@ linnea_quic_dbg_conn:
     pop r15
     pop r14
     pop r13
+    pop rbx
+    ret
+
+; linnea_quic_dbg_rx(rdi = rxbuf, rsi = datagram len, rdx = source sockaddr) —
+; log one arriving datagram: the connection id it targets (dcid: the id WE issued,
+; so it matches the state dump's cid= tag), the source address and port, the length
+; and the header form (0 short / 1 long). Dark unless the trigger is set. This is
+; the receive-side counterpart to the per-connection dump: when a connection's dump
+; shows la frozen (nothing received), this says whether the peer's datagrams were
+; arriving-but-dropped (present here, wrong/absent connection) or truly absent.
+linnea_quic_dbg_rx:
+    cmp byte [qdbg_on], 0
+    jne .on
+    ret
+.on:
+    push rbx
+    push rbp
+    push r13
+    push r14
+    push r15
+    mov r15, rsi                 ; datagram length
+    movzx eax, byte [rdi]        ; header form + dcid
+    test al, 0x80
+    jz .short
+    mov ebp, 1                   ; long header
+    mov rbx, [rdi + 6]           ; long-header DCID (first 8 bytes)
+    jmp .haveid
+.short:
+    xor ebp, ebp                 ; short header
+    mov rbx, [rdi + 1]           ; short-header DCID = the id we issued
+.haveid:
+    mov r13d, [rdx + 4]          ; sin_addr (u32)
+    movzx eax, word [rdx + 2]    ; sin_port (network order)
+    xchg al, ah                  ; -> host order
+    movzx r14d, ax
+    call linnea_log_stamp
+    W s_rx
+    mov rdi, rbx
+    call linnea_log_u64
+    W s_rxsrc
+    mov rdi, r13
+    call linnea_log_u64
+    W s_rxport
+    mov rdi, r14
+    call linnea_log_u64
+    W s_rxlen
+    mov rdi, r15
+    call linnea_log_u64
+    W s_rxhf
+    mov rdi, rbp
+    call linnea_log_u64
+    W s_nl
+    pop r15
+    pop r14
+    pop r13
+    pop rbp
     pop rbx
     ret
