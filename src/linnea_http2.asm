@@ -26,6 +26,7 @@ extern linnea_hpack_decode
 extern linnea_h3_altsvc
 extern linnea_h3_altsvc_len
 extern linnea_h3_server
+extern linnea_h3_advert
 ; static-file resolution lives in linnea_static.asm (shared with HTTP/3)
 extern linnea_static_normalize
 extern linnea_static_open
@@ -729,8 +730,8 @@ h2_serve:
     cmp qword [linnea_h3_altsvc_len], 0
     je .no_altsvc_h2
     mov eax, [rbx + linnea_connection.server]
-    cmp rax, [linnea_h3_server]
-    jne .no_altsvc_h2              ; a different origin: not ours to advertise
+    cmp byte [linnea_h3_advert + rax], 0
+    je .no_altsvc_h2              ; this origin has no h3 vhost: nothing to advertise
     lea rsi, [hdr_altsvc_name]
     mov rdx, hdr_altsvc_name_len
     lea rcx, [linnea_h3_altsvc]

@@ -76,6 +76,7 @@ default rel
 extern linnea_h3_altsvc
 extern linnea_h3_altsvc_len
 extern linnea_h3_server
+extern linnea_h3_advert
 %include "linnea_syscall.inc"
 %include "linnea_config.inc"
 %include "linnea_connection.inc"
@@ -1349,8 +1350,8 @@ linnea_http_handle:
     cmp qword [linnea_h3_altsvc_len], 0
     je .no_altsvc
     mov eax, [rbx + linnea_connection.server]
-    cmp rax, [linnea_h3_server]
-    jne .no_altsvc                 ; a different origin: not ours to advertise
+    cmp byte [linnea_h3_advert + rax], 0
+    je .no_altsvc                 ; this origin has no h3 vhost: nothing to advertise
     lea rdi, [hdr_altsvc]
     mov esi, hdr_altsvc_len
     call .append

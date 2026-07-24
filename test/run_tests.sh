@@ -1627,6 +1627,12 @@ PYEOF
         python3 test/quic/h3_sni_cert_test.py 47444 localhost localhost >/dev/null 2>&1
         check "h3 sni selects the owner cert by name" $?
     fi
+    # every h3 vhost advertises Alt-Svc, not only the socket owner, so each origin
+    # tells its own clients they can switch to h3 (a non-owner vhost is checked).
+    curl -s -D - -o /dev/null --http2 --cacert test/tls/sni.crt \
+        --resolve sni.test:47444:127.0.0.1 https://sni.test:47444/page.html \
+        | grep -qi 'alt-svc: h3='
+    check "h3 alt-svc advertised by a non-owner vhost" $?
     # h2 is on by default (tls-sni.json sets no "http2" key): a static vhost
     # negotiates h2.
     echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 -CAfile test/tls/sni.crt \

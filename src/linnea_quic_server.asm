@@ -62,6 +62,7 @@ global linnea_quic_altsvc_set
 global linnea_h3_altsvc
 global linnea_h3_altsvc_len
 global linnea_h3_server
+global linnea_h3_advert
 
 extern linnea_h3_read_headers
 extern linnea_h3_serve
@@ -216,6 +217,9 @@ s_walk_next: resq 1              ; next coalesced packet, so the Finished walk c
 linnea_h3_altsvc:     resb 48    ; Alt-Svc value, e.g. h3=":443"; ma=86400
 linnea_h3_altsvc_len: resq 1     ; 0 until a QUIC listener is bound
 linnea_h3_server:     resq 1     ; index of the server that owns that listener
+linnea_h3_advert:     resb LINNEA_MAX_SERVERS  ; byte[i]=1: server i advertises h3
+                                 ; (every vhost on the QUIC port, so each origin
+                                 ; tells clients it speaks h3 from its own responses)
 s_acklen:      resq 1
 s_docroot_ptr: resq 1
 s_docroot_len: resq 1

@@ -78,6 +78,7 @@ extern linnea_string_iequal
 extern linnea_network_quic_listener
 extern linnea_quic_server_init
 extern linnea_quic_add_vhost
+extern linnea_h3_advert
 extern linnea_quic_altsvc_set
 extern linnea_h3_server
 extern linnea_quic_server_datagram
@@ -310,6 +311,7 @@ linnea_uring_run:
     mov rdi, rax
     mov rsi, rcx
     call linnea_quic_add_vhost
+    mov byte [linnea_h3_advert + r14], 1        ; this origin advertises h3
 .quic_vhost_next:
     inc r14
     jmp .quic_vhost
