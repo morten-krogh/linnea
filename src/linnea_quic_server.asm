@@ -2714,7 +2714,7 @@ linnea_quic_server_rtx_sweep:
     jz .sw_conn_next
     mov rbx, rax                      ; connection
     cmp byte [qdbg_pass], 0           ; trace this live connection's state (dark unless
-    je .sw_no_dbg                     ; the /tmp/linnea-qdbg trigger file exists)
+    je .sw_no_dbg                     ; the working-dir "linnea-qdbg" trigger file exists)
     mov rdi, rbx
     call linnea_quic_dbg_conn
 .sw_no_dbg:

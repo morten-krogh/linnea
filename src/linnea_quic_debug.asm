@@ -1,10 +1,16 @@
 ; linnea_quic_debug.asm — opt-in QUIC connection-state tracing for diagnosing
 ; real-browser hangs the synthetic (aioquic) tests can't reproduce. It is dark
-; until the operator creates the trigger file /tmp/linnea-qdbg; the sweep then
-; dumps every live connection's flow-control, congestion and per-stream progress
-; to the server log once a second, so a stalled transfer shows exactly which
-; gate is stuck (stream/conn flow control, congestion window, or a request whose
-; reassembly never finished). Remove the file to go dark again — no restart.
+; until the operator creates the trigger file "linnea-qdbg" in the server's
+; working directory (next to the log); the sweep then dumps every live
+; connection's flow-control, congestion and per-stream progress to the server
+; log once a second, so a stalled transfer shows exactly which gate is stuck
+; (stream/conn flow control, congestion window, or a request whose reassembly
+; never finished). Remove the file to go dark again — no restart.
+;
+; The trigger lives in the working directory, NOT /tmp, on purpose: the systemd
+; unit sets PrivateTmp=true, so a /tmp file the operator creates is in a
+; different mount namespace and the service would never see it. The working
+; directory (where the log already lands) is shared, so the trigger works there.
 ;
 ; The cost when dark is one access() syscall per worker per second and nothing
 ; else, so it is safe to ship in the production binary.
@@ -27,7 +33,9 @@ LINNEA_SYS_ACCESS equ 21
 QDBG_PERIOD       equ 20            ; sweep ticks per poll/dump (50 ms tick => ~1 s)
 
 section .rodata
-qdbg_path:  db "/tmp/linnea-qdbg", 0
+; relative to the server's working directory (like the "log" path), so it is
+; visible despite the unit's PrivateTmp namespace — see the file header.
+qdbg_path:  db "linnea-qdbg", 0
 
 ; label pieces for the dump lines; each has a matching _len
 s_hdr:   db "qdbg cid="
