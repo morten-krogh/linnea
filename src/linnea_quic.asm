@@ -29,6 +29,8 @@ global linnea_quic_tp_parse
 global linnea_quic_flow_scan
 global linnea_quic_parse_priority
 global linnea_quic_reset_scan
+global linnea_quic_path_seen
+global linnea_quic_path_data
 global linnea_quic_build_sh
 global linnea_quic_build_ee
 global linnea_quic_build_cert
@@ -1984,6 +1986,7 @@ linnea_quic_reset_scan:
     mov r13, rdx                     ; out cursor
     mov r14, rcx                     ; max
     xor r15d, r15d                   ; count
+    mov qword [linnea_quic_path_seen], 0   ; also captures a PATH_CHALLENGE, if any
 .rs_scan:
     cmp rdi, rsi
     jae .rs_done
@@ -2007,7 +2010,7 @@ linnea_quic_reset_scan:
     cmp bl, 0x1e                     ; HANDSHAKE_DONE
     je .rs_skip1
     cmp bl, 0x1a                     ; PATH_CHALLENGE (8 bytes)
-    je .rs_skip8
+    je .rs_pathchal
     cmp bl, 0x1b                     ; PATH_RESPONSE (8 bytes)
     je .rs_skip8
     cmp bl, 0x18                     ; NEW_CONNECTION_ID
@@ -2039,6 +2042,17 @@ linnea_quic_reset_scan:
     inc rdi
     jmp .rs_scan
 .rs_skip8:
+    add rdi, 9
+    jmp .rs_scan
+.rs_pathchal:
+    ; PATH_CHALLENGE: capture the 8 data bytes so the caller can echo them in a
+    ; PATH_RESPONSE (RFC 9000 8.2), then skip past the frame like PATH_RESPONSE.
+    lea rax, [rdi + 9]
+    cmp rax, rsi
+    ja .rs_done                      ; truncated: stop
+    mov rax, [rdi + 1]               ; the 8 challenge bytes
+    mov [linnea_quic_path_data], rax
+    mov qword [linnea_quic_path_seen], 1
     add rdi, 9
     jmp .rs_scan
 .rs_v1:
@@ -2696,3 +2710,10 @@ linnea_quic_varint_encode:
     mov [rdi], sil
     mov eax, 1
     ret
+
+section .bss
+; PATH_CHALLENGE captured by linnea_quic_reset_scan (which fully walks the frames):
+; the 8 challenge bytes and a flag, so the receive path can echo them back in a
+; PATH_RESPONSE (RFC 9000 8.2). Reset at the start of each scan.
+linnea_quic_path_seen:  resq 1
+linnea_quic_path_data:  resb 8

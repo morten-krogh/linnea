@@ -99,6 +99,8 @@ extern linnea_quic_tp_parse
 extern linnea_quic_flow_scan
 extern linnea_quic_parse_priority
 extern linnea_quic_reset_scan
+extern linnea_quic_path_seen
+extern linnea_quic_path_data
 extern linnea_quic_conn_free_hook
 extern linnea_h3_tx_cap
 extern linnea_quic_conn_slot
@@ -190,6 +192,7 @@ fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow 
 LINNEA_QUIC_RESET_MAX equ 16
 reset_ids:   resq LINNEA_QUIC_RESET_MAX  ; stream ids the peer cancelled this packet
 reset_pay:   resb 32                  ; a RESET_STREAM frame we send back on cancel
+path_resp_pay: resb 16                ; a PATH_RESPONSE frame (0x1b + 8 echoed bytes)
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 maxstreams_pay: resb 16               ; a MAX_STREAMS frame raising the peer's limit
@@ -1226,6 +1229,19 @@ linnea_quic_server_datagram:
     cmp rbp, rbx
     jb .reset_loop
 .no_resets:
+    ; PATH_CHALLENGE -> PATH_RESPONSE (RFC 9000 8.2): echo the 8 challenge bytes so a
+    ; peer validating this path (e.g. after a migration) confirms our address. The
+    ; peer is already committed (post-auth) to this packet's source, so it follows.
+    cmp qword [linnea_quic_path_seen], 0
+    je .no_pathresp
+    mov byte [path_resp_pay], 0x1b
+    mov rax, [linnea_quic_path_data]
+    mov [path_resp_pay + 1], rax
+    lea rsi, [path_resp_pay]
+    mov [s_pl_ptr], rsi
+    mov qword [s_pl_len], 9
+    call emit_1rtt                    ; not rtx-tracked: a lost response is re-challenged
+.no_pathresp:
     ; open response streams are ack-clocked and flow-controlled: the acks just
     ; ingested, plus any MAX_DATA / MAX_STREAM_DATA the peer sent as it consumed
     ; the responses, may let more chunks go out (and a fully acknowledged stream is

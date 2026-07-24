@@ -21,6 +21,9 @@ extern linnea_quic_txchunk_clear
 extern linnea_quic_flow_scan
 extern linnea_quic_parse_priority
 extern linnea_quic_ack_ranges
+extern linnea_quic_reset_scan
+extern linnea_quic_path_seen
+extern linnea_quic_path_data
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 
@@ -79,10 +82,18 @@ msg_head_len equ $ - msg_head
 msg_slash: db "/"
 msg_nl:    db 10
 
+; PATH_CHALLENGE (0x1a + 8 bytes) bundled behind PADDING and a PING, plus trailing
+; PADDING: reset_scan must walk past the other frames and still capture it.
+tf_pc:     db 0x00, 0x01, 0x1a, 0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88, 0x00
+tf_pc_len  equ $ - tf_pc
+tf_nopc:   db 0x00, 0x01, 0x00      ; PADDING + PING + PADDING, no challenge
+tf_nopc_len equ $ - tf_nopc
+
 section .bss
 conn:      resb linnea_quic_conn_size
 pairs:     resb LINNEA_QUIC_ACK_MAXR * 16
 flow_out:  resb 16                 ; [max_data, max_stream_data] from a flow scan
+rid_out:   resq 16                 ; reset-stream ids (unused here; a valid dest)
 
 section .text
 
@@ -406,6 +417,23 @@ _start:
     call linnea_quic_parse_priority
     EXPECT rax, 3
     EXPECT rdx, 0
+
+    ; --- reset_scan captures a PATH_CHALLENGE bundled behind other frames, so the
+    ; receive path can echo it in a PATH_RESPONSE (RFC 9000 8.2) ---
+    lea rdi, [tf_pc]
+    mov esi, tf_pc_len
+    lea rdx, [rid_out]
+    mov ecx, 16
+    call linnea_quic_reset_scan
+    EXPECT qword [linnea_quic_path_seen], 1
+    EXPECT qword [linnea_quic_path_data], 0x8877665544332211
+    ; a scan with no challenge leaves the flag clear
+    lea rdi, [tf_nopc]
+    mov esi, tf_nopc_len
+    lea rdx, [rid_out]
+    mov ecx, 16
+    call linnea_quic_reset_scan
+    EXPECT qword [linnea_quic_path_seen], 0
 
     ; print "quic-rtx <pass>/<total>\n"
     lea rdi, [msg_head]
