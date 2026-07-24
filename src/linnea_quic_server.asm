@@ -453,7 +453,11 @@ linnea_quic_server_datagram:
     call linnea_quic_conn_lookup
     test rax, rax
     jz .done                         ; unknown connection: drop
-    call .refresh_peer
+    ; select the connection so we can decrypt, but do NOT adopt the source address
+    ; yet: an unauthenticated (spoofed) 1-RTT packet carrying a valid connection id
+    ; must not be able to redirect our sends. The address is committed only after
+    ; the AEAD opens, in .onertt_in below.
+    mov [cur_conn], rax
     jmp .onertt_in
 .demux_found:
     call .refresh_peer
@@ -1095,6 +1099,24 @@ linnea_quic_server_datagram:
     call linnea_quic_unprotect_short  ; rax = frame bytes, rdx = packet number
     test rax, rax
     js .done
+    ; The packet authenticated: only now adopt its source as the peer address, so a
+    ; migrated client's replies follow it. A spoofed 1-RTT packet cannot produce a
+    ; valid AEAD tag, so it never reaches here and can no longer redirect our sends
+    ; (RFC 9000 9.3). Anti-amplification is deliberately NOT re-armed on a change:
+    ; we run no PATH_CHALLENGE validation, so throttling a validated migration to 3x
+    ; would wedge it, and only an authenticated peer can move the address.
+    mov r10, rax                     ; hold the frame-byte count across the copy
+    mov rax, [cur_conn]
+    mov rcx, [salen]
+    cmp rcx, 16
+    jbe .oi_plen
+    mov ecx, 16
+.oi_plen:
+    mov [rax + linnea_quic_conn.peer_len], rcx
+    lea rdi, [rax + linnea_quic_conn.peer]
+    lea rsi, [sa]
+    rep movsb
+    mov rax, r10                     ; frame-byte count
     ; note it as received, so our next packet can acknowledge it — otherwise the
     ; peer keeps retransmitting a request we have already answered
     push rax

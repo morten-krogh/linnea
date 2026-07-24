@@ -473,6 +473,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_dup_request_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): retransmitted request is not served twice (no duplicate wedge)" $?
 
+    # a spoofed packet from a different source, carrying a valid connection id but
+    # no valid AEAD tag, must NOT redirect the server's sends (RFC 9000 9.3): the
+    # peer address is adopted only from an authenticated packet.
+    python3 test/quic/h3_migration_spoof_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): unauthenticated source does not redirect the connection" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1

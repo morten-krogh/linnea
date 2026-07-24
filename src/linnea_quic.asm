@@ -6,6 +6,7 @@ default rel
 
 %include "linnea_quic.inc"
 %include "linnea_aesgcm.inc"
+%include "linnea_quic_conn.inc"   ; for LINNEA_QUIC_RA_BUF (transport-param bound)
 
 global linnea_quic_varint_decode
 global linnea_quic_varint_encode
@@ -1529,9 +1530,13 @@ linnea_quic_build_transport_params:
     mov edx, 262144
     call tp_int
     mov r12, rax
-    mov rdi, r12                     ; initial_max_stream_data_bidi_remote (0x06)
-    mov esi, 0x06
-    mov edx, 262144
+    mov rdi, r12                     ; initial_max_stream_data_bidi_remote (0x06):
+    mov esi, 0x06                    ; the window for the client's REQUEST streams.
+    ; It must not exceed the per-stream reassembly buffer: a request body between
+    ; the buffer size and the advertised window overflows reassembly, is dropped
+    ; WITHOUT an ack, and the client retransmits it forever (a permanent stall). Bind
+    ; it to the buffer so the client is flow-controlled to what we can actually take.
+    mov edx, LINNEA_QUIC_RA_BUF
     call tp_int
     mov r12, rax
     mov rdi, r12                     ; initial_max_stream_data_uni (0x07)
