@@ -466,6 +466,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_reload_test.py 47452 10 >/dev/null 2>&1
     check "h3 (io_uring): reload-cancel (STOP_SENDING) does not stall the connection" $?
 
+    # a request whose ack is lost is retransmitted by the client; the server must
+    # ack the retransmit, not serve the stream a second time — a duplicate response
+    # slot resends the whole body and pins the shared congestion window (the real-
+    # browser wedge). Several chunked streams over one connection, ack-loss forced.
+    python3 test/quic/h3_dup_request_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): retransmitted request is not served twice (no duplicate wedge)" $?
+
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
     python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1

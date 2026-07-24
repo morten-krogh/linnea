@@ -1364,6 +1364,27 @@ linnea_quic_server_datagram:
     call emit_1rtt
     jmp .stream_scan                           ; waiting for more frames
 .serve_bidi:
+    ; Already answering this stream? Then this is a RETRANSMITTED request: the peer
+    ; resent it because our ack of the original was lost (which happens exactly
+    ; during a loss burst). Serving it again would open a second response slot for
+    ; the same stream — a duplicate that resends the whole body and pins the shared
+    ; congestion window, wedging the connection (observed with a real browser: the
+    ; same sid held two slots, one stuck fully-sent-but-unacked). Instead ack it via
+    ; the bare-ACK path so the peer stops retransmitting, and do not re-serve. The
+    ; packet is already recorded in rx_have (at .exp_pn_ready), so the ack covers it.
+    mov rax, [cur_conn]
+    lea rax, [rax + linnea_quic_conn.tx_streams]
+    mov rdx, LINNEA_QUIC_TXSTREAMS
+    mov rcx, [s_sid]
+.sb_dup:
+    cmp qword [rax + linnea_quic_txstream.active], 0
+    je .sb_dup_next
+    cmp qword [rax + linnea_quic_txstream.sid], rcx
+    je .ra_more                      ; a response is already open for this stream
+.sb_dup_next:
+    add rax, linnea_quic_txstream_size
+    dec rdx
+    jnz .sb_dup
     ; zero the request struct and point the QPACK scratch at h3scratch
     lea rdi, [req]
     xor eax, eax
