@@ -38,6 +38,7 @@ global linnea_quic_build_cert_verify
 global linnea_quic_build_finished
 
 extern linnea_quic_hp_mask
+extern linnea_quic_reset_token
 extern linnea_quic_initial_secrets
 extern linnea_aesgcm_init
 extern linnea_aesgcm_open
@@ -1521,6 +1522,17 @@ linnea_quic_build_transport_params:
     mov rcx, rbp
     call tp_bytes
     mov r12, rax
+    ; stateless_reset_token (0x02): the reset token for our connection id (r15), so
+    ; the peer can recognise a stateless reset for this connection (RFC 9000 10.3).
+    mov rdi, r15                     ; scid
+    lea rsi, [tp_srt]
+    call linnea_quic_reset_token
+    mov rdi, r12
+    mov esi, 0x02
+    lea rdx, [tp_srt]
+    mov ecx, 16
+    call tp_bytes
+    mov r12, rax
     mov rdi, r12                     ; max_idle_timeout (0x01) = 30000 ms
     mov esi, 0x01
     mov edx, 30000
@@ -2717,3 +2729,4 @@ section .bss
 ; PATH_RESPONSE (RFC 9000 8.2). Reset at the start of each scan.
 linnea_quic_path_seen:  resq 1
 linnea_quic_path_data:  resb 8
+tp_srt:                 resb 16    ; stateless_reset_token scratch for the tp build

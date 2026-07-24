@@ -19,6 +19,8 @@ global linnea_quic_hp_mask
 global linnea_quic_hs_secrets
 global linnea_quic_app_secrets
 global linnea_quic_ku_next
+global linnea_quic_reset_secret_init
+global linnea_quic_reset_token
 global linnea_quic_resumption_psk
 global linnea_quic_ticket_setup
 global linnea_quic_ticket_seal
@@ -163,6 +165,48 @@ linnea_quic_ku_next:
     call linnea_tls_hkdf_expand_label
     add rsp, 16
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_reset_secret_init() — fill the stateless-reset key from getrandom(2).
+; Must run once before the workers fork so they share it (a token computed after a
+; connection's state is gone must match the one advertised at handshake).
+linnea_quic_reset_secret_init:
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [linnea_quic_reset_secret]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    ret
+
+; linnea_quic_reset_token(rdi = connection id (8 bytes), rsi = out 16 bytes) —
+; the stateless-reset token for a connection id: the first 16 bytes of
+; SHA-256(reset_secret || cid). Keyed by the per-run secret, so it is
+; unpredictable to anyone who has not seen it advertised, yet recomputable by any
+; worker from the id alone (RFC 9000 10.3).
+linnea_quic_reset_token:
+    push rbx
+    push r12
+    sub rsp, 72                      ; [0..40] secret||cid, [40..72] digest
+    mov rbx, rsi                     ; out
+    mov r12, rdi                     ; cid
+    lea rdi, [rsp]                   ; input = secret(32) || cid(8)
+    lea rsi, [linnea_quic_reset_secret]
+    mov ecx, 32
+    rep movsb
+    mov rsi, r12
+    mov ecx, 8
+    rep movsb
+    lea rdi, [rsp]
+    mov esi, 40
+    lea rdx, [rsp + 40]
+    call linnea_sha256
+    lea rsi, [rsp + 40]              ; token = digest[0..16]
+    mov rdi, rbx
+    mov ecx, 16
+    rep movsb
+    add rsp, 72
     pop r12
     pop rbx
     ret
@@ -778,6 +822,10 @@ section .bss
 alignb 16
 q_ticket_key:  resb 16                    ; per-run QUIC stateless-ticket key
 q_ticket_ctx:  resb linnea_aesgcm_ctx_size
+; Stateless-reset key (RFC 9000 10.3): a per-run secret that keys the reset token
+; derived from a connection id. Generated once BEFORE the workers fork so every
+; worker computes the same token for a given id.
+linnea_quic_reset_secret: resb 32
 linnea_quic_hs_psk: resq 1                ; resumption PSK ptr for hs_secrets, 0 = fresh
 linnea_quic_early_ok: resq 1              ; 1 when 0-RTT is accepted (drives EE early_data)
 linnea_quic_resume_issued: resq 1         ; accepted ticket's issued time (0-RTT freshness)

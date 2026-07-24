@@ -101,6 +101,8 @@ extern linnea_quic_parse_priority
 extern linnea_quic_reset_scan
 extern linnea_quic_path_seen
 extern linnea_quic_path_data
+extern linnea_quic_reset_token
+extern linnea_worker_index
 extern linnea_quic_conn_free_hook
 extern linnea_h3_tx_cap
 extern linnea_quic_conn_slot
@@ -193,6 +195,9 @@ LINNEA_QUIC_RESET_MAX equ 16
 reset_ids:   resq LINNEA_QUIC_RESET_MAX  ; stream ids the peer cancelled this packet
 reset_pay:   resb 32                  ; a RESET_STREAM frame we send back on cancel
 path_resp_pay: resb 16                ; a PATH_RESPONSE frame (0x1b + 8 echoed bytes)
+LINNEA_QUIC_SRST_MAX equ 64           ; largest stateless reset we send
+srst_buf:    resb LINNEA_QUIC_SRST_MAX ; the stateless-reset packet we build
+srst_len:    resq 1
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 maxstreams_pay: resb 16               ; a MAX_STREAMS frame raising the peer's limit
@@ -462,13 +467,31 @@ linnea_quic_server_datagram:
     mov esi, LINNEA_QUIC_SCID_LEN
     call linnea_quic_conn_lookup
     test rax, rax
-    jz .done                         ; unknown connection: drop
+    jz .demux_short_reset            ; unknown connection: maybe a stateless reset
     ; select the connection so we can decrypt, but do NOT adopt the source address
     ; yet: an unauthenticated (spoofed) 1-RTT packet carrying a valid connection id
     ; must not be able to redirect our sends. The address is committed only after
     ; the AEAD opens, in .onertt_in below.
     mov [cur_conn], rax
     jmp .onertt_in
+.demux_short_reset:
+    ; No state for this connection id. Only reset ids THIS worker issued — the first
+    ; CID byte is the issuing worker's index. A packet mis-routed here for another
+    ; worker's connection (the SO_REUSEPORT 4-tuple fallback, when the BPF CID
+    ; steering is unavailable) must be dropped, not reset: resetting it would
+    ; spuriously kill a connection another worker is serving and could storm resets
+    ; between workers. In production the BPF steers each id to its worker, so a
+    ; genuinely-stateless id (slot reclaimed) still reaches here and is reset.
+    movzx eax, byte [linnea_quic_rxbuf + 1]   ; the DCID's worker byte
+    cmp eax, [linnea_worker_index]
+    jne .done
+    ; If the packet is long enough to be a real 1-RTT packet, send a stateless reset
+    ; (RFC 9000 10.3) so the peer tears down at once instead of idling out. Skip short
+    ; packets (< 22B): the reset must be shorter than its trigger (no loop) yet >= 21.
+    cmp r13, 22
+    jb .done
+    call send_stateless_reset
+    jmp .done
 .demux_found:
     call .refresh_peer
 .long_in:
@@ -2349,6 +2372,43 @@ ku_try:
     pop r14
     pop r13
     pop rbx
+    ret
+
+; send_stateless_reset — a 1-RTT packet arrived for a connection id we hold no
+; state for (r13 = its length, >= 22). Emit a stateless reset (RFC 9000 10.3): a
+; short-header-shaped packet of random bytes ending in the 16-byte reset token for
+; that connection id, one byte shorter than the trigger (capped) so it can never
+; grow into a reset loop and never amplifies. r12d = UDP socket; sa/salen = source.
+send_stateless_reset:
+    mov rax, r13
+    dec rax                          ; shorter than the trigger (loop/amp safety)
+    cmp rax, LINNEA_QUIC_SRST_MAX
+    jbe .ssr_len
+    mov eax, LINNEA_QUIC_SRST_MAX
+.ssr_len:
+    mov [srst_len], rax
+    mov r10, rax                     ; getrandom clobbers rax
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [srst_buf]
+    mov rsi, r10
+    xor edx, edx
+    syscall                          ; random-fill the whole packet
+    mov cl, [srst_buf]               ; first byte -> short-header form: fixed bit set,
+    and cl, 0x3f                     ; long-header bit clear, rest random
+    or cl, 0x40
+    mov [srst_buf], cl
+    lea rdi, [linnea_quic_rxbuf + 1] ; the (unknown) connection id it was sent to
+    mov rax, [srst_len]
+    lea rsi, [srst_buf + rax - 16]   ; token occupies the last 16 bytes
+    call linnea_quic_reset_token
+    mov eax, LINNEA_SYS_SENDTO
+    mov edi, r12d
+    lea rsi, [srst_buf]
+    mov rdx, [srst_len]
+    xor r10d, r10d
+    lea r8, [sa]
+    mov r9, [salen]
+    syscall
     ret
 
 ; tx_emit_chunk(rdi=stream ctx ptr, rsi=stream offset, rdx=length)
