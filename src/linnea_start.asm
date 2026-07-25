@@ -48,6 +48,7 @@ extern linnea_log_write
 extern linnea_log_u64
 extern linnea_network_listen_all
 extern linnea_connections_init
+extern linnea_h2p_init
 extern linnea_uring_run
 extern linnea_error_usage
 extern linnea_error_exit
@@ -321,6 +322,8 @@ spawn_worker:
     mov [linnea_worker_index], rbx        ; this worker's index, stamped into CIDs
     mov rdi, [linnea_config_instance + linnea_config.max_connections]
     call linnea_connections_init
+    mov rdi, [linnea_config_instance + linnea_config.max_connections]
+    call linnea_h2p_init                  ; proxy-over-h2 upstream slots
     lea rdi, [linnea_config_instance]
     call linnea_uring_run      ; never returns
 .orphan:

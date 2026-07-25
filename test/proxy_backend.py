@@ -11,6 +11,7 @@ import base64
 import hashlib
 import socket
 import sys
+import threading
 import time
 
 HOST, PORT = "127.0.0.1", 47100
@@ -194,18 +195,28 @@ def main():
     srv.listen(16)
     while True:
         conn, _ = srv.accept()
+        # One thread per connection: a long exchange (a websocket tunnel, or
+        # the deliberately slow route) must not stop the backend answering
+        # anything else. HTTP/2 clients open several upstream connections at
+        # once, so a serial backend would make their timing depend on
+        # unrelated traffic.
+        threading.Thread(target=serve_one, args=(conn,), daemon=True).start()
+
+
+def serve_one(conn):
+    try:
+        head, body, extra = read_request(conn)
+        if head:
+            respond(conn, head, body, extra)
+    except (BrokenPipeError, ConnectionResetError, ValueError, IndexError,
+            OSError):
+        pass
+    finally:
         try:
-            head, body, extra = read_request(conn)
-            if head:
-                respond(conn, head, body, extra)
-        except (BrokenPipeError, ConnectionResetError, ValueError, IndexError):
+            conn.shutdown(socket.SHUT_WR)
+        except OSError:
             pass
-        finally:
-            try:
-                conn.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-            conn.close()
+        conn.close()
 
 
 if __name__ == "__main__":

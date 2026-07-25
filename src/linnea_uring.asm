@@ -36,6 +36,7 @@ default rel
 %include "linnea_config.inc"
 %include "linnea_connection.inc"
 %include "linnea_http.inc"
+%include "linnea_http2.inc"
 %include "linnea_uring.inc"
 %include "linnea_quic.inc"
 %include "linnea_quic_conn.inc"
@@ -74,6 +75,11 @@ extern linnea_h2_init
 extern linnea_h2_handle
 extern linnea_h2_after_send
 extern linnea_h2_conn_free
+extern linnea_h2p_at
+extern linnea_h2p_event
+extern linnea_h2p_service
+extern linnea_h2p_conn_close
+extern h2p_compact
 extern linnea_string_iequal
 extern linnea_network_quic_listener
 extern linnea_quic_server_init
@@ -186,6 +192,7 @@ quic_fd:    resd 1
             resd 1
 qrecv_msg:  resb LINNEA_MSGHDR_SIZE
 qrecv_iov:  resb LINNEA_IOVEC_SIZE
+cqe_tag:       resd 1      ; the completing op's tag, kept past the shift
 qrecv_peer: resb LINNEA_SOCKADDR_IN6_SIZE
 sig_buf:            resb 128   ; struct signalfd_siginfo
 
@@ -272,9 +279,22 @@ linnea_uring_run:
     je .quic_next
     cmp qword [rdx + linnea_config_server.location_count], 0
     je .quic_next
+    ; the owner must be a PURE static vhost, like every h3 vhost (see the
+    ; registration loop below) — otherwise a mixed config could bind a QUIC
+    ; listener that no vhost ever registers on
     lea rcx, [rdx + linnea_config_server.locations]
+    mov rax, [rdx + linnea_config_server.location_count]
+    xor r9d, r9d
+.quic_owner_kinds:
+    cmp r9, rax
+    jae .quic_owner_ok
     cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
-    jne .quic_next             ; only a static root is served over h3 so far
+    jne .quic_next             ; proxy/redirect location: not an h3 owner
+    add rcx, linnea_config_location_size
+    inc r9
+    jmp .quic_owner_kinds
+.quic_owner_ok:
+    lea rcx, [rdx + linnea_config_server.locations]
     push rdx
     push rcx
     mov rdi, rdx
@@ -305,9 +325,23 @@ linnea_uring_run:
     je .quic_vhost_next
     cmp word [rax + linnea_config_server.port], r13w
     jne .quic_vhost_next                                ; a vhost on another port
+    ; Only a PURE static vhost is served over h3: h3 has no location routing,
+    ; so a proxy or redirect location would resolve under the static root and
+    ; 404 — and Alt-Svc migration is per-origin, so a browser that switched
+    ; would break those paths with no fallback. Such a vhost keeps h1/h2.
     lea rcx, [rax + linnea_config_server.locations]
+    mov r8, [rax + linnea_config_server.location_count]
+    xor r9d, r9d
+.quic_vhost_kinds:
+    cmp r9, r8
+    jae .quic_vhost_static                              ; every location is a root
     cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
-    jne .quic_vhost_next                                ; only a static root over h3
+    jne .quic_vhost_next                                ; proxy/redirect: no h3
+    add rcx, linnea_config_location_size
+    inc r9
+    jmp .quic_vhost_kinds
+.quic_vhost_static:
+    lea rcx, [rax + linnea_config_server.locations]     ; the first (root) location
     mov rdi, rax
     mov rsi, rcx
     call linnea_quic_add_vhost
@@ -386,6 +420,7 @@ linnea_uring_run:
 
     mov eax, r13d
     and eax, 0xff              ; op tag
+    mov [cqe_tag], eax
     shr r13, 8                 ; index
     cmp eax, LINNEA_UD_TIMEOUT
     je .wait                   ; timeout cqes carry no work
@@ -407,7 +442,55 @@ linnea_uring_run:
     je .on_qrecv
     cmp eax, LINNEA_UD_QTIMER
     je .on_qtimer
+    cmp eax, LINNEA_UD_H2UP_CONNECT
+    je .on_h2up
+    cmp eax, LINNEA_UD_H2UP_SEND
+    je .on_h2up
+    cmp eax, LINNEA_UD_H2UP_RECV
+    je .on_h2up
     jmp .on_accept             ; tag 0: no longer the textual fall-through
+
+; --- proxy-over-h2 upstream completion --------------------------------
+; The index carries (connection index << 3) | slot. The handler advances the
+; exchange and reports whether client-bound frames are now queued; then any
+; slot still wanting an upstream op is armed. A connection whose slot went
+; ZOMBIE may already be freed and reused — h2p_event handles that case by
+; freeing the slot and reporting nothing to send.
+.on_h2up:
+    mov r14, r13
+    and r14, 7                 ; slot index
+    shr r13, 3                 ; connection index
+    mov rdi, r13
+    call linnea_connection_at
+    mov r12, rax
+    mov rdi, r12
+    mov rsi, r14
+    mov edx, [cqe_tag]         ; which upstream op completed
+    mov ecx, r15d
+    call linnea_h2p_event      ; -> 1 = frames queued, 0 = nothing, -1 = stale
+    cmp eax, -1
+    je .wait                   ; the connection is gone (or now another's)
+    test eax, eax
+    jnz .h2up_send
+    ; no head/error to emit, but body bytes may have arrived: run the shared
+    ; idle decision, which schedules the next DATA frame for any stream
+    cmp qword [r12 + linnea_connection.h2_tx_busy], 0
+    jne .h2up_arm              ; a send owns out_buf; it resumes on drain
+    mov rdi, r12
+    call linnea_h2_after_send
+    cmp eax, LINNEA_H2_SEND
+    je .h2up_send
+    mov rdi, r12               ; nothing to send: make sure a recv is armed
+    call h2_arm_recv_once
+    jmp .h2up_arm
+.h2up_send:
+    mov rdi, r12
+    call linnea_uring_arm_send
+.h2up_arm:
+    mov rdi, r12
+    call linnea_uring_arm_h2p_ops
+    call linnea_uring_submit_now
+    jmp .wait
 
 ; --- QUIC datagram on the UDP listener: r15d = bytes or -errno ---------
 ; The handler owns the receive buffer and replies on the socket itself, so the
@@ -528,28 +611,12 @@ linnea_uring_run:
     lea rax, [linnea_uring_sni_select]
     mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_cb], rax
     mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_ctx], r12
-    ; Offer h2 in ALPN only when enabled AND the accepting server has no
-    ; proxy location — proxy-over-h2 is not implemented yet, so a proxy vhost
-    ; must keep speaking HTTP/1.1.
+    ; Offer h2 in ALPN whenever it is enabled: since Q86 a proxy location is
+    ; served over h2 too (each stream runs its own HTTP/1.1 upstream
+    ; exchange), so a proxy vhost no longer has to stay on HTTP/1.1. A
+    ; WebSocket upgrade still arrives on its own h1 connection, because we do
+    ; not advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441).
     mov eax, [rbx + linnea_config.http2]
-    test eax, eax
-    jz .set_alpn
-    mov ecx, [r12 + linnea_connection.server]
-    imul rcx, rcx, linnea_config_server_size
-    lea rdx, [rbx + rcx + linnea_config.servers]
-    mov r8, [rdx + linnea_config_server.location_count]
-    lea r9, [rdx + linnea_config_server.locations]
-    xor ecx, ecx
-.h2_loc_scan:
-    cmp rcx, r8
-    jae .set_alpn                          ; no proxy: eax stays 1
-    cmp qword [r9 + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
-    je .h2_off
-    add r9, linnea_config_location_size
-    inc rcx
-    jmp .h2_loc_scan
-.h2_off:
-    xor eax, eax
 .set_alpn:
     mov [r12 + linnea_connection.up_buf + linnea_tls_hs.alpn_h2_ok], eax
     mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
@@ -609,6 +676,7 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax               ; connection*
+    mov qword [r12 + linnea_connection.h2_rx_busy], 0
     cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
     je .tls_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
@@ -652,8 +720,23 @@ linnea_uring_run:
     jmp .wait
 ; --- HTTP/2: process buffered frames, then send / read / close --------
 .h2_process:
+    ; Since proxying, an upstream completion can arm client ops too, so both
+    ; directions may be busy at once. Frame processing owns both buffers — it
+    ; builds from out_buf's base, and consuming frames compacts in_buf — so it
+    ; must not run while either is in flight: a recv would be writing into
+    ; in_buf as we move its tail down, and a send would be reading out_buf as
+    ; we overwrite it. Whichever op is outstanding comes back here when it
+    ; completes (.on_recv, or .send_drained while in_len is nonzero).
+    cmp qword [r12 + linnea_connection.h2_tx_busy], 0
+    jne .wait
+    cmp qword [r12 + linnea_connection.h2_rx_busy], 0
+    jne .wait
     mov rdi, r12
     call linnea_h2_handle
+    push rax
+    mov rdi, r12               ; a proxied stream may now want an upstream op
+    call linnea_uring_arm_h2p_ops
+    pop rax
     cmp eax, LINNEA_H2_CLOSE
     je .h2_close
     test eax, eax              ; LINNEA_H2_MORE
@@ -673,7 +756,7 @@ linnea_uring_run:
     jmp .wait
 .recv_more:
     mov rdi, r12
-    call linnea_uring_arm_recv
+    call h2_arm_recv_once
     call linnea_uring_submit_now
     jmp .wait
 
@@ -728,6 +811,9 @@ linnea_uring_run:
     ; after our SETTINGS).
     cmp qword [r12 + linnea_connection.is_h2], 0
     je .not_h2_send
+    mov qword [r12 + linnea_connection.h2_tx_busy], 0   ; out_buf is free again
+    mov rdi, r12               ; buffer space freed may unblock an upstream read
+    call linnea_uring_arm_h2p_ops
     mov rdi, r12
     call linnea_h2_after_send
     cmp eax, LINNEA_H2_SEND
@@ -737,7 +823,7 @@ linnea_uring_run:
     cmp qword [r12 + linnea_connection.in_len], 0
     jne .h2_process
     mov rdi, r12
-    call linnea_uring_arm_recv
+    call h2_arm_recv_once
     call linnea_uring_submit_now
     jmp .wait
 .h2_send_more:
@@ -1445,6 +1531,8 @@ linnea_uring_run:
     je .close_file
     mov rdi, r12
     call linnea_h2_conn_free
+    mov rdi, r12               ; and any upstream proxy exchange it owned
+    call linnea_h2p_conn_close
 .close_file:
     mov rdi, [r12 + linnea_connection.file_base]
     test rdi, rdi
@@ -1464,6 +1552,9 @@ linnea_uring_run:
     mov edi, [r12 + linnea_connection.fd]
     mov eax, LINNEA_SYS_CLOSE
     syscall
+    ; a late completion (a proxy upstream op armed before this close) must
+    ; not arm anything on the socket we just closed
+    mov dword [r12 + linnea_connection.fd], -1
     mov rdi, r12
     call linnea_connection_free
     cmp dword [drain_flag], 0
@@ -1742,6 +1833,132 @@ linnea_uring_arm_up_recv:
     pop r12
     pop rbx
     jmp linnea_uring_arm_link_timeout
+
+; h2_arm_recv_once(rdi = connection*) — arm a client recv unless one is
+; already in flight. An HTTP/2 connection can be driven from either side (a
+; client frame or an upstream completion), so without this the two paths
+; could arm two recvs on the same socket, whose linked timeouts would then
+; tear the connection down under a working exchange.
+h2_arm_recv_once:
+    cmp qword [rdi + linnea_connection.is_h2], 0
+    je .aro_arm
+    cmp qword [rdi + linnea_connection.h2_rx_busy], 0
+    jne .aro_skip
+    mov qword [rdi + linnea_connection.h2_rx_busy], 1
+.aro_arm:
+    jmp linnea_uring_arm_recv
+.aro_skip:
+    ret
+
+; linnea_uring_arm_h2p_ops(rdi = connection*) — arm the upstream op each
+; proxy slot is waiting for (connect / send / recv), at most one per slot.
+; The slot's WANT flag is consumed as the op is queued and F_INFLIGHT marks
+; that the kernel owns its buffer, which is what makes a late completion on a
+; dead connection safe (the slot goes ZOMBIE rather than being reused).
+linnea_uring_arm_h2p_ops:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    mov r13, [rdi + linnea_connection.index]
+    xor r14d, r14d                    ; slot index
+.ao_loop:
+    mov rdi, r13
+    mov rsi, r14
+    call linnea_h2p_at
+    mov r12, rax
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
+    jnz .ao_next                      ; already has an op out
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_WANT_CONN
+    jnz .ao_connect
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
+    jnz .ao_send
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
+    jnz .ao_recv
+.ao_next:
+    inc r14
+    cmp r14d, LINNEA_H2P_SLOTS
+    jb .ao_loop
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.ao_connect:
+    and qword [r12 + linnea_h2p.flags], ~LINNEA_H2P_F_WANT_CONN
+    or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_CONNECT
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
+    mov ecx, [r12 + linnea_h2p.fd]
+    mov [rax + LINNEA_SQE_FD], ecx
+    mov rcx, [r12 + linnea_h2p.location]
+    lea rcx, [rcx + linnea_config_location.proxy_addr]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov qword [rax + LINNEA_SQE_OFF], LINNEA_SOCKADDR_IN_SIZE
+    mov edx, LINNEA_UD_H2UP_CONNECT
+    jmp .ao_finish
+
+.ao_send:
+    and qword [r12 + linnea_h2p.flags], ~LINNEA_H2P_F_WANT_SEND
+    or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_SEND
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
+    mov ecx, [r12 + linnea_h2p.fd]
+    mov [rax + LINNEA_SQE_FD], ecx
+    lea rcx, [r12 + linnea_h2p.buf]
+    add rcx, [r12 + linnea_h2p.sent]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov rcx, [r12 + linnea_h2p.req_len]
+    sub rcx, [r12 + linnea_h2p.sent]
+    mov [rax + LINNEA_SQE_LEN], ecx
+    mov edx, LINNEA_UD_H2UP_SEND
+    jmp .ao_finish
+
+.ao_recv:
+    ; recycle what the client has already taken, so a body larger than the
+    ; buffer keeps streaming — but not while a send is reading those bytes
+    cmp qword [rbx + linnea_connection.h2_tx_busy], 0
+    jne .ao_room
+    mov rdi, r12
+    call h2p_compact
+.ao_room:
+    ; still no room: wait for the client to take what is queued (every send
+    ; drain runs this again)
+    mov rcx, LINNEA_H2P_BUF
+    sub rcx, [r12 + linnea_h2p.len]
+    cmp rcx, 512
+    jb .ao_next
+    and qword [r12 + linnea_h2p.flags], ~LINNEA_H2P_F_WANT_RECV
+    or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
+    push rcx
+    call linnea_uring_get_sqe_zeroed
+    pop rcx
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECV
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
+    mov edx, [r12 + linnea_h2p.fd]
+    mov [rax + LINNEA_SQE_FD], edx
+    lea rdx, [r12 + linnea_h2p.buf]
+    add rdx, [r12 + linnea_h2p.len]
+    mov [rax + LINNEA_SQE_ADDR], rdx
+    mov [rax + LINNEA_SQE_LEN], ecx
+    mov edx, LINNEA_UD_H2UP_RECV
+
+.ao_finish:
+    ; user_data = ((conn index << 3 | slot) << 8) | tag
+    mov rcx, r13
+    shl rcx, 3
+    or rcx, r14
+    shl rcx, 8
+    or rcx, rdx
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    mov rdi, rbx                      ; the linked timeout must follow it
+    call linnea_uring_arm_link_timeout
+    jmp .ao_next
+
 
 ; linnea_uring_arm_qrecv() — queue a recvmsg on the QUIC listener. UDP needs
 ; the sender's address to reply, which plain recv does not report, so the

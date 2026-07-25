@@ -69,10 +69,11 @@ struc linnea_h2_stream
     .body_ptr:  resq 1   ; next unframed body byte
     .body_rem:  resq 1   ; body bytes not yet framed
     .flags:     resq 1   ; bit 0 = set END_STREAM on the final DATA frame
-    .rsv:       resq 1
+    .up:        resq 1   ; proxied stream: upstream slot index + 1 (0 = static)
 endstruc
 
-LINNEA_H2_STREAM_END  equ 1         ; .flags bit 0
+LINNEA_H2_STREAM_END    equ 1       ; .flags bit 0
+LINNEA_H2_STREAM_UPDONE equ 4       ; proxied: END_STREAM emitted, reap the slot
 
 ; up_buf overlay: [stream pool][header assembly][Huffman scratch]
 LINNEA_H2_POOL_OFF     equ 0
@@ -96,3 +97,70 @@ LINNEA_H2_MAX_CONT     equ 16     ; CONTINUATION frames per HEADERS (flood guard
 ; h2_build_request outcomes (negative sentinels vs a byte count)
 LINNEA_H2_REQ_MORE   equ -1      ; header block not fully buffered yet
 LINNEA_H2_REQ_ERR    equ -2      ; malformed: connection error, GOAWAY
+
+; --- proxy-over-h2 (Q86) --------------------------------------------------
+; A stream routed to a proxy location runs an h1 exchange with the upstream
+; (fresh connection, Connection: close) through a bounded per-connection pool
+; of upstream slots. Each slot owns a buffer that holds the rewritten request
+; (head + a bounded body) and is then reused for the upstream response. The
+; slots live in one global mmap indexed by connection pool index, so a slot
+; is addressable from an io_uring completion that carries only indices.
+; Concurrent upstream exchanges per connection. Sized for real browser
+; parallelism (six in-flight API calls is common) so a page's requests are
+; not refused and retried; also the most the 3-bit slot field in an op's
+; user_data can address. The buffers are mmap'd lazily, so an idle
+; connection's slots cost address space, not memory.
+LINNEA_H2P_SLOTS      equ 8
+LINNEA_H2P_BUF        equ 16384   ; slot buffer
+LINNEA_H2P_HEAD_MAX   equ 8192    ; rewritten request head cap (buf[0..) )
+LINNEA_H2P_BODY_OFF   equ 8192    ; request body collects at buf[BODY_OFF..)
+LINNEA_H2P_BODY_MAX   equ 8192    ; request body cap (h1's in_buf caps ~8K too)
+LINNEA_H2P_RHEAD_MAX  equ 6144    ; upstream response head cap (502 beyond)
+
+; slot states
+LINNEA_H2P_FREE       equ 0
+LINNEA_H2P_COLLECT    equ 1       ; buffering the request body (awaiting END_STREAM)
+LINNEA_H2P_CONNECTING equ 2       ; connect() to the upstream in flight / wanted
+LINNEA_H2P_SENDING    equ 3       ; sending the rewritten request
+LINNEA_H2P_HEAD       equ 4       ; reading the upstream response head
+LINNEA_H2P_RELAY      equ 5       ; head parsed; body decoding and streaming
+LINNEA_H2P_FAILED     equ 6       ; answer .status (502/504) or RST, then free
+LINNEA_H2P_ZOMBIE     equ 7       ; conn/stream died with an op in flight; the
+                                  ; completion frees the slot
+
+; slot flags
+LINNEA_H2P_F_HEAD_SENT equ 1      ; response HEADERS frame emitted
+LINNEA_H2P_F_EOF       equ 2      ; upstream closed (or exchange complete)
+LINNEA_H2P_F_IS_HEAD   equ 4      ; the client request was HEAD
+LINNEA_H2P_F_HEAD_RDY  equ 8      ; head parsed, HEADERS frame not yet emitted
+LINNEA_H2P_F_WANT_CONN equ 16     ; the loop should arm: connect
+LINNEA_H2P_F_WANT_SEND equ 32     ; ... send of the unsent request bytes
+LINNEA_H2P_F_WANT_RECV equ 64     ; ... recv into the response buffer
+LINNEA_H2P_F_INFLIGHT  equ 128    ; an upstream op is in flight
+LINNEA_H2P_F_BODY_DONE equ 256    ; response body fully received/decoded
+LINNEA_H2P_F_NO_BODY   equ 512    ; bodiless response (HEAD/204/304)
+LINNEA_H2P_F_RST       equ 1024   ; failure after HEAD_SENT: emit RST_STREAM
+LINNEA_H2P_F_REAP      equ 2048   ; fully framed: free once no send is reading
+                                  ; the slot buffer (the last DATA frame sends
+                                  ; straight out of it)
+
+struc linnea_h2p
+    .state:     resq 1
+    .fd:        resd 1            ; upstream socket, -1 = none
+    .fdpad:     resd 1
+    .sid:       resq 1            ; the client stream id
+    .gen:       resq 1            ; the connection incarnation this belongs to
+    .location:  resq 1            ; matched location* (connect addr, log)
+    .req_len:   resq 1            ; rewritten request bytes (head, then body)
+    .sent:      resq 1            ; upstream send progress
+    .len:       resq 1            ; response bytes received into buf
+    .rd:        resq 1            ; decode cursor (raw bytes consumed)
+    .wr:        resq 1            ; decoded-body write cursor (wr <= rd)
+    .off:       resq 1            ; decoded-body bytes already framed to the client
+    .body_rem:  resq 1            ; body bytes still expected; -1 = until close
+    .chunked:   resq 1            ; de-chunk phase: 0 = not chunked (see h2p_decode)
+    .chunk_rem: resq 1            ; data bytes left in the current chunk
+    .status:    resq 1            ; upstream status (or our 502/504)
+    .flags:     resq 1            ; LINNEA_H2P_F_*
+    .buf:       resb LINNEA_H2P_BUF
+endstruc

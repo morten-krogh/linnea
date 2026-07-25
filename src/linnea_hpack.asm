@@ -24,6 +24,7 @@ global hpack_int
 global hpack_str
 global hpack_huffman
 global emit_field
+global hpack_dyn_reset
 
 section .rodata
 pseudo_method:  db ":method"
@@ -37,6 +38,17 @@ hdr_ims:        db "if-modified-since"
 hdr_range:      db "range"
 hdr_ifr:        db "if-range"
 hdr_ae:         db "accept-encoding"
+; names stripped from the proxy header rebuild (hop-by-hop / managed)
+hdr_te:         db "te"
+hdr_conn:       db "connection"
+hdr_ka:         db "keep-alive"
+hdr_cl2:        db "content-length"
+hdr_pconn:      db "proxy-connection"
+hdr_tenc:       db "transfer-encoding"
+hdr_upg:        db "upgrade"
+
+section .bss
+lit_form:      resq 1
 
 section .text
 
@@ -74,7 +86,7 @@ linnea_hpack_decode:
     test rax, rax
     jz .err                         ; index 0 is illegal
     cmp rax, HPACK_STATIC_COUNT
-    ja .err_index                   ; dynamic table is empty
+    ja .indexed_dyn                 ; past the static table: the peer's own
     lea rdx, [rax - 1]
     shl rdx, 4                      ; * HPACK_STATIC_ENTRY_SIZE (16)
     lea rsi, [hpack_static_tab]
@@ -92,6 +104,19 @@ linnea_hpack_decode:
     jc .err_limit
     jmp .next
 
+; An index past the static table names an entry the peer inserted earlier on
+; this connection (RFC 7541 2.3.3): 62 selects the newest.
+.indexed_dyn:
+    mov rdi, [rbx + linnea_h2_req.dyn]
+    test rdi, rdi
+    jz .err_index                   ; no table (HTTP/3): undecodable
+    lea rsi, [rax - HPACK_STATIC_COUNT - 1]     ; 0 = newest
+    call hpack_dyn_get              ; -> rax = name, rdx = nlen, rsi = value,
+    jc .err_index                   ;    rdi = vlen; CF = out of range
+    call emit_field
+    jc .err_limit
+    jmp .next
+
 ; --- 6.2.x Literal Header Field ------------------------------------------
 .lit_inc:
     mov ecx, 6                      ; incremental indexing: 6-bit prefix
@@ -99,6 +124,10 @@ linnea_hpack_decode:
 .lit_noindex:
     mov ecx, 4                      ; without / never indexed: 4-bit prefix
 .literal:
+    mov [lit_form], ecx             ; the form, for the store decision below
+                                    ; (a file-scope slot, not the red zone:
+                                    ; hpack_int/hpack_str/emit_field all push,
+                                    ; and one decode runs at a time)
     mov rsi, r12
     mov rdi, r13
     call hpack_int                  ; rax = name index (0 => literal name)
@@ -117,7 +146,7 @@ linnea_hpack_decode:
     jmp .lit_value
 .lit_name_indexed:
     cmp rax, HPACK_STATIC_COUNT
-    ja .err_index
+    ja .lit_name_dyn
     lea rdx, [rax - 1]
     shl rdx, 4
     lea rsi, [hpack_static_tab]
@@ -127,6 +156,16 @@ linnea_hpack_decode:
     lea r14, [hpack_static_blob]
     add r14, r8                     ; name ptr
     mov r15, r9                     ; name len
+    jmp .lit_value
+.lit_name_dyn:
+    mov rdi, [rbx + linnea_h2_req.dyn]
+    test rdi, rdi
+    jz .err_index
+    lea rsi, [rax - HPACK_STATIC_COUNT - 1]
+    call hpack_dyn_get              ; -> rax = name ptr, rdx = name len
+    jc .err_index
+    mov r14, rax
+    mov r15, rdx
 .lit_value:
     mov rsi, r12
     mov rdi, r13
@@ -138,6 +177,25 @@ linnea_hpack_decode:
     mov rdi, rdx                    ; value len
     mov rax, r14                    ; name ptr
     mov rdx, r15                    ; name len
+    mov ecx, [lit_form]             ; the representation's prefix width
+    cmp ecx, 6                      ; a 6-bit prefix marks incremental
+    jne .lit_emit                   ; indexing: the peer stored this field,
+    push rax                        ; so we must too or its later indices
+    push rdx                        ; would resolve to the wrong entry
+    push rsi
+    push rdi
+    mov r8, [rbx + linnea_h2_req.dyn]
+    test r8, r8
+    jz .lit_stored
+    push rcx
+    call hpack_dyn_insert
+    pop rcx
+.lit_stored:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+.lit_emit:
     call emit_field
     jc .err_limit
     jmp .next
@@ -150,8 +208,17 @@ linnea_hpack_decode:
     call hpack_int                  ; rax = new max size
     jc .err
     mov r12, rsi
+    cmp rax, LINNEA_HPACK_DYN_CAP
+    ja .err                         ; larger than the protocol default
+    mov rdi, [rbx + linnea_h2_req.dyn]
+    test rdi, rdi
+    jz .tsize_none
+    mov [rdi + linnea_hpack_dyn.max], rax
+    call hpack_dyn_evict            ; shrink to the new limit
+    jmp .next
+.tsize_none:
     test rax, rax
-    jnz .err                        ; our advertised max is 0
+    jnz .err                        ; no table here: only "0" is meaningful
     jmp .next
 
 .ok:
@@ -191,6 +258,95 @@ emit_field:
     cmp r8, LINNEA_HPACK_MAX_LISTSIZE
     ja .ef_limit
     mov [rbx + linnea_h2_req.listsize], r8
+    ; --- proxy rebuild: append the field as an h1 "name: value" line -----
+    cmp qword [rbx + linnea_h2_req.hb_start], 0
+    je .no_rebuild
+    cmp byte [rax], ':'
+    je .no_rebuild                   ; pseudo-headers do not forward
+    ; hop-by-hop / managed names are stripped (see linnea_hpack.inc)
+    cmp rdx, 2
+    je .rb_chk_te
+    cmp rdx, 4
+    je .rb_chk_host
+    cmp rdx, 7
+    je .rb_chk_upg
+    cmp rdx, 10
+    je .rb_chk_10
+    cmp rdx, 14
+    je .rb_chk_cl
+    cmp rdx, 16
+    je .rb_chk_pconn
+    cmp rdx, 17
+    je .rb_chk_tenc
+    jmp .rebuild
+.rb_chk_te:
+    lea r9, [hdr_te]
+    jmp .rb_probe
+.rb_chk_host:
+    lea r9, [hdr_host]
+    jmp .rb_probe
+.rb_chk_upg:
+    lea r9, [hdr_upg]
+    jmp .rb_probe
+.rb_chk_cl:
+    lea r9, [hdr_cl2]
+    jmp .rb_probe
+.rb_chk_pconn:
+    lea r9, [hdr_pconn]
+    jmp .rb_probe
+.rb_chk_tenc:
+    lea r9, [hdr_tenc]
+    jmp .rb_probe
+.rb_chk_10:
+    push rsi
+    push rdi
+    lea r9, [hdr_conn]
+    call name_eq
+    pop rdi
+    pop rsi
+    je .no_rebuild
+    lea r9, [hdr_ka]
+.rb_probe:
+    push rsi
+    push rdi
+    call name_eq
+    pop rdi
+    pop rsi
+    je .no_rebuild                   ; a stripped name: capture only
+.rebuild:
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    mov r10, [rbx + linnea_h2_req.hb_cur]
+    lea r8, [r10 + rdx]
+    add r8, rdi
+    add r8, 4                        ; ": " + CRLF
+    cmp r8, [rbx + linnea_h2_req.hb_end]
+    ja .rb_over
+    mov rcx, rdx
+    mov rdi, r10
+    mov rsi, rax
+    rep movsb                        ; the name (already lowercase in h2)
+    mov word [rdi], ': '
+    add rdi, 2
+    mov rsi, [rsp + 8]               ; value ptr
+    mov rcx, [rsp]                   ; value len
+    rep movsb
+    mov word [rdi], 0x0a0d           ; CRLF
+    add rdi, 2
+    mov [rbx + linnea_h2_req.hb_cur], rdi
+    jmp .rb_done
+.rb_over:
+    mov r10, [rbx + linnea_h2_req.hb_end]
+    inc r10                          ; overflow sentinel: cur past end
+    mov [rbx + linnea_h2_req.hb_cur], r10
+.rb_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+.no_rebuild:
     ; :method (len 7)
     cmp rdx, 7
     jne .not_method
@@ -359,6 +515,165 @@ name_eq:
     mov rsi, rax
     mov rdi, r9
     repe cmpsb
+    ret
+
+; --- decoder dynamic table (RFC 7541 2.3.2, 4.1, 4.4) --------------------
+; Entries are copied into the connection's arena so they outlive the header
+; block they arrived in. The index arrays are a ring: .head is the newest, and
+; index i counts back from it. Eviction drops the oldest until the new entry
+; fits; an entry larger than the whole table empties it and is not stored,
+; which RFC 7541 4.4 explicitly allows.
+
+; hpack_dyn_reset(rdi = table*) — start empty, at the protocol default size.
+hpack_dyn_reset:
+    mov qword [rdi + linnea_hpack_dyn.count], 0
+    mov qword [rdi + linnea_hpack_dyn.head], 0
+    mov qword [rdi + linnea_hpack_dyn.size], 0
+    mov qword [rdi + linnea_hpack_dyn.used], 0
+    mov qword [rdi + linnea_hpack_dyn.max], LINNEA_HPACK_DYN_CAP
+    ret
+
+; hpack_dyn_get(rdi = table*, rsi = i, 0 = newest)
+;   -> rax = name ptr, rdx = name len, rsi = value ptr, rdi = value len.
+; CF set when i is past the live entries. Caller-saved only.
+hpack_dyn_get:
+    cmp rsi, [rdi + linnea_hpack_dyn.count]
+    jae .dg_bad
+    mov rax, [rdi + linnea_hpack_dyn.head]
+    sub rax, rsi
+    jns .dg_slot
+    add rax, LINNEA_HPACK_DYN_MAX               ; wrapped
+.dg_slot:
+    mov r8, [rdi + linnea_hpack_dyn.off + rax * 8]
+    mov rdx, [rdi + linnea_hpack_dyn.nlen + rax * 8]
+    mov r9, [rdi + linnea_hpack_dyn.vlen + rax * 8]
+    lea rax, [rdi + linnea_hpack_dyn.arena]
+    add rax, r8                                 ; name ptr
+    lea rsi, [rax + rdx]                        ; value follows the name
+    mov rdi, r9
+    clc
+    ret
+.dg_bad:
+    stc
+    ret
+
+; hpack_dyn_evict(rdi = table*) — drop oldest entries until the live size is
+; within .max. Caller-saved only.
+hpack_dyn_evict:
+.de_loop:
+    mov rax, [rdi + linnea_hpack_dyn.size]
+    cmp rax, [rdi + linnea_hpack_dyn.max]
+    jbe .de_done
+    cmp qword [rdi + linnea_hpack_dyn.count], 0
+    je .de_done
+    ; the oldest is head - (count - 1)
+    mov rcx, [rdi + linnea_hpack_dyn.head]
+    sub rcx, [rdi + linnea_hpack_dyn.count]
+    inc rcx
+    jns .de_slot
+    add rcx, LINNEA_HPACK_DYN_MAX
+.de_slot:
+    mov rdx, [rdi + linnea_hpack_dyn.nlen + rcx * 8]
+    add rdx, [rdi + linnea_hpack_dyn.vlen + rcx * 8]
+    add rdx, 32                                 ; RFC 7541 4.1 entry size
+    sub [rdi + linnea_hpack_dyn.size], rdx
+    dec qword [rdi + linnea_hpack_dyn.count]
+    jmp .de_loop
+.de_done:
+    ; an empty table reclaims the whole arena
+    cmp qword [rdi + linnea_hpack_dyn.count], 0
+    jne .de_ret
+    mov qword [rdi + linnea_hpack_dyn.used], 0
+.de_ret:
+    ret
+
+; hpack_dyn_insert(r8 = table*, rax = name ptr, rdx = name len,
+;                  rsi = value ptr, rdi = value len)
+; Store a literal-with-incremental-indexing field. Best effort: an entry that
+; cannot fit the arena empties the table and is dropped, exactly as a table
+; smaller than the entry would (RFC 7541 4.4) — later indices then simply do
+; not resolve, which is a decode error rather than a wrong header.
+hpack_dyn_insert:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, r8                     ; table
+    mov r12, rax                    ; name ptr
+    mov r13, rdx                    ; name len
+    mov r14, rsi                    ; value ptr
+    mov r15, rdi                    ; value len
+    ; make room for size + 32
+    lea rax, [r13 + r15]
+    add rax, 32
+    cmp rax, [rbx + linnea_hpack_dyn.max]
+    ja .di_clear                    ; larger than the table: it empties it
+    add [rbx + linnea_hpack_dyn.size], rax
+    mov rdi, rbx
+    call hpack_dyn_evict            ; bring the size back within max
+    cmp qword [rbx + linnea_hpack_dyn.count], LINNEA_HPACK_DYN_MAX
+    jae .di_drop                    ; entry slots exhausted
+    ; the arena is a bump allocator: compact by wrapping to the start when the
+    ; live entries have all been evicted, else refuse (rare: a long-lived
+    ; connection whose peer keeps inserting)
+    mov rax, [rbx + linnea_hpack_dyn.used]
+    lea rcx, [r13 + r15]
+    add rcx, rax
+    cmp rcx, LINNEA_HPACK_DYN_CAP
+    jbe .di_space
+    cmp qword [rbx + linnea_hpack_dyn.count], 0
+    jne .di_drop
+    xor eax, eax                    ; the table is empty: start over
+    mov [rbx + linnea_hpack_dyn.used], rax
+.di_space:
+    ; copy name ++ value into the arena
+    lea rdi, [rbx + linnea_hpack_dyn.arena]
+    add rdi, rax
+    push rax
+    mov rsi, r12
+    mov rcx, r13
+    rep movsb
+    mov rsi, r14
+    mov rcx, r15
+    rep movsb
+    pop rax
+    ; claim the newest slot
+    mov rcx, [rbx + linnea_hpack_dyn.head]
+    cmp qword [rbx + linnea_hpack_dyn.count], 0
+    je .di_first
+    inc rcx
+    cmp rcx, LINNEA_HPACK_DYN_MAX
+    jb .di_head
+    xor ecx, ecx
+    jmp .di_head
+.di_first:
+    xor ecx, ecx
+.di_head:
+    mov [rbx + linnea_hpack_dyn.head], rcx
+    mov [rbx + linnea_hpack_dyn.off + rcx * 8], rax
+    mov [rbx + linnea_hpack_dyn.nlen + rcx * 8], r13
+    mov [rbx + linnea_hpack_dyn.vlen + rcx * 8], r15
+    inc qword [rbx + linnea_hpack_dyn.count]
+    lea rax, [r13 + r15]
+    add [rbx + linnea_hpack_dyn.used], rax
+    jmp .di_ret
+.di_drop:
+    ; not stored: undo the size we charged, so the accounting stays honest
+    lea rax, [r13 + r15]
+    add rax, 32
+    sub [rbx + linnea_hpack_dyn.size], rax
+    jmp .di_ret
+.di_clear:
+    mov qword [rbx + linnea_hpack_dyn.count], 0
+    mov qword [rbx + linnea_hpack_dyn.size], 0
+    mov qword [rbx + linnea_hpack_dyn.used], 0
+.di_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; hpack_int(rsi=cur, rdi=end, ecx=N prefix bits) -> rax=value, rsi advanced.

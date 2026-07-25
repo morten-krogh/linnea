@@ -13,6 +13,32 @@
 ; pointers reference the input block, the rodata static blob, or scratch —
 ; all valid until the caller finishes building the response.
 
+; --- decoder dynamic table (RFC 7541 2.3.2) -------------------------------
+; We advertise SETTINGS_HEADER_TABLE_SIZE = 0, but that only binds the peer
+; once it has PROCESSED our SETTINGS. Until then it may index up to the
+; protocol default of 4096 bytes — and a client that opens several streams at
+; once (a page load, or parallel API calls) routinely does, referencing
+; entries it inserted on an earlier request of the same connection. Without a
+; table those references are undecodable, which cost a GOAWAY and every
+; in-flight request with it. So the decoder keeps one: entries are copied into
+; a per-connection arena, oldest evicted first, and an index of 62 + i selects
+; the i-th newest (RFC 7541 2.3.3).
+LINNEA_HPACK_DYN_CAP    equ 4096   ; arena bytes = the protocol default size
+LINNEA_HPACK_DYN_MAX    equ 128    ; entries (each costs >= 32 by RFC 7541 4.1)
+
+struc linnea_hpack_dyn
+    .count:   resq 1               ; live entries
+    .head:    resq 1               ; slot index of the newest entry
+    .size:    resq 1               ; RFC 7541 4.1 size of the live entries
+    .max:     resq 1               ; the peer's current table size limit
+    .used:    resq 1               ; arena bytes in use (append cursor)
+    .gen:     resq 1               ; connection incarnation this belongs to
+    .off:     resq LINNEA_HPACK_DYN_MAX     ; per entry: arena offset,
+    .nlen:    resq LINNEA_HPACK_DYN_MAX     ; name length,
+    .vlen:    resq LINNEA_HPACK_DYN_MAX     ; value length
+    .arena:   resb LINNEA_HPACK_DYN_CAP
+endstruc
+
 ; Bounds (HPACK-bomb / resource guards).
 LINNEA_HPACK_MAX_HEADERS   equ 128    ; total fields in one block
 LINNEA_HPACK_MAX_LISTSIZE  equ 8192   ; sum of (name+value+32) per RFC 7541 4.1
@@ -48,4 +74,17 @@ struc linnea_h2_req
     .ifr_len:     resq 1
     .ae_ptr:      resq 1        ; accept-encoding value, 0 if absent
     .ae_len:      resq 1
+    ; Header rebuild for proxying: when .hb_start is nonzero, emit_field
+    ; appends every forwardable field as an h1 "name: value\r\n" line at
+    ; .hb_cur (bounded by .hb_end; overflow parks .hb_cur past .hb_end).
+    ; Pseudo-headers and hop-by-hop/managed fields are skipped: connection,
+    ; keep-alive, transfer-encoding, upgrade, te, proxy-connection, host
+    ; (rewritten from :authority) and content-length (rewritten from the
+    ; actual collected body).
+    .hb_start:    resq 1
+    .hb_end:      resq 1
+    .hb_cur:      resq 1
+    .dyn:         resq 1        ; *linnea_hpack_dyn for this connection, or 0
+                                ; (QPACK passes 0: HTTP/3 has its own table
+                                ; encoding, and we advertise zero capacity)
 endstruc

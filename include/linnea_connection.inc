@@ -39,6 +39,13 @@ struc linnea_connection
     .fd:            resd 1         ; accepted socket
     .server:        resd 1         ; index of the server that accepted it
     .index:         resq 1         ; own pool index, kept for user_data and free
+    .gen:           resq 1         ; bumped on every alloc. An io_uring
+                                   ; completion carries only indices, so a
+                                   ; late one (a proxy upstream op whose
+                                   ; connection has since closed) is detected
+                                   ; by comparing the generation it was armed
+                                   ; under — the slot may already belong to a
+                                   ; different client.
     .next_free:     resq 1         ; free-list link (pool index), -1 = end
     .in_len:        resq 1         ; bytes received so far
     .head_len:      resq 1         ; bytes consumed by the current request head
@@ -89,6 +96,15 @@ struc linnea_connection
     .h2_rst_count:   resq 1        ; RST_STREAMs seen (rapid-reset guard)
     .h2_done_count:  resq 1        ; streams whose body completed (reset budget)
     .h2_init_swnd:   resq 1        ; peer's SETTINGS_INITIAL_WINDOW_SIZE
+    .h2_tx_busy:     resq 1        ; a client send is in flight: out_buf is
+                                   ; owned by it, defer frame building
+    .h2_rx_busy:     resq 1        ; a client recv is in flight. Upstream
+                                   ; completions can reach the client side at
+                                   ; any time, so both directions are tracked
+                                   ; explicitly: an op is armed only when its
+                                   ; direction is idle, and every path that
+                                   ; could leave the connection with nothing
+                                   ; armed re-arms the recv
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

@@ -1460,7 +1460,7 @@ else
     CA=test/tls/server.crt
     U=https://localhost:47443
 
-    resp=$(curl -si --max-time 5 --cacert $CA $U/hello.txt)
+    resp=$(curl -si --http1.1 --max-time 5 --cacert $CA $U/hello.txt)
     check_http "tls static body"   "hello from linnea" "$resp"
     check_http "tls static status" "200 OK" "$resp"
 
@@ -1478,7 +1478,7 @@ else
     [ "$n" = "100000" ]
     check "tls large file intact ($n bytes)" $?
 
-    resp=$(curl -si --max-time 5 --cacert $CA $U/api/simple)
+    resp=$(curl -si --http1.1 --max-time 5 --cacert $CA $U/api/simple)
     check_http "tls proxy body"   "backend body" "$resp"
     check_http "tls proxy status" "200 OK" "$resp"
 
@@ -1501,6 +1501,13 @@ with socket.create_connection(("localhost", int(sys.argv[2])), timeout=5) as raw
         assert b"200 OK" in buf, buf
 PYEOF
     check "tls python ssl (TLSv1.3, AES-128-GCM)" $?
+
+    # a vhost with a proxy location must not advertise h3: Alt-Svc migration
+    # is per-origin, and h3 has no location routing — a browser that switched
+    # would 404 on every proxied path with no fallback
+    hdrs=$(curl -si --max-time 5 --cacert $CA $U/hello.txt)
+    ! echo "$hdrs" | grep -qi 'alt-svc'
+    check "h3 not advertised by a proxy vhost (no alt-svc)" $?
 
     # kTLS reports the peer's close_notify as -EIO rather than a 0-length
     # read, so an orderly shutdown must not be logged as a recv error.
@@ -1527,12 +1534,86 @@ PYEOF
     check "tls resumption over kTLS (Reused)" $?
     rm -f "$LOG.sess"
 
-    # ALPN: this server (47443) has a proxy location, and proxy-over-h2 is
-    # not implemented, so it must keep speaking http/1.1 even with h2 on by
-    # default. Offering nothing gets no ALPN extension back.
+    # ALPN: since Q86 a proxy location is served over h2 too, so this
+    # server (47443, which has proxy locations) offers h2 like any other.
+    # Offering nothing gets no ALPN extension back.
     echo | timeout 5 openssl s_client -connect 127.0.0.1:47443 -CAfile $CA \
-        -tls1_3 -alpn h2,http/1.1 2>/dev/null | grep -q "ALPN protocol: http/1.1"
-    check "alpn: proxy vhost stays http/1.1 (h2 gated off)" $?
+        -tls1_3 -alpn h2,http/1.1 2>/dev/null | grep -q "ALPN protocol: h2"
+    check "alpn: proxy vhost offers h2 (proxy-over-h2)" $?
+
+    # --- proxy over HTTP/2 (Q86): each stream runs its own HTTP/1.1 upstream
+    # exchange, so the backend still only ever speaks h1 (and WebSocket).
+    h2p() { timeout 10 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 "$@"; }
+    P=https://localhost:47443
+    [ "$(h2p "$P/api/simple")" = "backend body" ]
+    check "http2 proxy: counted body relayed" $?
+    v=$(h2p -o /dev/null -w '%{http_version}' "$P/api/simple")
+    [ "$v" = "2" ]
+    check "http2 proxy: served over h2 (not downgraded)" $?
+    [ "$(h2p -d 'hello body' "$P/api/echo")" = "hello body" ]
+    check "http2 proxy: POST request body forwarded" $?
+    [ "$(h2p "$P/api/target?q=1&x=2")" = "/api/target?q=1&x=2" ]
+    check "http2 proxy: raw target incl. query forwarded" $?
+    [ "$(h2p "$P/api/chunked")" = "chunked body" ]
+    check "http2 proxy: chunked upstream de-chunked" $?
+    [ "$(h2p "$P/api/eof")" = "eof delimited body" ]
+    check "http2 proxy: close-delimited body relayed" $?
+    n=$(h2p "$P/api/big" | wc -c)
+    [ "$n" -eq 40000 ]
+    check "http2 proxy: large body through flow control ($n bytes)" $?
+    # the rewritten upstream request: Host from :authority, client headers
+    # forwarded, Content-Length re-derived, Connection: close ours
+    head=$(h2p -H 'X-Probe: abc' "$P/api/headers")
+    echo "$head" | grep -qi '^Host: localhost:47443' \
+        && echo "$head" | grep -qi '^x-probe: abc' \
+        && echo "$head" | grep -qi '^Connection: close' \
+        && ! echo "$head" | grep -qi '^:'
+    check "http2 proxy: request rewritten for the h1 backend" $?
+    # response headers translated, hop-by-hop dropped
+    hdrs=$(h2p -D - -o /dev/null "$P/api/simple")
+    echo "$hdrs" | grep -qi '^HTTP/2 200' \
+        && echo "$hdrs" | grep -qi '^content-length: 12' \
+        && ! echo "$hdrs" | grep -qi '^connection:'
+    check "http2 proxy: response head translated (no hop-by-hop)" $?
+    # a dead backend fails the stream, not the connection
+    code=$(h2p -o /dev/null -w '%{http_code}' "$P/down/x")
+    [ "$code" = "502" ]
+    check "http2 proxy: dead upstream answers 502" $?
+    # static and proxied streams multiplexed on ONE connection
+    out=$(timeout 15 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+        -w '%{num_connects}\n' -o /dev/null "$P/hello.txt" \
+        -w '%{num_connects}\n' -o /dev/null "$P/api/simple" | awk '{t += $1} END {print t}')
+    [ "$out" = "1" ]
+    check "http2 proxy: static + proxied share one connection" $?
+    # several proxied streams in flight at once (the slot pool)
+    S=$(mktemp -d)
+    timeout 20 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 --parallel \
+        -o "$S/a" "$P/api/simple" -o "$S/b" "$P/api/chunked" \
+        -o "$S/c" "$P/api/big" -o "$S/d" "$P/api/eof"
+    [ "$(cat "$S/a")" = "backend body" ] && [ "$(cat "$S/b")" = "chunked body" ] \
+        && [ "$(wc -c < "$S/c")" -eq 40000 ] && [ "$(cat "$S/d")" = "eof delimited body" ]
+    check "http2 proxy: four concurrent upstream exchanges" $?
+    rm -rf "$S"
+    # a page's worth of concurrent API calls (six, the usual browser cap)
+    codes=$(timeout 20 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 --parallel \
+        -w '%{http_code} ' -o /dev/null "$P/api/simple" -o /dev/null "$P/api/simple" \
+        -o /dev/null "$P/api/simple" -o /dev/null "$P/api/simple" \
+        -o /dev/null "$P/api/simple" -o /dev/null "$P/api/simple")
+    [ "$(echo $codes | tr ' ' '\n' | grep -c '^200$')" -eq 6 ]
+    check "http2 proxy: six concurrent proxied streams all answered" $?
+    # a HEAD is bodiless, and its slot must come back: more sequential
+    # bodiless requests than there are slots, all on one connection
+    args=""
+    for i in $(seq 12); do args="$args -I -o /dev/null $P/api/simple"; done
+    codes=$(timeout 20 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+        -w '%{http_code}\n' $args)
+    [ "$(echo "$codes" | grep -c '^200$')" -eq 12 ]
+    check "http2 proxy: bodiless HEAD responses free their slot" $?
+    # a redirect location over h2 (also newly reachable: h2 used to 404 it)
+    hdrs=$(h2p -D - -o /dev/null "$P/old/page.html")
+    echo "$hdrs" | grep -qi '^HTTP/2 301' \
+        && echo "$hdrs" | grep -qi '^location: https://example.com/old/page.html'
+    check "http2 redirect location (301 + Location)" $?
     echo | timeout 5 openssl s_client -connect 127.0.0.1:47443 -CAfile $CA \
         -tls1_3 2>/dev/null | grep -q "No ALPN negotiated"
     check "alpn absent when not offered" $?
@@ -1690,6 +1771,22 @@ PY
         -H 'priority: u=3, i' "$u/big.txt")
     [ "$pc" = "200" ]
     check "http2 priority header served (RFC 9218, no stream-id corruption)" $?
+    # HPACK dynamic table: a client may index into its own table before it
+    # has processed our SETTINGS(HEADER_TABLE_SIZE=0), and does exactly that
+    # when it opens several streams at once. Without a decoder-side table
+    # those references cost a GOAWAY and every in-flight request with it, so
+    # hammer the case: six parallel streams on a fresh connection, repeatedly.
+    hpack_fail=0
+    for _ in 1 2 3 4 5 6 7 8; do
+        codes=$(timeout 15 curl -s --http2 --cacert $CA $rl --parallel -w '%{http_code}\n' \
+            -o /dev/null "$u/hello.txt" -o /dev/null "$u/index.html" \
+            -o /dev/null "$u/style.css" -o /dev/null "$u/hello.txt" \
+            -o /dev/null "$u/index.html" -o /dev/null "$u/style.css" 2>/dev/null)
+        [ "$(echo "$codes" | grep -c '^200$')" -eq 6 ] || hpack_fail=$((hpack_fail + 1))
+    done
+    [ "$hpack_fail" -eq 0 ]
+    check "http2 HPACK dynamic table (8x six parallel streams)" $?
+
     # a full browser-like header set (many headers, incl. priority + sec-fetch-*)
     bc=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
         -H 'user-agent: Mozilla/5.0 Firefox/128.0' -H 'accept: text/html,*/*' \
