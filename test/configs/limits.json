@@ -1,0 +1,16 @@
+{
+  "log": "test/linnea.log",
+  "timeout": 30,
+  "max_connections": 64,
+  "workers": 1,
+  "head_timeout": 3,
+  "max_per_ip": 8,
+  "servers": [
+    {
+      "host": "0.0.0.0", "port": 47470, "hostname": "limits.test",
+      "locations": [
+        { "prefix": "/", "root": "test/www" }
+      ]
+    }
+  ]
+}

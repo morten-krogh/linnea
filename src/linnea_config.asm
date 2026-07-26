@@ -28,6 +28,10 @@ dump_workers:           db " workers="
 dump_workers_len        equ $ - dump_workers
 dump_http2:             db " http2="
 dump_http2_len          equ $ - dump_http2
+dump_headtmo:           db " head_timeout="
+dump_headtmo_len        equ $ - dump_headtmo
+dump_perip:             db " max_per_ip="
+dump_perip_len          equ $ - dump_perip
 dump_server:            db "server "
 dump_server_len         equ $ - dump_server
 dump_host:              db ": host="
@@ -327,6 +331,16 @@ linnea_config_dump:
     mov esi, dump_http2_len
     call linnea_print_stdout
     mov rdi, [rbx + linnea_config.http2]
+    call linnea_print_u64_stdout
+    lea rdi, [dump_headtmo]
+    mov esi, dump_headtmo_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.head_timeout]
+    call linnea_print_u64_stdout
+    lea rdi, [dump_perip]
+    mov esi, dump_perip_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.max_per_ip]
     call linnea_print_u64_stdout
     lea rdi, [newline]
     mov esi, 1

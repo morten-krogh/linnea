@@ -4,7 +4,9 @@
 ;   ws '{' member (ws ',' member)* ws '}' ws EOF
 ; where the top-level members are "log" (string) and "servers" (array of
 ; server objects), both required, plus the optional "timeout" (seconds,
-; 1-3600) and "max_connections" (1-65536), in any order, each at most once.
+; 1-3600), "max_connections" (1-65536), "head_timeout" (1-3600, the total a
+; request head may take) and "max_per_ip" (1-65536, connections one source
+; address may hold at once), in any order, each at most once.
 ;   server := ws '{' member (ws ',' member)* ws '}'
 ;   member := ws string ws ':' ws value
 ;
@@ -42,6 +44,10 @@ key_timeout:            db "timeout"
 key_timeout_len         equ $ - key_timeout
 key_maxconn:            db "max_connections"
 key_maxconn_len         equ $ - key_maxconn
+key_headtmo:            db "head_timeout"
+key_headtmo_len         equ $ - key_headtmo
+key_perip:              db "max_per_ip"
+key_perip_len           equ $ - key_perip
 key_workers:            db "workers"
 key_workers_len         equ $ - key_workers
 key_http2:              db "http2"
@@ -112,6 +118,11 @@ msg_number_range_len    equ $ - msg_number_range
 msg_timeout_range:      db "timeout must be between 1 and 3600"
 msg_timeout_range_len   equ $ - msg_timeout_range
 msg_maxconn_range:      db "max_connections must be between 1 and 65536"
+msg_maxconn_range_len2  equ 0
+msg_headtmo_range:      db "head_timeout must be between 1 and 3600"
+msg_headtmo_range_len   equ $ - msg_headtmo_range
+msg_perip_range:        db "max_per_ip must be between 1 and 65536"
+msg_perip_range_len     equ $ - msg_perip_range
 msg_maxconn_range_len   equ $ - msg_maxconn_range
 msg_workers_range:      db "workers must be between 1 and 256"
 msg_workers_range_len   equ $ - msg_workers_range
@@ -171,6 +182,8 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.log_len], 0
     mov qword [rbx + linnea_config.timeout], LINNEA_DEFAULT_TIMEOUT
     mov qword [rbx + linnea_config.max_connections], LINNEA_DEFAULT_MAX_CONNECTIONS
+    mov qword [rbx + linnea_config.head_timeout], LINNEA_DEFAULT_HEAD_TIMEOUT
+    mov qword [rbx + linnea_config.max_per_ip], LINNEA_DEFAULT_MAX_PER_IP
     mov qword [rbx + linnea_config.workers], LINNEA_DEFAULT_WORKERS
     mov qword [rbx + linnea_config.http2], 1     ; HTTP/2 on by default (M19)
     xor r13d, r13d             ; top-level key mask
@@ -211,6 +224,20 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_maxconn
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_headtmo]
+    mov ecx, key_headtmo_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_headtmo
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_perip]
+    mov ecx, key_perip_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_perip
     mov rdi, r14
     mov rsi, r15
     lea rdx, [key_workers]
@@ -302,6 +329,30 @@ linnea_config_parse:
     mov [rbx + linnea_config.max_connections], rax
     jmp .top_sep
 
+.top_headtmo:
+    test r13d, 64
+    jnz .top_dup
+    or r13d, 64
+    call linnea_parse_u64
+    test rax, rax
+    jz .headtmo_range
+    cmp rax, 3600
+    ja .headtmo_range
+    mov [rbx + linnea_config.head_timeout], rax
+    jmp .top_sep
+
+.top_perip:
+    test r13d, 128
+    jnz .top_dup
+    or r13d, 128
+    call linnea_parse_u64
+    test rax, rax
+    jz .perip_range
+    cmp rax, 65536
+    ja .perip_range
+    mov [rbx + linnea_config.max_per_ip], rax
+    jmp .top_sep
+
 .top_workers:
     test r13d, 16
     jnz .top_dup
@@ -372,6 +423,16 @@ linnea_config_parse:
     lea rdi, [msg_timeout_range]
     mov esi, msg_timeout_range_len
     jmp linnea_parse_fail
+.headtmo_range:
+    lea rdi, [msg_headtmo_range]
+    mov esi, msg_headtmo_range_len
+    jmp linnea_parse_fail
+
+.perip_range:
+    lea rdi, [msg_perip_range]
+    mov esi, msg_perip_range_len
+    jmp linnea_parse_fail
+
 .maxconn_range:
     lea rdi, [msg_maxconn_range]
     mov esi, msg_maxconn_range_len

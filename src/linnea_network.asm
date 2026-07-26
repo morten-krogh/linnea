@@ -11,6 +11,7 @@ default rel
 
 global linnea_network_listen_all
 global linnea_network_peer_format
+global linnea_network_peer_addr
 global linnea_network_parse_ipv4
 global linnea_network_quic_listener
 
@@ -556,4 +557,41 @@ linnea_network_parse_ipv4:
     ret
 .fail:
     mov rax, -1
+    ret
+
+
+; linnea_network_peer_addr(rdi = fd, rsi = out, 16 bytes) -> rax = address length
+;   (4 for IPv4, 16 for IPv6), or 0 if the peer cannot be read.
+; The address only — no port — because this identifies the host behind a
+; connection, and a host opening many connections uses many ports.
+linnea_network_peer_addr:
+    push rbx
+    sub rsp, 48                ; sockaddr (28) + socklen (8); keeps calls aligned
+    mov rbx, rsi
+    mov eax, LINNEA_SYS_GETPEERNAME
+    mov rsi, rsp
+    lea rdx, [rsp + 32]
+    mov qword [rsp + 32], LINNEA_SOCKADDR_IN6_SIZE
+    syscall
+    cmp rax, -4095
+    jae .none
+    movzx eax, word [rsp]
+    cmp eax, LINNEA_AF_INET6
+    je .v6
+    mov eax, [rsp + 4]         ; sockaddr_in: 4 address bytes
+    mov [rbx], eax
+    mov eax, 4
+    jmp .ret
+.v6:
+    mov rax, [rsp + 8]         ; sockaddr_in6: 16 address bytes
+    mov [rbx], rax
+    mov rax, [rsp + 16]
+    mov [rbx + 8], rax
+    mov eax, 16
+    jmp .ret
+.none:
+    xor eax, eax
+.ret:
+    add rsp, 48
+    pop rbx
     ret

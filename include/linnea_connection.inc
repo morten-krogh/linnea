@@ -94,6 +94,15 @@ struc linnea_connection
     .ws_u2c_busy:   resq 1         ; an op is in flight upstream->client
     .ws_c2u_ptr:    resq 1         ; unsent client bytes (in_buf); the
     .ws_c2u_rem:    resq 1         ; u2c direction owns out_ptr/out_rem
+    ; the peer's address without its port, for the per-source connection cap: the
+    ; formatted .peer above carries the port too, and two connections from one
+    ; host differ there
+    .peer_ip:       resb 16
+    .peer_ip_len:   resq 1
+    ; CLOCK_MONOTONIC seconds when the current request head started arriving (at
+    ; accept, then again after each request completes). The idle timeout rearms on
+    ; every byte; this does not, so a head that never finishes is still bounded.
+    .req_start:     resq 1
     .last_activity: resq 1         ; CLOCK_MONOTONIC seconds of the last data
                                    ; in either direction; a tunnel recv that
                                    ; times out re-arms unless both are idle

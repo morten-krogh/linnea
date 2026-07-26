@@ -10,6 +10,7 @@ global linnea_connections_init
 global linnea_connection_alloc
 global linnea_connection_free
 global linnea_connection_at
+global linnea_connection_count_ip
 global linnea_connection_active
 
 extern linnea_memory_map
@@ -17,6 +18,7 @@ extern linnea_memory_map
 section .bss
 
 pool_base:      resq 1
+pool_size:      resq 1         ; slots in the pool (walkers need the bound)
 free_head:      resq 1         ; pool index of first free slot, -1 = none
 linnea_connection_active: resq 1   ; slots handed out; drains read it
 
@@ -26,6 +28,7 @@ section .text
 linnea_connections_init:
     push rbx
     mov rbx, rdi               ; pool size
+    mov [pool_size], rdi
     imul rdi, rdi, linnea_connection_size
     call linnea_memory_map
     mov [pool_base], rax
@@ -101,4 +104,51 @@ linnea_connection_free:
 linnea_connection_at:
     imul rax, rdi, linnea_connection_size
     add rax, [pool_base]
+    ret
+
+
+; linnea_connection_count_ip(rdi = address, rsi = length) -> rax = how many live
+; connections come from that address. A walk of the pool rather than a table on
+; the side: the pool is the truth, so the count cannot drift from it, and the
+; walk happens once per accept.
+linnea_connection_count_ip:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    mov r13, rsi
+    xor r14d, r14d             ; count
+    xor r15d, r15d             ; index
+.ci_slot:
+    cmp r15, [pool_size]
+    jae .ci_done
+    mov rdi, r15
+    call linnea_connection_at
+    mov rbx, rax
+    cmp qword [rbx + linnea_connection.in_use], 0
+    je .ci_next
+    cmp [rbx + linnea_connection.peer_ip_len], r13
+    jne .ci_next
+    mov rax, [rbx + linnea_connection.peer_ip]        ; first 8 address bytes
+    cmp rax, [r12]
+    jne .ci_next
+    cmp r13, 8
+    jbe .ci_hit
+    mov rax, [rbx + linnea_connection.peer_ip + 8]    ; and the rest, for IPv6
+    cmp rax, [r12 + 8]
+    jne .ci_next
+.ci_hit:
+    inc r14d
+.ci_next:
+    inc r15
+    jmp .ci_slot
+.ci_done:
+    mov rax, r14
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret

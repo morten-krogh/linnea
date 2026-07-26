@@ -1307,6 +1307,19 @@ wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
 rm -f "$LOG" test/www/big.txt test/www/upload.bin test/www/upload2.bin test/www/h2range.bin test/www/huge.bin test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
 
+# --- connection limits: slow-head deadline and the per-address cap ---
+# One host must not be able to hold the server open. The idle timeout cannot stop
+# it: every byte rearms it, so a trickled request head keeps its slot forever.
+# limits.json sets a long idle timeout on purpose, so only the head deadline can
+# be what closes the trickling connection.
+$BIN test/configs/limits.json >/dev/null 2>&1 &
+limits_pid=$!
+sleep 0.5
+python3 test/limits_test.py 47470 >/dev/null 2>&1
+check "connection limits: slow head cut off, per-address cap holds" $?
+kill $limits_pid 2>/dev/null
+wait $limits_pid 2>/dev/null
+
 # --- graceful drain: SIGTERM finishes in-flight work, then exits ---
 # A slow download is in flight when the master is killed; the workers
 # must complete it, refuse new connections meanwhile, and exit after.

@@ -54,6 +54,8 @@ extern linnea_ring_get_cqe
 
 extern linnea_config_instance
 extern linnea_network_peer_format
+extern linnea_network_peer_addr
+extern linnea_connection_count_ip
 extern linnea_connection_alloc
 extern linnea_connection_free
 extern linnea_connection_at
@@ -136,6 +138,10 @@ log_nl:             db 10
 
 reason_peer:        db "peer closed"
 reason_peer_len     equ $ - reason_peer
+reason_slow_head:   db "request head too slow"
+reason_slow_head_len equ $ - reason_slow_head
+reason_per_ip:      db "per-address connection limit"
+reason_per_ip_len   equ $ - reason_per_ip
 reason_timeout:     db "idle timeout"
 reason_timeout_len  equ $ - reason_timeout
 reason_recv_err:    db "recv error"
@@ -189,6 +195,9 @@ section .bss
 
 ring:               resb LINNEA_RING_SIZE
 cqe_ptr:            resq 1
+head_timeout_ns:    resq 1     ; head_timeout as nanoseconds (same units as
+                               ; linnea_uring_now), for the request-head deadline
+max_per_ip:         resq 1     ; connections one source address may hold
 idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
                                ; tunnel's last_activity comparison
 sig_mask:           resq 1     ; blocked-signal set: SIGTERM + SIGHUP
@@ -244,6 +253,11 @@ linnea_uring_run:
     mov [idle_timeout], rax
     imul rax, rax, 1000000000
     mov [idle_timeout_ns], rax
+    mov rax, [rbx + linnea_config.head_timeout]
+    imul rax, rax, 1000000000
+    mov [head_timeout_ns], rax
+    mov rax, [rbx + linnea_config.max_per_ip]
+    mov [max_per_ip], rax
 
     mov edi, LINNEA_URING_ENTRIES
     lea rsi, [ring]
@@ -666,6 +680,33 @@ linnea_uring_run:
     lea rsi, [r12 + linnea_connection.peer]
     call linnea_network_peer_format
     mov [r12 + linnea_connection.peer_len], rax
+    ; the source address alone (no port), and how many connections it already
+    ; holds. Without this one host can take the whole pool with perfectly
+    ; well-formed traffic and everyone else is refused.
+    mov edi, [r12 + linnea_connection.fd]
+    lea rsi, [r12 + linnea_connection.peer_ip]
+    call linnea_network_peer_addr
+    mov [r12 + linnea_connection.peer_ip_len], rax
+    test rax, rax
+    jz .accept_counted         ; address unreadable: nothing to count it against
+    lea rdi, [r12 + linnea_connection.peer_ip]
+    mov rsi, rax
+    call linnea_connection_count_ip    ; this connection is already among them
+    cmp rax, [max_per_ip]
+    jbe .accept_counted
+    ; over the cap: hand the slot back and drop the connection without a log
+    ; line — logging every refusal would turn a flood into disk exhaustion
+    mov rdi, r12
+    call linnea_connection_free
+    mov edi, r15d
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    jmp .accept_rearm
+.accept_counted:
+    ; the head clock starts now: it covers the TLS handshake and the first
+    ; request head, and is rearmed per head below
+    call linnea_uring_now
+    mov [r12 + linnea_connection.req_start], rax
     mov rdi, r12
     call linnea_uring_log_accept
     ; TLS listeners begin a userspace handshake before any HTTP; its state
@@ -800,6 +841,26 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .recv_data:
+    ; A head must arrive within head_timeout, however slowly it is fed. The idle
+    ; timeout cannot do this: it is armed per operation and every byte rearms it,
+    ; so a client sending one byte per timeout period holds its slot forever.
+    ; req_start is zero between requests, so an idle keep-alive connection — which
+    ; is legitimate and may sit for a long time — is not on any clock.
+    call linnea_uring_now
+    mov rcx, [r12 + linnea_connection.req_start]
+    test rcx, rcx
+    jnz .recv_head_age
+    mov [r12 + linnea_connection.req_start], rax   ; first bytes of a new head
+    jmp .recv_head_ok
+.recv_head_age:
+    sub rax, rcx
+    jb .recv_head_ok           ; stamped ahead of now: never close on a wrap
+    cmp rax, [head_timeout_ns]
+    jbe .recv_head_ok
+    lea r14, [reason_slow_head]
+    mov r15d, reason_slow_head_len
+    jmp .conn_close
+.recv_head_ok:
     mov eax, r15d
     add [r12 + linnea_connection.in_len], rax
     cmp qword [r12 + linnea_connection.is_h2], 0
@@ -1964,6 +2025,9 @@ linnea_uring_arm_recv_buf:
 ; pinning the slot. Partial sends re-arm with a fresh timeout, so slow
 ; readers are unaffected.
 linnea_uring_arm_send:
+    ; a response is on its way, so this head is done — the next one starts its
+    ; own clock when its first bytes arrive
+    mov qword [rdi + linnea_connection.req_start], 0
     mov rsi, [rdi + linnea_connection.out_ptr]
     mov rdx, [rdi + linnea_connection.out_rem]
     ; fall through
