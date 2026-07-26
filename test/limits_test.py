@@ -16,12 +16,15 @@
 # Usage: limits_test.py <port>
 import socket
 import sys
+import threading
 import time
 
 port = int(sys.argv[1])
 HOST = "127.0.0.1"
 HEAD_TIMEOUT = 3
 MAX_PER_IP = 8
+MAX_UPSTREAM = 2
+BACKEND_PORT = 47471
 
 
 def get(sock, path="/hello.txt"):
@@ -85,4 +88,57 @@ other.close()
 for c in kept:
     c.close()
 
-print(f"ok (slow head cut at {held:.1f}s; {MAX_PER_IP} per address, others unaffected)")
+# --- upstream ceiling: past it a proxied request is refused, not passed on ---
+# A backend that accepts and then says nothing, so the connections we open to it
+# stay in flight for the whole test.
+backend = socket.socket()
+backend.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+backend.bind(("127.0.0.1", BACKEND_PORT))
+backend.listen(64)
+stalled = []
+
+
+def accept_and_stall():
+    while True:
+        try:
+            c, _ = backend.accept()
+        except OSError:
+            return
+        stalled.append(c)          # accepted, never answered
+
+
+threading.Thread(target=accept_and_stall, daemon=True).start()
+
+codes = []
+lock = threading.Lock()
+
+
+def proxied():
+    try:
+        c = socket.create_connection((HOST, port), timeout=8)
+        c.settimeout(8)
+        c.sendall(b"GET /api/x HTTP/1.1\r\nHost: limits.test\r\n\r\n")
+        r = c.recv(200)
+        with lock:
+            codes.append(r.split()[1].decode() if r.split() else "none")
+        c.close()
+    except Exception as e:
+        with lock:
+            codes.append(type(e).__name__)
+
+
+threads = [threading.Thread(target=proxied) for _ in range(MAX_UPSTREAM + 2)]
+for t in threads:
+    t.start()
+    time.sleep(0.2)                # let each reach the upstream before the next
+for t in threads:
+    t.join(timeout=12)
+
+refused = codes.count("503")
+assert refused >= 2, (
+    f"expected the requests past the ceiling of {MAX_UPSTREAM} upstream "
+    f"connections to be refused with 503, got {codes}")
+backend.close()
+
+print(f"ok (slow head cut at {held:.1f}s; {MAX_PER_IP} per address, others "
+      f"unaffected; {refused} proxied requests refused past the upstream ceiling)")

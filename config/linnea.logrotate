@@ -15,6 +15,9 @@
 
 /home/linnea/linnea/linnea.log {
     daily
+    # and whenever it gets large, not only once a day: every request writes a
+    # line, so a flood can fill the disk long before the daily run comes round
+    maxsize 100M
     rotate 14
     compress
     delaycompress

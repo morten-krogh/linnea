@@ -22,6 +22,11 @@ LINNEA_DEFAULT_HEAD_TIMEOUT     equ 10    ; seconds to finish a request head
 ; single host can take every slot in the pool — with well-formed traffic, no
 ; trickery needed — and everyone else is refused.
 LINNEA_DEFAULT_MAX_PER_IP       equ 64
+; Upstream (backend) connections in flight at once, per worker. Past this a
+; proxied request is answered 503 rather than opening one more: the backend is
+; usually far smaller than the flood that can reach us, and refusing here is
+; what keeps it alive.
+LINNEA_DEFAULT_MAX_UPSTREAM     equ 256
 LINNEA_DEFAULT_MAX_CONNECTIONS  equ 1024
 LINNEA_DEFAULT_WORKERS          equ 0     ; 0 = one worker per online CPU
 LINNEA_MAX_WORKERS              equ 256
@@ -86,6 +91,7 @@ struc linnea_config
     .max_connections: resq 1                      ; connection pool size, per worker
     .head_timeout:  resq 1                        ; seconds to complete a request head
     .max_per_ip:    resq 1                        ; connections one address may hold
+    .max_upstream:  resq 1                        ; upstream connections in flight
     .workers:       resq 1                        ; worker processes; 0 until the
                                                   ; auto count is resolved at startup
     .http2:         resq 1                        ; 1 = offer HTTP/2 via ALPN

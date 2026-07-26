@@ -65,6 +65,11 @@ global linnea_h2p_service
 global linnea_h2p_conn_close
 global h2p_compact
 
+extern linnea_upstream_count
+extern linnea_upstream_open
+extern linnea_upstream_closed
+extern linnea_upstream_limit
+
 section .rodata
 
 ; PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n
@@ -76,14 +81,6 @@ hdr_altsvc_name_len equ $ - hdr_altsvc_name
 mime_txt_h2:    db "text/plain"
 mime_txt_h2_len equ $ - mime_txt_h2
 
-dbgs:           db "DBG appends/bytes/sends/bodysends "
-dbgs_len        equ $ - dbgs
-dbgsp:          db " "
-dbgc:           db "DBG credit "
-dbgc_len        equ $ - dbgc
-dbgnl:          db 10
-dbgm:           db "DBG h2 goaway", 10
-dbgm_len        equ $ - dbgm
 msg_h2_pre:     db "linnea h2: "
 msg_h2_pre_len  equ $ - msg_h2_pre
 
@@ -376,8 +373,6 @@ linnea_h2_handle:
     pop rdi
     mov [rdi + linnea_h2p.rq_wr], r9
     sub [rdi + linnea_h2p.rq_rem], rax
-    inc qword [dbg_appends]
-    add [dbg_appended], rax
     or qword [rdi + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
     jmp .fd_done
 .fd_collect:
@@ -500,18 +495,6 @@ linnea_h2_handle:
     add r12, r11
     jmp .close                       ; peer is going away
 .goaway_close:
-    push rsi
-    push r9
-    push r10
-    push r11
-    call linnea_log_stamp
-    lea rdi, [dbgm]
-    mov esi, dbgm_len
-    call linnea_log_write
-    pop r11
-    pop r10
-    pop r9
-    pop rsi
     ; queue GOAWAY(last_stream_id=0, NO_ERROR) and close once it's sent
     mov byte [r13], 0
     mov byte [r13 + 1], 0
@@ -1727,6 +1710,7 @@ h2p_release:
     je .rel_nofd
     mov eax, LINNEA_SYS_CLOSE
     syscall
+    call linnea_upstream_closed
 .rel_nofd:
     pop rax
     mov dword [rax + linnea_h2p.fd], -1
@@ -1761,32 +1745,6 @@ linnea_h2p_conn_close:
     push rbx
     push r12
     mov qword [rdi + linnea_connection.h2_upload], 0
-    push rdi
-    call linnea_log_stamp
-    lea rdi, [dbgs]
-    mov esi, dbgs_len
-    call linnea_log_write
-    mov rdi, [dbg_appends]
-    call linnea_log_u64
-    lea rdi, [dbgsp]
-    mov esi, 1
-    call linnea_log_write
-    mov rdi, [dbg_appended]
-    call linnea_log_u64
-    lea rdi, [dbgsp]
-    mov esi, 1
-    call linnea_log_write
-    mov rdi, [dbg_sends]
-    call linnea_log_u64
-    lea rdi, [dbgsp]
-    mov esi, 1
-    call linnea_log_write
-    mov rdi, [dbg_bodysends]
-    call linnea_log_u64
-    lea rdi, [dbgnl]
-    mov esi, 1
-    call linnea_log_write
-    pop rdi
     mov rax, [rdi + linnea_connection.index]
     imul rax, rax, LINNEA_H2P_SLOTS
     imul rax, rax, linnea_h2p_size
@@ -1864,6 +1822,10 @@ h2p_finalize:
 h2p_open_upstream:
     push rbx
     mov rbx, rdi
+    ; the backend's ceiling applies whichever protocol the client speaks
+    call linnea_upstream_count
+    cmp rax, [linnea_upstream_limit]
+    jae .ou_busy
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM
     xor edx, edx
@@ -1872,6 +1834,7 @@ h2p_open_upstream:
     test eax, eax
     js .ou_nosock
     mov [rbx + linnea_h2p.fd], eax
+    call linnea_upstream_open
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_CONNECTING
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_CONN
     pop rbx
@@ -1879,6 +1842,13 @@ h2p_open_upstream:
 .ou_nosock:
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FAILED
     mov qword [rbx + linnea_h2p.status], 502
+    pop rbx
+    ret
+.ou_busy:
+    ; at the ceiling: 503, which says "try again", rather than 502, which says
+    ; the backend answered badly — it was never asked
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [rbx + linnea_h2p.status], 503
     pop rbx
     ret
 
@@ -2007,7 +1977,6 @@ linnea_h2p_event:
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
     jmp .ev_service
 .ev_send_stream:
-    inc qword [dbg_sends]
     ; a streamed request: the head goes out first, then FIFO body bytes.
     ; Body bytes that have left are owed back to the client as flow-control
     ; credit, and the FIFO slides down so the next window can land in it.
@@ -2017,7 +1986,6 @@ linnea_h2p_event:
     add [rbx + linnea_h2p.sent], r14d          ; still the head
     jmp .ev_stream_next
 .ev_sent_body:
-    inc qword [dbg_bodysends]
     mov eax, r14d
     add [rbx + linnea_h2p.rq_rd], rax
     add [rbx + linnea_h2p.rq_credit], rax      ; owed back as WINDOW_UPDATE
@@ -2117,6 +2085,7 @@ h2p_free_slot:
     je .fsl_nofd
     mov eax, LINNEA_SYS_CLOSE
     syscall
+    call linnea_upstream_closed
 .fsl_nofd:
     mov dword [rbx + linnea_h2p.fd], -1
     mov qword [rbx + linnea_h2p.flags], 0        ; see h2p_release
@@ -2183,17 +2152,6 @@ linnea_h2p_service:
     mov r14, [r12 + linnea_h2p.rq_credit]
     test r14, r14
     jz .sv_no_credit
-    push r14
-    call linnea_log_stamp
-    lea rdi, [dbgc]
-    mov esi, dbgc_len
-    call linnea_log_write
-    mov rdi, [rsp]
-    call linnea_log_u64
-    lea rdi, [dbgnl]
-    mov esi, 1
-    call linnea_log_write
-    pop r14
     mov qword [r12 + linnea_h2p.rq_credit], 0
     mov rdi, r15
     mov rsi, [r12 + linnea_h2p.sid]
@@ -3967,10 +3925,6 @@ h2p_pool:     resq 1                 ; the upstream slot array (one mmap)
 h2_dyn_pool:  resq 1                 ; per-connection HPACK dynamic tables
 h2_upload_pool: resq 1               ; per-connection streaming-upload buffers
 h2_cur_srv:   resq 1                 ; vhost whose response is being built
-dbg_appends:  resq 1
-dbg_appended: resq 1
-dbg_sends:    resq 1
-dbg_bodysends: resq 1
 h2_fd_len:    resd 1                 ; a DATA frame's flow-control cost
 h2_fd_credit: resd 1                 ; and whether it is owed back now
 h2p_numbuf:   resb 24

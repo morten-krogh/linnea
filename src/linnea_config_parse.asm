@@ -48,6 +48,8 @@ key_headtmo:            db "head_timeout"
 key_headtmo_len         equ $ - key_headtmo
 key_perip:              db "max_per_ip"
 key_perip_len           equ $ - key_perip
+key_maxup:              db "max_upstream"
+key_maxup_len           equ $ - key_maxup
 key_workers:            db "workers"
 key_workers_len         equ $ - key_workers
 key_http2:              db "http2"
@@ -123,6 +125,8 @@ msg_headtmo_range:      db "head_timeout must be between 1 and 3600"
 msg_headtmo_range_len   equ $ - msg_headtmo_range
 msg_perip_range:        db "max_per_ip must be between 1 and 65536"
 msg_perip_range_len     equ $ - msg_perip_range
+msg_maxup_range:        db "max_upstream must be between 1 and 65536"
+msg_maxup_range_len     equ $ - msg_maxup_range
 msg_maxconn_range_len   equ $ - msg_maxconn_range
 msg_workers_range:      db "workers must be between 1 and 256"
 msg_workers_range_len   equ $ - msg_workers_range
@@ -184,6 +188,7 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.max_connections], LINNEA_DEFAULT_MAX_CONNECTIONS
     mov qword [rbx + linnea_config.head_timeout], LINNEA_DEFAULT_HEAD_TIMEOUT
     mov qword [rbx + linnea_config.max_per_ip], LINNEA_DEFAULT_MAX_PER_IP
+    mov qword [rbx + linnea_config.max_upstream], LINNEA_DEFAULT_MAX_UPSTREAM
     mov qword [rbx + linnea_config.workers], LINNEA_DEFAULT_WORKERS
     mov qword [rbx + linnea_config.http2], 1     ; HTTP/2 on by default (M19)
     xor r13d, r13d             ; top-level key mask
@@ -238,6 +243,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_perip
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_maxup]
+    mov ecx, key_maxup_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_maxup
     mov rdi, r14
     mov rsi, r15
     lea rdx, [key_workers]
@@ -353,6 +365,18 @@ linnea_config_parse:
     mov [rbx + linnea_config.max_per_ip], rax
     jmp .top_sep
 
+.top_maxup:
+    test r13d, 256
+    jnz .top_dup
+    or r13d, 256
+    call linnea_parse_u64
+    test rax, rax
+    jz .maxup_range
+    cmp rax, 65536
+    ja .maxup_range
+    mov [rbx + linnea_config.max_upstream], rax
+    jmp .top_sep
+
 .top_workers:
     test r13d, 16
     jnz .top_dup
@@ -426,6 +450,11 @@ linnea_config_parse:
 .headtmo_range:
     lea rdi, [msg_headtmo_range]
     mov esi, msg_headtmo_range_len
+    jmp linnea_parse_fail
+
+.maxup_range:
+    lea rdi, [msg_maxup_range]
+    mov esi, msg_maxup_range_len
     jmp linnea_parse_fail
 
 .perip_range:

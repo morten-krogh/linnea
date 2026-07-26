@@ -11,12 +11,26 @@ global linnea_connection_alloc
 global linnea_connection_free
 global linnea_connection_at
 global linnea_connection_count_ip
+global linnea_upstream_open
+global linnea_upstream_closed
+global linnea_upstream_count
+global linnea_upstream_limit
 global linnea_connection_active
 
 extern linnea_memory_map
 
 section .bss
 
+; Upstream connections in flight, and the ceiling on them. Every proxied request
+; opens a connection to the backend, and nothing tied that to the backend's
+; capacity: a flood arriving here becomes a flood arriving there, and the server
+; survives while what it proxies for does not. Counted rather than scanned
+; because the scan would have to walk every connection's slots on every proxied
+; request; the count is maintained at the few places an upstream socket is opened
+; and closed, and every decrement is guarded by the same "was it open" test that
+; guards the close itself.
+linnea_upstream_inflight: resq 1
+linnea_upstream_limit:    resq 1
 pool_base:      resq 1
 pool_size:      resq 1         ; slots in the pool (walkers need the bound)
 free_head:      resq 1         ; pool index of first free slot, -1 = none
@@ -151,4 +165,26 @@ linnea_connection_count_ip:
     pop r13
     pop r12
     pop rbx
+    ret
+
+
+; linnea_upstream_open() — one more upstream connection is live.
+linnea_upstream_open:
+    inc qword [linnea_upstream_inflight]
+    ret
+
+; linnea_upstream_closed() — one fewer. Floors at zero: a miscount must not be
+; able to wrap into "billions in flight" and refuse every proxied request from
+; then on.
+linnea_upstream_closed:
+    cmp qword [linnea_upstream_inflight], 0
+    je .none
+    dec qword [linnea_upstream_inflight]
+.none:
+    ret
+
+; linnea_upstream_count() -> rax = upstream connections in flight, and whether
+; that is at the limit is the caller's business.
+linnea_upstream_count:
+    mov rax, [linnea_upstream_inflight]
     ret

@@ -114,6 +114,10 @@ extern linnea_log_write
 extern linnea_log_u64
 extern linnea_log_stamp
 
+extern linnea_upstream_count
+extern linnea_upstream_open
+extern linnea_upstream_limit
+
 section .rodata
 
 resp_400:       db "HTTP/1.1 400 Bad Request", 13, 10
@@ -152,6 +156,12 @@ resp_501:       db "HTTP/1.1 501 Not Implemented", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_501_len    equ $ - resp_501
+resp_503:       db "HTTP/1.1 503 Service Unavailable", 13, 10
+                db "Content-Type: text/plain", 13, 10
+                db "Content-Length: 20", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+                db "503 Service Unavail", 10
+resp_503_len    equ $ - resp_503
 resp_502:       db "HTTP/1.1 502 Bad Gateway", 13, 10
                 db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
@@ -1672,6 +1682,11 @@ linnea_http_handle:
     lea rdx, [rbx + linnea_connection.in_buf]
     add rax, rdx
     mov [rbx + linnea_connection.file_ptr], rax
+    ; the backend gets no more connections than it was sized for: past the
+    ; ceiling the request is refused here rather than passed on
+    call linnea_upstream_count
+    cmp rax, [linnea_upstream_limit]
+    jae .resp_503
     mov eax, LINNEA_SYS_SOCKET
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM
@@ -1680,6 +1695,7 @@ linnea_http_handle:
     cmp rax, -4095
     jae .resp_502
     mov [rbx + linnea_connection.up_fd], eax
+    call linnea_upstream_open
     mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_CONNECTING
     mov eax, LINNEA_HTTP_PROXY
     jmp .ret
@@ -1727,6 +1743,11 @@ linnea_http_handle:
     lea rax, [resp_502]
     mov ecx, resp_502_len
     mov qword [rsp + 112], 502
+    jmp .resp_static
+.resp_503:
+    lea rax, [resp_503]
+    mov ecx, resp_503_len
+    mov qword [rsp + 112], 503
     jmp .resp_static
 .resp_505:
     lea rax, [resp_505]

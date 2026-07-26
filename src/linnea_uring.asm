@@ -56,6 +56,8 @@ extern linnea_config_instance
 extern linnea_network_peer_format
 extern linnea_network_peer_addr
 extern linnea_connection_count_ip
+extern linnea_upstream_closed
+extern linnea_upstream_limit
 extern linnea_connection_alloc
 extern linnea_connection_free
 extern linnea_connection_at
@@ -258,6 +260,8 @@ linnea_uring_run:
     mov [head_timeout_ns], rax
     mov rax, [rbx + linnea_config.max_per_ip]
     mov [max_per_ip], rax
+    mov rax, [rbx + linnea_config.max_upstream]
+    mov [linnea_upstream_limit], rax
 
     mov edi, LINNEA_URING_ENTRIES
     lea rsi, [ring]
@@ -1494,6 +1498,7 @@ linnea_uring_run:
     je .proxy_logged
     mov eax, LINNEA_SYS_CLOSE
     syscall
+    call linnea_upstream_closed
     mov dword [r12 + linnea_connection.up_fd], -1
 .proxy_logged:
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
@@ -1791,6 +1796,7 @@ linnea_uring_run:
     je .close_no_up
     mov eax, LINNEA_SYS_CLOSE  ; an upstream exchange died with it
     syscall
+    call linnea_upstream_closed
     mov dword [r12 + linnea_connection.up_fd], -1
 .close_no_up:
     mov edi, [r12 + linnea_connection.fd]

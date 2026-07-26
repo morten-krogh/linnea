@@ -7,10 +7,20 @@
   "max_per_ip": 8,
   "servers": [
     {
-      "host": "0.0.0.0", "port": 47470, "hostname": "limits.test",
+      "host": "0.0.0.0",
+      "port": 47470,
+      "hostname": "limits.test",
       "locations": [
-        { "prefix": "/", "root": "test/www" }
+        {
+          "prefix": "/",
+          "root": "test/www"
+        },
+        {
+          "prefix": "/api",
+          "proxy": "127.0.0.1:47471"
+        }
       ]
     }
-  ]
+  ],
+  "max_upstream": 2
 }
