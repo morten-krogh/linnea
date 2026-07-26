@@ -43,6 +43,8 @@ test/www/up.bin
 test/www/h3big.bin
 test/www/h3range.bin
 test/www/h2range.bin
+test/www/upload.bin
+test/www/upload2.bin
 test/www/enc.txt
 test/www/enc.txt.gz
 test/www/enc.txt.br

@@ -155,6 +155,8 @@ log_drain_len       equ $ - log_drain
 log_drained:        db "worker drained", 10
 log_drained_len     equ $ - log_drained
 
+dbgsplit:           db "DBG split in_len "
+dbgsplit_len        equ $ - dbgsplit
 msg_signalfd:       db "signalfd failed"
 msg_signalfd_len    equ $ - msg_signalfd
 reason_up_recv_err: db "upstream recv error"
@@ -196,6 +198,9 @@ qrecv_iov:  resb LINNEA_IOVEC_SIZE
 cqe_tag:       resd 1      ; the completing op's tag, kept past the shift
 qrecv_peer: resb LINNEA_SOCKADDR_IN6_SIZE
 sig_buf:            resb 128   ; struct signalfd_siginfo
+; one record's plaintext during the TLS handoff (see the assertion above)
+tls_early_scratch:  resb LINNEA_CONN_IN_BUF
+tls_early_scratch_size equ LINNEA_CONN_IN_BUF
 
 section .text
 
@@ -207,12 +212,13 @@ section .text
 ; the divisor zero and fails the assembly.
 [absolute 0]
     resb 1 / (LINNEA_CONN_UP_BUF >= linnea_tls_hs_size)
-    ; .tls_handoff hands out_buf to linnea_tls_drain_early as the scratch a
-    ; record's plaintext is decrypted into, bounded only by in_buf's size —
-    ; and decryption happens before the tag is checked, so this bound has to
-    ; hold for a peer that knows no keys. The two buffers are sized
-    ; independently, so state the relationship instead of relying on it.
-    resb 1 / (LINNEA_CONN_OUT_BUF >= LINNEA_CONN_IN_BUF)
+    ; .tls_handoff decrypts a record's plaintext into tls_early_scratch,
+    ; bounded only by in_buf's size — and decryption happens before the tag
+    ; is checked, so the bound has to hold for a peer that knows no keys.
+    ; The scratch is per worker rather than per connection: only one
+    ; connection is ever mid-handoff at a time, and at a maximum TLS record
+    ; it would be the largest thing in the connection struct.
+    resb 1 / (tls_early_scratch_size >= LINNEA_CONN_IN_BUF)
 __?SECT?__
 
 ; linnea_uring_run(rdi=config*) — set up the ring, arm accepts, loop forever.
@@ -686,6 +692,8 @@ linnea_uring_run:
     je .tunnel_client_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
     je .closing_c2u
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_REQ_BODY
+    je .req_body_recv
     test r15d, r15d
     jg .recv_data
     jz .recv_eof
@@ -762,6 +770,33 @@ linnea_uring_run:
     call h2_arm_recv_once
     call linnea_uring_submit_now
     jmp .wait
+
+; --- streaming a request body: the client's bytes go straight upstream ---
+; The client stopping early (EOF, error or the idle timeout) means the body
+; will never be complete, so the exchange is over: the upstream sees a short
+; request and the connection is torn down. Nothing has been sent to the
+; client yet, so there is no half-response to worry about.
+.req_body_recv:
+    test r15d, r15d
+    jle .req_body_gone
+    mov eax, r15d
+    cmp rax, [r12 + linnea_connection.req_body_rem]
+    jbe .req_body_have
+    mov rax, [r12 + linnea_connection.req_body_rem]   ; ignore anything past
+.req_body_have:                                       ; the declared length
+    sub [r12 + linnea_connection.req_body_rem], rax
+    lea rcx, [r12 + linnea_connection.in_buf]
+    mov [r12 + linnea_connection.out_ptr], rcx
+    mov [r12 + linnea_connection.out_rem], rax
+    mov qword [r12 + linnea_connection.file_rem], 0
+    mov rdi, r12
+    call linnea_uring_arm_up_send
+    call linnea_uring_submit_now
+    jmp .wait
+.req_body_gone:
+    lea r14, [reason_peer]
+    mov r15d, reason_peer_len
+    jmp .conn_close
 
 ; --- send completion: r13 = connection index, r15d = bytes or -errno --
 ; A send that moved no bytes for the idle timeout completes -ECANCELED:
@@ -994,7 +1029,7 @@ linnea_uring_run:
     lea rdi, [r12 + linnea_connection.up_buf]
     lea rsi, [r12 + linnea_connection.in_buf]
     mov rdx, [r12 + linnea_connection.in_len]
-    lea rcx, [r12 + linnea_connection.out_buf]
+    lea rcx, [tls_early_scratch]
     mov r8, LINNEA_CONN_IN_BUF
     call linnea_tls_drain_early    ; rax = plaintext len / -1 / -2 / -3
     cmp rax, -1
@@ -1051,6 +1086,19 @@ linnea_uring_run:
     mov r15d, reason_tls_badrec_len
     jmp .conn_close
 .tls_split:
+    push r12
+    call linnea_log_stamp
+    lea rdi, [dbgsplit]
+    mov esi, dbgsplit_len
+    call linnea_log_write
+    pop r12
+    push r12
+    mov rdi, [r12 + linnea_connection.in_len]
+    call linnea_log_u64
+    lea rdi, [log_nl]
+    mov esi, 1
+    call linnea_log_write
+    pop r12
     lea r14, [reason_tls_split]
     mov r15d, reason_tls_split_len
     jmp .conn_close
@@ -1127,6 +1175,18 @@ linnea_uring_run:
     mov esi, 504               ; backend accepted but stopped reading
     jmp .proxy_fail
 .up_send_done:
+    ; more request body still to come from the client? Relay it a chunk at a
+    ; time — recv into in_buf, send that upstream, repeat — so an upload is
+    ; bounded by the buffer rather than having to fit in it.
+    cmp qword [r12 + linnea_connection.req_body_rem], 0
+    je .up_send_response
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_REQ_BODY
+    mov qword [r12 + linnea_connection.in_len], 0   ; the head is long gone
+    mov rdi, r12
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.up_send_response:
     ; the whole request is out; read the response head back into up_buf
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_HEAD
     mov qword [r12 + linnea_connection.up_len], 0
@@ -1710,6 +1770,31 @@ linnea_uring_arm_recv:
     mov [rax + LINNEA_SQE_ADDR], rdx
     mov edx, LINNEA_CONN_IN_BUF
     sub edx, ecx               ; in_len <= LINNEA_CONN_IN_BUF
+    ; During the userspace handshake, read no further than the end of the
+    ; record being assembled. A client may append its whole request to the
+    ; Finished — a large upload is megabytes — and everything we pull into
+    ; this buffer we must decrypt ourselves before the kernel takes over.
+    ; Stopping at the record boundary leaves that data in the socket, where
+    ; kTLS decrypts it after the handoff, so the request size stops being
+    ; bounded by this buffer.
+    cmp qword [rbx + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
+    jne .ar_len
+    cmp rcx, 5
+    jb .ar_hdr                 ; still assembling the 5-byte record header
+    movzx r8d, byte [rbx + linnea_connection.in_buf + 3]
+    shl r8d, 8
+    mov r8b, [rbx + linnea_connection.in_buf + 4]
+    add r8d, 5                 ; whole record = header + fragment
+    sub r8d, ecx               ; what is missing of it
+    jbe .ar_len                ; already whole (or past): leave the bound
+    cmp r8d, edx
+    ja .ar_len                 ; a record too large for the buffer: the
+    mov edx, r8d               ; existing "too large" path reports it
+    jmp .ar_len
+.ar_hdr:
+    mov edx, 5
+    sub edx, ecx
+.ar_len:
     mov [rax + LINNEA_SQE_LEN], edx
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
@@ -1912,6 +1997,22 @@ linnea_uring_arm_h2p_ops:
     mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
     mov ecx, [r12 + linnea_h2p.fd]
     mov [rax + LINNEA_SQE_FD], ecx
+    ; the head comes from the front of the buffer; once it is out, a
+    ; streamed body comes from the FIFO further in
+    mov rcx, [r12 + linnea_h2p.sent]
+    cmp rcx, [r12 + linnea_h2p.req_len]
+    jb .ao_send_head
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
+    jz .ao_send_head                 ; nothing left; the send is a no-op
+    mov rcx, [r12 + linnea_h2p.rq_buf]
+    add rcx, [r12 + linnea_h2p.rq_rd]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov rcx, [r12 + linnea_h2p.rq_wr]
+    sub rcx, [r12 + linnea_h2p.rq_rd]
+    mov [rax + LINNEA_SQE_LEN], ecx
+    mov edx, LINNEA_UD_H2UP_SEND
+    jmp .ao_finish
+.ao_send_head:
     lea rcx, [r12 + linnea_h2p.buf]
     add rcx, [r12 + linnea_h2p.sent]
     mov [rax + LINNEA_SQE_ADDR], rcx

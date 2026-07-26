@@ -116,6 +116,11 @@ LINNEA_H2P_HEAD_MAX   equ 8192    ; rewritten request head cap (buf[0..) )
 LINNEA_H2P_BODY_OFF   equ 8192    ; request body collects at buf[BODY_OFF..)
 LINNEA_H2P_BODY_MAX   equ 8192    ; request body cap (h1's in_buf caps ~8K too)
 LINNEA_H2P_RHEAD_MAX  equ 6144    ; upstream response head cap (502 beyond)
+; One streaming upload per connection gets this buffer (the h2 default
+; receive window, rounded up). Mapped lazily, so a connection that never
+; uploads never touches it; a second concurrent upload on the same
+; connection falls back to the bounded collect path.
+LINNEA_H2P_UPLOAD_BUF equ 65536
 
 ; slot states
 LINNEA_H2P_FREE       equ 0
@@ -143,6 +148,9 @@ LINNEA_H2P_F_RST       equ 1024   ; failure after HEAD_SENT: emit RST_STREAM
 LINNEA_H2P_F_REAP      equ 2048   ; fully framed: free once no send is reading
                                   ; the slot buffer (the last DATA frame sends
                                   ; straight out of it)
+LINNEA_H2P_F_REQ_STREAM equ 4096  ; the request body streams upstream as it
+                                  ; arrives instead of being collected whole
+LINNEA_H2P_F_REQ_DONE  equ 8192   ; every request-body byte has been forwarded
 
 struc linnea_h2p
     .state:     resq 1
@@ -163,5 +171,15 @@ struc linnea_h2p
     .chunk_rem: resq 1            ; data bytes left in the current chunk
     .status:    resq 1            ; upstream status (or our 502/504)
     .flags:     resq 1            ; LINNEA_H2P_F_*
+    ; Streaming request body: a FIFO in the connection's upload buffer. A
+    ; client may have a full receive window in flight before it has even
+    ; processed our SETTINGS, so the FIFO is sized for the protocol default
+    ; (65535) rather than anything we could advertise; the window is credited
+    ; back only as bytes go upstream, which paces everything after that.
+    .rq_buf:    resq 1            ; the FIFO (0 = collecting, not streaming)
+    .rq_rd:     resq 1            ; next body byte to send upstream
+    .rq_wr:     resq 1            ; append point
+    .rq_rem:    resq 1            ; body bytes still expected from the client
+    .rq_credit: resq 1            ; forwarded bytes owed back as WINDOW_UPDATE
     .buf:       resb LINNEA_H2P_BUF
 endstruc

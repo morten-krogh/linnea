@@ -54,6 +54,12 @@ def send_ch_then(port, ch, tail):
         try:
             s.recv(4096)   # a sealed alert, or a clean EOF: either is a reply
             return True
+        except ConnectionResetError:
+            # Also a refusal, and just as prompt: the server closed while our
+            # oversized record was still arriving, so the kernel answers the
+            # unread data with a reset. What this test is really measuring is
+            # that the record is refused at once rather than waited for.
+            return True
         except socket.timeout:
             return False   # stalled: waiting for a record it cannot receive
     finally:

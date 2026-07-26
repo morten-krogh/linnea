@@ -289,8 +289,16 @@ emit_field:
     lea r9, [hdr_upg]
     jmp .rb_probe
 .rb_chk_cl:
+    push rsi
+    push rdi
     lea r9, [hdr_cl2]
-    jmp .rb_probe
+    call name_eq
+    pop rdi
+    pop rsi
+    jne .rebuild
+    mov [rbx + linnea_h2_req.cl_ptr], rsi    ; kept: the proxy path forwards
+    mov [rbx + linnea_h2_req.cl_len], rdi    ; it and streams the body
+    jmp .no_rebuild
 .rb_chk_pconn:
     lea r9, [hdr_pconn]
     jmp .rb_probe

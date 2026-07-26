@@ -49,6 +49,9 @@ extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_iequal
 extern linnea_memory_map
+extern linnea_log_stamp
+extern linnea_log_write
+extern linnea_log_u64
 extern drain_flag
 
 ; proxy-over-h2: slot pool init + lookup for the io_uring loop, the upstream
@@ -71,6 +74,14 @@ hdr_altsvc_name_len equ $ - hdr_altsvc_name
 mime_txt_h2:    db "text/plain"
 mime_txt_h2_len equ $ - mime_txt_h2
 
+dbgs:           db "DBG appends/bytes/sends/bodysends "
+dbgs_len        equ $ - dbgs
+dbgsp:          db " "
+dbgc:           db "DBG credit "
+dbgc_len        equ $ - dbgc
+dbgnl:          db 10
+dbgm:           db "DBG h2 goaway", 10
+dbgm_len        equ $ - dbgm
 msg_h2_pre:     db "linnea h2: "
 msg_h2_pre_len  equ $ - msg_h2_pre
 
@@ -86,6 +97,7 @@ linnea_h2_init:
     mov qword [rdi + linnea_connection.h2_last_stream], 0
     mov qword [rdi + linnea_connection.h2_rst_count], 0
     mov qword [rdi + linnea_connection.h2_done_count], 0
+    mov qword [rdi + linnea_connection.h2_upload], 0
     mov qword [rdi + linnea_connection.h2_init_swnd], LINNEA_H2_INIT_WINDOW
     ; zero the stream pool: every slot free (id 0)
     push rdi
@@ -295,22 +307,13 @@ linnea_h2_handle:
     jmp .frames
 .f_data:
     ; A request body. The whole DATA payload, padding included, counts
-    ; against flow control, so credit the connection window back right away
-    ; (13 bytes; the loop reserved 32) — the bytes are either collected for
-    ; a proxied exchange or dropped.
-    test eax, eax
-    jz .fd_nowin
-    mov byte [r13], 0
-    mov byte [r13 + 1], 0
-    mov byte [r13 + 2], 4
-    mov byte [r13 + 3], LINNEA_H2_FT_WINDOW_UPDATE
-    mov byte [r13 + 4], 0
-    mov dword [r13 + 5], 0           ; stream 0: the connection window
-    mov ecx, eax
-    bswap ecx
-    mov [r13 + 9], ecx
-    add r13, 13
-.fd_nowin:
+    ; against flow control. Bytes we drop, or collect whole, are credited
+    ; back at once (13 bytes; the frame loop reserved 32). A body being
+    ; streamed upstream is credited only once those bytes have actually been
+    ; sent — that is what stops a client outrunning the backend, and what
+    ; keeps the FIFO within the window we advertised.
+    mov [h2_fd_len], eax             ; the payload's flow-control cost
+    mov dword [h2_fd_credit], 1
     movzx edx, byte [rsi + 5]        ; stream id
     and edx, 0x7f
     shl edx, 8
@@ -346,7 +349,36 @@ linnea_h2_handle:
     pop rcx
     pop rax
     test rdi, rdi
-    jz .f_ignore                     ; nobody is collecting: dropped
+    jz .fd_done                      ; nobody is collecting: dropped
+    test qword [rdi + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
+    jz .fd_collect
+    ; --- streaming: append to the FIFO; the loop sends it upstream ---
+    mov r8, [rdi + linnea_h2p.rq_wr]
+    lea r9, [r8 + rax]
+    cmp r9, LINNEA_H2P_UPLOAD_BUF
+    ja .fd_toobig                    ; past a full receive window: impossible
+    cmp rax, [rdi + linnea_h2p.rq_rem]
+    ja .fd_toobig                    ; more body than Content-Length declared
+    mov dword [h2_fd_credit], 0      ; credited once it has gone upstream
+    push rdi
+    push r10
+    push r11
+    mov rdx, [rdi + linnea_h2p.rq_buf]
+    add rdx, r8
+    mov rsi, rcx
+    mov rdi, rdx
+    mov rcx, rax
+    rep movsb
+    pop r11
+    pop r10
+    pop rdi
+    mov [rdi + linnea_h2p.rq_wr], r9
+    sub [rdi + linnea_h2p.rq_rem], rax
+    inc qword [dbg_appends]
+    add [dbg_appended], rax
+    or qword [rdi + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
+    jmp .fd_done
+.fd_collect:
     mov r8, [rdi + linnea_h2p.len]
     lea r9, [r8 + rax]
     cmp r9, LINNEA_H2P_BODY_MAX
@@ -366,16 +398,32 @@ linnea_h2_handle:
     pop r10
     pop rdi
     test r10b, LINNEA_H2_FLAG_END_STREAM
-    jz .f_ignore                     ; more body to come
+    jz .fd_done                      ; more body to come
     push r11
     call h2p_finalize                ; body complete: terminate and connect
     pop r11
-    jmp .f_ignore
+    jmp .fd_done
 .fd_toobig:
-    ; the request body exceeds what we forward (the h1 path caps bodies the
-    ; same way): the exchange fails with a 413, emitted by the service
+    ; more than we will forward without a length to declare: the exchange
+    ; fails with a 413, which the service emits
     mov qword [rdi + linnea_h2p.state], LINNEA_H2P_FAILED
     mov qword [rdi + linnea_h2p.status], 413
+.fd_done:
+    cmp dword [h2_fd_credit], 0
+    je .f_ignore
+    mov eax, [h2_fd_len]
+    test eax, eax
+    jz .f_ignore
+    mov byte [r13], 0
+    mov byte [r13 + 1], 0
+    mov byte [r13 + 2], 4
+    mov byte [r13 + 3], LINNEA_H2_FT_WINDOW_UPDATE
+    mov byte [r13 + 4], 0
+    mov dword [r13 + 5], 0           ; stream 0: the connection window
+    mov ecx, eax
+    bswap ecx
+    mov [r13 + 9], ecx
+    add r13, 13
 .f_ignore:
     add r12, r11
     jmp .frames
@@ -450,6 +498,18 @@ linnea_h2_handle:
     add r12, r11
     jmp .close                       ; peer is going away
 .goaway_close:
+    push rsi
+    push r9
+    push r10
+    push r11
+    call linnea_log_stamp
+    lea rdi, [dbgm]
+    mov esi, dbgm_len
+    call linnea_log_write
+    pop r11
+    pop r10
+    pop r9
+    pop rsi
     ; queue GOAWAY(last_stream_id=0, NO_ERROR) and close once it's sent
     mov byte [r13], 0
     mov byte [r13 + 1], 0
@@ -529,8 +589,8 @@ linnea_h2_handle:
 %define L_SID    linnea_h2_req_size + 8
 %define L_CONT   linnea_h2_req_size + 16
 %define L_OUT    linnea_h2_req_size + 24
-%if L_OUT + 8 > 264
-  %error "h2_build_request stack frame (sub rsp,264) too small for req + locals"
+%if L_OUT + 8 > 280
+  %error "h2_build_request stack frame (sub rsp,280) too small for req + locals"
 %endif
 h2_build_request:
     push rbx
@@ -539,7 +599,7 @@ h2_build_request:
     push r14
     push r15
     push rbp
-    sub rsp, 264
+    sub rsp, 280
     mov rbx, rdi                     ; conn
     mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
@@ -711,7 +771,7 @@ h2_build_request:
 .err:
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
-    add rsp, 264
+    add rsp, 280
     pop rbp
     pop r15
     pop r14
@@ -1227,6 +1287,11 @@ h2_serve:
     mov qword [r13 + linnea_h2p.chunked], 0
     mov qword [r13 + linnea_h2p.chunk_rem], 0
     mov qword [r13 + linnea_h2p.status], 0
+    mov qword [r13 + linnea_h2p.rq_rd], 0
+    mov qword [r13 + linnea_h2p.rq_wr], 0
+    mov qword [r13 + linnea_h2p.rq_rem], 0
+    mov qword [r13 + linnea_h2p.rq_credit], 0
+    mov qword [r13 + linnea_h2p.rq_buf], 0
     mov rcx, [rsp + S_HEAD]
     imul rcx, rcx, LINNEA_H2P_F_IS_HEAD
     mov [r13 + linnea_h2p.flags], rcx
@@ -1270,8 +1335,40 @@ h2_serve:
     sub rdi, rax
     mov [r13 + linnea_h2p.req_len], rdi   ; the head so far (no terminator)
     cmp dword [h2_req_es], 0
-    je .proxy_done                   ; DATA frames will collect the body
-    mov rdi, r13                     ; END_STREAM on HEADERS: no body —
+    jne .proxy_nobody                ; END_STREAM on HEADERS: no body at all
+    ; A body with a declared length streams: the length is forwarded as the
+    ; client gave it and the bytes follow as they arrive, so an upload is
+    ; bounded by the flow-control window rather than by our buffer. Without
+    ; a length there is nothing to declare upstream, so those (rare) bodies
+    ; are still collected and measured first.
+    mov rdi, [r12 + linnea_h2_req.cl_ptr]
+    test rdi, rdi
+    jz .proxy_done
+    mov rsi, [r12 + linnea_h2_req.cl_len]
+    call h2p_dec_u64                 ; -> rax = the value, or -1
+    cmp rax, -1
+    je .proxy_done                   ; unparseable: collect and re-derive
+    test rax, rax
+    jz .proxy_nobody
+    ; claim the connection's upload buffer; without it (a second concurrent
+    ; upload) fall back to collecting a bounded body
+    cmp qword [rbx + linnea_connection.h2_upload], 0
+    jne .proxy_done
+    lea rcx, [r14 + 1]
+    mov [rbx + linnea_connection.h2_upload], rcx
+    mov rcx, [rbx + linnea_connection.index]
+    imul rcx, rcx, LINNEA_H2P_UPLOAD_BUF
+    add rcx, [h2_upload_pool]
+    mov [r13 + linnea_h2p.rq_buf], rcx
+    mov [r13 + linnea_h2p.rq_rem], rax
+    or qword [r13 + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
+    mov rdi, r13
+    mov rsi, [r12 + linnea_h2_req.cl_ptr]
+    mov rdx, [r12 + linnea_h2_req.cl_len]
+    call h2p_finalize_stream         ; head + Content-Length, then connect
+    jmp .proxy_done
+.proxy_nobody:
+    mov rdi, r13
     call h2p_finalize                ; terminate the head and connect
 .proxy_done:
     xor eax, eax                     ; no response bytes at the out cursor
@@ -1505,6 +1602,11 @@ linnea_h2p_init:
     imul rdi, rdi, linnea_hpack_dyn_size
     call linnea_memory_map
     mov [h2_dyn_pool], rax
+    ; and one streaming-upload buffer per connection
+    mov rdi, rbx
+    imul rdi, rdi, LINNEA_H2P_UPLOAD_BUF
+    call linnea_memory_map
+    mov [h2_upload_pool], rax
     pop rbx
     ret
 
@@ -1552,8 +1654,11 @@ h2p_alloc:
 .al_hit:
     ret
 
-; h2p_find_collect(rdi = conn, esi = stream id) -> rax = slot* collecting
-; that stream's request body, or 0.
+; h2p_find_collect(rdi = conn, esi = stream id) -> rax = slot* still taking
+; that stream's request body, or 0. Either it is buffering the body whole
+; (COLLECT), or it is streaming one — in which case it has already moved on
+; to connecting and sending, and keeps taking DATA until the declared length
+; is in.
 h2p_find_collect:
     mov rax, [rdi + linnea_connection.index]
     imul rax, rax, LINNEA_H2P_SLOTS
@@ -1561,10 +1666,18 @@ h2p_find_collect:
     add rax, [h2p_pool]
     mov ecx, LINNEA_H2P_SLOTS
 .fc_scan:
-    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_COLLECT
-    jne .fc_next
     cmp [rax + linnea_h2p.sid], rsi
+    jne .fc_next
+    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_COLLECT
     je .fc_hit
+    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
+    jz .fc_next
+    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
+    je .fc_next
+    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_ZOMBIE
+    je .fc_next
+    cmp qword [rax + linnea_h2p.rq_rem], 0
+    jne .fc_hit
 .fc_next:
     add rax, linnea_h2p_size
     dec ecx
@@ -1637,6 +1750,33 @@ h2p_release:
 linnea_h2p_conn_close:
     push rbx
     push r12
+    mov qword [rdi + linnea_connection.h2_upload], 0
+    push rdi
+    call linnea_log_stamp
+    lea rdi, [dbgs]
+    mov esi, dbgs_len
+    call linnea_log_write
+    mov rdi, [dbg_appends]
+    call linnea_log_u64
+    lea rdi, [dbgsp]
+    mov esi, 1
+    call linnea_log_write
+    mov rdi, [dbg_appended]
+    call linnea_log_u64
+    lea rdi, [dbgsp]
+    mov esi, 1
+    call linnea_log_write
+    mov rdi, [dbg_sends]
+    call linnea_log_u64
+    lea rdi, [dbgsp]
+    mov esi, 1
+    call linnea_log_write
+    mov rdi, [dbg_bodysends]
+    call linnea_log_u64
+    lea rdi, [dbgnl]
+    mov esi, 1
+    call linnea_log_write
+    pop rdi
     mov rax, [rdi + linnea_connection.index]
     imul rax, rax, LINNEA_H2P_SLOTS
     imul rax, rax, linnea_h2p_size
@@ -1703,23 +1843,68 @@ h2p_finalize:
     mov [rbx + linnea_h2p.req_len], rdi
     mov qword [rbx + linnea_h2p.rd], 0
     mov qword [rbx + linnea_h2p.len], 0    ; buf is the response buffer now
-    ; open the upstream socket; the loop arms the connect
+    mov rdi, rbx
+    call h2p_open_upstream
+    pop r12
+    pop rbx
+    ret
+
+; h2p_open_upstream(rdi = slot*) — open the socket and ask the loop to
+; connect; a socket we cannot even open fails the exchange with a 502.
+h2p_open_upstream:
+    push rbx
+    mov rbx, rdi
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM
     xor edx, edx
     mov eax, LINNEA_SYS_SOCKET
     syscall
     test eax, eax
-    js .fin_nosock
+    js .ou_nosock
     mov [rbx + linnea_h2p.fd], eax
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_CONNECTING
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_CONN
-    pop r12
     pop rbx
     ret
-.fin_nosock:
+.ou_nosock:
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FAILED
     mov qword [rbx + linnea_h2p.status], 502
+    pop rbx
+    ret
+
+; h2p_finalize_stream(rdi = slot*, rsi = content-length text, rdx = its
+; length) — the request head is complete and its body will follow through the
+; FIFO: declare the length the client gave us (verbatim, so we forward what it
+; promised), terminate the head, and open the upstream socket. The body is not
+; part of req_len — it is sent from the FIFO as it arrives.
+h2p_finalize_stream:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    lea rdi, [rbx + linnea_h2p.buf]
+    add rdi, [rbx + linnea_h2p.req_len]
+    lea rsi, [h2p_clen]              ; "Content-Length: "
+    mov ecx, h2p_clen_len
+    rep movsb
+    mov rsi, r12                     ; the value as the client wrote it
+    mov rcx, r13
+    rep movsb
+    mov word [rdi], 0x0a0d
+    add rdi, 2
+    lea rsi, [h2p_conn_close]        ; "Connection: close" CRLF CRLF
+    mov ecx, h2p_conn_close_len
+    rep movsb
+    lea rax, [rbx + linnea_h2p.buf]
+    sub rdi, rax
+    mov [rbx + linnea_h2p.req_len], rdi
+    mov qword [rbx + linnea_h2p.rd], 0
+    mov qword [rbx + linnea_h2p.len], 0    ; buf doubles as the response buffer
+    mov rdi, rbx
+    call h2p_open_upstream
+    pop r13
     pop r12
     pop rbx
     ret
@@ -1802,10 +1987,65 @@ linnea_h2p_event:
 .ev_send:
     test r14d, r14d
     js .ev_send_err
+    test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
+    jnz .ev_send_stream
     add [rbx + linnea_h2p.sent], r14d
     mov rax, [rbx + linnea_h2p.sent]
     cmp rax, [rbx + linnea_h2p.req_len]
     jb .ev_send_more
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_HEAD
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
+    jmp .ev_service
+.ev_send_stream:
+    inc qword [dbg_sends]
+    ; a streamed request: the head goes out first, then FIFO body bytes.
+    ; Body bytes that have left are owed back to the client as flow-control
+    ; credit, and the FIFO slides down so the next window can land in it.
+    mov rax, [rbx + linnea_h2p.sent]
+    cmp rax, [rbx + linnea_h2p.req_len]
+    jae .ev_sent_body
+    add [rbx + linnea_h2p.sent], r14d          ; still the head
+    jmp .ev_stream_next
+.ev_sent_body:
+    inc qword [dbg_bodysends]
+    mov eax, r14d
+    add [rbx + linnea_h2p.rq_rd], rax
+    add [rbx + linnea_h2p.rq_credit], rax      ; owed back as WINDOW_UPDATE
+    ; Reclaim what has been sent. Fully drained, the FIFO simply restarts;
+    ; partly drained, the remainder slides down — a body of any size then
+    ; flows through a buffer the size of one receive window. This is the one
+    ; safe moment to move those bytes: the send that was reading them has
+    ; just completed and the next is armed after we return.
+    mov rax, [rbx + linnea_h2p.rq_rd]
+    cmp rax, [rbx + linnea_h2p.rq_wr]
+    jb .ev_stream_slide
+    mov qword [rbx + linnea_h2p.rq_rd], 0      ; FIFO drained: start over
+    mov qword [rbx + linnea_h2p.rq_wr], 0
+    jmp .ev_stream_next
+.ev_stream_slide:
+    push rsi
+    push rdi
+    mov rsi, [rbx + linnea_h2p.rq_buf]
+    mov rdi, rsi
+    add rsi, rax                               ; the unsent remainder
+    mov rcx, [rbx + linnea_h2p.rq_wr]
+    sub rcx, rax
+    mov [rbx + linnea_h2p.rq_wr], rcx
+    mov qword [rbx + linnea_h2p.rq_rd], 0
+    rep movsb
+    pop rdi
+    pop rsi
+.ev_stream_next:
+    ; more to send? Otherwise, if the body is complete, read the response
+    mov rax, [rbx + linnea_h2p.sent]
+    cmp rax, [rbx + linnea_h2p.req_len]
+    jb .ev_send_more                           ; head not fully out
+    mov rax, [rbx + linnea_h2p.rq_rd]
+    cmp rax, [rbx + linnea_h2p.rq_wr]
+    jb .ev_send_more                           ; FIFO has bytes
+    cmp qword [rbx + linnea_h2p.rq_rem], 0
+    jne .ev_service                            ; waiting on more DATA
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_REQ_DONE
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_HEAD
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
     jmp .ev_service
@@ -1862,6 +2102,7 @@ linnea_h2p_event:
 
 ; h2p_free_slot(rbx = slot*) — close the upstream fd and mark the slot free.
 h2p_free_slot:
+    mov qword [rbx + linnea_h2p.rq_buf], 0
     mov edi, [rbx + linnea_h2p.fd]
     cmp edi, -1
     je .fsl_nofd
@@ -1884,6 +2125,25 @@ linnea_h2p_service:
     push r14
     push r15
     mov rbx, rdi                     ; conn
+    ; the upload buffer belongs to one streaming request at a time: hand it
+    ; back as soon as that slot is done, so the next upload can have it
+    mov rcx, [rbx + linnea_connection.h2_upload]
+    test rcx, rcx
+    jz .sv_claim_ok
+    dec rcx
+    imul rax, rcx, linnea_h2p_size
+    mov rdx, [rbx + linnea_connection.index]
+    imul rdx, rdx, LINNEA_H2P_SLOTS
+    imul rdx, rdx, linnea_h2p_size
+    add rax, rdx
+    add rax, [h2p_pool]
+    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
+    jz .sv_unclaim
+    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
+    jne .sv_claim_ok
+.sv_unclaim:
+    mov qword [rbx + linnea_connection.h2_upload], 0
+.sv_claim_ok:
     cmp qword [rbx + linnea_connection.h2_tx_busy], 0
     jne .sv_none                     ; out_buf is in flight; retry on drain
     lea r15, [rbx + linnea_connection.out_buf]   ; write cursor
@@ -1899,6 +2159,35 @@ linnea_h2p_service:
     sub rax, r15
     cmp rax, 1024
     jb .sv_done
+    ; request-body bytes that have gone upstream are owed back to the client
+    ; as flow-control credit — on the stream and on the connection — or it
+    ; stops sending after one window
+    mov r14, [r12 + linnea_h2p.rq_credit]
+    test r14, r14
+    jz .sv_no_credit
+    push r14
+    call linnea_log_stamp
+    lea rdi, [dbgc]
+    mov esi, dbgc_len
+    call linnea_log_write
+    mov rdi, [rsp]
+    call linnea_log_u64
+    lea rdi, [dbgnl]
+    mov esi, 1
+    call linnea_log_write
+    pop r14
+    mov qword [r12 + linnea_h2p.rq_credit], 0
+    mov rdi, r15
+    mov rsi, [r12 + linnea_h2p.sid]
+    mov edx, r14d
+    call h2p_emit_window
+    add r15, rax
+    mov rdi, r15
+    xor esi, esi                     ; stream 0: the connection window
+    mov edx, r14d
+    call h2p_emit_window
+    add r15, rax
+.sv_no_credit:
     test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_REAP
     jnz .sv_reap
     cmp qword [r12 + linnea_h2p.state], LINNEA_H2P_FAILED
@@ -2003,6 +2292,30 @@ h2p_finish_stream:
     inc qword [rdi + linnea_connection.h2_done_count]
 .fs_ret:
     pop rbx
+    ret
+
+; h2p_emit_window(rdi = out, rsi = stream id (0 = connection), edx =
+; increment) -> rax = 13. A WINDOW_UPDATE frame.
+h2p_emit_window:
+    mov byte [rdi], 0
+    mov byte [rdi + 1], 0
+    mov byte [rdi + 2], 4
+    mov byte [rdi + 3], LINNEA_H2_FT_WINDOW_UPDATE
+    mov byte [rdi + 4], 0
+    mov rax, rsi
+    mov rcx, rax
+    shr rax, 24
+    mov [rdi + 5], al
+    mov rax, rcx
+    shr rax, 16
+    mov [rdi + 6], al
+    mov rax, rcx
+    shr rax, 8
+    mov [rdi + 7], al
+    mov [rdi + 8], cl
+    bswap edx
+    mov [rdi + 9], edx
+    mov eax, 13
     ret
 
 ; h2p_emit_rst(rdi = out, rsi = stream id, edx = error code) -> rax = 13.
@@ -3629,7 +3942,14 @@ h2_hdrs_buf:  resb 8192              ; proxy: the rebuilt h1 header lines
 h2_req_es:    resd 1                 ; END_STREAM was set on the HEADERS frame
 h2p_pool:     resq 1                 ; the upstream slot array (one mmap)
 h2_dyn_pool:  resq 1                 ; per-connection HPACK dynamic tables
+h2_upload_pool: resq 1               ; per-connection streaming-upload buffers
 h2_cur_srv:   resq 1                 ; vhost whose response is being built
+dbg_appends:  resq 1
+dbg_appended: resq 1
+dbg_sends:    resq 1
+dbg_bodysends: resq 1
+h2_fd_len:    resd 1                 ; a DATA frame's flow-control cost
+h2_fd_credit: resd 1                 ; and whether it is owed back now
 h2p_numbuf:   resb 24
 h2p_stbuf:    resb 4                 ; a status as three ASCII digits
 h2p_nmbuf:    resb 64                ; a response field name, lowercased

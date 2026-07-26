@@ -1048,7 +1048,9 @@ n=$(printf '%s' "$resp" | grep -c "200 OK")
 [ "$n" -eq 2 ]
 check "body discarded, keep-alive" $?
 check_http "chunked 501" "501 Not Implemented" "$(raw_http 'GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n')"
-check_http "body too large 413" "413 Content Too Large" "$(raw_http 'GET / HTTP/1.1\r\nContent-Length: 9000\r\n\r\n')"
+# A static location cannot stream a body, so one it cannot buffer with the
+# head is refused; a proxy location streams the same body instead (below).
+check_http "body too large 413" "413 Content Too Large" "$(raw_http 'GET / HTTP/1.1\r\nContent-Length: 20000\r\n\r\n')"
 
 # --- protocol errors and traversal (raw, curl normalizes paths) ---
 check_http "http 400" "400 Bad Request" "$(raw_http 'GARBAGE\r\n\r\n')"
@@ -1189,6 +1191,19 @@ curl -s --max-time 3 http://127.0.0.1:47080/api/truncated >/dev/null 2>&1
 grep -qF ': upstream closed early' "$LOG"
 check "proxy truncated body" $?
 
+# --- large uploads: the body streams to the upstream instead of being
+# buffered whole, so it is bounded by the relay, not by in_buf ---
+python3 -c "
+import random, sys
+random.seed(11)
+open('test/www/upload.bin','wb').write(bytes(random.getrandbits(8) for _ in range(300000)))"
+want=$(md5sum < test/www/upload.bin | cut -d' ' -f1)
+curl -s --max-time 30 --data-binary @test/www/upload.bin \
+    http://127.0.0.1:47080/api/echo > /tmp/upload_echo.bin
+[ "$(md5sum < /tmp/upload_echo.bin | cut -d' ' -f1)" = "$want" ]
+check "proxy streams a 300000-byte request body (byte-exact)" $?
+rm -f /tmp/upload_echo.bin
+
 # --- proxied request log lines: upstream status, relayed byte count ---
 grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /api/simple" 200 12' "$LOG"
 check "proxy log 200" $?
@@ -1265,7 +1280,7 @@ check "termination idle timeout" $?
 kill $server_pid $backend_pid 2>/dev/null
 wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
-rm -f "$LOG" test/www/big.txt test/www/h2range.bin test/www/huge.bin test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
+rm -f "$LOG" test/www/big.txt test/www/upload.bin test/www/upload2.bin test/www/h2range.bin test/www/huge.bin test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
 
 # --- graceful drain: SIGTERM finishes in-flight work, then exits ---
 # A slow download is in flight when the master is killed; the workers
@@ -1657,6 +1672,27 @@ PYEOF
         -o /dev/null "$P/api/simple" -o /dev/null "$P/api/simple")
     [ "$(echo $codes | tr ' ' '\n' | grep -c '^200$')" -eq 6 ]
     check "http2 proxy: six concurrent proxied streams all answered" $?
+    # a large upload over h2: the body streams through the flow-control
+    # window instead of being collected, so it is not capped by a buffer
+    python3 -c "
+import random
+random.seed(13)
+open('test/www/upload2.bin','wb').write(bytes(random.getrandbits(8) for _ in range(300000)))"
+uwant=$(md5sum < test/www/upload2.bin | cut -d' ' -f1)
+timeout 60 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+    --data-binary @test/www/upload2.bin "https://localhost:47443/api/echo" \
+    > /tmp/upload2_echo.bin
+[ "$(md5sum < /tmp/upload2_echo.bin | cut -d' ' -f1)" = "$uwant" ]
+check "http2 streams a 300000-byte request body (byte-exact)" $?
+rm -f /tmp/upload2_echo.bin
+# and over TLS HTTP/1.1, where the client pipelines it behind the handshake
+timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+    --data-binary @test/www/upload2.bin "https://localhost:47443/api/echo" \
+    > /tmp/upload3_echo.bin
+[ "$(md5sum < /tmp/upload3_echo.bin | cut -d' ' -f1)" = "$uwant" ]
+check "tls http1.1 streams a 300000-byte request body (byte-exact)" $?
+rm -f /tmp/upload3_echo.bin
+
     # a HEAD is bodiless, and its slot must come back: more sequential
     # bodiless requests than there are slots, all on one connection
     args=""

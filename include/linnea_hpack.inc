@@ -84,6 +84,8 @@ struc linnea_h2_req
     .hb_start:    resq 1
     .hb_end:      resq 1
     .hb_cur:      resq 1
+    .cl_ptr:      resq 1        ; content-length value, 0 if absent (the
+    .cl_len:      resq 1        ; proxy path forwards it and streams the body)
     .dyn:         resq 1        ; *linnea_hpack_dyn for this connection, or 0
                                 ; (QPACK passes 0: HTTP/3 has its own table
                                 ; encoding, and we advertise zero capacity)

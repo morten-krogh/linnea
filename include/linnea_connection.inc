@@ -1,7 +1,12 @@
 ; Connection pool limits and per-connection state layout.
 ; The pool size comes from the config (max_connections).
 
-LINNEA_CONN_IN_BUF      equ 8192   ; request head+body buffer (431/413 if exceeded)
+; Request head+body buffer (431/413 if exceeded). It must also be able to
+; hold one maximum-size TLS record: during the userspace handshake we read a
+; record at a time, and a record the client pipelines behind its Finished has
+; to be decrypted here before the kernel takes over the connection. TLS 1.3
+; caps a record at 16384 plaintext bytes plus header and expansion.
+LINNEA_CONN_IN_BUF      equ 17408
 LINNEA_CONN_UP_BUF      equ 8448   ; the outbound request head (client head
                                    ; plus our Connection line), then reused
                                    ; for the upstream response head and the
@@ -24,6 +29,9 @@ LINNEA_PROXY_TUNNEL     equ 6      ; full-duplex byte relay after a 101; the
                                    ; one-op invariant becomes one PER DIRECTION
 LINNEA_PROXY_CLOSING    equ 7      ; tunnel torn down; both sockets are shut
                                    ; down, waiting for in-flight ops to drain
+LINNEA_PROXY_REQ_BODY   equ 8      ; relaying a request body too large to
+                                   ; buffer: client recv -> upstream send,
+                                   ; a chunk at a time, until it is all sent
 
 ; conn.tls_phase — a TLS connection is only special until the keys reach the
 ; kernel; after that the ordinary HTTP/proxy/tunnel path runs unchanged.
@@ -68,6 +76,12 @@ struc linnea_connection
                                    ; -1 = until the upstream closes
     .relayed:       resq 1         ; body bytes relayed to the client
     .up_len:        resq 1         ; bytes buffered in up_buf
+    .req_body_rem:  resq 1         ; request-body bytes still to come from the
+                                   ; client and be relayed upstream. Nonzero
+                                   ; only for a body too large to buffer with
+                                   ; the head, which streams through in_buf a
+                                   ; chunk at a time instead of being held
+                                   ; whole (a 413 before Q89).
     .up_status:     resq 1         ; upstream status code, for the log
     .is_head:       resq 1         ; 1 = the client sent HEAD (no body relay)
     ; --- upgrade tunnel (websockets etc.) ----------------------------
@@ -98,6 +112,7 @@ struc linnea_connection
     .h2_init_swnd:   resq 1        ; peer's SETTINGS_INITIAL_WINDOW_SIZE
     .h2_tx_busy:     resq 1        ; a client send is in flight: out_buf is
                                    ; owned by it, defer frame building
+    .h2_upload:      resq 1        ; slot index + 1 owning the upload buffer
     .h2_rx_busy:     resq 1        ; a client recv is in flight. Upstream
                                    ; completions can reach the client side at
                                    ; any time, so both directions are tracked

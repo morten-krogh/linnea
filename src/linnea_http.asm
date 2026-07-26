@@ -362,7 +362,7 @@ linnea_http_handle:
     push r13
     push r14
     push r15
-    sub rsp, 288
+    sub rsp, 304
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -796,16 +796,31 @@ linnea_http_handle:
     jnz .resp_501
     ; an unknown method is only an error on a static location (405 below);
     ; proxy locations forward whatever the client sent
-    ; the whole body must be buffered so it can be discarded with the
-    ; head; only then is keep-alive safe
+    ; A body that fits is buffered whole with the head, so both can be
+    ; dropped together and keep-alive stays safe. One that does not fit is
+    ; only servable by a proxy location, which streams it upstream as it
+    ; arrives — the routing below sends anything else to a 413.
+    mov qword [rsp + 288], 0   ; streaming the request body?
+    mov qword [rbx + linnea_connection.req_body_rem], 0
     mov rax, [rbx + linnea_connection.head_len]
     add rax, [rsp + 128]
     cmp rax, LINNEA_CONN_IN_BUF
-    ja .resp_413
+    ja .body_stream
     cmp rax, [rbx + linnea_connection.in_len]
     jbe .body_ready
     mov eax, LINNEA_HTTP_NEED_MORE
     jmp .ret
+.body_stream:
+    ; keep the head consumed and hand the routing whatever body bytes have
+    ; already arrived; the rest follows through the same buffer
+    mov qword [rsp + 288], 1
+    mov rcx, [rbx + linnea_connection.in_len]
+    sub rcx, [rbx + linnea_connection.head_len]      ; body bytes in hand
+    mov rax, [rsp + 128]
+    sub rax, rcx                                     ; still to come
+    mov [rbx + linnea_connection.req_body_rem], rax
+    mov [rsp + 128], rcx       ; what .proxy_start queues behind the head
+    mov rax, [rbx + linnea_connection.in_len]
 .body_ready:
     mov [rbx + linnea_connection.head_len], rax
     ; strip the query string for routing; [rsp+144] keeps the raw length
@@ -1040,9 +1055,11 @@ linnea_http_handle:
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
     je .proxy_start
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
-    je .redirect_start
+    je .redirect_check
 
     ; --- static location ---------------------------------------------
+    cmp qword [rsp + 288], 0
+    jne .resp_413              ; only a proxy streams a body this large
     cmp qword [rsp], -1
     je .resp_405               ; files are GET/HEAD only
     mov rdi, r15               ; path end, from the match above
@@ -1391,6 +1408,11 @@ linnea_http_handle:
     mov rax, [rsp + 280]       ; the log's byte count: what the body holds
     mov [rsp + 32], rax
     jmp .log_request
+
+.redirect_check:
+    cmp qword [rsp + 288], 0
+    jne .resp_413              ; a redirect cannot consume the body either
+    jmp .redirect_start
 
 ; --- redirect location: 301, Location = target + the raw request -------
 ; The original percent-encoded target (query included) is appended to the
@@ -1800,7 +1822,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 288
+    add rsp, 304
     pop r15
     pop r14
     pop r13
