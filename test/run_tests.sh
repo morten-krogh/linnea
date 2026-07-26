@@ -493,6 +493,23 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_dup_request_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): retransmitted request is not served twice (no duplicate wedge)" $?
 
+    # an Initial's header carries the token a client echoes from a Retry, and the
+    # server copies that header into a fixed scratch buffer to authenticate the
+    # packet. The token is client-supplied, so an oversized one must be refused
+    # rather than copied over whatever follows the buffer — a worker that dies here
+    # is a remote, pre-handshake stack overwrite with attacker-chosen bytes.
+    python3 test/quic/h3_initial_token_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): oversized Initial token refused, not copied past its buffer" $?
+
+    # a flood of Initials that are never answered must not fill the connection pool
+    # and lock real clients out: once enough slots are held by unvalidated peers the
+    # server demands a Retry token, which only a client at a real address can echo.
+    # Runs late and settles afterwards — it deliberately leaves the pool under
+    # pressure, and the pool needs a moment to reclaim the forged slots.
+    python3 test/quic/h3_retry_test.py 47452 300 >/dev/null 2>&1
+    check "h3 (io_uring): forged-Initial flood does not lock out real clients" $?
+    sleep 6
+
     # a spoofed packet from a different source, carrying a valid connection id but
     # no valid AEAD tag, must NOT redirect the server's sends (RFC 9000 9.3): the
     # peer address is adopted only from an authenticated packet.

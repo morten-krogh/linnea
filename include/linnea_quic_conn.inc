@@ -20,6 +20,24 @@ LINNEA_QUIC_MAX_CONNS equ 64        ; connections per worker
 LINNEA_QUIC_RXBUF_SIZE equ 2048     ; linnea_quic_rxbuf, the datagram we read into
 LINNEA_QUIC_SCID_LEN  equ 8         ; every connection ID we issue is 8 bytes
 LINNEA_QUIC_IDLE_SECS equ 30        ; reclaim a slot after this long with no packet
+; A handshake that has stalled is reclaimed far sooner than an established
+; connection: a peer that has not finished in this long is either gone or never
+; existed (a spoofed Initial), and holding its slot for the full idle window is
+; what lets a trickle of forged packets keep the pool occupied.
+LINNEA_QUIC_HS_IDLE_SECS equ 3
+
+; Address validation (RFC 9000 8.1). An Initial packet costs a connection slot, a
+; key exchange and a signature, and its source address is unverifiable — UDP has no
+; handshake — so a flood of forged Initials would otherwise fill the pool and lock
+; real clients out (measured: ~300 abandoned Initials, and no browser could open
+; h3 until the sweep caught up). Once this many slots are held by peers that have
+; not yet proved their address, a new Initial without a token is answered with a
+; Retry instead: the client must echo the token from an address that really
+; receives our packets before any state is created. Below the threshold nothing
+; changes, so the common case keeps its 1-RTT (and 0-RTT) handshake.
+LINNEA_QUIC_UNVALIDATED_MAX equ 16
+LINNEA_QUIC_RETRY_TOKEN_LEN equ 46  ; version(1) ts(8) odcid_len(1) odcid(20) mac(16)
+LINNEA_QUIC_RETRY_WINDOW_MS equ 10000  ; a token older than this is refused
 
 ; A ClientHello too large for one Initial packet (a browser offering a
 ; post-quantum key share runs to ~1.6 KB, well over the ~1200-byte Initial) is
@@ -324,6 +342,15 @@ struc linnea_quic_conn
     ; the offset-0 fragment, and the ClientHello is parsed once ch_len reaches it.
     .odcid:      resb LINNEA_QUIC_MAX_CID   ; the client's original DCID
     .odcid_len:  resq 1
+    ; What to advertise as original_destination_connection_id (RFC 9000 7.3). It is
+    ; normally .odcid, but after a Retry the client's Initials carry the id WE chose,
+    ; so the parameter must still name the id it first used — recovered from the
+    ; token, since we kept no state for it. A client checks both this and
+    ; retry_source_connection_id and aborts the handshake if either is wrong.
+    .tp_odcid:     resb LINNEA_QUIC_MAX_CID
+    .tp_odcid_pad: resb 4                    ; keep the struct 8-byte aligned
+    .tp_odcid_len: resq 1
+    .via_retry:    resq 1              ; 1 if this connection came through a Retry
     .ch_len:     resq 1              ; contiguous ClientHello bytes reassembled
     .ch_total:   resq 1              ; full ClientHello size, 0 until the header lands
     .ch_hi:      resq 1              ; highest offset+len seen (extent of ch_seen)

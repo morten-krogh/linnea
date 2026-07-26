@@ -36,6 +36,7 @@ extern linnea_file_unmap
 extern linnea_bpf_probe
 extern linnea_bpf_reuseport_setup
 extern linnea_quic_reset_secret_init
+extern linnea_quic_retry_secret_init
 extern linnea_worker_index
 extern linnea_config_parse
 extern linnea_config_validate
@@ -196,6 +197,7 @@ _start:
     ; derive the stateless-reset key once, here in the master, so every forked
     ; worker inherits the same secret and computes matching reset tokens (RFC 9000 10.3)
     call linnea_quic_reset_secret_init
+    call linnea_quic_retry_secret_init
 
     xor r12d, r12d             ; worker slot
 .spawn_loop:

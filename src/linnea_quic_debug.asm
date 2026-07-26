@@ -28,6 +28,7 @@ global linnea_quic_dbg_serve
 global linnea_quic_dbg_reset
 global linnea_quic_dbg_chunk
 global linnea_quic_dbg_fc
+global linnea_quic_dbg_num
 global qdbg_pass
 
 extern linnea_log_write
@@ -97,6 +98,10 @@ s_rxhf:  db " hf="
 s_rxhf_len equ $ - s_rxhf
 s_srv:   db "qsrv sid="
 s_srv_len equ $ - s_srv
+s_num:   db "qnum tag="
+s_num_len equ $ - s_num
+s_numv:  db " val="
+s_numv_len equ $ - s_numv
 s_fcd:   db "qfcd max="
 s_fcd_len equ $ - s_fcd
 s_fcdc:  db " cur="
@@ -447,6 +452,29 @@ linnea_quic_dbg_fc:
     mov rdi, rbx
     call linnea_log_u64
     W s_fcdc
+    mov rdi, r13
+    call linnea_log_u64
+    W s_nl
+    pop r13
+    pop rbx
+    ret
+
+; linnea_quic_dbg_num(rdi = tag, rsi = value) — log one labelled number. Dark
+; unless the trigger is set; used while tracing a path that has no state to dump.
+linnea_quic_dbg_num:
+    cmp byte [qdbg_on], 0
+    jne .on
+    ret
+.on:
+    push rbx
+    push r13
+    mov rbx, rdi
+    mov r13, rsi
+    call linnea_log_stamp
+    W s_num
+    mov rdi, rbx
+    call linnea_log_u64
+    W s_numv
     mov rdi, r13
     call linnea_log_u64
     W s_nl

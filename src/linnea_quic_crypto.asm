@@ -13,6 +13,7 @@ default rel
 %include "linnea_quic.inc"
 %include "linnea_aesgcm.inc"
 %include "linnea_syscall.inc"
+%include "linnea_quic_conn.inc"
 
 global linnea_quic_initial_secrets
 global linnea_quic_hp_mask
@@ -20,6 +21,9 @@ global linnea_quic_hs_secrets
 global linnea_quic_app_secrets
 global linnea_quic_ku_next
 global linnea_quic_reset_secret_init
+global linnea_quic_retry_secret_init
+global linnea_quic_retry_token_make
+global linnea_quic_retry_token_check
 global linnea_quic_reset_token
 global quic_v2_active
 global linnea_quic_resumption_psk
@@ -860,3 +864,170 @@ linnea_quic_hs_psk: resq 1                ; resumption PSK ptr for hs_secrets, 0
 linnea_quic_early_ok: resq 1              ; 1 when 0-RTT is accepted (drives EE early_data)
 linnea_quic_resume_issued: resq 1         ; accepted ticket's issued time (0-RTT freshness)
 strike_reg:    resb STRIKE_N * 16         ; 0-RTT replay strike register (per worker)
+
+
+; --- Retry tokens (RFC 9000 8.1.2) ------------------------------------------
+; A Retry token proves the client really receives packets at the address it
+; claims: we send it one, and only a client at that address can echo it back.
+; The token is stateless — everything needed to check it is inside — because the
+; whole point is to create no state until the address is proven. It is bound to
+; the peer address and to the connection id the client first used (needed later
+; for the original_destination_connection_id transport parameter), stamped with a
+; timestamp so it expires, and authenticated with a secret this run generates.
+;
+;   token = version(1) | timestamp ms(8) | odcid len(1) | odcid(20, zero padded)
+;           | HMAC-SHA256(secret, canonical peer address | the 30 bytes above)[0..16]
+;
+; The secret is drawn once before the workers fork, so a token issued by one
+; worker verifies in any of them.
+
+section .bss
+linnea_quic_retry_secret: resb 32
+retry_hbuf:  resb 52                 ; canonical address (20) + token body (30)
+retry_mac:   resb 32
+
+section .text
+
+; linnea_quic_retry_secret_init() — fill the Retry token key from getrandom(2).
+; Must run before the workers fork, like the stateless-reset secret.
+linnea_quic_retry_secret_init:
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [linnea_quic_retry_secret]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    ret
+
+; retry_addr_canon(rdi = sockaddr, rsi = out, 20 bytes) — the peer address in a
+; fixed shape: family, port, and the address bytes. The fields that can differ
+; between two datagrams from the same peer (IPv6 flowinfo and scope id) are left
+; out, so a token stays valid for the client that was sent it.
+retry_addr_canon:
+    xor eax, eax
+    mov [rsi], rax
+    mov [rsi + 8], rax
+    mov dword [rsi + 16], eax
+    mov ax, [rdi]                     ; sa_family
+    mov [rsi], ax
+    mov ax, [rdi + 2]                 ; port, network order
+    mov [rsi + 2], ax
+    cmp word [rdi], LINNEA_AF_INET6
+    je .v6
+    mov eax, [rdi + 4]                ; sockaddr_in: 4 address bytes
+    mov [rsi + 4], eax
+    ret
+.v6:
+    mov rax, [rdi + 8]                ; sockaddr_in6: 16 address bytes
+    mov [rsi + 4], rax
+    mov rax, [rdi + 16]
+    mov [rsi + 12], rax
+    ret
+
+; retry_token_mac(rdi = sockaddr, rsi = token body (the first 30 bytes)) — leaves
+; the 32-byte HMAC in retry_mac. Shared by make and check so they cannot drift.
+retry_token_mac:
+    push rbx
+    mov rbx, rsi
+    lea rsi, [retry_hbuf]
+    call retry_addr_canon
+    lea rdi, [retry_hbuf + 20]
+    mov rsi, rbx
+    mov ecx, 30
+    rep movsb
+    lea rdi, [linnea_quic_retry_secret]
+    mov esi, 32
+    lea rdx, [retry_hbuf]
+    mov ecx, 50
+    lea r8, [retry_mac]
+    call linnea_hmac_sha256
+    pop rbx
+    ret
+
+; linnea_quic_retry_token_make(rdi = sockaddr, rsi = odcid, rdx = odcid len,
+;   rcx = now in ms, r8 = out) — writes LINNEA_QUIC_RETRY_TOKEN_LEN bytes.
+linnea_quic_retry_token_make:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, r8                       ; out
+    mov r12, rdi                      ; sockaddr
+    mov r13, rsi                      ; odcid
+    mov r14, rdx                      ; odcid len
+    mov byte [rbx], 1                 ; token version
+    mov [rbx + 1], rcx                ; timestamp
+    mov [rbx + 9], r14b
+    xor eax, eax                      ; zero the odcid field, then fill it
+    mov [rbx + 10], rax
+    mov [rbx + 18], rax
+    mov dword [rbx + 26], eax
+    lea rdi, [rbx + 10]
+    mov rsi, r13
+    mov rcx, r14
+    rep movsb
+    mov rdi, r12
+    mov rsi, rbx
+    call retry_token_mac
+    mov rax, [retry_mac]              ; the first 16 bytes authenticate the token
+    mov [rbx + 30], rax
+    mov rax, [retry_mac + 8]
+    mov [rbx + 38], rax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_retry_token_check(rdi = sockaddr, rsi = token, rdx = token len,
+;   rcx = now in ms, r8 = odcid out, 20 bytes)
+;   -> rax = the odcid length, or -1 if the token is not one we issued to this
+;      address within the freshness window.
+linnea_quic_retry_token_check:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rsi                      ; token
+    mov r12, r8                       ; odcid out
+    mov r13, rcx                      ; now
+    mov r14, rdi                      ; sockaddr
+    cmp rdx, LINNEA_QUIC_RETRY_TOKEN_LEN
+    jne .bad
+    cmp byte [rbx], 1
+    jne .bad
+    ; freshness: reject both the stale and the impossible (a timestamp ahead of
+    ; now means the token was not made by this run)
+    mov rax, r13
+    sub rax, [rbx + 1]
+    jb .bad
+    cmp rax, LINNEA_QUIC_RETRY_WINDOW_MS
+    ja .bad
+    movzx eax, byte [rbx + 9]
+    cmp eax, LINNEA_QUIC_MAX_CID
+    ja .bad
+    mov rdi, r14
+    mov rsi, rbx
+    call retry_token_mac
+    ; compare the 16 authenticating bytes without an early exit
+    mov rax, [retry_mac]
+    xor rax, [rbx + 30]
+    mov rcx, [retry_mac + 8]
+    xor rcx, [rbx + 38]
+    or rax, rcx
+    jnz .bad
+    movzx eax, byte [rbx + 9]         ; good: hand back the original id
+    mov rdi, r12
+    lea rsi, [rbx + 10]
+    mov ecx, eax
+    push rax
+    rep movsb
+    pop rax
+    jmp .ret
+.bad:
+    mov rax, -1
+.ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret

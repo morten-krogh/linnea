@@ -16,6 +16,8 @@ global linnea_quic_conn_alloc
 global linnea_quic_conn_free
 global linnea_quic_conn_sweep
 global linnea_quic_conn_active
+global linnea_quic_conn_unvalidated
+global linnea_quic_conn_sweep_now
 global linnea_quic_conn_slot
 global linnea_worker_index
 global linnea_quic_conn_free_hook
@@ -198,7 +200,16 @@ linnea_quic_conn_sweep:
     jb .sw_next                      ; stamped ahead of now: treat as active,
                                      ; never let the subtraction wrap and
                                      ; reclaim a live connection
-    cmp rax, rsi
+    ; an established connection gets the full idle window; one still handshaking
+    ; gets a much shorter one (see LINNEA_QUIC_HS_IDLE_SECS)
+    mov rdx, rsi
+    cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
+    je .sw_window
+    cmp rdx, LINNEA_QUIC_HS_IDLE_SECS
+    jbe .sw_window
+    mov edx, LINNEA_QUIC_HS_IDLE_SECS
+.sw_window:
+    cmp rax, rdx
     jbe .sw_next                     ; still within the idle window
     cmp qword [linnea_quic_conn_free_hook], 0
     je .sw_reclaim
@@ -220,6 +231,37 @@ linnea_quic_conn_sweep:
     mov eax, r12d
     pop r12
     pop rbx
+    ret
+
+; linnea_quic_conn_sweep_now() -> rax = slots reclaimed. Reads the clock itself
+; and reclaims every connection that has gone quiet. The allocation path sweeps
+; too, but that is not enough on its own: while address validation is engaged, an
+; Initial without a token never reaches allocation, so nothing would ever sweep
+; and the forged slots that engaged it would hold it engaged for good. Driven
+; from the periodic timer, the pool recovers on its own.
+linnea_quic_conn_sweep_now:
+    call conn_now
+    mov rdi, rax
+    mov esi, LINNEA_QUIC_IDLE_SECS
+    jmp linnea_quic_conn_sweep
+
+; linnea_quic_conn_unvalidated() -> rax = slots held by peers that have not proved
+; their address (no Handshake packet yet, and no Retry token). This is what the
+; server gates on before opening a connection for an unvalidated Initial.
+linnea_quic_conn_unvalidated:
+    xor eax, eax
+    lea rdx, [conn_pool]
+    mov ecx, LINNEA_QUIC_MAX_CONNS
+.uv_slot:
+    cmp qword [rdx + linnea_quic_conn.in_use], 0
+    je .uv_next
+    cmp qword [rdx + linnea_quic_conn.amp_valid], 0
+    jne .uv_next
+    inc eax
+.uv_next:
+    add rdx, linnea_quic_conn_size
+    dec ecx
+    jnz .uv_slot
     ret
 
 ; linnea_quic_conn_active() -> rax = slots currently in use.

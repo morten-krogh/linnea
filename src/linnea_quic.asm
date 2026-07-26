@@ -25,6 +25,8 @@ global linnea_quic_protect
 global linnea_quic_ch_parse
 global linnea_quic_alpn_has
 global linnea_quic_build_transport_params
+global linnea_quic_retry_scid
+global linnea_quic_retry_scid_len
 global linnea_quic_tp_parse
 global linnea_quic_flow_scan
 global linnea_quic_parse_priority
@@ -85,14 +87,22 @@ linnea_quic_initial_dcid:
 ;   -> rax = plaintext length (or -1), rdx = the packet number.
 ; Removes header protection and AEAD-opens an Initial (long-header) packet,
 ; writing the frame bytes to out. RFC 9001 5.3 / 5.4.
-%define U_AAD    0        ; unprotected header (AAD), <= 64 bytes
-%define U_NONCE  64       ; 12-byte AEAD nonce
-%define U_MASK   80       ; 5-byte header-protection mask (8 reserved)
-%define U_HLEN   88       ; header length (= AAD length)
-%define U_PNLEN  96       ; packet-number length
-%define U_PN     104      ; decoded packet number
-%define U_HASTOK 304      ; 1 for an Initial (has a token), 0 for a Handshake
-%define U_CTX    112      ; AES-GCM context (192 bytes)
+; The AAD is the packet's header, which for an Initial includes the token the
+; client echoes from a Retry — 46 bytes of ours, and other servers issue larger
+; ones. 64 bytes was enough only while every Initial we saw carried an empty
+; token: a tokened one overran into the nonce below it and the packet then failed
+; to decrypt, silently, with the handshake stalling. The copy is bounded against
+; this size as well (U_AAD_MAX), so a header longer than any real one is refused
+; rather than trusted.
+%define U_AAD     0       ; unprotected header (AAD)
+%define U_AAD_MAX 192     ; and its capacity
+%define U_NONCE   192     ; 12-byte AEAD nonce
+%define U_MASK    208     ; 5-byte header-protection mask (8 reserved)
+%define U_HLEN    216     ; header length (= AAD length)
+%define U_PNLEN   224     ; packet-number length
+%define U_PN      232     ; decoded packet number
+%define U_CTX     240     ; AES-GCM context (192 bytes)
+%define U_HASTOK  432     ; 1 for an Initial (has a token), 0 for a Handshake
 ; Initial packets carry a token; Handshake packets do not. Both entry points
 ; share the body; U_HASTOK selects whether the token varint is skipped.
 linnea_quic_unprotect_hs:
@@ -107,7 +117,7 @@ unprotect_body:
     push r14
     push r15
     push rbp
-    sub rsp, 312                     ; frame (keeps rsp 16-aligned for calls)
+    sub rsp, 440                     ; frame (keeps rsp 16-aligned for calls)
     mov rbx, rdi                     ; packet
     mov rbp, rsi                     ; packet length
     mov r12, rdx                     ; keys
@@ -156,6 +166,8 @@ unprotect_body:
     inc ecx                          ; pn length (1..4)
     mov [rsp + U_PNLEN], rcx
     lea rax, [r14 + rcx]             ; header length = pn_offset + pn_len
+    cmp rax, U_AAD_MAX
+    ja .err                          ; header longer than the AAD scratch: refuse
     mov [rsp + U_HLEN], rax
     ; --- copy the header into the AAD scratch, then unmask b0 + pn ---
     lea rsi, [rbx]
@@ -231,7 +243,7 @@ unprotect_body:
 .err:
     mov rax, -1
 .done:
-    add rsp, 312
+    add rsp, 440
     pop rbp
     pop r15
     pop r14
@@ -1522,6 +1534,18 @@ linnea_quic_build_transport_params:
     mov rcx, rbp
     call tp_bytes
     mov r12, rax
+    ; retry_source_connection_id (0x10), only when this handshake went through a
+    ; Retry: the client checks it against the id our Retry offered and aborts if
+    ; it disagrees, which is what stops a third party injecting a Retry.
+    cmp qword [linnea_quic_retry_scid_len], 0
+    je .no_retry_scid
+    mov rdi, r12
+    mov esi, 0x10
+    lea rdx, [linnea_quic_retry_scid]
+    mov rcx, [linnea_quic_retry_scid_len]
+    call tp_bytes
+    mov r12, rax
+.no_retry_scid:
     ; stateless_reset_token (0x02): the reset token for our connection id (r15), so
     ; the peer can recognise a stateless reset for this connection (RFC 9000 10.3).
     mov rdi, r15                     ; scid
@@ -2724,6 +2748,10 @@ linnea_quic_varint_encode:
     ret
 
 section .bss
+; retry_source_connection_id (RFC 9000 7.3): the id a Retry issued for this
+; handshake, which the client verifies. Zero length = no Retry, parameter omitted.
+linnea_quic_retry_scid:     resb LINNEA_QUIC_MAX_CID
+linnea_quic_retry_scid_len: resq 1
 ; PATH_CHALLENGE captured by linnea_quic_reset_scan (which fully walks the frames):
 ; the 8 challenge bytes and a flag, so the receive path can echo them back in a
 ; PATH_RESPONSE (RFC 9000 8.2). Reset at the start of each scan.

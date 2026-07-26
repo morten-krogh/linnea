@@ -89,6 +89,14 @@ extern linnea_quic_build_finished
 extern linnea_quic_conn_lookup
 extern linnea_quic_conn_lookup_odcid
 extern linnea_quic_conn_alloc
+extern linnea_quic_conn_unvalidated
+extern linnea_quic_conn_sweep_now
+extern linnea_quic_retry_scid
+extern linnea_quic_retry_scid_len
+extern linnea_aesgcm_init
+extern linnea_aesgcm_seal
+extern linnea_quic_retry_token_make
+extern linnea_quic_retry_token_check
 extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
 extern linnea_quic_ku_next
@@ -126,6 +134,7 @@ extern linnea_quic_dbg_serve
 extern linnea_quic_dbg_reset
 extern linnea_quic_dbg_chunk
 extern linnea_quic_dbg_fc
+extern linnea_quic_dbg_num
 extern qdbg_pass
 extern qdbg_on
 extern linnea_string_from_u64
@@ -146,6 +155,14 @@ extern linnea_quic_hs_psk
 extern linnea_quic_early_ok
 extern linnea_quic_resume_issued
 section .rodata
+; Retry integrity tag key and nonce, fixed by the RFC per QUIC version:
+; v1 RFC 9001 5.8, v2 RFC 9369 3.3. They authenticate a Retry to any client
+; without a shared secret — the tag proves only that the packet was not mangled,
+; and its binding to the original connection id is what makes it useful.
+retry_key_v1:   db 0xbe,0x0c,0x69,0x0b,0x9f,0x66,0x57,0x5a,0x1d,0x76,0x6b,0x54,0xe3,0x68,0xc8,0x4e
+retry_nonce_v1: db 0x46,0x15,0x99,0xd3,0x5d,0x63,0x2b,0xf2,0x23,0x98,0x25,0xbb
+retry_key_v2:   db 0x8f,0xb4,0xb0,0x1b,0x56,0xac,0x48,0xe2,0x60,0xfb,0xcb,0xce,0xad,0x7c,0xcc,0x92
+retry_nonce_v2: db 0xd8,0x69,0x69,0xbc,0x2d,0x7c,0x6d,0x99,0x90,0xef,0xb0,0x4a
 altsvc_pre:  db 'h3=":'
 altsvc_pre_len equ $ - altsvc_pre
 altsvc_post: db '"; ma=86400'
@@ -245,6 +262,19 @@ s_ch_ptr:    resq 1
 s_ch_len:    resq 1
 s_odcid_ptr: resq 1
 s_odcid_len: resq 1
+; the Initial that is opening a connection: its token (empty unless the client is
+; answering a Retry), the client's source id (the Retry is addressed to it), and
+; the original id recovered from a valid token
+retry_ctx:   resb 256               ; AES-GCM context for the Retry integrity tag
+s_tok_ptr:   resq 1
+s_tok_len:   resq 1
+s_cscid_ptr: resq 1
+s_cscid_len: resq 1
+s_tok_odcid: resb LINNEA_QUIC_MAX_CID
+s_tok_odcid_len: resq 1
+s_via_retry: resq 1
+retry_buf:   resb 128                ; a Retry packet: header, ids, token, tag
+retry_aad:   resb 160                ; the Retry pseudo-packet the tag covers
 s_cert_len:  resq 1
 s_priv:      resq 1
 s_ini_len:   resq 1
@@ -504,6 +534,52 @@ linnea_quic_server_datagram:
     test cl, cl                               ; v1 Initial = type 0
     jnz .done
 .dn_alloc:
+    ; RFC 9000 14.1: a datagram carrying an Initial that opens a connection must
+    ; be at least 1200 bytes. A client always pads it; enforcing the floor means a
+    ; single small forged packet cannot buy a handshake, and keeps any reply we
+    ; send well inside the 3x amplification bound. (The Version Negotiation path
+    ; above deliberately answers small probes — its reply is tiny.)
+    cmp r13, 1200
+    jb .done
+    lea rdi, [linnea_quic_rxbuf]
+    mov rsi, r13
+    call initial_token               ; rax = token ptr (0 = malformed header)
+    test rax, rax
+    jz .done
+    mov [s_tok_ptr], rax
+    mov [s_tok_len], rdx
+    mov [s_cscid_ptr], r8
+    mov [s_cscid_len], r9
+    test rdx, rdx
+    jnz .dn_token                    ; the client is answering a Retry
+    ; No token. Open the connection straight away — the common case, and the one
+    ; that keeps the handshake at one round trip — unless too many slots are
+    ; already held by peers that have not proved their address, which is what a
+    ; forged flood looks like. Then the client must come back with a token.
+    call linnea_quic_conn_unvalidated
+    cmp rax, LINNEA_QUIC_UNVALIDATED_MAX
+    jb .dn_fresh
+    call send_retry
+    jmp .done
+.dn_token:
+    ; A token is only worth anything if we issued it, to this address, recently.
+    ; An unusable one is dropped rather than answered: replying would hand a
+    ; spoofer a packet, and a client whose token expired retransmits anyway.
+    call now_ms
+    mov rcx, rax
+    lea rdi, [sa]
+    mov rsi, [s_tok_ptr]
+    mov rdx, [s_tok_len]
+    lea r8, [s_tok_odcid]
+    call linnea_quic_retry_token_check
+    test rax, rax
+    js .done
+    mov [s_tok_odcid_len], rax
+    mov qword [s_via_retry], 1
+    jmp .dn_do_alloc
+.dn_fresh:
+    mov qword [s_via_retry], 0
+.dn_do_alloc:
     lea rdi, [sa]
     mov rsi, [salen]
     call linnea_quic_conn_alloc
@@ -522,6 +598,28 @@ linnea_quic_server_datagram:
     mov [rax + linnea_quic_conn.odcid_len], rcx
     lea rdi, [rax + linnea_quic_conn.odcid]
     lea rsi, [linnea_quic_rxbuf + 6]
+    rep movsb
+    ; original_destination_connection_id: normally the id this packet carries, but
+    ; after a Retry the id the client used BEFORE it, which only the token knows.
+    mov rax, [cur_conn]
+    mov rcx, [s_via_retry]
+    mov [rax + linnea_quic_conn.via_retry], rcx
+    test rcx, rcx
+    jnz .dn_tp_retry
+    mov rcx, [rax + linnea_quic_conn.odcid_len]
+    mov [rax + linnea_quic_conn.tp_odcid_len], rcx
+    lea rdi, [rax + linnea_quic_conn.tp_odcid]
+    lea rsi, [rax + linnea_quic_conn.odcid]
+    rep movsb
+    jmp .long_in
+.dn_tp_retry:
+    ; the token proves the peer receives packets at this address, so the 3x
+    ; amplification limit has done its job and no longer applies (RFC 9000 8.1)
+    mov qword [rax + linnea_quic_conn.amp_valid], 1
+    mov rcx, [s_tok_odcid_len]
+    mov [rax + linnea_quic_conn.tp_odcid_len], rcx
+    lea rdi, [rax + linnea_quic_conn.tp_odcid]
+    lea rsi, [s_tok_odcid]
     rep movsb
     jmp .long_in
 .demux_short:
@@ -828,9 +926,23 @@ linnea_quic_server_datagram:
     CONNLEA r9, hs_sec
     call linnea_quic_hs_secrets
     ; EE || Cert || CertVerify || Finished into hsmsg
+    ; retry_source_connection_id (RFC 9000 7.3): after a Retry the client checks
+    ; that the id it has been talking to is the one our Retry chose. Empty length
+    ; means no Retry happened and the parameter is omitted.
+    mov rax, [cur_conn]
+    mov qword [linnea_quic_retry_scid_len], 0
+    cmp qword [rax + linnea_quic_conn.via_retry], 0
+    je .hs_no_retry
+    mov rcx, [rax + linnea_quic_conn.odcid_len]      ; = the id our Retry issued
+    mov [linnea_quic_retry_scid_len], rcx
+    lea rdi, [linnea_quic_retry_scid]
+    lea rsi, [rax + linnea_quic_conn.odcid]
+    rep movsb
+.hs_no_retry:
     lea rdi, [hsmsg]
-    mov rsi, [s_odcid_ptr]
-    mov rdx, [s_odcid_len]
+    mov rax, [cur_conn]
+    lea rsi, [rax + linnea_quic_conn.tp_odcid]
+    mov rdx, [rax + linnea_quic_conn.tp_odcid_len]
     CONNLEA rcx, scid
     mov r8d, 8
     call linnea_quic_build_ee        ; rax = EE length
@@ -2665,6 +2777,210 @@ send_version_negotiation:
 .vn_ret:
     ret
 
+; initial_token(rdi = packet, rsi = datagram length)
+;   -> rax = token pointer (0 if the header is malformed or runs past the end),
+;      rdx = token length, r8 = the client's source id, r9 = its length.
+; Walks an Initial's long header: version, the two connection ids, then the token
+; the client echoes from a Retry (empty on a first flight). Every step is bounded
+; against the datagram, because this runs before anything is trusted.
+initial_token:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi                      ; packet
+    lea r12, [rdi + rsi]              ; end of the datagram
+    cmp rsi, 7
+    jb .bad
+    movzx ecx, byte [rbx + 5]         ; destination id length
+    cmp ecx, LINNEA_QUIC_MAX_CID
+    ja .bad
+    lea r13, [rbx + 6 + rcx]          ; -> source id length byte
+    cmp r13, r12
+    jae .bad
+    movzx r14d, byte [r13]            ; source id length
+    cmp r14d, LINNEA_QUIC_MAX_CID
+    ja .bad
+    lea r15, [r13 + 1]                ; -> source id
+    lea r13, [r15 + r14]              ; -> token length varint
+    cmp r13, r12
+    jae .bad
+    mov rdi, r13
+    mov rsi, r12                      ; the decoder bounds itself against the end
+    call linnea_quic_varint_decode    ; rax = token length, rdx = varint size
+    test rdx, rdx
+    jz .bad                           ; truncated varint
+    lea rcx, [r13 + rdx]              ; -> the token itself
+    mov rdx, rax                      ; token length
+    lea rax, [rcx + rdx]
+    cmp rax, r12
+    ja .bad                           ; the token runs past the datagram
+    mov rax, rcx                      ; token pointer
+    mov r8, r15                       ; source id (set after the call: the decoder
+    mov r9, r14                       ; uses r8/r9 as scratch)
+    jmp .ret
+.bad:
+    xor eax, eax
+    xor edx, edx
+.ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; send_retry() — answer an Initial with a Retry packet (RFC 9000 17.2.5) instead
+; of opening a connection: it carries a token the client must echo, which proves
+; it receives packets at the address it claims. No state is kept for it here —
+; everything needed to check the token later is inside the token.
+;
+; The packet is addressed to the client's source id, offers a fresh id of ours as
+; the connection id to use from now on, and ends with an integrity tag computed
+; over a pseudo-packet that begins with the id the client was originally using —
+; that binding is what stops an attacker splicing a Retry into someone else's
+; handshake (RFC 9001 5.8). The tag's key and nonce are fixed by the RFC and
+; differ per QUIC version.
+; r12d = the UDP socket, r13 = the datagram length, sa/salen = the source.
+send_retry:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    ; --- header ---
+    lea rbx, [retry_buf]
+    mov eax, [linnea_quic_rxbuf + 1]  ; the version, as it sits on the wire
+    mov r15d, eax                     ; (kept: it selects the tag key below)
+    cmp eax, 0x01000000
+    je .rt_v1
+    mov byte [rbx], 0xc0              ; v2 packet type Retry = 0 (RFC 9369 3.2)
+    jmp .rt_ver
+.rt_v1:
+    mov byte [rbx], 0xf0              ; v1 packet type Retry = 3
+.rt_ver:
+    mov [rbx + 1], eax
+    lea rdi, [rbx + 5]
+    ; destination id = the client's source id
+    mov rcx, [s_cscid_len]
+    mov [rdi], cl
+    inc rdi
+    mov rsi, [s_cscid_ptr]
+    rep movsb
+    ; source id = a fresh id of ours. The first byte steers the client's next
+    ; packet back to this worker (the BPF reuseport program reads it); the second
+    ; is a slot index no pool can hold, so the packet lands on the new-connection
+    ; path here rather than matching a live connection by accident.
+    mov byte [rdi], LINNEA_QUIC_SCID_LEN
+    inc rdi
+    mov rax, [linnea_worker_index]
+    mov [rdi], al
+    mov byte [rdi + 1], 0xff
+    push rdi
+    lea rdi, [rdi + 2]
+    mov esi, 6
+    call getrandom_bytes
+    pop rdi
+    mov r14, rdi                      ; keep our new id for the token binding
+    add rdi, LINNEA_QUIC_SCID_LEN
+    ; --- token ---
+    push rdi
+    call now_ms
+    mov rcx, rax
+    pop rdi
+    push rdi
+    mov r8, rdi                       ; token destination
+    lea rdi, [sa]
+    movzx eax, byte [linnea_quic_rxbuf + 5]
+    mov rdx, rax                      ; the id the client is using now: it becomes
+    lea rsi, [linnea_quic_rxbuf + 6]  ; original_destination_connection_id later
+    call linnea_quic_retry_token_make
+    pop rdi
+    add rdi, LINNEA_QUIC_RETRY_TOKEN_LEN
+    mov r13, rdi
+    sub r13, rbx                      ; packet length so far, tag not yet added
+    ; --- integrity tag over the pseudo-packet ---
+    ; pseudo = original id length | original id | the packet built above
+    lea rdi, [retry_aad]
+    movzx eax, byte [linnea_quic_rxbuf + 5]
+    mov [rdi], al
+    inc rdi
+    lea rsi, [linnea_quic_rxbuf + 6]
+    mov rcx, rax
+    rep movsb
+    mov rsi, rbx
+    mov rcx, r13
+    rep movsb
+    lea rax, [retry_aad]
+    sub rdi, rax                      ; pseudo-packet length
+    mov r15d, r15d
+    sub rsp, 16
+    lea rax, [rbx + r13]              ; the tag goes at the end of the packet
+    mov [rsp], rax
+    push rdi                          ; aad length (rdi is clobbered below)
+    lea rdi, [retry_ctx]
+    cmp r15d, 0x01000000
+    je .rt_key_v1
+    lea rsi, [retry_key_v2]
+    jmp .rt_key
+.rt_key_v1:
+    lea rsi, [retry_key_v1]
+.rt_key:
+    call linnea_aesgcm_init
+    pop rcx                           ; aad length
+    lea rdi, [retry_ctx]
+    cmp r15d, 0x01000000
+    je .rt_nonce_v1
+    lea rsi, [retry_nonce_v2]
+    jmp .rt_seal
+.rt_nonce_v1:
+    lea rsi, [retry_nonce_v1]
+.rt_seal:
+    lea rdx, [retry_aad]
+    xor r8d, r8d                      ; no plaintext: the tag is the whole output
+    xor r9d, r9d
+    call linnea_aesgcm_seal
+    add rsp, 16
+    ; --- send it ---
+    lea rdx, [r13 + 16]               ; packet + tag
+    mov eax, LINNEA_SYS_SENDTO
+    mov edi, r12d
+    lea rsi, [retry_buf]
+    xor r10d, r10d
+    lea r8, [sa]
+    mov r9, [salen]
+    syscall
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; getrandom_bytes(rdi = destination, esi = count) — fill from getrandom(2),
+; retrying a short read. Used for the ids a Retry hands out.
+getrandom_bytes:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12d, esi
+.gr_more:
+    mov eax, LINNEA_SYS_GETRANDOM
+    mov rdi, rbx
+    mov esi, r12d
+    xor edx, edx
+    syscall
+    test rax, rax
+    jle .gr_ret                       ; a failing getrandom is fatal for secrecy,
+    add rbx, rax                      ; but the caller's ids are still unguessable
+    sub r12d, eax                     ; enough: retry what is left
+    jnz .gr_more
+.gr_ret:
+    pop r12
+    pop rbx
+    ret
+
 ; tx_emit_chunk(rdi=stream ctx ptr, rsi=stream offset, rdx=length)
 ;   -> rax = packet number used.
 ; Build and send one packet of one open response stream: a leading ACK, then a
@@ -3261,6 +3577,9 @@ linnea_quic_server_rtx_sweep:
     push r15
     sub rsp, 8                        ; align the call sites (rsp % 16 == 0)
     mov r12d, edi                     ; fd
+    ; reclaim connections that have gone quiet, including handshakes that stalled
+    ; (a forged Initial never comes back) — see linnea_quic_conn_sweep_now
+    call linnea_quic_conn_sweep_now
     call now_ms
     mov r15, rax                      ; now, ms
     call linnea_quic_dbg_tick         ; opt-in tracing: sets qdbg_pass for this pass
