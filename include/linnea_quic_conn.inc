@@ -64,6 +64,16 @@ LINNEA_QUIC_ACK_MAXR    equ 16      ; ACK ranges decoded from one incoming frame
 LINNEA_QUIC_PTO_MS      equ 250     ; base probe timeout, milliseconds
 LINNEA_QUIC_PTO_CAP     equ 4       ; largest backoff shift (250ms << 4 = 4s)
 LINNEA_QUIC_PTO_MAX     equ 6       ; attempts before a packet is given up on
+; Response-body chunks are given up on far later than a small control reply. Stream
+; data is reliable by contract: a chunk we stop retransmitting is data the peer will
+; never have, which both truncates the response and strands the connection-level flow
+; control credit it consumed (the peer counts the largest offset it received, we count
+; the largest we sent, and only a RESET_STREAM's final size can close that gap). With
+; the backoff capped at 4 s, 16 attempts span ~50 s — longer than the idle timeout, so
+; in practice a chunk is retransmitted until it lands or the connection is reclaimed.
+; Six attempts (~8 s) is far too few on a path with real loss: a client that drops
+; half our packets, as one does when its receive buffer overflows, hits it routinely.
+LINNEA_QUIC_TX_PTO_MAX  equ 16      ; attempts before a response chunk is given up on
 ; ACK-based loss detection (RFC 9002 6.1.1): a response chunk left at least this
 ; many packet numbers behind the largest acknowledged is treated as lost and
 ; retransmitted at once, rather than waiting out the growing PTO — prompt recovery
@@ -107,6 +117,7 @@ LINNEA_QUIC_EARLY_BUF   equ 1024
 LINNEA_QUIC_TX_CHUNK    equ 1100    ; stream bytes per 1-RTT packet
 LINNEA_QUIC_TX_HDR      equ 256     ; HEADERS frame + DATA frame header prefix cap
 LINNEA_QUIC_TXSTREAMS   equ 100     ; = advertised initial_max_streams_bidi
+LINNEA_QUIC_RST_SEEN    equ 32      ; cancelled stream ids remembered per connection
 ; Bidi-stream flow control (RFC 9000 4.6). We advertise this many streams up front,
 ; then raise the peer's limit with MAX_STREAMS as it opens streams, so a long-lived
 ; (reused) connection never runs out — without this a browser that refreshes enough
@@ -271,6 +282,15 @@ struc linnea_quic_conn
     .flight_cv_len: resq 1          ; CertificateVerify length (Finished's 36 follow it)
     .flight_tail: resb LINNEA_QUIC_FLIGHT_TAIL   ; EE || CertVerify || Finished
     ; request-stream reassembly: LINNEA_QUIC_RA_CTXS streams reassemble at once
+    ; Stream ids the peer has cancelled (RESET_STREAM / STOP_SENDING), as a
+    ; small ring. A cancel can arrive before the request that produced it has
+    ; finished arriving — a retransmitted or reordered STREAM frame then
+    ; opens a response for a stream the peer has stopped, and that response
+    ; can never drain: the peer will never raise its stream window, so the
+    ; slot stays active with its file mapped for the life of the connection
+    ; until concurrent requests are refused with a 503.
+    .rst_ids:    resq LINNEA_QUIC_RST_SEEN
+    .rst_cursor: resq 1
     .ra_ctx:     resb LINNEA_QUIC_RA_CTXS * linnea_quic_ra_size
     ; the open response streams (up to LINNEA_QUIC_TXSTREAMS at once): each slot
     ; holds one large response's mapping, head and progress; the pump interleaves

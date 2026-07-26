@@ -24,6 +24,10 @@ global linnea_quic_dbg_tick
 global linnea_quic_dbg_conn
 global linnea_quic_dbg_rx
 global qdbg_on
+global linnea_quic_dbg_serve
+global linnea_quic_dbg_reset
+global linnea_quic_dbg_chunk
+global linnea_quic_dbg_fc
 global qdbg_pass
 
 extern linnea_log_write
@@ -91,6 +95,24 @@ s_rxlen: db " len="
 s_rxlen_len equ $ - s_rxlen
 s_rxhf:  db " hf="
 s_rxhf_len equ $ - s_rxhf
+s_srv:   db "qsrv sid="
+s_srv_len equ $ - s_srv
+s_fcd:   db "qfcd max="
+s_fcd_len equ $ - s_fcd
+s_fcdc:  db " cur="
+s_fcdc_len equ $ - s_fcdc
+s_chk:   db "qchk sid="
+s_chk_len equ $ - s_chk
+s_chko:  db " off="
+s_chko_len equ $ - s_chko
+s_chkl:  db " len="
+s_chkl_len equ $ - s_chkl
+s_rst:   db "qrst sid="
+s_rst_len equ $ - s_rst
+s_rstfs: db " fsize="
+s_rstfs_len equ $ - s_rstfs
+s_rstk:  db " kept="
+s_rstk_len equ $ - s_rstk
 
 section .bss
 qdbg_on:   resb 1               ; 1 while tracing is enabled (readable by others)
@@ -321,5 +343,113 @@ linnea_quic_dbg_rx:
     pop r14
     pop r13
     pop rbp
+    pop rbx
+    ret
+
+; linnea_quic_dbg_serve(rdi = stream id) — log that a response is being opened for
+; this request stream. Dark unless the trigger is set. Two lines for one id mean the
+; request was served twice (a retransmitted request, or one served after its cancel):
+; each copy consumes the connection's send credit again, though the peer counts the
+; bytes once, so the connection eventually stalls with credit apparently exhausted.
+linnea_quic_dbg_serve:
+    cmp byte [qdbg_on], 0
+    jne .on
+    ret
+.on:
+    push rbx
+    mov rbx, rdi
+    call linnea_log_stamp
+    W s_srv
+    mov rdi, rbx
+    call linnea_log_u64
+    W s_nl
+    pop rbx
+    ret
+
+; linnea_quic_dbg_reset(rdi = sid, rsi = final size, rdx = 1 if the retransmission
+; ring kept it) — log a RESET_STREAM we sent. Dark unless the trigger is set. A
+; reset the ring did not keep is sent once and never resent: if that copy is lost
+; the peer never learns the stream's final size, so the connection flow-control
+; credit for the bytes it never received is never released.
+linnea_quic_dbg_reset:
+    cmp byte [qdbg_on], 0
+    jne .on
+    ret
+.on:
+    push rbx
+    push r13
+    push r14
+    mov rbx, rdi
+    mov r13, rsi
+    mov r14, rdx
+    call linnea_log_stamp
+    W s_rst
+    mov rdi, rbx
+    call linnea_log_u64
+    W s_rstfs
+    mov rdi, r13
+    call linnea_log_u64
+    W s_rstk
+    mov rdi, r14
+    call linnea_log_u64
+    W s_nl
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; linnea_quic_dbg_chunk(rdi = sid, rsi = stream offset, rdx = length) — log one
+; response chunk as the pump sends it for the first time (retransmissions are not
+; logged: they reuse the offset and consume no further flow-control credit).
+linnea_quic_dbg_chunk:
+    cmp byte [qdbg_on], 0
+    jne .on
+    ret
+.on:
+    push rbx
+    push r13
+    push r14
+    mov rbx, rdi
+    mov r13, rsi
+    mov r14, rdx
+    call linnea_log_stamp
+    W s_chk
+    mov rdi, rbx
+    call linnea_log_u64
+    W s_chko
+    mov rdi, r13
+    call linnea_log_u64
+    W s_chkl
+    mov rdi, r14
+    call linnea_log_u64
+    W s_nl
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; linnea_quic_dbg_fc(rdi = MAX_DATA value read from a packet, rsi = the window
+; before it) — log connection-level credit as it is absorbed. Dark unless the
+; trigger is set. Only called when a packet actually carried a MAX_DATA frame, so
+; silence here while the peer insists it raised the window means the frame never
+; reached us or the frame walk did not reach it.
+linnea_quic_dbg_fc:
+    cmp byte [qdbg_on], 0
+    jne .on
+    ret
+.on:
+    push rbx
+    push r13
+    mov rbx, rdi
+    mov r13, rsi
+    call linnea_log_stamp
+    W s_fcd
+    mov rdi, rbx
+    call linnea_log_u64
+    W s_fcdc
+    mov rdi, r13
+    call linnea_log_u64
+    W s_nl
+    pop r13
     pop rbx
     ret

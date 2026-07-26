@@ -478,6 +478,14 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_reload_test.py 47452 10 >/dev/null 2>&1
     check "h3 (io_uring): reload-cancel (STOP_SENDING) does not stall the connection" $?
 
+    # connection-level credit (MAX_DATA) must be read from every packet, including
+    # the ones that arrive while no response stream is open — which is exactly what a
+    # reload's cancels leave behind. The peer sends each value once (its packet is
+    # acknowledged), so a raise the server misses is gone for good: the server then
+    # stalls at a window the peer has long since widened, with nothing in flight.
+    python3 test/quic/h3_maxdata_test.py 47452 8 >/dev/null 2>&1
+    check "h3 (io_uring): MAX_DATA is absorbed with no response stream open" $?
+
     # a request whose ack is lost is retransmitted by the client; the server must
     # ack the retransmit, not serve the stream a second time — a duplicate response
     # slot resends the whole body and pins the shared congestion window (the real-

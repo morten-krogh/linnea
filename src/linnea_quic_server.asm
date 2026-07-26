@@ -122,6 +122,10 @@ extern linnea_quic_conn_slot
 extern linnea_quic_dbg_tick
 extern linnea_quic_dbg_conn
 extern linnea_quic_dbg_rx
+extern linnea_quic_dbg_serve
+extern linnea_quic_dbg_reset
+extern linnea_quic_dbg_chunk
+extern linnea_quic_dbg_fc
 extern qdbg_pass
 extern qdbg_on
 extern linnea_string_from_u64
@@ -1350,6 +1354,37 @@ linnea_quic_server_datagram:
     ; the responses, may let more chunks go out (and a fully acknowledged stream is
     ; closed out — its mapping released). Absorb the flow-control frames per active
     ; stream, then pump. Skip the walk entirely while nothing is streaming.
+    ; Connection-level credit first, and unconditionally: MAX_DATA raises the window
+    ; for the whole connection, and the peer sends each new value ONCE — the packet
+    ; carrying it is acknowledged, so a value we fail to read is never repeated and
+    ; our send window stays behind for the life of the connection. The per-stream walk
+    ; below runs only while a response is open, which is exactly when a MAX_DATA can
+    ; be missed: a browser reload cancels every stream, and the packets that follow
+    ; carry the credit for what it just consumed with no stream left to walk. Miss
+    ; enough of them and the window we believe we have is spent while the peer thinks
+    ; it granted plenty — the connection then stalls with nothing in flight, and only
+    ; a new connection recovers.
+    mov qword [fc_scan], 0
+    mov qword [fc_scan + 8], 0
+    lea rdi, [plaintext]
+    mov rsi, r14
+    mov rdx, -1                       ; matches no stream id: MAX_STREAM_DATA is left
+    lea rcx, [fc_scan]                ; to the per-stream walk, which owns the slots
+    call linnea_quic_flow_scan
+    mov rcx, [cur_conn]
+    mov rdx, [fc_scan]                ; largest MAX_DATA in this packet
+    test rdx, rdx
+    jz .fc_conn_done
+    mov r15, rdx                      ; dark trace: the credit and what it replaces
+    mov rdi, rdx
+    mov rsi, [rcx + linnea_quic_conn.fc_conn_max]
+    call linnea_quic_dbg_fc
+    mov rcx, [cur_conn]
+    mov rdx, r15
+    cmp rdx, [rcx + linnea_quic_conn.fc_conn_max]
+    jbe .fc_conn_done
+    mov [rcx + linnea_quic_conn.fc_conn_max], rdx
+.fc_conn_done:
     mov rax, [cur_conn]
     lea rcx, [rax + linnea_quic_conn.tx_streams]
     mov edx, LINNEA_QUIC_TXSTREAMS
@@ -1580,6 +1615,20 @@ linnea_quic_server_datagram:
     add rax, linnea_quic_txstream_size
     dec rdx
     jnz .sb_dup
+    ; a stream the peer has cancelled gets no response: serving it would open
+    ; a slot that can never drain (its window will never be raised)
+    mov rax, [cur_conn]
+    xor ecx, ecx
+    mov rdx, [s_sid]
+    inc rdx                           ; ids are stored as id + 1
+.rst_seen_scan:
+    cmp [rax + linnea_quic_conn.rst_ids + rcx * 8], rdx
+    je .stream_scan
+    inc ecx
+    cmp ecx, LINNEA_QUIC_RST_SEEN
+    jb .rst_seen_scan
+    mov rdi, [s_sid]
+    call linnea_quic_dbg_serve
     ; zero the request struct and point the QPACK scratch at h3scratch
     lea rdi, [req]
     xor eax, eax
@@ -2844,6 +2893,10 @@ tx_pump:
     mov rcx, [s_tp_len]
     add [rbx + linnea_quic_conn.fc_conn_sent], rcx   ; against the conn window
     add [rbp + linnea_quic_txstream.off], rcx
+    mov rdi, [rbp + linnea_quic_txstream.sid]
+    mov rsi, [s_tp_off]
+    mov rdx, [s_tp_len]
+    call linnea_quic_dbg_chunk
     ; an incremental stream just sent: rotate the cursor so its equal-urgency peers
     ; take the next turn (non-incremental streams stay put and run to completion).
     cmp qword [rbp + linnea_quic_txstream.incremental], 0
@@ -3043,6 +3096,67 @@ tx_abort_one:
     pop rbx
     ret
 
+; tx_reset_stream(rdi = stream id, rsi = final size) — end this response stream
+; short: RESET_STREAM tells the peer no more data is coming and, in its final size,
+; how much the stream would have held. The peer needs it for two things. It ends the
+; stream (no FIN will arrive, so without this the peer waits or re-requests), and it
+; settles flow control: the peer credits its connection window by final size minus
+; the largest offset it actually received, which is the only way the credit for
+; bytes lost in flight is ever released. Skip it and every abandoned stream leaks
+; connection credit permanently — after enough of them the window is spent and the
+; connection can send nothing, however idle it is (that is exactly what a browser's
+; reload-cancel storm produces). Sent as a 1-RTT packet and buffered for loss
+; recovery, since a lost copy leaks the same credit.
+; cur_conn must be the connection and r12d the UDP socket (emit_1rtt needs both).
+tx_reset_stream:
+    push rbx
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                        ; 4 pushes + 8: keep the call site 16-aligned
+    mov rbx, rdi                      ; stream id
+    mov r13, rsi                      ; final size
+    ; RESET_STREAM = type 0x04, stream id, app error code, final size (RFC 9000 19.4)
+    lea r14, [reset_pay]
+    mov byte [r14], 0x04
+    inc r14
+    mov rdi, r14
+    mov rsi, rbx                      ; stream id
+    call linnea_quic_varint_encode
+    add r14, rax
+    mov rdi, r14
+    mov esi, 0x10c                    ; H3_REQUEST_CANCELLED
+    call linnea_quic_varint_encode
+    add r14, rax
+    mov rdi, r14
+    mov rsi, r13                      ; final size
+    call linnea_quic_varint_encode
+    add r14, rax
+    lea rax, [reset_pay]
+    sub r14, rax                      ; frame length
+    lea rsi, [reset_pay]
+    mov [s_pl_ptr], rsi
+    mov [s_pl_len], r14
+    call emit_1rtt                    ; send it on r12d; rax = the packet number used
+    mov r15, rax
+    call now_ms                       ; buffer it for loss recovery — it must arrive
+    mov r8, rax
+    mov rdi, [cur_conn]
+    mov rsi, r15
+    lea rdx, [reset_pay]
+    mov rcx, [s_pl_len]
+    call linnea_quic_rtx_record
+    mov rdx, rax                      ; 1 = the ring kept it (dark trace)
+    mov rdi, rbx
+    mov rsi, r13
+    call linnea_quic_dbg_reset
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
 ; reset_teardown(rdi=conn, rsi=stream id) — the peer cancelled this stream
 ; (STOP_SENDING / RESET_STREAM). Abort its open response (free the slot, unmap, and
 ; drop its in-flight chunks so they stop holding the shared congestion window) and
@@ -3064,6 +3178,18 @@ reset_teardown:
     mov rbx, rdi                      ; conn
     mov r13, rsi                      ; stream id
     mov r15, -1                       ; final size (-1 = no active response to reset)
+    ; remember the id: a request whose frames are still arriving must not be
+    ; served after its cancel (see .rst_ids)
+    mov rax, [rbx + linnea_quic_conn.rst_cursor]
+    lea rcx, [r13 + 1]                ; stored as id + 1: a zeroed slot means
+    mov [rbx + linnea_quic_conn.rst_ids + rax * 8], rcx   ; empty, and 0 is a
+                                      ; perfectly valid stream id
+    inc rax
+    cmp rax, LINNEA_QUIC_RST_SEEN
+    jb .rt_cur_ok
+    xor eax, eax
+.rt_cur_ok:
+    mov [rbx + linnea_quic_conn.rst_cursor], rax
     xor r14d, r14d                    ; slot index
 .rt_tx:
     mov rax, r14
@@ -3085,36 +3211,9 @@ reset_teardown:
     jb .rt_tx
     jmp .rt_ra                        ; no open response: nothing to RESET_STREAM
 .rt_reset:
-    ; RESET_STREAM = type 0x04, stream id, app error code, final size (RFC 9000 19.4)
-    lea r14, [reset_pay]
-    mov byte [r14], 0x04
-    inc r14
-    mov rdi, r14
-    mov rsi, r13                      ; stream id
-    call linnea_quic_varint_encode
-    add r14, rax
-    mov rdi, r14
-    mov esi, 0x10c                    ; H3_REQUEST_CANCELLED
-    call linnea_quic_varint_encode
-    add r14, rax
-    mov rdi, r14
-    mov rsi, r15                      ; final size (bytes we sent)
-    call linnea_quic_varint_encode
-    add r14, rax
-    lea rax, [reset_pay]
-    sub r14, rax                      ; frame length
-    lea rsi, [reset_pay]
-    mov [s_pl_ptr], rsi
-    mov [s_pl_len], r14
-    call emit_1rtt                    ; send it on r12d; rax = the packet number used
-    mov r15, rax
-    call now_ms                       ; buffer it for loss recovery — it must arrive
-    mov r8, rax
-    mov rdi, [cur_conn]
-    mov rsi, r15
-    lea rdx, [reset_pay]
-    mov rcx, [s_pl_len]
-    call linnea_quic_rtx_record
+    mov rdi, r13                      ; stream id
+    mov rsi, r15                      ; final size = the bytes we sent
+    call tx_reset_stream
 .rt_ra:
     xor r14d, r14d                    ; context index
 .rt_ra_loop:
@@ -3233,10 +3332,21 @@ linnea_quic_server_rtx_sweep:
     shl rdx, cl
     cmp rax, rdx
     jb .sw_tc_next                    ; not yet due
-    cmp qword [r14 + linnea_quic_txchunk.tries], LINNEA_QUIC_PTO_MAX
+    cmp qword [r14 + linnea_quic_txchunk.tries], LINNEA_QUIC_TX_PTO_MAX
     jb .sw_tc_resend
-    mov rdi, rbx                      ; given up: drop just this stream, not the
-    mov rsi, [r14 + linnea_quic_txchunk.ctx]   ; whole connection's other transfers
+    ; given up on: drop just this stream, not the connection's other transfers, and
+    ; tell the peer where the stream ends — it has neither these bytes nor a FIN, and
+    ; only the final size releases the connection credit they consumed.
+    mov rax, [r14 + linnea_quic_txchunk.ctx]
+    imul rax, rax, linnea_quic_txstream_size
+    lea rcx, [rbx + linnea_quic_conn.tx_streams]
+    add rax, rcx                      ; the chunk's stream slot
+    mov [cur_conn], rbx               ; emit_1rtt sends on this connection
+    mov rdi, [rax + linnea_quic_txstream.sid]
+    mov rsi, [rax + linnea_quic_txstream.off]      ; final size = the bytes we sent
+    call tx_reset_stream
+    mov rdi, rbx
+    mov rsi, [r14 + linnea_quic_txchunk.ctx]
     call tx_abort_one
     jmp .sw_tc_next                   ; keep sweeping the remaining streams' chunks
 .sw_tc_resend:
