@@ -217,6 +217,14 @@ unprotect_body:
     lea rsi, [r12 + linnea_quic_keys.key]
     call linnea_aesgcm_init
     ; ct = packet + pn_offset + pn_len ; ctlen = length_value - pn_len
+    ; The Length field is attacker-controlled: require it to cover the packet
+    ; number and a 16-byte tag before subtracting, or ctlen underflows to a
+    ; ~2^64 value that aesgcm_open's unsigned "ctlen >= 16" guard waves through,
+    ; driving an unbounded OOB read/write.
+    mov rcx, [rsp + U_PNLEN]
+    add rcx, 16                      ; pn_len + tag
+    cmp r15, rcx
+    jb .err
     mov r9, r15
     sub r9, [rsp + U_PNLEN]          ; ctlen (payload incl. 16-byte tag)
     lea r8, [rbx + r14]

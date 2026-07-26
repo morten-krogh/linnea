@@ -755,7 +755,13 @@ linnea_quic_server_datagram:
     ; dgram is overwritten by each recvfrom.
     movzx eax, byte [linnea_quic_rxbuf + 5]
     lea rsi, [linnea_quic_rxbuf + 6 + rax]
-    movzx ecx, byte [rsi]            ; SCID length
+    movzx ecx, byte [rsi]            ; SCID length (raw wire byte, 0..255)
+    ; conn.dcid is LINNEA_QUIC_MAX_CID bytes. This completing Initial's header
+    ; was not size-checked by initial_token (that only guards a first packet),
+    ; so bound the SCID before the copy or rep movsb overruns the field into
+    ; the handshake secrets and reply-header builders that reuse dcid_len.
+    cmp ecx, LINNEA_QUIC_MAX_CID
+    ja .done                         ; malformed: drop, the conn times out
     inc rsi                          ; -> SCID bytes
     mov rax, [cur_conn]
     mov [rax + linnea_quic_conn.dcid_len], rcx

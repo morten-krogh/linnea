@@ -43,6 +43,11 @@ check() {
     fi
 }
 
+# workers_of <master-pid>: the sorted worker PIDs of a running server. A crash
+# is invisible through a fresh request because the master respawns the worker,
+# so an attack test compares this before and after: any change is a crash.
+workers_of() { pgrep -P "$1" 2>/dev/null | sort | tr '\n' ' '; }
+
 # --- config parsing and validation ---
 run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test locations=3" \
     timeout 0.5 $BIN test/configs/listen.json
@@ -610,6 +615,19 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
                  https://localhost:47452/hello.txt)
     [ "$body" = "hello from linnea" ]
     check "h3 (io_uring): HTTP/2 over TCP still served on the same port" $?
+
+    # a pre-auth malformed Initial (long-header Length rewritten to 0) must not
+    # underflow the AEAD ciphertext length and crash a worker; the workers must
+    # be the same processes afterwards, and normal h3 must still be served
+    ulw_before=$(workers_of $h3_pid)
+    python3 test/quic/h3_length_underflow_test.py 47452 >/dev/null 2>&1
+    sleep 0.5
+    python3 test/quic/h3_e2e_test.py 47452 >/dev/null 2>&1
+    ulw_ok=$?
+    ulw_after=$(workers_of $h3_pid)
+    [ -n "$ulw_before" ] && [ "$ulw_before" = "$ulw_after" ] && [ $ulw_ok -eq 0 ]
+    check "h3 (io_uring): malformed Length Initial crashes no worker (pre-auth)" $?
+
     kill $h3_pid 2>/dev/null
     wait $h3_pid 2>/dev/null
 else
@@ -2064,6 +2082,18 @@ assert s.recv(64) == b"tunnel-bytes-over-tls"
 s.close()
 PYEOF
     check "tls websocket tunnel (101 + blind relay)" $?
+
+    # RST_STREAM must crash no worker: resetting a proxied stream whose upstream
+    # is live and in flight (h2p_kill closing it with a syscall), and RST on
+    # stream 0 (a connection error, not a lookup that re-frees a reaped slot).
+    prst_before=$(workers_of $tls_server_pid)
+    timeout 60 python3 test/tls/h2_proxy_rst.py $CA 47443 >/dev/null 2>&1
+    sleep 0.5
+    resp=$(curl -si --http2 --max-time 5 --cacert $CA $U/hello.txt)
+    prst_after=$(workers_of $tls_server_pid)
+    [ -n "$prst_before" ] && [ "$prst_before" = "$prst_after" ] \
+        && printf '%s' "$resp" | grep -qF "hello from linnea"
+    check "http2 proxied-stream RST + RST-stream-0 crash no worker" $?
 
     kill $tls_server_pid $tls_backend_pid 2>/dev/null
     wait $tls_server_pid 2>/dev/null

@@ -116,6 +116,7 @@ extern linnea_log_stamp
 
 extern linnea_upstream_count
 extern linnea_upstream_open
+extern linnea_upstream_closed
 extern linnea_upstream_limit
 
 section .rodata
@@ -1556,6 +1557,20 @@ linnea_http_handle:
 ; The event loop takes it from here (connect, send, read the head back).
 .proxy_start:
     mov [rbx + linnea_connection.location], rax
+    ; the client head is rewritten into up_buf (method + target + our version
+    ; and Connection lines + every client header verbatim). up_buf is smaller
+    ; than in_buf, and .append is an unchecked rep movsb, so bound the head
+    ; first: a head that fits in_buf but not up_buf would otherwise overrun the
+    ; slot into the next connection. head_len here spans the buffered body too
+    ; (set at .body_ready), so subtract it — the pure head is what gets copied,
+    ; exactly as the copy loop computes its limit. Upper bound = pure head + the
+    ; longest Connection line we add + the request-line rewrite slack.
+    mov rcx, [rbx + linnea_connection.head_len]
+    sub rcx, [rsp + 128]             ; buffered body bytes queued behind the head
+    add rcx, hdr_up_upgrade_len
+    add rcx, req_version_len + 32
+    cmp rcx, LINNEA_CONN_UP_BUF
+    ja .resp_431
     mov rcx, [rsp + 120]
     mov [rbx + linnea_connection.vhost], rcx   ; the log fires on completion
     mov rcx, [rsp + 24]
@@ -2104,6 +2119,8 @@ linnea_http_proxy_error:
     je .no_up
     mov eax, LINNEA_SYS_CLOSE
     syscall
+    call linnea_upstream_closed   ; release the ceiling slot, or a 502/504
+                                  ; storm permanently wedges proxying at 503
     mov dword [rbx + linnea_connection.up_fd], -1
 .no_up:
     mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE

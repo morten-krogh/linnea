@@ -260,6 +260,11 @@ linnea_h2_handle:
     shl edx, 8
     movzx ecx, byte [rsi + 8]
     or edx, ecx
+    ; RST_STREAM on stream 0 is a connection error (RFC 9113 6.4). It must not
+    ; reach h2_slot_find: id 0 is the free-slot marker, so a lookup for 0 would
+    ; return a freed slot and munmap its stale file_base a second time.
+    test edx, edx
+    jz .goaway_close
     add r12, r11                     ; consume the frame (munmap clobbers r11)
     mov rdi, rbx
     mov esi, edx
@@ -277,6 +282,7 @@ linnea_h2_handle:
     pop rax
 .rst_freed:
     mov qword [rax + linnea_h2_stream.id], 0
+    mov qword [rax + linnea_h2_stream.file_base], 0   ; no stale mapping to re-free
 .rst_kill:
     pop rdx                          ; the reset stream's id
     mov rdi, rbx
@@ -1677,11 +1683,15 @@ h2p_find_collect:
 ; kernel still owns the buffer.
 h2p_kill:
     push rbx
+    push r12
     mov rax, [rdi + linnea_connection.index]
     imul rax, rax, LINNEA_H2P_SLOTS
     imul rax, rax, linnea_h2p_size
     add rax, [h2p_pool]
-    mov ecx, LINNEA_H2P_SLOTS
+    ; the counter must be callee-saved: h2p_release issues a syscall, which
+    ; clobbers rcx (and r11). A count kept in ecx would become a text address
+    ; after the first release and the scan would run off the pool.
+    mov r12d, LINNEA_H2P_SLOTS
 .k_scan:
     cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
     je .k_next
@@ -1694,8 +1704,9 @@ h2p_kill:
     mov rax, rbx
 .k_next:
     add rax, linnea_h2p_size
-    dec ecx
+    dec r12d
     jnz .k_scan
+    pop r12
     pop rbx
     ret
 
@@ -2050,6 +2061,8 @@ linnea_h2p_event:
     je .ev_fail_nofd
     mov eax, LINNEA_SYS_CLOSE
     syscall
+    call linnea_upstream_closed   ; release the ceiling slot here: setting fd
+                                  ; to -1 makes the later free skip its decrement
     mov dword [rbx + linnea_h2p.fd], -1
 .ev_fail_nofd:
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FAILED
@@ -3270,6 +3283,7 @@ h2_schedule:
     pop rax
 .reap_free:
     mov qword [rax + linnea_h2_stream.id], 0
+    mov qword [rax + linnea_h2_stream.file_base], 0   ; no stale mapping to re-free
     inc qword [rbx + linnea_connection.h2_done_count]   ; refills the reset budget
 .reap_next:
     inc ecx
