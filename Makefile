@@ -7,21 +7,15 @@ OBJS = $(SRCS:.asm=.o)
 INCS = $(wildcard include/*.inc)
 BIN  = bin/linnea
 
-# liburing is vendored (lib/ is gitignored) and built statically without
-# libc (nolibc is the default on x86-64 since liburing 2.15).
-LIBURING_TAG = liburing-2.15
-LIBURING_DIR = lib/liburing
-LIBURING_A   = $(LIBURING_DIR)/src/liburing.a
+# No dependencies: the binary is nasm + ld over src/, statically linked, with no
+# libc and no third-party code. The io_uring rings are driven straight from
+# src/linnea_ring.asm (io_uring_setup/io_uring_enter), which is what liburing
+# used to provide.
 
 all: $(BIN)
 
-$(BIN): $(OBJS) $(LIBURING_A)
-	$(LD) -o $@ $(OBJS) $(LIBURING_A)
-
-$(LIBURING_A):
-	test -d $(LIBURING_DIR) || git clone --depth 1 -b $(LIBURING_TAG) https://github.com/axboe/liburing.git $(LIBURING_DIR)
-	cd $(LIBURING_DIR) && ./configure > /dev/null
-	$(MAKE) -C $(LIBURING_DIR)/src
+$(BIN): $(OBJS)
+	$(LD) -o $@ $(OBJS)
 
 src/%.o: src/%.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<

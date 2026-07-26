@@ -1,9 +1,8 @@
-; io_uring constants and struct layouts.
-;
-; SQE and CQE layouts are stable kernel ABI. The struct io_uring offsets are
-; liburing internals — they are pinned to the vendored liburing-2.15 build
-; (lib/liburing) and were verified with offsetof() against its headers:
-;   sizeof(struct io_uring) = 216, offsetof(cq.khead) = 104.
+; io_uring constants and struct layouts. Every offset here is stable kernel ABI
+; (io_uring(7)): the sqe and cqe layouts, the io_uring_params block that
+; io_uring_setup(2) fills in, and the ring offsets inside it. linnea_ring
+; below is ours — src/linnea_ring.asm builds and drives the rings directly, so
+; nothing in this file depends on a library's private layout.
 
 ; struct io_uring_sqe (kernel ABI, 64 bytes)
 LINNEA_SQE_OPCODE       equ 0    ; u8
@@ -73,11 +72,66 @@ LINNEA_IOVEC_SIZE       equ 16
 ; for that long completes with -ECANCELED; the request fails or the
 ; connection closes. The duration comes from the config's "timeout".
 
-; struct io_uring (liburing 2.15 internal layout)
-LINNEA_URING_RING_SIZE  equ 216
-LINNEA_URING_CQ_KHEAD   equ 104  ; struct io_uring_cq.khead pointer
+; struct io_uring_params (kernel ABI, 120 bytes) — io_uring_setup(2) reports the
+; queue sizes it chose, the features it supports, and where each queue's fields
+; sit inside the ring mappings.
+LINNEA_URING_P_SQ_ENTRIES equ 0    ; u32
+LINNEA_URING_P_CQ_ENTRIES equ 4    ; u32
+LINNEA_URING_P_FLAGS      equ 8    ; u32 (IORING_SETUP_*)
+LINNEA_URING_P_FEATURES   equ 20   ; u32 (IORING_FEAT_*)
+LINNEA_URING_P_SQ_OFF     equ 40   ; struct io_sqring_offsets
+LINNEA_URING_P_CQ_OFF     equ 80   ; struct io_cqring_offsets
+LINNEA_URING_PARAMS_SIZE  equ 120
+
+; struct io_sqring_offsets / io_cqring_offsets: byte offsets into the ring mapping
+LINNEA_SQ_OFF_HEAD        equ 0
+LINNEA_SQ_OFF_TAIL        equ 4
+LINNEA_SQ_OFF_RING_MASK   equ 8
+LINNEA_SQ_OFF_RING_ENTRIES equ 12
+LINNEA_SQ_OFF_FLAGS       equ 16
+LINNEA_SQ_OFF_DROPPED     equ 20
+LINNEA_SQ_OFF_ARRAY       equ 24
+LINNEA_CQ_OFF_HEAD        equ 0
+LINNEA_CQ_OFF_TAIL        equ 4
+LINNEA_CQ_OFF_RING_MASK   equ 8
+LINNEA_CQ_OFF_RING_ENTRIES equ 12
+LINNEA_CQ_OFF_OVERFLOW    equ 16
+LINNEA_CQ_OFF_CQES        equ 20
+
+; mmap offsets that select which region io_uring_setup's fd maps
+LINNEA_IORING_OFF_SQ_RING equ 0
+LINNEA_IORING_OFF_CQ_RING equ 0x8000000
+LINNEA_IORING_OFF_SQES    equ 0x10000000
+
+LINNEA_IORING_FEAT_SINGLE_MMAP equ 1   ; sq and cq rings share one mapping
+LINNEA_IORING_ENTER_GETEVENTS  equ 1   ; io_uring_enter flag: also reap completions
+LINNEA_IORING_SQ_CQ_OVERFLOW   equ 2   ; sq flags: completions are backlogged
+
+; struct linnea_ring — our ring handle: the queue pointers the hot paths need,
+; cached out of the mappings, plus what is required to submit and to unmap.
+struc linnea_ring
+    .fd:        resq 1               ; the io_uring_setup(2) fd
+    .sq_khead:  resq 1               ; u32*: submissions the kernel has consumed
+    .sq_ktail:  resq 1               ; u32*: submissions we have published
+    .sq_kflags: resq 1               ; u32*: IORING_SQ_*
+    .sq_mask:   resq 1
+    .sq_entries: resq 1
+    .sqes:      resq 1               ; struct io_uring_sqe[]
+    .sq_tail:   resq 1               ; our tail: prepared, not yet published
+    .cq_khead:  resq 1               ; u32*: completions we have consumed
+    .cq_ktail:  resq 1               ; u32*: completions the kernel has published
+    .cq_mask:   resq 1
+    .cqes:      resq 1               ; struct io_uring_cqe[]
+    .sq_base:   resq 1               ; mappings, kept for munmap
+    .sq_len:    resq 1
+    .cq_base:   resq 1               ; 0 when the cq shares the sq mapping
+    .cq_len:    resq 1
+    .sqes_len:  resq 1
+endstruc
+LINNEA_RING_SIZE        equ linnea_ring_size
 
 LINNEA_URING_ENTRIES    equ 256  ; submission queue depth
 LINNEA_EINTR            equ 4
+LINNEA_EAGAIN           equ 11
 LINNEA_EIO              equ 5
 LINNEA_ECANCELED        equ 125

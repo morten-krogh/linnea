@@ -1,5 +1,6 @@
-; linnea_uring.asm — io_uring event loop built on liburing (vendored,
-; nolibc build). One multishot accept is armed per listening socket.
+; linnea_uring.asm — the io_uring event loop. The rings themselves are set up and
+; driven by linnea_ring.asm, straight against the kernel (no liburing): this file
+; fills sqes and dispatches cqes. One multishot accept is armed per listening socket.
 ; Accepted connections get a pool slot and a recv with a linked idle
 ; timeout; complete request heads are answered by linnea_http (headers
 ; from out_buf, then the mmap'd file if any). Keep-alive connections
@@ -46,10 +47,10 @@ default rel
 global linnea_uring_run
 global drain_flag
 
-extern io_uring_queue_init
-extern io_uring_get_sqe
-extern io_uring_submit
-extern __io_uring_get_cqe
+extern linnea_ring_init
+extern linnea_ring_get_sqe
+extern linnea_ring_submit
+extern linnea_ring_get_cqe
 
 extern linnea_config_instance
 extern linnea_network_peer_format
@@ -102,11 +103,11 @@ extern linnea_worker_index
 
 section .rodata
 
-msg_init:           db "io_uring_queue_init failed"
+msg_init:           db "io_uring setup failed"
 msg_init_len        equ $ - msg_init
 msg_sqe:            db "io_uring submission queue full"
 msg_sqe_len         equ $ - msg_sqe
-msg_submit:         db "io_uring_submit failed"
+msg_submit:         db "io_uring submit failed"
 msg_submit_len      equ $ - msg_submit
 msg_wait:           db "io_uring wait failed"
 msg_wait_len        equ $ - msg_wait
@@ -186,7 +187,7 @@ pto_timer:          dq 0, 50000000                  ; {sec, nsec} = 50 ms
 
 section .bss
 
-ring:               resb LINNEA_URING_RING_SIZE
+ring:               resb LINNEA_RING_SIZE
 cqe_ptr:            resq 1
 idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
                                ; tunnel's last_activity comparison
@@ -247,7 +248,7 @@ linnea_uring_run:
     mov edi, LINNEA_URING_ENTRIES
     lea rsi, [ring]
     xor edx, edx
-    call io_uring_queue_init
+    call linnea_ring_init
     test eax, eax
     js .init_fail
 
@@ -415,8 +416,7 @@ linnea_uring_run:
     lea rsi, [cqe_ptr]
     xor edx, edx               ; submit = 0
     mov ecx, 1                 ; wait_nr = 1
-    xor r8d, r8d               ; sigmask = NULL
-    call __io_uring_get_cqe
+    call linnea_ring_get_cqe
     cmp eax, -LINNEA_EINTR
     je .wait
     test eax, eax
@@ -428,7 +428,7 @@ linnea_uring_run:
     mov r15d, [r12 + LINNEA_CQE_RES]
     ; mark the cqe seen: *cq.khead += 1 (x86 stores have release ordering)
     lea rax, [ring]
-    mov rcx, [rax + LINNEA_URING_CQ_KHEAD]
+    mov rcx, [rax + linnea_ring.cq_khead]
     mov edx, [rcx]
     inc edx
     mov [rcx], edx
@@ -1800,7 +1800,7 @@ linnea_uring_now:
 linnea_uring_submit_now:
     sub rsp, 8                 ; keep calls 16-byte aligned
     lea rdi, [ring]
-    call io_uring_submit
+    call linnea_ring_submit
     add rsp, 8
     test eax, eax
     js .fail
@@ -1814,7 +1814,7 @@ linnea_uring_submit_now:
 linnea_uring_get_sqe_zeroed:
     sub rsp, 8
     lea rdi, [ring]
-    call io_uring_get_sqe
+    call linnea_ring_get_sqe
     add rsp, 8
     test rax, rax
     jz .full
