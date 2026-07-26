@@ -151,6 +151,7 @@ struc linnea_h2p
     .sid:       resq 1            ; the client stream id
     .gen:       resq 1            ; the connection incarnation this belongs to
     .location:  resq 1            ; matched location* (connect addr, log)
+    .srv:       resq 1            ; the vhost that matched, for its headers
     .req_len:   resq 1            ; rewritten request bytes (head, then body)
     .sent:      resq 1            ; upstream send progress
     .len:       resq 1            ; response bytes received into buf

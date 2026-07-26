@@ -141,11 +141,17 @@ hd, _ = fetch(port, "/hello.txt", [(b"if-none-match", b'"stale"'),
                                    (b"if-modified-since", lastmod)])
 assert hd.get(b":status") == b"200", hd
 
+# the vhost's configured security headers ride every response
+assert hd.get(b"strict-transport-security") == b"max-age=31536000", hd
+assert hd.get(b"x-content-type-options") == b"nosniff", hd
+
 # a 404 carries date and server but no validators
 hd, _ = fetch(port, "/nope.txt")
 assert hd.get(b":status") == b"404", hd
 assert b"etag" not in hd and b"last-modified" not in hd, hd
 assert re.match(DATE_RE, hd.get(b"date", b"")), hd
 assert hd.get(b"server") == b"linnea", hd
+assert hd.get(b"strict-transport-security") == b"max-age=31536000", hd
+assert hd.get(b"x-content-type-options") == b"nosniff", hd
 
 print("ok")

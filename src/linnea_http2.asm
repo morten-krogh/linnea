@@ -784,6 +784,7 @@ h2_serve:
     mov rsi, r12
     call h2_select_vhost             ; -> rax = server*
     mov r13, rax
+    mov [h2_cur_srv], rax            ; its security headers ride the response
     lea rdi, [h2_path_buf + LINNEA_HTTP2_PATH_ROOT]
     mov rsi, [r12 + linnea_h2_req.path_ptr]
     mov rdx, [r12 + linnea_h2_req.path_len]
@@ -1215,6 +1216,8 @@ h2_serve:
     mov [r13 + linnea_h2p.gen], rcx
     mov rcx, [rsp + S_LOC]
     mov [r13 + linnea_h2p.location], rcx
+    mov rcx, [h2_cur_srv]            ; for the response's security headers,
+    mov [r13 + linnea_h2p.srv], rcx  ; built long after this request returns
     mov qword [r13 + linnea_h2p.sent], 0
     mov qword [r13 + linnea_h2p.len], 0
     mov qword [r13 + linnea_h2p.rd], 0
@@ -2551,6 +2554,8 @@ h2p_emit_headers:
     mov [rsp], rdi                   ; frame start
     mov rbx, rsi                     ; slot
     mov [rsp + 8], rdx               ; conn
+    mov rax, [rbx + linnea_h2p.srv]  ; the vhost this request selected
+    mov [h2_cur_srv], rax
     lea r15, [rdi + 9]               ; payload cursor
     ; :status — literal with the static name index (8), value as 3 digits
     mov rax, [rbx + linnea_h2p.status]
@@ -2672,6 +2677,45 @@ h2p_emit_headers:
     lea r14, [rbp + 2]
     jmp .eh_line
 .eh_done:
+    ; our own security headers ride a proxied response too — they describe
+    ; the origin, not the backend — but only when the backend did not set
+    ; them itself, so an app that sends its own policy still wins
+    mov r14, [h2_cur_srv]
+    test r14, r14
+    jz .eh_frame
+    cmp qword [r14 + linnea_config_server.hsts_len], 0
+    je .eh_nosniff
+    lea rdi, [r12]                   ; the upstream head
+    mov rsi, [rbx + linnea_h2p.rd]
+    lea rdx, [h2p_hn_hsts]
+    mov ecx, h2p_hn_hsts_len
+    call h2p_head_find               ; -> rdx = length (0 = absent)
+    test rdx, rdx
+    jnz .eh_nosniff
+    mov rdi, r15
+    mov esi, 56                      ; strict-transport-security
+    lea rdx, [r14 + linnea_config_server.hsts]
+    mov rcx, [r14 + linnea_config_server.hsts_len]
+    call h2_enc_hdr
+    mov r15, rdi
+.eh_nosniff:
+    cmp qword [r14 + linnea_config_server.nosniff], 0
+    je .eh_frame
+    lea rdi, [r12]
+    mov rsi, [rbx + linnea_h2p.rd]
+    lea rdx, [h2_nosniff_name]
+    mov ecx, h2_nosniff_name_len
+    call h2p_head_find
+    test rdx, rdx
+    jnz .eh_frame
+    mov rdi, r15
+    lea rsi, [h2_nosniff_name]
+    mov rdx, h2_nosniff_name_len
+    lea rcx, [h2_nosniff_val]
+    mov r8, h2_nosniff_val_len
+    call h2_enc_hdr_lit
+    mov r15, rdi
+.eh_frame:
     ; the frame header: END_HEADERS, plus END_STREAM when no body follows
     mov rdi, [rsp]
     mov rbp, r15
@@ -2760,6 +2804,8 @@ h2p_emit_error:
     push r14
     push r15
     mov rbx, rsi                     ; slot
+    mov rax, [rbx + linnea_h2p.srv]
+    mov [h2_cur_srv], rax
     mov r14, rdi                     ; frame start
     mov rax, [rbx + linnea_h2p.status]
     lea r12, [body_502]              ; the message body
@@ -3288,9 +3334,14 @@ h2_enc_hdr_lit:
     ret
 
 ; h2_enc_date_server(rdi=dst) -> rdi advanced. The date and server response
-; fields every response carries (static-table names 33 and 54).
+; fields every response carries (static-table names 33 and 54), then the
+; serving vhost's security headers. The vhost comes from h2_cur_srv, set by
+; whichever path is building this response — every caller runs synchronously
+; inside one response build, so a global is enough and keeps this off the
+; register-starved encode paths.
 h2_enc_date_server:
     push rbx
+    push r12
     mov rbx, rdi
     call linnea_time_http_now        ; rax = current IMF-fixdate text
     mov rdi, rbx
@@ -3302,6 +3353,25 @@ h2_enc_date_server:
     lea rdx, [srv_linnea]
     mov ecx, srv_linnea_len
     call h2_enc_hdr
+    mov r12, [h2_cur_srv]
+    test r12, r12
+    jz .eds_done
+    cmp qword [r12 + linnea_config_server.hsts_len], 0
+    je .eds_nosniff
+    mov esi, 56                      ; strict-transport-security
+    lea rdx, [r12 + linnea_config_server.hsts]
+    mov rcx, [r12 + linnea_config_server.hsts_len]
+    call h2_enc_hdr
+.eds_nosniff:
+    cmp qword [r12 + linnea_config_server.nosniff], 0
+    je .eds_done
+    lea rsi, [h2_nosniff_name]       ; not in the HPACK static table: both
+    mov rdx, h2_nosniff_name_len     ; the name and the value are literals
+    lea rcx, [h2_nosniff_val]
+    mov r8, h2_nosniff_val_len
+    call h2_enc_hdr_lit
+.eds_done:
+    pop r12
     pop rbx
     ret
 
@@ -3496,6 +3566,10 @@ enc_gzip_h2:     db "gzip"
 enc_gzip_h2_len  equ $ - enc_gzip_h2
 h2_ae_name:      db "Accept-Encoding"
 h2_ae_name_len   equ $ - h2_ae_name
+h2_nosniff_name: db "x-content-type-options"
+h2_nosniff_name_len equ $ - h2_nosniff_name
+h2_nosniff_val:  db "nosniff"
+h2_nosniff_val_len equ $ - h2_nosniff_val
 status_301_h2:   db "301"
 status_431_h2:   db "431"
 body_431: db "431 Request Header Fields Too Large", 10
@@ -3519,6 +3593,8 @@ h2p_hn_cl:       db "content-length"
 h2p_hn_cl_len    equ $ - h2p_hn_cl
 h2p_chunked:     db "chunked"
 h2p_chunked_len  equ $ - h2p_chunked
+h2p_hn_hsts:     db "strict-transport-security"
+h2p_hn_hsts_len  equ $ - h2p_hn_hsts
 ; response fields never forwarded to the client: hop-by-hop (RFC 9110 7.6.1)
 ; plus the framing h2 carries itself
 h2p_d_conn:      db "connection"
@@ -3553,6 +3629,7 @@ h2_hdrs_buf:  resb 8192              ; proxy: the rebuilt h1 header lines
 h2_req_es:    resd 1                 ; END_STREAM was set on the HEADERS frame
 h2p_pool:     resq 1                 ; the upstream slot array (one mmap)
 h2_dyn_pool:  resq 1                 ; per-connection HPACK dynamic tables
+h2_cur_srv:   resq 1                 ; vhost whose response is being built
 h2p_numbuf:   resb 24
 h2p_stbuf:    resb 4                 ; a status as three ASCII digits
 h2p_nmbuf:    resb 64                ; a response field name, lowercased

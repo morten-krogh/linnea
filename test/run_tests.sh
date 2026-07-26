@@ -1302,6 +1302,36 @@ $BIN -t test/configs/bad-timeout.json >/dev/null 2>&1
 [ $? -ne 0 ]
 check "config check rejects a bad config" $?
 
+# --- log rotation (SIGHUP) ---
+# Every process holds its own descriptor for the log, so after a rotation
+# they must be told to reopen it: without that they keep filling the renamed
+# inode and the fresh file stays empty.
+rm -f "$LOG" "$LOG.rot"
+$BIN test/configs/listen.json >/dev/null 2>&1 &
+rot_master=$!
+sleep 0.3
+curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null
+sleep 0.2
+mv "$LOG" "$LOG.rot"
+curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null
+sleep 0.2
+rotated_before=$(wc -l < "$LOG.rot")
+kill -HUP $rot_master
+sleep 0.5
+curl -s --max-time 3 http://127.0.0.1:47080/index.html -o /dev/null
+sleep 0.3
+kill -0 $rot_master 2>/dev/null
+check "sighup: the server survives it" $?
+[ -s "$LOG" ]
+check "sighup: reopens the log (new file has lines)" $?
+grep -q '"GET /index.html"' "$LOG"
+check "sighup: post-rotate requests log to the new file" $?
+[ "$(wc -l < "$LOG.rot")" -eq "$rotated_before" ]
+check "sighup: the rotated file stops growing" $?
+kill $rot_master 2>/dev/null
+wait $rot_master 2>/dev/null
+rm -f "$LOG.rot"
+
 # --- zero-downtime binary upgrade (SIGUSR2) ---
 # The master re-execs in place: same PID, listeners adopted (never
 # closed), new workers up, old workers drained. A request in flight when
@@ -1505,6 +1535,13 @@ with socket.create_connection(("localhost", int(sys.argv[2])), timeout=5) as raw
 PYEOF
     check "tls python ssl (TLSv1.3, AES-128-GCM)" $?
 
+    # configured security headers ride every response this vhost builds
+    hdrs=$(curl -si --http1.1 --max-time 5 --cacert $CA $U/hello.txt)
+    check_http "hsts header (h1)"     "Strict-Transport-Security: max-age=31536000" "$hdrs"
+    check_http "nosniff header (h1)"  "X-Content-Type-Options: nosniff" "$hdrs"
+    hdrs=$(curl -si --http1.1 --max-time 5 --cacert $CA $U/no-such-file)
+    check_http "hsts on a 404 (h1)"   "Strict-Transport-Security:" "$hdrs"
+
     # a vhost with a proxy location must not advertise h3: Alt-Svc migration
     # is per-origin, and h3 has no location routing — a browser that switched
     # would 404 on every proxied path with no fallback
@@ -1543,6 +1580,22 @@ PYEOF
     echo | timeout 5 openssl s_client -connect 127.0.0.1:47443 -CAfile $CA \
         -tls1_3 -alpn h2,http/1.1 2>/dev/null | grep -q "ALPN protocol: h2"
     check "alpn: proxy vhost offers h2 (proxy-over-h2)" $?
+
+    # security headers over h2, on static, error and proxied responses
+    sec() { timeout 10 curl -s --http2 -D - -o /dev/null --cacert $CA \
+        --resolve localhost:47443:127.0.0.1 "$1"; }
+    h=$(sec "https://localhost:47443/hello.txt")
+    echo "$h" | grep -qi '^strict-transport-security: max-age=31536000' \
+        && echo "$h" | grep -qi '^x-content-type-options: nosniff'
+    check "http2 security headers (static)" $?
+    h=$(sec "https://localhost:47443/nope")
+    echo "$h" | grep -qi '^strict-transport-security:' \
+        && echo "$h" | grep -qi '^x-content-type-options:'
+    check "http2 security headers (404)" $?
+    h=$(sec "https://localhost:47443/api/simple")
+    echo "$h" | grep -qi '^strict-transport-security:' \
+        && echo "$h" | grep -qi '^x-content-type-options:'
+    check "http2 security headers (proxied response)" $?
 
     # --- proxy over HTTP/2 (Q86): each stream runs its own HTTP/1.1 upstream
     # exchange, so the backend still only ever speaks h1 (and WebSocket).

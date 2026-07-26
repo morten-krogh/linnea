@@ -68,6 +68,10 @@ key_cert:               db "cert"
 key_cert_len            equ $ - key_cert
 key_key:                db "key"
 key_key_len             equ $ - key_key
+key_hsts:               db "hsts"
+key_hsts_len            equ $ - key_hsts
+key_nosniff:            db "nosniff"
+key_nosniff_len         equ $ - key_nosniff
 
 msg_eof:                db "unexpected end of file"
 msg_eof_len             equ $ - msg_eof
@@ -121,6 +125,8 @@ msg_root_long:          db "root too long"
 msg_root_long_len       equ $ - msg_root_long
 msg_redirect_long:      db "redirect too long"
 msg_redirect_long_len   equ $ - msg_redirect_long
+msg_nosniff:            db "nosniff must be 0 or 1"
+msg_nosniff_len         equ $ - msg_nosniff
 msg_cc_long:            db "cache_control too long"
 msg_cc_long_len         equ $ - msg_cc_long
 msg_path_long:          db "cert/key path too long"
@@ -399,6 +405,8 @@ linnea_parse_server:
     mov dword [rbx + linnea_config_server.tls], 0
     mov qword [rbx + linnea_config_server.cert_path_len], 0
     mov qword [rbx + linnea_config_server.key_path_len], 0
+    mov qword [rbx + linnea_config_server.hsts_len], 0
+    mov qword [rbx + linnea_config_server.nosniff], 0
     mov edi, '{'
     call linnea_parse_expect
 .member_loop:
@@ -451,6 +459,20 @@ linnea_parse_server:
     call linnea_string_equal
     test eax, eax
     jnz .key_key
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_hsts]
+    mov ecx, key_hsts_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_hsts
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_nosniff]
+    mov ecx, key_nosniff_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_nosniff
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -523,6 +545,33 @@ linnea_parse_server:
     mov rsi, rax
     call linnea_string_copy
     jmp .member_sep
+
+.key_hsts:
+    test r12d, 64
+    jnz .dup
+    or r12d, 64
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_ROOT
+    ja .path_long
+    mov [rbx + linnea_config_server.hsts_len], rdx
+    lea rdi, [rbx + linnea_config_server.hsts]
+    mov rsi, rax
+    call linnea_string_copy
+    jmp .member_sep
+
+.key_nosniff:
+    test r12d, 128
+    jnz .dup
+    or r12d, 128
+    call linnea_parse_u64
+    cmp rax, 1
+    ja .nosniff_range
+    mov [rbx + linnea_config_server.nosniff], rax
+    jmp .member_sep
+.nosniff_range:
+    lea rdi, [msg_nosniff]
+    mov esi, msg_nosniff_len
+    jmp linnea_parse_fail
 
 .key_locations:
     test r12d, 8

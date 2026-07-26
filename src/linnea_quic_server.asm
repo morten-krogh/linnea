@@ -38,6 +38,9 @@ struc linnea_quic_vhost
     .root_len: resq 1
     .cc_ptr:   resq 1               ; the location's Cache-Control value
     .cc_len:   resq 1               ; (len 0 = none configured)
+    .hsts_ptr: resq 1               ; the server's Strict-Transport-Security
+    .hsts_len: resq 1               ; value (len 0 = not sent)
+    .nosniff:  resq 1               ; 1 = send X-Content-Type-Options
 endstruc
 
 ; Per-connection state lives in the pool slot cur_conn points at. CONNLEA loads
@@ -72,6 +75,9 @@ extern linnea_h3_body_off
 extern linnea_h3_body_len
 extern linnea_qpack_ccontrol_ptr
 extern linnea_qpack_ccontrol_len
+extern linnea_qpack_hsts_ptr
+extern linnea_qpack_hsts_len
+extern linnea_qpack_nosniff
 extern linnea_quic_initial_dcid
 extern linnea_quic_initial_secrets
 extern linnea_quic_ch_parse
@@ -306,6 +312,12 @@ linnea_quic_add_vhost:
     mov [rdx + linnea_quic_vhost.cc_ptr], r8
     mov r8, [rsi + linnea_config_location.cache_control_len]
     mov [rdx + linnea_quic_vhost.cc_len], r8
+    lea r8, [rdi + linnea_config_server.hsts]
+    mov [rdx + linnea_quic_vhost.hsts_ptr], r8
+    mov r8, [rdi + linnea_config_server.hsts_len]
+    mov [rdx + linnea_quic_vhost.hsts_len], r8
+    mov r8, [rdi + linnea_config_server.nosniff]
+    mov [rdx + linnea_quic_vhost.nosniff], r8
     inc qword [vhost_count]
 .av_full:
     xor eax, eax
@@ -1661,6 +1673,17 @@ linnea_quic_server_datagram:
     xor r11d, r11d
 .h3_cc_set:
     mov [linnea_qpack_ccontrol_ptr], r11
+    ; this vhost's security headers, for the encoder
+    mov r10, [rax + linnea_quic_vhost.hsts_len]
+    mov [linnea_qpack_hsts_len], r10
+    mov r11, [rax + linnea_quic_vhost.hsts_ptr]
+    test r10, r10
+    jnz .h3_hsts_set
+    xor r11d, r11d
+.h3_hsts_set:
+    mov [linnea_qpack_hsts_ptr], r11
+    mov r10, [rax + linnea_quic_vhost.nosniff]
+    mov [linnea_qpack_nosniff], r10
     mov r8, [s_body_ptr]             ; the request body, for a POST echo
     mov r9, [s_body_len]
     ; may we start a chunked response? Yes while any of the LINNEA_QUIC_TXSTREAMS

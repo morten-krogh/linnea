@@ -200,6 +200,10 @@ hdr_server:     db 13, 10, "Server: linnea"
 hdr_server_len  equ $ - hdr_server
 hdr_cache_control: db 13, 10, "Cache-Control: "
 hdr_cache_control_len equ $ - hdr_cache_control
+hdr_hsts:       db 13, 10, "Strict-Transport-Security: "
+hdr_hsts_len    equ $ - hdr_hsts
+hdr_nosniff:    db 13, 10, "X-Content-Type-Options: nosniff"
+hdr_nosniff_len equ $ - hdr_nosniff
 hdr_date:       db 13, 10, "Date: "
 hdr_date_len    equ $ - hdr_date
 hdr_content_range: db 13, 10, "Content-Range: bytes "
@@ -230,6 +234,7 @@ version_11_sp_len equ $ - version_11_sp
 version_11:     db "HTTP/1.1"          ; 8 bytes, compared as one qword
 version_10:     db "HTTP/1.0"          ; accepted from an upstream, rewritten
 crlf:           db 13, 10
+crlfcrlf:       db 13, 10, 13, 10
 method_get:     db "GET"
 method_head:    db "HEAD"
 index_html:     db "index.html"
@@ -1350,6 +1355,7 @@ linnea_http_handle:
     mov esi, hdr_accept_ranges_len
     call .append
     call .append_validators
+    mov rdi, [rsp + 120]       ; the serving vhost
     call .append_server_date
     mov rdi, [rsp + 152]       ; the matched location's Cache-Control, if set
     call .append_cache_control
@@ -1397,6 +1403,7 @@ linnea_http_handle:
     mov rcx, [rax + linnea_config_location.redirect_len]
     add rcx, [rsp + 144]       ; raw target length
     add rcx, status_301_len + hdr_301_tail_len + hdr_server_len + hdr_date_len + LINNEA_HTTP_DATE_LEN
+    add rcx, hdr_hsts_len + LINNEA_MAX_ROOT + hdr_nosniff_len
     cmp rcx, LINNEA_CONN_OUT_BUF
     ja .resp_414
     lea r15, [rbx + linnea_connection.out_buf]
@@ -1410,6 +1417,7 @@ linnea_http_handle:
     mov rdi, [rsp + 8]         ; the raw request target, query included
     mov rsi, [rsp + 144]
     call .append
+    mov rdi, [rsp + 120]       ; the serving vhost
     call .append_server_date
     lea rdi, [hdr_301_tail]
     mov esi, hdr_301_tail_len
@@ -1441,6 +1449,7 @@ linnea_http_handle:
     mov esi, hdr_vary_len      ; encoding itself is metadata it should not
     call .append               ; restate
     call .append_validators
+    mov rdi, [rsp + 120]       ; the serving vhost
     call .append_server_date
     mov rdi, [rsp + 152]       ; the matched location's Cache-Control, if set
     call .append_cache_control
@@ -1490,6 +1499,7 @@ linnea_http_handle:
     lea rdi, [zero_ch]
     mov esi, 1
     call .append
+    mov rdi, [rsp + 120]       ; the serving vhost
     call .append_server_date
     cmp qword [rsp + 24], 0
     je .conn_close_416
@@ -1701,6 +1711,33 @@ linnea_http_handle:
     mov ecx, resp_505_len
     mov qword [rsp + 112], 505
 .resp_static:
+    ; The canned error responses are sent straight from rodata. When the
+    ; vhost configures security headers they have to appear here too — a
+    ; browser whose first request 404s should still learn the policy — so
+    ; the blob is copied into out_buf without its blank line, the headers
+    ; are appended, and the blank line is put back. Every blob ends with
+    ; "Connection: close" CRLF CRLF, which is what the 4 accounts for.
+    mov rdx, [rsp + 120]       ; the serving vhost (a default until matched)
+    test rdx, rdx
+    jz .rs_asis
+    cmp qword [rdx + linnea_config_server.hsts_len], 0
+    jne .rs_copy
+    cmp qword [rdx + linnea_config_server.nosniff], 0
+    je .rs_asis
+.rs_copy:
+    lea r15, [rbx + linnea_connection.out_buf]
+    mov rdi, rax
+    lea rsi, [rcx - 4]         ; the head without its terminating blank line
+    call .append
+    mov rdi, [rsp + 120]
+    call .append_security
+    lea rdi, [crlfcrlf]
+    mov esi, 4
+    call .append
+    lea rax, [rbx + linnea_connection.out_buf]
+    mov rcx, r15
+    sub rcx, rax
+.rs_asis:
     mov [rbx + linnea_connection.out_ptr], rax
     mov [rbx + linnea_connection.out_rem], rcx
     mov qword [rbx + linnea_connection.keep_alive], 0
@@ -1841,9 +1878,14 @@ linnea_http_handle:
 .acc_done:
     ret
 
-; .append_server_date() — the Server line and a Date line naming the current
-; time (RFC 9110 6.6.1), shared by every dynamically assembled head.
+; .append_server_date(rdi = the serving vhost, may be 0) — the Server line, a
+; Date line naming the current time (RFC 9110 6.6.1), and whatever security
+; headers that vhost configures. Shared by every dynamically assembled head.
+; The vhost comes in as an argument rather than off the caller's frame: a
+; call has already pushed the return address, so the frame offsets differ
+; here from every other line in this handler.
 .append_server_date:
+    push rdi                   ; the vhost, across the appends
     lea rdi, [hdr_server]
     mov esi, hdr_server_len
     call .append
@@ -1853,7 +1895,36 @@ linnea_http_handle:
     call linnea_time_http_now
     mov rdi, rax
     mov esi, LINNEA_HTTP_DATE_LEN
+    call .append
+    pop rdi                    ; the serving vhost
+    ; fall through to the security headers
+
+; .append_security(rdi = the serving vhost, may be 0) — the Strict-Transport
+; -Security and X-Content-Type-Options lines this vhost configures, if any.
+.append_security:
+    test rdi, rdi
+    jz .asd_done
+    mov r8, rdi
+    cmp qword [r8 + linnea_config_server.hsts_len], 0
+    je .asd_nosniff
+    push r8
+    lea rdi, [hdr_hsts]
+    mov esi, hdr_hsts_len
+    call .append
+    pop r8
+    push r8
+    lea rdi, [r8 + linnea_config_server.hsts]
+    mov rsi, [r8 + linnea_config_server.hsts_len]
+    call .append
+    pop r8
+.asd_nosniff:
+    cmp qword [r8 + linnea_config_server.nosniff], 0
+    je .asd_done
+    lea rdi, [hdr_nosniff]
+    mov esi, hdr_nosniff_len
     jmp .append
+.asd_done:
+    ret
 
 ; .append(rdi=ptr, rsi=len) — local helper; r15 is the write cursor.
 ; The 200 header line lengths are bounded well under LINNEA_CONN_OUT_BUF.

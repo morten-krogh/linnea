@@ -55,6 +55,12 @@ struc linnea_config_server
     .pad3:          resd 1
     .cert_path:     resb LINNEA_MAX_ROOT + 1      ; PEM cert chain path
     .cert_path_len: resq 1
+    ; Optional security headers, sent on the responses this server builds.
+    ; HSTS is only meaningful over TLS (RFC 6797 7.2: a UA ignores it on a
+    ; plain connection), so it is configured per server, next to the cert.
+    .hsts:          resb LINNEA_MAX_ROOT + 1      ; Strict-Transport-Security
+    .hsts_len:      resq 1                        ; value (0 = not sent)
+    .nosniff:       resq 1                        ; 1 = X-Content-Type-Options
     .key_path:      resb LINNEA_MAX_ROOT + 1      ; PEM PKCS#8 key path
     .key_path_len:  resq 1
     .cert_list:     resq 1                        ; TLS certificate_list, pre-framed

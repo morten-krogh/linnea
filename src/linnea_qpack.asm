@@ -27,6 +27,9 @@ global linnea_qpack_crange_len
 global linnea_qpack_ccontrol_ptr
 global linnea_qpack_ccontrol_len
 global linnea_qpack_cenc
+global linnea_qpack_hsts_ptr
+global linnea_qpack_hsts_len
+global linnea_qpack_nosniff
 
 extern hpack_int
 extern hpack_str
@@ -66,6 +69,11 @@ linnea_qpack_ccontrol_len: resq 1
 ; the coding of the variant served (0 plain, 1 gzip, 2 br); set per response
 ; by the h3 serve path, emitted as an indexed content-encoding line
 linnea_qpack_cenc: resq 1
+; the serving vhost's security headers (ptr 0 / 0 = not configured), set per
+; request by the QUIC server before the serve
+linnea_qpack_hsts_ptr: resq 1
+linnea_qpack_hsts_len: resq 1
+linnea_qpack_nosniff:  resq 1
 
 section .text
 
@@ -447,6 +455,26 @@ linnea_qpack_encode_response:
     mov rbx, rdi
 .no_ccontrol:
 .no_validators:
+    ; --- the vhost's security headers, on every response ---
+    cmp qword [linnea_qpack_nosniff], 0
+    je .no_nosniff
+    mov rdi, rbx
+    mov byte [rdi], 0xc0 | 61        ; x-content-type-options: nosniff —
+    inc rdi                          ; name and value both in the table
+    mov rbx, rdi
+.no_nosniff:
+    cmp qword [linnea_qpack_hsts_ptr], 0
+    je .no_hsts
+    mov rdi, rbx
+    mov eax, 56                      ; strict-transport-security: name ref
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    mov rsi, [linnea_qpack_hsts_ptr]
+    mov rdx, [linnea_qpack_hsts_len]
+    call qenc_str
+    mov rbx, rdi
+.no_hsts:
     ; --- date and server, on every response ---
     call linnea_time_http_now        ; rax = current IMF-fixdate text
     mov r13, rax

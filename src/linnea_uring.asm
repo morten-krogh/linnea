@@ -67,6 +67,7 @@ extern linnea_print_u64_stderr
 extern linnea_log_write
 extern linnea_log_u64
 extern linnea_log_stamp
+extern linnea_log_reopen
 extern linnea_tls_hs_init
 extern linnea_tls_hs_input
 extern linnea_tls_drain_early
@@ -185,7 +186,7 @@ ring:               resb LINNEA_URING_RING_SIZE
 cqe_ptr:            resq 1
 idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
                                ; tunnel's last_activity comparison
-sig_mask:           resq 1     ; blocked-signal set: SIGTERM
+sig_mask:           resq 1     ; blocked-signal set: SIGTERM + SIGHUP
 sig_fd:             resd 1
 drain_flag:         resd 1     ; 1 = draining: no accepts, close after serve
 quic_fd:    resd 1
@@ -235,10 +236,11 @@ linnea_uring_run:
     test eax, eax
     js .init_fail
 
-    ; SIGTERM means drain, and arrives as a cqe like everything else:
-    ; block it, open a signalfd for it, and arm a read on the ring. The
-    ; master's death delivers it too (PR_SET_PDEATHSIG in linnea_start).
-    mov qword [sig_mask], 1 << (LINNEA_SIGTERM - 1)
+    ; SIGTERM means drain and SIGHUP means reopen the log after a rotation;
+    ; both arrive as cqes like everything else: block them, open a signalfd
+    ; for the pair, and arm a read on the ring. The master's death delivers
+    ; SIGTERM too (PR_SET_PDEATHSIG in linnea_start).
+    mov qword [sig_mask], (1 << (LINNEA_SIGTERM - 1)) | (1 << (LINNEA_SIGHUP - 1))
     mov eax, LINNEA_SYS_RT_SIGPROCMASK
     mov edi, LINNEA_SIG_BLOCK
     lea rsi, [sig_mask]
@@ -254,14 +256,7 @@ linnea_uring_run:
     cmp rax, -4095
     jae .signalfd_fail
     mov [sig_fd], eax
-    call linnea_uring_get_sqe_zeroed
-    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_READ
-    mov ecx, [sig_fd]
-    mov [rax + LINNEA_SQE_FD], ecx
-    lea rcx, [sig_buf]
-    mov [rax + LINNEA_SQE_ADDR], rcx
-    mov dword [rax + LINNEA_SQE_LEN], 128
-    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_SIGNAL
+    call linnea_uring_arm_signal
 
     ; HTTP/3 listener: the first TLS server with usable key material gets a
     ; UDP socket on its own host and port. Failure is not fatal — we simply
@@ -529,6 +524,14 @@ linnea_uring_run:
 ; requests run to their end, close instead of keep-alive afterwards,
 ; and exit when the last connection is freed.
 .on_signal:
+    ; struct signalfd_siginfo starts with the signal number
+    cmp dword [sig_buf], LINNEA_SIGHUP
+    jne .on_sigterm
+    call linnea_log_reopen     ; rotated: write into the new file from here
+    call linnea_uring_arm_signal
+    call linnea_uring_submit_now
+    jmp .wait
+.on_sigterm:
     cmp dword [drain_flag], 0
     jnz .wait                  ; a second SIGTERM changes nothing
     mov dword [drain_flag], 1
@@ -1959,6 +1962,19 @@ linnea_uring_arm_h2p_ops:
     call linnea_uring_arm_link_timeout
     jmp .ao_next
 
+
+; linnea_uring_arm_signal() — queue the signalfd read. Re-armed after a
+; SIGHUP (a drain never needs another signal).
+linnea_uring_arm_signal:
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_READ
+    mov ecx, [sig_fd]
+    mov [rax + LINNEA_SQE_FD], ecx
+    lea rcx, [sig_buf]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 128
+    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_SIGNAL
+    ret
 
 ; linnea_uring_arm_qrecv() — queue a recvmsg on the QUIC listener. UDP needs
 ; the sender's address to reply, which plain recv does not report, so the

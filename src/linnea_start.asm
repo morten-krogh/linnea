@@ -43,6 +43,7 @@ extern linnea_config_dump
 extern linnea_config_instance
 extern linnea_tls_setup
 extern linnea_log_open
+extern linnea_log_reopen
 extern linnea_log_stamp
 extern linnea_log_write
 extern linnea_log_u64
@@ -187,6 +188,7 @@ _start:
     syscall
     mov [master_pid], rax
     call install_sigusr2       ; catch SIGUSR2 to trigger a hot upgrade
+    call install_sighup        ; and SIGHUP to reopen the log after a rotate
     ; load the BPF connection-ID steering program before forking so the workers
     ; inherit the map and program fds. Best-effort: without CAP_BPF it fails and
     ; the QUIC reuseport group falls back to plain 4-tuple hashing.
@@ -261,6 +263,15 @@ _start:
     call spawn_worker
     jmp .supervise
 .interrupted:
+    cmp byte [hup_pending], 0
+    je .chk_upgrade
+    mov byte [hup_pending], 0
+    ; a rotation: reopen our own log, then tell the workers to do the same.
+    ; They each hold their own descriptor (inherited across the fork), so
+    ; every one of them has to reopen or it keeps filling the rotated file.
+    call linnea_log_reopen
+    call signal_workers_hup
+.chk_upgrade:
     cmp byte [upgrade_pending], 0
     je .supervise
     mov byte [upgrade_pending], 0
@@ -587,9 +598,49 @@ install_sigusr2:
     syscall
     ret
 
-; The handler and its restorer. Async-signal-safe: only a byte store.
+; install_sighup — catch SIGHUP the same way: the handler only flags, and
+; the supervision loop does the work when wait4 returns -EINTR.
+install_sighup:
+    lea rax, [sighup_handler]
+    mov [sa_buf], rax
+    mov qword [sa_buf + 8], LINNEA_SA_RESTORER
+    lea rax, [sig_restorer]
+    mov [sa_buf + 16], rax
+    mov qword [sa_buf + 24], 0
+    mov eax, LINNEA_SYS_RT_SIGACTION
+    mov edi, LINNEA_SIGHUP
+    lea rsi, [sa_buf]
+    xor edx, edx
+    mov r10d, 8
+    syscall
+    ret
+
+; signal_workers_hup — SIGHUP every live worker so it reopens its log.
+signal_workers_hup:
+    push rbx
+    xor ebx, ebx
+.sw_loop:
+    cmp rbx, [linnea_config_instance + linnea_config.workers]
+    jae .sw_done
+    mov rdi, [worker_pids + rbx * 8]
+    test rdi, rdi
+    jz .sw_next
+    mov esi, LINNEA_SIGHUP
+    mov eax, LINNEA_SYS_KILL
+    syscall
+.sw_next:
+    inc rbx
+    jmp .sw_loop
+.sw_done:
+    pop rbx
+    ret
+
+; The handlers and their restorer. Async-signal-safe: only a byte store.
 sigusr2_handler:
     mov byte [upgrade_pending], 1
+    ret
+sighup_handler:
+    mov byte [hup_pending], 1
     ret
 sig_restorer:
     mov eax, LINNEA_SYS_RT_SIGRETURN
@@ -690,3 +741,4 @@ monotonic_ns:
 section .bss
 alignb 8
 upgrade_pending: resb 1
+hup_pending:    resb 1

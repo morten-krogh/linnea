@@ -7,6 +7,7 @@ default rel
 %include "linnea_time.inc"
 
 global linnea_log_open
+global linnea_log_reopen
 global linnea_log_write
 global linnea_log_u64
 global linnea_log_stamp
@@ -34,13 +35,16 @@ time_ts:        resq 2         ; struct timespec
 stamp_buf:      resb 24        ; "[YYYY-MM-DD HH:MM:SS] "
 line_buf:       resb LOG_LINE_CAP
 line_len:       resq 1
+log_path:       resq 1     ; the configured path, for reopening after a rotate
 
 section .text
 
 ; linnea_log_open(rdi=path cstr) — open for append, create with 0644.
+; The path is kept so the file can be reopened later (see linnea_log_reopen).
 linnea_log_open:
     push rbx
     mov rbx, rdi               ; kept for the error message
+    mov [log_path], rdi
     mov eax, LINNEA_SYS_OPEN
     mov esi, LINNEA_O_WRONLY | LINNEA_O_CREAT | LINNEA_O_APPEND
     mov edx, LINNEA_MODE_0644
@@ -55,6 +59,37 @@ linnea_log_open:
     mov esi, msg_open_len
     mov rdx, rbx
     jmp linnea_error_open      ; never returns
+
+; linnea_log_reopen() — reopen the log file at its configured path, for
+; SIGHUP after a rotation: without it every process keeps writing into the
+; renamed (or deleted) inode, so the lines are lost and the disk is never
+; reclaimed. Opening the new file before dropping the old fd means a failure
+; leaves logging working — an unwritable path is a reason to keep the old
+; file, not to lose the log. Anything buffered from a half-built line is
+; dropped: it belongs to the old file's last write.
+linnea_log_reopen:
+    push rbx
+    mov rdi, [log_path]
+    test rdi, rdi
+    jz .lr_ret                 ; never opened: nothing to reopen
+    mov eax, LINNEA_SYS_OPEN
+    mov esi, LINNEA_O_WRONLY | LINNEA_O_CREAT | LINNEA_O_APPEND
+    mov edx, LINNEA_MODE_0644
+    syscall
+    cmp rax, -4095
+    jae .lr_ret                ; keep the old fd
+    mov ebx, eax               ; the new fd
+    mov edi, [linnea_log_fd]
+    cmp edi, ebx
+    je .lr_store
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+.lr_store:
+    mov [linnea_log_fd], ebx
+    mov qword [line_len], 0
+.lr_ret:
+    pop rbx
+    ret
 
 ; linnea_log_write(rdi=ptr, rsi=len) — append to the pending line and
 ; emit it as ONE write once the chunk ends in a newline. A log line is
