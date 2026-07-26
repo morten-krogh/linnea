@@ -116,6 +116,16 @@ LINNEA_H2P_HEAD_MAX   equ 8192    ; rewritten request head cap (buf[0..) )
 LINNEA_H2P_BODY_OFF   equ 8192    ; request body collects at buf[BODY_OFF..)
 LINNEA_H2P_BODY_MAX   equ 8192    ; request body cap (h1's in_buf caps ~8K too)
 LINNEA_H2P_RHEAD_MAX  equ 6144    ; upstream response head cap (502 beyond)
+; out_buf room a translated response HEADERS frame may need: the upstream
+; head, plus HPACK's per-field length prefixes, plus the fields we add
+; ourselves. Reserved before emitting one — a short reservation spilled the
+; frame into up_buf, whose first bytes are the stream pool, which turned
+; into refused streams on a healthy connection.
+LINNEA_H2P_HEAD_ROOM  equ 7680
+; And the room h2_serve's own responses need at the frame loop's cursor: the
+; largest is a redirect, whose Location carries a URL prefix plus the request
+; target (bounded at 2048 where it is built).
+LINNEA_H2_RESP_ROOM   equ 3072
 ; One streaming upload per connection gets this buffer (the h2 default
 ; receive window, rounded up). Mapped lazily, so a connection that never
 ; uploads never touches it; a second concurrent upload on the same

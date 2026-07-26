@@ -222,6 +222,11 @@ section .text
     ; connection is ever mid-handoff at a time, and at a maximum TLS record
     ; it would be the largest thing in the connection struct.
     resb 1 / (tls_early_scratch_size >= LINNEA_CONN_IN_BUF)
+    ; out_buf has to hold the largest single frame either builder can emit,
+    ; or the overflow lands in up_buf — whose first bytes are the HTTP/2
+    ; stream pool, so the damage shows up as refused streams elsewhere.
+    resb 1 / (LINNEA_CONN_OUT_BUF >= LINNEA_H2P_HEAD_ROOM)
+    resb 1 / (LINNEA_CONN_OUT_BUF >= LINNEA_H2_RESP_ROOM)
 __?SECT?__
 
 ; linnea_uring_run(rdi=config*) — set up the ring, arm accepts, loop forever.
@@ -2090,6 +2095,8 @@ linnea_uring_arm_h2p_ops:
     mov rsi, r14
     call linnea_h2p_at
     mov r12, rax
+    cmp qword [r12 + linnea_h2p.state], LINNEA_H2P_FREE
+    je .ao_next                       ; nothing to arm for a free slot
     test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
     jnz .ao_next                      ; already has an op out
     test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_WANT_CONN

@@ -292,7 +292,7 @@ linnea_h2_handle:
     ; Ensure room for a HEADERS (+ small inline error DATA) first.
     lea rax, [rbx + linnea_connection.out_buf + LINNEA_CONN_OUT_BUF]
     sub rax, r13
-    cmp rax, 600
+    cmp rax, LINNEA_H2_RESP_ROOM
     jb .flush                        ; not enough room now; flush and resume
     mov rdi, rbx                     ; conn
     ; rsi already = this frame's header pointer
@@ -1730,6 +1730,14 @@ h2p_release:
 .rel_nofd:
     pop rax
     mov dword [rax + linnea_h2p.fd], -1
+    ; scrub what the walkers act on: a stale WANT_* would arm an op on the
+    ; closed fd, a stale HEAD_RDY would emit a HEADERS frame for a stream
+    ; that no longer exists, and a stale credit a WINDOW_UPDATE on an idle
+    ; stream — which is a connection error to the peer
+    mov qword [rax + linnea_h2p.flags], 0
+    mov qword [rax + linnea_h2p.rq_credit], 0
+    mov qword [rax + linnea_h2p.rq_buf], 0
+    mov qword [rax + linnea_h2p.sid], 0
     mov qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
     ret
 .rel_zombie:
@@ -2104,7 +2112,6 @@ linnea_h2p_event:
 
 ; h2p_free_slot(rbx = slot*) — close the upstream fd and mark the slot free.
 h2p_free_slot:
-    mov qword [rbx + linnea_h2p.rq_buf], 0
     mov edi, [rbx + linnea_h2p.fd]
     cmp edi, -1
     je .fsl_nofd
@@ -2112,6 +2119,10 @@ h2p_free_slot:
     syscall
 .fsl_nofd:
     mov dword [rbx + linnea_h2p.fd], -1
+    mov qword [rbx + linnea_h2p.flags], 0        ; see h2p_release
+    mov qword [rbx + linnea_h2p.rq_credit], 0
+    mov qword [rbx + linnea_h2p.rq_buf], 0
+    mov qword [rbx + linnea_h2p.sid], 0
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FREE
     ret
 
@@ -2156,11 +2167,16 @@ linnea_h2p_service:
     mov r12, rax                     ; slot cursor
     mov r13d, LINNEA_H2P_SLOTS
 .sv_scan:
-    ; keep a frame's worth of headroom
+    ; a translated HEADERS frame has to fit whole (see LINNEA_H2P_HEAD_ROOM);
+    ; if it cannot, stop and let the next pass emit it
     lea rax, [rbx + linnea_connection.out_buf + LINNEA_CONN_OUT_BUF]
     sub rax, r15
-    cmp rax, 1024
+    cmp rax, LINNEA_H2P_HEAD_ROOM
     jb .sv_done
+    ; a free slot keeps no flags worth acting on: skip it before the credit
+    ; and readiness tests below, so a stale bit cannot resurrect it
+    cmp qword [r12 + linnea_h2p.state], LINNEA_H2P_FREE
+    je .sv_next
     ; request-body bytes that have gone upstream are owed back to the client
     ; as flow-control credit — on the stream and on the connection — or it
     ; stops sending after one window
