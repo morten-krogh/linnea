@@ -1723,6 +1723,29 @@ timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:47443:127.0.0.1 \
 check "tls http1.1 streams a 300000-byte request body (byte-exact)" $?
 rm -f /tmp/upload3_echo.bin
 
+    # A streamed upload must leave the connection consistent: the request
+    # head stays in place (so the access log can still name it) and the
+    # keep-alive bookkeeping never sees in_len below head_len — that
+    # underflowed into a gigabyte-scale copy off the end of the connection
+    # pool, killing the worker.
+    timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+        -o /dev/null -w '%{http_code}' --data-binary @test/www/upload2.bin \
+        "https://localhost:47443/api/echo" > /tmp/upl_code.txt
+    timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+        -o /dev/null -w '%{num_connects} %{http_code}' --data-binary @test/www/upload2.bin \
+        "https://localhost:47443/api/echo" --next --http1.1 --cacert $CA \
+        --resolve localhost:47443:127.0.0.1 -o /dev/null \
+        -w ' %{num_connects} %{http_code}' "https://localhost:47443/hello.txt" \
+        > /tmp/upl_ka.txt
+    [ "$(cat /tmp/upl_ka.txt)" = "1 200 0 200" ]
+    check "tls upload: keep-alive survives a streamed body" $?
+    grep -q '"POST /api/echo" 200' "$LOG"
+    check "tls upload: the streamed request is logged with its target" $?
+    # the worker must still be the one that started (no crash + respawn)
+    ! grep -q "exited, respawning" "$LOG"
+    check "tls upload: no worker died" $?
+    rm -f /tmp/upl_code.txt /tmp/upl_ka.txt
+
     # a HEAD is bodiless, and its slot must come back: more sequential
     # bodiless requests than there are slots, all on one connection
     args=""

@@ -847,7 +847,7 @@ linnea_uring_run:
     mov rax, [r12 + linnea_connection.req_body_rem]   ; ignore anything past
 .req_body_have:                                       ; the declared length
     sub [r12 + linnea_connection.req_body_rem], rax
-    lea rcx, [r12 + linnea_connection.in_buf]
+    lea rcx, [r12 + linnea_connection.up_buf]     ; the chunk landed here
     mov [r12 + linnea_connection.out_ptr], rcx
     mov [r12 + linnea_connection.out_rem], rax
     mov qword [r12 + linnea_connection.file_rem], 0
@@ -961,9 +961,16 @@ linnea_uring_run:
     mov r15d, reason_drain_len
     jmp .conn_close
 .keep_alive_continue:
-    ; keep-alive: drop the consumed head, keep any pipelined bytes
+    ; keep-alive: drop the consumed head, keep any pipelined bytes. The
+    ; subtraction is guarded: an in_len below head_len would wrap into a
+    ; gigabyte-scale rep movsb that walks off the end of the pool, and a
+    ; state where that is even briefly true is a bug elsewhere, not a
+    ; reason to corrupt memory.
     mov rax, [r12 + linnea_connection.in_len]
     sub rax, [r12 + linnea_connection.head_len]
+    jae .ka_have
+    xor eax, eax
+.ka_have:
     mov [r12 + linnea_connection.in_len], rax
     lea rdi, [r12 + linnea_connection.in_buf]
     mov rsi, rdi
@@ -1243,9 +1250,15 @@ linnea_uring_run:
     cmp qword [r12 + linnea_connection.req_body_rem], 0
     je .up_send_response
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_REQ_BODY
-    mov qword [r12 + linnea_connection.in_len], 0   ; the head is long gone
+    ; The rest of the body is relayed through up_buf, which is idle between
+    ; sending the request head and reading the response head. in_buf is left
+    ; exactly as the parser saw it — the head still readable for the access
+    ; log, in_len still consistent with head_len for the keep-alive
+    ; bookkeeping below, and the whole buffer available as a chunk window.
     mov rdi, r12
-    call linnea_uring_arm_recv
+    lea rsi, [r12 + linnea_connection.up_buf]
+    mov edx, LINNEA_CONN_UP_BUF
+    call linnea_uring_arm_recv_buf
     call linnea_uring_submit_now
     jmp .wait
 .up_send_response:
@@ -1863,6 +1876,34 @@ linnea_uring_arm_recv:
     or rcx, LINNEA_UD_RECV
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx               ; the timeout sqe must immediately follow
+    pop rbx
+    jmp linnea_uring_arm_link_timeout
+
+; linnea_uring_arm_recv_buf(rdi=connection*, rsi=buffer, rdx=len)
+; A client recv into somewhere other than in_buf — the request-body relay
+; uses up_buf so the parsed head stays intact. Same linked idle timeout as
+; any other client read.
+linnea_uring_arm_recv_buf:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECV
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
+    mov ecx, [rbx + linnea_connection.fd]
+    mov [rax + LINNEA_SQE_FD], ecx
+    mov [rax + LINNEA_SQE_ADDR], r12
+    mov [rax + LINNEA_SQE_LEN], r13d
+    mov rcx, [rbx + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_RECV
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    mov rdi, rbx
+    pop r13
+    pop r12
     pop rbx
     jmp linnea_uring_arm_link_timeout
 
