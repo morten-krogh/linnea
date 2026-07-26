@@ -389,6 +389,9 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
 
     python3 test/quic/h3_enc_test.py 47452 >/dev/null 2>&1
     check "h3 pre-compressed variants (br/gzip, vary, variant etag 304)" $?
+
+    python3 test/quic/h3_qpack_err_test.py 47452 >/dev/null 2>&1
+    check "h3 undecodable field section ends the connection (0x200)" $?
     python3 test/quic/h3_multi_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): several requests on one connection" $?
     python3 test/quic/h3_conns_test.py 47452 >/dev/null 2>&1

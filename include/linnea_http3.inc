@@ -24,6 +24,7 @@ LINNEA_H3_STREAM_QPACK_DEC  equ 0x03
 LINNEA_H3_ERR_MISSING_SETTINGS equ 0x0105  ; control stream opened without SETTINGS
 LINNEA_H3_ERR_STREAM_CREATION  equ 0x0103  ; a second control stream
 LINNEA_H3_ERR_CLOSED_CRITICAL  equ 0x0104  ; a critical stream (control/QPACK) closed
+LINNEA_H3_ERR_QPACK_DECOMP     equ 0x0200  ; QPACK could not decode a field section
 
 ; linnea_h3_read_headers(rdi=stream ptr, rsi=stream len, rdx=req *linnea_h2_req)
 ;   -> rax = 0 on success (a HEADERS frame was found and QPACK-decoded),
@@ -32,6 +33,13 @@ LINNEA_H3_ERR_CLOSED_CRITICAL  equ 0x0104  ; a critical stream (control/QPACK) c
 ;      and sets .scratch / .scratch_end (as for linnea_qpack_decode).
 LINNEA_H3_ERR          equ 1      ; malformed/truncated frame
 LINNEA_H3_ERR_NOHEADERS equ 2     ; no HEADERS frame in the stream data
+; A field section that QPACK could not decode. Kept distinct from the frame
+; errors above because RFC 9204 2.2.1 requires it to end the CONNECTION with
+; QPACK_DECOMPRESSION_FAILED: once a field section is undecodable the peer's
+; encoder state and ours have diverged, so no later request could be read
+; either. (Our zero-capacity table means a compliant client never gets here —
+; QPACK's capacity starts at 0 and may only rise to what we advertise.)
+LINNEA_H3_ERR_QPACK    equ 3
 
 ; Largest POST body echoed back inline; a larger one (whose echo would not fit
 ; one response packet) gets a small receipt — its length and a hash — instead.

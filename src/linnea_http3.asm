@@ -133,7 +133,10 @@ linnea_h3_read_headers:
     mov rbp, rax                     ; keep the field-section length
     call linnea_qpack_decode         ; returns 0 | -err
     test rax, rax
-    js .ret                          ; propagate a decode error
+    jns .decoded
+    mov rax, -LINNEA_H3_ERR_QPACK    ; the caller ends the connection with it
+    jmp .ret
+.decoded:
     mov r15d, 1                      ; HEADERS decoded
     add r12, rbp                     ; past the field section
     jmp .frame

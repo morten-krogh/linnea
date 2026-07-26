@@ -1583,7 +1583,17 @@ linnea_quic_server_datagram:
     lea rdx, [req]
     call linnea_h3_read_headers      ; r8 = body ptr, r9 = body len on success
     test rax, rax
-    jnz .stream_scan                 ; not a complete request on this stream
+    jz .req_ok
+    ; An undecodable field section is a CONNECTION error (RFC 9204 2.2.1):
+    ; the encoder's table state and ours have diverged, so every later
+    ; request on this connection would fail too — say so instead of leaving
+    ; the client waiting on a stream we silently dropped. Anything else here
+    ; is just an incomplete request: wait for more stream data.
+    cmp rax, -LINNEA_H3_ERR_QPACK
+    jne .stream_scan
+    mov edi, LINNEA_H3_ERR_QPACK_DECOMP
+    jmp .h3_close
+.req_ok:
     mov [s_body_ptr], r8             ; keep the body across the response build
     mov [s_body_len], r9
     ; record it for a graceful GOAWAY: a drain rejects streams past this one, so
