@@ -84,12 +84,17 @@ linnea_connection_alloc:
 
 ; linnea_connection_free(rdi=connection*)
 linnea_connection_free:
+    ; Idempotent: a double free would link the slot to itself, and every
+    ; later alloc would hand out that same slot to every new client.
+    cmp qword [rdi + linnea_connection.in_use], 0
+    je .already_free
     mov qword [rdi + linnea_connection.in_use], 0
     mov rax, [free_head]
     mov [rdi + linnea_connection.next_free], rax
     mov rax, [rdi + linnea_connection.index]
     mov [free_head], rax
     dec qword [linnea_connection_active]
+.already_free:
     ret
 
 ; linnea_connection_at(rdi=pool index) -> rax=connection*

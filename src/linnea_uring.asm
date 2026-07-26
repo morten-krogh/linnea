@@ -199,6 +199,7 @@ quic_fd:    resd 1
 qrecv_msg:  resb LINNEA_MSGHDR_SIZE
 qrecv_iov:  resb LINNEA_IOVEC_SIZE
 cqe_tag:       resd 1      ; the completing op's tag, kept past the shift
+cqe_gen:       resd 1      ; and the connection incarnation it was armed for
 qrecv_peer: resb LINNEA_SOCKADDR_IN6_SIZE
 sig_buf:            resb 128   ; struct signalfd_siginfo
 ; one record's plaintext during the TLS handoff (see the assertion above)
@@ -435,7 +436,11 @@ linnea_uring_run:
     mov eax, r13d
     and eax, 0xff              ; op tag
     mov [cqe_tag], eax
-    shr r13, 8                 ; index
+    mov rcx, r13               ; ud_pack: gen(32) | index(24) | tag(8). The
+    shr rcx, 32                ; generation says which incarnation of the
+    mov [cqe_gen], ecx         ; connection slot armed this operation.
+    shr r13, 8
+    and r13, 0xffffff          ; index
     cmp eax, LINNEA_UD_TIMEOUT
     je .wait                   ; timeout cqes carry no work
     cmp eax, LINNEA_UD_CANCEL
@@ -504,6 +509,13 @@ linnea_uring_run:
     mov rdi, r12
     call linnea_uring_arm_h2p_ops
     call linnea_uring_submit_now
+    jmp .wait
+
+; A completion whose generation does not match the slot's belongs to a
+; connection that has since closed. Nothing to do: the socket it referred to
+; is closed, the buffers it used belong to whoever holds the slot now, and
+; acting on it would corrupt them.
+.stale_completion:
     jmp .wait
 
 ; --- QUIC datagram on the UDP listener: r15d = bytes or -errno ---------
@@ -618,6 +630,9 @@ linnea_uring_run:
     mov r14, r13
     shl r14, 8
     or r14, LINNEA_UD_RECV     ; the recv this connection is parked on
+    mov rcx, [r12 + linnea_connection.gen]     ; same packing as the arm
+    shl rcx, 32
+    or r14, rcx
     mov [rax + LINNEA_SQE_ADDR], r14
     mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_CANCEL
 .idle_next:
@@ -735,7 +750,11 @@ linnea_uring_run:
 .on_recv:
     mov rdi, r13
     call linnea_connection_at
-    mov r12, rax               ; connection*
+    mov r12, rax
+    mov ecx, [cqe_gen]         ; a completion for an earlier incarnation of
+    cmp ecx, [r12 + linnea_connection.gen]   ; this slot: the connection it
+    jne .stale_completion      ; belonged to is gone, and the slot may now
+                               ; be serving someone else               ; connection*
     mov qword [r12 + linnea_connection.h2_rx_busy], 0
     cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
     je .tls_recv
@@ -872,6 +891,10 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
+    mov ecx, [cqe_gen]         ; a completion for an earlier incarnation of
+    cmp ecx, [r12 + linnea_connection.gen]   ; this slot: the connection it
+    jne .stale_completion      ; belonged to is gone, and the slot may now
+                               ; be serving someone else
     cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
     je .tls_on_send
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
@@ -892,9 +915,14 @@ linnea_uring_run:
 .send_ok:
     mov eax, r15d
     add [r12 + linnea_connection.out_ptr], rax
-    sub [r12 + linnea_connection.out_rem], rax
-    cmp qword [r12 + linnea_connection.out_rem], 0
-    jne .send_more
+    mov rcx, [r12 + linnea_connection.out_rem]
+    sub rcx, rax
+    jae .send_acct             ; a count that would wrap is treated as drained:
+    xor ecx, ecx               ; the alternative is a send of ~4 GiB from a
+.send_acct:                    ; buffer inside the connection pool
+    mov [r12 + linnea_connection.out_rem], rcx
+    test rcx, rcx
+    jnz .send_more
     ; current segment done; is the file body still queued?
     mov rax, [r12 + linnea_connection.file_rem]
     test rax, rax
@@ -1188,6 +1216,10 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
+    mov ecx, [cqe_gen]         ; a completion for an earlier incarnation of
+    cmp ecx, [r12 + linnea_connection.gen]   ; this slot: the connection it
+    jne .stale_completion      ; belonged to is gone, and the slot may now
+                               ; be serving someone else
     test r15d, r15d
     jz .connect_ok
     cmp r15d, -LINNEA_ECANCELED
@@ -1218,6 +1250,10 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
+    mov ecx, [cqe_gen]         ; a completion for an earlier incarnation of
+    cmp ecx, [r12 + linnea_connection.gen]   ; this slot: the connection it
+    jne .stale_completion      ; belonged to is gone, and the slot may now
+                               ; be serving someone else
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
     je .tunnel_up_send
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
@@ -1282,6 +1318,10 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
+    mov ecx, [cqe_gen]         ; a completion for an earlier incarnation of
+    cmp ecx, [r12 + linnea_connection.gen]   ; this slot: the connection it
+    jne .stale_completion      ; belonged to is gone, and the slot may now
+                               ; be serving someone else
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
     je .tunnel_up_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
@@ -1879,6 +1919,9 @@ linnea_uring_arm_recv:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_RECV
+    mov rdx, [rbx + linnea_connection.gen]      ; see ud_pack
+    shl rdx, 32
+    or rcx, rdx
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx               ; the timeout sqe must immediately follow
     pop rbx
@@ -1905,6 +1948,9 @@ linnea_uring_arm_recv_buf:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_RECV
+    mov rdx, [rbx + linnea_connection.gen]
+    shl rdx, 32
+    or rcx, rdx
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx
     pop r13
@@ -1939,6 +1985,9 @@ linnea_uring_arm_send_buf:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_SEND
+    mov rdx, [rbx + linnea_connection.gen]
+    shl rdx, 32
+    or rcx, rdx
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx               ; the timeout sqe must immediately follow
     pop r13
@@ -1965,6 +2014,9 @@ linnea_uring_arm_connect:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_CONNECT
+    mov rdx, [rbx + linnea_connection.gen]
+    shl rdx, 32
+    or rcx, rdx
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx               ; the timeout sqe must immediately follow
     pop rbx
@@ -1996,6 +2048,9 @@ linnea_uring_arm_up_send_buf:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_UP_SEND
+    mov rdx, [rbx + linnea_connection.gen]
+    shl rdx, 32
+    or rcx, rdx
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx               ; the timeout sqe must immediately follow
     pop r13
@@ -2023,6 +2078,9 @@ linnea_uring_arm_up_recv:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_UP_RECV
+    mov rdx, [rbx + linnea_connection.gen]
+    shl rdx, 32
+    or rcx, rdx
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx               ; the timeout sqe must immediately follow
     pop r13
