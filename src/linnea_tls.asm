@@ -596,6 +596,9 @@ parse_ch:
     test r14d, 0x200
     jnz .ext_dup
     or r14d, 0x200
+    lea rax, [rbx + 1]
+    cmp rax, [rsp]
+    ja .pop_decode             ; the 1-byte list length must be present
     movzx eax, byte [rbx]       ; list length (1 byte)
     lea rcx, [rbx + 1 + rax]
     cmp rcx, [rsp]
@@ -670,6 +673,9 @@ parse_ch:
     movzx eax, byte [rbx]
     shl eax, 8
     mov al, [rbx + 1]
+    test eax, 1
+    jnz .pop_decode            ; 2-byte entries: an odd length would let the
+                               ; loop below read one byte past the list
     lea rcx, [rbx + 2 + rax]
     cmp rcx, [rsp]
     jne .pop_decode
@@ -737,6 +743,9 @@ parse_ch:
     test r14d, 0x2000
     jnz .ext_dup
     or r14d, 0x2000
+    lea rax, [rbx + 1]
+    cmp rax, [rsp]
+    ja .pop_decode              ; the 1-byte ke_modes length must be present
     movzx eax, byte [rbx]        ; ke_modes length (1 byte)
     lea rcx, [rbx + 1 + rax]
     cmp rcx, [rsp]
@@ -797,8 +806,10 @@ parse_ch:
     mov rax, r10
     sub rax, [rbp + linnea_tls_hs.ch_base]
     mov [rbp + linnea_tls_hs.binders_off], rax
-    ; first binder: 1-byte length (must be 32) then the 32 bytes
-    lea rax, [r10 + 3]
+    ; first binder: 1-byte length (must be 32) then the 32 bytes. Bound the
+    ; whole thing (r10+3 .. r10+35), not just the length byte, or the copy
+    ; below over-reads up to 32 bytes past the ClientHello.
+    lea rax, [r10 + 3 + 32]
     cmp rax, [rsp]
     ja .pop_decode
     cmp byte [r10 + 2], 32
@@ -963,6 +974,21 @@ try_resume:
     add rsp, 16
     test rax, rax
     js .no                     ; bad tag: forged or wrong-run ticket
+    ; expiry: the ticket carries its issue time (TR_PT+32); past the advertised
+    ; lifetime it must not resume, or a captured ticket is valid for the whole
+    ; process lifetime (the sealing key never rotates). rbx is free here.
+    mov rbx, [rsp + TR_PT + 32]   ; issued (tv_sec)
+    sub rsp, 16
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    xor edi, edi               ; CLOCK_REALTIME
+    lea rsi, [rsp]
+    syscall
+    mov rax, [rsp]             ; now (tv_sec)
+    add rsp, 16
+    sub rax, rbx               ; age = now - issued
+    js .no                     ; issued in the future (clock skew): reject
+    cmp rax, LINNEA_TLS_TICKET_LIFETIME
+    ja .no                     ; expired
     ; the ticket is bound to the server_name it was issued under
     lea rdi, [rbp + linnea_tls_hs.sni]
     mov esi, [rbp + linnea_tls_hs.sni_len]

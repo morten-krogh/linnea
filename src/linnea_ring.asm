@@ -226,10 +226,14 @@ linnea_ring_get_sqe:
     push rsi
     mov rsi, [rdi + linnea_ring.sq_tail]
     mov rcx, [rdi + linnea_ring.sq_khead]
-    mov ecx, [rcx]                    ; kernel-consumed head
-    mov rax, rsi
-    sub rax, rcx                      ; entries in our hands
-    cmp rax, [rdi + linnea_ring.sq_entries]
+    mov ecx, [rcx]                    ; kernel-consumed head (u32, wraps at 2^32)
+    ; the in-flight count is a 32-bit modular difference: sq_tail is our own
+    ; unbounded 64-bit counter, but the kernel head is a u32, so a 64-bit
+    ; subtraction reports ~2^32 (always >= entries -> permanently "full") once
+    ; sq_tail passes 2^32. Compare the low 32 bits, the way the kernel does.
+    mov eax, esi
+    sub eax, ecx                      ; entries in our hands (mod 2^32)
+    cmp eax, [rdi + linnea_ring.sq_entries]
     jae .full
     mov rax, rsi
     and rax, [rdi + linnea_ring.sq_mask]
@@ -268,11 +272,29 @@ linnea_ring_submit:
     jz .none
     mov [rcx], esi                    ; publish (plain store: x86 orders it after
                                       ; the sqe writes above)
-    mov edx, eax                      ; to_submit
-    mov edi, [rdi + linnea_ring.fd]
+    mov edi, [rdi + linnea_ring.fd]   ; fd (edi is preserved across ring_enter)
+    push rax                          ; [rsp+8] to_submit (regs don't survive the
+    mov r9d, 1024                     ;         syscall; keep it on the stack)
+    push r9                           ; [rsp]   retry budget
+    xor r8d, r8d                      ; flags = 0 on the first attempt
+.enter_try:
+    mov edx, [rsp + 8]                ; to_submit (the kernel has not consumed it)
     xor r10d, r10d                    ; min_complete = 0
-    xor r8d, r8d                      ; flags
     call ring_enter
+    cmp eax, -LINNEA_EINTR
+    je .enter_retry                   ; a signal arrived before it did anything
+    cmp eax, -LINNEA_EBUSY
+    jne .enter_done                   ; success, or a real error to report
+    ; EBUSY: overflowed completions block new submissions. Flush them into the
+    ; CQ (GETEVENTS reaps nothing here — the main loop consumes them), and retry
+    ; a bounded number of times. Persistent EBUSY still falls through as fatal.
+    mov r8d, LINNEA_IORING_ENTER_GETEVENTS
+.enter_retry:
+    dec qword [rsp]
+    jz .enter_done                    ; budget spent: return the last errno (fatal)
+    jmp .enter_try
+.enter_done:
+    add rsp, 16
     jmp .ret
 .none:
     xor eax, eax

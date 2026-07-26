@@ -628,6 +628,8 @@ linnea_uring_run:
 .cancel_submit:
     cmp dword [fast_drain], 0
     je .cancel_done
+    call linnea_uring_submit_now   ; flush the accept cancels before the idle
+                                   ; loop queues potentially hundreds more
     ; cancel the read each idle connection is parked on; the cancellation
     ; lands as -ECANCELED on that connection, which closes it
     xor r13d, r13d
@@ -655,7 +657,11 @@ linnea_uring_run:
     mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_CANCEL
 .idle_next:
     inc r13
-    jmp .idle_loop
+    test r13d, 127
+    jnz .idle_loop
+    call linnea_uring_submit_now   ; bound the SQ (256 entries): a server holding
+                                   ; many idle connections would otherwise overflow
+    jmp .idle_loop                 ; it before .cancel_done gets to submit
 .cancel_done:
     call linnea_uring_submit_now
     jmp .wait
@@ -1107,6 +1113,22 @@ linnea_uring_run:
 .tls_recv_data:
     mov eax, r15d
     add [r12 + linnea_connection.in_len], rax
+    ; the head clock (stamped at accept) must bound the handshake too, or a
+    ; client that drips ClientHello/Finished bytes rearms only the per-op idle
+    ; timeout and holds its slot forever — slowloris on 443. Same check as the
+    ; plaintext head at .recv_data.
+    call linnea_uring_now
+    mov rcx, [r12 + linnea_connection.req_start]
+    test rcx, rcx
+    jz .tls_deadline_ok            ; not on a clock (should not happen pre-DONE)
+    sub rax, rcx
+    jb .tls_deadline_ok            ; stamped ahead of now: never close on a wrap
+    cmp rax, [head_timeout_ns]
+    jbe .tls_deadline_ok
+    lea r14, [reason_slow_head]
+    mov r15d, reason_slow_head_len
+    jmp .conn_close
+.tls_deadline_ok:
     ; Already DONE: the handshake is over and we are only here to collect
     ; the rest of a record the client pipelined behind its Finished, which
     ; must be whole before the kernel can take the socket over.

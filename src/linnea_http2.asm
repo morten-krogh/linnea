@@ -208,6 +208,8 @@ linnea_h2_handle:
 .f_window:
     ; WINDOW_UPDATE: grow the connection window (stream 0) or a streaming
     ; response's window. A zero increment is a protocol error.
+    cmp r11, 13                      ; exactly 4 payload bytes (RFC 9113 6.9);
+    jne .goaway_close                ; else the read below runs past the frame
     mov eax, [rsi + 9]
     bswap eax
     and eax, 0x7fffffff              ; 31-bit increment (top bit reserved)
@@ -484,6 +486,9 @@ linnea_h2_handle:
     add r12, r11
     jmp .frames
 .f_ping:
+    cmp r11, 17                      ; PING carries exactly 8 bytes (RFC 9113 6.7);
+    jne .goaway_close                ; else the echo below reads past the frame and
+                                     ; returns 8 stale in_buf bytes to the peer
     test r10b, LINNEA_H2_FLAG_ACK
     jnz .f_ignore
     mov byte [r13], 0                ; PING ACK: length 8

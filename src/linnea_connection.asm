@@ -149,8 +149,16 @@ linnea_connection_count_ip:
     cmp rax, [r12]
     jne .ci_next
     cmp r13, 8
-    jbe .ci_hit
-    mov rax, [rbx + linnea_connection.peer_ip + 8]    ; and the rest, for IPv6
+    jbe .ci_hit                ; IPv4 (len 4) is fully matched by the 8 bytes
+    ; IPv6: cap on the /64 routing prefix — a client with an ordinary /64 has
+    ; 2^64 addresses and matching the full /128 would let it evade the cap. But
+    ; a zero /64 prefix is an IPv4-mapped address (::ffff:a.b.c.d) or loopback,
+    ; whose distinguishing bits are in the low 8 bytes; the listeners are
+    ; dual-stack, so IPv4 arrives mapped and must stay per-address. Match the
+    ; full /128 there, the /64 otherwise.
+    test rax, rax
+    jnz .ci_hit                ; native IPv6 /64 prefix: enough on its own
+    mov rax, [rbx + linnea_connection.peer_ip + 8]
     cmp rax, [r12 + 8]
     jne .ci_next
 .ci_hit:

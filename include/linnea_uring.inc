@@ -134,4 +134,5 @@ LINNEA_URING_ENTRIES    equ 256  ; submission queue depth
 LINNEA_EINTR            equ 4
 LINNEA_EAGAIN           equ 11
 LINNEA_EIO              equ 5
+LINNEA_EBUSY            equ 16
 LINNEA_ECANCELED        equ 125

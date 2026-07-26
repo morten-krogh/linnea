@@ -120,14 +120,13 @@ msg_number_range_len    equ $ - msg_number_range
 msg_timeout_range:      db "timeout must be between 1 and 3600"
 msg_timeout_range_len   equ $ - msg_timeout_range
 msg_maxconn_range:      db "max_connections must be between 1 and 65536"
-msg_maxconn_range_len2  equ 0
+msg_maxconn_range_len   equ $ - msg_maxconn_range
 msg_headtmo_range:      db "head_timeout must be between 1 and 3600"
 msg_headtmo_range_len   equ $ - msg_headtmo_range
 msg_perip_range:        db "max_per_ip must be between 1 and 65536"
 msg_perip_range_len     equ $ - msg_perip_range
 msg_maxup_range:        db "max_upstream must be between 1 and 65536"
 msg_maxup_range_len     equ $ - msg_maxup_range
-msg_maxconn_range_len   equ $ - msg_maxconn_range
 msg_workers_range:      db "workers must be between 1 and 256"
 msg_workers_range_len   equ $ - msg_workers_range
 msg_http2_range:        db "http2 must be 0 or 1"

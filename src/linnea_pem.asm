@@ -64,6 +64,9 @@ linnea_pem_decode:
     test rax, rax
     js .nofind
     add rbx, begin_len
+    lea rax, [rbx + r15]     ; bytes_eq has no end check, so bound it here:
+    cmp rax, r13             ; a truncated file (no mmap zero-fill tail when the
+    ja .bad                  ; size is a page multiple) would else read past it
     mov rdi, rbx             ; the name must follow immediately
     mov rsi, r14
     mov rcx, r15
@@ -71,6 +74,9 @@ linnea_pem_decode:
     test eax, eax
     jz .bad
     add rbx, r15
+    lea rax, [rbx + 5]
+    cmp rax, r13
+    ja .bad
     mov rdi, rbx             ; ...and then the closing dashes
     lea rsi, [dashes5]
     mov rcx, 5
@@ -92,6 +98,9 @@ linnea_pem_decode:
     ; positions, but '-' never appears in base64 so a plain check is safe)
     cmp byte [rbx], '-'
     jne .decode
+    lea rax, [rbx + end_len]    ; not enough bytes left to be "-----END": it is
+    cmp rax, r13               ; data, not the marker (and bytes_eq is unbounded)
+    ja .decode
     mov rdi, rbx
     lea rsi, [end_pfx]
     mov rcx, end_len

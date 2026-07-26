@@ -190,6 +190,8 @@ linnea_hpack_decode:
     push rcx
     call hpack_dyn_insert
     pop rcx
+    test rax, rax
+    js .lit_desync                   ; table out of sync with the peer: bail
 .lit_stored:
     pop rdi
     pop rsi
@@ -224,6 +226,9 @@ linnea_hpack_decode:
 .ok:
     xor eax, eax
     jmp .ret
+.lit_desync:
+    add rsp, 32                     ; drop the saved name/value ptr+len (4 qwords)
+    ; fall through: an out-of-sync dynamic table is a COMPRESSION_ERROR
 .err:
     mov eax, -LINNEA_HPACK_ERR
     jmp .ret
@@ -665,17 +670,27 @@ hpack_dyn_insert:
     inc qword [rbx + linnea_hpack_dyn.count]
     lea rax, [r13 + r15]
     add [rbx + linnea_hpack_dyn.used], rax
+    xor eax, eax                    ; stored: in sync with the peer
     jmp .di_ret
 .di_drop:
-    ; not stored: undo the size we charged, so the accounting stays honest
+    ; We could not store an entry the peer's encoder DID add to its table
+    ; (our slots or the non-compacting arena ran out). The index spaces are now
+    ; out of sync, so every later reference would resolve to the wrong entry —
+    ; a decode error, not a silently-substituted header. Signal it: the caller
+    ; ends the connection (COMPRESSION_ERROR). A compliant peer never reaches
+    ; here because we advertise SETTINGS_HEADER_TABLE_SIZE = 0.
     lea rax, [r13 + r15]
     add rax, 32
-    sub [rbx + linnea_hpack_dyn.size], rax
+    sub [rbx + linnea_hpack_dyn.size], rax   ; keep the accounting honest
+    mov eax, -1
     jmp .di_ret
 .di_clear:
+    ; entry larger than the table max: both sides drop it, table empties, they
+    ; stay in sync (RFC 7541 4.4) — not an error
     mov qword [rbx + linnea_hpack_dyn.count], 0
     mov qword [rbx + linnea_hpack_dyn.size], 0
     mov qword [rbx + linnea_hpack_dyn.used], 0
+    xor eax, eax
 .di_ret:
     pop r15
     pop r14

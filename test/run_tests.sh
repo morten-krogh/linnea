@@ -1338,6 +1338,20 @@ check "connection limits: slow head cut off, per-address cap holds" $?
 kill $limits_pid 2>/dev/null
 wait $limits_pid 2>/dev/null
 
+# --- the head deadline also bounds the TLS handshake (slowloris on 443) ---
+# A client dribbling ClientHello bytes rearms only the per-op idle timeout; the
+# head deadline (stamped at accept) must cut it, while a real handshake serves.
+if python3 -c 'import ssl' 2>/dev/null; then
+    $BIN test/configs/tls-slowhead.json >/dev/null 2>&1 &
+    slowhs_pid=$!
+    sleep 0.5
+    timeout 40 python3 test/tls/tls_slow_handshake.py test/tls/server.crt 47455 3 \
+        >/dev/null 2>&1
+    check "tls handshake slowloris cut at the head deadline" $?
+    kill $slowhs_pid 2>/dev/null
+    wait $slowhs_pid 2>/dev/null
+fi
+
 # --- graceful drain: SIGTERM finishes in-flight work, then exits ---
 # A slow download is in flight when the master is killed; the workers
 # must complete it, refuse new connections meanwhile, and exit after.
@@ -2040,6 +2054,11 @@ PY
     # M20: strict stream-id validation + honouring SETTINGS_INITIAL_WINDOW_SIZE.
     timeout 20 python3 test/tls/h2_conformance.py $CA 47446 >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
+
+    # wrong-length PING / WINDOW_UPDATE are a connection error, not an over-read
+    # (a zero-length PING used to echo 8 stale in_buf bytes to the peer)
+    timeout 20 python3 test/tls/h2_frame_size.py $CA 47446 >/dev/null 2>&1
+    check "http2 control-frame size validated (no PING over-read/echo)" $?
 
     kill $h2_pid 2>/dev/null
     wait $h2_pid 2>/dev/null
