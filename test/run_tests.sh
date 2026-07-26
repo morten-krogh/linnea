@@ -1317,6 +1317,36 @@ $BIN -t test/configs/bad-timeout.json >/dev/null 2>&1
 [ $? -ne 0 ]
 check "config check rejects a bad config" $?
 
+# --- stop is prompt: an idle keep-alive connection must not hold it ---
+# SIGTERM closes connections that are merely parked, so a stop takes about
+# as long as the work in flight, not as long as the idle timeout. SIGQUIT
+# is the patient drain used for the hot upgrade, where the new generation
+# is already serving; it leaves those connections alone.
+rm -f "$LOG"
+$BIN test/configs/listen.json >/dev/null 2>&1 &
+stop_master=$!
+sleep 0.3
+stop_workers=$(pgrep -P $stop_master | tr '\n' ' ')
+# hold an idle keep-alive connection open across the stop
+python3 test/keepalive_holder.py 47080 20 &
+stop_holder=$!
+sleep 0.5
+start=$SECONDS
+kill -TERM $stop_master $stop_workers 2>/dev/null
+gone=0
+for _ in $(seq 1 60); do
+    still=0
+    for w in $stop_workers; do kill -0 "$w" 2>/dev/null && still=1; done
+    [ "$still" -eq 0 ] && { gone=1; break; }
+    sleep 0.1
+done
+elapsed=$((SECONDS - start))
+[ "$gone" -eq 1 ]
+check "sigterm: workers exit with an idle connection open (${elapsed}s)" $?
+kill $stop_holder 2>/dev/null
+wait $stop_holder 2>/dev/null
+wait $stop_master 2>/dev/null
+
 # --- log rotation (SIGHUP) ---
 # Every process holds its own descriptor for the log, so after a rotation
 # they must be told to reopen it: without that they keep filling the renamed

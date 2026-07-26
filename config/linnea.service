@@ -15,10 +15,21 @@
 #   echo tls | sudo tee /etc/modules-load.d/ktls.conf
 #
 # systemd supervises the master; the master supervises the workers.
-# Stopping the unit SIGTERMs the whole control group: workers drain —
-# stop accepting, finish open connections, then exit — and systemd
-# waits for the cgroup (up to TimeoutStopSec, then SIGKILL). The
-# workers' PR_SET_PDEATHSIG covers a master that dies on its own.
+#
+# Stopping the unit SIGTERMs the whole control group. A worker then stops
+# accepting, finishes whatever is in flight, and closes the rest at once —
+# including connections merely parked on a keep-alive, which is what makes
+# a stop prompt: waiting for those would take as long as the idle timeout,
+# and a browser almost always has one open.
+#
+# SIGQUIT is the patient version of the same drain: idle connections are
+# left to live out their keep-alive. That is what the master sends its old
+# workers during a reload, where the new generation is already serving and
+# nobody is waiting.
+#
+# SIGHUP reopens the log, for logrotate (see config/linnea.logrotate).
+#
+# The workers' PR_SET_PDEATHSIG covers a master that dies on its own.
 
 [Unit]
 Description=Linnea HTTP/TLS server
@@ -37,6 +48,11 @@ ExecStart=/usr/local/bin/linnea /home/linnea/linnea/config/linnea-tls.json
 ExecReload=/bin/kill -USR2 $MAINPID
 Restart=on-failure
 RestartSec=1
+# A stop should be quick: the drain closes idle connections immediately and
+# only waits on requests actually in flight. This bounds the exceptions —
+# an upstream that has stopped reading, a WebSocket tunnel still carrying
+# traffic — instead of letting them run out the 45s default.
+TimeoutStopSec=10
 
 # Grant capabilities as ambient (not file caps on the binary), so a rebuilt
 # bin/linnea keeps working with no setcap re-run:

@@ -76,6 +76,8 @@ extern linnea_h2_init
 extern linnea_h2_handle
 extern linnea_h2_after_send
 extern linnea_h2_conn_free
+extern linnea_h2_pool_active
+extern h2_queue_goaway_pub
 extern linnea_h2p_at
 extern linnea_h2p_event
 extern linnea_h2p_service
@@ -191,6 +193,7 @@ idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
 sig_mask:           resq 1     ; blocked-signal set: SIGTERM + SIGHUP
 sig_fd:             resd 1
 drain_flag:         resd 1     ; 1 = draining: no accepts, close after serve
+fast_drain:         resd 1     ; 1 = also close connections that are merely idle
 quic_fd:    resd 1
             resd 1
 qrecv_msg:  resb LINNEA_MSGHDR_SIZE
@@ -242,11 +245,16 @@ linnea_uring_run:
     test eax, eax
     js .init_fail
 
-    ; SIGTERM means drain and SIGHUP means reopen the log after a rotation;
-    ; both arrive as cqes like everything else: block them, open a signalfd
-    ; for the pair, and arm a read on the ring. The master's death delivers
-    ; SIGTERM too (PR_SET_PDEATHSIG in linnea_start).
-    mov qword [sig_mask], (1 << (LINNEA_SIGTERM - 1)) | (1 << (LINNEA_SIGHUP - 1))
+    ; Signals arrive as cqes like everything else: block them, open a
+    ; signalfd, and arm a read on the ring.
+    ;   SIGTERM  stop: finish what is in flight, close the rest at once
+    ;   SIGQUIT  drain: also let idle connections live out their keep-alive,
+    ;            used when a new generation is already serving (hot upgrade)
+    ;   SIGHUP   reopen the log after a rotation
+    ; The master's death delivers SIGTERM too (PR_SET_PDEATHSIG in
+    ; linnea_start).
+    mov qword [sig_mask], (1 << (LINNEA_SIGTERM - 1)) | (1 << (LINNEA_SIGHUP - 1)) \
+                        | (1 << (LINNEA_SIGQUIT - 1))
     mov eax, LINNEA_SYS_RT_SIGPROCMASK
     mov edi, LINNEA_SIG_BLOCK
     lea rsi, [sig_mask]
@@ -532,15 +540,25 @@ linnea_uring_run:
 .on_signal:
     ; struct signalfd_siginfo starts with the signal number
     cmp dword [sig_buf], LINNEA_SIGHUP
-    jne .on_sigterm
+    jne .on_stop_signal
     call linnea_log_reopen     ; rotated: write into the new file from here
     call linnea_uring_arm_signal
     call linnea_uring_submit_now
     jmp .wait
-.on_sigterm:
+.on_stop_signal:
     cmp dword [drain_flag], 0
-    jnz .wait                  ; a second SIGTERM changes nothing
+    jnz .wait                  ; a second stop signal changes nothing
     mov dword [drain_flag], 1
+    ; SIGQUIT is the patient drain: leave idle connections to their
+    ; keep-alive timeout. SIGTERM means the unit is stopping, so an idle
+    ; connection — one with no request in flight — is closed now rather
+    ; than waited on; otherwise `systemctl stop` takes as long as the idle
+    ; timeout, since a browser almost always has one open.
+    mov dword [fast_drain], 1
+    cmp dword [sig_buf], LINNEA_SIGQUIT
+    jne .drain_go
+    mov dword [fast_drain], 0
+.drain_go:
     call linnea_log_stamp
     lea rdi, [log_drain]
     mov esi, log_drain_len
@@ -573,6 +591,34 @@ linnea_uring_run:
     inc r13
     jmp .cancel_loop
 .cancel_submit:
+    cmp dword [fast_drain], 0
+    je .cancel_done
+    ; cancel the read each idle connection is parked on; the cancellation
+    ; lands as -ECANCELED on that connection, which closes it
+    xor r13d, r13d
+.idle_loop:
+    cmp r13, [rbx + linnea_config.max_connections]
+    jae .cancel_done
+    mov rdi, r13
+    call linnea_connection_at
+    mov r12, rax
+    cmp qword [r12 + linnea_connection.in_use], 0
+    je .idle_next
+    mov rdi, r12
+    call conn_is_idle
+    test eax, eax
+    jz .idle_next
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_ASYNC_CANCEL
+    mov r14, r13
+    shl r14, 8
+    or r14, LINNEA_UD_RECV     ; the recv this connection is parked on
+    mov [rax + LINNEA_SQE_ADDR], r14
+    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_CANCEL
+.idle_next:
+    inc r13
+    jmp .idle_loop
+.cancel_done:
     call linnea_uring_submit_now
     jmp .wait
 .drained_exit:
@@ -710,9 +756,25 @@ linnea_uring_run:
     mov r15d, reason_peer_len
     jmp .conn_close
 .recv_timeout:
+    cmp dword [drain_flag], 0
+    jne .recv_drain            ; we cancelled it: the unit is stopping
     lea r14, [reason_timeout]
     mov r15d, reason_timeout_len
     jmp .conn_close
+.recv_drain:
+    ; An HTTP/2 peer is owed a GOAWAY before the connection goes. Nothing is
+    ; armed on this connection now — the read we cancelled was the only op —
+    ; so the frame can be built and sent, and its completion closes us.
+    cmp qword [r12 + linnea_connection.is_h2], 0
+    je .drain_close
+    cmp qword [r12 + linnea_connection.h2_state], LINNEA_H2_DRAINING
+    je .drain_close
+    mov rdi, r12
+    call h2_queue_goaway_pub
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
 .recv_data:
     mov eax, r15d
     add [r12 + linnea_connection.in_len], rax
@@ -1921,6 +1983,37 @@ linnea_uring_arm_up_recv:
     pop r12
     pop rbx
     jmp linnea_uring_arm_link_timeout
+
+; conn_is_idle(rdi = connection*) -> eax = 1 when the connection has no work
+; in flight: nothing half-received, nothing queued to send, no upstream
+; exchange or tunnel, and for HTTP/2 no open stream. Such a connection is
+; only holding its keep-alive open, so a stop can close it at once; anything
+; else is finished first.
+conn_is_idle:
+    push rbx
+    mov rbx, rdi
+    cmp qword [rbx + linnea_connection.in_len], 0
+    jne .ci_busy
+    cmp qword [rbx + linnea_connection.out_rem], 0
+    jne .ci_busy
+    cmp qword [rbx + linnea_connection.file_rem], 0
+    jne .ci_busy
+    cmp qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    jne .ci_busy
+    cmp qword [rbx + linnea_connection.is_h2], 0
+    je .ci_idle
+    mov rdi, rbx               ; an h2 connection with a stream open is busy
+    call linnea_h2_pool_active
+    test rax, rax
+    jnz .ci_busy
+.ci_idle:
+    mov eax, 1
+    pop rbx
+    ret
+.ci_busy:
+    xor eax, eax
+    pop rbx
+    ret
 
 ; h2_arm_recv_once(rdi = connection*) — arm a client recv unless one is
 ; already in flight. An HTTP/2 connection can be driven from either side (a

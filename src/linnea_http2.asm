@@ -23,6 +23,8 @@ global linnea_h2_init
 global linnea_h2_handle
 global linnea_h2_after_send
 global linnea_h2_conn_free
+global linnea_h2_pool_active
+global h2_queue_goaway_pub
 
 extern linnea_hpack_decode
 extern hpack_dyn_reset
@@ -3793,6 +3795,10 @@ linnea_h2_after_send:
     pop rbx
     ret
 
+; The loop queues a GOAWAY when it closes an idle connection during a stop.
+h2_queue_goaway_pub:
+    jmp h2_queue_goaway
+
 ; h2_queue_goaway(rdi=conn) — write GOAWAY(last-stream-id, NO_ERROR) into
 ; out_buf, arm it as the pending send, and move to the DRAINING state.
 h2_queue_goaway:
@@ -3823,6 +3829,7 @@ h2_queue_goaway:
     ret
 
 ; h2_pool_active(rdi=conn) -> rax = number of active (non-free) stream slots.
+linnea_h2_pool_active:
 h2_pool_active:
     lea rdx, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]
     xor eax, eax

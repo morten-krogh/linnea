@@ -55,6 +55,9 @@ struc linnea_connection
                                    ; under — the slot may already belong to a
                                    ; different client.
     .next_free:     resq 1         ; free-list link (pool index), -1 = end
+    .in_use:        resq 1         ; 1 while handed out. The drain walks the
+                                   ; pool looking for connections to close, and
+                                   ; a free slot's fields are stale.
     .in_len:        resq 1         ; bytes received so far
     .head_len:      resq 1         ; bytes consumed by the current request head
     .keep_alive:    resq 1         ; 1 = keep the connection after the response

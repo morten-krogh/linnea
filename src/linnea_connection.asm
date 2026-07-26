@@ -58,6 +58,7 @@ linnea_connection_alloc:
     add rdx, [pool_base]
     mov rcx, [rdx + linnea_connection.next_free]
     mov [free_head], rcx
+    mov qword [rdx + linnea_connection.in_use], 1
     mov qword [rdx + linnea_connection.in_len], 0
     mov qword [rdx + linnea_connection.head_len], 0
     mov qword [rdx + linnea_connection.keep_alive], 0
@@ -83,6 +84,7 @@ linnea_connection_alloc:
 
 ; linnea_connection_free(rdi=connection*)
 linnea_connection_free:
+    mov qword [rdi + linnea_connection.in_use], 0
     mov rax, [free_head]
     mov [rdi + linnea_connection.next_free], rax
     mov rax, [rdi + linnea_connection.index]

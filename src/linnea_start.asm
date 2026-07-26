@@ -17,7 +17,7 @@
 ; master re-execs the new binary in place — same PID, so systemd keeps
 ; tracking it. The listening sockets have no CLOEXEC, so they survive
 ; the exec; the new master adopts them (never closing them, so no
-; connection is refused), spawns new workers, then SIGTERMs the old
+; connection is refused), spawns new workers, then SIGQUITs the old
 ; workers, which drain with the old code still mapped. Before committing
 ; the master runs the new binary in config-check mode (`-t`); if it
 ; rejects the config the upgrade is refused and the old generation keeps
@@ -207,7 +207,7 @@ _start:
     jmp .spawn_loop
 .spawned:
     ; an upgrade: the new workers are accepting on the shared sockets, so
-    ; now retire the old generation — SIGTERM makes them drain (M11)
+    ; now retire the old generation — SIGQUIT makes them drain (M11)
     cmp qword [upgrade_env], 0
     je .supervise
     call kill_old_workers
@@ -564,7 +564,11 @@ parse_dec:
 .done:
     ret
 
-; kill_old_workers — SIGTERM the previous generation so it drains
+; kill_old_workers — retire the previous generation with SIGQUIT, the
+; patient drain: the new workers are already serving on the same listeners,
+; so an old worker holding an idle keep-alive connection costs nothing and
+; the client keeps its connection until it is done with it. A stop (SIGTERM)
+; is the impatient one, because then nobody is left to serve.
 kill_old_workers:
     push rbx
     xor ebx, ebx
@@ -573,7 +577,7 @@ kill_old_workers:
     jae .done
     mov eax, LINNEA_SYS_KILL
     mov rdi, [old_pids + rbx * 8]
-    mov esi, LINNEA_SIGTERM
+    mov esi, LINNEA_SIGQUIT
     syscall
     inc rbx
     jmp .loop
