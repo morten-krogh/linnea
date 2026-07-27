@@ -192,6 +192,11 @@ idle_timeout:       dq LINNEA_DEFAULT_TIMEOUT, 0    ; struct __kernel_timespec
 ; each tick runs the retransmission sweep. 50 ms bounds how late a lost reply is
 ; resent past its probe timeout, and how often a worker wakes when idle.
 pto_timer:          dq 0, 50000000                  ; {sec, nsec} = 50 ms
+; How long to wait before retrying an accept that keeps failing. A multishot
+; accept the kernel disarms with an error is otherwise re-armed at once, and a
+; standing error (EMFILE above all: the fd limit is reached before the
+; connection pool fills) turns the loop into a spin.
+accept_retry_timer: dq 0, 100000000                 ; {sec, nsec} = 100 ms
 
 section .bss
 
@@ -206,6 +211,8 @@ sig_mask:           resq 1     ; blocked-signal set: SIGTERM + SIGHUP
 sig_fd:             resd 1
 drain_flag:         resd 1     ; 1 = draining: no accepts, close after serve
 fast_drain:         resd 1     ; 1 = also close connections that are merely idle
+accept_err_streak:  resd 1     ; consecutive failed accepts; drives the backoff
+conn_full_warned:   resd 1     ; the pool-full warning has been logged already
 quic_fd:    resd 1
             resd 1
 qrecv_msg:  resb LINNEA_MSGHDR_SIZE
@@ -479,6 +486,8 @@ linnea_uring_run:
     je .on_qrecv
     cmp eax, LINNEA_UD_QTIMER
     je .on_qtimer
+    cmp eax, LINNEA_UD_ARETRY
+    je .on_aretry
     cmp eax, LINNEA_UD_H2UP_CONNECT
     je .on_h2up
     cmp eax, LINNEA_UD_H2UP_SEND
@@ -680,9 +689,11 @@ linnea_uring_run:
     jnz .accept_drain
     test r15d, r15d
     js .accept_err
+    mov dword [accept_err_streak], 0   ; accepting again: end any backoff
     call linnea_connection_alloc
     test rax, rax
     jz .conn_limit
+    mov dword [conn_full_warned], 0
     mov r12, rax               ; connection*
     mov [r12 + linnea_connection.fd], r15d
     mov [r12 + linnea_connection.server], r13d
@@ -776,6 +787,12 @@ linnea_uring_run:
     syscall
     jmp .wait
 .accept_err:
+    ; Report the first failure of a streak only: the peer chooses how often it
+    ; connects, so a line per failure is a write-to-disk-on-demand amplifier
+    ; (the same class Q98 closed for the request log).
+    inc dword [accept_err_streak]
+    cmp dword [accept_err_streak], 1
+    jne .accept_backoff
     lea rdi, [warn_accept]
     mov esi, warn_accept_len
     call linnea_print_stderr
@@ -785,11 +802,28 @@ linnea_uring_run:
     lea rdi, [warn_accept_end]
     mov esi, warn_accept_end_len
     call linnea_print_stderr
-    jmp .accept_rearm
+    jmp .accept_rearm          ; a one-off (ECONNABORTED): retry immediately
+.accept_backoff:
+    ; failing repeatedly with nothing accepted in between: the cause is
+    ; standing (EMFILE/ENFILE/ENOBUFS), so re-arm on a timer instead of
+    ; spinning the loop at 100% CPU until something happens to free an fd
+    mov rdi, r13
+    call linnea_uring_arm_accept_retry
+    call linnea_uring_submit_now
+    jmp .wait
+.on_aretry:
+    mov rdi, r13               ; the listener whose accept we backed off
+    call linnea_uring_arm_accept
+    call linnea_uring_submit_now
+    jmp .wait
 .conn_limit:
     mov edi, r15d
     mov eax, LINNEA_SYS_CLOSE
     syscall
+    ; warn once per spell of fullness, not once per refused connection
+    cmp dword [conn_full_warned], 0
+    jne .accept_rearm
+    mov dword [conn_full_warned], 1
     lea rdi, [warn_full]
     mov esi, warn_full_len
     call linnea_print_stderr
@@ -2440,6 +2474,25 @@ linnea_uring_arm_qrecv:
     mov dword [rax + LINNEA_SQE_LEN], 1
     mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_QRECV
 .noq:
+    ret
+
+; linnea_uring_arm_accept_retry(rdi = listener index) — queue a one-shot
+; IORING_OP_TIMEOUT that re-arms this listener's accept once the backoff
+; elapses. The listener index rides in the user_data exactly as the accept's
+; does, so the completion knows which listener to bring back. Caller submits.
+linnea_uring_arm_accept_retry:
+    push rdi
+    call linnea_uring_get_sqe_zeroed
+    pop rdi
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_TIMEOUT
+    mov dword [rax + LINNEA_SQE_FD], -1
+    lea rcx, [accept_retry_timer]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1        ; one timespec
+    mov qword [rax + LINNEA_SQE_OFF], 0        ; fire on the timer, not a count
+    shl rdi, 8
+    or rdi, LINNEA_UD_ARETRY
+    mov [rax + LINNEA_SQE_USER_DATA], rdi
     ret
 
 ; linnea_uring_arm_qtimer() — queue the QUIC probe-timeout tick: a relative

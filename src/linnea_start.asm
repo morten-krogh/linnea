@@ -518,6 +518,11 @@ parse_upgrade_env:
     mov rsi, [upgrade_env]
     xor r12d, r12d             ; fd index
 .fd_loop:
+    ; the value comes from the environment, so bound the write: more entries
+    ; than there are listener slots would walk straight past the table. A short
+    ; count then fails the server_count check below and refuses the upgrade.
+    cmp r12, LINNEA_MAX_SERVERS
+    jae .topology
     call parse_dec             ; rax = value, rsi advanced
     mov [adopt_fd_table + r12 * 4], eax
     inc r12
@@ -535,6 +540,8 @@ parse_upgrade_env:
 .pid_loop:
     cmp byte [rsi], 0
     je .pids_done
+    cmp r12, LINNEA_MAX_WORKERS        ; likewise bounded: environment input
+    jae .pids_done
     call parse_dec
     mov [old_pids + r12 * 8], rax
     inc r12

@@ -41,12 +41,16 @@ section .text
 
 ; linnea_log_open(rdi=path cstr) — open for append, create with 0644.
 ; The path is kept so the file can be reopened later (see linnea_log_reopen).
+; O_CLOEXEC, unlike the listeners, which are deliberately left inheritable so
+; the hot upgrade's execve can adopt them: the new generation opens its own
+; log, so an inherited one would leak an fd per reload and pin the rotated
+; inode, keeping a rotated-away log's disk space from ever being reclaimed.
 linnea_log_open:
     push rbx
     mov rbx, rdi               ; kept for the error message
     mov [log_path], rdi
     mov eax, LINNEA_SYS_OPEN
-    mov esi, LINNEA_O_WRONLY | LINNEA_O_CREAT | LINNEA_O_APPEND
+    mov esi, LINNEA_O_WRONLY | LINNEA_O_CREAT | LINNEA_O_APPEND | LINNEA_O_CLOEXEC
     mov edx, LINNEA_MODE_0644
     syscall
     cmp rax, -4095
@@ -73,7 +77,7 @@ linnea_log_reopen:
     test rdi, rdi
     jz .lr_ret                 ; never opened: nothing to reopen
     mov eax, LINNEA_SYS_OPEN
-    mov esi, LINNEA_O_WRONLY | LINNEA_O_CREAT | LINNEA_O_APPEND
+    mov esi, LINNEA_O_WRONLY | LINNEA_O_CREAT | LINNEA_O_APPEND | LINNEA_O_CLOEXEC
     mov edx, LINNEA_MODE_0644
     syscall
     cmp rax, -4095

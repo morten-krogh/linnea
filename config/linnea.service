@@ -53,6 +53,11 @@ RestartSec=1
 # an upstream that has stopped reading, a WebSocket tunnel still carrying
 # traffic — instead of letting them run out the 45s default.
 TimeoutStopSec=10
+# Every connection is an fd, and a TLS proxy connection is two. The default
+# soft limit is 1024, which is below the config's max_connections — so the
+# limit would be hit before the pool filled, and accept(2) would start
+# failing with EMFILE while the server still believed it had room.
+LimitNOFILE=65536
 
 # Grant capabilities as ambient (not file caps on the binary), so a rebuilt
 # bin/linnea keeps working with no setcap re-run:

@@ -49,6 +49,7 @@ LINNEA_UD_QRECV         equ 9          ; datagram on the QUIC (UDP) listener
 LINNEA_UD_QTIMER        equ 10         ; QUIC probe-timeout tick: run the rtx sweep
 ; proxy-over-h2 upstream ops: the index field carries (conn index << 3) | slot,
 ; so a completion can find its upstream slot without touching the connection
+LINNEA_UD_ARETRY        equ 14         ; accept-retry tick after a failed accept
 LINNEA_UD_H2UP_CONNECT  equ 11
 LINNEA_UD_H2UP_SEND     equ 12
 LINNEA_UD_H2UP_RECV     equ 13

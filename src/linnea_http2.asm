@@ -2205,6 +2205,12 @@ linnea_h2p_service:
     ; and readiness tests below, so a stale bit cannot resurrect it
     cmp qword [r12 + linnea_h2p.state], LINNEA_H2P_FREE
     je .sv_next
+    ; a zombie belongs to a connection that is already gone — it is parked only
+    ; until its in-flight op completes. Its sid names a stream this connection
+    ; never opened, so acting on its readiness flags or its stream-level credit
+    ; would emit frames for a stranger's stream once the slot's index is reused
+    cmp qword [r12 + linnea_h2p.state], LINNEA_H2P_ZOMBIE
+    je .sv_next
     ; request-body bytes that have gone upstream are owed back to the client
     ; as flow-control credit — on the stream and on the connection — or it
     ; stops sending after one window

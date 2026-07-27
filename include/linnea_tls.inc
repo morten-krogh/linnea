@@ -80,7 +80,15 @@ LINNEA_TLS_MAX_FRAGMENT equ LINNEA_TLS_MSG_BUF
 ; not its typical size: an ECDSA signature is DER, so its length varies with
 ; r and s and usually lands a byte or two under the bound. The term is
 ; header(4) + scheme(2) + length(2) + LINNEA_P256_ECDSA_MAX_SIG.
-LINNEA_TLS_FLIGHT_OVERHEAD equ 6 + 8 + (8 + LINNEA_P256_ECDSA_MAX_SIG) + 36
+;
+; The EncryptedExtensions term is 6 only when the message is empty. Once an
+; ALPN protocol is selected, build_ee writes 13 + L bytes, where L is the
+; selected name's length — "http/1.1" is the longest we ever offer. Budgeting
+; the empty form left the bound 15 bytes short, so a chain sized into that
+; window would have run the Finished past the end of msg_buf.
+LINNEA_TLS_MAX_ALPN_NAME equ 8            ; "http/1.1"
+LINNEA_TLS_EE_MAX        equ 13 + LINNEA_TLS_MAX_ALPN_NAME
+LINNEA_TLS_FLIGHT_OVERHEAD equ LINNEA_TLS_EE_MAX + 8 + (8 + LINNEA_P256_ECDSA_MAX_SIG) + 36
 LINNEA_TLS_MAX_CERT_LIST equ LINNEA_TLS_MSG_BUF - LINNEA_TLS_FLIGHT_OVERHEAD
 
 ; kTLS handoff (docs.kernel.org/networking/tls.html). After the handshake
