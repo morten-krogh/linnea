@@ -119,11 +119,10 @@ want = open("test/www/hello.txt", "rb").read()
 
 # Header sizes chosen so the field section ends at a variety of offsets — the
 # bitmap is per bit, so a frame boundary that is not a multiple of 8 is exactly
-# where a byte-per-byte map and a bit map would diverge. Kept under ~2 KB of
-# decoded header: past that the server stops answering a request entirely
-# (no response, no stream error — the client just hangs), which predates this
-# test and is tracked separately.
-for size in (1500, 1701, 1900, 2001):
+# where a byte-per-byte map and a bit map would diverge. The larger sizes also
+# cover the QPACK literal scratch: at 2048 it overflowed, and the overflow was
+# reported as a decompression failure that killed the whole connection.
+for size in (1500, 1701, 2001, 2500, 3003):
     filler = b"x" * size
     for name, order in (("in order", list),
                         ("reversed", lambda r: list(r)[::-1]),

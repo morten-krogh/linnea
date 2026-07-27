@@ -201,7 +201,12 @@ onertt_pay:  resb 256                 ; ACK + HANDSHAKE_DONE + uni streams + NST
 onertt_pkt:  resb 4096                ; the protected 1-RTT packet
 strm_pay:    resb 4096                ; STREAM frame carrying the h3 response
 req:         resb linnea_h2_req_size  ; decoded h3 request
-h3scratch:   resb 2048                ; QPACK literal scratch
+; QPACK literal scratch: every Huffman-decoded header value of one request goes
+; here. At 2048 an ordinary request with a large cookie overflowed it, and the
+; overflow was reported as a QPACK decompression failure — which killed the
+; whole connection, taking every other request on it, for what is really our
+; own resource limit. Sized to the header-list bound so that limit decides.
+h3scratch:   resb LINNEA_HPACK_MAX_LISTSIZE
 s_pl_ptr:    resq 1
 s_pl_len:    resq 1
 s_sid:       resq 1                   ; stream id of the request being served
@@ -1758,7 +1763,7 @@ linnea_quic_server_datagram:
     rep stosb
     lea rax, [h3scratch]
     mov [req + linnea_h2_req.scratch], rax
-    lea rax, [h3scratch + 2048]
+    lea rax, [h3scratch + LINNEA_HPACK_MAX_LISTSIZE]
     mov [req + linnea_h2_req.scratch_end], rax
     ; parse the HTTP/3 request (HEADERS frame -> QPACK decode)
     mov rdi, [s_sdata]

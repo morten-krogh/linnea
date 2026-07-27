@@ -229,14 +229,18 @@ linnea_hpack_decode:
 .lit_desync:
     add rsp, 32                     ; drop the saved name/value ptr+len (4 qwords)
     ; fall through: an out-of-sync dynamic table is a COMPRESSION_ERROR
+; 64-bit, not eax: the caller tests the sign of the whole rax, and a 32-bit
+; move zero-extends, so every one of these errors arrived as a large POSITIVE
+; number and the caller's `js` never fired. linnea_qpack_decode always got
+; this right, which is why h3 reacted to a bad field section and h2 did not.
 .err:
-    mov eax, -LINNEA_HPACK_ERR
+    mov rax, -LINNEA_HPACK_ERR
     jmp .ret
 .err_index:
-    mov eax, -LINNEA_HPACK_ERR_INDEX
+    mov rax, -LINNEA_HPACK_ERR_INDEX
     jmp .ret
 .err_limit:
-    mov eax, -LINNEA_HPACK_ERR_LIMIT
+    mov rax, -LINNEA_HPACK_ERR_LIMIT
 .ret:
     pop r15
     pop r14
