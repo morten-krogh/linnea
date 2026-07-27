@@ -84,6 +84,8 @@ LINNEA_SOCK_DGRAM    equ 2
 LINNEA_SOL_SOCKET    equ 1
 LINNEA_SO_REUSEADDR  equ 2
 LINNEA_SO_REUSEPORT  equ 15
+LINNEA_SO_RCVBUF     equ 8
+LINNEA_SO_RXQ_OVFL   equ 40    ; ask for the per-socket drop count as a cmsg
 LINNEA_IPPROTO_IPV6  equ 41
 LINNEA_IPV6_V6ONLY   equ 26
 LINNEA_SOCKADDR_IN_SIZE equ 16  ; struct sockaddr_in: family u16, port u16 (BE), addr u32 (BE), zero[8]

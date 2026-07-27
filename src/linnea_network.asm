@@ -47,6 +47,10 @@ log_close_len       equ $ - log_close
 
 sockopt_one:        dd 1
 sockopt_zero:       dd 0
+; 4 MiB of QUIC receive buffer, shared by every connection on this worker. The
+; kernel clamps this to net.core.rmem_max (4 MiB on a stock kernel) and doubles
+; what it stores for its own bookkeeping.
+sockopt_rcvbuf:     dd 4194304
 
 section .bss
 
@@ -176,6 +180,30 @@ linnea_network_quic_listener:
     syscall
     cmp rax, -4095
     jae .qclose
+    ; Every QUIC connection this worker serves shares this one socket, so its
+    ; receive buffer is a resource they all draw on: a burst spread across many
+    ; connections concentrates here, and whatever does not fit is dropped by the
+    ; kernel before the server ever sees it. The default (net.core.rmem_default,
+    ; ~208KB) is a couple of hundred datagrams. Ask for more; the kernel clamps
+    ; to net.core.rmem_max, so this is a request, not a demand, and a failure
+    ; costs nothing.
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, r12
+    mov esi, LINNEA_SOL_SOCKET
+    mov edx, LINNEA_SO_RCVBUF
+    lea r10, [sockopt_rcvbuf]
+    mov r8d, 4
+    syscall
+    ; and count what is dropped anyway: SO_RXQ_OVFL attaches the socket's
+    ; running overflow counter to each recvmsg as a control message. Without it
+    ; the loss is completely invisible — the datagrams simply never arrive.
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, r12
+    mov esi, LINNEA_SOL_SOCKET
+    mov edx, LINNEA_SO_RXQ_OVFL
+    lea r10, [sockopt_one]
+    mov r8d, 4
+    syscall
     mov eax, LINNEA_SYS_BIND
     mov rdi, r12
     lea rsi, [sockaddr_scratch]

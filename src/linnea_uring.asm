@@ -125,6 +125,10 @@ warn_full_len       equ $ - warn_full
 
 log_accept:         db "accepted connection on "
 log_accept_len      equ $ - log_accept
+log_qdrop:          db "quic receive overflow: "
+log_qdrop_len       equ $ - log_qdrop
+log_qdrop_end:      db " datagrams dropped by the kernel (socket buffer full)", 10
+log_qdrop_end_len   equ $ - log_qdrop_end
 log_closed:         db "closed connection on "
 log_closed_len      equ $ - log_closed
 log_from:           db " from "
@@ -217,6 +221,9 @@ quic_fd:    resd 1
             resd 1
 qrecv_msg:  resb LINNEA_MSGHDR_SIZE
 qrecv_iov:  resb LINNEA_IOVEC_SIZE
+; control buffer for the SO_RXQ_OVFL cmsg: cmsghdr(16) + u32, rounded up
+qrecv_cmsg: resb LINNEA_QRECV_CMSG_SIZE
+qrecv_drops: resq 1        ; last overflow count seen, to report only the delta
 cqe_tag:       resd 1      ; the completing op's tag, kept past the shift
 cqe_gen:       resd 1      ; and the connection incarnation it was armed for
 qrecv_peer: resb LINNEA_SOCKADDR_IN6_SIZE
@@ -551,6 +558,7 @@ linnea_uring_run:
 .on_qrecv:
     test r15d, r15d
     jle .qrecv_rearm
+    call qrecv_check_drops
     mov edi, r15d
     lea rsi, [qrecv_peer]
     mov edx, [qrecv_msg + LINNEA_MSGHDR_NAMELEN]   ; kernel-updated length
@@ -2483,8 +2491,9 @@ linnea_uring_arm_qrecv:
     lea rcx, [qrecv_iov]
     mov [qrecv_msg + LINNEA_MSGHDR_IOV], rcx
     mov qword [qrecv_msg + LINNEA_MSGHDR_IOVLEN], 1
-    mov qword [qrecv_msg + LINNEA_MSGHDR_CONTROL], 0
-    mov qword [qrecv_msg + LINNEA_MSGHDR_CONTROLLEN], 0
+    lea rcx, [qrecv_cmsg]      ; room for the SO_RXQ_OVFL counter
+    mov [qrecv_msg + LINNEA_MSGHDR_CONTROL], rcx
+    mov qword [qrecv_msg + LINNEA_MSGHDR_CONTROLLEN], LINNEA_QRECV_CMSG_SIZE
     mov dword [qrecv_msg + LINNEA_MSGHDR_FLAGS], 0
     lea rcx, [linnea_quic_rxbuf]
     mov [qrecv_iov + LINNEA_IOVEC_BASE], rcx
@@ -2498,6 +2507,38 @@ linnea_uring_arm_qrecv:
     mov dword [rax + LINNEA_SQE_LEN], 1
     mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_QRECV
 .noq:
+    ret
+
+; qrecv_check_drops() — read the SO_RXQ_OVFL counter the kernel attached to the
+; datagram we just received, and log any increase. Every QUIC connection on this
+; worker shares one socket, so an overflow is not one connection's problem: the
+; datagrams are gone before the server sees them, and without this the loss
+; leaves no trace anywhere. Only the delta is reported, and only when it moves,
+; so a healthy server says nothing. Clobbers only caller-saved registers.
+qrecv_check_drops:
+    cmp qword [qrecv_msg + LINNEA_MSGHDR_CONTROLLEN], LINNEA_CMSG_DATA + 4
+    jb .qcd_done                       ; no control data: the option is not on
+    cmp dword [qrecv_cmsg + LINNEA_CMSG_LEVEL], LINNEA_SOL_SOCKET
+    jne .qcd_done
+    cmp dword [qrecv_cmsg + LINNEA_CMSG_TYPE], LINNEA_SO_RXQ_OVFL
+    jne .qcd_done
+    mov eax, [qrecv_cmsg + LINNEA_CMSG_DATA]     ; the socket's running total
+    cmp rax, [qrecv_drops]
+    jbe .qcd_done                      ; unchanged (or wrapped): nothing to say
+    mov rcx, rax
+    sub rcx, [qrecv_drops]             ; how many since the last report
+    mov [qrecv_drops], rax
+    push rcx
+    call linnea_log_stamp
+    lea rdi, [log_qdrop]
+    mov esi, log_qdrop_len
+    call linnea_log_write
+    pop rdi
+    call linnea_log_u64
+    lea rdi, [log_qdrop_end]
+    mov esi, log_qdrop_end_len
+    call linnea_log_write
+.qcd_done:
     ret
 
 ; linnea_uring_arm_accept_retry(rdi = listener index) — queue a one-shot

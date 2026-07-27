@@ -64,6 +64,12 @@ LINNEA_MSGHDR_CONTROL   equ 32
 LINNEA_MSGHDR_CONTROLLEN equ 40
 LINNEA_MSGHDR_FLAGS     equ 48   ; int
 LINNEA_MSGHDR_SIZE      equ 56
+; struct cmsghdr: len(8) level(4) type(4) then the data. One u32 counter.
+LINNEA_CMSG_LEN         equ 0
+LINNEA_CMSG_LEVEL       equ 8
+LINNEA_CMSG_TYPE        equ 12
+LINNEA_CMSG_DATA        equ 16
+LINNEA_QRECV_CMSG_SIZE  equ 32
 LINNEA_IOVEC_BASE       equ 0
 LINNEA_IOVEC_LEN        equ 8
 LINNEA_IOVEC_SIZE       equ 16
