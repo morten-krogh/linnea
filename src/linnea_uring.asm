@@ -582,10 +582,17 @@ linnea_uring_run:
 ; requests run to their end, close instead of keep-alive afterwards,
 ; and exit when the last connection is freed.
 .on_signal:
+    ; A short or failed read leaves the PREVIOUS siginfo in the buffer (or
+    ; zeros on the first one), and zero is not SIGHUP — it would fall straight
+    ; through to the stop path and begin a drain nobody asked for. Only a
+    ; whole struct is a signal.
+    cmp r15d, 128                   ; sizeof(struct signalfd_siginfo)
+    jne .signal_reread
     ; struct signalfd_siginfo starts with the signal number
     cmp dword [sig_buf], LINNEA_SIGHUP
     jne .on_stop_signal
     call linnea_log_reopen     ; rotated: write into the new file from here
+.signal_reread:
     call linnea_uring_arm_signal
     call linnea_uring_submit_now
     jmp .wait
@@ -873,11 +880,18 @@ linnea_uring_run:
     mov r15d, reason_timeout_len
     jmp .conn_close
 .recv_drain:
-    ; An HTTP/2 peer is owed a GOAWAY before the connection goes. Nothing is
-    ; armed on this connection now — the read we cancelled was the only op —
-    ; so the frame can be built and sent, and its completion closes us.
+    ; An HTTP/2 peer is owed a GOAWAY before the connection goes. The read we
+    ; cancelled is usually this connection's only op — but not always: we also
+    ; get here when an h2 connection's own idle timeout fires while a response
+    ; send is still in flight. Building the GOAWAY would rewrite out_buf under
+    ; that send and arm a second one on the same socket, splicing a GOAWAY into
+    ; the middle of a DATA frame and double-advancing out_ptr on both
+    ; completions. The send's own drain runs the drain-aware idle decision
+    ; (linnea_h2_after_send), so leaving it to that loses nothing.
     cmp qword [r12 + linnea_connection.is_h2], 0
     je .drain_close
+    cmp qword [r12 + linnea_connection.h2_tx_busy], 0
+    jne .wait
     cmp qword [r12 + linnea_connection.h2_state], LINNEA_H2_DRAINING
     je .drain_close
     mov rdi, r12
@@ -932,9 +946,9 @@ linnea_uring_run:
     ; we overwrite it. Whichever op is outstanding comes back here when it
     ; completes (.on_recv, or .send_drained while in_len is nonzero).
     cmp qword [r12 + linnea_connection.h2_tx_busy], 0
-    jne .wait
+    jne .h2_park
     cmp qword [r12 + linnea_connection.h2_rx_busy], 0
-    jne .wait
+    jne .h2_park
     mov rdi, r12
     call linnea_h2_handle
     push rax
@@ -949,7 +963,17 @@ linnea_uring_run:
     call linnea_uring_arm_send
     call linnea_uring_submit_now
     jmp .wait
+; Reached with upstream sqes possibly prepared but the SQ tail not yet
+; published: our caller queued them and only then learned the connection is
+; done. Publishing costs nothing (the teardown parks an in-flight slot as a
+; ZOMBIE and shuts its socket down, so it completes and releases promptly),
+; whereas leaving them unsubmitted holds the upstream fd and its slot in the
+; ceiling until some unrelated connection happens to submit.
+.h2_park:
+    call linnea_uring_submit_now
+    jmp .wait
 .h2_close:
+    call linnea_uring_submit_now
     lea r14, [reason_done]
     mov r15d, reason_done_len
     jmp .conn_close

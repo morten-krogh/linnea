@@ -157,11 +157,14 @@ resp_501:       db "HTTP/1.1 501 Not Implemented", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_501_len    equ $ - resp_501
+; Bodiless, like every other canned response: .resp_static appends the vhost's
+; security headers by copying the blob without its terminating blank line (the
+; "- 4"), which silently cut into a trailing body instead — the appended
+; headers landed inside it and Content-Length then covered the wrong bytes.
 resp_503:       db "HTTP/1.1 503 Service Unavailable", 13, 10
-                db "Content-Type: text/plain", 13, 10
-                db "Content-Length: 20", 13, 10
+                db "Server: linnea", 13, 10
+                db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
-                db "503 Service Unavail", 10
 resp_503_len    equ $ - resp_503
 resp_502:       db "HTTP/1.1 502 Bad Gateway", 13, 10
                 db "Server: linnea", 13, 10
