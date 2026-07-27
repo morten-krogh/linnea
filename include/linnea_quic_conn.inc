@@ -16,7 +16,14 @@
 ;
 ; Requires linnea_quic.inc (linnea_quic_keys_size, LINNEA_QUIC_MAX_CID).
 
-LINNEA_QUIC_MAX_CONNS equ 64        ; connections per worker
+; Connections per worker. The pool index is byte 1 of every connection ID we
+; issue (byte 0 is the worker, for the BPF steering), so 256 is the most this
+; ID layout can address — anything larger needs a wider ID. A slot is large
+; (mostly its LINNEA_QUIC_TXSTREAMS response-stream slots), but the pool is
+; .bss and faulted lazily, so an unused slot costs address space, not memory.
+; A browser holds one QUIC connection open for a whole page load, so this is
+; the ceiling on concurrent h3 clients per worker.
+LINNEA_QUIC_MAX_CONNS equ 256       ; connections per worker
 LINNEA_QUIC_RXBUF_SIZE equ 2048     ; linnea_quic_rxbuf, the datagram we read into
 LINNEA_QUIC_SCID_LEN  equ 8         ; every connection ID we issue is 8 bytes
 LINNEA_QUIC_IDLE_SECS equ 30        ; reclaim a slot after this long with no packet

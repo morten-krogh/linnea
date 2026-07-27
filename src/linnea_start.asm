@@ -70,6 +70,8 @@ msg_storm:      db "worker died within a second of starting; giving up"
 msg_storm_len   equ $ - msg_storm
 msg_topology:   db "hot upgrade needs an unchanged listener set; use restart"
 msg_topology_len equ $ - msg_topology
+msg_fdlimit:    db "file descriptor limit too low for max_connections; raise LimitNOFILE"
+msg_fdlimit_len equ $ - msg_fdlimit
 
 log_worker:     db "worker "
 log_worker_len  equ $ - log_worker
@@ -110,6 +112,7 @@ chk_envp:       resq 2
 env_buf:        resb 4096                ; "LINNEA_UPGRADE=fds;pids"
 time_scratch:   resq 2
 affinity_mask:  resb 128
+fd_rlimit:      resq 2         ; struct rlimit64 {cur, max} for RLIMIT_NOFILE
 
 section .text
 
@@ -164,6 +167,7 @@ _start:
     lea rdi, [linnea_config_instance]
     call linnea_config_validate
     call resolve_workers
+    call ensure_fd_limit       ; the pool is only real if we have the fds for it
     lea rdi, [linnea_config_instance + linnea_config.log]
     call linnea_log_open
     lea rdi, [linnea_config_instance]
@@ -739,6 +743,57 @@ resolve_workers:
     mov [linnea_config_instance + linnea_config.workers], rax
 .done:
     ret
+
+; ensure_fd_limit() — make RLIMIT_NOFILE big enough for the configured pool,
+; or refuse to start.
+;
+; Every connection is a descriptor, and a proxied one is two, so a worker
+; whose soft limit is below its own max_connections can never fill its pool:
+; accept(2) starts failing with EMFILE while the server still believes it has
+; room, and the graceful pool-full path never runs. The default soft limit
+; (1024) is exactly the default max_connections, so the stock configuration
+; hits this. A process may raise its own soft limit up to the hard limit
+; without privilege, so do that here rather than making it the operator's
+; problem; only a hard limit that is genuinely too low is fatal. Runs in the
+; master, before the fork, so every worker inherits the raised limit.
+ensure_fd_limit:
+    push rbx
+    ; what one worker can have open at once, plus room for the listeners, the
+    ; log, the ring, the signalfd and the BPF fds
+    mov rbx, [linnea_config_instance + linnea_config.max_connections]
+    add rbx, [linnea_config_instance + linnea_config.max_upstream]
+    mov rax, [linnea_config_instance + linnea_config.server_count]
+    lea rbx, [rbx + rax * 2]   ; a TCP and a UDP listener per server
+    add rbx, 32                ; slack for the fixed descriptors
+    ; read the current limit
+    xor edi, edi               ; pid 0 = us
+    mov esi, LINNEA_RLIMIT_NOFILE
+    xor edx, edx               ; no new limit: just read
+    lea r10, [fd_rlimit]
+    mov eax, LINNEA_SYS_PRLIMIT64
+    syscall
+    cmp rax, -4095
+    jae .done                  ; cannot read it: leave the limit alone
+    cmp [fd_rlimit], rbx       ; soft limit already sufficient?
+    jae .done
+    cmp [fd_rlimit + 8], rbx   ; hard limit is the ceiling we may raise to
+    jb .too_low
+    mov [fd_rlimit], rbx       ; raise the soft limit, keep the hard one
+    xor edi, edi
+    mov esi, LINNEA_RLIMIT_NOFILE
+    lea rdx, [fd_rlimit]
+    xor r10d, r10d
+    mov eax, LINNEA_SYS_PRLIMIT64
+    syscall
+    cmp rax, -4095
+    jae .too_low               ; refused: the pool would silently not fit
+.done:
+    pop rbx
+    ret
+.too_low:
+    lea rdi, [msg_fdlimit]
+    mov esi, msg_fdlimit_len
+    jmp linnea_error_exit
 
 ; monotonic_ns() -> rax = CLOCK_MONOTONIC now, as nanoseconds.
 monotonic_ns:

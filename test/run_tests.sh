@@ -63,6 +63,14 @@ run_test "bad workers"     1 stderr "workers must be between 1 and 256" \
     $BIN test/configs/bad-workers.json
 run_test "invalid host"    1 stderr "invalid host address" \
     $BIN test/configs/bad-host.json
+# a hard fd limit below the configured pool is fatal: the pool could never
+# fill, and accept would fail with EMFILE while the server thought it had room
+run_test "fd limit too low" 1 stderr "file descriptor limit too low" \
+    bash -c "ulimit -n 200; exec $BIN test/configs/listen.json"
+# a low SOFT limit is not fatal — a process may raise its own up to the hard
+# limit, so the server does that for itself rather than refusing to start
+run_test "fd soft limit raised" 124 stdout "config:" \
+    bash -c "ulimit -S -n 64; exec timeout 0.5 $BIN test/configs/listen.json"
 run_test "missing argv"    1 stderr "usage:" \
     $BIN
 run_test "missing file"    1 stderr "cannot open config file" \
@@ -2254,10 +2262,14 @@ cat > $emf <<EOF
       "locations": [ { "prefix": "/", "root": "test/www" } ] } ]
 }
 EOF
-bash -c "ulimit -n 48; exec $BIN $emf" >test/emfile.err 2>&1 &
+# The startup check now makes an EMFILE from the *configured* pool impossible,
+# so squeeze the running worker instead — which is the case that remains real:
+# a system-wide ENFILE, or an operator lowering the limit under a live process.
+$BIN $emf >test/emfile.err 2>&1 &
 emf_pid=$!
 sleep 0.6
 emf_w=$(workers_of $emf_pid | awk '{print $1}')
+[ -n "$emf_w" ] && prlimit --pid $emf_w --nofile=48:524288 2>/dev/null
 python3 - <<'PY' &
 import socket, time
 socks = []
