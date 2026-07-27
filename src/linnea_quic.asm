@@ -1722,7 +1722,7 @@ linnea_quic_parse_priority:
     inc rdi
     jmp .pp_member
 .pp_u:
-    lea rcx, [rdi + 2]               ; need "u=" then a digit
+    lea rcx, [rdi + 3]               ; need "u=" then a digit: 3 bytes
     cmp rcx, r10
     ja .pp_adv
     cmp byte [rdi + 1], '='
@@ -2397,6 +2397,9 @@ linnea_quic_ch_parse:
     movzx ecx, byte [r14 + 1]
     or eax, ecx
     lea rdx, [r14 + 2]               ; the list itself
+    lea rcx, [rdx + rax]             ; the list must fit inside the extension
+    cmp rcx, r15
+    ja .chp_next
     mov [rbx + linnea_quic_ch.alpn_ptr], rdx
     mov [rbx + linnea_quic_ch.alpn_len], rax
     jmp .chp_next
@@ -2456,6 +2459,8 @@ linnea_quic_ch_parse:
     lea rdx, [rax + 4]               ; + obfuscated age
     cmp rdx, r10
     ja .chp_next
+    cmp ecx, LINNEA_QUIC_TICKET_LEN
+    jne .chp_next                    ; not our ticket shape: ignore the offer
     lea rax, [r14 + 4]
     mov [rbx + linnea_quic_ch.psk_id_ptr], rax
     mov [rbx + linnea_quic_ch.psk_id_len], rcx
@@ -2466,6 +2471,9 @@ linnea_quic_ch_parse:
     ja .chp_next
     cmp byte [r10 + 2], 32
     jne .chp_next
+    lea rax, [r10 + 3 + 32]          ; the binder's 32 bytes must be present too
+    cmp rax, r15
+    ja .chp_next
     lea rax, [r10 + 3]
     mov [rbx + linnea_quic_ch.psk_binder_ptr], rax
     jmp .chp_next

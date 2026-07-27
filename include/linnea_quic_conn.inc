@@ -133,7 +133,7 @@ LINNEA_QUIC_EARLY_BUF   equ 1024
 ; therefore never refused for lack of a slot. Slots cost only fixed memory (they
 ; share one congestion window), not bandwidth.
 LINNEA_QUIC_TX_CHUNK    equ 1100    ; stream bytes per 1-RTT packet
-LINNEA_QUIC_TX_HDR      equ 256     ; HEADERS frame + DATA frame header prefix cap
+LINNEA_QUIC_TX_HDR      equ 512     ; HEADERS frame + DATA frame header prefix cap
 LINNEA_QUIC_TXSTREAMS   equ 100     ; = advertised initial_max_streams_bidi
 LINNEA_QUIC_RST_SEEN    equ 32      ; cancelled stream ids remembered per connection
 ; Bidi-stream flow control (RFC 9000 4.6). We advertise this many streams up front,

@@ -628,6 +628,19 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     [ -n "$ulw_before" ] && [ "$ulw_before" = "$ulw_after" ] && [ $ulw_ok -eq 0 ]
     check "h3 (io_uring): malformed Length Initial crashes no worker (pre-auth)" $?
 
+    # a resumption offer whose PskIdentity is longer than a real ticket must be
+    # rejected before the AEAD: the open writes identity_len-28 bytes into a
+    # 48-byte stack slot, so an oversized identity overwrote the return address
+    # of a pre-auth path. Real resumption must keep working afterwards.
+    pio_before=$(workers_of $h3_pid)
+    python3 test/quic/h3_psk_id_overflow_test.py 47452 >/dev/null 2>&1
+    sleep 0.5
+    python3 test/quic/h3_resume_test.py 47452 >/dev/null 2>&1
+    pio_ok=$?
+    pio_after=$(workers_of $h3_pid)
+    [ -n "$pio_before" ] && [ "$pio_before" = "$pio_after" ] && [ $pio_ok -eq 0 ]
+    check "h3 (io_uring): oversized PskIdentity crashes no worker (pre-auth)" $?
+
     kill $h3_pid 2>/dev/null
     wait $h3_pid 2>/dev/null
 else
@@ -1712,6 +1725,21 @@ PYEOF
         && echo "$h" | grep -qi '^x-content-type-options:'
     check "http2 security headers (proxied response)" $?
 
+    # h2/h3 hand the whole :path to the normalizer, where h1 first cut the query
+    # off and, for a directory, put back the slash normalize consumed. Without
+    # that, every URL carrying a query and every directory but "/" 404'd on h2.
+    q() { timeout 10 curl -s -o /dev/null -w '%{http_code}' --http2 --cacert $CA \
+              --resolve localhost:47443:127.0.0.1 "https://localhost:47443$1"; }
+    [ "$(q '/index.html?v=1')" = 200 ] && [ "$(q '/hello.txt?a=b&c=d')" = 200 ]
+    check "http2: a query string is not part of the file name" $?
+    # (a directory without the trailing slash 404s on h1 too — no redirect)
+    [ "$(q '/sub/')" = 200 ] && [ "$(q '/sub/.')" = 200 ] && [ "$(q '/sub')" = 404 ]
+    check "http2: a directory serves its index.html" $?
+    # a control byte in the path truncates the name at open(2) while the MIME
+    # lookup reads past it, and CR/LF forges a request line in a proxied head
+    [ "$(q '/hello.txt%00.html')" = 400 ] && [ "$(q '/api%0d%0aX:%201')" = 400 ]
+    check "http2: an encoded control byte in the path is rejected" $?
+
     # --- proxy over HTTP/2 (Q86): each stream runs its own HTTP/1.1 upstream
     # exchange, so the backend still only ever speaks h1 (and WebSocket).
     h2p() { timeout 10 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 "$@"; }
@@ -1732,6 +1760,15 @@ PYEOF
     n=$(h2p "$P/api/big" | wc -c)
     [ "$n" -eq 40000 ]
     check "http2 proxy: large body through flow control ($n bytes)" $?
+    # a stream pool slot that once served a proxied stream keeps its .up unless
+    # the static path clears it, which sent the scheduler to the upstream branch
+    # and left the file body unsent (200 with an empty body, slot never reaped)
+    sz=$(timeout 15 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+             -o /dev/null -o /dev/null -o /dev/null -o /dev/null \
+             -w '%{size_download} ' \
+             "$P/api/simple" "$P/index.html" "$P/api/simple" "$P/index.html")
+    [ "$sz" = "12 335 12 335 " ]
+    check "http2: static body still served after a proxied stream reuses the slot" $?
     # the rewritten upstream request: Host from :authority, client headers
     # forwarded, Content-Length re-derived, Connection: close ours
     head=$(h2p -H 'X-Probe: abc' "$P/api/headers")

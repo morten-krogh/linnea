@@ -1890,6 +1890,13 @@ linnea_quic_server_datagram:
     ; priority. The head (HEADERS frame + DATA frame header, rax bytes at strm_pay +
     ; rbx) is bounded by LINNEA_H3_HEAD_MAX, which fits the slot's hdr. tx_cap
     ; guaranteed a free slot when it let linnea_h3_serve return a chunked response.
+    ; The head has to fit the slot's hdr, which is the struct's last field — an
+    ; over-long one would run straight into the next slot's .active/.base/.size
+    ; and have the pump read and later munmap attacker-influenced addresses. The
+    ; buffers are sized for the worst response any legal config can produce, so
+    ; this is a backstop: drop the mapping and reset the stream instead.
+    cmp rax, LINNEA_QUIC_TX_HDR
+    ja .sl_toolong
     ; First resolve the client's RFC 9218 priority (default urgency 3, non-
     ; incremental), before the serve registers are reused for the slot fill.
     mov qword [s_prio_u], 3
@@ -1945,6 +1952,15 @@ linnea_quic_server_datagram:
     mov rcx, rax
     rep movsb
     call tx_pump
+    jmp .stream_scan
+.sl_toolong:
+    mov rdi, r8                       ; release the response's file mapping
+    mov rsi, r9
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    mov rdi, [s_sid]
+    xor esi, esi                      ; nothing of the body was sent
+    call tx_reset_stream
     jmp .stream_scan
 
 ; --- a client unidirectional stream: control, QPACK encoder/decoder or grease.

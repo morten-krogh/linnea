@@ -47,9 +47,15 @@ linnea_static_normalize:
     cmp rdx, rcx
     jae .zdecoded
     movzx eax, byte [rsi + rdx]
+    cmp al, '?'
+    je .zdecoded                     ; the query string is not part of the path
     cmp al, '%'
     je .zpct
-    mov [rdi], al
+    cmp al, 0x20
+    jb .zbad                         ; a raw control byte: NUL truncates the name
+    cmp al, 0x7f                     ; at open(2) while the MIME lookup keeps
+    je .zbad                         ; reading past it, and CR/LF forges a second
+    mov [rdi], al                    ; request line in a proxied head
     inc rdi
     inc rdx
     jmp .zdec
@@ -69,6 +75,10 @@ linnea_static_normalize:
     shl r8d, 4
     or eax, r8d
     jz .zbad                         ; %00 truncates the path
+    cmp al, 0x20                     ; and no encoded control byte either
+    jb .zbad
+    cmp al, 0x7f
+    je .zbad
     mov [rdi], al
     inc rdi
     add rdx, 3

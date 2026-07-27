@@ -52,7 +52,7 @@ body_503:      db "503 Service Unavailable", 10
 body_503_len   equ $ - body_503
 
 section .bss
-fs_buf:   resb 512                    ; encoded response field section
+fs_buf:   resb 768                    ; encoded response field section
 clen_buf: resb 20                     ; content-length as decimal ASCII
 h3_path_buf: resb 4096                ; root ++ decoded path ++ NUL
 post_receipt: resb 64                 ; "<len> <hash>" for a large POST body
@@ -382,6 +382,11 @@ linnea_h3_serve:
     test r9, r9
     jz .noindex
     mov rdi, r14                     ; a directory: serve index.html from it
+    cmp byte [rdi - 1], '/'          ; normalize consumed the trailing slash on
+    je .append_index                 ; every directory but "/", so put it back
+    mov byte [rdi], '/'
+    inc rdi
+.append_index:
     lea rsi, [idx_name]
     mov ecx, idx_name_len
     rep movsb

@@ -55,4 +55,4 @@ LINNEA_H3_INLINE_MAX   equ 1024
 ; validators, date and server QPACK fields plus framing come to well under
 ; this). Must not exceed the per-connection head buffer it is copied into
 ; (LINNEA_QUIC_TX_HDR in linnea_quic_conn.inc).
-LINNEA_H3_HEAD_MAX     equ 256
+LINNEA_H3_HEAD_MAX     equ 512

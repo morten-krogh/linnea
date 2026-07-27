@@ -9,6 +9,14 @@ endstruc
 
 LINNEA_QUIC_MAX_CID   equ 20      ; RFC 9000: connection IDs are 0..20 bytes
 
+; A sealed resumption ticket, exactly as linnea_quic_ticket_seal writes it:
+;   nonce(12) || GCM( psk(32) || issued(8) || sni_hash(8) ) || tag(16)
+; linnea_quic_ticket_open writes in_len-28 plaintext bytes into a fixed-size
+; slot, so an offered PskIdentity must be exactly this long before it is
+; allowed to reach the AEAD — the length comes straight off the wire.
+LINNEA_QUIC_TICKET_PT  equ 48
+LINNEA_QUIC_TICKET_LEN equ LINNEA_QUIC_TICKET_PT + 28
+
 ; 0-RTT is accepted only for a ticket issued within this many seconds, which
 ; bounds how long the replay strike register must remember a binder (RFC 9001
 ; 9.2). A resuming client past the window still resumes — just at 1-RTT.

@@ -690,13 +690,18 @@ linnea_quic_ticket_resume:
     mov r14d, ecx                    ; truncated-CH len
     mov r15, r8                      ; received binder
     mov rbp, r9                      ; current SNI hash
-    ; open the ticket -> plaintext(48)
+    ; open the ticket -> plaintext(48). The offered length is attacker-chosen,
+    ; and the open writes (and, on a bad tag, zeroes) in_len-28 bytes into the
+    ; RS_PT slot — which is only LINNEA_QUIC_TICKET_PT bytes — so the length
+    ; has to be checked here, before the AEAD, not after it.
+    cmp r12d, LINNEA_QUIC_TICKET_LEN
+    jne .rs_rej
     mov rdi, rbx
     mov esi, r12d
     lea rdx, [rsp + RS_PT]
     call linnea_quic_ticket_open
-    cmp rax, 48
-    jne .rs_rej                      ; bad tag or unexpected length
+    cmp rax, LINNEA_QUIC_TICKET_PT
+    jne .rs_rej                      ; bad tag
     ; the ticket is bound to the server_name it was issued under
     mov rax, [rsp + RS_PT + 40]
     cmp rax, [rbp]

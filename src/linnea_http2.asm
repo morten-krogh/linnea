@@ -887,6 +887,11 @@ h2_serve:
     cmp qword [rsp + S_DIR], 0
     je .named
     mov rdi, r14
+    cmp byte [rdi - 1], '/'          ; normalize consumed the trailing slash on
+    je .append_index_h2              ; every directory but "/", so put it back
+    mov byte [rdi], '/'
+    inc rdi
+.append_index_h2:
     lea rsi, [index_html_h2]
     mov ecx, 10
     rep movsb
@@ -1118,6 +1123,11 @@ h2_serve:
     mov rcx, [rsp + S_RLEN]
     mov [rax + linnea_h2_stream.body_rem], rcx
     mov qword [rax + linnea_h2_stream.flags], LINNEA_H2_STREAM_END
+    ; a static body streams from the mapping, not from an upstream. The free
+    ; paths clear only .id, so a slot that once served a proxied stream still
+    ; carries its .up — which would send the scheduler to the upstream branch
+    ; and stream this file from that exchange's buffer instead.
+    mov qword [rax + linnea_h2_stream.up], 0
     mov r8b, LINNEA_H2_FLAG_END_HEADERS   ; DATA follows; no END_STREAM here
 .flags:
     mov rdi, [rsp + S_OUT]
