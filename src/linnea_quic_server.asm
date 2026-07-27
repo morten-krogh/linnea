@@ -1620,7 +1620,10 @@ linnea_quic_server_datagram:
     mov qword [rax + linnea_quic_ra.len], 0
     mov qword [rax + linnea_quic_ra.fin], 0
     ; clear the seen-map up to the previous run's high-water, then reset it
+    ; (one bit per stream byte, so round the high-water up to whole bytes)
     mov rcx, [rax + linnea_quic_ra.hi]
+    add rcx, 7
+    shr rcx, 3
     lea rdi, [rax + linnea_quic_ra.seen]
     push rax                                   ; xor al clobbers rax's low byte
     xor al, al
@@ -1644,13 +1647,14 @@ linnea_quic_server_datagram:
     mov rsi, [s_sdata]
     mov rcx, r10
     rep movsb                                  ; copy the frame's bytes (rax intact)
-    lea rdi, [rax + linnea_quic_ra.seen]
-    add rdi, r9                                ; seen + offset
-    mov rcx, r10
-    push rax                                   ; mov al clobbers rax's low byte
-    mov al, 1
-    rep stosb                                  ; mark those bytes seen
-    pop rax
+    lea rdi, [rax + linnea_quic_ra.seen]       ; mark those bytes seen. bts takes
+    mov rsi, r9                                ; a bit offset that may run past the
+    mov rcx, r10                               ; operand, so it addresses the whole
+.ra_mark:                                      ; map from one base
+    bts [rdi], rsi
+    inc rsi
+    dec rcx
+    jnz .ra_mark
 .ra_hi_upd:
     mov r10, [rax + linnea_quic_ra.hi]
     cmp r11, r10
@@ -1664,8 +1668,8 @@ linnea_quic_server_datagram:
 .ra_adv_loop:
     cmp r8, r10                                ; reached the high-water?
     jae .ra_adv_done
-    cmp byte [rdi + r8], 0
-    je .ra_adv_done                            ; a gap: stop here
+    bt [rdi], r8
+    jnc .ra_adv_done                           ; a gap: stop here
     inc r8
     jmp .ra_adv_loop
 .ra_adv_done:

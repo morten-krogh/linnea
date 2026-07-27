@@ -223,7 +223,10 @@ struc linnea_quic_ra
     .fin:      resq 1               ; the FIN has been seen
     .final:    resq 1               ; the stream's total size (valid once fin)
     .buf:      resb LINNEA_QUIC_RA_BUF
-    .seen:     resb LINNEA_QUIC_RA_BUF   ; byte i = 1 once stream byte i has arrived
+    ; bit i = 1 once stream byte i has arrived. A bit, not a byte: at one byte
+    ; per byte this array alone was half the size of a connection, and there
+    ; are LINNEA_QUIC_RA_CTXS of them in every one.
+    .seen:     resb (LINNEA_QUIC_RA_BUF + 7) / 8
 endstruc
 
 struc linnea_quic_sent

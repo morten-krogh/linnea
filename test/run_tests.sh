@@ -579,6 +579,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_frag_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): out-of-order multi-frame ClientHello reassembled" $?
 
+    # the request-stream reassembler: a request too big for one packet, with the
+    # datagrams reversed and shuffled, so a hole opens and later fills. Every
+    # other h3 test sends a request that fits one packet, which never exercises
+    # the arrived-bytes map at all
+    timeout 120 python3 test/quic/h3_reorder_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): multi-packet request reassembled out of order" $?
+
     # session resumption: the real server issues a NewSessionTicket with the
     # early_data extension once the handshake completes
     python3 test/quic/h3_ticket_test.py 47452 >/dev/null 2>&1
