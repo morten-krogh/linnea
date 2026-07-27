@@ -1669,6 +1669,12 @@ PYEOF
     check_http "nosniff header (h1)"  "X-Content-Type-Options: nosniff" "$hdrs"
     hdrs=$(curl -si --http1.1 --max-time 5 --cacert $CA $U/no-such-file)
     check_http "hsts on a 404 (h1)"   "Strict-Transport-Security:" "$hdrs"
+    # a proxy failure answers from the same canned blobs, but used to send them
+    # straight from rodata — so a 502 from a dead upstream, often the first
+    # thing a client ever sees from the origin, carried no policy at all
+    hdrs=$(curl -si --http1.1 --max-time 5 --cacert $CA $U/down/x)
+    check_http "hsts on a proxy 502 (h1)"    "Strict-Transport-Security:" "$hdrs"
+    check_http "nosniff on a proxy 502 (h1)" "X-Content-Type-Options: nosniff" "$hdrs"
 
     # a vhost with a proxy location must not advertise h3: Alt-Svc migration
     # is per-origin, and h3 has no location routing — a browser that switched

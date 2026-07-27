@@ -1778,29 +1778,13 @@ linnea_http_handle:
     ; the blob is copied into out_buf without its blank line, the headers
     ; are appended, and the blank line is put back. Every blob ends with
     ; "Connection: close" CRLF CRLF, which is what the 4 accounts for.
-    mov rdx, [rsp + 120]       ; the serving vhost (a default until matched)
-    test rdx, rdx
-    jz .rs_asis
-    cmp qword [rdx + linnea_config_server.hsts_len], 0
-    jne .rs_copy
-    cmp qword [rdx + linnea_config_server.nosniff], 0
-    je .rs_asis
-.rs_copy:
-    lea r15, [rbx + linnea_connection.out_buf]
-    mov rdi, rax
-    lea rsi, [rcx - 4]         ; the head without its terminating blank line
-    call .append
-    mov rdi, [rsp + 120]
-    call .append_security
-    lea rdi, [crlfcrlf]
-    mov esi, 4
-    call .append
-    lea rax, [rbx + linnea_connection.out_buf]
-    mov rcx, r15
-    sub rcx, rax
-.rs_asis:
+    mov rdi, rbx
+    mov rsi, rax               ; the blob
+    mov rdx, rcx               ; and its length
+    mov rcx, [rsp + 120]       ; the serving vhost (a default until matched)
+    call http_error_blob       ; -> rax = ptr, rdx = length
     mov [rbx + linnea_connection.out_ptr], rax
-    mov [rbx + linnea_connection.out_rem], rcx
+    mov [rbx + linnea_connection.out_rem], rdx
     mov qword [rbx + linnea_connection.keep_alive], 0
     mov qword [rbx + linnea_connection.file_rem], 0  ; drop anything queued
     mov qword [rsp + 32], 0    ; error responses carry no body
@@ -2019,6 +2003,68 @@ linnea_http_handle:
 
 
 
+; http_error_blob(rdi=conn*, rsi=blob, rdx=blob len, rcx=server* or 0)
+;   -> rax = response ptr, rdx = response length
+; A canned error response carrying the vhost's security headers. A browser
+; whose first request fails should still learn the policy, and that includes
+; the ones a proxy failure produces — a 502 from a dead upstream is often the
+; very first thing a client sees. The blob is copied into out_buf without its
+; terminating blank line, the headers are appended, and the blank line is put
+; back; every blob ends with "Connection: close" CRLF CRLF, which is what the
+; 4 accounts for, and each header literal carries its own leading CRLF. With
+; no headers configured the blob is returned untouched, straight from rodata.
+http_error_blob:
+    test rcx, rcx
+    jz .heb_asis
+    cmp qword [rcx + linnea_config_server.hsts_len], 0
+    jne .heb_copy
+    cmp qword [rcx + linnea_config_server.nosniff], 0
+    jne .heb_copy
+.heb_asis:
+    mov rax, rsi
+    ret
+.heb_copy:
+    push rbx
+    push r12
+    push r15
+    mov rbx, rcx                     ; server*
+    mov r12, rdi                     ; conn*
+    lea r15, [rdi + linnea_connection.out_buf]
+    mov rdi, r15                     ; the blob without its blank line
+    mov rcx, rdx
+    sub rcx, 4
+    rep movsb
+    mov r15, rdi
+    cmp qword [rbx + linnea_config_server.hsts_len], 0
+    je .heb_nosniff
+    lea rsi, [hdr_hsts]
+    mov rcx, hdr_hsts_len
+    rep movsb
+    lea rsi, [rbx + linnea_config_server.hsts]
+    mov rcx, [rbx + linnea_config_server.hsts_len]
+    rep movsb
+    mov r15, rdi
+.heb_nosniff:
+    cmp qword [rbx + linnea_config_server.nosniff], 0
+    je .heb_blank
+    mov rdi, r15
+    lea rsi, [hdr_nosniff]
+    mov rcx, hdr_nosniff_len
+    rep movsb
+    mov r15, rdi
+.heb_blank:
+    mov rdi, r15
+    lea rsi, [crlfcrlf]
+    mov ecx, 4
+    rep movsb
+    lea rax, [r12 + linnea_connection.out_buf]
+    mov rdx, rdi
+    sub rdx, rax
+    pop r15
+    pop r12
+    pop rbx
+    ret
+
 ; --- proxying ----------------------------------------------------------
 
 ; linnea_http_log_conn(rdi=conn*, rsi=status, rdx=bytes)
@@ -2136,8 +2182,13 @@ linnea_http_proxy_error:
     lea rax, [resp_504]
     mov ecx, resp_504_len
 .set:
+    mov rdi, rbx               ; the vhost's security headers ride this too
+    mov rsi, rax
+    mov rdx, rcx
+    mov rcx, [rbx + linnea_connection.vhost]
+    call http_error_blob       ; -> rax = ptr, rdx = length
     mov [rbx + linnea_connection.out_ptr], rax
-    mov [rbx + linnea_connection.out_rem], rcx
+    mov [rbx + linnea_connection.out_rem], rdx
     mov qword [rbx + linnea_connection.keep_alive], 0
     mov qword [rbx + linnea_connection.file_rem], 0   ; drop the queued body
     mov rdi, rbx
