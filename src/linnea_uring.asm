@@ -807,6 +807,8 @@ linnea_uring_run:
     jne .stale_completion      ; belonged to is gone, and the slot may now
                                ; be serving someone else               ; connection*
     mov qword [r12 + linnea_connection.h2_rx_busy], 0
+    cmp qword [r12 + linnea_connection.h2_closing], 0
+    jne .h2_closing_check      ; a straggler of a torn-down h2 connection
     cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
     je .tls_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
@@ -966,6 +968,8 @@ linnea_uring_run:
     cmp ecx, [r12 + linnea_connection.gen]   ; this slot: the connection it
     jne .stale_completion      ; belonged to is gone, and the slot may now
                                ; be serving someone else
+    cmp qword [r12 + linnea_connection.h2_closing], 0
+    jne .h2_closing_send       ; a straggler of a torn-down h2 connection
     cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
     je .tls_on_send
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
@@ -976,10 +980,12 @@ linnea_uring_run:
     jns .send_ok
     cmp r15d, -LINNEA_ECANCELED
     je .send_timeout
+    mov qword [r12 + linnea_connection.h2_tx_busy], 0   ; this send is over
     lea r14, [reason_send_err]
     mov r15d, reason_send_err_len
     jmp .conn_close
 .send_timeout:
+    mov qword [r12 + linnea_connection.h2_tx_busy], 0   ; this send is over
     lea r14, [reason_send_timeout]
     mov r15d, reason_send_timeout_len
     jmp .conn_close
@@ -1766,8 +1772,45 @@ linnea_uring_run:
     mov r15, [r12 + linnea_connection.close_reason_len]
     jmp .conn_close
 
+; a straggler op of a torn-down h2 connection completed; its result no longer
+; matters (the socket is shut down). Free once both directions are idle.
+.h2_closing_send:
+    mov qword [r12 + linnea_connection.h2_tx_busy], 0
+.h2_closing_check:
+    mov rax, [r12 + linnea_connection.h2_rx_busy]
+    or rax, [r12 + linnea_connection.h2_tx_busy]
+    test rax, rax
+    jnz .wait
+    mov r14, [r12 + linnea_connection.close_reason]
+    mov r15, [r12 + linnea_connection.close_reason_len]
+    jmp .conn_close_now
+
 ; connection teardown; r12 = connection*, r14/r15 = reason string ptr/len
+;
+; HTTP/2 drives both directions at once — an upstream completion can arm a
+; client send while a client recv is still outstanding — so unlike h1 the op
+; that got us here need not be the only one. The kernel holds in_buf/out_buf
+; and any stream body mapping until the other op completes, and close(2) does
+; not cancel it; the slot is reused LIFO, so freeing now would let the kernel
+; write into the next connection's in_buf or send it a freed out_buf. Shut the
+; socket down so the straggler completes, and defer, exactly as a tunnel does.
 .conn_close:
+    cmp qword [r12 + linnea_connection.is_h2], 0
+    je .conn_close_now
+    mov rax, [r12 + linnea_connection.h2_rx_busy]
+    or rax, [r12 + linnea_connection.h2_tx_busy]
+    test rax, rax
+    jz .conn_close_now
+    mov edi, [r12 + linnea_connection.fd]
+    mov esi, LINNEA_SHUT_RDWR
+    mov eax, LINNEA_SYS_SHUTDOWN
+    syscall
+    mov [r12 + linnea_connection.close_reason], r14
+    mov [r12 + linnea_connection.close_reason_len], r15
+    mov qword [r12 + linnea_connection.h2_closing], 1
+    jmp .wait
+.conn_close_now:
+    mov qword [r12 + linnea_connection.h2_closing], 0
     call linnea_log_stamp
     lea rdi, [log_closed]
     mov esi, log_closed_len

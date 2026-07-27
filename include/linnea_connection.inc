@@ -132,6 +132,12 @@ struc linnea_connection
                                    ; direction is idle, and every path that
                                    ; could leave the connection with nothing
                                    ; armed re-arms the recv
+    ; Teardown began while the other direction still had an op in flight. The
+    ; kernel owns in_buf/out_buf (and any stream body mapping) until that op
+    ; completes, so the socket is shut down and the free deferred — freeing now
+    ; would let the kernel write into a recycled buffer. close_reason holds the
+    ; log reason across the wait, as it does for a tunnel.
+    .h2_closing:     resq 1
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

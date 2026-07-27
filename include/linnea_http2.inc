@@ -191,5 +191,11 @@ struc linnea_h2p
     .rq_wr:     resq 1            ; append point
     .rq_rem:    resq 1            ; body bytes still expected from the client
     .rq_credit: resq 1            ; forwarded bytes owed back as WINDOW_UPDATE
+    ; Connection-level credit left behind when the slot was freed with body
+    ; bytes still uncredited (the client reset the stream, or the upstream
+    ; failed, mid-upload). The stream is gone, so this can only go out on
+    ; stream 0 — and it must, or the connection window never recovers. It
+    ; outlives the slot's tenancy and is cleared per connection.
+    .rq_owed:   resq 1
     .buf:       resb LINNEA_H2P_BUF
 endstruc

@@ -1745,6 +1745,15 @@ h2p_release:
     ; that no longer exists, and a stale credit a WINDOW_UPDATE on an idle
     ; stream — which is a connection error to the peer
     mov qword [rax + linnea_h2p.flags], 0
+    ; the connection still owes the peer for every request-body byte it sent:
+    ; what went upstream uncredited, plus whatever is still sitting in the FIFO
+    mov rcx, [rax + linnea_h2p.rq_credit]
+    mov rdx, [rax + linnea_h2p.rq_wr]
+    sub rdx, [rax + linnea_h2p.rq_rd]
+    add rcx, rdx
+    add [rax + linnea_h2p.rq_owed], rcx
+    mov qword [rax + linnea_h2p.rq_rd], 0
+    mov qword [rax + linnea_h2p.rq_wr], 0
     mov qword [rax + linnea_h2p.rq_credit], 0
     mov qword [rax + linnea_h2p.rq_buf], 0
     mov qword [rax + linnea_h2p.sid], 0
@@ -1777,6 +1786,7 @@ linnea_h2p_conn_close:
     add rax, [h2p_pool]
     mov r12d, LINNEA_H2P_SLOTS
 .cc_scan:
+    mov qword [rax + linnea_h2p.rq_owed], 0   ; the connection it was owed to
     cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
     je .cc_next
     cmp qword [rax + linnea_h2p.state], LINNEA_H2P_ZOMBIE
@@ -2117,6 +2127,13 @@ h2p_free_slot:
 .fsl_nofd:
     mov dword [rbx + linnea_h2p.fd], -1
     mov qword [rbx + linnea_h2p.flags], 0        ; see h2p_release
+    mov rcx, [rbx + linnea_h2p.rq_credit]        ; still owed on stream 0
+    mov rdx, [rbx + linnea_h2p.rq_wr]
+    sub rdx, [rbx + linnea_h2p.rq_rd]
+    add rcx, rdx
+    add [rbx + linnea_h2p.rq_owed], rcx
+    mov qword [rbx + linnea_h2p.rq_rd], 0
+    mov qword [rbx + linnea_h2p.rq_wr], 0
     mov qword [rbx + linnea_h2p.rq_credit], 0
     mov qword [rbx + linnea_h2p.rq_buf], 0
     mov qword [rbx + linnea_h2p.sid], 0
@@ -2170,6 +2187,20 @@ linnea_h2p_service:
     sub rax, r15
     cmp rax, LINNEA_H2P_HEAD_ROOM
     jb .sv_done
+    ; credit a dead stream's request body back on the connection window. This
+    ; outlives the slot, so it runs before the free-slot skip below: the stream
+    ; is gone, so stream 0 is the only place it can go, and without it one
+    ; aborted upload leaves the connection window short for good.
+    mov r14, [r12 + linnea_h2p.rq_owed]
+    test r14, r14
+    jz .sv_no_owed
+    mov qword [r12 + linnea_h2p.rq_owed], 0
+    mov rdi, r15
+    xor esi, esi                     ; stream 0 only
+    mov edx, r14d
+    call h2p_emit_window
+    add r15, rax
+.sv_no_owed:
     ; a free slot keeps no flags worth acting on: skip it before the credit
     ; and readiness tests below, so a stale bit cannot resurrect it
     cmp qword [r12 + linnea_h2p.state], LINNEA_H2P_FREE

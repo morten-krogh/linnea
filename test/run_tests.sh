@@ -1769,6 +1769,30 @@ PYEOF
              "$P/api/simple" "$P/index.html" "$P/api/simple" "$P/index.html")
     [ "$sz" = "12 335 12 335 " ]
     check "http2: static body still served after a proxied stream reuses the slot" $?
+    # request-body bytes are debited from the connection window on arrival and
+    # credited only once they go upstream, so a reset mid-upload used to strand
+    # them: four ~16KB rounds exhausted the 65535 window for the connection's life
+    python3 test/tls/h2_upload_credit.py $CA 47443 >/dev/null 2>&1
+    check "http2: an aborted upload returns its connection flow control" $?
+    # tearing an h2 connection down while the other direction still has an op in
+    # flight now shuts the socket down and defers the free until it completes,
+    # so the kernel cannot write into a recycled buffer. Confirm the deferral
+    # always resolves: fds must come back to the baseline, not accumulate.
+    w1=$(workers_of $tls_server_pid | awk '{print $1}')
+    fd0=$(ls /proc/$w1/fd 2>/dev/null | wc -l)
+    for _ in $(seq 1 30); do
+        timeout 5 curl -s --http2 --max-time 0.05 --cacert $CA \
+            --resolve localhost:47443:127.0.0.1 -o /dev/null \
+            "https://localhost:47443/api/big" 2>/dev/null
+        timeout 5 curl -s --http2 --max-time 0.05 --cacert $CA \
+            --resolve localhost:47443:127.0.0.1 -o /dev/null \
+            "https://localhost:47443/big.txt" 2>/dev/null
+    done
+    sleep 3
+    fd1=$(ls /proc/$w1/fd 2>/dev/null | wc -l)
+    [ -n "$fd0" ] && [ "$fd0" -gt 0 ] && [ "$fd1" -le $((fd0 + 2)) ] \
+        && [ "$(h2p -o /dev/null -w '%{http_code}' "$P/index.html")" = 200 ]
+    check "http2: aborted mid-transfer connections are freed, not leaked ($fd0 -> $fd1 fds)" $?
     # the rewritten upstream request: Host from :authority, client headers
     # forwarded, Content-Length re-derived, Connection: close ours
     head=$(h2p -H 'X-Probe: abc' "$P/api/headers")
