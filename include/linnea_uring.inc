@@ -138,6 +138,15 @@ endstruc
 LINNEA_RING_SIZE        equ linnea_ring_size
 
 LINNEA_URING_ENTRIES    equ 256  ; submission queue depth
+; Completion queue depth, sized explicitly rather than taking the kernel's
+; default of twice the submission queue. Every operation here carries a linked
+; timeout, so a parked connection accounts for TWO completions, and the default
+; 512 was already under water at a few hundred connections — past that the
+; kernel has to backlog completions internally. It handles that correctly, but
+; the ring reports it only in a flag nobody was reading, so the cost was
+; invisible. Must be a power of two and at least LINNEA_URING_ENTRIES.
+LINNEA_URING_CQ_ENTRIES equ 4096
+LINNEA_IORING_SETUP_CQSIZE equ 8    ; params.cq_entries is meaningful
 LINNEA_EINTR            equ 4
 LINNEA_EAGAIN           equ 11
 LINNEA_EIO              equ 5

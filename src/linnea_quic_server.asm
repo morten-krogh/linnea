@@ -215,6 +215,7 @@ s_sdata:     resq 1                   ; that stream's data pointer
 s_slen:      resq 1                   ; and length
 s_soff:      resq 1                   ; and offset (0 = the stream's first bytes)
 s_sfin:      resq 1                   ; and whether its FIN bit is set
+s_rst_code:  resq 1                   ; app error code for the next RESET_STREAM
 s_body_ptr:  resq 1                   ; request body captured by read_headers
 s_body_len:  resq 1
 s_txc_pn:    resq 1                   ; packet number a chunk just went out under
@@ -1776,12 +1777,22 @@ linnea_quic_server_datagram:
     ; An undecodable field section is a CONNECTION error (RFC 9204 2.2.1):
     ; the encoder's table state and ours have diverged, so every later
     ; request on this connection would fail too — say so instead of leaving
-    ; the client waiting on a stream we silently dropped. Anything else here
-    ; is just an incomplete request: wait for more stream data.
+    ; the client waiting on a stream we silently dropped.
     cmp rax, -LINNEA_H3_ERR_TOOLARGE
     je .req_toolarge
     cmp rax, -LINNEA_H3_ERR_QPACK
-    jne .stream_scan
+    je .req_qpack_bad
+    ; Anything else is a malformed request: a truncated frame, or no HEADERS at
+    ; all. Both entries to .serve_bidi require the FIN, so the stream is whole
+    ; and nothing more is coming — dropping it here left the client waiting on
+    ; a request that would never be answered. Reset the stream instead, which
+    ; also settles the flow-control credit its bytes are holding.
+    mov rdi, [s_sid]
+    mov rsi, [s_slen]                ; final size: what the stream did carry
+    mov edx, 0x10e                   ; H3_MESSAGE_ERROR (RFC 9114 8.1)
+    call tx_reset_stream_code
+    jmp .stream_scan
+.req_qpack_bad:
     mov edi, LINNEA_H3_ERR_QPACK_DECOMP
     jmp .h3_close
 .req_toolarge:
@@ -3483,6 +3494,11 @@ tx_abort_one:
 ; recovery, since a lost copy leaks the same credit.
 ; cur_conn must be the connection and r12d the UDP socket (emit_1rtt needs both).
 tx_reset_stream:
+    mov edx, 0x10c                    ; H3_REQUEST_CANCELLED
+; tx_reset_stream_code(rdi = stream id, rsi = final size, edx = app error code)
+; — the same, for a caller that is rejecting the request rather than cancelling
+; a response it had already begun.
+tx_reset_stream_code:
     push rbx
     push r13
     push r14
@@ -3490,6 +3506,7 @@ tx_reset_stream:
     sub rsp, 8                        ; 4 pushes + 8: keep the call site 16-aligned
     mov rbx, rdi                      ; stream id
     mov r13, rsi                      ; final size
+    mov [s_rst_code], rdx             ; the error code to report
     ; RESET_STREAM = type 0x04, stream id, app error code, final size (RFC 9000 19.4)
     lea r14, [reset_pay]
     mov byte [r14], 0x04
@@ -3499,7 +3516,7 @@ tx_reset_stream:
     call linnea_quic_varint_encode
     add r14, rax
     mov rdi, r14
-    mov esi, 0x10c                    ; H3_REQUEST_CANCELLED
+    mov rsi, [s_rst_code]             ; H3_REQUEST_CANCELLED unless the caller chose
     call linnea_quic_varint_encode
     add r14, rax
     mov rdi, r14

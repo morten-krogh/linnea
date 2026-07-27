@@ -32,6 +32,7 @@ default rel
 %include "linnea_syscall.inc"
 %include "linnea_uring.inc"
 
+global linnea_ring_cq_overflows
 global linnea_ring_init
 global linnea_ring_get_sqe
 global linnea_ring_submit
@@ -41,10 +42,13 @@ section .bss
 ; struct io_uring_params, filled by the kernel at setup (see linnea_uring.inc for
 ; the field offsets). One ring per process, so one static block is enough.
 params: resb LINNEA_URING_PARAMS_SIZE
+; times the kernel had to backlog completions because the cq ring was full
+linnea_ring_cq_overflows: resq 1
 
 section .text
 
-; linnea_ring_init(edi = entries, rsi = ring*, edx = setup flags)
+; linnea_ring_init(edi = entries, rsi = ring*, edx = setup flags,
+;                  ecx = completion-queue entries, 0 = let the kernel choose)
 ;   -> eax = 0, or a negative errno.
 ; io_uring_setup(2) sizes the queues (the kernel rounds entries up to a power of
 ; two and may give a larger cq), then the three regions are mapped and the ring's
@@ -57,6 +61,7 @@ linnea_ring_init:
     push r15
     mov r12, rsi                      ; ring*
     mov r13d, edi                     ; entries
+    mov r15d, ecx                     ; requested cq entries (before rep stosb)
 
     ; zero the ring struct and the params block: unset fields must read as 0,
     ; both for the kernel (reserved fields) and for our own cached counters.
@@ -68,6 +73,11 @@ linnea_ring_init:
     mov ecx, LINNEA_URING_PARAMS_SIZE
     rep stosb
     mov [params + LINNEA_URING_P_FLAGS], edx
+    test r15d, r15d
+    jz .no_cqsize                     ; leave the kernel its default (2x sq)
+    mov [params + LINNEA_URING_P_CQ_ENTRIES], r15d
+    or dword [params + LINNEA_URING_P_FLAGS], LINNEA_IORING_SETUP_CQSIZE
+.no_cqsize:
 
     mov eax, LINNEA_SYS_IO_URING_SETUP
     mov edi, r13d
@@ -355,6 +365,12 @@ linnea_ring_get_cqe:
     mov rax, [rbx + linnea_ring.sq_kflags]
     mov eax, [rax]
     and eax, LINNEA_IORING_SQ_CQ_OVERFLOW
+    jz .no_overflow
+    ; the completion queue was too small and the kernel is holding a backlog.
+    ; No completion is lost — the enter below flushes them — but it means the
+    ; ring is undersized for the load, which was previously visible nowhere.
+    inc qword [linnea_ring_cq_overflows]
+.no_overflow:
     or eax, r13d
     or eax, r14d
     jz .again                         ; no reason to enter: report emptiness

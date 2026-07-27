@@ -51,6 +51,7 @@ extern linnea_ring_init
 extern linnea_ring_get_sqe
 extern linnea_ring_submit
 extern linnea_ring_get_cqe
+extern linnea_ring_cq_overflows
 
 extern linnea_config_instance
 extern linnea_network_peer_format
@@ -125,6 +126,10 @@ warn_full_len       equ $ - warn_full
 
 log_accept:         db "accepted connection on "
 log_accept_len      equ $ - log_accept
+log_cqovf:          db "completion ring backlogged "
+log_cqovf_len       equ $ - log_cqovf
+log_cqovf_end:      db " times (cq too small for the load; nothing lost)", 10
+log_cqovf_end_len   equ $ - log_cqovf_end
 log_qdrop:          db "quic receive overflow: "
 log_qdrop_len       equ $ - log_qdrop
 log_qdrop_end:      db " datagrams dropped by the kernel (socket buffer full)", 10
@@ -224,6 +229,7 @@ qrecv_iov:  resb LINNEA_IOVEC_SIZE
 ; control buffer for the SO_RXQ_OVFL cmsg: cmsghdr(16) + u32, rounded up
 qrecv_cmsg: resb LINNEA_QRECV_CMSG_SIZE
 qrecv_drops: resq 1        ; last overflow count seen, to report only the delta
+ring_ovf_seen: resq 1      ; likewise for the completion ring's backlog count
 cqe_tag:       resd 1      ; the completing op's tag, kept past the shift
 cqe_gen:       resd 1      ; and the connection incarnation it was armed for
 qrecv_peer: resb LINNEA_SOCKADDR_IN6_SIZE
@@ -280,6 +286,7 @@ linnea_uring_run:
     mov edi, LINNEA_URING_ENTRIES
     lea rsi, [ring]
     xor edx, edx
+    mov ecx, LINNEA_URING_CQ_ENTRIES
     call linnea_ring_init
     test eax, eax
     js .init_fail
@@ -1877,6 +1884,7 @@ linnea_uring_run:
     jmp .wait
 .conn_close_now:
     mov qword [r12 + linnea_connection.h2_closing], 0
+    call ring_check_overflow   ; a teardown is a regular, cheap place to notice
     call linnea_log_stamp
     lea rdi, [log_closed]
     mov esi, log_closed_len
@@ -2515,6 +2523,30 @@ linnea_uring_arm_qrecv:
 ; datagrams are gone before the server sees them, and without this the loss
 ; leaves no trace anywhere. Only the delta is reported, and only when it moves,
 ; so a healthy server says nothing. Clobbers only caller-saved registers.
+; ring_check_overflow() — report a completion-queue backlog if one has happened
+; since the last check. Nothing is lost when it does (linnea_ring_get_cqe
+; flushes the kernel's backlog with an enter), but it means the ring is
+; undersized for the load, and it is otherwise visible nowhere at all.
+ring_check_overflow:
+    mov rax, [linnea_ring_cq_overflows]
+    cmp rax, [ring_ovf_seen]
+    jbe .rco_done
+    mov rcx, rax
+    sub rcx, [ring_ovf_seen]
+    mov [ring_ovf_seen], rax
+    push rcx
+    call linnea_log_stamp
+    lea rdi, [log_cqovf]
+    mov esi, log_cqovf_len
+    call linnea_log_write
+    pop rdi
+    call linnea_log_u64
+    lea rdi, [log_cqovf_end]
+    mov esi, log_cqovf_end_len
+    call linnea_log_write
+.rco_done:
+    ret
+
 qrecv_check_drops:
     cmp qword [qrecv_msg + LINNEA_MSGHDR_CONTROLLEN], LINNEA_CMSG_DATA + 4
     jb .qcd_done                       ; no control data: the option is not on
