@@ -13,6 +13,7 @@ usage: fuzz_clienthello.py <cafile> <port> [count]   (default 500)
 Dev-time harness; run bigger counts for a soak. Exits non-zero if the
 server dies or stops handshaking.
 """
+import glob
 import os
 import random
 import socket
@@ -49,10 +50,15 @@ def main():
     cafile, port = sys.argv[1], int(sys.argv[2])
     count = int(sys.argv[3]) if len(sys.argv) > 3 else 500
     rng = random.Random(20260716)
-    base = None
-    seed_ch = os.path.join(os.path.dirname(__file__), "clienthello_seed.bin")
-    if os.path.exists(seed_ch):
-        base = open(seed_ch, "rb").read()
+    # Every clienthello_seed*.bin, not just the original: the mutator only
+    # flips bytes and truncates, so it can never invent an extension a seed
+    # does not already carry. The extra seeds (see gen_ch_seeds.py) bring
+    # server_name, ALPN and a pre_shared_key offer with its binder — the three
+    # most involved parsers in parse_ch, and the ones the original seed left
+    # entirely unreached.
+    seeds = [open(p, "rb").read() for p in
+             sorted(glob.glob(os.path.join(os.path.dirname(__file__),
+                                           "clienthello_seed*.bin")))]
 
     for i in range(count):
         pick = rng.random()
@@ -63,8 +69,8 @@ def main():
             n = rng.randint(0, 300)
             body = bytes(rng.randrange(256) for _ in range(n))
             p = b"\x16\x03\x01" + len(body).to_bytes(2, "big") + body
-        elif base and pick < 0.85:               # mutated real ClientHello
-            b = bytearray(base)
+        elif seeds and pick < 0.85:              # mutated real ClientHello
+            b = bytearray(rng.choice(seeds))
             for _ in range(rng.randint(1, 10)):
                 b[rng.randrange(len(b))] = rng.randrange(256)
             cut = rng.randint(5, len(b))

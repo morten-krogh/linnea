@@ -79,6 +79,20 @@ assert saw_goaway(fr(1, 0x05, 1, req()) + fr(1, 0x05, 1, req())), "reused id not
 assert not saw_goaway(fr(1, 0x05, 1, req("/hello.txt")) + fr(1, 0x05, 3, req("/hello.txt"))
                       + fr(1, 0x05, 5, req("/hello.txt"))), "valid increasing ids rejected"
 
+# DATA on stream 0 (RFC 9113 6.1): there is no stream to carry a body, and
+# id 0 doubles as our free-slot marker, so it must never reach a slot lookup
+assert saw_goaway(fr(0, 0, 0, b"body")), "DATA on stream 0 not rejected"
+
+# a flow-control window may not exceed 2^31-1 (RFC 9113 6.9.1), on the
+# connection or on a stream
+assert saw_goaway(fr(8, 0, 0, struct.pack(">I", 0x7fffffff))
+                  + fr(8, 0, 0, struct.pack(">I", 0x7fffffff))), \
+    "connection window overflow not rejected"
+assert saw_goaway(fr(1, 0x05, 1, req("/big.txt"))
+                  + fr(8, 0, 1, struct.pack(">I", 0x7fffffff))
+                  + fr(8, 0, 1, struct.pack(">I", 0x7fffffff))), \
+    "stream window overflow not rejected"
+
 # SETTINGS_INITIAL_WINDOW_SIZE: a small window must throttle the server's send
 s = connect()
 s.sendall(fr(4, 0, 0, struct.pack(">HI", 0x04, 150)))     # INITIAL_WINDOW_SIZE = 150

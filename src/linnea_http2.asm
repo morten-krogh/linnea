@@ -228,7 +228,17 @@ linnea_h2_handle:
     or edx, ecx
     test edx, edx
     jnz .f_window_stream
-    add [rbx + linnea_connection.h2_cwnd], rax
+    ; RFC 9113 6.9.1: a flow-control window may not exceed 2^31-1. The spec
+    ; lets us end the stream or the connection "as appropriate"; a peer that
+    ; overflows a window is broken or hostile either way, so both cases take
+    ; the connection down, as the INITIAL_WINDOW_SIZE check already does.
+    ; Signed throughout: a window can legitimately be negative after a
+    ; SETTINGS-driven shrink.
+    mov rcx, [rbx + linnea_connection.h2_cwnd]
+    add rcx, rax
+    cmp rcx, 0x7fffffff
+    jg .goaway_close
+    mov [rbx + linnea_connection.h2_cwnd], rcx
     jmp .f_ignore
 .f_window_stream:
     push rax                         ; increment
@@ -238,7 +248,11 @@ linnea_h2_handle:
     pop rcx                          ; increment
     test rax, rax
     jz .f_ignore                     ; unknown / closed stream: ignore
-    add [rax + linnea_h2_stream.swnd], rcx
+    mov rdx, [rax + linnea_h2_stream.swnd]
+    add rdx, rcx
+    cmp rdx, 0x7fffffff
+    jg .goaway_close
+    mov [rax + linnea_h2_stream.swnd], rdx
     jmp .f_ignore
 .f_rst:
     ; RST_STREAM: drop the stream's slot. Rate-based rapid-reset guard
@@ -332,6 +346,10 @@ linnea_h2_handle:
     shl edx, 8
     movzx ecx, byte [rsi + 8]
     or edx, ecx
+    test edx, edx
+    jz .goaway_close                 ; DATA on stream 0 (RFC 9113 6.1): there is
+                                     ; no stream to carry a body, and id 0 is
+                                     ; also our free-slot marker
     lea rcx, [rsi + 9]               ; payload, minus any padding
     test r10b, LINNEA_H2_FLAG_PADDED
     jz .fd_nopad
