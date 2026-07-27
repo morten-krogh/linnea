@@ -79,6 +79,7 @@ extern linnea_tls_hs_input
 extern linnea_tls_drain_early
 extern linnea_ktls_enable
 extern linnea_h2_init
+extern linnea_h2_busy
 extern linnea_h2_handle
 extern linnea_h2_after_send
 extern linnea_h2_conn_free
@@ -891,6 +892,22 @@ linnea_uring_run:
 .recv_timeout:
     cmp dword [drain_flag], 0
     jne .recv_drain            ; we cancelled it: the unit is stopping
+    ; The idle clock only counts silence from the CLIENT, so a connection whose
+    ; work is all server-side looks idle. A proxied response goes quiet between
+    ; upstream chunks; closing here truncated it and killed every other stream
+    ; on the connection. Rearm instead while this connection still owes work —
+    ; the head deadline and the upstream's own timeouts still bound it.
+    cmp qword [r12 + linnea_connection.is_h2], 0
+    je .recv_timeout_close
+    mov rdi, r12
+    call linnea_h2_busy
+    test rax, rax
+    jz .recv_timeout_close
+    mov rdi, r12
+    call h2_arm_recv_once
+    call linnea_uring_submit_now
+    jmp .wait
+.recv_timeout_close:
     lea r14, [reason_timeout]
     mov r15d, reason_timeout_len
     jmp .conn_close

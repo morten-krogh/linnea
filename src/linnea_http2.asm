@@ -64,6 +64,7 @@ global linnea_h2p_event
 global linnea_h2p_service
 global linnea_h2p_conn_close
 global h2p_compact
+global linnea_h2_busy
 
 extern linnea_upstream_count
 extern linnea_upstream_open
@@ -204,7 +205,14 @@ linnea_h2_handle:
     je .f_data                       ; a request body (proxying) or dropped
     cmp r9d, LINNEA_H2_FT_HEADERS
     je .f_headers
-    jmp .goaway_close                ; stray CONTINUATION / unknown
+    cmp r9d, LINNEA_H2_FT_CONTINUATION
+    je .goaway_close                 ; not preceded by HEADERS: a protocol error
+    ; RFC 9113 4.1: an unknown or unsupported frame type MUST be discarded, not
+    ; treated as an error. Extensions are negotiated per-frame-type, so a peer
+    ; is entitled to send one unannounced — and clients that grease their frame
+    ; types, or send PRIORITY_UPDATE (0x10), were having the connection closed
+    ; on them for conforming behaviour.
+    jmp .f_ignore
 .f_window:
     ; WINDOW_UPDATE: grow the connection window (stream 0) or a streaming
     ; response's window. A zero increment is a protocol error.
@@ -3888,6 +3896,39 @@ h2_queue_goaway:
 
 ; h2_pool_active(rdi=conn) -> rax = number of active (non-free) stream slots.
 linnea_h2_pool_active:
+; linnea_h2_busy(rdi = conn) -> rax = 1 if this connection has work of its own
+; in progress: an open response stream, or an upstream exchange still running.
+;
+; The client's idle timeout is armed per receive and refreshed only by bytes
+; FROM the client, so a connection where the server is the one making progress
+; looks idle. That is tolerable for a static body — a send is almost always in
+; flight and the timeout path defers on h2_tx_busy — but a proxied response
+; sits with nothing in flight in the gaps between upstream chunks, and the
+; timeout would tear the connection down mid-response, taking every other
+; stream on it with it.
+linnea_h2_busy:
+    push rdi
+    call h2_pool_active
+    pop rdi
+    test eax, eax
+    jnz .busy_yes
+    mov rax, [rdi + linnea_connection.index]      ; any upstream slot still live
+    imul rax, rax, LINNEA_H2P_SLOTS
+    imul rax, rax, linnea_h2p_size
+    add rax, [h2p_pool]
+    mov ecx, LINNEA_H2P_SLOTS
+.busy_scan:
+    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
+    jne .busy_yes
+    add rax, linnea_h2p_size
+    dec ecx
+    jnz .busy_scan
+    xor eax, eax
+    ret
+.busy_yes:
+    mov eax, 1
+    ret
+
 h2_pool_active:
     lea rdx, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]
     xor eax, eax
