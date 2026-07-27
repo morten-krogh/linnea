@@ -586,6 +586,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     timeout 120 python3 test/quic/h3_reorder_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): multi-packet request reassembled out of order" $?
 
+    # a header section past our bound is our resource limit, not the peer's
+    # encoder misbehaving: it must be answered on its own stream (431), not
+    # reported as a decompression failure that takes the whole connection down
+    timeout 60 python3 test/quic/h3_bigheaders_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): oversized header list gets 431, connection survives" $?
+
     # session resumption: the real server issues a NewSessionTicket with the
     # early_data extension once the handshake completes
     python3 test/quic/h3_ticket_test.py 47452 >/dev/null 2>&1

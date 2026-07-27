@@ -10,6 +10,7 @@ default rel
 
 global linnea_h3_read_headers
 global linnea_h3_build_response
+global linnea_h3_build_431
 global linnea_h3_build_response_head
 global linnea_h3_serve
 global linnea_h3_tx_cap
@@ -48,6 +49,8 @@ body_404:      db "404 Not Found", 10
 body_404_len   equ $ - body_404
 body_400:      db "400 Bad Request", 10
 body_400_len   equ $ - body_400
+body_431:      db "431 Request Header Fields Too Large", 10
+body_431_len   equ $ - body_431
 body_503:      db "503 Service Unavailable", 10
 body_503_len   equ $ - body_503
 
@@ -134,6 +137,13 @@ linnea_h3_read_headers:
     call linnea_qpack_decode         ; returns 0 | -err
     test rax, rax
     jns .decoded
+    ; a header list past our bound is a resource limit, answerable on the
+    ; stream; only a genuine decode failure is a connection error
+    cmp rax, -LINNEA_HPACK_ERR_LIMIT
+    jne .qpack_broken
+    mov rax, -LINNEA_H3_ERR_TOOLARGE
+    jmp .ret
+.qpack_broken:
     mov rax, -LINNEA_H3_ERR_QPACK    ; the caller ends the connection with it
     jmp .ret
 .decoded:
@@ -257,6 +267,19 @@ linnea_h3_build_response_head:
     pop r13
     pop rbx
     ret
+
+; linnea_h3_build_431(rdi=out) -> rax = length written.
+; The whole response for a request whose header section we will not hold: the
+; request never parsed, so there is no path, method or vhost to serve from —
+; only a status the client can act on, which beats resetting the stream and
+; leaving it to guess why.
+linnea_h3_build_431:
+    mov esi, 431
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_431]
+    mov r9d, body_431_len
+    jmp linnea_h3_build_response
 
 ; linnea_h3_build_response(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
 ;   r8=body_ptr, r9=body_len) -> rax = total length written.

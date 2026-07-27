@@ -69,6 +69,7 @@ global linnea_h3_altsvc_len
 global linnea_h3_server
 global linnea_h3_advert
 
+extern linnea_h3_build_431
 extern linnea_h3_read_headers
 extern linnea_h3_serve
 extern linnea_h3_body_off
@@ -1777,10 +1778,36 @@ linnea_quic_server_datagram:
     ; request on this connection would fail too — say so instead of leaving
     ; the client waiting on a stream we silently dropped. Anything else here
     ; is just an incomplete request: wait for more stream data.
+    cmp rax, -LINNEA_H3_ERR_TOOLARGE
+    je .req_toolarge
     cmp rax, -LINNEA_H3_ERR_QPACK
     jne .stream_scan
     mov edi, LINNEA_H3_ERR_QPACK_DECOMP
     jmp .h3_close
+.req_toolarge:
+    ; The header section decoded but is bigger than we hold. That is our limit,
+    ; not a protocol violation, so it is answered on this stream (RFC 9114
+    ; 4.2.2) — a connection error here would take every other request with it,
+    ; and a client waiting only on its own response would see nothing at all.
+    ; The request never parsed, so there is no path or vhost: a bare 431.
+    lea rdi, [strm_pay]
+    CONNLEA rsi, rx_have
+    call linnea_quic_build_ack       ; the ack must precede the STREAM frame
+    mov [s_acklen], rax
+    mov rcx, rax
+    mov byte [strm_pay + rcx], 0x09  ; STREAM | FIN
+    lea rdi, [strm_pay + rcx + 1]
+    mov rsi, [s_sid]
+    call linnea_quic_varint_encode
+    mov rbx, [s_acklen]
+    add rbx, rax
+    inc rbx                          ; bytes before the HTTP/3 response
+    lea rdi, [strm_pay + rbx]
+    call linnea_h3_build_431         ; rax = response length
+    lea rdx, [rax + rbx]             ; STREAM frame length
+    lea rsi, [strm_pay]
+    call .send_1rtt
+    jmp .stream_scan
 .req_ok:
     mov [s_body_ptr], r8             ; keep the body across the response build
     mov [s_body_len], r9

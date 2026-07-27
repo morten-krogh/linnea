@@ -40,6 +40,11 @@ LINNEA_H3_ERR_NOHEADERS equ 2     ; no HEADERS frame in the stream data
 ; either. (Our zero-capacity table means a compliant client never gets here —
 ; QPACK's capacity starts at 0 and may only rise to what we advertise.)
 LINNEA_H3_ERR_QPACK    equ 3
+; The field section decoded fine but is larger than we will hold. That is our
+; own resource limit, not the peer's encoder going wrong, so it must not be
+; reported as a decompression failure: RFC 9114 4.2.2 wants a 431 or a stream
+; reset, and killing the connection would take every other request with it.
+LINNEA_H3_ERR_TOOLARGE equ 4
 
 ; Largest POST body echoed back inline; a larger one (whose echo would not fit
 ; one response packet) gets a small receipt — its length and a hash — instead.
