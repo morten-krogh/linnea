@@ -370,6 +370,7 @@ section .text
 ;   [rsp+256] If-Range ptr (0 = absent)          [rsp+264] its len
 ;   [rsp+272] body offset   [rsp+280] body length (the whole file, or the
 ;             satisfiable range of a 206)
+;   [rsp+296] Host field lines seen (RFC 9112 3.2 wants exactly one)
 linnea_http_handle:
     push rbx
     push r12
@@ -386,6 +387,7 @@ linnea_http_handle:
     mov qword [rsp + 32], 0    ; response bytes
     mov qword [rsp + 88], 0    ; no Host header yet
     mov qword [rsp + 96], 0
+    mov qword [rsp + 296], 0   ; and none counted
     mov qword [rsp + 104], 0   ; no method yet
     mov qword [rsp + 128], 0   ; no body
     mov qword [rsp + 136], 0   ; no Content-Length/Transfer-Encoding seen
@@ -704,9 +706,9 @@ linnea_http_handle:
     test eax, eax
     jnz .ifr_header
 .try_host:
-    ; Host? (first occurrence wins, used for vhost selection)
-    cmp qword [rsp + 88], 0
-    jne .header_next
+    ; Host? Counted, not just captured: a second Host field line is a request
+    ; smuggling primitive (an intermediary may route on the other one), so
+    ; every occurrence must be seen even though the first supplies the value.
     mov rdi, [rsp + 56]
     mov rsi, [rsp + 64]
     lea rdx, [hn_host]
@@ -714,6 +716,9 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jz .header_next
+    inc qword [rsp + 296]
+    cmp qword [rsp + 88], 0
+    jne .header_next           ; keep the first value; the count rejects it below
     mov rax, [rsp + 72]
     mov [rsp + 88], rax
     mov rax, [rsp + 80]
@@ -806,6 +811,26 @@ linnea_http_handle:
 
     ; --- serve the file ---------------------------------------------
 .parsed:
+    ; Host (RFC 9112 3.2): exactly one field line, and a value that could be
+    ; an authority. Every request we accept is HTTP/1.1 (the version check
+    ; above admits nothing else), so the header is mandatory — and a missing
+    ; or repeated one is how a request gets routed one way here and another
+    ; way at an intermediary.
+    cmp qword [rsp + 296], 1
+    jne .resp_400
+    mov rcx, [rsp + 96]
+    test rcx, rcx
+    jz .resp_400               ; "Host:" with no authority at all
+    mov rdx, [rsp + 88]
+.host_char:
+    movzx eax, byte [rdx]
+    cmp al, 0x20
+    jbe .resp_400              ; space or control byte inside the authority
+    cmp al, 0x7f
+    je .resp_400
+    inc rdx
+    dec rcx
+    jnz .host_char
     test qword [rsp + 136], 2
     jnz .resp_501
     ; an unknown method is only an error on a static location (405 below);

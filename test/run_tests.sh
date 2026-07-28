@@ -1171,31 +1171,59 @@ resp=$(curl -s --max-time 2 'http://127.0.0.1:47080/a%20b.txt')
 check_http "decode space"      "space file" "$resp"
 resp=$(curl -s --max-time 2 'http://127.0.0.1:47080/sub%2Fpage.html')
 check_http "decode slash"      "subdirectory page" "$resp"
-check_http "encoded traversal" "400 Bad Request" "$(raw_http 'GET /%2e%2e/secret HTTP/1.1\r\nConnection: close\r\n\r\n')"
-check_http "bad escape"        "400 Bad Request" "$(raw_http 'GET /%zz HTTP/1.1\r\nConnection: close\r\n\r\n')"
-check_http "encoded NUL"       "400 Bad Request" "$(raw_http 'GET /%00 HTTP/1.1\r\nConnection: close\r\n\r\n')"
+check_http "encoded traversal" "400 Bad Request" "$(raw_http 'GET /%2e%2e/secret HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
+check_http "bad escape"        "400 Bad Request" "$(raw_http 'GET /%zz HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
+check_http "encoded NUL"       "400 Bad Request" "$(raw_http 'GET /%00 HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
 
 # --- path normalization (raw, curl normalizes dot segments itself) ---
-check_http "double slash"   "hello from linnea" "$(raw_http 'GET //hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n')"
-check_http "dot segment"    "hello from linnea" "$(raw_http 'GET /./hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n')"
-check_http "dotdot resolve" "hello from linnea" "$(raw_http 'GET /sub/../hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n')"
-check_http "dotdot to dir"  "linnea index page" "$(raw_http 'GET /sub/.. HTTP/1.1\r\nConnection: close\r\n\r\n')"
-check_http "above root"     "400 Bad Request" "$(raw_http 'GET /a/../../x HTTP/1.1\r\nConnection: close\r\n\r\n')"
+check_http "double slash"   "hello from linnea" "$(raw_http 'GET //hello.txt HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
+check_http "dot segment"    "hello from linnea" "$(raw_http 'GET /./hello.txt HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
+check_http "dotdot resolve" "hello from linnea" "$(raw_http 'GET /sub/../hello.txt HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
+check_http "dotdot to dir"  "linnea index page" "$(raw_http 'GET /sub/.. HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
+check_http "above root"     "400 Bad Request" "$(raw_http 'GET /a/../../x HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
 
 # --- request bodies ---
-resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nContent-Length: 5\r\n\r\nXXXXXGET /hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n')
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test\r\nContent-Length: 5\r\n\r\nXXXXXGET /hello.txt HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')
 n=$(printf '%s' "$resp" | grep -c "200 OK")
 [ "$n" -eq 2 ]
 check "body discarded, keep-alive" $?
-check_http "chunked 501" "501 Not Implemented" "$(raw_http 'GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n')"
+check_http "chunked 501" "501 Not Implemented" "$(raw_http 'GET / HTTP/1.1\r\nHost: one.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n')"
 # A static location cannot stream a body, so one it cannot buffer with the
 # head is refused; a proxy location streams the same body instead (below).
-check_http "body too large 413" "413 Content Too Large" "$(raw_http 'GET / HTTP/1.1\r\nContent-Length: 20000\r\n\r\n')"
+check_http "body too large 413" "413 Content Too Large" "$(raw_http 'GET / HTTP/1.1\r\nHost: one.test\r\nContent-Length: 20000\r\n\r\n')"
 
 # --- protocol errors and traversal (raw, curl normalizes paths) ---
 check_http "http 400" "400 Bad Request" "$(raw_http 'GARBAGE\r\n\r\n')"
 check_http "http 505" "505 HTTP Version Not Supported" "$(raw_http 'GET / HTTP/1.0\r\nConnection: close\r\n\r\n')"
-check_http "traversal blocked" "400 Bad Request" "$(raw_http 'GET /../secret HTTP/1.1\r\nConnection: close\r\n\r\n')"
+check_http "traversal blocked" "400 Bad Request" "$(raw_http 'GET /../secret HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
+
+# --- Host header rules (Q123, RFC 9112 3.2): every request we accept is
+# HTTP/1.1, so exactly one Host field line is mandatory and its value must
+# look like an authority. A missing or repeated Host used to be served
+# normally — and a second Host is a smuggling primitive, since an
+# intermediary may route on the other one.
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "host: one Host serves"  "200 OK" "$resp"
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\n\r\n')
+check_http "host: missing Host is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test\r\nHost: evil.test\r\n\r\n')
+check_http "host: duplicate Host is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test\r\nHost: one.test\r\n\r\n')
+check_http "host: repeated identical Host is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost:\r\n\r\n')
+check_http "host: empty Host is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one test\r\n\r\n')
+check_http "host: Host with a space is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test:47080\r\n\r\n')
+check_http "host: Host with a port serves" "200 OK" "$resp"
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: [::1]:47080\r\n\r\n')
+check_http "host: IPv6-literal Host serves" "200 OK" "$resp"
+# the trailing OWS a field value may carry is trimmed before validation
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test\t\r\n\r\n')
+check_http "host: trailing OWS trimmed, not rejected" "200 OK" "$resp"
+# a proxied location is routed only after the Host check
+resp=$(raw_http 'GET /api/simple HTTP/1.1\r\n\r\n')
+check_http "host: missing Host on a proxy location is 400" "400 Bad Request" "$resp"
 
 # --- request log lines (with peer address) ---
 grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /hello\.txt" 200 18' "$LOG"
@@ -1221,7 +1249,7 @@ check_http "keep-alive body 2" "linnea index page" "$resp"
 check "keep-alive single accept" $?
 
 # --- pipelined requests in one write ---
-resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\n\r\nGET /hello.txt HTTP/1.1\r\nConnection: close\r\n\r\n')
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\nGET /hello.txt HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')
 n=$(printf '%s' "$resp" | grep -c "200 OK")
 [ "$n" -eq 2 ]
 check "pipelined requests" $?
@@ -1314,7 +1342,7 @@ resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/clpad)
 check_http "proxy CL whitespace" "valid" "$resp"
 # Expect must not be forwarded: the body is already buffered, and an
 # interim 100 Continue would be parsed as the response itself
-resp=$(raw_http 'POST /api/expect HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\nHELLO')
+resp=$(raw_http 'POST /api/expect HTTP/1.1\r\nHost: one.test\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\nHELLO')
 check_http "proxy drops Expect"  "real" "$resp"
 printf '%s' "$resp" | grep -qF "100 Continue"
 [ $? -ne 0 ]
@@ -1395,7 +1423,7 @@ check "ws termination upstream closed" $?
 # (2s in this config) fires.
 truncate -s 64M test/www/huge.bin
 (exec 3<>/dev/tcp/127.0.0.1/47080
- printf 'GET /huge.bin HTTP/1.1\r\n\r\n' >&3
+ printf 'GET /huge.bin HTTP/1.1\r\nHost: one.test\r\n\r\n' >&3
  sleep 6) &
 stall_pid=$!
 sleep 4
