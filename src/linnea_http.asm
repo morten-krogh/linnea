@@ -131,6 +131,14 @@ resp_404:       db "HTTP/1.1 404 Not Found", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_404_len    equ $ - resp_404
+; "OPTIONS *": what this server supports, as a whole. Bodiless, like every
+; other canned response, and it keeps the connection (nothing went wrong).
+slash_target:   db "/"
+resp_options:   db "HTTP/1.1 200 OK", 13, 10
+                db "Allow: GET, HEAD, OPTIONS", 13, 10
+                db "Server: linnea", 13, 10
+                db "Content-Length: 0", 13, 10, 13, 10
+resp_options_len equ $ - resp_options
 resp_405:       db "HTTP/1.1 405 Method Not Allowed", 13, 10
                 db "Allow: GET, HEAD", 13, 10
                 db "Server: linnea", 13, 10
@@ -371,13 +379,15 @@ section .text
 ;   [rsp+272] body offset   [rsp+280] body length (the whole file, or the
 ;             satisfiable range of a 206)
 ;   [rsp+296] Host field lines seen (RFC 9112 3.2 wants exactly one)
+;   [rsp+304] asterisk-form: the target was "*", so the request is about the
+;             server itself rather than any resource (OPTIONS *)
 linnea_http_handle:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 304
+    sub rsp, 320
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -493,6 +503,40 @@ linnea_http_handle:
     cmp rax, LINNEA_HTTP_MAX_TARGET
     ja .resp_400
     inc r15                    ; skip the SP
+
+    ; --- request-target forms (RFC 9112 3.2) ----------------------
+    ; Only origin-form ("/path") used to survive: everything else reached the
+    ; path normalizer and came back 400. absolute-form is one a server MUST
+    ; accept, and asterisk-form is how OPTIONS asks about the server itself.
+    ; Both are recognised here, before the target is used for anything.
+    mov qword [rsp + 304], 0   ; not an OPTIONS * request
+    mov rax, [rsp + 8]
+    cmp qword [rsp + 16], 1
+    jne .not_asterisk
+    cmp byte [rax], '*'
+    jne .not_asterisk
+    mov qword [rsp + 304], 1   ; asterisk-form: the server itself
+    jmp .target_form_done
+.not_asterisk:
+    push r13
+    push r15
+    mov rdi, [rsp + 16 + 8]    ; target ptr (two pushes above the frame)
+    mov rsi, [rsp + 16 + 16]   ; target len
+    call target_absolute       ; rax = path ptr / 0, rdx = path len,
+                               ; rcx = authority ptr, r8 = authority len
+    pop r15
+    pop r13
+    test rax, rax
+    jz .target_form_done
+    ; absolute-form: the target carries its own authority, and RFC 9112 3.2
+    ; says THAT is what identifies the resource — a Host header, which an
+    ; HTTP/1.1 client must still send, is ignored rather than obeyed.
+    mov [rsp + 8], rax
+    mov [rsp + 16], rdx
+    mov [rsp + 144], rdx
+    mov [rsp + 88], rcx        ; routing follows the target's authority
+    mov [rsp + 96], r8
+.target_form_done:
 
     ; --- version: exactly "HTTP/1.1" CRLF -------------------------
     lea rax, [r15 + 8]
@@ -811,6 +855,20 @@ linnea_http_handle:
 
     ; --- serve the file ---------------------------------------------
 .parsed:
+    ; "OPTIONS *" asks about the server, not about a resource (RFC 9112
+    ; 3.2.4): there is no path to route, so answer it here. Any other method
+    ; with an asterisk target is nonsense and stays a 400.
+    cmp qword [rsp + 304], 0
+    je .not_options_star
+    cmp qword [rsp + 104], 7           ; the method text sits at in_buf[0)
+    jne .resp_400
+    lea rax, [rbx + linnea_connection.in_buf]
+    cmp dword [rax], 'OPTI'
+    jne .resp_400
+    cmp dword [rax + 3], 'IONS'
+    jne .resp_400
+    jmp .resp_options
+.not_options_star:
     ; Host (RFC 9112 3.2): exactly one field line, and a value that could be
     ; an authority. Every request we accept is HTTP/1.1 (the version check
     ; above admits nothing else), so the header is mandatory — and a missing
@@ -1757,6 +1815,11 @@ linnea_http_handle:
     mov ecx, resp_400_len
     mov qword [rsp + 112], 400
     jmp .resp_static
+.resp_options:
+    lea rax, [resp_options]
+    mov ecx, resp_options_len
+    mov qword [rsp + 112], 200
+    jmp .resp_static
 .resp_405:
     lea rax, [resp_405]
     mov ecx, resp_405_len
@@ -1870,7 +1933,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 304
+    add rsp, 320
     pop r15
     pop r14
     pop r13
@@ -2087,6 +2150,68 @@ http_error_blob:
     sub rdx, rax
     pop r15
     pop r12
+    pop rbx
+    ret
+
+; target_absolute(rdi = target ptr, rsi = target length)
+;   -> rax = path ptr (0 when the target is not absolute-form), rdx = path
+;      length, rcx = authority ptr, r8 = authority length.
+; RFC 9112 3.2.2: "scheme://authority/path". A server MUST accept it, and the
+; authority it carries — not the Host header — identifies the resource. The
+; path returned is the part from the '/' that ends the authority; a target
+; with no such '/' ("http://host") means the root. Only http and https are
+; recognised, case-insensitively, since the scheme is case-insensitive.
+target_absolute:
+    push rbx
+    mov rbx, rdi
+    cmp rsi, 8                       ; the shortest is "http://x"
+    jb .ta_no
+    ; scheme: "http" then optional "s", then "://"
+    mov eax, [rbx]
+    or eax, 0x20202020               ; fold to lowercase
+    cmp eax, 'http'
+    jne .ta_no
+    lea rdi, [rbx + 4]
+    movzx eax, byte [rdi]
+    or al, 0x20
+    cmp al, 's'
+    jne .ta_sep
+    inc rdi
+.ta_sep:
+    mov eax, [rdi]
+    and eax, 0x00ffffff
+    cmp eax, '://'
+    jne .ta_no
+    add rdi, 3                       ; the authority starts here
+    mov rcx, rdi                     ; authority ptr
+    lea r9, [rbx + rsi]              ; target end
+    mov r8, rdi
+.ta_auth:
+    cmp r8, r9
+    jae .ta_root                     ; no path at all: the root
+    cmp byte [r8], '/'
+    je .ta_path
+    inc r8
+    jmp .ta_auth
+.ta_path:
+    mov rax, r8                      ; the path begins at that '/'
+    mov rdx, r9
+    sub rdx, r8                      ; its length
+    sub r8, rcx                      ; authority length
+    test r8, r8
+    jz .ta_no                        ; "http:///path" names nothing
+    pop rbx
+    ret
+.ta_root:
+    sub r8, rcx                      ; authority length
+    test r8, r8
+    jz .ta_no
+    lea rax, [slash_target]          ; the root, since the target gave no path
+    mov rdx, 1
+    pop rbx
+    ret
+.ta_no:
+    xor eax, eax
     pop rbx
     ret
 

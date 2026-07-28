@@ -1197,6 +1197,31 @@ check_http "http 400" "400 Bad Request" "$(raw_http 'GARBAGE\r\n\r\n')"
 check_http "http 505" "505 HTTP Version Not Supported" "$(raw_http 'GET / HTTP/1.0\r\nConnection: close\r\n\r\n')"
 check_http "traversal blocked" "400 Bad Request" "$(raw_http 'GET /../secret HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
 
+# --- request-target forms (Q127, RFC 9112 3.2). Only origin-form used to
+# survive: absolute-form and "OPTIONS *" reached the path normalizer and came
+# back 400. A server MUST accept absolute-form, and the authority it carries
+# — not the Host header — identifies the resource.
+resp=$(raw_http 'GET http://one.test/hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: absolute-form served" "hello from linnea" "$resp"
+resp=$(raw_http 'GET https://one.test/hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: absolute-form (https scheme) served" "hello from linnea" "$resp"
+resp=$(raw_http 'GET http://one.test HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: absolute-form with no path is the root" "200 OK" "$resp"
+# the target's authority wins over Host: three.test has its own root, which
+# holds no hello.txt, so routing by it is visible as a 404
+resp=$(raw_http 'GET http://three.test/hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: absolute-form authority beats Host" "404" "$resp"
+resp=$(raw_http 'GET http:///hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: absolute-form with an empty authority is 400" "400 Bad Request" "$resp"
+# an HTTP/1.1 client must still send Host, even in absolute-form
+resp=$(raw_http 'GET http://one.test/hello.txt HTTP/1.1\r\n\r\n')
+check_http "target: absolute-form still requires a Host line" "400 Bad Request" "$resp"
+resp=$(raw_http 'OPTIONS * HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: OPTIONS * answered" "200 OK" "$resp"
+check_http "target: OPTIONS * lists the methods" "Allow: GET, HEAD, OPTIONS" "$resp"
+resp=$(raw_http 'GET * HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: asterisk with any other method is 400" "400 Bad Request" "$resp"
+
 # --- Host header rules (Q123, RFC 9112 3.2): every request we accept is
 # HTTP/1.1, so exactly one Host field line is mandatory and its value must
 # look like an authority. A missing or repeated Host used to be served
