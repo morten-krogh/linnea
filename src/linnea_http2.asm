@@ -972,7 +972,28 @@ h2_serve:
     mov rsi, r12
     call h2_select_vhost             ; -> rax = server*
     mov r13, rax
-    mov [h2_cur_srv], rax            ; its security headers ride the response
+    ; Is this connection allowed to answer for that name? It presented one
+    ; certificate; a vhost covered by a DIFFERENT one is not ours to serve
+    ; here, and RFC 9110 7.4 says so with 421 — the client then opens a
+    ; connection where the right certificate is presented. A name we do not
+    ; host at all selects the connection's own vhost above, so it never
+    ; reaches this test.
+    mov rdi, rbx
+    call h2_conn_vhost
+    ; the response is built from a vhost either way — for a 421 it is this
+    ; connection's own, since that is the site whose certificate we presented
+    ; (and h2_cur_srv is dereferenced while building ANY response, so it must
+    ; be set before every path that can answer)
+    mov [h2_cur_srv], rax
+    cmp rax, r13
+    je .vhost_ok
+    mov rdi, r13
+    mov rsi, rax
+    call h2_same_cert
+    test eax, eax
+    jz .resp_421
+.vhost_ok:
+    mov [h2_cur_srv], r13            ; its security headers ride the response
     lea rdi, [h2_path_buf + LINNEA_HTTP2_PATH_ROOT]
     mov rsi, [r12 + linnea_h2_req.path_ptr]
     mov rdx, [r12 + linnea_h2_req.path_len]
@@ -1659,6 +1680,12 @@ h2_serve:
     lea rax, [status_404_h2]
     lea r14, [body_404]
     mov r15d, body_404_len
+    jmp .error
+.resp_421:
+    lea rax, [status_421_h2]
+    lea r14, [body_421_h2]
+    mov r15d, body_421_h2_len
+    mov qword [rsp + S_LSTAT], 421
     jmp .error
 .resp_400:
     lea rax, [status_400_h2]
@@ -3903,6 +3930,50 @@ h2_schedule:
     pop rbx
     ret
 
+; h2_conn_vhost(rdi=conn) -> rax = server* whose certificate this connection
+; presented: the SNI-selected vhost, or the accepting server when the client
+; named nothing we host (the RFC 6066 fallback hs_init starts from).
+h2_conn_vhost:
+    mov rax, [rdi + linnea_connection.sni_vhost]
+    test rax, rax
+    jnz .cv_ret
+    mov eax, [rdi + linnea_connection.server]
+    imul rax, rax, linnea_config_server_size
+    lea rcx, [linnea_config_instance]
+    lea rax, [rcx + rax + linnea_config.servers]
+.cv_ret:
+    ret
+
+; h2_same_cert(rdi=server* a, rsi=server* b) -> eax = 1 when both are served
+; under the same certificate. The certificate BYTES are compared, not the
+; vhost: one multi-SAN certificate shared by several vhosts is exactly what a
+; browser coalesces onto one connection, and those names are all ours to
+; answer. (The HTTP/3 side does the same in vhost_same_cert.)
+h2_same_cert:
+    mov rax, [rdi + linnea_config_server.cert_list_len]
+    cmp rax, [rsi + linnea_config_server.cert_list_len]
+    jne .sc_no
+    push rsi
+    push rdi
+    mov rdi, [rdi + linnea_config_server.cert_list]
+    mov rsi, [rsi + linnea_config_server.cert_list]
+    cmp rdi, rsi
+    je .sc_yes_pop
+    mov rcx, rax
+    repe cmpsb
+    jne .sc_no_pop
+.sc_yes_pop:
+    pop rdi
+    pop rsi
+    mov eax, 1
+    ret
+.sc_no_pop:
+    pop rdi
+    pop rsi
+.sc_no:
+    xor eax, eax
+    ret
+
 ; h2_select_vhost(rdi=conn, rsi=req) -> rax = server* (by :authority, else the
 ; accepting server). Authority host is compared without any :port suffix.
 h2_select_vhost:
@@ -3912,10 +3983,15 @@ h2_select_vhost:
     push r13
     push r14
     push r15
-    mov eax, [rdi + linnea_connection.server]
-    imul rax, rax, linnea_config_server_size
+    ; the default is the vhost whose certificate this connection presented,
+    ; not the listener owner: a name we do not host (an address, an alias) is
+    ; answered by the site the client actually negotiated, which is also what
+    ; keeps it clear of the 421 test in the caller
+    push rsi
+    call h2_conn_vhost
+    pop rsi
+    mov r15, rax                                     ; default / result
     lea rbx, [linnea_config_instance]
-    lea r15, [rbx + rax + linnea_config.servers]     ; default / result
     mov r12, [rsi + linnea_h2_req.auth_ptr]
     test r12, r12
     jz .vdone
@@ -4364,6 +4440,7 @@ h2_nosniff_name_len equ $ - h2_nosniff_name
 h2_nosniff_val:  db "nosniff"
 h2_nosniff_val_len equ $ - h2_nosniff_val
 status_301_h2:   db "301"
+status_421_h2:   db "421"
 status_431_h2:   db "431"
 body_431: db "431 Request Header Fields Too Large", 10
 body_431_len equ $ - body_431
@@ -4373,6 +4450,8 @@ body_504: db "504 Gateway Timeout", 10
 body_504_len equ $ - body_504
 body_408: db "408 Request Timeout", 10
 body_408_len equ $ - body_408
+body_421_h2: db "421 Misdirected Request", 10
+body_421_h2_len equ $ - body_421_h2
 body_413: db "413 Content Too Large", 10
 body_413_len equ $ - body_413
 ; --- proxy-over-h2 literals ---

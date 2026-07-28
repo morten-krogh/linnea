@@ -147,6 +147,13 @@ struc linnea_connection
     ; Holds 1 + the number of linger reads served, so a peer trickling bytes
     ; cannot extend the linger forever.
     .linger:         resq 1
+    ; The vhost whose certificate this connection presented (0 = the
+    ; accepting server's, the RFC 6066 fallback for an absent or unknown
+    ; server_name). It is what decides which names the connection may speak
+    ; for: HTTP/2 routes per request by :authority, and a name belonging to a
+    ; vhost with a DIFFERENT certificate is answered 421, exactly as HTTP/3
+    ; does since Q124.
+    .sni_vhost:      resq 1
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

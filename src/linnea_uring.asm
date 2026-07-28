@@ -228,6 +228,7 @@ cqe_ptr:            resq 1
 head_timeout_ns:    resq 1     ; head_timeout as nanoseconds (same units as
                                ; linnea_uring_now), for the request-head deadline
 max_per_ip:         resq 1     ; connections one source address may hold
+sni_select_conn:    resq 1     ; the connection the SNI callback is deciding for
 idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
                                ; tunnel's last_activity comparison
 sig_mask:           resq 1     ; blocked-signal set: SIGTERM + SIGHUP
@@ -780,6 +781,7 @@ linnea_uring_run:
     mov r12, rax               ; connection*
     mov [r12 + linnea_connection.fd], r15d
     mov [r12 + linnea_connection.server], r13d
+    mov qword [r12 + linnea_connection.sni_vhost], 0
     mov edi, r15d
     lea rsi, [r12 + linnea_connection.peer]
     call linnea_network_peer_format
@@ -2878,6 +2880,8 @@ linnea_uring_sni_select:
     push r13
     push r14
     push r15
+    mov [sni_select_conn], rdi     ; every register is spoken for below, and
+                                   ; rdi becomes the SNI text inside the loop
     test rdx, rdx
     jz .none                   ; no server_name offered
     mov r14, rsi               ; sni ptr
@@ -2909,6 +2913,8 @@ linnea_uring_sni_select:
     pop rdx
     test eax, eax
     jz .next
+    mov rcx, [sni_select_conn]                     ; rdi is the SNI text by now
+    mov [rcx + linnea_connection.sni_vhost], rdx   ; whose cert we present
     mov rax, [rdx + linnea_config_server.cert_list]
     mov rcx, [rdx + linnea_config_server.key_priv]
     mov rdx, [rdx + linnea_config_server.cert_list_len]

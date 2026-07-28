@@ -2438,6 +2438,25 @@ PYEOF
         --resolve sni.test:47444:127.0.0.1 https://sni.test:47444/page.html)
     check_http "sni end to end (cert + vhost routing)" "subdirectory page" "$resp"
 
+    # Q126: h2 answers only for names the certificate it presented covers —
+    # the rule h3 got in Q124. A cross-certificate request gets 421, a name
+    # we do not host is served by the connection's own vhost, and two vhosts
+    # sharing ONE certificate still coalesce onto a single connection. The
+    # worker-PID check is not ceremony: the first version of this crashed the
+    # worker (the 421 path skipped the vhost the response builder reads), and
+    # a crash looks exactly like a closed connection from the client side.
+    $BIN test/configs/tls-coalesce.json >/dev/null 2>&1 &
+    coal_h2_pid=$!
+    sleep 0.4
+    md_before=$(workers_of $sni_server_pid)
+    timeout 60 python3 test/tls/h2_misdirected.py $CA 47444 47459 >/dev/null 2>&1
+    md_rc=$?
+    md_after=$(workers_of $sni_server_pid)
+    [ "$md_rc" -eq 0 ] && [ -n "$md_before" ] && [ "$md_before" = "$md_after" ]
+    check "http2 misdirected request: 421 across certs, coalescing kept" $?
+    kill $coal_h2_pid 2>/dev/null
+    wait $coal_h2_pid 2>/dev/null
+
     # Q124: h3 honours :authority instead of serving whatever the TLS SNI
     # chose, and answers a name this connection's certificate does not cover
     # with 421 rather than the other vhost's page.
