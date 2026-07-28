@@ -21,6 +21,7 @@ LINNEA_H3_STREAM_QPACK_DEC  equ 0x03
 
 ; HTTP/3 error codes (RFC 9114 8.1), sent in an application CONNECTION_CLOSE
 ; when a peer breaks a control-stream rule.
+LINNEA_H3_ERR_NO_ERROR         equ 0x0100  ; orderly close (the drain's goodbye)
 LINNEA_H3_ERR_MISSING_SETTINGS equ 0x0105  ; control stream opened without SETTINGS
 LINNEA_H3_ERR_STREAM_CREATION  equ 0x0103  ; a second control stream
 LINNEA_H3_ERR_CLOSED_CRITICAL  equ 0x0104  ; a critical stream (control/QPACK) closed

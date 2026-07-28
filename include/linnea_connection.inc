@@ -138,6 +138,15 @@ struc linnea_connection
     ; would let the kernel write into a recycled buffer. close_reason holds the
     ; log reason across the wait, as it does for a tunnel.
     .h2_closing:     resq 1
+    ; Lingering close (drain): the response's last bytes were handed to the
+    ; kernel, but close(2) with unread inbound (a downloading h2 client is
+    ; always sending WINDOW_UPDATEs) answers with an RST that discards the
+    ; untransmitted tail of the send buffer. The write side is shut down
+    ; (the FIN queues behind the data) and reads are drained until the peer
+    ; closes or a short timeout runs out; only then is the socket closed.
+    ; Holds 1 + the number of linger reads served, so a peer trickling bytes
+    ; cannot extend the linger forever.
+    .linger:         resq 1
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

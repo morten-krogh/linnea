@@ -62,6 +62,7 @@ global linnea_quic_add_vhost
 global linnea_quic_server_datagram
 global linnea_quic_server_rtx_sweep
 global linnea_quic_server_goaway_all
+global linnea_quic_server_drain_sweep
 global linnea_quic_rxbuf
 global linnea_quic_altsvc_set
 global linnea_h3_altsvc
@@ -124,6 +125,7 @@ extern linnea_quic_path_seen
 extern linnea_quic_path_data
 extern linnea_quic_reset_token
 extern linnea_worker_index
+global linnea_quic_draining
 extern quic_v2_active
 extern linnea_quic_conn_free_hook
 extern linnea_h3_tx_cap
@@ -242,6 +244,10 @@ srst_buf:    resb LINNEA_QUIC_SRST_MAX ; the stateless-reset packet we build
 srst_len:    resq 1
 vneg_buf:    resb 64                   ; a Version Negotiation packet we build
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
+; 1 while the worker is draining (set by the event loop's stop path — the
+; loop's own drain_flag lives in a module the standalone handshake test binary
+; does not link). A draining worker opens no new connections.
+linnea_quic_draining: resd 1
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
 maxstreams_pay: resb 16               ; a MAX_STREAMS frame raising the peer's limit
 ch_out:      resb linnea_quic_ch_size
@@ -541,6 +547,10 @@ linnea_quic_server_datagram:
     test cl, cl                               ; v1 Initial = type 0
     jnz .done
 .dn_alloc:
+    ; draining: the GOAWAY told existing peers to move on, so a fresh Initial
+    ; gets no reply — the client's retry lands on the replacement worker
+    cmp dword [linnea_quic_draining], 0
+    jne .done
     ; RFC 9000 14.1: a datagram carrying an Initial that opens a connection must
     ; be at least 1200 bytes. A client always pads it; enforcing the floor means a
     ; single small forged packet cannot buy a handshake, and keeps any reply we
@@ -2085,16 +2095,7 @@ linnea_quic_server_datagram:
 ; emit_1rtt (no loss-recovery tracking): the connection is gone the moment this
 ; is queued, so a lost close is not worth resending.
 .h3_close:
-    mov byte [cc_pay], 0x1d          ; CONNECTION_CLOSE (application)
-    mov rsi, rdi                     ; error code
-    lea rdi, [cc_pay + 1]
-    call linnea_quic_varint_encode   ; rax = error-code varint length
-    mov byte [cc_pay + 1 + rax], 0x00   ; reason phrase length = 0
-    lea rsi, [cc_pay]
-    mov [s_pl_ptr], rsi
-    lea rdx, [rax + 2]               ; payload = type(1) + code + reason-len(1)
-    mov [s_pl_len], rdx
-    call emit_1rtt
+    call send_app_close
     mov rdi, [cur_conn]
     call linnea_quic_conn_free
     jmp .done
@@ -3827,6 +3828,81 @@ linnea_quic_server_goaway_all:
     inc r13d
     cmp r13d, LINNEA_QUIC_MAX_CONNS
     jb .ga_conn
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; send_app_close(rdi = h3 error code) — queue an application CONNECTION_CLOSE
+; (frame 0x1d) carrying the code on cur_conn, via emit_1rtt on the socket in
+; r12d. Best-effort and untracked, like every close: the slot is freed the
+; moment it is queued, so a lost close is not worth resending.
+send_app_close:
+    push rbx                         ; emit_1rtt wants a 16-aligned call site
+    mov byte [cc_pay], 0x1d          ; CONNECTION_CLOSE (application)
+    mov rsi, rdi                     ; error code
+    lea rdi, [cc_pay + 1]
+    call linnea_quic_varint_encode   ; rax = error-code varint length
+    mov byte [cc_pay + 1 + rax], 0x00   ; reason phrase length = 0
+    lea rsi, [cc_pay]
+    mov [s_pl_ptr], rsi
+    lea rdx, [rax + 2]               ; payload = type(1) + code + reason-len(1)
+    mov [s_pl_len], rdx
+    call emit_1rtt
+    pop rbx
+    ret
+
+; linnea_quic_server_drain_sweep(edi = UDP socket fd) — one drain pass over the
+; pool: every connected peer with nothing left in flight — no response stream
+; open, no chunk unacknowledged, no request still reassembling — is told
+; goodbye with CONNECTION_CLOSE(H3_NO_ERROR) and its slot freed. A connection
+; still working is left alone; a later pass catches it once its last chunk is
+; acknowledged. Handshakes in progress are not closed here (a 1-RTT close would
+; not decrypt for them): the handshake idle sweep reclaims them within
+; LINNEA_QUIC_HS_IDLE_SECS. Driven by the event loop's periodic timer, which
+; keeps ticking during a drain exactly so this and the retransmission sweep can
+; finish the in-flight responses the drain is waiting on.
+linnea_quic_server_drain_sweep:
+    push rbx
+    push r12
+    push r13                         ; 3 pushes: the call sites are 16-aligned
+    mov r12d, edi                    ; fd, for emit_1rtt
+    xor r13d, r13d                   ; connection index
+.ds_conn:
+    mov edi, r13d
+    call linnea_quic_conn_slot       ; rax = conn* or 0
+    test rax, rax
+    jz .ds_next
+    mov rbx, rax
+    cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
+    jne .ds_next
+    cmp qword [rbx + linnea_quic_conn.bytes_in_flight], 0
+    jne .ds_next
+    lea rcx, [rbx + linnea_quic_conn.tx_streams]
+    mov edx, LINNEA_QUIC_TXSTREAMS
+.ds_tx:
+    cmp qword [rcx + linnea_quic_txstream.active], 0
+    jne .ds_next                     ; a response is still going out
+    add rcx, linnea_quic_txstream_size
+    dec edx
+    jnz .ds_tx
+    lea rcx, [rbx + linnea_quic_conn.ra_ctx]
+    mov edx, LINNEA_QUIC_RA_CTXS
+.ds_ra:
+    cmp qword [rcx + linnea_quic_ra.active], 0
+    jne .ds_next                     ; a request is still arriving
+    add rcx, linnea_quic_ra_size
+    dec edx
+    jnz .ds_ra
+    mov [cur_conn], rbx
+    mov edi, LINNEA_H3_ERR_NO_ERROR
+    call send_app_close
+    mov rdi, rbx
+    call linnea_quic_conn_free
+.ds_next:
+    inc r13d
+    cmp r13d, LINNEA_QUIC_MAX_CONNS
+    jb .ds_conn
     pop r13
     pop r12
     pop rbx

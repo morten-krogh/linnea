@@ -715,6 +715,44 @@ else
     check "h3 GOAWAY drain test (skipped: deps unavailable)" 0
 fi
 
+# Drain with an in-flight h3 response (Q117): the drain-exit test used to count
+# only TCP connections, so a worker whose work was all QUIC exited the moment
+# the drain began (and stopped re-arming the datagram recv besides) — the peer
+# hung mid-download with nothing on the wire to tell it. Now the worker keeps
+# receiving, finishes the response, says goodbye with CONNECTION_CLOSE
+# (H3_NO_ERROR), and only then exits.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    rm -f test/linnea.log
+    $BIN test/configs/tls-h3-drain.json >/dev/null 2>&1 &
+    di_master=$!
+    sleep 0.5
+    timeout 40 python3 test/quic/h3_drain_inflight_test.py 47453 $di_master >/dev/null 2>&1
+    check "h3 (io_uring): drain finishes the in-flight response, then closes" $?
+    wait $di_master 2>/dev/null
+    sleep 0.5
+    ! pgrep -f 'tls-h3-drain\.json' >/dev/null
+    check "h3 drain exits after the last QUIC connection" $?
+    rm -f test/linnea.log
+else
+    check "h3 in-flight drain test (skipped: deps unavailable)" 0
+fi
+
+# Drain with an in-flight h2 response and a slow reader (Q117): the connection
+# was freed once the last body byte reached the kernel, and close(2) with the
+# client's unread WINDOW_UPDATEs queued answered with an RST that discarded
+# the untransmitted tail of the send buffer — ~90% of the body arrived, then a
+# reset. The lingering close (shutdown the write side, drain reads until the
+# peer closes) delivers every byte.
+rm -f test/linnea.log
+python3 -c "open('test/www/h2drain.bin','wb').write(bytes(3000000))"
+$BIN test/configs/tls-h3-drain.json >/dev/null 2>&1 &
+h2d_master=$!
+sleep 0.5
+timeout 60 python3 test/tls/h2_drain_slow.py test/tls/server.crt 47453 $h2d_master >/dev/null 2>&1
+check "http2 drain delivers the whole in-flight body to a slow reader" $?
+wait $h2d_master 2>/dev/null
+rm -f test/linnea.log test/www/h2drain.bin
+
 # Large certificate chain (~5.2 KB, seven certs — over the old ~3.9 KB cap) on
 # both transports. On h3 the flight is both larger than one datagram (QUIC forbids
 # IP fragmentation, so the Certificate CRYPTO is split across <=MTU Handshake

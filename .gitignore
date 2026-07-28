@@ -41,6 +41,7 @@ test/www/med.txt
 test/www/huge.bin
 test/www/up.bin
 test/www/h3big.bin
+test/www/h2drain.bin
 test/www/h3range.bin
 test/www/h2range.bin
 test/www/upload.bin

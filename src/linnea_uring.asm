@@ -100,6 +100,9 @@ extern linnea_h3_server
 extern linnea_quic_server_datagram
 extern linnea_quic_server_rtx_sweep
 extern linnea_quic_server_goaway_all
+extern linnea_quic_server_drain_sweep
+extern linnea_quic_conn_active
+extern linnea_quic_draining
 extern linnea_quic_rxbuf
 extern linnea_bpf_map_fd
 extern linnea_bpf_prog_fd
@@ -198,6 +201,12 @@ reason_tls_ktls_len equ $ - reason_tls_ktls
 section .data
 
 idle_timeout:       dq LINNEA_DEFAULT_TIMEOUT, 0    ; struct __kernel_timespec
+; How long a lingering close waits between signs of life from the peer — a
+; client consuming the response tail keeps sending WINDOW_UPDATEs, so only a
+; vanished one goes this quiet. LINNEA_LINGER_TOTAL_NS bounds the linger as a
+; whole, however lively the peer.
+linger_timeout:     dq 2, 0                         ; struct __kernel_timespec
+LINNEA_LINGER_TOTAL_NS equ 30000000000              ; 30 s
 ; QUIC probe-timeout tick. A relative one-shot timeout re-armed on every fire;
 ; each tick runs the retransmission sweep. 50 ms bounds how late a lost reply is
 ; resent past its probe timeout, and how often a worker wakes when idle.
@@ -573,20 +582,33 @@ linnea_uring_run:
     mov ecx, [quic_fd]
     call linnea_quic_server_datagram
 .qrecv_rearm:
-    cmp dword [drain_flag], 0
-    jne .wait                  ; draining: take no new datagrams
+    ; the recv stays armed while draining — the in-flight responses the drain
+    ; waits on need the peer's ACKs and flow-control credit to finish, and a
+    ; handler may just have freed the last connection (the peer said goodbye)
+    call drain_all_done
+    test eax, eax
+    jnz .drained_exit
     call linnea_uring_arm_qrecv
     call linnea_uring_submit_now
     jmp .wait
 
 ; --- QUIC probe-timeout tick: resend anything unacknowledged past its PTO ---
 ; The timeout completes (with -ETIME) on every tick; res carries no work. Run
-; the retransmission sweep over the pool, then re-arm unless draining.
+; the retransmission sweep over the pool, then re-arm. The tick keeps running
+; during a drain: retransmission is what finishes the in-flight responses the
+; drain waits on, and the drain sweep closes each connection (CONNECTION_CLOSE,
+; H3_NO_ERROR) the moment it has nothing left in flight.
 .on_qtimer:
     mov edi, [quic_fd]
     call linnea_quic_server_rtx_sweep
     cmp dword [drain_flag], 0
-    jne .wait                  ; draining: no more ticks
+    je .qtimer_rearm
+    mov edi, [quic_fd]
+    call linnea_quic_server_drain_sweep
+    call drain_all_done
+    test eax, eax
+    jnz .drained_exit
+.qtimer_rearm:
     call linnea_uring_arm_qtimer
     call linnea_uring_submit_now
     jmp .wait
@@ -616,6 +638,7 @@ linnea_uring_run:
     cmp dword [drain_flag], 0
     jnz .wait                  ; a second stop signal changes nothing
     mov dword [drain_flag], 1
+    mov dword [linnea_quic_draining], 1  ; the QUIC module's copy: refuse new conns
     ; SIGQUIT is the patient drain: leave idle connections to their
     ; keep-alive timeout. SIGTERM means the unit is stopping, so an idle
     ; connection — one with no request in flight — is closed now rather
@@ -630,15 +653,20 @@ linnea_uring_run:
     lea rdi, [log_drain]
     mov esi, log_drain_len
     call linnea_log_write
-    ; tell connected h3 peers we are going away before anything else — even a
-    ; worker with no TCP connections (which exits below) gets the GOAWAY out
+    ; tell connected h3 peers we are going away before anything else, then
+    ; close the ones with nothing in flight right now — a `systemctl stop`
+    ; with only an idle browser tab connected should say goodbye and exit
+    ; immediately, not leave the peer to its idle timeout
     cmp dword [quic_fd], 0
     jl .no_goaway
     mov edi, [quic_fd]
     call linnea_quic_server_goaway_all
+    mov edi, [quic_fd]
+    call linnea_quic_server_drain_sweep
 .no_goaway:
-    cmp qword [linnea_connection_active], 0
-    je .drained_exit
+    call drain_all_done
+    test eax, eax
+    jnz .drained_exit
     xor r13d, r13d             ; server index
 .cancel_loop:
     cmp r13, [rbx + linnea_config.server_count]
@@ -866,6 +894,8 @@ linnea_uring_run:
     mov qword [r12 + linnea_connection.h2_rx_busy], 0
     cmp qword [r12 + linnea_connection.h2_closing], 0
     jne .h2_closing_check      ; a straggler of a torn-down h2 connection
+    cmp qword [r12 + linnea_connection.linger], 0
+    jne .linger_recv           ; a lingering close: reads are drained, not served
     cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
     je .tls_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
@@ -1006,6 +1036,8 @@ linnea_uring_run:
     jmp .wait
 .h2_close:
     call linnea_uring_submit_now
+    cmp dword [drain_flag], 0
+    jne .drain_finish          ; the GOAWAY and final frames must not be lost
     lea r14, [reason_done]
     mov r15d, reason_done_len
     jmp .conn_close
@@ -1150,7 +1182,7 @@ linnea_uring_run:
     mov qword [r12 + linnea_connection.file_size], 0
 .no_unmap:
     cmp dword [drain_flag], 0
-    jne .drain_close           ; draining: no keep-alive, no pipelining
+    jne .drain_finish          ; draining: no keep-alive — deliver, then close
     cmp qword [r12 + linnea_connection.keep_alive], 0
     jne .keep_alive_continue
     lea r14, [reason_done]
@@ -1160,6 +1192,71 @@ linnea_uring_run:
     lea r14, [reason_drain]
     mov r15d, reason_drain_len
     jmp .conn_close
+
+; --- lingering close: the drain just delivered a response's last bytes -----
+; They are in the kernel's send buffer, not at the client — and close(2) on a
+; socket with unread inbound (a downloading h2 client is always sending
+; WINDOW_UPDATEs) answers with an RST that discards that untransmitted tail.
+; So: shut down the write side (the FIN queues behind the data), then keep
+; reading and dropping until the peer sees it all and closes; only then close.
+.drain_finish:
+    lea r14, [reason_drain]
+    mov r15d, reason_drain_len
+.drain_linger:
+    mov edi, [r12 + linnea_connection.fd]
+    mov esi, LINNEA_SHUT_WR
+    mov eax, LINNEA_SYS_SHUTDOWN
+    syscall
+    mov [r12 + linnea_connection.close_reason], r14
+    mov [r12 + linnea_connection.close_reason_len], r15
+    mov qword [r12 + linnea_connection.linger], 1
+    call linnea_uring_now      ; req_start is free here (arm_send zeroed it):
+    mov [r12 + linnea_connection.req_start], rax   ; it bounds the whole linger
+    cmp qword [r12 + linnea_connection.h2_rx_busy], 0
+    je .linger_arm
+    ; a recv is already parked (h2 keeps one armed for WINDOW_UPDATEs), but
+    ; under the long idle timeout. Cancel it: its -ECANCELED lands below with
+    ; linger still 1, which re-arms under the short linger timeout instead.
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_ASYNC_CANCEL
+    mov rcx, [r12 + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_RECV
+    mov rdx, [r12 + linnea_connection.gen]
+    shl rdx, 32
+    or rcx, rdx
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_CANCEL
+    call linnea_uring_submit_now
+    jmp .wait
+.linger_recv:
+    ; the linger read came back: data (a consuming client's WINDOW_UPDATEs) is
+    ; dropped and the read re-armed; EOF or an error ends the connection
+    test r15d, r15d
+    jz .linger_done            ; EOF: the peer read everything and closed
+    js .linger_err
+.linger_arm:
+    ; a fresh silence window per read, but a hard bound on the whole linger:
+    ; a peer feeding us a byte every second must not hold the slot forever
+    call linnea_uring_now
+    sub rax, [r12 + linnea_connection.req_start]
+    mov rcx, LINNEA_LINGER_TOTAL_NS
+    cmp rax, rcx
+    ja .linger_done
+    mov qword [r12 + linnea_connection.linger], 2   ; the linger read is armed
+    mov rdi, r12
+    call arm_linger_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.linger_err:
+    cmp r15d, -LINNEA_ECANCELED
+    jne .linger_done           ; a real error: nothing more will be delivered
+    cmp qword [r12 + linnea_connection.linger], 1
+    je .linger_arm             ; our own cancel of the pre-drain recv
+.linger_done:                  ; else the linger timeout: the peer fell silent
+    mov r14, [r12 + linnea_connection.close_reason]
+    mov r15, [r12 + linnea_connection.close_reason_len]
+    jmp .conn_close_now
 .keep_alive_continue:
     ; keep-alive: drop the consumed head, keep any pipelined bytes. The
     ; subtraction is guarded: an in_len below head_len would wrap into a
@@ -1901,6 +1998,7 @@ linnea_uring_run:
     jmp .wait
 .conn_close_now:
     mov qword [r12 + linnea_connection.h2_closing], 0
+    mov qword [r12 + linnea_connection.linger], 0
     call ring_check_overflow   ; a teardown is a regular, cheap place to notice
     call linnea_log_stamp
     lea rdi, [log_closed]
@@ -1963,10 +2061,9 @@ linnea_uring_run:
     mov dword [r12 + linnea_connection.fd], -1
     mov rdi, r12
     call linnea_connection_free
-    cmp dword [drain_flag], 0
-    je .wait
-    cmp qword [linnea_connection_active], 0
-    jne .wait
+    call drain_all_done
+    test eax, eax
+    jz .wait
     jmp .drained_exit          ; draining and that was the last one
 
 .init_fail:
@@ -2149,6 +2246,60 @@ linnea_uring_arm_recv:
     mov rdi, rbx               ; the timeout sqe must immediately follow
     pop rbx
     jmp linnea_uring_arm_link_timeout
+
+; arm_linger_recv(rdi=connection*)
+; The read that drains a lingering close: into in_buf from the top (the bytes
+; are dropped, in_len is not advanced), linked to the short linger timeout
+; rather than the idle one — the peer has our FIN and the whole response, so
+; all that is being waited for is its close.
+arm_linger_recv:
+    push rbx
+    mov rbx, rdi
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECV
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
+    mov ecx, [rbx + linnea_connection.fd]
+    mov [rax + LINNEA_SQE_FD], ecx
+    lea rcx, [rbx + linnea_connection.in_buf]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], LINNEA_CONN_IN_BUF
+    mov rcx, [rbx + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_RECV
+    mov rdx, [rbx + linnea_connection.gen]      ; see ud_pack
+    shl rdx, 32
+    or rcx, rdx
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    call linnea_uring_get_sqe_zeroed            ; the linked linger timeout
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_LINK_TIMEOUT
+    mov dword [rax + LINNEA_SQE_FD], -1
+    lea rcx, [linger_timeout]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1
+    mov rcx, [rbx + linnea_connection.index]
+    shl rcx, 8
+    or rcx, LINNEA_UD_TIMEOUT
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    pop rbx
+    ret
+
+; drain_all_done() -> eax = 1 when the worker is draining and nothing is left
+; to wait for: no TCP connection holds a slot, and no QUIC connection either.
+; The two pools drain independently, so the exit test must consult both — the
+; QUIC pool was once left out, and a worker with in-flight h3 responses exited
+; the moment its last TCP connection closed, hanging the peers mid-download.
+drain_all_done:
+    xor eax, eax
+    cmp dword [drain_flag], 0
+    je .dad_ret
+    cmp qword [linnea_connection_active], 0
+    jne .dad_ret
+    call linnea_quic_conn_active
+    test rax, rax
+    setz al
+    movzx eax, al
+.dad_ret:
+    ret
 
 ; linnea_uring_arm_recv_buf(rdi=connection*, rsi=buffer, rdx=len)
 ; A client recv into somewhere other than in_buf — the request-body relay
