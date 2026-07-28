@@ -538,6 +538,14 @@ linnea_uring_run:
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
+    ; A lingering close owns this connection's teardown and arms exactly one
+    ; recv at a time; running the h2p machinery here could arm a second client
+    ; op, which would still be in flight when .linger_done frees the slot — the
+    ; kernel would then write into a recycled buffer. During linger the upstream
+    ; completion is left to the close path (conn_close_now closes the fd and
+    ; frees the h2p slots), so just wait.
+    cmp qword [r12 + linnea_connection.linger], 0
+    jne .wait
     mov rdi, r12
     mov rsi, r14
     mov edx, [cqe_tag]         ; which upstream op completed
@@ -1180,6 +1188,10 @@ linnea_uring_run:
                                ; be serving someone else
     cmp qword [r12 + linnea_connection.h2_closing], 0
     jne .h2_closing_send       ; a straggler of a torn-down h2 connection
+    cmp qword [r12 + linnea_connection.linger], 0
+    jne .linger_straggler      ; a send finishing during a lingering close: the
+                               ; linger recv loop owns the teardown, so this
+                               ; completion only clears its busy flag and waits
     cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
     je .tls_on_send
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
@@ -1345,6 +1357,11 @@ linnea_uring_run:
     mov r14, [r12 + linnea_connection.close_reason]
     mov r15, [r12 + linnea_connection.close_reason_len]
     jmp .conn_close_now
+.linger_straggler:             ; a send completed during linger: clear its flag
+    mov qword [r12 + linnea_connection.h2_tx_busy], 0   ; and let the recv loop
+    jmp .wait                                           ; finish the teardown (a
+                                                        ; dead-end: reached only by
+                                                        ; the explicit jump in .on_send)
 .keep_alive_continue:
     ; keep-alive: drop the consumed head, keep any pipelined bytes. The
     ; subtraction is guarded: an in_len below head_len would wrap into a
