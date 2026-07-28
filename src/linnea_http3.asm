@@ -142,6 +142,13 @@ linnea_h3_read_headers:
     add r12, rax                     ; skip any other frame's payload
     jmp .frame
 .headers:
+    ; A HEADERS after the first is a trailer section (RFC 9114 4.1). We serve
+    ; from the request headers, not trailers, and must NOT let a trailer merge
+    ; into the request struct: a trailing `range`/`if-none-match`/etc. would
+    ; otherwise change the response the client never asked to change. Skip it
+    ; unread; the request was already parsed from the first HEADERS.
+    test r15d, r15d
+    jnz .trailer_skip
     mov rdi, r12                     ; QPACK field section
     mov rsi, rax
     mov rdx, r14
@@ -183,6 +190,9 @@ linnea_h3_read_headers:
 .data_skip:
     add r12, rax
     jmp .frame
+.trailer_skip:                       ; a dead-end reached only by the jump in
+    add r12, rax                     ; .headers: advance past the trailer's
+    jmp .frame                       ; field section without decoding it
 .done:
     test r15d, r15d
     jz .noheaders

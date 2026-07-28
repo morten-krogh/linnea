@@ -698,6 +698,22 @@ else
     check "dual-stack IPv6 test (skipped: deps unavailable)" 0
 fi
 
+# Q134: a trailing HEADERS frame (trailers) must not merge into the request
+# and change the response — a trailer "range: bytes=0-4" used to turn a
+# whole-file GET into a 206.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    rm -f test/linnea.log
+    $BIN test/configs/tls-h3-drain.json >/dev/null 2>&1 &
+    tr_master=$!
+    sleep 0.5
+    timeout 60 python3 test/quic/h3_trailer_test.py 47453 >/dev/null 2>&1
+    check "h3 (io_uring): trailers do not influence the response" $?
+    kill $tr_master 2>/dev/null
+    wait $tr_master 2>/dev/null
+    for p in $(pgrep -f 'tls-h3-drain'); do kill -9 $p 2>/dev/null; done
+    rm -f test/linnea.log
+fi
+
 # HTTP/3 GOAWAY on drain: a worker told to drain sends GOAWAY on its control
 # stream so the client opens no new requests, then exits. A single-worker config
 # keeps the signalling deterministic; the test kills the master itself.
