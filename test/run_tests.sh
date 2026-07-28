@@ -2142,7 +2142,12 @@ PY
 
     # M19: fuzz the frame layer and HPACK decoder — malformed streams must
     # never crash the worker; a live h2 GET still serves between batches.
-    timeout 60 python3 test/tls/fuzz_h2.py $CA 47446 120 >/dev/null 2>&1
+    # 150s, not 60: since unknown frame types are discarded rather than drawing
+    # a GOAWAY (RFC 9113 4.1), the server no longer ends a fuzzed connection
+    # early, so the client waits out its own timeout on more cases. The run is
+    # slower by design — it measures ~80s — and a crash still shows as a
+    # non-zero exit rather than as the timeout.
+    timeout 150 python3 test/tls/fuzz_h2.py $CA 47446 120 >/dev/null 2>&1
     check "http2 fuzz (malformed frames + HPACK survive, server serves)" $?
 
     # M20: strict stream-id validation + honouring SETTINGS_INITIAL_WINDOW_SIZE.

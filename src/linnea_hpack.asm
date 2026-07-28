@@ -255,6 +255,52 @@ linnea_hpack_decode:
 ; caller-saved registers plus [rbx]. name_eq clobbers rcx/rsi/rdi, so the
 ; value ptr/len are saved around each probe.
 emit_field:
+    ; RFC 9113 8.2.1 / RFC 9114 4.1.2: a field name must be lowercase and carry
+    ; no delimiter, and neither name nor value may contain CR, LF or NUL. This
+    ; is load-bearing, not pedantry. The proxy rebuild below writes the field
+    ; out as "name: value CRLF" straight into an HTTP/1.1 request head, so a CR
+    ; or LF in either half forges a second request at the backend — and an
+    ; uppercase name walks past the hop-by-hop checks further down, which
+    ; compare against lowercase constants, so a capitalised Transfer-Encoding
+    ; or Content-Length reaches the upstream and desynchronises it.
+    ; rax = name, rdx = name length, rsi = value, rdi = value length.
+    ; rcx and r8 are already this function's scratch (see name_eq).
+    xor ecx, ecx
+.ef_name_scan:
+    cmp rcx, rdx
+    jae .ef_name_ok
+    movzx r8d, byte [rax + rcx]
+    cmp r8b, 0x20
+    jb .ef_bad                       ; CR, LF, NUL, any control byte
+    cmp r8b, 0x7f
+    jae .ef_bad
+    cmp r8b, 'A'
+    jb .ef_name_next
+    cmp r8b, 'Z'
+    jbe .ef_bad                      ; uppercase: malformed, and a filter bypass
+.ef_name_next:
+    cmp r8b, ':'
+    jne .ef_name_inc
+    test rcx, rcx
+    jnz .ef_bad                      ; ':' only as a pseudo-header's first byte
+.ef_name_inc:
+    inc rcx
+    jmp .ef_name_scan
+.ef_name_ok:
+    xor ecx, ecx
+.ef_val_scan:
+    cmp rcx, rdi
+    jae .ef_val_ok
+    movzx r8d, byte [rsi + rcx]
+    cmp r8b, 0x0d
+    je .ef_bad
+    cmp r8b, 0x0a
+    je .ef_bad
+    test r8b, r8b
+    jz .ef_bad
+    inc rcx
+    jmp .ef_val_scan
+.ef_val_ok:
     mov r8, [rbx + linnea_h2_req.nheaders]
     inc r8
     cmp r8, LINNEA_HPACK_MAX_HEADERS
@@ -523,6 +569,9 @@ emit_field:
     ret
 .ef_limit:
     stc
+    ret
+.ef_bad:
+    stc                              ; a malformed field: reject the request
     ret
 
 ; name_eq(rax=ptr, rdx=len, r9=const ptr) -> ZF=1 if the len bytes match.
