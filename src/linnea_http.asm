@@ -297,12 +297,58 @@ mime_html:      db "text/html"
 mime_html_len   equ $ - mime_html
 mime_css:       db "text/css"
 mime_css_len    equ $ - mime_css
-mime_js:        db "application/javascript"
+mime_js:        db "text/javascript"
 mime_js_len     equ $ - mime_js
 mime_json:      db "application/json"
 mime_json_len   equ $ - mime_json
 mime_txt:       db "text/plain"
 mime_txt_len    equ $ - mime_txt
+mime_htm: db "text/html"
+mime_htm_len equ $ - mime_htm
+mime_mjs: db "text/javascript"
+mime_mjs_len equ $ - mime_mjs
+mime_wasm: db "application/wasm"
+mime_wasm_len equ $ - mime_wasm
+mime_webp: db "image/webp"
+mime_webp_len equ $ - mime_webp
+mime_avif: db "image/avif"
+mime_avif_len equ $ - mime_avif
+mime_woff2: db "font/woff2"
+mime_woff2_len equ $ - mime_woff2
+mime_woff: db "font/woff"
+mime_woff_len equ $ - mime_woff
+mime_ttf: db "font/ttf"
+mime_ttf_len equ $ - mime_ttf
+mime_otf: db "font/otf"
+mime_otf_len equ $ - mime_otf
+mime_mp3: db "audio/mpeg"
+mime_mp3_len equ $ - mime_mp3
+mime_ogg: db "audio/ogg"
+mime_ogg_len equ $ - mime_ogg
+mime_wav: db "audio/wav"
+mime_wav_len equ $ - mime_wav
+mime_m4a: db "audio/mp4"
+mime_m4a_len equ $ - mime_m4a
+mime_aac: db "audio/aac"
+mime_aac_len equ $ - mime_aac
+mime_flac: db "audio/flac"
+mime_flac_len equ $ - mime_flac
+mime_pdf: db "application/pdf"
+mime_pdf_len equ $ - mime_pdf
+mime_xml: db "application/xml"
+mime_xml_len equ $ - mime_xml
+mime_csv: db "text/csv"
+mime_csv_len equ $ - mime_csv
+mime_md: db "text/markdown"
+mime_md_len equ $ - mime_md
+mime_zip: db "application/zip"
+mime_zip_len equ $ - mime_zip
+mime_gz: db "application/gzip"
+mime_gz_len equ $ - mime_gz
+mime_map: db "application/json"
+mime_map_len equ $ - mime_map
+mime_wmanifest: db "application/manifest+json"
+mime_wmanifest_len equ $ - mime_wmanifest
 mime_mp4:       db "video/mp4"
 mime_mp4_len    equ $ - mime_mp4
 mime_webm:      db "video/webm"
@@ -336,6 +382,29 @@ ext_ico:        db "ico"
 ext_mp4:        db "mp4"
 ext_webm:       db "webm"
 ext_ogv:        db "ogv"
+ext_htm: db "htm"
+ext_mjs: db "mjs"
+ext_wasm: db "wasm"
+ext_webp: db "webp"
+ext_avif: db "avif"
+ext_woff2: db "woff2"
+ext_woff: db "woff"
+ext_ttf: db "ttf"
+ext_otf: db "otf"
+ext_mp3: db "mp3"
+ext_ogg: db "ogg"
+ext_wav: db "wav"
+ext_m4a: db "m4a"
+ext_aac: db "aac"
+ext_flac: db "flac"
+ext_pdf: db "pdf"
+ext_xml: db "xml"
+ext_csv: db "csv"
+ext_md: db "md"
+ext_zip: db "zip"
+ext_gz: db "gz"
+ext_map: db "map"
+ext_wmanifest: db "webmanifest"
 
 ; entries: ext ptr, ext len, mime ptr, mime len; terminated by a 0 ptr
 mime_table:
@@ -353,6 +422,29 @@ mime_table:
     dq ext_mp4,  3, mime_mp4,  mime_mp4_len
     dq ext_webm, 4, mime_webm, mime_webm_len
     dq ext_ogv,  3, mime_ogv,  mime_ogv_len
+    dq ext_htm, 3, mime_htm, mime_htm_len
+    dq ext_mjs, 3, mime_mjs, mime_mjs_len
+    dq ext_wasm, 4, mime_wasm, mime_wasm_len
+    dq ext_webp, 4, mime_webp, mime_webp_len
+    dq ext_avif, 4, mime_avif, mime_avif_len
+    dq ext_woff2, 5, mime_woff2, mime_woff2_len
+    dq ext_woff, 4, mime_woff, mime_woff_len
+    dq ext_ttf, 3, mime_ttf, mime_ttf_len
+    dq ext_otf, 3, mime_otf, mime_otf_len
+    dq ext_mp3, 3, mime_mp3, mime_mp3_len
+    dq ext_ogg, 3, mime_ogg, mime_ogg_len
+    dq ext_wav, 3, mime_wav, mime_wav_len
+    dq ext_m4a, 3, mime_m4a, mime_m4a_len
+    dq ext_aac, 3, mime_aac, mime_aac_len
+    dq ext_flac, 4, mime_flac, mime_flac_len
+    dq ext_pdf, 3, mime_pdf, mime_pdf_len
+    dq ext_xml, 3, mime_xml, mime_xml_len
+    dq ext_csv, 3, mime_csv, mime_csv_len
+    dq ext_md, 2, mime_md, mime_md_len
+    dq ext_zip, 3, mime_zip, mime_zip_len
+    dq ext_gz, 2, mime_gz, mime_gz_len
+    dq ext_map, 3, mime_map, mime_map_len
+    dq ext_wmanifest, 11, mime_wmanifest, mime_wmanifest_len
     dq 0
 
 section .bss

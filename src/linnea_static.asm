@@ -859,11 +859,34 @@ ext_ico_h2:  db "ico"
 ext_mp4_h2:  db "mp4"
 ext_webm_h2: db "webm"
 ext_ogv_h2:  db "ogv"
+ext_htm_h2: db "htm"
+ext_mjs_h2: db "mjs"
+ext_wasm_h2: db "wasm"
+ext_webp_h2: db "webp"
+ext_avif_h2: db "avif"
+ext_woff2_h2: db "woff2"
+ext_woff_h2: db "woff"
+ext_ttf_h2: db "ttf"
+ext_otf_h2: db "otf"
+ext_mp3_h2: db "mp3"
+ext_ogg_h2: db "ogg"
+ext_wav_h2: db "wav"
+ext_m4a_h2: db "m4a"
+ext_aac_h2: db "aac"
+ext_flac_h2: db "flac"
+ext_pdf_h2: db "pdf"
+ext_xml_h2: db "xml"
+ext_csv_h2: db "csv"
+ext_md_h2: db "md"
+ext_zip_h2: db "zip"
+ext_gz_h2: db "gz"
+ext_map_h2: db "map"
+ext_wmanifest_h2: db "webmanifest"
 mime_html_h2: db "text/html"
 mime_html_h2_len equ $ - mime_html_h2
 mime_css_h2:  db "text/css"
 mime_css_h2_len equ $ - mime_css_h2
-mime_js_h2:   db "application/javascript"
+mime_js_h2:   db "text/javascript"
 mime_js_h2_len equ $ - mime_js_h2
 mime_json_h2: db "application/json"
 mime_json_h2_len equ $ - mime_json_h2
@@ -879,6 +902,52 @@ mime_svg_h2:  db "image/svg+xml"
 mime_svg_h2_len equ $ - mime_svg_h2
 mime_ico_h2:  db "image/x-icon"
 mime_ico_h2_len equ $ - mime_ico_h2
+mime_htm_h2: db "text/html"
+mime_htm_h2_len equ $ - mime_htm_h2
+mime_mjs_h2: db "text/javascript"
+mime_mjs_h2_len equ $ - mime_mjs_h2
+mime_wasm_h2: db "application/wasm"
+mime_wasm_h2_len equ $ - mime_wasm_h2
+mime_webp_h2: db "image/webp"
+mime_webp_h2_len equ $ - mime_webp_h2
+mime_avif_h2: db "image/avif"
+mime_avif_h2_len equ $ - mime_avif_h2
+mime_woff2_h2: db "font/woff2"
+mime_woff2_h2_len equ $ - mime_woff2_h2
+mime_woff_h2: db "font/woff"
+mime_woff_h2_len equ $ - mime_woff_h2
+mime_ttf_h2: db "font/ttf"
+mime_ttf_h2_len equ $ - mime_ttf_h2
+mime_otf_h2: db "font/otf"
+mime_otf_h2_len equ $ - mime_otf_h2
+mime_mp3_h2: db "audio/mpeg"
+mime_mp3_h2_len equ $ - mime_mp3_h2
+mime_ogg_h2: db "audio/ogg"
+mime_ogg_h2_len equ $ - mime_ogg_h2
+mime_wav_h2: db "audio/wav"
+mime_wav_h2_len equ $ - mime_wav_h2
+mime_m4a_h2: db "audio/mp4"
+mime_m4a_h2_len equ $ - mime_m4a_h2
+mime_aac_h2: db "audio/aac"
+mime_aac_h2_len equ $ - mime_aac_h2
+mime_flac_h2: db "audio/flac"
+mime_flac_h2_len equ $ - mime_flac_h2
+mime_pdf_h2: db "application/pdf"
+mime_pdf_h2_len equ $ - mime_pdf_h2
+mime_xml_h2: db "application/xml"
+mime_xml_h2_len equ $ - mime_xml_h2
+mime_csv_h2: db "text/csv"
+mime_csv_h2_len equ $ - mime_csv_h2
+mime_md_h2: db "text/markdown"
+mime_md_h2_len equ $ - mime_md_h2
+mime_zip_h2: db "application/zip"
+mime_zip_h2_len equ $ - mime_zip_h2
+mime_gz_h2: db "application/gzip"
+mime_gz_h2_len equ $ - mime_gz_h2
+mime_map_h2: db "application/json"
+mime_map_h2_len equ $ - mime_map_h2
+mime_wmanifest_h2: db "application/manifest+json"
+mime_wmanifest_h2_len equ $ - mime_wmanifest_h2
 mime_mp4_h2:  db "video/mp4"
 mime_mp4_h2_len equ $ - mime_mp4_h2
 mime_webm_h2: db "video/webm"
@@ -902,6 +971,29 @@ mime_table_h2:
     dq ext_mp4_h2,  3, mime_mp4_h2,  mime_mp4_h2_len
     dq ext_webm_h2, 4, mime_webm_h2, mime_webm_h2_len
     dq ext_ogv_h2,  3, mime_ogv_h2,  mime_ogv_h2_len
+    dq ext_htm_h2, 3, mime_htm_h2, mime_htm_h2_len
+    dq ext_mjs_h2, 3, mime_mjs_h2, mime_mjs_h2_len
+    dq ext_wasm_h2, 4, mime_wasm_h2, mime_wasm_h2_len
+    dq ext_webp_h2, 4, mime_webp_h2, mime_webp_h2_len
+    dq ext_avif_h2, 4, mime_avif_h2, mime_avif_h2_len
+    dq ext_woff2_h2, 5, mime_woff2_h2, mime_woff2_h2_len
+    dq ext_woff_h2, 4, mime_woff_h2, mime_woff_h2_len
+    dq ext_ttf_h2, 3, mime_ttf_h2, mime_ttf_h2_len
+    dq ext_otf_h2, 3, mime_otf_h2, mime_otf_h2_len
+    dq ext_mp3_h2, 3, mime_mp3_h2, mime_mp3_h2_len
+    dq ext_ogg_h2, 3, mime_ogg_h2, mime_ogg_h2_len
+    dq ext_wav_h2, 3, mime_wav_h2, mime_wav_h2_len
+    dq ext_m4a_h2, 3, mime_m4a_h2, mime_m4a_h2_len
+    dq ext_aac_h2, 3, mime_aac_h2, mime_aac_h2_len
+    dq ext_flac_h2, 4, mime_flac_h2, mime_flac_h2_len
+    dq ext_pdf_h2, 3, mime_pdf_h2, mime_pdf_h2_len
+    dq ext_xml_h2, 3, mime_xml_h2, mime_xml_h2_len
+    dq ext_csv_h2, 3, mime_csv_h2, mime_csv_h2_len
+    dq ext_md_h2, 2, mime_md_h2, mime_md_h2_len
+    dq ext_zip_h2, 3, mime_zip_h2, mime_zip_h2_len
+    dq ext_gz_h2, 2, mime_gz_h2, mime_gz_h2_len
+    dq ext_map_h2, 3, mime_map_h2, mime_map_h2_len
+    dq ext_wmanifest_h2, 11, mime_wmanifest_h2, mime_wmanifest_h2_len
     dq 0
 
 

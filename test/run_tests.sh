@@ -1204,6 +1204,29 @@ check_http "traversal blocked" "400 Bad Request" "$(raw_http 'GET /../secret HTT
 printf 'not really a video' > test/www/clip.mp4
 resp=$(raw_http 'GET /clip.mp4 HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "mime: .mp4 is video/mp4" "Content-Type: video/mp4" "$resp"
+
+# Q130: the types a modern site cannot do without. The first three are hard
+# failures rather than cosmetics — WebAssembly refuses to instantiate without
+# application/wasm, an ES module served as octet-stream is rejected outright
+# under the nosniff we send, and a .htm answered as octet-stream downloads
+# instead of rendering. Both tables are checked, since h1 and h2/h3 keep
+# separate ones and a type added to only one is the likely mistake.
+mime_probe() {                 # mime_probe <ext> <expected type>
+    printf 'x' > "test/www/probe.$1"
+    resp=$(raw_http "GET /probe.$1 HTTP/1.1\r\nHost: one.test\r\n\r\n")
+    check_http "mime: .$1 is $2" "Content-Type: $2" "$resp"
+    rm -f "test/www/probe.$1"
+}
+mime_probe wasm        application/wasm
+mime_probe mjs         text/javascript
+mime_probe htm         text/html
+mime_probe woff2       font/woff2
+mime_probe webp        image/webp
+mime_probe avif        image/avif
+mime_probe mp3         audio/mpeg
+mime_probe pdf         application/pdf
+mime_probe webmanifest application/manifest+json
+mime_probe js          text/javascript
 resp=$(raw_http 'GET /clip.mp4 HTTP/1.1\r\nHost: one.test\r\nRange: bytes=0-3\r\n\r\n')
 check_http "mime: a 206 keeps the video type" "Content-Type: video/mp4" "$resp"
 check_http "mime: the 206 is a real partial" "206 Partial Content" "$resp"
@@ -2407,12 +2430,26 @@ PYEOF
     timeout 90 python3 test/tls/h2_authority.py $CA 47443 >/dev/null 2>&1
     check "http2 authority rules (stream errors, connection survives)" $?
 
+    # Q130: h2/h3 read a SEPARATE mime table from h1's, so the types are
+    # checked here too — a type added to one table only is the easy mistake.
+    printf 'x' > test/www/probe.wasm
+    ct=$(timeout 10 curl -s -D - -o /dev/null --http2 --cacert $CA \
+        --resolve localhost:47443:127.0.0.1 https://localhost:47443/probe.wasm \
+        | grep -i '^content-type' | tr -d '\r')
+    printf '%s' "$ct" | grep -qF "application/wasm"
+    check "http2 mime table has the same types (.wasm)" $?
+    rm -f test/www/probe.wasm
+
     # Q120: h2 requests reach the access log — static and proxied alike, in
     # h1's exact format. Before this only h1 was logged, so most real browser
     # traffic was invisible.
-    grep -qE 'request localhost from [0-9.:]+ "GET /hello.txt HTTP/2" 200 ' "$LOG" \
-        && grep -qE '"GET /api/simple HTTP/2" 200 ' "$LOG"
-    check "http2 requests access-logged (static + proxied)" $?
+    # checked separately: as one AND-ed grep a red run could not say which
+    # half was missing, and the static and proxied lines are emitted by
+    # different code (h2_serve's funnel vs h2p_finish_stream).
+    grep -qE 'request localhost from [0-9.:]+ "GET /hello.txt HTTP/2" 200 ' "$LOG"
+    check "http2 static request access-logged" $?
+    grep -qE '"GET /api/simple HTTP/2" 200 ' "$LOG"
+    check "http2 proxied request access-logged" $?
 
     # Body-phase slowloris (Q119): head_timeout used to stop at the request
     # head, so a client trickling a proxied request body — or sitting silent
