@@ -1477,6 +1477,40 @@ grep -qF 'worker drained' "$LOG"
 check "drain logged" $?
 rm -f /tmp/drain_out test/www/drain.bin "$LOG"
 
+# --- accepts spread across the workers (Q122): each worker owns its own
+# SO_REUSEPORT listener set, so the kernel hashes connections across them.
+# Before, every accept landed on one worker's ring and multi-core TCP
+# scaling was theoretical. 24 held connections must reach BOTH workers.
+rm -f "$LOG"
+$BIN test/configs/listen.json >/dev/null 2>&1 &
+spread_master=$!
+sleep 0.3
+spread_workers=$(pgrep -P $spread_master | sort | tr '\n' ' ')
+python3 - <<'PYEOF2' &
+import socket, time
+socks = []
+for i in range(24):
+    s = socket.create_connection(("127.0.0.1", 47080), timeout=5)
+    s.sendall(b"GET /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n")
+    s.recv(200)
+    socks.append(s)
+time.sleep(2.5)
+for s in socks:
+    s.close()
+PYEOF2
+spread_holder=$!
+sleep 1.2
+spread_ok=1
+for w in $spread_workers; do
+    n=$(ls /proc/$w/fd 2>/dev/null | wc -l)
+    [ "$n" -gt 12 ] || spread_ok=0
+done
+[ "$spread_ok" = 1 ] && [ -n "$spread_workers" ]
+check "accepts spread across the workers (all above baseline)" $?
+wait $spread_holder
+kill $spread_master 2>/dev/null
+wait $spread_master 2>/dev/null
+
 # --- config-check mode: `linnea -t` accepts good, rejects bad ---
 $BIN -t test/configs/listen.json >/dev/null 2>&1
 check "config check accepts a good config" $?

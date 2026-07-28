@@ -3,26 +3,30 @@
 ; adopt) listeners -> fork workers -> supervise.
 ;
 ; Multi-process model: the master parses the config, loads certs and
-; keys, and binds every listener exactly once, then forks
-; config.workers workers ("workers" in the config; the default is one
-; per online CPU). Each worker inherits the listening fds and runs the
-; whole event loop; the kernel completes each incoming connection on
-; exactly one worker's accept. The master serves no traffic: it waits on
-; its workers and respawns any that die.
+; keys, and binds one SO_REUSEPORT listener set per worker (after a
+; plain-bind probe per port, so a foreign holder still fails fast), then
+; forks config.workers workers ("workers" in the config; the default is
+; one per online CPU). Each worker accepts on its own listeners, so the
+; kernel's reuseport hash spreads connections across the workers instead
+; of one ring winning every accept. The master serves no traffic: it
+; waits on its workers and respawns any that die (their sockets live on
+; in the master's fd table, so a respawn resumes the same listeners).
 ;
 ; Shutdown: every worker carries PR_SET_PDEATHSIG(SIGTERM), so a master
 ; death takes them with it; a SIGTERM to the group drains them (M11).
 ;
 ; Zero-downtime binary upgrade (SIGUSR2, i.e. `systemctl reload`): the
 ; master re-execs the new binary in place — same PID, so systemd keeps
-; tracking it. The listening sockets have no CLOEXEC, so they survive
-; the exec; the new master adopts them (never closing them, so no
-; connection is refused), spawns new workers, then SIGQUITs the old
-; workers, which drain with the old code still mapped. Before committing
+; tracking it. The new generation binds its own reuseport listener group
+; alongside the draining one's (the old sockets leave the group as the
+; old workers close them), spawns new workers, then SIGQUITs the old
+; ones, which drain with the old code still mapped. Before committing
 ; the master runs the new binary in config-check mode (`-t`); if it
 ; rejects the config the upgrade is refused and the old generation keeps
-; serving. A hot upgrade assumes the listener set is unchanged — a
-; config that adds or moves listeners needs a full restart instead.
+; serving. Legacy fallback: an upgrade env carrying real listener fds
+; (a pre-Q122 generation) is adopted shared, exactly as before, and that
+; chain persists — reuseport cannot join a non-reuseport socket's port —
+; until a full restart.
 
 default rel
 
@@ -37,6 +41,9 @@ extern linnea_bpf_probe
 extern linnea_bpf_reuseport_setup
 extern linnea_bpf_map_fd
 extern linnea_bpf_prog_fd
+extern linnea_network_probe_owner
+extern linnea_listen_reuseport
+extern linnea_listen_quiet
 extern linnea_quic_reset_secret_init
 extern linnea_quic_retry_secret_init
 extern linnea_worker_index
@@ -112,7 +119,21 @@ steer_base:     resq 1                   ; this generation's steering-index base
 adopt_bpf_map:  resq 1                   ; inherited map fd (valid if adopt_bpf_ok)
 adopt_bpf_prog: resq 1                   ; inherited program fd
 adopt_bpf_ok:   resq 1                   ; 1 = the env carried a bpf section
-adopt_fd_table: resd LINNEA_MAX_SERVERS  ; inherited listener fds
+adopt_fd_table: resd LINNEA_MAX_SERVERS  ; inherited listener fds (legacy)
+; One listener set per worker (Q122): the master binds workers x servers
+; SO_REUSEPORT sockets so the kernel spreads accepted connections, and each
+; child rewrites its config's listen_fds from its row after the fork. The
+; master keeps every fd for respawns; they are FD_CLOEXEC, so a hot upgrade's
+; execve drops them and the next generation binds its own group alongside.
+; legacy_shared marks the fallback: an upgrade env that carried real fds (a
+; pre-Q122 generation) adopts the old shared sockets exactly as before — and
+; must hand THOSE on in the old format too, because a fresh reuseport group
+; cannot coexist with them.
+worker_listen_fds: resd LINNEA_MAX_WORKERS * LINNEA_MAX_SERVERS
+legacy_shared:  resq 1                   ; 1 = shared adopted listeners
+env_no_fds:     resq 1                   ; 1 = the env carried no listener fds
+adopt_matrix:   resq 1                   ; 1 = the env carried a whole matrix
+adopt_workers:  resq 1                   ; how many rows it carried
 wait_status:    resd 1
 check_status:   resd 1
 sa_buf:         resb 32                  ; struct kernel_sigaction
@@ -186,18 +207,33 @@ _start:
     lea rdi, [linnea_config_instance]     ; CPUID gate + cert/key loading
     call linnea_tls_setup
 
-    ; listeners: bind fresh, or adopt the fds inherited across an upgrade
+    ; listeners: one SO_REUSEPORT set per worker, so accepts spread. A fresh
+    ; start probes each port first (a plain bind, closed at once) so another
+    ; program holding it still fails fast; an upgrade skips the probe — the
+    ; draining generation legitimately holds every port. An upgrade env that
+    ; carries real fds comes from a pre-Q122 generation: adopt them, shared,
+    ; exactly as before (legacy_shared).
     cmp qword [upgrade_env], 0
     jne .adopt_listeners
-    lea rdi, [linnea_config_instance]
-    xor esi, esi                          ; bind
-    call linnea_network_listen_all
+    call probe_ports
+    call bind_worker_listeners
     jmp .listeners_ready
 .adopt_listeners:
-    call parse_upgrade_env                ; fills adopt_fd_table + old_pids
-    lea rdi, [linnea_config_instance]
+    call parse_upgrade_env                ; fills the fd tables + old_pids
+    cmp qword [adopt_matrix], 0
+    jne .adopt_rows
+    cmp qword [env_no_fds], 0
+    jne .bind_fresh_rows
+    lea rdi, [linnea_config_instance]     ; a pre-Q122 generation: shared fds
     lea rsi, [adopt_fd_table]
     call linnea_network_listen_all
+    mov qword [legacy_shared], 1
+    jmp .listeners_ready
+.bind_fresh_rows:
+    call bind_worker_listeners
+    jmp .listeners_ready
+.adopt_rows:
+    call adopt_worker_listeners
 .listeners_ready:
 
     mov eax, LINNEA_SYS_GETPID
@@ -366,6 +402,23 @@ spawn_worker:
     mov rax, [steer_base]
     add rax, rbx
     mov [linnea_worker_index], rax
+    ; this worker's own listener set (its row of worker_listen_fds), unless
+    ; the generation runs on legacy shared adopted sockets
+    cmp qword [legacy_shared], 0
+    jne .lfd_done
+    xor ecx, ecx
+.lfd_loop:
+    cmp rcx, [linnea_config_instance + linnea_config.server_count]
+    jae .lfd_done
+    mov rax, rbx
+    imul rax, rax, LINNEA_MAX_SERVERS
+    add rax, rcx
+    mov eax, [worker_listen_fds + rax * 4]
+    imul rdx, rcx, linnea_config_server_size
+    mov [rdx + linnea_config_instance + linnea_config.servers + linnea_config_server.listen_fd], eax
+    inc rcx
+    jmp .lfd_loop
+.lfd_done:
     mov rdi, [linnea_config_instance + linnea_config.max_connections]
     call linnea_connections_init
     mov rdi, [linnea_config_instance + linnea_config.max_connections]
@@ -503,6 +556,7 @@ do_upgrade:
 build_upgrade_env:
     push rbx
     push r12
+    push r13
     lea rbx, [env_buf]
     lea rsi, [env_prefix]      ; copy the prefix
     mov ecx, env_prefix_len
@@ -513,6 +567,49 @@ build_upgrade_env:
     inc rbx
     dec ecx
     jnz .copy_pfx
+    ; The listener matrix, "m<workers>:fd:fd:..." row-major: the next
+    ; generation keeps every socket open, so nothing the kernel already queued
+    ; is reset. A legacy generation (still on pre-Q122 shared sockets) hands
+    ; those on in the old one-fd-per-server format instead.
+    cmp qword [legacy_shared], 0
+    jne .fd_legacy
+    mov rax, [linnea_config_instance + linnea_config.workers]
+    imul rax, [linnea_config_instance + linnea_config.server_count]
+    cmp rax, 512                ; the env buffer holds this many comfortably
+    ja .fd_toobig               ; absurd worker count: bind fresh instead
+    mov byte [rbx], 'm'
+    inc rbx
+    mov rdi, [linnea_config_instance + linnea_config.workers]
+    mov rsi, rbx
+    call linnea_string_from_u64
+    add rbx, rax
+    xor r12d, r12d              ; row
+.fdm_row:
+    cmp r12, [linnea_config_instance + linnea_config.workers]
+    jae .fds_done
+    xor r13d, r13d              ; column
+.fdm_col:
+    cmp r13, [linnea_config_instance + linnea_config.server_count]
+    jae .fdm_next
+    mov byte [rbx], ':'
+    inc rbx
+    mov rax, r12
+    imul rax, rax, LINNEA_MAX_SERVERS
+    add rax, r13
+    mov edi, [worker_listen_fds + rax * 4]
+    mov rsi, rbx
+    call linnea_string_from_u64
+    add rbx, rax
+    inc r13
+    jmp .fdm_col
+.fdm_next:
+    inc r12
+    jmp .fdm_row
+.fd_toobig:
+    mov byte [rbx], '-'
+    inc rbx
+    jmp .fds_done
+.fd_legacy:
     xor r12d, r12d
 .fd_loop:
     cmp r12, [linnea_config_instance + linnea_config.server_count]
@@ -573,6 +670,7 @@ build_upgrade_env:
     add rbx, rax
 .env_done:
     mov byte [rbx], 0
+    pop r13
     pop r12
     pop rbx
     ret
@@ -582,7 +680,55 @@ build_upgrade_env:
 ; the config's server count (a changed listener set cannot be adopted).
 parse_upgrade_env:
     push rbx
+    push r12
+    push r13
+    push r14
     mov rsi, [upgrade_env]
+    cmp byte [rsi], '-'        ; no fds handed over: bind a fresh group
+    jne .fd_try_matrix
+    inc rsi
+    mov qword [env_no_fds], 1
+    cmp byte [rsi], ';'
+    jne .topology
+    inc rsi
+    jmp .fds_over
+.fd_try_matrix:
+    cmp byte [rsi], 'm'        ; "m<workers>:fd:fd:..." — the listener matrix
+    jne .fd_have
+    inc rsi
+    call parse_dec             ; how many rows follow
+    cmp rax, LINNEA_MAX_WORKERS
+    ja .topology
+    mov [adopt_workers], rax
+    mov r13, rax
+    xor r12d, r12d             ; row
+.fdm_row:
+    cmp r12, r13
+    jae .fdm_done
+    xor r14d, r14d             ; column
+.fdm_col:
+    cmp r14, [linnea_config_instance + linnea_config.server_count]
+    jae .fdm_next
+    cmp byte [rsi], ':'
+    jne .topology              ; a truncated matrix cannot be trusted
+    inc rsi
+    call parse_dec
+    mov rcx, r12
+    imul rcx, rcx, LINNEA_MAX_SERVERS
+    add rcx, r14
+    mov [worker_listen_fds + rcx * 4], eax
+    inc r14
+    jmp .fdm_col
+.fdm_next:
+    inc r12
+    jmp .fdm_row
+.fdm_done:
+    mov qword [adopt_matrix], 1
+    cmp byte [rsi], ';'
+    jne .topology
+    inc rsi
+    jmp .fds_over
+.fd_have:
     xor r12d, r12d             ; fd index
 .fd_loop:
     ; the value comes from the environment, so bound the write: more entries
@@ -603,6 +749,7 @@ parse_upgrade_env:
     inc rsi
     cmp r12, [linnea_config_instance + linnea_config.server_count]
     jne .topology
+.fds_over:
     xor r12d, r12d             ; pid index
 .pid_loop:
     cmp byte [rsi], 0
@@ -644,12 +791,154 @@ parse_upgrade_env:
     mov [steer_base], rax
     mov qword [adopt_bpf_ok], 1
 .no_bpf:
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 .topology:
     lea rdi, [msg_topology]
     mov esi, msg_topology_len
     jmp linnea_error_exit
+
+; probe_ports — bind each server's port once without SO_REUSEPORT (closed at
+; once): a reuseport bind joins any same-uid group silently, so only this
+; plain bind still fails fast when another program holds the port. Sequential
+; probes of the same port never collide with each other (each closes first).
+probe_ports:
+    push rbx
+    xor ebx, ebx
+.pp_loop:
+    cmp rbx, [linnea_config_instance + linnea_config.server_count]
+    jae .pp_done
+    imul rdi, rbx, linnea_config_server_size
+    lea rdi, [rdi + linnea_config_instance + linnea_config.servers]
+    call linnea_network_probe_owner
+    inc rbx
+    jmp .pp_loop
+.pp_done:
+    pop rbx
+    ret
+
+; bind_worker_listeners — one SO_REUSEPORT listener set per worker: run the
+; ordinary bind pass once per worker and keep each pass's fds as that
+; worker's row. The config's listen_fd fields end up holding the last row;
+; every child overwrites them with its own row after the fork, so that is
+; scratch, not state. The master keeps all the fds for respawns.
+bind_worker_listeners:
+    push rbx
+    push r12
+    push r13
+    mov dword [linnea_listen_reuseport], 1
+    xor r12d, r12d             ; worker row
+.bw_worker:
+    cmp r12, [linnea_config_instance + linnea_config.workers]
+    jae .bw_done
+    lea rdi, [linnea_config_instance]
+    xor esi, esi               ; bind fresh
+    call linnea_network_listen_all
+    mov dword [linnea_listen_quiet], 1   ; one "listening on" line per port
+    xor r13d, r13d             ; server column
+.bw_copy:
+    cmp r13, [linnea_config_instance + linnea_config.server_count]
+    jae .bw_next
+    imul rax, r13, linnea_config_server_size
+    mov eax, [rax + linnea_config_instance + linnea_config.servers + linnea_config_server.listen_fd]
+    mov rcx, r12
+    imul rcx, rcx, LINNEA_MAX_SERVERS
+    add rcx, r13
+    mov [worker_listen_fds + rcx * 4], eax
+    inc r13
+    jmp .bw_copy
+.bw_next:
+    inc r12
+    jmp .bw_worker
+.bw_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; adopt_worker_listeners — take over the previous generation's listener
+; matrix. Every socket stays OPEN across the upgrade, which is the whole
+; point: a connection the kernel already queued on one is accepted by the new
+; worker that inherits it, where binding a fresh group instead would reset it
+; (the pre-Q122 shared listener had this property for free). Rows are adopted
+; through the ordinary bind pass in adopt mode, so vhost fd sharing and the
+; listener_owner flags are derived exactly as on a cold start.
+;
+; A config whose worker count changed still upgrades: extra rows are bound
+; fresh, surplus ones closed — leaving a surplus socket open would keep it in
+; the reuseport group with nobody accepting on it, a black hole for every
+; connection the kernel hashed there.
+adopt_worker_listeners:
+    push rbx
+    push r12
+    push r13
+    mov dword [linnea_listen_reuseport], 1
+    xor r12d, r12d
+.aw_row:
+    cmp r12, [linnea_config_instance + linnea_config.workers]
+    jae .aw_surplus
+    cmp r12, [adopt_workers]
+    jae .aw_fresh_row                ; more workers than the old generation had
+    mov rax, r12
+    imul rax, rax, LINNEA_MAX_SERVERS
+    lea rsi, [worker_listen_fds + rax * 4]
+    lea rdi, [linnea_config_instance]
+    call linnea_network_listen_all   ; adopt this row
+    jmp .aw_store
+.aw_fresh_row:
+    lea rdi, [linnea_config_instance]
+    xor esi, esi                     ; bind a fresh set for the new row
+    call linnea_network_listen_all
+.aw_store:
+    mov dword [linnea_listen_quiet], 1   ; one listener line for the generation
+    xor r13d, r13d
+.aw_copy:
+    cmp r13, [linnea_config_instance + linnea_config.server_count]
+    jae .aw_next
+    imul rax, r13, linnea_config_server_size
+    mov eax, [rax + linnea_config_instance + linnea_config.servers + linnea_config_server.listen_fd]
+    mov rcx, r12
+    imul rcx, rcx, LINNEA_MAX_SERVERS
+    add rcx, r13
+    mov [worker_listen_fds + rcx * 4], eax
+    inc r13
+    jmp .aw_copy
+.aw_next:
+    inc r12
+    jmp .aw_row
+.aw_surplus:
+    ; rows the old generation had and this one does not: close them, or they
+    ; stay in the reuseport group unaccepted
+    cmp r12, [adopt_workers]
+    jae .aw_done
+    xor r13d, r13d
+.aw_close:
+    cmp r13, [linnea_config_instance + linnea_config.server_count]
+    jae .aw_close_next
+    imul rax, r13, linnea_config_server_size
+    lea rax, [rax + linnea_config_instance + linnea_config.servers]
+    cmp dword [rax + linnea_config_server.listener_owner], 0
+    je .aw_close_skip                ; a vhost repeats its owner's fd
+    mov rcx, r12
+    imul rcx, rcx, LINNEA_MAX_SERVERS
+    add rcx, r13
+    mov edi, [worker_listen_fds + rcx * 4]
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+.aw_close_skip:
+    inc r13
+    jmp .aw_close
+.aw_close_next:
+    inc r12
+    jmp .aw_surplus
+.aw_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; clear_cloexec(rdi = fd) — drop FD_CLOEXEC so the fd survives an execve.
 clear_cloexec:
@@ -859,8 +1148,13 @@ ensure_fd_limit:
     ; log, the ring, the signalfd and the BPF fds
     mov rbx, [linnea_config_instance + linnea_config.max_connections]
     add rbx, [linnea_config_instance + linnea_config.max_upstream]
+    ; TCP listeners: one per server PER WORKER (the master holds every row for
+    ; respawns); plus each worker's own UDP socket and inherited copies
     mov rax, [linnea_config_instance + linnea_config.server_count]
-    lea rbx, [rbx + rax * 2]   ; a TCP and a UDP listener per server
+    mov rcx, [linnea_config_instance + linnea_config.workers]
+    add rcx, 2
+    imul rax, rcx
+    add rbx, rax
     add rbx, 32                ; slack for the fixed descriptors
     ; read the current limit
     xor edi, edi               ; pid 0 = us

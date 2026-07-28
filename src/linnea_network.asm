@@ -10,6 +10,9 @@ default rel
 %include "linnea_config.inc"
 
 global linnea_network_listen_all
+global linnea_network_probe_owner
+global linnea_listen_reuseport
+global linnea_listen_quiet
 global linnea_network_peer_format
 global linnea_network_addr_format
 global linnea_network_peer_addr
@@ -55,6 +58,13 @@ sockopt_rcvbuf:     dd 4194304
 
 section .bss
 
+; 1 = listener_create binds SO_REUSEPORT + FD_CLOEXEC: one listener set per
+; worker, so the kernel spreads accepted connections across the workers
+; instead of one ring winning them all. Off for the legacy adopted-fd path.
+linnea_listen_reuseport: resd 1
+; 1 = bind silently. The per-worker listener sets are the same sockets from
+; the operator's point of view, so only the first pass logs "listening on".
+linnea_listen_quiet: resd 1
 sockaddr_scratch:   resb LINNEA_SOCKADDR_IN6_SIZE
 adopt_fds:          resq 1     ; fd array for a hot upgrade, or 0
 
@@ -129,6 +139,76 @@ linnea_network_listen_all:
     pop rbx
     ret
 
+; linnea_network_probe_owner(rdi=server*) — bind the server's port WITHOUT
+; SO_REUSEPORT and close the socket at once. A reuseport bind happily joins
+; any same-uid group, so it alone would never notice a port that some other
+; program already holds; this plain bind is the fail-fast check the shared
+; listener used to provide. Only called on a fresh start — during a hot
+; upgrade the previous generation legitimately holds the port.
+linnea_network_probe_owner:
+    push rbx
+    push r12
+    mov rbx, rdi
+    lea rsi, [sockaddr_scratch]
+    call linnea_network_fill_sockaddr6
+    cmp rax, -1
+    je .pr_bad_host
+    mov eax, LINNEA_SYS_SOCKET
+    mov edi, LINNEA_AF_INET6
+    mov esi, LINNEA_SOCK_STREAM
+    xor edx, edx
+    syscall
+    cmp rax, -4095
+    jae .pr_socket_fail
+    mov r12, rax
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, r12
+    mov esi, LINNEA_IPPROTO_IPV6
+    mov edx, LINNEA_IPV6_V6ONLY
+    lea r10, [sockopt_zero]
+    mov r8d, 4
+    syscall
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, r12
+    mov esi, LINNEA_SOL_SOCKET
+    mov edx, LINNEA_SO_REUSEADDR
+    lea r10, [sockopt_one]
+    mov r8d, 4
+    syscall
+    mov eax, LINNEA_SYS_BIND
+    mov rdi, r12
+    lea rsi, [sockaddr_scratch]
+    mov edx, LINNEA_SOCKADDR_IN6_SIZE
+    syscall
+    cmp rax, -4095
+    jae .pr_bind_fail
+    mov edi, r12d
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    pop r12
+    pop rbx
+    ret
+.pr_bad_host:
+    lea rdi, [msg_bad_host]
+    mov esi, msg_bad_host_len
+    mov rdx, rbx
+    xor ecx, ecx
+    jmp linnea_error_server
+.pr_socket_fail:
+    neg rax
+    mov rcx, rax
+    lea rdi, [msg_socket]
+    mov esi, msg_socket_len
+    mov rdx, rbx
+    jmp linnea_error_server
+.pr_bind_fail:
+    neg rax
+    mov rcx, rax
+    lea rdi, [msg_bind]
+    mov esi, msg_bind_len
+    mov rdx, rbx
+    jmp linnea_error_server
+
 ; linnea_network_listener_create(rdi=server*)
 ; linnea_network_quic_listener(rdi=server*) -> rax = udp fd, or -1 on failure.
 ; The HTTP/3 counterpart of the TCP listener: the same host and port, but a
@@ -170,8 +250,9 @@ linnea_network_quic_listener:
     ; datagram to one socket by hashing its 4-tuple, so all packets from a
     ; given client reach the same worker — the affinity a QUIC connection
     ; needs, since each worker holds its own connection pool. The TCP
-    ; listener is still bound once, by the master, without SO_REUSEPORT, so
-    ; a second linnea on the same port still fails fast there.
+    ; listeners work the same way since Q122; the master's port PROBE (a
+    ; plain bind, immediately closed) is what still fails fast when some
+    ; other program holds the port.
     mov eax, LINNEA_SYS_SETSOCKOPT
     mov rdi, r12
     mov esi, LINNEA_SOL_SOCKET
@@ -261,6 +342,23 @@ linnea_network_listener_create:
     syscall
     cmp rax, -4095
     jae .sockopt_fail
+    cmp dword [linnea_listen_reuseport], 0
+    je .no_rp
+    ; one listener per worker: SO_REUSEPORT groups them and the kernel hashes
+    ; each connection to one, spreading the accepts. Deliberately NOT
+    ; close-on-exec: a hot upgrade hands the whole matrix to the next
+    ; generation, which keeps every socket open, so a connection already
+    ; queued on one is still accepted (closing it would reset that client).
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, r12
+    mov esi, LINNEA_SOL_SOCKET
+    mov edx, LINNEA_SO_REUSEPORT
+    lea r10, [sockopt_one]
+    mov r8d, 4
+    syscall
+    cmp rax, -4095
+    jae .sockopt_fail
+.no_rp:
     mov eax, LINNEA_SYS_BIND
     mov rdi, r12
     lea rsi, [sockaddr_scratch]
@@ -275,6 +373,8 @@ linnea_network_listener_create:
     cmp rax, -4095
     jae .listen_fail
     mov [rbx + linnea_config_server.listen_fd], r12d
+    cmp dword [linnea_listen_quiet], 0
+    jne .lc_quiet
     call linnea_log_stamp
     lea rdi, [log_listen]
     mov esi, log_listen_len
@@ -296,6 +396,7 @@ linnea_network_listener_create:
     lea rdi, [log_close]
     mov esi, log_close_len
     call linnea_log_write
+.lc_quiet:
     pop r12
     pop rbx
     ret
@@ -340,6 +441,8 @@ linnea_network_listener_create:
 linnea_network_listener_adopt:
     push rbx
     mov rbx, rdi
+    cmp dword [linnea_listen_quiet], 0
+    jne .la_quiet
     call linnea_log_stamp
     lea rdi, [log_adopt]
     mov esi, log_adopt_len
@@ -361,6 +464,7 @@ linnea_network_listener_adopt:
     lea rdi, [log_close]
     mov esi, log_close_len
     call linnea_log_write
+.la_quiet:
     pop rbx
     ret
 

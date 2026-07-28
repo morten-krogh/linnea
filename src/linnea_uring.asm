@@ -657,6 +657,34 @@ linnea_uring_run:
     lea rdi, [log_drain]
     mov esi, log_drain_len
     call linnea_log_write
+    ; Leave the reuseport group FIRST: until this worker's listeners are
+    ; closed the kernel keeps hashing new connections to them, and a draining
+    ; worker refuses what it accepts — during a hot upgrade those are exactly
+    ; the requests the new generation should have got. Closing hands the group
+    ; back to the sockets still serving. (Anything already queued on these
+    ; sockets is reset; that window is microseconds, against a whole drain.)
+    ; The fd is cleared so the accept completion below does not close it a
+    ; second time — by then the number may belong to someone else entirely.
+    xor r13d, r13d
+.close_listeners:
+    cmp r13, [rbx + linnea_config.server_count]
+    jae .listeners_closed
+    imul rax, r13, linnea_config_server_size
+    lea rax, [rbx + rax + linnea_config.servers]
+    cmp dword [rax + linnea_config_server.listener_owner], 0
+    je .close_listeners_next
+    mov edi, [rax + linnea_config_server.listen_fd]
+    cmp edi, -1
+    je .close_listeners_next
+    mov dword [rax + linnea_config_server.listen_fd], -1
+    push rax
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    pop rax
+.close_listeners_next:
+    inc r13
+    jmp .close_listeners
+.listeners_closed:
     ; tell connected h3 peers we are going away before anything else, then
     ; close the ones with nothing in flight right now — a `systemctl stop`
     ; with only an idle browser tab connected should say goodbye and exit
@@ -838,8 +866,12 @@ linnea_uring_run:
     imul rax, r13, linnea_config_server_size
     lea rax, [rbx + rax + linnea_config.servers]
     mov edi, [rax + linnea_config_server.listen_fd]
+    cmp edi, -1
+    je .accept_drain_closed    ; the drain already closed it
+    mov dword [rax + linnea_config_server.listen_fd], -1
     mov eax, LINNEA_SYS_CLOSE
     syscall
+.accept_drain_closed:
     jmp .wait
 .accept_err:
     ; Report the first failure of a streak only: the peer chooses how often it
