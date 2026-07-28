@@ -51,7 +51,7 @@ global linnea_h3_body_len
 section .rodata
 idx_name:      db "index.html"
 idx_name_len   equ $ - idx_name
-txt_plain:     db "text/plain"
+txt_plain:     db "text/plain; charset=utf-8"
 txt_plain_len  equ $ - txt_plain
 body_404:      db "404 Not Found", 10
 body_404_len   equ $ - body_404

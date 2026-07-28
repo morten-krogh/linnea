@@ -31,9 +31,9 @@ def rvlq(b, i):
     return v, i + n
 
 
-PATHS = {0: ("/hello.txt", b"text/plain"),
-         4: ("/style.css", b"text/css"),
-         8: ("/index.html", b"text/html")}
+PATHS = {0: ("/hello.txt", b"text/plain; charset=utf-8"),
+         4: ("/style.css", b"text/css; charset=utf-8"),
+         8: ("/index.html", b"text/html; charset=utf-8")}
 
 port = int(sys.argv[1])
 cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])

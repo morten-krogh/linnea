@@ -293,19 +293,19 @@ slash_ch:       db "/"
 zero_ch:        db "0"
 
 ; MIME types by file extension; default is application/octet-stream.
-mime_html:      db "text/html"
+mime_html:      db "text/html; charset=utf-8"
 mime_html_len   equ $ - mime_html
-mime_css:       db "text/css"
+mime_css:       db "text/css; charset=utf-8"
 mime_css_len    equ $ - mime_css
-mime_js:        db "text/javascript"
+mime_js:        db "text/javascript; charset=utf-8"
 mime_js_len     equ $ - mime_js
 mime_json:      db "application/json"
 mime_json_len   equ $ - mime_json
-mime_txt:       db "text/plain"
+mime_txt:       db "text/plain; charset=utf-8"
 mime_txt_len    equ $ - mime_txt
-mime_htm: db "text/html"
+mime_htm: db "text/html; charset=utf-8"
 mime_htm_len equ $ - mime_htm
-mime_mjs: db "text/javascript"
+mime_mjs: db "text/javascript; charset=utf-8"
 mime_mjs_len equ $ - mime_mjs
 mime_wasm: db "application/wasm"
 mime_wasm_len equ $ - mime_wasm
@@ -337,9 +337,9 @@ mime_pdf: db "application/pdf"
 mime_pdf_len equ $ - mime_pdf
 mime_xml: db "application/xml"
 mime_xml_len equ $ - mime_xml
-mime_csv: db "text/csv"
+mime_csv: db "text/csv; charset=utf-8"
 mime_csv_len equ $ - mime_csv
-mime_md: db "text/markdown"
+mime_md: db "text/markdown; charset=utf-8"
 mime_md_len equ $ - mime_md
 mime_zip: db "application/zip"
 mime_zip_len equ $ - mime_zip

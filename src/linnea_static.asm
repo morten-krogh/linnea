@@ -882,15 +882,15 @@ ext_zip_h2: db "zip"
 ext_gz_h2: db "gz"
 ext_map_h2: db "map"
 ext_wmanifest_h2: db "webmanifest"
-mime_html_h2: db "text/html"
+mime_html_h2: db "text/html; charset=utf-8"
 mime_html_h2_len equ $ - mime_html_h2
-mime_css_h2:  db "text/css"
+mime_css_h2:  db "text/css; charset=utf-8"
 mime_css_h2_len equ $ - mime_css_h2
-mime_js_h2:   db "text/javascript"
+mime_js_h2:   db "text/javascript; charset=utf-8"
 mime_js_h2_len equ $ - mime_js_h2
 mime_json_h2: db "application/json"
 mime_json_h2_len equ $ - mime_json_h2
-mime_txt_h2:  db "text/plain"
+mime_txt_h2:  db "text/plain; charset=utf-8"
 mime_txt_h2_len equ $ - mime_txt_h2
 mime_png_h2:  db "image/png"
 mime_png_h2_len equ $ - mime_png_h2
@@ -902,9 +902,9 @@ mime_svg_h2:  db "image/svg+xml"
 mime_svg_h2_len equ $ - mime_svg_h2
 mime_ico_h2:  db "image/x-icon"
 mime_ico_h2_len equ $ - mime_ico_h2
-mime_htm_h2: db "text/html"
+mime_htm_h2: db "text/html; charset=utf-8"
 mime_htm_h2_len equ $ - mime_htm_h2
-mime_mjs_h2: db "text/javascript"
+mime_mjs_h2: db "text/javascript; charset=utf-8"
 mime_mjs_h2_len equ $ - mime_mjs_h2
 mime_wasm_h2: db "application/wasm"
 mime_wasm_h2_len equ $ - mime_wasm_h2
@@ -936,9 +936,9 @@ mime_pdf_h2: db "application/pdf"
 mime_pdf_h2_len equ $ - mime_pdf_h2
 mime_xml_h2: db "application/xml"
 mime_xml_h2_len equ $ - mime_xml_h2
-mime_csv_h2: db "text/csv"
+mime_csv_h2: db "text/csv; charset=utf-8"
 mime_csv_h2_len equ $ - mime_csv_h2
-mime_md_h2: db "text/markdown"
+mime_md_h2: db "text/markdown; charset=utf-8"
 mime_md_h2_len equ $ - mime_md_h2
 mime_zip_h2: db "application/zip"
 mime_zip_h2_len equ $ - mime_zip_h2

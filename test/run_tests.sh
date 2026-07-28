@@ -1227,6 +1227,20 @@ mime_probe mp3         audio/mpeg
 mime_probe pdf         application/pdf
 mime_probe webmanifest application/manifest+json
 mime_probe js          text/javascript
+# Q131: the text types declare UTF-8. A page carries <meta charset> and is
+# fine either way, but a .txt or .csv without it is left to whatever the
+# browser guesses. Not on application/json: RFC 8259 defines JSON as UTF-8
+# and its media type has no charset parameter at all.
+mime_probe txt  'text/plain; charset=utf-8'
+mime_probe csv  'text/csv; charset=utf-8'
+mime_probe css  'text/css; charset=utf-8'
+resp=$(raw_http 'GET /probe.json HTTP/1.1\r\nHost: one.test\r\n\r\n')
+printf 'x' > test/www/probe.json
+resp=$(raw_http 'GET /probe.json HTTP/1.1\r\nHost: one.test\r\n\r\n')
+printf '%s' "$resp" | grep -qi 'charset' && json_charset=1 || json_charset=0
+[ "$json_charset" = 0 ]
+check "mime: application/json carries no charset" $?
+rm -f test/www/probe.json
 resp=$(raw_http 'GET /clip.mp4 HTTP/1.1\r\nHost: one.test\r\nRange: bytes=0-3\r\n\r\n')
 check_http "mime: a 206 keeps the video type" "Content-Type: video/mp4" "$resp"
 check_http "mime: the 206 is a real partial" "206 Partial Content" "$resp"
@@ -2246,7 +2260,7 @@ PY
     check "http2 request uses HTTP/2 (not downgraded)" $?
     ct=$(curl -s -o /dev/null --http2 --cacert $CA $rl \
         -w '%{content_type}' "$u/style.css")
-    [ "$ct" = "text/css" ]
+    [ "$ct" = "text/css; charset=utf-8" ]
     check "http2 content-type from extension (css)" $?
     # a body larger than the initial flow-control window (100000 > 65535):
     # exercises DATA chunking and WINDOW_UPDATE-driven resumption
@@ -2371,8 +2385,21 @@ PY
     # draining worker is timing-fragile. The hot-upgrade path keeps other
     # workers alive, so old workers drain cleanly there.)
 
+    # This has gone red twice in full runs while passing eight times in a
+    # row standalone, idle and under load — so the cause is suite STATE, not
+    # the test. Its verdict rests on a 2s reply deadline, so on failure ask
+    # the same server for an ordinary page: if that answers, the server is
+    # healthy and the deadline was simply missed; if it does not, a worker
+    # is wedged by this point and that is a real bug worth chasing.
     timeout 30 python3 test/tls/oversized_record.py $CA 47443 \
         test/tls/clienthello_seed.bin >/dev/null 2>&1
+    ovr_rc=$?
+    if [ $ovr_rc -ne 0 ]; then
+        ovr_probe=$(timeout 5 curl -s -o /dev/null -w '%{http_code}' --cacert $CA \
+            --resolve localhost:47443:127.0.0.1 https://localhost:47443/hello.txt 2>&1)
+        echo "  (oversized-record failed; the same server answers /hello.txt with: ${ovr_probe:-nothing})"
+    fi
+    [ $ovr_rc -eq 0 ]
     check "tls oversized record refused (msg_buf bound)" $?
 
     # Q125: a ClientHello split across records must still complete. A

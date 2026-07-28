@@ -123,9 +123,9 @@ a.close()
 b.close()
 
 assert ha.get(b":status") == b"200", ha
-assert ha.get(b"content-type") == b"text/plain", ha
+assert ha.get(b"content-type") == b"text/plain; charset=utf-8", ha
 assert ba == open("test/www/hello.txt", "rb").read(), ba
 assert hb.get(b":status") == b"200", hb
-assert hb.get(b"content-type") == b"text/css", hb
+assert hb.get(b"content-type") == b"text/css; charset=utf-8", hb
 assert bb == open("test/www/style.css", "rb").read(), bb
 print("ok")

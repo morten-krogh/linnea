@@ -92,20 +92,20 @@ port = int(sys.argv[1])
 # a real file from the document root, with its MIME type
 hd, body = fetch(port, "/hello.txt")
 assert hd.get(b":status") == b"200", hd
-assert hd.get(b"content-type") == b"text/plain", hd
+assert hd.get(b"content-type") == b"text/plain; charset=utf-8", hd
 assert body == open("test/www/hello.txt", "rb").read(), body
 assert hd.get(b"content-length") == str(len(body)).encode(), hd
 
 # a directory serves index.html, and the MIME comes from the resolved file
 hd, body = fetch(port, "/")
 assert hd.get(b":status") == b"200", hd
-assert hd.get(b"content-type") == b"text/html", hd
+assert hd.get(b"content-type") == b"text/html; charset=utf-8", hd
 assert body == open("test/www/index.html", "rb").read(), body
 
 # a stylesheet picks up text/css
 hd, body = fetch(port, "/style.css")
 assert hd.get(b":status") == b"200", hd
-assert hd.get(b"content-type") == b"text/css", hd
+assert hd.get(b"content-type") == b"text/css; charset=utf-8", hd
 assert body == open("test/www/style.css", "rb").read(), body
 
 # a missing path is a 404
