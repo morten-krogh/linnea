@@ -53,11 +53,24 @@ RestartSec=1
 # an upstream that has stopped reading, a WebSocket tunnel still carrying
 # traffic — instead of letting them run out the 45s default.
 TimeoutStopSec=10
-# Every connection is an fd, and a TLS proxy connection is two. The default
-# soft limit is 1024, which is below the config's max_connections — so the
-# limit would be hit before the pool filled, and accept(2) would start
-# failing with EMFILE while the server still believed it had room.
-LimitNOFILE=65536
+# There is deliberately no LimitNOFILE here, and adding one would make things
+# worse rather than better.
+#
+# Every connection is a descriptor and a TLS proxy connection is two, so the
+# default soft limit of 1024 sits below the configured max_connections: the
+# limit is reached before the pool fills, and accept(2) starts failing with
+# EMFILE while the server still believes it has room. The server fixes that
+# itself — before forking, the master computes what one worker can hold
+# (max_connections + max_upstream + the listeners + slack) and raises its own
+# soft limit to it, which every worker inherits. A process may do that up to
+# the hard limit without privilege. That number tracks the config; a constant
+# written here would not, and would drift the moment max_connections changed.
+#
+# The trap: a bare "LimitNOFILE=N" sets the hard limit as well as the soft one.
+# systemd's default hard limit is 524288, so LimitNOFILE=65536 would LOWER the
+# ceiling the server is allowed to raise itself to, by a factor of eight —
+# taking away the headroom it was meant to provide. If a limit ever does need
+# stating here, spell it soft:hard (e.g. 1024:524288) so the ceiling survives.
 
 # Grant capabilities as ambient (not file caps on the binary), so a rebuilt
 # bin/linnea keeps working with no setcap re-run:
