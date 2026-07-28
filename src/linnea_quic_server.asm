@@ -748,6 +748,16 @@ linnea_quic_server_datagram:
     call linnea_quic_conn_lookup
     test rax, rax
     jz .demux_short_reset            ; unknown connection: maybe a stateless reset
+    ; The 1-RTT keys do not exist until the client Finished is verified (.do_cfin
+    ; sets ST_CONNECTED and derives ap_ckeys). Before that the key material is
+    ; still the zeroed slot, and a zero AEAD/header-protection key is a KNOWN key:
+    ; anyone could forge a packet that "opens", which would then adopt its source
+    ; as the peer address and be served — a pre-auth reflection and hijack. So a
+    ; short-header packet for a connection that has not completed its handshake is
+    ; dropped; a legitimate client never sends 1-RTT before its own Finished, and
+    ; a reordered one is recovered by the client's retransmission.
+    cmp qword [rax + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
+    jne .done
     ; select the connection so we can decrypt, but do NOT adopt the source address
     ; yet: an unauthenticated (spoofed) 1-RTT packet carrying a valid connection id
     ; must not be able to redirect our sends. The address is committed only after
