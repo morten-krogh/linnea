@@ -24,6 +24,7 @@ global hpack_int
 global hpack_str
 global hpack_huffman
 global emit_field
+global linnea_hpack_req_check
 global hpack_dyn_reset
 
 section .rodata
@@ -313,6 +314,34 @@ emit_field:
     cmp r8, LINNEA_HPACK_MAX_LISTSIZE
     ja .ef_limit
     mov [rbx + linnea_h2_req.listsize], r8
+    ; --- pseudo-header placement and repetition (RFC 9113 8.3 / 9114 4.3.1) -
+    ; A repeated pseudo-header is the h2/h3 twin of a repeated Host: we would
+    ; keep the last, an intermediary the first, and one request becomes two
+    ; different ones. A pseudo-header trailing a regular field, or one we do
+    ; not know, is malformed for the same reason — the peer and we would not
+    ; agree on what the request says.
+    cmp byte [rax], ':'
+    je .ef_pseudo
+    mov qword [rbx + linnea_h2_req.regular_seen], 1
+    jmp .ef_order_ok
+.ef_pseudo:
+    cmp qword [rbx + linnea_h2_req.regular_seen], 0
+    jne .ef_malformed                ; pseudo-header after a regular field
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    call pseudo_bit                  ; -> r8 = the bit, 0 if unrecognized
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+    test r8, r8
+    jz .ef_malformed                 ; an unknown pseudo-header
+    test [rbx + linnea_h2_req.pseudo_seen], r8
+    jnz .ef_malformed                ; a repeat
+    or [rbx + linnea_h2_req.pseudo_seen], r8
+.ef_order_ok:
     ; --- proxy rebuild: append the field as an h1 "name: value" line -----
     cmp qword [rbx + linnea_h2_req.hb_start], 0
     je .no_rebuild
@@ -560,18 +589,73 @@ emit_field:
     pop rdi
     pop rsi
     jnz .done
-    cmp qword [rbx + linnea_h2_req.auth_ptr], 0
-    jne .done                       ; :authority wins over Host
-    mov [rbx + linnea_h2_req.auth_ptr], rsi
-    mov [rbx + linnea_h2_req.auth_len], rdi
+    inc qword [rbx + linnea_h2_req.host_count]
+    cmp qword [rbx + linnea_h2_req.host_ptr], 0
+    jne .done                       ; keep the first; the count rejects a repeat
+    mov [rbx + linnea_h2_req.host_ptr], rsi
+    mov [rbx + linnea_h2_req.host_len], rdi
 .done:
     clc
+    ret
+.ef_malformed:
+    mov qword [rbx + linnea_h2_req.malformed], 1
+    stc
     ret
 .ef_limit:
     stc
     ret
 .ef_bad:
     stc                              ; a malformed field: reject the request
+    ret
+
+; pseudo_bit(rax = name, rdx = name length) -> r8 = the LINNEA_H2_PS_* bit for
+; a request pseudo-header we know, 0 for anything else. name_eq wants the name
+; in rax/rdx and clobbers rcx/rsi/rdi, so the name is held in r10/r11 across
+; the probes; the caller has saved rax/rdx/rsi/rdi and the rebuild below
+; reloads r10 itself.
+pseudo_bit:
+    mov r10, rax                     ; name
+    mov r11, rdx                     ; length
+    cmp r11, 7
+    je .pb_len7
+    cmp r11, 5
+    je .pb_len5
+    cmp r11, 10
+    je .pb_len10
+    jmp .pb_none
+.pb_len7:
+    lea r9, [pseudo_method]
+    call name_eq
+    je .pb_method
+    mov rax, r10
+    mov rdx, r11
+    lea r9, [pseudo_scheme]
+    call name_eq
+    je .pb_scheme
+    jmp .pb_none
+.pb_len5:
+    lea r9, [pseudo_path]
+    call name_eq
+    je .pb_path
+    jmp .pb_none
+.pb_len10:
+    lea r9, [pseudo_auth]
+    call name_eq
+    je .pb_auth
+.pb_none:
+    xor r8d, r8d
+    ret
+.pb_method:
+    mov r8d, LINNEA_H2_PS_METHOD
+    ret
+.pb_path:
+    mov r8d, LINNEA_H2_PS_PATH
+    ret
+.pb_scheme:
+    mov r8d, LINNEA_H2_PS_SCHEME
+    ret
+.pb_auth:
+    mov r8d, LINNEA_H2_PS_AUTH
     ret
 
 ; name_eq(rax=ptr, rdx=len, r9=const ptr) -> ZF=1 if the len bytes match.
@@ -921,4 +1005,66 @@ hpack_huffman:
     pop r14
     pop r13
     pop r12
+    ret
+
+; linnea_hpack_req_check(rdi = req) -> rax = 0 when the decoded request is
+; well formed, -1 when it is not (a STREAM error; see .malformed).
+;
+; What the field-by-field pass cannot see: whether the request ended up with
+; an authority at all, and whether the two places it can come from agree.
+; RFC 9113 8.3.1 / RFC 9114 4.3.1: a request carries :authority (or, from an
+; intermediary translating HTTP/1.1, Host), and a Host that contradicts
+; :authority is malformed — we would route on one, the next hop on the other.
+; The value itself must be able to BE an authority: non-empty, no spaces or
+; control bytes, exactly as the HTTP/1.1 side now demands of Host.
+linnea_hpack_req_check:
+    push rbx
+    mov rbx, rdi
+    cmp qword [rbx + linnea_h2_req.host_count], 1
+    ja .bad                          ; more than one Host: the h1 rule, here too
+    mov rsi, [rbx + linnea_h2_req.auth_ptr]
+    test rsi, rsi
+    jnz .have_auth
+    ; no :authority — Host stands in for it, and must then exist
+    mov rsi, [rbx + linnea_h2_req.host_ptr]
+    test rsi, rsi
+    jz .bad
+    mov rdx, [rbx + linnea_h2_req.host_len]
+    mov [rbx + linnea_h2_req.auth_ptr], rsi
+    mov [rbx + linnea_h2_req.auth_len], rdx
+    jmp .check_value
+.have_auth:
+    cmp qword [rbx + linnea_h2_req.host_count], 0
+    je .check_value                  ; :authority alone
+    ; both present: they must say the same thing
+    mov rdx, [rbx + linnea_h2_req.auth_len]
+    cmp rdx, [rbx + linnea_h2_req.host_len]
+    jne .bad
+    mov rdi, [rbx + linnea_h2_req.host_ptr]
+    mov rcx, rdx
+    test rcx, rcx
+    jz .check_value
+    repe cmpsb
+    jne .bad
+.check_value:
+    mov rsi, [rbx + linnea_h2_req.auth_ptr]
+    mov rcx, [rbx + linnea_h2_req.auth_len]
+    test rcx, rcx
+    jz .bad                          ; an empty authority names nothing
+.cv_scan:
+    movzx eax, byte [rsi]
+    cmp al, 0x20
+    jbe .bad                         ; space or control byte
+    cmp al, 0x7f
+    je .bad
+    inc rsi
+    dec rcx
+    jnz .cv_scan
+    xor eax, eax
+    pop rbx
+    ret
+.bad:
+    mov qword [rbx + linnea_h2_req.malformed], 1
+    mov rax, -1
+    pop rbx
     ret

@@ -11,10 +11,12 @@ default rel
 global linnea_h3_read_headers
 global linnea_h3_build_response
 global linnea_h3_build_431
+global linnea_h3_build_421
 global linnea_h3_build_response_head
 global linnea_h3_serve
 global linnea_h3_tx_cap
 
+extern linnea_hpack_req_check
 extern linnea_quic_varint_decode
 extern linnea_quic_varint_encode
 extern linnea_log_access
@@ -53,6 +55,8 @@ body_404:      db "404 Not Found", 10
 body_404_len   equ $ - body_404
 body_400:      db "400 Bad Request", 10
 body_400_len   equ $ - body_400
+body_421: db "421 Misdirected Request", 10
+body_421_len equ $ - body_421
 body_431:      db "431 Request Header Fields Too Large", 10
 body_431_len   equ $ - body_431
 body_503:      db "503 Service Unavailable", 10
@@ -141,6 +145,10 @@ linnea_h3_read_headers:
     call linnea_qpack_decode         ; returns 0 | -err
     test rax, rax
     jns .decoded
+    ; a request that broke a semantic rule decoded fine — the QPACK state is
+    ; intact, so RFC 9114 4.1.2 fails the STREAM, which -LINNEA_H3_ERR does
+    cmp qword [r14 + linnea_h2_req.malformed], 0
+    jne .err
     ; a header list past our bound is a resource limit, answerable on the
     ; stream; only a genuine decode failure is a connection error
     cmp rax, -LINNEA_HPACK_ERR_LIMIT
@@ -151,6 +159,12 @@ linnea_h3_read_headers:
     mov rax, -LINNEA_H3_ERR_QPACK    ; the caller ends the connection with it
     jmp .ret
 .decoded:
+    ; the whole-request rules (an agreeing, plausible authority from one
+    ; source or the other) — shared with HTTP/2
+    mov rdi, r14
+    call linnea_hpack_req_check
+    test rax, rax
+    js .err
     mov r15d, 1                      ; HEADERS decoded
     add r12, rbp                     ; past the field section
     jmp .frame
@@ -292,6 +306,19 @@ linnea_h3_build_response_head:
     pop r13
     pop rbx
     ret
+
+; linnea_h3_build_421(rdi=out) -> rax = length written.
+; The whole response for a request whose authority this connection is not
+; authoritative for (its certificate covers a different site). A client that
+; coalesced onto this connection retries on a fresh one, where the right
+; certificate is presented; nothing else recovers as cleanly.
+linnea_h3_build_421:
+    mov esi, 421
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_421]
+    mov r9d, body_421_len
+    jmp linnea_h3_build_response
 
 ; linnea_h3_build_431(rdi=out) -> rax = length written.
 ; The whole response for a request whose header section we will not hold: the

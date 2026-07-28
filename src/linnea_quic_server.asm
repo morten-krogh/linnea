@@ -71,6 +71,7 @@ global linnea_h3_server
 global linnea_h3_advert
 
 extern linnea_h3_build_431
+extern linnea_h3_build_421
 extern linnea_h3_read_headers
 extern linnea_h3_serve
 extern linnea_h3_body_off
@@ -150,6 +151,7 @@ extern linnea_quic_dbg_num
 extern qdbg_pass
 extern qdbg_on
 extern linnea_string_from_u64
+extern linnea_string_iequal
 extern linnea_quic_conn_free
 extern linnea_quic_varint_encode
 extern linnea_quic_varint_decode
@@ -222,6 +224,8 @@ h3scratch:   resb LINNEA_HPACK_MAX_LISTSIZE
 s_pl_ptr:    resq 1
 s_pl_len:    resq 1
 s_sid:       resq 1                   ; stream id of the request being served
+s_serve_vhost: resq 1                 ; vhost answering it: the connection's,
+                                      ; or another one its certificate covers
 s_sdata:     resq 1                   ; that stream's data pointer
 s_slen:      resq 1                   ; and length
 s_soff:      resq 1                   ; and offset (0 = the stream's first bytes)
@@ -426,6 +430,95 @@ select_vhost:
 vhost_slot:
     imul rax, rax, linnea_quic_vhost_size
     lea rax, [vhost_tab + rax]
+    ret
+
+; authority_vhost(rdi = authority ptr, rsi = authority length) -> rax = vhost
+; index, or -1 when no configured vhost carries that name. The port is cut
+; first: ":authority" may carry one, a configured hostname never does.
+authority_vhost:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    mov r13, rsi
+    xor eax, eax
+.av_port:
+    cmp rax, r13
+    jae .av_scan
+    cmp byte [r12 + rax], ':'
+    je .av_cut
+    inc rax
+    jmp .av_port
+.av_cut:
+    mov r13, rax
+.av_scan:
+    test r13, r13
+    jz .av_none
+    xor r14d, r14d
+.av_loop:
+    cmp r14, [vhost_count]
+    jae .av_none
+    mov rax, r14
+    call vhost_slot
+    mov r15, rax
+    mov rdi, r12
+    mov rsi, r13
+    mov rdx, [r15 + linnea_quic_vhost.host_ptr]
+    mov rcx, [r15 + linnea_quic_vhost.host_len]
+    call linnea_string_iequal
+    test eax, eax
+    jnz .av_found
+    inc r14
+    jmp .av_loop
+.av_found:
+    mov rax, r14
+    jmp .av_ret
+.av_none:
+    mov rax, -1
+.av_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; vhost_same_cert(rdi = vhost index a, rsi = vhost index b) -> eax = 1 when
+; both are served under the same certificate — which is what decides whether
+; THIS connection is authoritative for another vhost's name. Comparing the
+; certificate itself, not the index, is deliberate: one multi-SAN cert shared
+; by several vhosts is exactly the case browsers coalesce onto one connection,
+; and refusing those would cost a connection per origin for no security gain.
+vhost_same_cert:
+    push rbx
+    push r12
+    mov rax, rdi
+    call vhost_slot
+    mov rbx, rax
+    mov rax, rsi
+    call vhost_slot
+    mov r12, rax
+    mov rax, [rbx + linnea_quic_vhost.cert_len]
+    cmp rax, [r12 + linnea_quic_vhost.cert_len]
+    jne .vsc_no
+    mov rdi, [rbx + linnea_quic_vhost.cert_ptr]
+    mov rsi, [r12 + linnea_quic_vhost.cert_ptr]
+    cmp rdi, rsi
+    je .vsc_yes                      ; the same bytes, trivially
+    mov rcx, rax
+    repe cmpsb
+    jne .vsc_no
+.vsc_yes:
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.vsc_no:
+    xor eax, eax
+    pop r12
+    pop rbx
     ret
 
 ; linnea_quic_altsvc_set(rdi=port) — build the Alt-Svc value advertising HTTP/3
@@ -1815,6 +1908,39 @@ linnea_quic_server_datagram:
 .req_qpack_bad:
     mov edi, LINNEA_H3_ERR_QPACK_DECOMP
     jmp .h3_close
+.misdirected:
+    ; the access line names the vhost that DID answer — this connection's own,
+    ; since the serve block that normally sets it is skipped below
+    mov rax, [cur_conn]
+    mov rax, [rax + linnea_quic_conn.vhost]
+    call vhost_slot
+    mov r10, [rax + linnea_quic_vhost.host_ptr]
+    mov [linnea_log_acc_host], r10
+    mov r10, [rax + linnea_quic_vhost.host_len]
+    mov [linnea_log_acc_host_len], r10
+    ; RFC 9110 7.4 / RFC 9114 4.3.1: this connection cannot speak for the
+    ; authority the request names — its certificate covers a different site.
+    ; 421 is the answer that tells the client to try a fresh connection,
+    ; where the right certificate can be presented.
+    lea rdi, [strm_pay]
+    CONNLEA rsi, rx_have
+    call linnea_quic_build_ack       ; the ack must precede the STREAM frame
+    mov [s_acklen], rax
+    mov rcx, rax
+    mov byte [strm_pay + rcx], 0x09  ; STREAM | FIN
+    lea rdi, [strm_pay + rcx + 1]
+    mov rsi, [s_sid]
+    call linnea_quic_varint_encode
+    mov rbx, [s_acklen]
+    add rbx, rax
+    inc rbx
+    lea rdi, [strm_pay + rbx]
+    call linnea_h3_build_421         ; rax = response length
+    lea rdx, [rax + rbx]             ; STREAM frame length
+    lea rsi, [strm_pay]
+    call .send_1rtt
+    jmp .stream_scan
+
 .req_toolarge:
     ; The header section decoded but is bigger than we hold. That is our limit,
     ; not a protocol violation, so it is answered on this stream (RFC 9114
@@ -1921,8 +2047,45 @@ linnea_quic_server_datagram:
     inc rbx                          ; bytes before the HTTP/3 response
     lea rcx, [strm_pay + rbx]
     lea rdi, [req]
-    mov rax, [cur_conn]
-    mov rax, [rax + linnea_quic_conn.vhost]   ; serve from this vhost's document root
+    ; Which vhost serves this request? Until Q124 it was always the one the
+    ; TLS SNI chose, so a request explicitly addressed to another site we host
+    ; was silently answered with this one's content. Now :authority decides —
+    ; but only among the names this connection's certificate actually covers.
+    ; A name belonging to a vhost with a DIFFERENT certificate is not ours to
+    ; answer on this connection: RFC 9114 4.3.1 / RFC 9110 7.4 make that a 421,
+    ; which tells the client to open a new connection instead of failing. A
+    ; name we do not host at all (an IP literal, an alias) keeps the old
+    ; behaviour and is served by the connection's own vhost.
+    mov r10, [cur_conn]
+    mov r10, [r10 + linnea_quic_conn.vhost]
+    mov [s_serve_vhost], r10
+    push rcx
+    push rdi
+    mov rdi, [req + linnea_h2_req.auth_ptr]
+    mov rsi, [req + linnea_h2_req.auth_len]
+    call authority_vhost             ; rax = vhost index, or -1 if not ours
+    pop rdi
+    pop rcx
+    cmp rax, -1
+    je .h3_vhost_ready               ; a name we do not host: as before
+    mov r10, [cur_conn]
+    mov r10, [r10 + linnea_quic_conn.vhost]
+    cmp rax, r10
+    je .h3_vhost_ready               ; the connection's own vhost
+    push rcx
+    push rdi
+    push rax
+    mov rdi, rax
+    mov rsi, r10
+    call vhost_same_cert
+    pop r10                          ; the requested vhost index
+    pop rdi
+    pop rcx
+    test eax, eax
+    jz .misdirected                  ; another site, another certificate: 421
+    mov [s_serve_vhost], r10         ; same certificate: we are authoritative
+.h3_vhost_ready:
+    mov rax, [s_serve_vhost]
     call vhost_slot
     mov r10, [rax + linnea_quic_vhost.host_ptr]
     mov [linnea_log_acc_host], r10

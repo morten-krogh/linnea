@@ -48,6 +48,18 @@ LINNEA_HPACK_ERR           equ 1      ; malformed field / truncated
 LINNEA_HPACK_ERR_INDEX     equ 2      ; index out of range (no dynamic table)
 LINNEA_HPACK_ERR_HUFFMAN   equ 3      ; bad Huffman padding / EOS
 LINNEA_HPACK_ERR_LIMIT     equ 4      ; header-list or count bound exceeded
+; A semantically malformed REQUEST (RFC 9113 8.3 / RFC 9114 4.3.1): a repeated
+; or misplaced pseudo-header, an unknown one, a Host that contradicts
+; :authority, a missing or implausible authority. The field block decoded
+; cleanly — the compression state is fine — so this ends the STREAM, not the
+; connection, unlike every other error here.
+LINNEA_HPACK_ERR_MALFORMED equ 5
+
+; .pseudo_seen bits
+LINNEA_H2_PS_METHOD equ 1
+LINNEA_H2_PS_PATH   equ 2
+LINNEA_H2_PS_SCHEME equ 4
+LINNEA_H2_PS_AUTH   equ 8
 
 struc linnea_h2_req
     .method_ptr:  resq 1
@@ -58,6 +70,17 @@ struc linnea_h2_req
     .scheme_len:  resq 1
     .auth_ptr:    resq 1        ; :authority, or Host as a fallback
     .auth_len:    resq 1
+    ; Pseudo-header bookkeeping (RFC 9113 8.3): which ones have been seen (a
+    ; repeat is malformed), and whether a regular field has appeared yet (a
+    ; pseudo-header after one is malformed). Zeroed with the rest of the struct.
+    .pseudo_seen: resq 1        ; bitmask, LINNEA_H2_PS_*
+    .regular_seen: resq 1       ; 1 once a non-pseudo field has been decoded
+    .host_ptr:    resq 1        ; the Host field itself, kept apart from
+    .host_len:    resq 1        ; .auth_ptr so the two can be compared
+    .host_count:  resq 1        ; Host field lines (more than one is malformed)
+    .malformed:   resq 1        ; 1 = the request breaks a semantic rule, so
+                                ; the STREAM fails; the field block itself
+                                ; decoded, leaving the connection usable
     .nheaders:    resq 1        ; fields decoded (bound guard)
     .listsize:    resq 1        ; running RFC 7541 4.1 size (bound guard)
     .scratch:     resq 1        ; bump cursor for Huffman output

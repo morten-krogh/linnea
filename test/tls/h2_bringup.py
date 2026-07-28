@@ -45,15 +45,40 @@ s.sendall(frame(6, 0, 0, b"linnea!!"))
 t, f, sid, p = readframe()
 assert t == 6 and f & 1 and p == b"linnea!!", f"bad PING ACK: {t} {f} {p!r}"
 
-# a request (HEADERS) is not served yet: expect a graceful GOAWAY, close
+# A HEADERS carrying only :method (indexed \x82) has no path and no
+# authority, so it is a malformed REQUEST — and since Q124 that fails its own
+# stream (RFC 9113 8.1.1) instead of taking the connection down with it: the
+# field block decoded fine, so nothing about the connection is in doubt.
 s.sendall(frame(1, 0x05, 1, b"\x82"))
+saw_rst = False
 saw_goaway = False
 while True:
     fr = readframe()
     if fr is None:
         break
+    if fr[0] == 3 and fr[2] == 1:
+        saw_rst = True
+        break
     if fr[0] == 7:
         saw_goaway = True
-assert saw_goaway, "expected GOAWAY on an unservable request"
+        break
+assert not saw_goaway, "a malformed request took the whole connection down"
+assert saw_rst, "expected RST_STREAM on a malformed request"
+
+# and the connection still works: a well-formed request on a new stream
+def hdr(n, v):
+    return b"\x00" + bytes([len(n)]) + n + bytes([len(v)]) + v
+
+s.sendall(frame(1, 0x05, 3, hdr(b":method", b"GET") + hdr(b":scheme", b"https")
+                + hdr(b":authority", b"localhost") + hdr(b":path", b"/hello.txt")))
+served = False
+while True:
+    fr = readframe()
+    if fr is None:
+        break
+    if fr[0] == 1 and fr[2] == 3 and b"200" in fr[3]:
+        served = True
+        break
+assert served, "the connection was unusable after the stream error"
 s.close()
 print("ok")

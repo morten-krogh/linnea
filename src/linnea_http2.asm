@@ -27,6 +27,7 @@ global linnea_h2_pool_active
 global h2_queue_goaway_pub
 
 extern linnea_hpack_decode
+extern linnea_hpack_req_check
 extern hpack_dyn_reset
 extern linnea_h3_altsvc
 extern linnea_h3_altsvc_len
@@ -644,8 +645,8 @@ linnea_h2_handle:
 %define L_OUT    linnea_h2_req_size + 24
 %define L_BIG    linnea_h2_req_size + 32
 %define L_ASM    linnea_h2_req_size + 40
-%if L_ASM + 8 > 328
-  %error "h2_build_request stack frame (sub rsp,328) too small for req + locals"
+%if L_ASM + 8 > 384
+  %error "h2_build_request stack frame (sub rsp,384) too small for req + locals"
 %endif
 h2_build_request:
     push rbx
@@ -654,7 +655,7 @@ h2_build_request:
     push r14
     push r15
     push rbp
-    sub rsp, 328
+    sub rsp, 384
     mov rbx, rdi                     ; conn
     mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
@@ -811,10 +812,16 @@ h2_build_request:
     call linnea_hpack_decode
     test rax, rax
     js .decode_err
+    ; the rules the field-by-field pass cannot see: an authority from one
+    ; source or the other, agreeing and plausible
+    lea rdi, [rsp + REQ]
+    call linnea_hpack_req_check
+    test rax, rax
+    js .malformed_stream
     cmp qword [rsp + REQ + linnea_h2_req.method_ptr], 0
-    je .err
+    je .malformed_stream
     cmp qword [rsp + REQ + linnea_h2_req.path_ptr], 0
-    je .err
+    je .malformed_stream
 
     ; stream-id validation (RFC 9113 5.1.1): a client stream must be odd and
     ; numerically greater than every stream it has opened. Checked here (once
@@ -838,12 +845,34 @@ h2_build_request:
     jmp .ret
 
 .decode_err:
+    ; A request that broke a semantic rule (a repeated or misplaced
+    ; pseudo-header) decoded perfectly well — the compression state is intact,
+    ; so RFC 9113 8.1.1 wants the STREAM to fail, not the connection.
+    cmp qword [rsp + REQ + linnea_h2_req.malformed], 0
+    jne .malformed_stream
     ; The decoder's list bound (LINNEA_HPACK_MAX_LISTSIZE — exactly what we
     ; advertise as SETTINGS_MAX_HEADER_LIST_SIZE) is OUR limit, hit by a
     ; conforming block that is simply too big: answer the stream. Everything
     ; else is real HPACK rot and stays a connection error.
     cmp rax, -LINNEA_HPACK_ERR_LIMIT
     jne .err
+.malformed_stream:
+    ; RFC 9113 8.1.1: a malformed request is a stream error. The connection
+    ; and its HPACK state are fine, so every other stream carries on.
+    mov r8, [rsp + L_SID]
+    cmp r8, [rbx + linnea_connection.h2_last_stream]
+    jbe .ms_stamped
+    mov [rbx + linnea_connection.h2_last_stream], r8
+.ms_stamped:
+    mov rdi, [rsp + L_OUT]
+    mov rsi, [rsp + L_SID]
+    mov edx, LINNEA_H2_PROTOCOL_ERROR
+    call h2p_emit_rst                ; -> rax = bytes written
+    mov rdx, rax
+    mov rax, r12
+    sub rax, [rsp + L_START]         ; bytes consumed
+    jmp .ret
+
 .too_big:
     ; the stream id still advances the strictly-increasing floor: this stream
     ; was answered, so a later HEADERS reusing its id must be refused
@@ -866,7 +895,7 @@ h2_build_request:
 .err:
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
-    add rsp, 328
+    add rsp, 384
     pop rbp
     pop r15
     pop r14

@@ -2348,6 +2348,13 @@ PYEOF
         && printf '%s' "$resp" | grep -qF "hello from linnea"
     check "http2 proxied-stream RST + RST-stream-0 crash no worker" $?
 
+    # Q124: the authority rules — :authority is h2's Host, and a duplicate,
+    # a Host contradicting it, a misplaced pseudo-header or a missing
+    # authority must fail THAT STREAM (the connection keeps serving), while
+    # a Host standing in for :authority still works.
+    timeout 90 python3 test/tls/h2_authority.py $CA 47443 >/dev/null 2>&1
+    check "http2 authority rules (stream errors, connection survives)" $?
+
     # Q120: h2 requests reach the access log — static and proxied alike, in
     # h1's exact format. Before this only h1 was logged, so most real browser
     # traffic was invisible.
@@ -2423,6 +2430,32 @@ PYEOF
     resp=$(curl -s --max-time 5 --cacert test/tls/sni.crt \
         --resolve sni.test:47444:127.0.0.1 https://sni.test:47444/page.html)
     check_http "sni end to end (cert + vhost routing)" "subdirectory page" "$resp"
+
+    # Q124: h3 honours :authority instead of serving whatever the TLS SNI
+    # chose, and answers a name this connection's certificate does not cover
+    # with 421 rather than the other vhost's page.
+    if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+        timeout 90 python3 test/quic/h3_authority_test.py 47444 >/dev/null 2>&1
+        check "h3 authority selects the vhost; cross-cert gets 421" $?
+    else
+        check "h3 authority test (skipped: deps unavailable)" 0
+    fi
+
+    # ...and the other side of that strictness: two vhosts sharing ONE
+    # certificate are both names the connection can speak for, so a single
+    # h3 connection serves both (what a browser coalesces). Own server: the
+    # two vhosts differ from the SNI pair in using the same cert.
+    if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+        $BIN test/configs/tls-coalesce.json >/dev/null 2>&1 &
+        coal_pid=$!
+        sleep 0.4
+        timeout 60 python3 test/quic/h3_coalesce_test.py 47459 >/dev/null 2>&1
+        check "h3 coalescing: one cert, two vhosts, one connection" $?
+        kill $coal_pid 2>/dev/null
+        wait $coal_pid 2>/dev/null
+    else
+        check "h3 coalescing test (skipped: deps unavailable)" 0
+    fi
     kill $sni_server_pid 2>/dev/null
     wait $sni_server_pid 2>/dev/null
     rm -f "$LOG"
