@@ -532,7 +532,14 @@ linnea_h2_handle:
     add r12, r11
     jmp .close                       ; peer is going away
 .goaway_close:
-    ; queue GOAWAY(last_stream_id=0, NO_ERROR) and close once it's sent
+    ; Queue GOAWAY and close once it is sent. Every jump here is a protocol
+    ; fault, so the code must not be NO_ERROR: a conforming peer reads that as
+    ; a graceful shutdown, retries the offending request on a fresh connection
+    ; and — since the fault is deterministic — never stops. It also left real
+    ; faults indistinguishable from an orderly close in a capture.
+    ; PROTOCOL_ERROR for all of them: more specific codes (COMPRESSION_ERROR,
+    ; FRAME_SIZE_ERROR, FLOW_CONTROL_ERROR) would need the reason threaded
+    ; through each of the sites that jump here.
     mov byte [r13], 0
     mov byte [r13 + 1], 0
     mov byte [r13 + 2], 8
@@ -540,7 +547,7 @@ linnea_h2_handle:
     mov byte [r13 + 4], 0
     mov dword [r13 + 5], 0
     mov dword [r13 + 9], 0           ; last_stream_id 0
-    mov dword [r13 + 13], 0          ; error code NO_ERROR
+    mov dword [r13 + 13], LINNEA_H2_PROTOCOL_ERROR << 24   ; big-endian
     add r13, 17
     mov qword [rbx + linnea_connection.h2_state], LINNEA_H2_CLOSING
 
