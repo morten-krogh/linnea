@@ -36,6 +36,7 @@ LINNEA_H2_FLAG_PRIORITY    equ 0x20   ; HEADERS
 LINNEA_H2_SETTINGS_HEADER_TABLE_SIZE      equ 0x01
 LINNEA_H2_SETTINGS_MAX_CONCURRENT_STREAMS equ 0x03
 LINNEA_H2_SETTINGS_INITIAL_WINDOW_SIZE    equ 0x04
+LINNEA_H2_SETTINGS_MAX_HEADER_LIST        equ 0x06
 
 ; error codes (RFC 9113 7) for RST_STREAM / GOAWAY
 LINNEA_H2_NO_ERROR         equ 0
@@ -75,7 +76,9 @@ endstruc
 LINNEA_H2_STREAM_END    equ 1       ; .flags bit 0
 LINNEA_H2_STREAM_UPDONE equ 4       ; proxied: END_STREAM emitted, reap the slot
 
-; up_buf overlay: [stream pool][header assembly][Huffman scratch]
+; up_buf overlay: [stream pool] (the header-block assembly and its decode
+; scratch once followed here; they moved to the lazily-mapped h2_hb_pool so a
+; big cookie load no longer has to fit in up_buf's corner — see below)
 LINNEA_H2_POOL_OFF     equ 0
 LINNEA_H2_POOL_BYTES   equ linnea_h2_stream_size * LINNEA_H2_MAX_STREAMS
 
@@ -86,12 +89,18 @@ LINNEA_HTTP2_PATH_ROOT equ LINNEA_MAX_ROOT + 1
 LINNEA_HTTP2_PATH_BUF  equ LINNEA_HTTP2_PATH_ROOT + 2560
 LINNEA_HTTP2_MAX_PATH  equ 2048     ; bound on the decoded :path length
 
-; request assembly (M16): the reassembled header block and the Huffman
-; decode scratch live in up_buf after the stream pool (pool 1024, assembly
-; 3072, scratch 3072 all fit in up_buf's 8448 bytes).
-LINNEA_H2_HBLOCK_MAX   equ 3072   ; max reassembled header-block bytes
-LINNEA_H2_ASSEMBLY_OFF equ LINNEA_H2_POOL_BYTES               ; up_buf + this
-LINNEA_H2_SCRATCH_OFF  equ LINNEA_H2_ASSEMBLY_OFF + LINNEA_H2_HBLOCK_MAX
+; Request assembly (M16, rehomed Q121): the reassembled header block and the
+; HPACK decode scratch live in h2_hb_pool — one lazily-mapped area per
+; connection, like the upload buffers — because the 3072 bytes they used to
+; get in up_buf meant a browser with a big cookie load killed its whole
+; connection. The scratch is double the block: Huffman expands at most 8/5,
+; so a block that fits can always decode into it. The DECODED list is bounded
+; separately by LINNEA_HPACK_MAX_LISTSIZE (8192), which is what we advertise
+; as SETTINGS_MAX_HEADER_LIST_SIZE; overrunning either the block cap or the
+; list bound answers that stream 431 — the connection lives on.
+LINNEA_H2_HB_ASM       equ 8192   ; max reassembled header-block bytes
+LINNEA_H2_HB_SCRATCH   equ 16384  ; decoded-literal arena (2x: Huffman <= 8/5)
+LINNEA_H2_HB_AREA      equ LINNEA_H2_HB_ASM + LINNEA_H2_HB_SCRATCH
 LINNEA_H2_MAX_CONT     equ 16     ; CONTINUATION frames per HEADERS (flood guard)
 
 ; h2_build_request outcomes (negative sentinels vs a byte count)

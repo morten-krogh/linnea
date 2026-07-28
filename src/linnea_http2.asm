@@ -120,10 +120,10 @@ linnea_h2_init:
     rep stosq
     pop rdi
     lea rax, [rdi + linnea_connection.out_buf]
-    ; SETTINGS frame: length 12, type 4, flags 0, stream 0, two settings
+    ; SETTINGS frame: length 18, type 4, flags 0, stream 0, three settings
     mov byte [rax], 0
     mov byte [rax + 1], 0
-    mov byte [rax + 2], 12
+    mov byte [rax + 2], 18
     mov byte [rax + 3], LINNEA_H2_FT_SETTINGS
     mov byte [rax + 4], 0
     mov dword [rax + 5], 0          ; stream 0
@@ -137,8 +137,13 @@ linnea_h2_init:
     mov byte [rax + 15], 0
     mov byte [rax + 16], LINNEA_H2_SETTINGS_MAX_CONCURRENT_STREAMS
     mov dword [rax + 17], 0x10000000    ; value 16, big-endian
+    ; MAX_HEADER_LIST_SIZE = the decoder's real list bound, so a conforming
+    ; client trims its cookies instead of discovering the limit as a 431.
+    mov byte [rax + 21], 0
+    mov byte [rax + 22], LINNEA_H2_SETTINGS_MAX_HEADER_LIST
+    mov dword [rax + 23], 0x00200000    ; value 8192, big-endian
     mov [rdi + linnea_connection.out_ptr], rax
-    mov qword [rdi + linnea_connection.out_rem], 21
+    mov qword [rdi + linnea_connection.out_rem], 27
     mov qword [rdi + linnea_connection.file_rem], 0
     mov qword [rdi + linnea_connection.h2_tx_busy], 1
     ret
@@ -621,7 +626,8 @@ linnea_h2_handle:
 ;   on success, rdx = response length written at conn.out_buf.
 ;
 ; Reassembles the header block (stripping HEADERS padding/priority and any
-; CONTINUATION frames) into up_buf, HPACK-decodes it, and writes a minimal
+; CONTINUATION frames) into the connection's h2_hb_pool area, HPACK-decodes
+; it, and writes a minimal
 ; 200 response — HEADERS(:status 200) + DATA echoing the decoded method and
 ; path — into out_buf. The echo proves the decode end to end; M17 replaces
 ; it with the real static/proxy response path and HPACK encoder.
@@ -636,8 +642,10 @@ linnea_h2_handle:
 %define L_SID    linnea_h2_req_size + 8
 %define L_CONT   linnea_h2_req_size + 16
 %define L_OUT    linnea_h2_req_size + 24
-%if L_OUT + 8 > 280
-  %error "h2_build_request stack frame (sub rsp,280) too small for req + locals"
+%define L_BIG    linnea_h2_req_size + 32
+%define L_ASM    linnea_h2_req_size + 40
+%if L_ASM + 8 > 328
+  %error "h2_build_request stack frame (sub rsp,328) too small for req + locals"
 %endif
 h2_build_request:
     push rbx
@@ -646,15 +654,19 @@ h2_build_request:
     push r14
     push r15
     push rbp
-    sub rsp, 280
+    sub rsp, 328
     mov rbx, rdi                     ; conn
     mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
     lea r13, [rsi + rdx]             ; avail end
     mov r12, rsi                     ; current frame header
-    lea r14, [rbx + linnea_connection.up_buf + LINNEA_H2_ASSEMBLY_OFF]
-    lea r15, [r14 + LINNEA_H2_HBLOCK_MAX]            ; assembly limit
+    mov r14, [rbx + linnea_connection.index]
+    imul r14, r14, LINNEA_H2_HB_AREA
+    add r14, [h2_hb_pool]                            ; this connection's area
+    mov [rsp + L_ASM], r14
+    lea r15, [r14 + LINNEA_H2_HB_ASM]                ; assembly limit
     mov qword [rsp + L_CONT], 0
+    mov qword [rsp + L_BIG], 0
 
 .frame_loop:
     mov rax, r13
@@ -747,7 +759,7 @@ h2_build_request:
     mov rax, r15
     sub rax, r14
     cmp r11, rax
-    ja .err                          ; header block exceeds HBLOCK_MAX
+    ja .block_big                    ; over the cap: consume the run, then 431
     mov rdi, r14
     mov rcx, r11
     rep movsb                        ; rsi -> rdi
@@ -759,7 +771,19 @@ h2_build_request:
     ja .err                          ; CONTINUATION flood
     jmp .frame_loop
 
+.block_big:
+    ; A block too large to hold. The frames are still consumed (nothing is
+    ; copied) until END_HEADERS, and the stream is answered 431 below: the
+    ; connection lives on. The block goes UNDECODED — safe from HPACK desync
+    ; only because we advertise HEADER_TABLE_SIZE 0, so a conforming encoder
+    ; never touches the dynamic table; one that inserts anyway is caught by
+    ; the decoder's insert guard on its next block (COMPRESSION_ERROR).
+    mov qword [rsp + L_BIG], 1
+    jmp .after_append
+
 .assembled:
+    cmp qword [rsp + L_BIG], 0
+    jne .too_big
     ; zero the whole req struct — a count derived from the struct size, so a
     ; field added later (like the conditional-request pointers) cannot be left
     ; holding stale stack bytes
@@ -767,9 +791,10 @@ h2_build_request:
     xor eax, eax
     mov ecx, linnea_h2_req_size / 8
     rep stosq
-    lea rax, [rbx + linnea_connection.up_buf + LINNEA_H2_SCRATCH_OFF]
+    mov rax, [rsp + L_ASM]
+    add rax, LINNEA_H2_HB_ASM                        ; scratch follows the block
     mov [rsp + REQ + linnea_h2_req.scratch], rax
-    lea rcx, [rax + LINNEA_H2_HBLOCK_MAX]
+    lea rcx, [rax + LINNEA_H2_HB_SCRATCH]
     mov [rsp + REQ + linnea_h2_req.scratch_end], rcx
     mov rdi, rbx                     ; the connection's HPACK dynamic table
     call h2_dyn_for
@@ -779,13 +804,13 @@ h2_build_request:
     mov [rsp + REQ + linnea_h2_req.hb_cur], rax
     lea rax, [h2_hdrs_buf + 8192]
     mov [rsp + REQ + linnea_h2_req.hb_end], rax
-    lea rdi, [rbx + linnea_connection.up_buf + LINNEA_H2_ASSEMBLY_OFF]  ; block
+    mov rdi, [rsp + L_ASM]           ; the reassembled block
     mov rsi, r14
     sub rsi, rdi                     ; block length
     lea rdx, [rsp + REQ]
     call linnea_hpack_decode
     test rax, rax
-    js .err                          ; any HPACK error -> connection error
+    js .decode_err
     cmp qword [rsp + REQ + linnea_h2_req.method_ptr], 0
     je .err
     cmp qword [rsp + REQ + linnea_h2_req.path_ptr], 0
@@ -812,13 +837,36 @@ h2_build_request:
     sub rax, [rsp + L_START]         ; bytes consumed
     jmp .ret
 
+.decode_err:
+    ; The decoder's list bound (LINNEA_HPACK_MAX_LISTSIZE — exactly what we
+    ; advertise as SETTINGS_MAX_HEADER_LIST_SIZE) is OUR limit, hit by a
+    ; conforming block that is simply too big: answer the stream. Everything
+    ; else is real HPACK rot and stays a connection error.
+    cmp rax, -LINNEA_HPACK_ERR_LIMIT
+    jne .err
+.too_big:
+    ; the stream id still advances the strictly-increasing floor: this stream
+    ; was answered, so a later HEADERS reusing its id must be refused
+    mov r8, [rsp + L_SID]
+    cmp r8, [rbx + linnea_connection.h2_last_stream]
+    jbe .tb_stamped
+    mov [rbx + linnea_connection.h2_last_stream], r8
+.tb_stamped:
+    mov rdi, rbx
+    mov rsi, [rsp + L_SID]
+    mov rdx, [rsp + L_OUT]
+    call h2_431_stream               ; -> rax = response length
+    mov rdx, rax
+    mov rax, r12
+    sub rax, [rsp + L_START]         ; bytes consumed
+    jmp .ret
 .more:
     mov rax, LINNEA_H2_REQ_MORE
     jmp .ret
 .err:
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
-    add rsp, 280
+    add rsp, 328
     pop rbp
     pop r15
     pop r14
@@ -1751,6 +1799,11 @@ linnea_h2p_init:
     imul rdi, rdi, LINNEA_H2P_UPLOAD_BUF
     call linnea_memory_map
     mov [h2_upload_pool], rax
+    ; and the header-block assembly + decode scratch, one area per connection
+    mov rdi, rbx
+    imul rdi, rdi, LINNEA_H2_HB_AREA
+    call linnea_memory_map
+    mov [h2_hb_pool], rax
     pop rbx
     ret
 
@@ -2487,6 +2540,116 @@ linnea_h2p_service:
 ; h2p_finish_stream(rdi = conn, rsi = slot*) — the stream needs no more DATA
 ; from this slot: free its stream-pool slot (nothing is mapped) so the
 ; scheduler stops considering it and the reset budget is credited.
+; h2_431_stream(rdi=conn, rsi=stream id, rdx=out) -> rax = bytes written.
+; A whole 431 response — HEADERS + DATA(END_STREAM) — for a stream whose
+; header block overran our limits before it ever parsed: there is no req and
+; no :authority, so the accepting server stands in as the vhost (its security
+; headers ride the response, and its name goes in the access line, where the
+; method and target print "-").
+h2_431_stream:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+    mov rbx, rdi                     ; conn
+    mov r12, rsi                     ; stream id
+    mov r14, rdx                     ; out start
+    mov eax, [rbx + linnea_connection.server]
+    imul rax, rax, linnea_config_server_size
+    lea rax, [rax + linnea_config_instance + linnea_config.servers]
+    mov [h2_cur_srv], rax
+    ; content-length text
+    mov edi, body_431_len
+    lea rsi, [h2_numbuf]
+    call linnea_string_from_u64
+    mov r13, rax                     ; its length
+    ; HEADERS payload
+    lea rdi, [r14 + 9]
+    mov rbp, rdi                     ; payload start
+    mov esi, 8                       ; :status
+    lea rdx, [status_431_h2]
+    mov ecx, 3
+    call h2_enc_hdr
+    mov esi, 31                      ; content-type: text/plain
+    lea rdx, [mime_txt_h2]
+    mov ecx, mime_txt_h2_len
+    call h2_enc_hdr
+    mov esi, 28                      ; content-length
+    lea rdx, [h2_numbuf]
+    mov rcx, r13
+    call h2_enc_hdr
+    call h2_enc_date_server
+    mov rcx, rdi
+    sub rcx, rbp                     ; payload length
+    ; HEADERS frame header (END_HEADERS; the DATA carries END_STREAM)
+    mov rdi, r14
+    mov rax, rcx
+    shr rax, 16
+    mov [rdi], al
+    mov rax, rcx
+    shr rax, 8
+    mov [rdi + 1], al
+    mov [rdi + 2], cl
+    mov byte [rdi + 3], LINNEA_H2_FT_HEADERS
+    mov byte [rdi + 4], LINNEA_H2_FLAG_END_HEADERS
+    mov rax, r12
+    shr rax, 24
+    mov [rdi + 5], al
+    mov rax, r12
+    shr rax, 16
+    mov [rdi + 6], al
+    mov rax, r12
+    shr rax, 8
+    mov [rdi + 7], al
+    mov [rdi + 8], r12b
+    ; DATA frame: the 431 body, END_STREAM
+    lea rdi, [rdi + rcx + 9]
+    mov byte [rdi], 0
+    mov byte [rdi + 1], 0
+    mov byte [rdi + 2], body_431_len
+    mov byte [rdi + 3], LINNEA_H2_FT_DATA
+    mov byte [rdi + 4], LINNEA_H2_FLAG_END_STREAM
+    mov rax, r12
+    shr rax, 24
+    mov [rdi + 5], al
+    mov rax, r12
+    shr rax, 16
+    mov [rdi + 6], al
+    mov rax, r12
+    shr rax, 8
+    mov [rdi + 7], al
+    mov [rdi + 8], r12b
+    add rdi, 9
+    lea rsi, [body_431]
+    mov ecx, body_431_len
+    rep movsb
+    mov r13, rdi
+    sub r13, r14                     ; total bytes written
+    ; the access line: the request never parsed, so method and target are "-"
+    mov rax, [h2_cur_srv]
+    lea rcx, [rax + linnea_config_server.hostname]
+    mov [linnea_log_acc_host], rcx
+    mov rcx, [rax + linnea_config_server.hostname_len]
+    mov [linnea_log_acc_host_len], rcx
+    lea rcx, [rbx + linnea_connection.peer]
+    mov [linnea_log_acc_peer], rcx
+    mov rcx, [rbx + linnea_connection.peer_len]
+    mov [linnea_log_acc_peer_len], rcx
+    xor ecx, ecx
+    mov [linnea_log_acc_meth], rcx
+    mov [linnea_log_acc_tgt], rcx
+    mov qword [linnea_log_acc_status], 431
+    mov qword [linnea_log_acc_bytes], body_431_len
+    call linnea_log_access
+    mov rax, r13
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 h2p_finish_stream:
     push rbx
     push r12
@@ -4233,6 +4396,8 @@ h2_req_es:    resd 1                 ; END_STREAM was set on the HEADERS frame
 h2p_pool:     resq 1                 ; the upstream slot array (one mmap)
 h2_dyn_pool:  resq 1                 ; per-connection HPACK dynamic tables
 h2_upload_pool: resq 1               ; per-connection streaming-upload buffers
+h2_hb_pool:    resq 1                ; per-connection header-block assembly +
+                                     ; HPACK decode scratch (LINNEA_H2_HB_AREA)
 h2_cur_srv:   resq 1                 ; vhost whose response is being built
 h2_fd_len:    resd 1                 ; a DATA frame's flow-control cost
 h2_fd_credit: resd 1                 ; and whether it is owed back now

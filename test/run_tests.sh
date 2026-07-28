@@ -2211,17 +2211,21 @@ PY
     timeout 20 python3 test/tls/h2_conformance.py $CA 47446 >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
 
-    # Headers whose decoded literals overflow the Huffman scratch must be
-    # refused, not served with the overflowing fields silently missing. The
-    # decoder did report the error — but in eax, which zero-extends, so the
-    # caller's sign test never fired and the request was served with Cookie,
-    # Range and the conditionals quietly dropped.
+    # A biggish cookie load (4.8 KB) fits the Q121 limits and must be SERVED —
+    # whole, not with the overflowing fields silently dropped (the Q100 bug),
+    # and certainly not by killing the connection (the pre-Q121 behaviour).
     bigck=$(python3 -c "print('a'*4800)")
     code=$(timeout 10 curl -s -o /dev/null -w '%{http_code}' --http2 --cacert $CA \
         --resolve localhost:47446:127.0.0.1 -H "Cookie: $bigck" \
         https://localhost:47446/hello.txt 2>/dev/null)
-    [ "$code" != 200 ]
-    check "http2 oversized header block refused, not silently truncated" $?
+    [ "$code" = 200 ]
+    check "http2 big-but-legal cookie served (fits the raised limits)" $?
+
+    # Q121: an oversized header block answers the stream 431 (the connection
+    # survives and keeps serving), and SETTINGS advertises the real
+    # MAX_HEADER_LIST_SIZE so clients can trim before hitting it.
+    timeout 30 python3 test/tls/h2_big_headers.py $CA 47446 >/dev/null 2>&1
+    check "http2 oversized header block: stream 431, connection survives" $?
 
     # wrong-length PING / WINDOW_UPDATE are a connection error, not an over-read
     # (a zero-length PING used to echo 8 stale in_buf bytes to the peer)
