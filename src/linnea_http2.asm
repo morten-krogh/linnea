@@ -55,6 +55,8 @@ extern linnea_log_stamp
 extern linnea_log_write
 extern linnea_log_u64
 extern drain_flag
+extern head_timeout_ns
+extern linnea_uring_now
 
 ; proxy-over-h2: slot pool init + lookup for the io_uring loop, the upstream
 ; event handler, and connection teardown (see the Q86 section below)
@@ -407,6 +409,11 @@ linnea_h2_handle:
     pop rdi
     mov [rdi + linnea_h2p.rq_wr], r9
     sub [rdi + linnea_h2p.rq_rem], rax
+    ; pay the body clock forward for these bytes; the deadline test itself runs
+    ; in the service pass (no clock read here — rcx/r11 hold live frame state)
+    mov r8, rax
+    imul r8, r8, LINNEA_BODY_NS_PER_BYTE
+    add [rdi + linnea_h2p.rq_start], r8
     or qword [rdi + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
     jmp .fd_done
 .fd_collect:
@@ -1401,6 +1408,8 @@ h2_serve:
     mov [r13 + linnea_h2p.rq_buf], rcx
     mov [r13 + linnea_h2p.rq_rem], rax
     or qword [r13 + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
+    call linnea_uring_now            ; the body clock starts with the claim
+    mov [r13 + linnea_h2p.rq_start], rax
     mov rdi, r13
     mov rsi, [r12 + linnea_h2_req.cl_ptr]
     mov rdx, [r12 + linnea_h2_req.cl_len]
@@ -2200,7 +2209,31 @@ linnea_h2p_service:
     test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
     jz .sv_unclaim
     cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
-    jne .sv_claim_ok
+    je .sv_unclaim
+    ; Still streaming: the body clock. Every received byte paid it forward
+    ; (LINNEA_BODY_NS_PER_BYTE, the DATA path); a client trickling — or gone
+    ; silent, with the recv timeout driving this pass — falls behind by more
+    ; than the head deadline and the exchange fails 408, releasing the
+    ; upstream slot it was holding. The failed slot is emitted by the walk
+    ; below in this same pass.
+    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FAILED
+    je .sv_claim_ok                  ; already failed: the walk below emits it
+    cmp qword [rax + linnea_h2p.rq_rem], 0
+    je .sv_claim_ok                  ; body fully received: nothing to bound
+    mov r12, rax                     ; (the walk below reassigns r12)
+    call linnea_uring_now
+    mov rcx, [r12 + linnea_h2p.rq_start]
+    cmp rcx, rax
+    jbe .sv_body_age
+    mov [r12 + linnea_h2p.rq_start], rax   ; no credit banked ahead of now
+    jmp .sv_claim_ok
+.sv_body_age:
+    sub rax, rcx
+    cmp rax, [head_timeout_ns]
+    jbe .sv_claim_ok
+    mov qword [r12 + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [r12 + linnea_h2p.status], 408
+    jmp .sv_claim_ok
 .sv_unclaim:
     mov qword [rbx + linnea_connection.h2_upload], 0
 .sv_claim_ok:
@@ -3204,9 +3237,15 @@ h2p_emit_error:
     jmp .ee_status
 .ee_pick_413:
     cmp rax, 413
-    jne .ee_status
+    jne .ee_pick_408
     lea r12, [body_413]
     mov r13d, body_413_len
+    jmp .ee_status
+.ee_pick_408:
+    cmp rax, 408
+    jne .ee_status
+    lea r12, [body_408]
+    mov r13d, body_408_len
 .ee_status:
     lea rdi, [h2p_stbuf]             ; the status as three digits
     xor edx, edx
@@ -4004,6 +4043,8 @@ body_502: db "502 Bad Gateway", 10
 body_502_len equ $ - body_502
 body_504: db "504 Gateway Timeout", 10
 body_504_len equ $ - body_504
+body_408: db "408 Request Timeout", 10
+body_408_len equ $ - body_408
 body_413: db "413 Content Too Large", 10
 body_413_len equ $ - body_413
 ; --- proxy-over-h2 literals ---

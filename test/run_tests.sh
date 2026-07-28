@@ -2279,6 +2279,21 @@ PYEOF
         && printf '%s' "$resp" | grep -qF "hello from linnea"
     check "http2 proxied-stream RST + RST-stream-0 crash no worker" $?
 
+    # Body-phase slowloris (Q119): head_timeout used to stop at the request
+    # head, so a client trickling a proxied request body — or sitting silent
+    # on an h2 upload, dodging the idle timeout — held its upstream slot
+    # forever. The body clock (LINNEA_BODY_NS_PER_BYTE per received byte) cuts
+    # a trickler about head_timeout after its last honest burst: h1 closes,
+    # h2 fails the stream 408 and the connection and slot live on. A
+    # full-speed upload must be untouched. Own server: head_timeout=3.
+    $BIN test/configs/tls-slowbody.json >/dev/null 2>&1 &
+    slowbody_pid=$!
+    sleep 0.3
+    timeout 60 python3 test/tls/slow_body.py $CA 47457 >/dev/null 2>&1
+    check "request-body slowloris cut on h1 and h2; honest uploads untouched" $?
+    kill $slowbody_pid 2>/dev/null
+    wait $slowbody_pid 2>/dev/null
+
     kill $tls_server_pid $tls_backend_pid 2>/dev/null
     wait $tls_server_pid 2>/dev/null
     wait $tls_backend_pid 2>/dev/null

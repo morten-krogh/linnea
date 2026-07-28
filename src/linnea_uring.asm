@@ -46,6 +46,8 @@ default rel
 
 global linnea_uring_run
 global drain_flag
+global head_timeout_ns
+global linnea_uring_now
 
 extern linnea_ring_init
 extern linnea_ring_get_sqe
@@ -155,6 +157,8 @@ reason_peer:        db "peer closed"
 reason_peer_len     equ $ - reason_peer
 reason_slow_head:   db "request head too slow"
 reason_slow_head_len equ $ - reason_slow_head
+reason_slow_body:   db "request body too slow"
+reason_slow_body_len equ $ - reason_slow_body
 reason_per_ip:      db "per-address connection limit"
 reason_per_ip_len   equ $ - reason_per_ip
 reason_timeout:     db "idle timeout"
@@ -933,6 +937,21 @@ linnea_uring_run:
     call linnea_h2_busy
     test rax, rax
     jz .recv_timeout_close
+    ; Run a service pass before re-arming: this timeout is the only clock a
+    ; SILENT streaming upload ever sees (no frames arrive, so no pass would
+    ; otherwise run), and the pass is what fails one that has overrun the body
+    ; deadline — its 408 goes out here rather than never.
+    cmp qword [r12 + linnea_connection.h2_tx_busy], 0
+    jne .recv_timeout_rearm    ; the in-flight send's drain runs the same pass
+    mov rdi, r12
+    call linnea_h2_after_send
+    cmp eax, LINNEA_H2_SEND
+    jne .recv_timeout_rearm
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.recv_timeout_rearm:
     mov rdi, r12
     call h2_arm_recv_once
     call linnea_uring_submit_now
@@ -1060,6 +1079,37 @@ linnea_uring_run:
 .req_body_recv:
     test r15d, r15d
     jle .req_body_gone
+    ; The body clock: the head deadline keeps running here, paid forward by
+    ; progress — every received byte buys LINNEA_BODY_NS_PER_BYTE. A real
+    ; uploader keeps the clock pinned to now; a client trickling a byte per
+    ; idle period — which holds this connection's upstream slot — falls
+    ; behind and is cut about head_timeout after its last honest burst.
+    ; req_start can be ZERO here: a head that arrived pipelined behind the
+    ; TLS handshake (or a previous response) reaches .process without ever
+    ; passing .recv_data's stamp, and the last send's arm zeroed the clock.
+    ; Then it starts with this first relayed chunk.
+    mov rcx, [r12 + linnea_connection.req_start]
+    test rcx, rcx
+    jnz .req_body_pay
+    call linnea_uring_now
+    mov [r12 + linnea_connection.req_start], rax
+    jmp .req_body_take
+.req_body_pay:
+    mov eax, r15d
+    imul rax, rax, LINNEA_BODY_NS_PER_BYTE
+    add rax, rcx
+    mov [r12 + linnea_connection.req_start], rax
+    call linnea_uring_now
+    mov rcx, [r12 + linnea_connection.req_start]
+    cmp rcx, rax
+    jbe .req_body_age
+    mov [r12 + linnea_connection.req_start], rax   ; no credit banked ahead of now
+    jmp .req_body_take
+.req_body_age:
+    sub rax, rcx
+    cmp rax, [head_timeout_ns]
+    ja .req_body_slow
+.req_body_take:
     mov eax, r15d
     cmp rax, [r12 + linnea_connection.req_body_rem]
     jbe .req_body_have
@@ -1077,6 +1127,10 @@ linnea_uring_run:
 .req_body_gone:
     lea r14, [reason_peer]
     mov r15d, reason_peer_len
+    jmp .conn_close
+.req_body_slow:
+    lea r14, [reason_slow_body]
+    mov r15d, reason_slow_body_len
     jmp .conn_close
 
 ; --- send completion: r13 = connection index, r15d = bytes or -errno --

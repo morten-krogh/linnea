@@ -131,6 +131,12 @@ LINNEA_H2_RESP_ROOM   equ 3072
 ; uploads never touches it; a second concurrent upload on the same
 ; connection falls back to the bounded collect path.
 LINNEA_H2P_UPLOAD_BUF equ 65536
+; The request-body clock (h1 streaming relay and h2 uploads): the head deadline
+; keeps running through the body, and every received byte buys this much more
+; time. 2 ms/byte = a 500 B/s floor — any real uploader outruns it thousands of
+; times over, while a trickler holding an upstream slot falls behind and is cut
+; roughly head_timeout after its last honest burst.
+LINNEA_BODY_NS_PER_BYTE equ 2000000
 
 ; slot states
 LINNEA_H2P_FREE       equ 0
@@ -191,6 +197,10 @@ struc linnea_h2p
     .rq_wr:     resq 1            ; append point
     .rq_rem:    resq 1            ; body bytes still expected from the client
     .rq_credit: resq 1            ; forwarded bytes owed back as WINDOW_UPDATE
+    .rq_start:  resq 1            ; the body clock: stamped at the claim, paid
+                                  ; forward LINNEA_BODY_NS_PER_BYTE per received
+                                  ; byte (capped at now), failed 408 when it
+                                  ; falls head_timeout behind
     ; Connection-level credit left behind when the slot was freed with body
     ; bytes still uncredited (the client reset the stream, or the upstream
     ; failed, mid-upload). The stream is gone, so this can only go out on
