@@ -21,6 +21,8 @@ extern linnea_quic_varint_decode
 extern linnea_quic_varint_encode
 extern linnea_log_access
 extern linnea_log_acc_peer
+extern linnea_log_acc_proto
+extern linnea_log_acc_proto_len
 extern linnea_log_acc_status
 extern linnea_log_acc_bytes
 extern linnea_qpack_decode
@@ -55,6 +57,8 @@ body_404:      db "404 Not Found", 10
 body_404_len   equ $ - body_404
 body_400:      db "400 Bad Request", 10
 body_400_len   equ $ - body_400
+proto_h3: db "HTTP/3"
+proto_h3_len equ $ - proto_h3
 body_421: db "421 Misdirected Request", 10
 body_421_len equ $ - body_421
 body_431:      db "431 Request Header Fields Too Large", 10
@@ -222,6 +226,9 @@ linnea_h3_build_headers:
     mov eax, esi
     mov [linnea_log_acc_status], rax
     mov [linnea_log_acc_bytes], r8
+    lea rax, [proto_h3]                 ; this builder is HTTP/3-only
+    mov [linnea_log_acc_proto], rax
+    mov qword [linnea_log_acc_proto_len], proto_h3_len
     push rdi
     push rsi
     push rdx

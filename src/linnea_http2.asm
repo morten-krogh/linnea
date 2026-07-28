@@ -67,6 +67,8 @@ extern linnea_log_acc_meth
 extern linnea_log_acc_meth_len
 extern linnea_log_acc_tgt
 extern linnea_log_acc_tgt_len
+extern linnea_log_acc_proto
+extern linnea_log_acc_proto_len
 extern linnea_log_acc_status
 extern linnea_log_acc_bytes
 
@@ -1801,6 +1803,9 @@ h2_serve:
 .acc_line:
     mov [linnea_log_acc_status], rdx
     mov [linnea_log_acc_bytes], rcx
+    lea rax, [proto_h2]
+    mov [linnea_log_acc_proto], rax
+    mov qword [linnea_log_acc_proto_len], proto_h2_len
     mov rax, [h2_cur_srv]
     lea rcx, [rax + linnea_config_server.hostname]
     mov [linnea_log_acc_host], rcx
@@ -2697,6 +2702,9 @@ h2_431_stream:
     mov [linnea_log_acc_tgt], rcx
     mov qword [linnea_log_acc_status], 431
     mov qword [linnea_log_acc_bytes], body_431_len
+    lea rcx, [proto_h2]
+    mov [linnea_log_acc_proto], rcx
+    mov qword [linnea_log_acc_proto_len], proto_h2_len
     call linnea_log_access
     mov rax, r13
     pop rbp
@@ -2738,6 +2746,9 @@ h2p_finish_stream:
     mov [linnea_log_acc_status], rcx
     mov rcx, [rbx + linnea_h2p.lg_bytes]
     mov [linnea_log_acc_bytes], rcx
+    lea rcx, [proto_h2]
+    mov [linnea_log_acc_proto], rcx
+    mov qword [linnea_log_acc_proto_len], proto_h2_len
     mov byte [rbx + linnea_h2p.lg_meth], 0
     call linnea_log_access
 .fs_scan:
@@ -4448,6 +4459,8 @@ body_502: db "502 Bad Gateway", 10
 body_502_len equ $ - body_502
 body_504: db "504 Gateway Timeout", 10
 body_504_len equ $ - body_504
+proto_h2: db "HTTP/2"
+proto_h2_len equ $ - proto_h2
 body_408: db "408 Request Timeout", 10
 body_408_len equ $ - body_408
 body_421_h2: db "421 Misdirected Request", 10

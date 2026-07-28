@@ -709,7 +709,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_goaway_test.py 47453 $ga_master >/dev/null 2>&1
     check "h3 (io_uring): drain sends GOAWAY on the control stream" $?
     # Q120: the request that test served must be in the access log
-    grep -qE 'request localhost from [0-9.:]+ "GET /hello.txt" 200 ' test/linnea.log
+    grep -qE 'request localhost from [0-9.:]+ "GET /hello.txt HTTP/3" 200 ' test/linnea.log
     check "h3 request access-logged" $?
     wait $ga_master 2>/dev/null
     pkill -f tls-h3-drain 2>/dev/null
@@ -1001,7 +1001,7 @@ check_http "rfc850 date ignored" "hello from linnea" "$resp"
 resp=$(curl -si --max-time 2 -H 'If-None-Match: "x"' -H "If-Modified-Since: $lastmod" http://127.0.0.1:47080/hello.txt)
 check_http "if-none-match wins"  "hello from linnea" "$resp"
 
-grep -qF '"GET /hello.txt" 304 0' "$LOG"
+grep -qF '"GET /hello.txt HTTP/1.1" 304 0' "$LOG"
 check "request log 304" $?
 
 # --- pre-compressed variants: enc.txt has both a .br and a .gz beside it ---
@@ -1153,9 +1153,9 @@ curl -s --max-time 4 -r 0-4 \
 after=$(grep -c "accepted connection" "$LOG")
 [ $((after - before)) -eq 1 ]
 check "206 keep-alive single accept" $?
-grep -qF '"GET /hello.txt" 206 5' "$LOG"
+grep -qF '"GET /hello.txt HTTP/1.1" 206 5' "$LOG"
 check "request log 206" $?
-grep -qF '"GET /hello.txt" 416 0' "$LOG"
+grep -qF '"GET /hello.txt HTTP/1.1" 416 0' "$LOG"
 check "request log 416" $?
 
 # --- virtual hosts: 47080 is shared by one.test (default) and three.test ---
@@ -1251,15 +1251,15 @@ resp=$(raw_http 'GET /api/simple HTTP/1.1\r\n\r\n')
 check_http "host: missing Host on a proxy location is 400" "400 Bad Request" "$resp"
 
 # --- request log lines (with peer address) ---
-grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /hello\.txt" 200 18' "$LOG"
+grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /hello\.txt HTTP/1\.1" 200 18' "$LOG"
 check "request log 200" $?
-grep -qE 'request three\.test from 127\.0\.0\.1:[0-9]+ "GET /page\.html" 200' "$LOG"
+grep -qE 'request three\.test from 127\.0\.0\.1:[0-9]+ "GET /page\.html HTTP/1\.1" 200' "$LOG"
 check "request log vhost" $?
-grep -qE '"GET /a%20b\.txt" 200' "$LOG"
+grep -qE '"GET /a%20b\.txt HTTP/1\.1" 200' "$LOG"
 check "request log raw target" $?
-grep -qF '"GET /no-such-file" 404 0' "$LOG"
+grep -qF '"GET /no-such-file HTTP/1.1" 404 0' "$LOG"
 check "request log 404" $?
-grep -qF '"POST /hello.txt" 405 0' "$LOG"
+grep -qF '"POST /hello.txt HTTP/1.1" 405 0' "$LOG"
 check "request log 405" $?
 grep -qE '^\[20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\] request' "$LOG"
 check "log timestamps" $?
@@ -1398,17 +1398,17 @@ check "proxy streams a 300000-byte request body (byte-exact)" $?
 rm -f /tmp/upload_echo.bin
 
 # --- proxied request log lines: upstream status, relayed byte count ---
-grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /api/simple" 200 12' "$LOG"
+grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /api/simple HTTP/1\.1" 200 12' "$LOG"
 check "proxy log 200" $?
-grep -qF '"POST /api/echo" 200 10' "$LOG"
+grep -qF '"POST /api/echo HTTP/1.1" 200 10' "$LOG"
 check "proxy log body bytes" $?
-grep -qF '"GET /api/target?x=1&y=2" 200' "$LOG"
+grep -qF '"GET /api/target?x=1&y=2 HTTP/1.1" 200' "$LOG"
 check "proxy log query" $?
-grep -qF '"GET /down/x" 502 0' "$LOG"
+grep -qF '"GET /down/x HTTP/1.1" 502 0' "$LOG"
 check "proxy log 502" $?
-grep -qF '"GET /api/slow" 504 0' "$LOG"
+grep -qF '"GET /api/slow HTTP/1.1" 504 0' "$LOG"
 check "proxy log 504" $?
-grep -qF '"HEAD /api/simple" 200 0' "$LOG"
+grep -qF '"HEAD /api/simple HTTP/1.1" 200 0' "$LOG"
 check "proxy log HEAD" $?
 
 # --- websockets: upgrade passthrough and the full-duplex tunnel ---
@@ -1437,7 +1437,7 @@ check_http "unrequested 101 becomes 502" "502 Bad Gateway" "$resp"
 resp=$(curl -si --max-time 3 -H 'Connection: upgrade' -H 'Upgrade: websocket' \
     http://127.0.0.1:47080/hello.txt)
 check_http "upgrade on static location" "hello from linnea" "$resp"
-grep -qF '"GET /api/ws-echo" 101 0' "$LOG"
+grep -qF '"GET /api/ws-echo HTTP/1.1" 101 0' "$LOG"
 check "ws request log 101" $?
 grep -qF ': upstream closed' "$LOG"
 check "ws termination upstream closed" $?
@@ -1623,7 +1623,7 @@ kill -0 $rot_master 2>/dev/null
 check "sighup: the server survives it" $?
 [ -s "$LOG" ]
 check "sighup: reopens the log (new file has lines)" $?
-grep -q '"GET /index.html"' "$LOG"
+grep -q '"GET /index.html HTTP/1.1"' "$LOG"
 check "sighup: post-rotate requests log to the new file" $?
 [ "$(wc -l < "$LOG.rot")" -eq "$rotated_before" ]
 check "sighup: the rotated file stops growing" $?
@@ -2047,7 +2047,7 @@ rm -f /tmp/upload3_echo.bin
         > /tmp/upl_ka.txt
     [ "$(cat /tmp/upl_ka.txt)" = "1 200 0 200" ]
     check "tls upload: keep-alive survives a streamed body" $?
-    grep -q '"POST /api/echo" 200' "$LOG"
+    grep -q '"POST /api/echo HTTP/1.1" 200' "$LOG"
     check "tls upload: the streamed request is logged with its target" $?
     # the worker must still be the one that started (no crash + respawn)
     ! grep -q "exited, respawning" "$LOG"
@@ -2390,8 +2390,8 @@ PYEOF
     # Q120: h2 requests reach the access log — static and proxied alike, in
     # h1's exact format. Before this only h1 was logged, so most real browser
     # traffic was invisible.
-    grep -qE 'request localhost from [0-9.:]+ "GET /hello.txt" 200 ' "$LOG" \
-        && grep -qE '"GET /api/simple" 200 ' "$LOG"
+    grep -qE 'request localhost from [0-9.:]+ "GET /hello.txt HTTP/2" 200 ' "$LOG" \
+        && grep -qE '"GET /api/simple HTTP/2" 200 ' "$LOG"
     check "http2 requests access-logged (static + proxied)" $?
 
     # Body-phase slowloris (Q119): head_timeout used to stop at the request

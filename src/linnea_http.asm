@@ -268,6 +268,11 @@ log_from:       db " from "
 log_from_len    equ $ - log_from
 log_quote:      db ' "'
 log_endq:       db '" '
+; the protocol closes the quoted request, as the Common Log Format has it.
+; Every request this handler accepts is HTTP/1.1 — the version check admits
+; nothing else — so it is a constant here.
+log_proto11:    db " HTTP/1.1"
+log_proto11_len equ $ - log_proto11
 log_dash:       db "-"
 log_sp:         db " "
 log_nl:         db 10
@@ -1916,6 +1921,9 @@ linnea_http_handle:
     mov esi, 1
 .log_target:
     call linnea_log_write
+    lea rdi, [log_proto11]
+    mov esi, log_proto11_len
+    call linnea_log_write
     lea rdi, [log_endq]
     mov esi, 2
     call linnea_log_write
@@ -2281,6 +2289,9 @@ linnea_http_log_conn:
     call linnea_log_write
     mov rdi, r13
     mov rsi, [rsp + 24]
+    call linnea_log_write
+    lea rdi, [log_proto11]
+    mov esi, log_proto11_len
     call linnea_log_write
     lea rdi, [log_endq]
     mov esi, 2

@@ -20,6 +20,8 @@ global linnea_log_acc_meth
 global linnea_log_acc_meth_len
 global linnea_log_acc_tgt
 global linnea_log_acc_tgt_len
+global linnea_log_acc_proto
+global linnea_log_acc_proto_len
 global linnea_log_acc_status
 global linnea_log_acc_bytes
 
@@ -69,6 +71,8 @@ linnea_log_acc_meth:     resq 1
 linnea_log_acc_meth_len: resq 1
 linnea_log_acc_tgt:      resq 1
 linnea_log_acc_tgt_len:  resq 1
+linnea_log_acc_proto:    resq 1     ; "HTTP/1.1" / "HTTP/2" / "HTTP/3"
+linnea_log_acc_proto_len: resq 1
 linnea_log_acc_status:   resq 1
 linnea_log_acc_bytes:    resq 1
 
@@ -254,7 +258,10 @@ linnea_log_stamp:
 
 ; linnea_log_access — emit one access-log line from the linnea_log_acc_*
 ; parameter block, in the same format for every protocol:
-;   '[stamp] request <host> from <peer> "<METHOD> <TARGET>" <status> <bytes>'
+;   '[stamp] request <host> from <peer> "<METHOD> <TARGET> <PROTO>" <status> <bytes>'
+; The protocol goes inside the quotes, where the Common Log Format has always
+; put it, so the request line reads as the client sent it (h2 and h3 have no
+; request line of their own, but the shape is what log tools expect).
 ; A zero host/peer/method/target pointer prints as "-" (a request that never
 ; parsed far enough to have one). Clobbers no callee-saved registers.
 linnea_log_access:
@@ -279,6 +286,11 @@ linnea_log_access:
     mov esi, 1
     call linnea_log_write
     lea rbx, [linnea_log_acc_tgt]
+    call .acc_field
+    lea rdi, [acc_sp]
+    mov esi, 1
+    call linnea_log_write
+    lea rbx, [linnea_log_acc_proto]
     call .acc_field
     lea rdi, [acc_endq]
     mov esi, 2
