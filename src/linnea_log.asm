@@ -11,6 +11,17 @@ global linnea_log_reopen
 global linnea_log_write
 global linnea_log_u64
 global linnea_log_stamp
+global linnea_log_access
+global linnea_log_acc_host
+global linnea_log_acc_host_len
+global linnea_log_acc_peer
+global linnea_log_acc_peer_len
+global linnea_log_acc_meth
+global linnea_log_acc_meth_len
+global linnea_log_acc_tgt
+global linnea_log_acc_tgt_len
+global linnea_log_acc_status
+global linnea_log_acc_bytes
 
 extern linnea_print_fd
 extern linnea_string_from_u64
@@ -21,6 +32,17 @@ section .rodata
 
 msg_open:       db "cannot open log file: "
 msg_open_len    equ $ - msg_open
+; the access line's fixed pieces — the same format for every protocol:
+; 'request <host> from <peer> "<METHOD> <TARGET>" <status> <bytes>'
+acc_req:        db "request "
+acc_req_len     equ $ - acc_req
+acc_from:       db " from "
+acc_from_len    equ $ - acc_from
+acc_quote:      db ' "'
+acc_endq:       db '" '
+acc_dash:       db "-"
+acc_sp:         db " "
+acc_nl:         db 10
 
 section .data
 
@@ -36,6 +58,19 @@ stamp_buf:      resb 24        ; "[YYYY-MM-DD HH:MM:SS] "
 line_buf:       resb LOG_LINE_CAP
 line_len:       resq 1
 log_path:       resq 1     ; the configured path, for reopening after a rotate
+; The access-line parameter block (see linnea_log_access): seven fields
+; outgrow the argument registers, and the worker is single-threaded, so the
+; caller fills these and calls. A zero text pointer prints as "-".
+linnea_log_acc_host:     resq 1
+linnea_log_acc_host_len: resq 1
+linnea_log_acc_peer:     resq 1
+linnea_log_acc_peer_len: resq 1
+linnea_log_acc_meth:     resq 1
+linnea_log_acc_meth_len: resq 1
+linnea_log_acc_tgt:      resq 1
+linnea_log_acc_tgt_len:  resq 1
+linnea_log_acc_status:   resq 1
+linnea_log_acc_bytes:    resq 1
 
 section .text
 
@@ -216,3 +251,55 @@ linnea_log_stamp:
     add dl, '0'
     mov [rdi + 1], dl
     ret
+
+; linnea_log_access — emit one access-log line from the linnea_log_acc_*
+; parameter block, in the same format for every protocol:
+;   '[stamp] request <host> from <peer> "<METHOD> <TARGET>" <status> <bytes>'
+; A zero host/peer/method/target pointer prints as "-" (a request that never
+; parsed far enough to have one). Clobbers no callee-saved registers.
+linnea_log_access:
+    push rbx
+    call linnea_log_stamp
+    lea rdi, [acc_req]
+    mov esi, acc_req_len
+    call linnea_log_write
+    lea rbx, [linnea_log_acc_host]
+    call .acc_field
+    lea rdi, [acc_from]
+    mov esi, acc_from_len
+    call linnea_log_write
+    lea rbx, [linnea_log_acc_peer]
+    call .acc_field
+    lea rdi, [acc_quote]
+    mov esi, 2
+    call linnea_log_write
+    lea rbx, [linnea_log_acc_meth]
+    call .acc_field
+    lea rdi, [acc_sp]
+    mov esi, 1
+    call linnea_log_write
+    lea rbx, [linnea_log_acc_tgt]
+    call .acc_field
+    lea rdi, [acc_endq]
+    mov esi, 2
+    call linnea_log_write
+    mov rdi, [linnea_log_acc_status]
+    call linnea_log_u64
+    lea rdi, [acc_sp]
+    mov esi, 1
+    call linnea_log_write
+    mov rdi, [linnea_log_acc_bytes]
+    call linnea_log_u64
+    lea rdi, [acc_nl]
+    mov esi, 1
+    call linnea_log_write
+    pop rbx
+    ret
+.acc_field:                    ; rbx = ptr slot (its length follows); "-" if 0
+    mov rdi, [rbx]
+    mov rsi, [rbx + 8]
+    test rdi, rdi
+    jnz linnea_log_write
+    lea rdi, [acc_dash]
+    mov esi, 1
+    jmp linnea_log_write

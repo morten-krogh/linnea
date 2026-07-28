@@ -17,6 +17,10 @@ global linnea_h3_tx_cap
 
 extern linnea_quic_varint_decode
 extern linnea_quic_varint_encode
+extern linnea_log_access
+extern linnea_log_acc_peer
+extern linnea_log_acc_status
+extern linnea_log_acc_bytes
 extern linnea_qpack_decode
 extern linnea_qpack_encode_response
 extern linnea_qpack_send_validators
@@ -195,6 +199,27 @@ linnea_h3_build_headers:
     push r14
     push r15
     push rbp
+    ; The access line: every HTTP/3 response of any shape passes through here,
+    ; and the server parked the who-and-what (peer, host, method, target) in
+    ; the log's parameter block before serving. Only the outcome is added. A
+    ; zero peer means no context was set (a bare test driver): log nothing.
+    cmp qword [linnea_log_acc_peer], 0
+    je .no_acc
+    mov eax, esi
+    mov [linnea_log_acc_status], rax
+    mov [linnea_log_acc_bytes], r8
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push r8
+    call linnea_log_access
+    pop r8
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+.no_acc:
     mov rbx, rdi                     ; out start
     mov r14, rdi                     ; out cursor
     mov r15d, esi                    ; status

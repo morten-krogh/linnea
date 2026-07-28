@@ -11,6 +11,7 @@ default rel
 
 global linnea_network_listen_all
 global linnea_network_peer_format
+global linnea_network_addr_format
 global linnea_network_peer_addr
 global linnea_network_parse_ipv4
 global linnea_network_quic_listener
@@ -371,8 +372,6 @@ linnea_network_listener_adopt:
 ; cursor (72 bytes is plenty). On any failure writes "-" and returns 1.
 linnea_network_peer_format:
     push rbx
-    push r12
-    push r13
     sub rsp, 48                ; sockaddr (28) + socklen (8); keeps calls aligned
     mov rbx, rsi               ; out buffer
     mov eax, LINNEA_SYS_GETPEERNAME
@@ -381,22 +380,48 @@ linnea_network_peer_format:
     mov qword [rsp + 32], LINNEA_SOCKADDR_IN6_SIZE
     syscall
     cmp rax, -4095
-    jae .unknown
-    mov r12, rbx               ; write cursor
-    movzx eax, word [rsp]
+    jae .pf_unknown
+    mov rdi, rsp
+    mov rsi, rbx
+    call linnea_network_addr_format
+    add rsp, 48
+    pop rbx
+    ret
+.pf_unknown:
+    mov byte [rbx], '-'
+    mov eax, 1
+    add rsp, 48
+    pop rbx
+    ret
+
+; linnea_network_addr_format(rdi=sockaddr*, rsi=out buffer) -> rax = length.
+; The address text: "a.b.c.d:port" for IPv4 (native or v6-mapped),
+; "[h:h:h:h:h:h:h:h]:port" for IPv6, "-" for any other family. Split from
+; peer_format so the QUIC side can log a peer from its stored sockaddr —
+; a UDP socket has no connected fd for getpeername to ask about.
+linnea_network_addr_format:
+    push rbx
+    push r12
+    push r13
+    push rbp
+    sub rsp, 8                 ; keep the number-formatter calls 16-aligned
+    mov rbp, rdi               ; the sockaddr
+    mov rbx, rsi               ; out buffer start
+    mov r12, rsi               ; write cursor
+    movzx eax, word [rbp]
     cmp eax, LINNEA_AF_INET6
     je .v6maybe
     cmp eax, LINNEA_AF_INET
     jne .unknown
-    lea r13, [rsp + 4]         ; native IPv4: octets at offset 4
+    lea r13, [rbp + 4]         ; native IPv4: octets at offset 4
     jmp .fmt_v4
 .v6maybe:
     ; IPv4-mapped ::ffff:a.b.c.d has addr bytes 0..9 = 0, 10,11 = 0xff
-    cmp qword [rsp + 8], 0
+    cmp qword [rbp + 8], 0
     jne .v6
-    cmp dword [rsp + 16], 0xffff0000
+    cmp dword [rbp + 16], 0xffff0000
     jne .v6
-    lea r13, [rsp + 20]        ; the mapped IPv4 octets
+    lea r13, [rbp + 20]        ; the mapped IPv4 octets
     ; fall through
 .fmt_v4:
     movzx edi, byte [r13]
@@ -426,7 +451,7 @@ linnea_network_peer_format:
     ; "[h:h:h:h:h:h:h:h]" — eight big-endian 16-bit groups, minimal hex digits
     mov byte [r12], '['
     inc r12
-    lea r13, [rsp + 8]         ; 16 address bytes
+    lea r13, [rbp + 8]         ; 16 address bytes
     xor r9d, r9d               ; group index 0..7
 .v6_group:
     test r9d, r9d
@@ -472,7 +497,7 @@ linnea_network_peer_format:
 .port:
     mov byte [r12], ':'
     inc r12
-    movzx eax, word [rsp + 2]
+    movzx eax, word [rbp + 2]
     xchg al, ah                ; network to host order
     movzx edi, ax
     mov rsi, r12
@@ -480,7 +505,8 @@ linnea_network_peer_format:
     add r12, rax
     mov rax, r12
     sub rax, rbx
-    add rsp, 48
+    add rsp, 8
+    pop rbp
     pop r13
     pop r12
     pop rbx
@@ -488,7 +514,8 @@ linnea_network_peer_format:
 .unknown:
     mov byte [rbx], '-'
     mov eax, 1
-    add rsp, 48
+    add rsp, 8
+    pop rbp
     pop r13
     pop r12
     pop rbx

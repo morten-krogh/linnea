@@ -251,7 +251,9 @@ H3TEST_OBJS = test/quic/linnea_h3test.o src/linnea_http3.o src/linnea_qpack.o \
               src/linnea_hpack.o src/linnea_quic.o src/linnea_quic_crypto.o \
               src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
               src/linnea_x25519.o src/linnea_fe25519.o src/linnea_static.o \
-              src/linnea_string.o src/linnea_time.o $(QUICP256)
+              src/linnea_string.o src/linnea_time.o src/linnea_log.o \
+              src/linnea_print.o src/linnea_error.o \
+              src/linnea_config_parse.o src/linnea_network.o $(QUICP256)
 
 test/quic/linnea_h3test.o: test/quic/linnea_h3test.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -267,7 +269,9 @@ H3RESP_OBJS = test/quic/linnea_h3resp.o src/linnea_http3.o src/linnea_qpack.o \
               src/linnea_hpack.o src/linnea_quic.o src/linnea_quic_crypto.o \
               src/linnea_aesgcm.o src/linnea_sha256.o src/linnea_tls_kdf.o \
               src/linnea_x25519.o src/linnea_fe25519.o src/linnea_static.o \
-              src/linnea_string.o src/linnea_time.o $(QUICP256)
+              src/linnea_string.o src/linnea_time.o src/linnea_log.o \
+              src/linnea_print.o src/linnea_error.o \
+              src/linnea_config_parse.o src/linnea_network.o $(QUICP256)
 
 test/quic/linnea_h3resp.o: test/quic/linnea_h3resp.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<

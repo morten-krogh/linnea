@@ -57,6 +57,17 @@ extern linnea_log_u64
 extern drain_flag
 extern head_timeout_ns
 extern linnea_uring_now
+extern linnea_log_access
+extern linnea_log_acc_host
+extern linnea_log_acc_host_len
+extern linnea_log_acc_peer
+extern linnea_log_acc_peer_len
+extern linnea_log_acc_meth
+extern linnea_log_acc_meth_len
+extern linnea_log_acc_tgt
+extern linnea_log_acc_tgt_len
+extern linnea_log_acc_status
+extern linnea_log_acc_bytes
 
 ; proxy-over-h2: slot pool init + lookup for the io_uring loop, the upstream
 ; event handler, and connection teardown (see the Q86 section below)
@@ -852,6 +863,8 @@ h2_build_request:
 %define S_RLEN  104             ; bytes to send (the range's, or the whole file's)
 %define S_CRLEN 112             ; content-range value length (0 = not a 206)
 %define S_ENC   120             ; coding served (0 plain, 1 gzip, 2 br)
+%define S_LSTAT 128             ; access log: numeric status (0 = do not log)
+%define S_LBYTES 136            ; access log: body bytes
 h2_serve:
     push rbx
     push r12
@@ -859,8 +872,10 @@ h2_serve:
     push r14
     push r15
     push rbp
-    sub rsp, 136
+    sub rsp, 152
     mov rbx, rdi                     ; conn
+    mov qword [rsp + S_LSTAT], 0     ; paths that answer set these; a stream
+    mov qword [rsp + S_LBYTES], 0    ; refused with RST logs nothing
     mov r12, rsi                     ; req
     mov [rsp + S_SID], r8
     mov [rsp + S_OUT], r9            ; where the response is written
@@ -1058,9 +1073,13 @@ h2_serve:
     mov r15, rdi                     ; payload start
     mov esi, 8                       ; :status
     lea rdx, [status_200_h2]
+    mov qword [rsp + S_LSTAT], 200
+    mov rax, [rsp + S_RLEN]
+    mov [rsp + S_LBYTES], rax
     cmp qword [rsp + S_CRLEN], 0
     je .st_sel
     lea rdx, [status_206_h2]
+    mov qword [rsp + S_LSTAT], 206
 .st_sel:
     mov ecx, 3
     call h2_enc_hdr
@@ -1191,6 +1210,16 @@ h2_serve:
     shr rax, 8
     mov [rdi + 7], al
     mov [rdi + 8], dl
+    ; the access line: every stream answered via .flags — static, conditional,
+    ; redirect — logs here. A stream that got no response (refused with
+    ; RST_STREAM, or claimed by the proxy path, which logs at its own finish)
+    ; left S_LSTAT zero and is skipped; the error path logs at its own exit.
+    cmp qword [rsp + S_LSTAT], 0
+    je .flags_unlogged
+    mov rdx, [rsp + S_LSTAT]
+    mov rcx, [rsp + S_LBYTES]
+    call .acc_line
+.flags_unlogged:
     lea rax, [rbp + 9]               ; HEADERS flight length
     jmp .out
 
@@ -1267,6 +1296,7 @@ h2_serve:
     mov r15, rdi                     ; payload start
     mov esi, 8                       ; :status
     lea rdx, [status_301_h2]
+    mov qword [rsp + S_LSTAT], 301
     mov ecx, 3
     call h2_enc_hdr
     mov esi, 46                      ; location
@@ -1338,9 +1368,30 @@ h2_serve:
     mov qword [r13 + linnea_h2p.rq_rem], 0
     mov qword [r13 + linnea_h2p.rq_credit], 0
     mov qword [r13 + linnea_h2p.rq_buf], 0
+    mov qword [r13 + linnea_h2p.lg_bytes], 0
     mov rcx, [rsp + S_HEAD]
     imul rcx, rcx, LINNEA_H2P_F_IS_HEAD
     mov [r13 + linnea_h2p.flags], rcx
+    ; park the method and target for the access line (h2p_finish_stream):
+    ; buf holds the rewritten head only until the response overwrites it
+    mov rcx, [r12 + linnea_h2_req.method_len]
+    cmp rcx, 15
+    jbe .lg_m_fits
+    mov ecx, 15
+.lg_m_fits:
+    mov [r13 + linnea_h2p.lg_meth], cl
+    lea rdi, [r13 + linnea_h2p.lg_meth + 1]
+    mov rsi, [r12 + linnea_h2_req.method_ptr]
+    rep movsb
+    mov rcx, [r12 + linnea_h2_req.path_len]
+    cmp rcx, 103
+    jbe .lg_t_fits
+    mov ecx, 103
+.lg_t_fits:
+    mov [r13 + linnea_h2p.lg_tgt], cl
+    lea rdi, [r13 + linnea_h2p.lg_tgt + 1]
+    mov rsi, [r12 + linnea_h2_req.path_ptr]
+    rep movsb
     ; --- rewrite the request head: request line, Host, rebuilt headers.
     ; Content-Length and the terminating empty line follow in h2p_finalize
     ; once the body (if any) is collected. Bound it first.
@@ -1452,6 +1503,7 @@ h2_serve:
     mov r15, rdi                     ; payload start
     mov esi, 8                       ; :status
     lea rdx, [status_304_h2]
+    mov qword [rsp + S_LSTAT], 304
     mov ecx, 3
     call h2_enc_hdr
     mov esi, 34                      ; etag
@@ -1504,6 +1556,7 @@ h2_serve:
     mov r15, rdi                     ; payload start
     mov esi, 8                       ; :status
     lea rdx, [status_416_h2]
+    mov qword [rsp + S_LSTAT], 416
     mov ecx, 3
     call h2_enc_hdr
     mov esi, 30                      ; content-range
@@ -1536,6 +1589,19 @@ h2_serve:
     mov r15d, body_400_len
 .error:
     mov [rsp + S_STAT], rax          ; status string (3 chars)
+    ; the numeric status for the access line, from those three digits
+    movzx ecx, byte [rax]
+    lea ecx, [rcx + rcx * 4]
+    imul ecx, ecx, 20                ; c0 * 100
+    movzx edx, byte [rax + 1]
+    lea edx, [rdx + rdx * 4]
+    add edx, edx                     ; + c1 * 10
+    add ecx, edx
+    movzx edx, byte [rax + 2]        ; + c2
+    add ecx, edx
+    sub ecx, '0' * 111               ; the three digits' ASCII bias
+    mov [rsp + S_LSTAT], rcx
+    mov [rsp + S_LBYTES], r15
     mov rdi, r15
     lea rsi, [h2_numbuf]
     call linnea_string_from_u64
@@ -1610,8 +1676,13 @@ h2_serve:
     rep movsb
     mov rax, rdi
     sub rax, [rsp + S_OUT]            ; total bytes written
+    mov r13, rax                      ; keep it across the access line
+    mov rdx, [rsp + S_LSTAT]
+    mov rcx, [rsp + S_LBYTES]
+    call .acc_line
+    mov rax, r13
 .out:
-    add rsp, 136
+    add rsp, 152
     pop rbp
     pop r15
     pop r14
@@ -1619,6 +1690,31 @@ h2_serve:
     pop r12
     pop rbx
     ret
+; .acc_line(rdx=status, rcx=body bytes) — the access line for this stream,
+; from rbx (conn), r12 (req) and h2_cur_srv. Register arguments only: the
+; error path calls this with the stack as .flags sees it plus a return
+; address, so rsp-relative slots would be off by eight.
+.acc_line:
+    mov [linnea_log_acc_status], rdx
+    mov [linnea_log_acc_bytes], rcx
+    mov rax, [h2_cur_srv]
+    lea rcx, [rax + linnea_config_server.hostname]
+    mov [linnea_log_acc_host], rcx
+    mov rcx, [rax + linnea_config_server.hostname_len]
+    mov [linnea_log_acc_host_len], rcx
+    lea rcx, [rbx + linnea_connection.peer]
+    mov [linnea_log_acc_peer], rcx
+    mov rcx, [rbx + linnea_connection.peer_len]
+    mov [linnea_log_acc_peer_len], rcx
+    mov rcx, [r12 + linnea_h2_req.method_ptr]
+    mov [linnea_log_acc_meth], rcx
+    mov rcx, [r12 + linnea_h2_req.method_len]
+    mov [linnea_log_acc_meth_len], rcx
+    mov rcx, [r12 + linnea_h2_req.path_ptr]
+    mov [linnea_log_acc_tgt], rcx
+    mov rcx, [r12 + linnea_h2_req.path_len]
+    mov [linnea_log_acc_tgt_len], rcx
+    jmp linnea_log_access
 
 ; =========================================================================
 ; proxy-over-h2 (Q86): a stream routed to a proxy location runs an HTTP/1.1
@@ -2328,7 +2424,12 @@ linnea_h2p_service:
     ret
 
 .sv_reap:
-    ; its last DATA frame has drained: the buffer is nobody's now
+    ; its last DATA frame has drained: the buffer is nobody's now. The
+    ; scheduler already freed the stream slot at END_STREAM, so finish here
+    ; only emits the exchange's access line (slot_find misses, harmlessly).
+    mov rdi, rbx
+    mov rsi, r12
+    call h2p_finish_stream
     mov rax, r12
     call h2p_release
     jmp .sv_next
@@ -2388,16 +2489,49 @@ linnea_h2p_service:
 ; scheduler stops considering it and the reset budget is credited.
 h2p_finish_stream:
     push rbx
-    mov rbx, rsi
-    mov rsi, [rsi + linnea_h2p.sid]
-    push rdi
+    push r12
+    sub rsp, 8                        ; keep the calls 16-aligned
+    mov rbx, rsi                      ; slot
+    mov r12, rdi                      ; conn
+    ; the access line for the proxied exchange — method and target were parked
+    ; at the claim, status and body bytes are the outcome (a synthetic
+    ; 502/504/408 included). Once per exchange: the length byte is cleared.
+    cmp byte [rbx + linnea_h2p.lg_meth], 0
+    je .fs_scan
+    mov rax, [rbx + linnea_h2p.srv]
+    lea rcx, [rax + linnea_config_server.hostname]
+    mov [linnea_log_acc_host], rcx
+    mov rcx, [rax + linnea_config_server.hostname_len]
+    mov [linnea_log_acc_host_len], rcx
+    lea rcx, [r12 + linnea_connection.peer]
+    mov [linnea_log_acc_peer], rcx
+    mov rcx, [r12 + linnea_connection.peer_len]
+    mov [linnea_log_acc_peer_len], rcx
+    movzx ecx, byte [rbx + linnea_h2p.lg_meth]
+    mov [linnea_log_acc_meth_len], rcx
+    lea rcx, [rbx + linnea_h2p.lg_meth + 1]
+    mov [linnea_log_acc_meth], rcx
+    movzx ecx, byte [rbx + linnea_h2p.lg_tgt]
+    mov [linnea_log_acc_tgt_len], rcx
+    lea rcx, [rbx + linnea_h2p.lg_tgt + 1]
+    mov [linnea_log_acc_tgt], rcx
+    mov rcx, [rbx + linnea_h2p.status]
+    mov [linnea_log_acc_status], rcx
+    mov rcx, [rbx + linnea_h2p.lg_bytes]
+    mov [linnea_log_acc_bytes], rcx
+    mov byte [rbx + linnea_h2p.lg_meth], 0
+    call linnea_log_access
+.fs_scan:
+    mov rdi, r12
+    mov rsi, [rbx + linnea_h2p.sid]
     call h2_slot_find
-    pop rdi
     test rax, rax
     jz .fs_ret
     mov qword [rax + linnea_h2_stream.id], 0
-    inc qword [rdi + linnea_connection.h2_done_count]
+    inc qword [r12 + linnea_connection.h2_done_count]
 .fs_ret:
+    add rsp, 8
+    pop r12
     pop rbx
     ret
 
@@ -3247,6 +3381,7 @@ h2p_emit_error:
     lea r12, [body_408]
     mov r13d, body_408_len
 .ee_status:
+    mov [rbx + linnea_h2p.lg_bytes], r13   ; the synthetic body, for the access line
     lea rdi, [h2p_stbuf]             ; the status as three digits
     xor edx, edx
     mov ecx, 100
@@ -3547,6 +3682,7 @@ h2_schedule:
     pop r13
     pop rbx
     add [rax + linnea_h2p.off], r14
+    add [rax + linnea_h2p.lg_bytes], r14   ; body bytes framed, for the access line
     test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
     jz .emit_static
     mov rcx, [rax + linnea_h2p.wr]

@@ -207,5 +207,13 @@ struc linnea_h2p
     ; stream 0 — and it must, or the connection window never recovers. It
     ; outlives the slot's tenancy and is cleared per connection.
     .rq_owed:   resq 1
+    .lg_bytes:  resq 1            ; body bytes framed to the client, for the
+                                  ; access line (.off gets rebased by the
+                                  ; buffer compaction, so it cannot serve)
+    ; the access line's method and target, copied at the claim: the rewritten
+    ; request head in buf is overwritten by the response long before the
+    ; status is known. One length byte, then the (truncated) text.
+    .lg_meth:   resb 16
+    .lg_tgt:    resb 104
     .buf:       resb LINNEA_H2P_BUF
 endstruc

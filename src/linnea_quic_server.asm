@@ -125,6 +125,15 @@ extern linnea_quic_path_seen
 extern linnea_quic_path_data
 extern linnea_quic_reset_token
 extern linnea_worker_index
+extern linnea_network_addr_format
+extern linnea_log_acc_host
+extern linnea_log_acc_host_len
+extern linnea_log_acc_peer
+extern linnea_log_acc_peer_len
+extern linnea_log_acc_meth
+extern linnea_log_acc_meth_len
+extern linnea_log_acc_tgt
+extern linnea_log_acc_tgt_len
 global linnea_quic_draining
 extern quic_v2_active
 extern linnea_quic_conn_free_hook
@@ -244,6 +253,7 @@ srst_buf:    resb LINNEA_QUIC_SRST_MAX ; the stateless-reset packet we build
 srst_len:    resq 1
 vneg_buf:    resb 64                   ; a Version Negotiation packet we build
 cc_pay:      resb 16                  ; an application CONNECTION_CLOSE payload
+acc_peer_buf: resb 64                  ; the peer's address text, for the access line
 ; 1 while the worker is draining (set by the event loop's stop path — the
 ; loop's own drain_flag lives in a module the standalone handshake test binary
 ; does not link). A draining worker opens no new connections.
@@ -1811,6 +1821,17 @@ linnea_quic_server_datagram:
     ; 4.2.2) — a connection error here would take every other request with it,
     ; and a client waiting only on its own response would see nothing at all.
     ; The request never parsed, so there is no path or vhost: a bare 431.
+    ; The access line still names the peer; method, target and host print "-".
+    CONNLEA rdi, peer
+    lea rsi, [acc_peer_buf]
+    call linnea_network_addr_format
+    mov [linnea_log_acc_peer_len], rax
+    lea rax, [acc_peer_buf]
+    mov [linnea_log_acc_peer], rax
+    xor eax, eax
+    mov [linnea_log_acc_meth], rax
+    mov [linnea_log_acc_tgt], rax
+    mov [linnea_log_acc_host], rax
     lea rdi, [strm_pay]
     CONNLEA rsi, rx_have
     call linnea_quic_build_ack       ; the ack must precede the STREAM frame
@@ -1832,6 +1853,23 @@ linnea_quic_server_datagram:
 .req_ok:
     mov [s_body_ptr], r8             ; keep the body across the response build
     mov [s_body_len], r9
+    ; the access line's who-and-what: peer text, method, target. The vhost's
+    ; name is set below with the other per-vhost fields; the status and byte
+    ; count ride linnea_h3_build_headers, which every response passes through.
+    CONNLEA rdi, peer
+    lea rsi, [acc_peer_buf]
+    call linnea_network_addr_format
+    mov [linnea_log_acc_peer_len], rax
+    lea rax, [acc_peer_buf]
+    mov [linnea_log_acc_peer], rax
+    mov rax, [req + linnea_h2_req.method_ptr]
+    mov [linnea_log_acc_meth], rax
+    mov rax, [req + linnea_h2_req.method_len]
+    mov [linnea_log_acc_meth_len], rax
+    mov rax, [req + linnea_h2_req.path_ptr]
+    mov [linnea_log_acc_tgt], rax
+    mov rax, [req + linnea_h2_req.path_len]
+    mov [linnea_log_acc_tgt_len], rax
     ; record it for a graceful GOAWAY: a drain rejects streams past this one, so
     ; the client knows exactly what it must retry elsewhere
     mov rax, [cur_conn]
@@ -1886,6 +1924,10 @@ linnea_quic_server_datagram:
     mov rax, [cur_conn]
     mov rax, [rax + linnea_quic_conn.vhost]   ; serve from this vhost's document root
     call vhost_slot
+    mov r10, [rax + linnea_quic_vhost.host_ptr]
+    mov [linnea_log_acc_host], r10
+    mov r10, [rax + linnea_quic_vhost.host_len]
+    mov [linnea_log_acc_host_len], r10
     mov rsi, [rax + linnea_quic_vhost.root_ptr]
     mov rdx, [rax + linnea_quic_vhost.root_len]
     ; this vhost's Cache-Control for the QPACK encoder (ptr 0 = none)

@@ -708,6 +708,9 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     sleep 0.5
     python3 test/quic/h3_goaway_test.py 47453 $ga_master >/dev/null 2>&1
     check "h3 (io_uring): drain sends GOAWAY on the control stream" $?
+    # Q120: the request that test served must be in the access log
+    grep -qE 'request localhost from [0-9.:]+ "GET /hello.txt" 200 ' test/linnea.log
+    check "h3 request access-logged" $?
     wait $ga_master 2>/dev/null
     pkill -f tls-h3-drain 2>/dev/null
     rm -f test/linnea.log
@@ -2278,6 +2281,13 @@ PYEOF
     [ -n "$prst_before" ] && [ "$prst_before" = "$prst_after" ] \
         && printf '%s' "$resp" | grep -qF "hello from linnea"
     check "http2 proxied-stream RST + RST-stream-0 crash no worker" $?
+
+    # Q120: h2 requests reach the access log — static and proxied alike, in
+    # h1's exact format. Before this only h1 was logged, so most real browser
+    # traffic was invisible.
+    grep -qE 'request localhost from [0-9.:]+ "GET /hello.txt" 200 ' "$LOG" \
+        && grep -qE '"GET /api/simple" 200 ' "$LOG"
+    check "http2 requests access-logged (static + proxied)" $?
 
     # Body-phase slowloris (Q119): head_timeout used to stop at the request
     # head, so a client trickling a proxied request body — or sitting silent
