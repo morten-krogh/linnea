@@ -219,10 +219,19 @@ linnea_tls_hs_input:
     je .do_fin
     jmp .ret                    ; DONE / FAILED: nothing to do
 
-; ---- WAIT_CH: expect one handshake record carrying a ClientHello -----
+; ---- WAIT_CH: assemble the ClientHello, then answer it ---------------
+; A handshake message is a stream of bytes carried by records, not a thing
+; records contain one of (RFC 8446 5.1): a client may split its ClientHello
+; across as many records as it likes, and one over 2^14 bytes MUST be split.
+; This used to read the first record's payload as the whole message, so a
+; fragmented ClientHello — deliberate, or forced by a post-quantum key share
+; — failed the handshake outright. Fragments are now appended to msg_buf
+; (free until build_flight writes the flight there, well after parsing) and
+; the message is parsed once it is whole.
 .do_ch:
     mov rbx, [rsp + IN_BUF]
     mov r12, [rsp + IN_LEN]
+.ch_rec:
     cmp r12, 5
     jb .ret                     ; need the record header
     movzx eax, byte [rbx]
@@ -238,7 +247,47 @@ linnea_tls_hs_input:
     cmp rax, r12
     ja .ret                     ; wait for the rest of the record
 
-    lea rsi, [rbx + 5]          ; handshake message (== the fragment)
+    ; append this fragment to what we already hold
+    mov eax, [rbp + linnea_tls_hs.msg_len]
+    lea rcx, [rax + r13]
+    cmp rcx, LINNEA_TLS_MSG_BUF
+    ja .ch_toolarge             ; a ClientHello bigger than we can assemble
+    push rbx
+    push r12
+    push r13
+    lea rdi, [rbp + linnea_tls_hs.msg_buf]
+    add rdi, rax
+    lea rsi, [rbx + 5]
+    mov rcx, r13
+    rep movsb
+    pop r13
+    pop r12
+    pop rbx
+    mov eax, [rbp + linnea_tls_hs.msg_len]
+    add eax, r13d
+    mov [rbp + linnea_tls_hs.msg_len], eax
+    ; the record is ours either way
+    lea rcx, [r13 + 5]
+    add [rbp + linnea_tls_hs.consumed], rcx
+    add rbx, rcx
+    sub r12, rcx
+    ; is the handshake message complete? Its 4-byte header carries the length.
+    cmp eax, 4
+    jb .ch_rec                  ; not even the header yet
+    lea rsi, [rbp + linnea_tls_hs.msg_buf]
+    movzx edx, byte [rsi + 1]   ; 24-bit length, big-endian
+    shl edx, 8
+    mov dl, [rsi + 2]
+    shl edx, 8
+    mov dl, [rsi + 3]
+    lea ecx, [rdx + 4]          ; whole message = header + body
+    cmp ecx, LINNEA_TLS_MSG_BUF
+    ja .ch_toolarge             ; it announces more than we could ever hold
+    cmp eax, ecx
+    jb .ch_rec                  ; more fragments to come
+    ; complete: the message is msg_buf[0, ecx)
+    mov r13d, ecx
+    lea rsi, [rbp + linnea_tls_hs.msg_buf]
     mov rdx, r13
     ; absorb the ClientHello into the transcript before responding
     mov rdi, rbp
@@ -275,9 +324,7 @@ linnea_tls_hs_input:
     mov rdi, rbp
     call try_resume
 
-    ; consume the whole record regardless of what follows it
-    lea rax, [r13 + 5]
-    mov [rbp + linnea_tls_hs.consumed], rax
+    ; every record that carried the message was consumed as it arrived
 
     mov rdi, rbp                ; SH + CCS + encrypted flight into outbuf
     mov rsi, [rsp + IN_OUT]
@@ -291,6 +338,12 @@ linnea_tls_hs_input:
     jmp .plain_alert
 .ch_overflow:
     mov edi, LINNEA_TLS_A_RECORD_OVERFLOW
+    jmp .plain_alert
+.ch_toolarge:
+    ; It fragments correctly, we simply cannot hold it: say so rather than
+    ; waiting for fragments we would only drop. msg_buf is the ceiling
+    ; (LINNEA_TLS_MSG_BUF), well above any classical or ML-KEM hello.
+    mov edi, LINNEA_TLS_A_HANDSHAKE_FAILURE
     jmp .plain_alert
 .ch_alert:
     mov edi, eax                ; the descriptor parse_ch returned

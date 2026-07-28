@@ -2307,6 +2307,13 @@ PY
         test/tls/clienthello_seed.bin >/dev/null 2>&1
     check "tls oversized record refused (msg_buf bound)" $?
 
+    # Q125: a ClientHello split across records must still complete. A
+    # handshake message is a byte stream carried by records, so a client may
+    # fragment it at will — and one over 2^14 bytes has no choice. Every
+    # fragmented hello used to draw a fatal alert.
+    timeout 60 python3 test/tls/fragmented_ch.py 47443 >/dev/null 2>&1
+    check "tls fragmented ClientHello completes the handshake" $?
+
     # Records pipelined behind the Finished, including one split the way an
     # MSS boundary would split it — the case loopback never produces.
     timeout 40 python3 test/tls/pipelined_early.py $CA 47443 >/dev/null 2>&1
