@@ -1647,10 +1647,18 @@ curl -s --max-time 30 --limit-rate 500k http://127.0.0.1:47080/up.bin \
 up_curl=$!
 # a steady stream of quick requests, counting any refusal
 up_fails=0
+up_why=""
 ( sleep 0.4; kill -USR2 $up_master ) &
 for i in $(seq 1 60); do
-    curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null \
-        || up_fails=$((up_fails + 1))
+    # record HOW a request failed, not just that it did: this check has gone
+    # red about once in a dozen runs and never under a targeted repro (seven
+    # runs, two of them under CPU load, zero refusals), so the next red run
+    # should say whether the server refused (curl 7) or the client simply ran
+    # out of its 3s patience on a loaded box (curl 28).
+    if ! curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null; then
+        up_fails=$((up_fails + 1))
+        up_why="$up_why $i:curl$?"
+    fi
     sleep 0.03
 done
 kill -0 $up_master 2>/dev/null
@@ -1660,7 +1668,7 @@ n=$(wc -c < /tmp/up_out)
 [ "$n" -eq 3000000 ]
 check "upgrade finishes the in-flight download ($n bytes)" $?
 [ "$up_fails" -eq 0 ]
-check "upgrade refuses no new request ($up_fails failed)" $?
+check "upgrade refuses no new request ($up_fails failed:${up_why:- none})" $?
 sleep 1
 gone=1
 for w in $old_workers; do kill -0 "$w" 2>/dev/null && gone=0; done
