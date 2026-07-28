@@ -35,6 +35,8 @@ extern linnea_file_map_readonly
 extern linnea_file_unmap
 extern linnea_bpf_probe
 extern linnea_bpf_reuseport_setup
+extern linnea_bpf_map_fd
+extern linnea_bpf_prog_fd
 extern linnea_quic_reset_secret_init
 extern linnea_quic_retry_secret_init
 extern linnea_worker_index
@@ -101,6 +103,15 @@ config_ptr:     resq 1
 upgrade_env:    resq 1                   ; the LINNEA_UPGRADE value, or 0
 old_pids:       resq LINNEA_MAX_WORKERS  ; previous generation, to drain
 old_pid_count:  resq 1
+; QUIC CID-steering handoff (see the bpf section of the upgrade env). The BPF
+; map and program are INHERITED across a hot upgrade: the draining workers'
+; sockets stay registered in the map, so their connections' packets keep
+; steering to them. Each generation stamps and registers under its own half of
+; the index space (steer_base 0 or 64) so the two never collide.
+steer_base:     resq 1                   ; this generation's steering-index base
+adopt_bpf_map:  resq 1                   ; inherited map fd (valid if adopt_bpf_ok)
+adopt_bpf_prog: resq 1                   ; inherited program fd
+adopt_bpf_ok:   resq 1                   ; 1 = the env carried a bpf section
 adopt_fd_table: resd LINNEA_MAX_SERVERS  ; inherited listener fds
 wait_status:    resd 1
 check_status:   resd 1
@@ -196,8 +207,21 @@ _start:
     call install_sighup        ; and SIGHUP to reopen the log after a rotate
     ; load the BPF connection-ID steering program before forking so the workers
     ; inherit the map and program fds. Best-effort: without CAP_BPF it fails and
-    ; the QUIC reuseport group falls back to plain 4-tuple hashing.
+    ; the QUIC reuseport group falls back to plain 4-tuple hashing. Across a hot
+    ; upgrade the PREVIOUS generation's map and program are adopted instead of
+    ; loaded fresh: attaching a new program would replace the group's steering
+    ; wholesale, and the draining workers' connections — whose ids carry THEIR
+    ; indices — would steer to our workers, who answer with stateless resets.
+    cmp qword [adopt_bpf_ok], 0
+    je .bpf_fresh
+    mov rax, [adopt_bpf_map]
+    mov [linnea_bpf_map_fd], rax
+    mov rax, [adopt_bpf_prog]
+    mov [linnea_bpf_prog_fd], rax
+    jmp .bpf_ready
+.bpf_fresh:
     call linnea_bpf_reuseport_setup
+.bpf_ready:
     ; derive the stateless-reset key once, here in the master, so every forked
     ; worker inherits the same secret and computes matching reset tokens (RFC 9000 10.3)
     call linnea_quic_reset_secret_init
@@ -336,7 +360,12 @@ spawn_worker:
     syscall
     cmp rax, [master_pid]
     jne .orphan
-    mov [linnea_worker_index], rbx        ; this worker's index, stamped into CIDs
+    ; the steering index this worker stamps into its connection ids and
+    ; registers its QUIC socket under: its slot, offset into this generation's
+    ; half of the map so it never collides with a generation still draining
+    mov rax, [steer_base]
+    add rax, rbx
+    mov [linnea_worker_index], rax
     mov rdi, [linnea_config_instance + linnea_config.max_connections]
     call linnea_connections_init
     mov rdi, [linnea_config_instance + linnea_config.max_connections]
@@ -408,7 +437,16 @@ do_upgrade:
     and eax, 0xff
     test eax, eax
     jnz .reject                ; non-zero exit: config rejected
-    ; 2. build the handoff environment and re-exec argv[0] in place
+    ; 2. build the handoff environment and re-exec argv[0] in place.
+    ; bpf(2) fds are born close-on-exec (sockets are not): clear the flag so
+    ; the steering map and program survive into the next generation.
+    cmp qword [linnea_bpf_prog_fd], 0
+    jl .no_bpf_fds
+    mov rdi, [linnea_bpf_map_fd]
+    call clear_cloexec
+    mov rdi, [linnea_bpf_prog_fd]
+    call clear_cloexec
+.no_bpf_fds:
     call build_upgrade_env
     mov rax, [argv0_ptr]
     mov [exec_argv], rax
@@ -509,6 +547,31 @@ build_upgrade_env:
     inc rbx
     jmp .pid_loop
 .pids_done:
+    ; the steering handoff: the map and program fds (kept open across execve)
+    ; and the base half of the index space this generation stamped, so the next
+    ; one takes the other half. Omitted when the steering never loaded — the
+    ; next generation then tries a fresh load, exactly like a cold start.
+    cmp qword [linnea_bpf_prog_fd], 0
+    jl .env_done
+    mov byte [rbx], ';'
+    inc rbx
+    mov rdi, [linnea_bpf_map_fd]
+    mov rsi, rbx
+    call linnea_string_from_u64
+    add rbx, rax
+    mov byte [rbx], ':'
+    inc rbx
+    mov rdi, [linnea_bpf_prog_fd]
+    mov rsi, rbx
+    call linnea_string_from_u64
+    add rbx, rax
+    mov byte [rbx], ':'
+    inc rbx
+    mov rdi, [steer_base]
+    mov rsi, rbx
+    call linnea_string_from_u64
+    add rbx, rax
+.env_done:
     mov byte [rbx], 0
     pop r12
     pop rbx
@@ -555,12 +618,46 @@ parse_upgrade_env:
     jmp .pid_loop
 .pids_done:
     mov [old_pid_count], r12
+    ; the optional steering handoff: "…;map:prog:base". Malformed or absent
+    ; means no adoption — a fresh load, which is always safe, just not seamless.
+    cmp byte [rsi], ';'
+    jne .no_bpf
+    inc rsi
+    call parse_dec             ; the previous generation's map fd
+    mov [adopt_bpf_map], rax
+    cmp byte [rsi], ':'
+    jne .no_bpf
+    inc rsi
+    call parse_dec             ; its program fd
+    mov [adopt_bpf_prog], rax
+    cmp byte [rsi], ':'
+    jne .no_bpf
+    inc rsi
+    call parse_dec             ; the half of the index space it stamped
+    xor rax, 64                ; take the other half…
+    and rax, 64                ; …and force a sane base whatever the env held
+    cmp qword [linnea_config_instance + linnea_config.workers], 64
+    jbe .base_ok
+    xor eax, eax               ; more workers than half the map holds: share
+                               ; base 0 (colliding, the pre-Q118 behaviour)
+.base_ok:
+    mov [steer_base], rax
+    mov qword [adopt_bpf_ok], 1
+.no_bpf:
     pop rbx
     ret
 .topology:
     lea rdi, [msg_topology]
     mov esi, msg_topology_len
     jmp linnea_error_exit
+
+; clear_cloexec(rdi = fd) — drop FD_CLOEXEC so the fd survives an execve.
+clear_cloexec:
+    mov eax, LINNEA_SYS_FCNTL
+    mov esi, LINNEA_F_SETFD
+    xor edx, edx               ; flags = 0: no FD_CLOEXEC
+    syscall
+    ret
 
 ; parse_dec(rsi=ptr) -> rax = decimal value, rsi advanced past the digits
 parse_dec:

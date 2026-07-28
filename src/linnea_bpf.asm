@@ -1,13 +1,21 @@
 ; linnea_bpf.asm — eBPF connection-ID steering for the QUIC reuseport group.
 ;
 ; A SK_REUSEPORT program reads the QUIC packet's Destination Connection ID and
-; steers the datagram to the worker that owns the connection: the worker index
+; steers the datagram to the worker that owns the connection: the steering index
 ; is the first byte of the DCID (short header: offset 1; long header: offset 6),
 ; used as the index into a REUSEPORT_SOCKARRAY the workers register into. An
 ; index with no socket (a client's random first-Initial CID, or a worker not yet
 ; up) makes the helper fail, and the program returns SK_PASS so the kernel falls
 ; back to its 4-tuple hash. bpf(2) is called directly with a hand-built attr
 ; block and hand-assembled program bytecode; loading needs CAP_BPF.
+;
+; The map and program live as long as the SERVICE, not the process: a hot
+; upgrade hands both fds to the next generation (see the upgrade env in
+; linnea_start.asm), which registers its sockets under the other half of the
+; index space (steer_base 0 <-> 64). Loading fresh instead would detach the old
+; program from the group, and every draining worker's connection — its ids
+; carry the old generation's indices — would steer to the new worker at that
+; index, which has no state for it and answers with a stateless reset.
 
 default rel
 

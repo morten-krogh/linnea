@@ -737,6 +737,22 @@ else
     check "h3 in-flight drain test (skipped: deps unavailable)" 0
 fi
 
+# Steering handoff across a hot upgrade (Q118): a master handed the previous
+# generation's bpf map+program in LINNEA_UPGRADE stamps its connection ids from
+# the other half of the index space (base 64), so the draining generation's
+# connections keep steering to their workers; unusable inherited fds cost only
+# the steering. The script plays the old master itself (inherited listener,
+# zombie old-worker pid, pipe fds standing in for the bpf pair).
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    rm -f test/linnea.log
+    timeout 30 python3 test/quic/h3_steer_base_test.py \
+        test/configs/tls-h3-drain.json 47453 >/dev/null 2>&1
+    check "h3 (io_uring): upgrade handoff stamps the other steering half" $?
+    rm -f test/linnea.log
+else
+    check "h3 steering handoff test (skipped: deps unavailable)" 0
+fi
+
 # Drain with an in-flight h2 response and a slow reader (Q117): the connection
 # was freed once the last body byte reached the kernel, and close(2) with the
 # client's unread WINDOW_UPDATEs queued answered with an RST that discarded

@@ -28,9 +28,12 @@ conn_pool: resb LINNEA_QUIC_MAX_CONNS * linnea_quic_conn_size
 ; server hangs per-connection resource release here (an open response stream's
 ; file mapping); the pool itself stays free of mmap knowledge.
 linnea_quic_conn_free_hook: resq 1
-; this worker's index (0-based), stamped into every connection id it issues so
+; this worker's steering index, stamped into every connection id it issues so
 ; the BPF reuseport program can steer the connection's later packets back here.
-; Zero until the master sets it after fork; a single-worker server never changes it.
+; The worker's slot plus its generation's steer_base (0, or 64 across a hot
+; upgrade — the map is shared between the generations, so each stamps its own
+; half and a draining worker's connections keep steering to it). Zero until
+; the master sets it after fork.
 linnea_worker_index: resq 1
 
 section .text
@@ -146,12 +149,12 @@ linnea_quic_conn_alloc:
     rep stosb
     mov qword [rbx + linnea_quic_conn.in_use], 1
     mov qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_NEW
-    ; connection id = worker index || pool index || 6 random bytes. The worker
-    ; index steers the connection back to this worker (BPF reuseport); the pool
-    ; index locates the slot; the random tail authenticates it.
+    ; connection id = steering index || pool index || 6 random bytes. The
+    ; steering index routes the connection back to this worker (BPF reuseport);
+    ; the pool index locates the slot; the random tail authenticates it.
     mov [rbx + linnea_quic_conn.scid + 1], r12b       ; pool index
     mov eax, [linnea_worker_index]
-    mov [rbx + linnea_quic_conn.scid], al             ; worker index
+    mov [rbx + linnea_quic_conn.scid], al             ; steering index
     lea rdi, [rbx + linnea_quic_conn.scid + 2]
     mov esi, LINNEA_QUIC_SCID_LEN - 2
     xor edx, edx
