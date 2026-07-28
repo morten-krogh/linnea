@@ -303,6 +303,12 @@ mime_json:      db "application/json"
 mime_json_len   equ $ - mime_json
 mime_txt:       db "text/plain"
 mime_txt_len    equ $ - mime_txt
+mime_mp4:       db "video/mp4"
+mime_mp4_len    equ $ - mime_mp4
+mime_webm:      db "video/webm"
+mime_webm_len   equ $ - mime_webm
+mime_ogv:       db "video/ogg"
+mime_ogv_len    equ $ - mime_ogv
 mime_png:       db "image/png"
 mime_png_len    equ $ - mime_png
 mime_jpeg:      db "image/jpeg"
@@ -327,6 +333,9 @@ ext_jpeg:       db "jpeg"
 ext_gif:        db "gif"
 ext_svg:        db "svg"
 ext_ico:        db "ico"
+ext_mp4:        db "mp4"
+ext_webm:       db "webm"
+ext_ogv:        db "ogv"
 
 ; entries: ext ptr, ext len, mime ptr, mime len; terminated by a 0 ptr
 mime_table:
@@ -341,6 +350,9 @@ mime_table:
     dq ext_gif,  3, mime_gif,  mime_gif_len
     dq ext_svg,  3, mime_svg,  mime_svg_len
     dq ext_ico,  3, mime_ico,  mime_ico_len
+    dq ext_mp4,  3, mime_mp4,  mime_mp4_len
+    dq ext_webm, 4, mime_webm, mime_webm_len
+    dq ext_ogv,  3, mime_ogv,  mime_ogv_len
     dq 0
 
 section .bss

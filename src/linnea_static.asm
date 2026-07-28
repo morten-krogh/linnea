@@ -856,6 +856,9 @@ ext_jpeg_h2: db "jpeg"
 ext_gif_h2:  db "gif"
 ext_svg_h2:  db "svg"
 ext_ico_h2:  db "ico"
+ext_mp4_h2:  db "mp4"
+ext_webm_h2: db "webm"
+ext_ogv_h2:  db "ogv"
 mime_html_h2: db "text/html"
 mime_html_h2_len equ $ - mime_html_h2
 mime_css_h2:  db "text/css"
@@ -876,6 +879,12 @@ mime_svg_h2:  db "image/svg+xml"
 mime_svg_h2_len equ $ - mime_svg_h2
 mime_ico_h2:  db "image/x-icon"
 mime_ico_h2_len equ $ - mime_ico_h2
+mime_mp4_h2:  db "video/mp4"
+mime_mp4_h2_len equ $ - mime_mp4_h2
+mime_webm_h2: db "video/webm"
+mime_webm_h2_len equ $ - mime_webm_h2
+mime_ogv_h2:  db "video/ogg"
+mime_ogv_h2_len equ $ - mime_ogv_h2
 mime_default_h2: db "application/octet-stream"
 mime_default_h2_len equ $ - mime_default_h2
 mime_table_h2:
@@ -890,6 +899,9 @@ mime_table_h2:
     dq ext_gif_h2,  3, mime_gif_h2,  mime_gif_h2_len
     dq ext_svg_h2,  3, mime_svg_h2,  mime_svg_h2_len
     dq ext_ico_h2,  3, mime_ico_h2,  mime_ico_h2_len
+    dq ext_mp4_h2,  3, mime_mp4_h2,  mime_mp4_h2_len
+    dq ext_webm_h2, 4, mime_webm_h2, mime_webm_h2_len
+    dq ext_ogv_h2,  3, mime_ogv_h2,  mime_ogv_h2_len
     dq 0
 
 

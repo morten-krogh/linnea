@@ -1197,6 +1197,18 @@ check_http "http 400" "400 Bad Request" "$(raw_http 'GARBAGE\r\n\r\n')"
 check_http "http 505" "505 HTTP Version Not Supported" "$(raw_http 'GET / HTTP/1.0\r\nConnection: close\r\n\r\n')"
 check_http "traversal blocked" "400 Bad Request" "$(raw_http 'GET /../secret HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
 
+# --- video MIME types (Q129): a .mp4 served as application/octet-stream is
+# not played by a browser's <video> element, so the type is what makes a
+# media file usable at all. Range handling is exercised elsewhere; what is
+# checked here is the type, on a plain GET and on a 206.
+printf 'not really a video' > test/www/clip.mp4
+resp=$(raw_http 'GET /clip.mp4 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "mime: .mp4 is video/mp4" "Content-Type: video/mp4" "$resp"
+resp=$(raw_http 'GET /clip.mp4 HTTP/1.1\r\nHost: one.test\r\nRange: bytes=0-3\r\n\r\n')
+check_http "mime: a 206 keeps the video type" "Content-Type: video/mp4" "$resp"
+check_http "mime: the 206 is a real partial" "206 Partial Content" "$resp"
+rm -f test/www/clip.mp4
+
 # --- request-target forms (Q127, RFC 9112 3.2). Only origin-form used to
 # survive: absolute-form and "OPTIONS *" reached the path normalizer and came
 # back 400. A server MUST accept absolute-form, and the authority it carries
