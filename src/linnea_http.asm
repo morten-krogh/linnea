@@ -964,25 +964,14 @@ linnea_http_handle:
 
     ; --- serve the file ---------------------------------------------
 .parsed:
-    ; "OPTIONS *" asks about the server, not about a resource (RFC 9112
-    ; 3.2.4): there is no path to route, so answer it here. Any other method
-    ; with an asterisk target is nonsense and stays a 400.
-    cmp qword [rsp + 304], 0
-    je .not_options_star
-    cmp qword [rsp + 104], 7           ; the method text sits at in_buf[0)
-    jne .resp_400
-    lea rax, [rbx + linnea_connection.in_buf]
-    cmp dword [rax], 'OPTI'
-    jne .resp_400
-    cmp dword [rax + 3], 'IONS'
-    jne .resp_400
-    jmp .resp_options
-.not_options_star:
     ; Host (RFC 9112 3.2): exactly one field line, and a value that could be
     ; an authority. Every request we accept is HTTP/1.1 (the version check
     ; above admits nothing else), so the header is mandatory — and a missing
     ; or repeated one is how a request gets routed one way here and another
-    ; way at an intermediary.
+    ; way at an intermediary. This runs before the asterisk-form branch below:
+    ; "OPTIONS *" carries no authority of its own, so it is exactly the request
+    ; whose Host an intermediary would read differently, and the rule is not
+    ; waived for it.
     cmp qword [rsp + 296], 1
     jne .resp_400
     mov rcx, [rsp + 96]
@@ -1000,6 +989,20 @@ linnea_http_handle:
     jnz .host_char
     test qword [rsp + 136], 2
     jnz .resp_501
+    ; "OPTIONS *" asks about the server, not about a resource (RFC 9112
+    ; 3.2.4): there is no path to route, so answer it here. Any other method
+    ; with an asterisk target is nonsense and stays a 400.
+    cmp qword [rsp + 304], 0
+    je .not_options_star
+    cmp qword [rsp + 104], 7           ; the method text sits at in_buf[0)
+    jne .resp_400
+    lea rax, [rbx + linnea_connection.in_buf]
+    cmp dword [rax], 'OPTI'
+    jne .resp_400
+    cmp dword [rax + 3], 'IONS'
+    jne .resp_400
+    jmp .resp_options
+.not_options_star:
     ; an unknown method is only an error on a static location (405 below);
     ; proxy locations forward whatever the client sent
     ; A body that fits is buffered whole with the head, so both can be

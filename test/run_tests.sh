@@ -1297,6 +1297,14 @@ check_http "target: OPTIONS * answered" "200 OK" "$resp"
 check_http "target: OPTIONS * lists the methods" "Allow: GET, HEAD, OPTIONS" "$resp"
 resp=$(raw_http 'GET * HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "target: asterisk with any other method is 400" "400 Bad Request" "$resp"
+# the asterisk form used to be answered before the Host rules ran, so it was the
+# one request that could arrive with no Host or two of them and still get a 200
+resp=$(raw_http 'OPTIONS * HTTP/1.1\r\n\r\n')
+check_http "target: OPTIONS * without a Host is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'OPTIONS * HTTP/1.1\r\nHost: one.test\r\nHost: evil.test\r\n\r\n')
+check_http "target: OPTIONS * with two Hosts is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'OPTIONS * HTTP/1.1\r\nHost: one.test\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n')
+check_http "target: OPTIONS * with a chunked body is 501" "501 Not Implemented" "$resp"
 
 # --- Host header rules (Q123, RFC 9112 3.2): every request we accept is
 # HTTP/1.1, so exactly one Host field line is mandatory and its value must
