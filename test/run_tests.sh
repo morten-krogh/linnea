@@ -2427,12 +2427,15 @@ PY
     # draining worker is timing-fragile. The hot-upgrade path keeps other
     # workers alive, so old workers drain cleanly there.)
 
-    # This has gone red twice in full runs while passing eight times in a
-    # row standalone, idle and under load — so the cause is suite STATE, not
-    # the test. Its verdict rests on a 2s reply deadline, so on failure ask
-    # the same server for an ordinary page: if that answers, the server is
-    # healthy and the deadline was simply missed; if it does not, a worker
-    # is wedged by this point and that is a real bug worth chasing.
+    # This used to go red in full runs and was put down to suite STATE. It was
+    # not: the test itself refused a prompt server. It pushes 8000 bytes at a
+    # server that rejects the record on its 5-byte header, so the reset lands
+    # while sendall is still writing, and only the recv was wrapped to expect
+    # it — measured at ~10-20% under load, on this code and on the code before
+    # it. Fixed in the test. The probe below stays, because the one failure
+    # worth chasing is still the same one: on failure ask the same server for
+    # an ordinary page — if that answers, the server is healthy and the 2s
+    # reply deadline was simply missed; if it does not, a worker is wedged.
     timeout 30 python3 test/tls/oversized_record.py $CA 47443 \
         test/tls/clienthello_seed.bin >/dev/null 2>&1
     ovr_rc=$?

@@ -50,15 +50,24 @@ def send_ch_then(port, ch, tail):
         # The flight (ServerHello .. Finished) proves we reached WAIT_FIN.
         if not s.recv(4096):
             raise AssertionError("no server flight: the ClientHello was rejected")
-        s.sendall(tail)
         try:
+            s.sendall(tail)
             s.recv(4096)   # a sealed alert, or a clean EOF: either is a reply
             return True
-        except ConnectionResetError:
+        except (ConnectionResetError, BrokenPipeError):
             # Also a refusal, and just as prompt: the server closed while our
             # oversized record was still arriving, so the kernel answers the
             # unread data with a reset. What this test is really measuring is
             # that the record is refused at once rather than waited for.
+            #
+            # The send has to be inside this handler, not just the recv. The
+            # spill case pushes 8000 bytes at a server that refuses on the
+            # 5-byte header, so the reset routinely arrives while sendall is
+            # still writing — the promptness this test wants is exactly what
+            # provokes it. With the send outside, a fast refusal raised
+            # ConnectionResetError out of the test and reported it as a
+            # failure: a ~10-20% flake under load, which the suite had put
+            # down to shared state.
             return True
         except socket.timeout:
             return False   # stalled: waiting for a record it cannot receive
