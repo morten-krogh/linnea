@@ -647,8 +647,8 @@ linnea_h2_handle:
 %define L_OUT    linnea_h2_req_size + 24
 %define L_BIG    linnea_h2_req_size + 32
 %define L_ASM    linnea_h2_req_size + 40
-%if L_ASM + 8 > 384
-  %error "h2_build_request stack frame (sub rsp,384) too small for req + locals"
+%if L_ASM + 8 > 392
+  %error "h2_build_request stack frame (sub rsp,392) too small for req + locals"
 %endif
 h2_build_request:
     push rbx
@@ -657,7 +657,11 @@ h2_build_request:
     push r14
     push r15
     push rbp
-    sub rsp, 384
+    ; 392, not a round 384: six pushes leave rsp 8 past a 16-byte boundary, so an
+    ; even frame would hand every callee a misaligned stack. Nothing under here
+    ; uses an aligned SSE load today, so this was a trap rather than a crash — but
+    ; it is one movaps away from being a crash, and the AES paths are close by.
+    sub rsp, 392
     mov rbx, rdi                     ; conn
     mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
@@ -897,7 +901,7 @@ h2_build_request:
 .err:
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
-    add rsp, 384
+    add rsp, 392
     pop rbp
     pop r15
     pop r14
