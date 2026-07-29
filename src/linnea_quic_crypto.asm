@@ -167,10 +167,13 @@ linnea_quic_ku_next:
     mov qword [rsp], 32
     call linnea_tls_hkdf_expand_label
     add rsp, 16
-    ; key = HKDF-Expand-Label(next, "quic key", "", 16)
+    ; key = HKDF-Expand-Label(next, "quic key" / "quicv2 key", "", 16). The
+    ; version-dependent labels matter here as much as anywhere else: deriving a
+    ; v2 connection's new key under the v1 label produced a key neither side
+    ; shared, so the first packet after an update failed to open and the
+    ; connection died.
     mov rdi, r12
-    lea rsi, [lbl_quic_key]
-    mov edx, 8
+    QLABEL lbl_quic_key, lbl_quicv2_key, 8
     xor ecx, ecx
     xor r8d, r8d
     lea r9, [r13 + linnea_quic_keys.key]
@@ -178,10 +181,9 @@ linnea_quic_ku_next:
     mov qword [rsp], 16
     call linnea_tls_hkdf_expand_label
     add rsp, 16
-    ; iv = HKDF-Expand-Label(next, "quic iv", "", 12)
+    ; iv = HKDF-Expand-Label(next, "quic iv" / "quicv2 iv", "", 12)
     mov rdi, r12
-    lea rsi, [lbl_quic_iv]
-    mov edx, 7
+    QLABEL lbl_quic_iv, lbl_quicv2_iv, 7
     xor ecx, ecx
     xor r8d, r8d
     lea r9, [r13 + linnea_quic_keys.iv]
