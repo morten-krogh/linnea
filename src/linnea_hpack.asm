@@ -266,6 +266,13 @@ emit_field:
     ; or Content-Length reaches the upstream and desynchronises it.
     ; rax = name, rdx = name length, rsi = value, rdi = value length.
     ; rcx and r8 are already this function's scratch (see name_eq).
+    test rdx, rdx
+    jz .ef_bad                       ; a field name is a token, so never empty
+                                     ; (RFC 9110 5.1). An empty one skipped the
+                                     ; scan below entirely, went out as a bare
+                                     ; ": value" line to the upstream, and left
+                                     ; the pseudo-header test reading a byte the
+                                     ; field does not own.
     xor ecx, ecx
 .ef_name_scan:
     cmp rcx, rdx
@@ -1060,6 +1067,27 @@ linnea_hpack_req_check:
     inc rsi
     dec rcx
     jnz .cv_scan
+    ; :path gets the same treatment. On HTTP/1.1 the request line cannot hold a
+    ; space or a control byte and survive parsing, but here the target is just
+    ; another field value, where only CR/LF/NUL are refused — so an ESC or a
+    ; backspace used to travel all the way into the access log, which h1 would
+    ; never have written. A URI has no room for either byte anyway (RFC 3986 2).
+    mov rsi, [rbx + linnea_h2_req.path_ptr]
+    test rsi, rsi
+    jz .ok
+    mov rcx, [rbx + linnea_h2_req.path_len]
+    test rcx, rcx
+    jz .ok
+.pv_scan:
+    movzx eax, byte [rsi]
+    cmp al, 0x20
+    jbe .bad
+    cmp al, 0x7f
+    je .bad
+    inc rsi
+    dec rcx
+    jnz .pv_scan
+.ok:
     xor eax, eax
     pop rbx
     ret

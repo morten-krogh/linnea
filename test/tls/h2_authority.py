@@ -58,14 +58,38 @@ def probe(name, fields):
     s.close()
     return verdict, alive
 A=h(b":authority",b"localhost"); M=h(b":method",b"GET"); S=h(b":scheme",b"https"); P=h(b":path",b"/hello.txt")
-probe("baseline", M+S+A+P)
-probe("no :authority, no Host", M+S+P)
-probe("Host only (legal h1->h2 translation)", M+S+P+h(b"host",b"localhost"))
-probe("duplicate :authority", M+S+A+h(b":authority",b"evil.test")+P)
-probe(":authority + conflicting Host", M+S+A+P+h(b"host",b"evil.test"))
-probe(":authority + agreeing Host", M+S+A+P+h(b"host",b"localhost"))
-probe("duplicate :path", M+S+A+P+h(b":path",b"/secret"))
-probe("pseudo after regular field", M+S+h(b"accept",b"*/*")+A+P)
-probe("unknown pseudo-header", M+S+A+P+h(b":protocol",b"x"))
-probe("empty :authority", M+S+h(b":authority",b"")+P)
-probe("duplicate Host", M+S+P+h(b"host",b"localhost")+h(b"host",b"localhost"))
+
+# Each case says what the stream must end as: "200" for a request that is fine,
+# "RST" for one that breaks a rule. A rejected stream must also leave the
+# connection serving — the field block decoded, so the HPACK state is intact and
+# RFC 9113 8.1.1 makes this a stream error, not a connection one.
+CASES = [
+    ("baseline", M+S+A+P, "200"),
+    ("no :authority, no Host", M+S+P, "RST"),
+    ("Host only (legal h1->h2 translation)", M+S+P+h(b"host",b"localhost"), "200"),
+    ("duplicate :authority", M+S+A+h(b":authority",b"evil.test")+P, "RST"),
+    (":authority + conflicting Host", M+S+A+P+h(b"host",b"evil.test"), "RST"),
+    (":authority + agreeing Host", M+S+A+P+h(b"host",b"localhost"), "200"),
+    ("duplicate :path", M+S+A+P+h(b":path",b"/secret"), "RST"),
+    ("pseudo after regular field", M+S+h(b"accept",b"*/*")+A+P, "RST"),
+    ("unknown pseudo-header", M+S+A+P+h(b":protocol",b"x"), "RST"),
+    ("empty :authority", M+S+h(b":authority",b"")+P, "RST"),
+    ("duplicate Host", M+S+P+h(b"host",b"localhost")+h(b"host",b"localhost"), "RST"),
+    # a field name is a token, so it is never empty: an empty one used to pass
+    # the name scan untouched and go upstream as a bare ": value" line
+    ("empty field name", M+S+A+P+h(b"",b"x"), "RST"),
+    # h1 cannot carry a control byte in the request line at all; here the target
+    # is just a field value, so an ESC used to reach the access log
+    ("control byte in :path", M+S+A+h(b":path",b"/hello\x1b.txt"), "RST"),
+    ("space in :path", M+S+A+h(b":path",b"/hello .txt"), "RST"),
+]
+
+fails=0
+for name, fields, want in CASES:
+    verdict, alive = probe(name, fields)
+    ok = (verdict == "served 200") if want == "200" else \
+         (verdict is not None and verdict.startswith("RST") and alive == "yes")
+    print(f"{'ok  ' if ok else 'FAIL'} {name}: {verdict} (alive={alive}), want {want}")
+    fails += not ok
+if fails:
+    sys.exit(1)
