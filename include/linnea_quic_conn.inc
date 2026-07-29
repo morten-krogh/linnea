@@ -245,6 +245,20 @@ struc linnea_quic_conn
     .peer_len:   resq 1              ; sockaddr length
     .state:      resq 1
     .ctrl_id:    resq 1              ; the peer's control stream id, 0 until seen
+    ; The control stream's frame walk (RFC 9114 6.2.1). It carries a frame
+    ; sequence like any other stream, but it never ends and arrives spread over
+    ; STREAM frames, so it is walked as it streams rather than reassembled:
+    ; .ctrl_off is the next stream offset the walk can consume, .ctrl_skip the
+    ; payload bytes of the frame in progress still to be discarded, and
+    ; .ctrl_hdr holds a frame header split across a STREAM-frame boundary (two
+    ; varints, so at most 16 bytes). .ctrl_settings records that the opening
+    ; SETTINGS has been seen — the first frame must be one and no later frame may
+    ; be. Zero-initialised with the slot, which is exactly the starting state.
+    .ctrl_off:   resq 1
+    .ctrl_skip:  resq 1
+    .ctrl_hlen:  resq 1
+    .ctrl_settings: resq 1
+    .ctrl_hdr:   resb 16
     .h3_goaway_id: resq 1            ; lowest request stream a drain would reject
     .ms_bidi_max:  resq 1            ; bidi stream count granted to the peer (MAX_STREAMS)
     .vhost:        resq 1            ; index into the vhost table, chosen by the SNI:

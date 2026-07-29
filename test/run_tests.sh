@@ -432,6 +432,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_settings_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): client control stream validated (SETTINGS-first enforced)" $?
 
+    # and the rest of the control stream's frame sequence, not just its first two
+    # bytes: DATA/HEADERS/PUSH_PROMISE, the reserved HTTP/2 types and a second
+    # SETTINGS end the connection, GREASE and the control frames are skipped by
+    # length, and a header split across STREAM frames still parses
+    timeout 180 python3 test/quic/h3_ctrl_frames_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): control-stream frames walked and validated" $?
+
     # request bodies: a POST's DATA frames are captured and echoed back intact
     python3 test/quic/h3_body_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): request body captured and echoed (POST)" $?

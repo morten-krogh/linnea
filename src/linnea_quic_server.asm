@@ -2290,7 +2290,14 @@ linnea_quic_server_datagram:
     je .uni_qpack
     cmp cl, LINNEA_H3_STREAM_QPACK_DEC
     je .uni_qpack
+    cmp cl, LINNEA_H3_STREAM_PUSH
+    je .uni_push                     ; a push stream, from a client
     jmp .stream_scan                 ; grease/unknown: not interpreted
+.uni_push:
+    ; only a server pushes, so a client-opened push stream is a connection error
+    ; H3_STREAM_CREATION_ERROR (RFC 9114 6.2.2). We never push at all.
+    mov edi, LINNEA_H3_ERR_STREAM_CREATION
+    jmp .h3_close
 .uni_qpack:
     cmp qword [s_sfin], 0
     jne .uni_critical_closed         ; a QPACK stream must not be closed
@@ -2306,7 +2313,7 @@ linnea_quic_server_datagram:
     jne .stream_scan
     cmp qword [s_sfin], 0
     jne .uni_critical_closed
-    jmp .stream_scan
+    jmp .uni_ctrl_walk               ; more control-stream frames to walk
 .uni_control:
     ; closing the control stream is a critical-stream error, whatever it carries
     cmp qword [s_sfin], 0
@@ -2317,26 +2324,162 @@ linnea_quic_server_datagram:
     test rax, rax
     jz .uni_ctrl_first
     cmp rax, [s_sid]
-    je .uni_ctrl_settings            ; the same control stream again
+    je .uni_ctrl_walk                ; the same control stream again
     mov edi, LINNEA_H3_ERR_STREAM_CREATION
     jmp .h3_close
 .uni_ctrl_first:
     mov rax, [s_sid]
     mov [rdx + linnea_quic_conn.ctrl_id], rax
-.uni_ctrl_settings:
-    ; the first frame on the control stream must be SETTINGS. If only the type
-    ; byte is present it may follow in a later frame, so do not reject that.
-    cmp qword [s_slen], 2
-    jb .stream_scan
-    mov rax, [s_sdata]
-    movzx ecx, byte [rax + 1]        ; first control-stream frame type (0x04 = SETTINGS)
-    cmp cl, LINNEA_H3_FRAME_SETTINGS
-    je .stream_scan                  ; SETTINGS first: accepted (its values ignored)
-    mov edi, LINNEA_H3_ERR_MISSING_SETTINGS
+    ; the walk starts after the stream-type byte this frame opened with
+    mov qword [rdx + linnea_quic_conn.ctrl_off], 1
+.uni_ctrl_walk:
+    ; walk whatever frames these bytes complete. The first must be SETTINGS and
+    ; no later one may be; DATA, HEADERS, PUSH_PROMISE and the types HTTP/2
+    ; reserved end the connection; the rest are skipped by their length.
+    call .ctrl_walk                  ; eax = 0, or the code to close with
+    test eax, eax
+    jz .stream_scan
+    mov edi, eax
     jmp .h3_close
 .uni_critical_closed:
     mov edi, LINNEA_H3_ERR_CLOSED_CRITICAL
-    ; fall through to .h3_close
+    jmp .h3_close
+
+; .ctrl_walk() -> eax = 0 when the control-stream bytes in this STREAM frame are
+; acceptable, else the HTTP/3 error code to close the connection with. Walks the
+; frame sequence on the peer's control stream (RFC 9114 6.2.1, 7.2), carrying its
+; position across STREAM frames in the connection: the payload of a frame we do
+; not read is discarded by .ctrl_skip, and a frame header split across a frame
+; boundary is accumulated in .ctrl_hdr.
+;
+; Only bytes that continue the contiguous prefix are walked. A STREAM frame that
+; arrives ahead of .ctrl_off leaves a hole, and since a reordered (as opposed to
+; lost) frame is delivered only once, those bytes may never come again — so the
+; walk simply stops advancing rather than guessing. Enforcement then quietly ends
+; for that connection, which is the right way round: these rules describe what a
+; peer must not send, and none of them protects anything we would otherwise be
+; exposed to, so a missed violation costs nothing while a wrong close would kill
+; a conforming client. A genuine retransmission fills the hole and the walk
+; resumes on its own.
+; Uses [cur_conn] and the s_s* stream globals; clobbers only caller-saved
+; registers plus rbx/r12/r13/r14/rbp, which it saves. Five pushes, so the calls
+; below see a 16-aligned stack.
+.ctrl_walk:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+    mov rbx, [cur_conn]
+    mov r12, [s_sdata]                ; cursor over this frame's new bytes
+    mov r13, [s_slen]                 ; how many are left
+    mov r14, [rbx + linnea_quic_conn.ctrl_off]
+    mov rax, [s_soff]
+    cmp rax, r14
+    ja .cw_ok                         ; a hole: stop walking (see above)
+    ; bytes below .ctrl_off were walked already — a retransmission overlapping
+    ; what we have. Skip that prefix; if the whole frame is old there is nothing
+    ; new to do.
+    mov rcx, r14
+    sub rcx, rax                      ; already-seen bytes at the front
+    cmp rcx, r13
+    jae .cw_ok
+    add r12, rcx
+    sub r13, rcx
+.cw_loop:
+    test r13, r13
+    jz .cw_ok
+    ; a frame whose payload we are discarding takes precedence over new headers
+    mov rcx, [rbx + linnea_quic_conn.ctrl_skip]
+    test rcx, rcx
+    jz .cw_hdr
+    cmp rcx, r13
+    jbe .cw_skip_n
+    mov rcx, r13
+.cw_skip_n:
+    sub [rbx + linnea_quic_conn.ctrl_skip], rcx
+    add r12, rcx
+    sub r13, rcx
+    add r14, rcx
+    jmp .cw_loop
+.cw_hdr:
+    ; feed the header one byte at a time and retry the decode: the two varints
+    ; are 16 bytes at the very most, so the buffer can never fill without them
+    ; both decoding, and a byte at a time is what lets a header split across
+    ; STREAM frames resume exactly where it stopped
+    mov rcx, [rbx + linnea_quic_conn.ctrl_hlen]
+    cmp rcx, 16
+    jae .cw_ok                        ; unreachable; never walk off the buffer
+    movzx eax, byte [r12]
+    mov [rbx + linnea_quic_conn.ctrl_hdr + rcx], al
+    inc rcx
+    mov [rbx + linnea_quic_conn.ctrl_hlen], rcx
+    inc r12
+    dec r13
+    inc r14
+    lea rdi, [rbx + linnea_quic_conn.ctrl_hdr]
+    lea rbp, [rdi + rcx]              ; end of the buffered header bytes
+    mov rsi, rbp
+    call linnea_quic_varint_decode    ; frame type
+    test rdx, rdx
+    jz .cw_loop                       ; incomplete: take another byte
+    lea rdi, [rbx + linnea_quic_conn.ctrl_hdr]
+    add rdi, rdx                      ; the length varint follows the type
+    mov rsi, rbp
+    mov rbp, rax                      ; hold the type across the second decode
+    call linnea_quic_varint_decode    ; frame length
+    test rdx, rdx
+    jz .cw_loop                       ; incomplete: take another byte
+    ; a whole frame header: its payload is next, and the header buffer is spent
+    mov qword [rbx + linnea_quic_conn.ctrl_hlen], 0
+    mov [rbx + linnea_quic_conn.ctrl_skip], rax
+    ; SETTINGS opens the control stream and appears exactly once (7.2.4)
+    cmp qword [rbx + linnea_quic_conn.ctrl_settings], 0
+    jne .cw_settings_seen
+    cmp rbp, LINNEA_H3_FRAME_SETTINGS
+    jne .cw_no_settings               ; the stream opened with something else
+    mov qword [rbx + linnea_quic_conn.ctrl_settings], 1
+    jmp .cw_loop
+.cw_settings_seen:
+    cmp rbp, LINNEA_H3_FRAME_SETTINGS
+    je .cw_unexpected                 ; a second SETTINGS
+    ; DATA and HEADERS belong to a request stream (7.2.1, 7.2.2), and a server
+    ; may not receive PUSH_PROMISE at all (7.2.5)
+    cmp rbp, LINNEA_H3_FRAME_DATA
+    je .cw_unexpected
+    cmp rbp, LINNEA_H3_FRAME_HEADERS
+    je .cw_unexpected
+    cmp rbp, LINNEA_H3_FRAME_PUSH_PROMISE
+    je .cw_unexpected
+    ; the frame types HTTP/2 used that HTTP/3 reserves (7.2.8)
+    cmp rbp, 0x02
+    je .cw_unexpected
+    cmp rbp, 0x06
+    je .cw_unexpected
+    cmp rbp, 0x08
+    je .cw_unexpected
+    cmp rbp, 0x09
+    je .cw_unexpected
+    ; CANCEL_PUSH, GOAWAY and MAX_PUSH_ID belong here, and an unknown type —
+    ; GREASE, or an extension we do not implement — must be ignored (9). Either
+    ; way the payload is discarded.
+    jmp .cw_loop
+.cw_ok:
+    mov [rbx + linnea_quic_conn.ctrl_off], r14
+    xor eax, eax
+    jmp .cw_ret
+.cw_no_settings:
+    mov eax, LINNEA_H3_ERR_MISSING_SETTINGS
+    jmp .cw_ret
+.cw_unexpected:
+    mov eax, LINNEA_H3_ERR_FRAME_UNEXPECTED
+.cw_ret:
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; .h3_close(edi = HTTP/3 error code) — end the connection with an application
 ; CONNECTION_CLOSE (frame 0x1d) carrying the code, then free the slot. Sent via

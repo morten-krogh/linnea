@@ -16,6 +16,7 @@ LINNEA_H3_FRAME_MAX_PUSH_ID equ 0x0d
 
 ; Unidirectional stream types (the first varint on a client uni stream).
 LINNEA_H3_STREAM_CONTROL    equ 0x00
+LINNEA_H3_STREAM_PUSH       equ 0x01   ; only a server may open one (6.2.2)
 LINNEA_H3_STREAM_QPACK_ENC  equ 0x02
 LINNEA_H3_STREAM_QPACK_DEC  equ 0x03
 
