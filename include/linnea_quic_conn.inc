@@ -105,6 +105,13 @@ LINNEA_QUIC_TX_PTO_MAX  equ 16      ; attempts before a response chunk is given 
 ; under loss/reordering. 3 is the RFC's kPacketThreshold (tolerates 3-deep reorder).
 LINNEA_QUIC_LOSS_THRESH equ 3
 
+; PRIORITY_UPDATE (RFC 9218 7.2) on the control stream. The payload is a varint
+; element id plus a priority field value, so a real one is well under 32 bytes;
+; the buffer is generous and anything past it is treated as not a priority frame.
+; PU_PEND is how many updates for not-yet-open response streams are remembered.
+LINNEA_QUIC_PU_BUF  equ 64
+LINNEA_QUIC_PU_PEND equ 8
+
 ; A request whose frames span several packets is reassembled in a per-connection
 ; buffer: each frame is placed at its offset (out-of-order frames are buffered,
 ; not dropped), a parallel byte-map records which bytes have arrived, and the
@@ -259,6 +266,23 @@ struc linnea_quic_conn
     .ctrl_hlen:  resq 1
     .ctrl_settings: resq 1
     .ctrl_hdr:   resb 16
+    ; PRIORITY_UPDATE is the one control-stream frame whose payload we read
+    ; rather than skip, so it alone is captured as it streams past: .ctrl_pucap
+    ; is 0 while skipping, or the frame type while collecting into .ctrl_pu.
+    ; A payload longer than the buffer is not captured at all — a priority field
+    ; value is a few bytes ("u=1, i"), so anything near this size is not one.
+    .ctrl_pucap: resq 1
+    .ctrl_pulen: resq 1
+    .ctrl_pu:    resb LINNEA_QUIC_PU_BUF
+    ; A PRIORITY_UPDATE may name a request stream whose response has not opened
+    ; yet: the control stream and the request stream are separate, so the update
+    ; can overtake the request that it reprioritises. RFC 9218 7 says to keep the
+    ; signal rather than drop it, so the most recent value per stream waits here
+    ; and is applied when the response slot is filled. A small ring: the oldest
+    ; entry is evicted, which costs at most a missed reprioritisation.
+    .pu_sid:     resq LINNEA_QUIC_PU_PEND    ; stream id + 1 (0 = empty)
+    .pu_val:     resq LINNEA_QUIC_PU_PEND    ; urgency | incremental << 8
+    .pu_next:    resq 1                      ; write cursor
     .h3_goaway_id: resq 1            ; lowest request stream a drain would reject
     .ms_bidi_max:  resq 1            ; bidi stream count granted to the peer (MAX_STREAMS)
     .vhost:        resq 1            ; index into the vhost table, chosen by the SNI:

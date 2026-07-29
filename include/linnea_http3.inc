@@ -13,6 +13,12 @@ LINNEA_H3_FRAME_SETTINGS    equ 0x04
 LINNEA_H3_FRAME_PUSH_PROMISE equ 0x05
 LINNEA_H3_FRAME_GOAWAY      equ 0x07
 LINNEA_H3_FRAME_MAX_PUSH_ID equ 0x0d
+; PRIORITY_UPDATE (RFC 9218 7.2), the only extension frame we read. Its payload
+; is varint(prioritized element id) followed by the same RFC 8941 dictionary the
+; `priority` header field carries. Two types: one for a request stream, one for a
+; pushed one. Both belong on the control stream and nowhere else.
+LINNEA_H3_FRAME_PRIORITY_UPDATE      equ 0xF0700
+LINNEA_H3_FRAME_PRIORITY_UPDATE_PUSH equ 0xF0701
 
 ; Unidirectional stream types (the first varint on a client uni stream).
 LINNEA_H3_STREAM_CONTROL    equ 0x00
@@ -26,6 +32,7 @@ LINNEA_H3_ERR_NO_ERROR         equ 0x0100  ; orderly close (the drain's goodbye)
 LINNEA_H3_ERR_STREAM_CREATION  equ 0x0103  ; a second control stream
 LINNEA_H3_ERR_CLOSED_CRITICAL  equ 0x0104  ; a critical stream (control/QPACK) closed
 LINNEA_H3_ERR_FRAME_UNEXPECTED equ 0x0105  ; a frame illegal in the stream it arrived on
+LINNEA_H3_ERR_ID               equ 0x0108  ; an id a frame named cannot exist
 LINNEA_H3_ERR_MISSING_SETTINGS equ 0x010a  ; control stream opened without SETTINGS
 LINNEA_H3_ERR_QPACK_DECOMP     equ 0x0200  ; QPACK could not decode a field section
 

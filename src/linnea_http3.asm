@@ -152,6 +152,12 @@ linnea_h3_read_headers:
     sub rcx, 2
     cmp rcx, 7                        ; original type in 0x02..0x09
     jbe .frame_unexpected
+    ; PRIORITY_UPDATE belongs on the control stream, and RFC 9218 7.2 makes it
+    ; H3_FRAME_UNEXPECTED anywhere else — including here
+    cmp rbx, LINNEA_H3_FRAME_PRIORITY_UPDATE
+    je .frame_unexpected
+    cmp rbx, LINNEA_H3_FRAME_PRIORITY_UPDATE_PUSH
+    je .frame_unexpected
     add r12, rax                     ; grease / unknown: skip its payload
     jmp .frame
 .headers:

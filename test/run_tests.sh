@@ -470,6 +470,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_priority_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): responses scheduled by RFC 9218 priority" $?
 
+    # and the client can change its mind afterwards: a PRIORITY_UPDATE on the
+    # control stream reprioritises a response already streaming, and one that
+    # overtakes the request it names is kept and applied when that stream opens
+    timeout 300 python3 test/quic/h3_priority_update_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): PRIORITY_UPDATE reprioritises a response" $?
+
     # a size/boundary/request-style matrix: every response, from 0 bytes through
     # the inline/chunked threshold and exact chunk multiples to 200 KB, must
     # terminate (deliver a FIN) — sequentially reusing one connection, all at once

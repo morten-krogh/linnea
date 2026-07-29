@@ -2208,7 +2208,7 @@ linnea_quic_server_datagram:
     mov qword [s_prio_i], 0
     mov r10, [req + linnea_h2_req.prio_ptr]
     test r10, r10
-    jz .sl_find
+    jz .sl_prio_pending               ; no header, but an update may still await
     push rax                          ; head length
     push rbx                          ; head offset in strm_pay
     push r8                           ; file base
@@ -2220,6 +2220,36 @@ linnea_quic_server_datagram:
     mov [s_prio_i], rdx
     pop r9
     pop r8
+    pop rbx
+    pop rax
+.sl_prio_pending:
+    ; A PRIORITY_UPDATE that overtook this request wins over the header it came
+    ; with: the header is the priority the request was born with, the update is
+    ; the client changing its mind afterwards (RFC 9218 7). Consume the entry —
+    ; it has done its job, and leaving it would re-apply to a later stream that
+    ; happened to reuse the id, which cannot occur but costs nothing to rule out.
+    push rax
+    push rbx
+    mov rbx, [cur_conn]
+    mov rdx, [s_sid]
+    inc rdx                           ; stored as id + 1
+    xor ecx, ecx
+.sl_pp_scan:
+    cmp [rbx + linnea_quic_conn.pu_sid + rcx * 8], rdx
+    je .sl_pp_hit
+    inc ecx
+    cmp ecx, LINNEA_QUIC_PU_PEND
+    jb .sl_pp_scan
+    jmp .sl_pp_done
+.sl_pp_hit:
+    mov qword [rbx + linnea_quic_conn.pu_sid + rcx * 8], 0
+    mov rax, [rbx + linnea_quic_conn.pu_val + rcx * 8]
+    mov rdx, rax
+    and rdx, 0xff
+    mov [s_prio_u], rdx
+    shr rax, 8
+    mov [s_prio_i], rax
+.sl_pp_done:
     pop rbx
     pop rax
 .sl_find:
@@ -2398,9 +2428,28 @@ linnea_quic_server_datagram:
     mov rcx, r13
 .cw_skip_n:
     sub [rbx + linnea_quic_conn.ctrl_skip], rcx
+    ; a PRIORITY_UPDATE's payload is collected as it goes by, not discarded
+    cmp qword [rbx + linnea_quic_conn.ctrl_pucap], 0
+    je .cw_skip_move
+    push rcx
+    mov rdi, [rbx + linnea_quic_conn.ctrl_pulen]
+    lea rdi, [rbx + linnea_quic_conn.ctrl_pu + rdi]
+    mov rsi, r12
+    add [rbx + linnea_quic_conn.ctrl_pulen], rcx
+    rep movsb                         ; bounded: the length was checked at the header
+    pop rcx
+.cw_skip_move:
     add r12, rcx
     sub r13, rcx
     add r14, rcx
+    ; the frame ends here: a captured PRIORITY_UPDATE is now whole, so act on it
+    cmp qword [rbx + linnea_quic_conn.ctrl_skip], 0
+    jne .cw_loop
+    cmp qword [rbx + linnea_quic_conn.ctrl_pucap], 0
+    je .cw_loop
+    call .pu_apply                    ; eax = 0, or the code to close with
+    test eax, eax
+    jnz .cw_ret_off
     jmp .cw_loop
 .cw_hdr:
     ; feed the header one byte at a time and retry the decode: the two varints
@@ -2460,13 +2509,33 @@ linnea_quic_server_datagram:
     je .cw_unexpected
     cmp rbp, 0x09
     je .cw_unexpected
+    ; PRIORITY_UPDATE (RFC 9218 7.2) is the one extension frame we read: its
+    ; payload is captured as it streams by and acted on once the frame ends.
+    ; A payload too long to be a priority field value is left uncaptured and
+    ; simply skipped, like any other frame we do not understand.
+    cmp rbp, LINNEA_H3_FRAME_PRIORITY_UPDATE
+    je .cw_prio
+    cmp rbp, LINNEA_H3_FRAME_PRIORITY_UPDATE_PUSH
+    je .cw_prio
     ; CANCEL_PUSH, GOAWAY and MAX_PUSH_ID belong here, and an unknown type —
     ; GREASE, or an extension we do not implement — must be ignored (9). Either
     ; way the payload is discarded.
     jmp .cw_loop
+.cw_prio:
+    mov rcx, [rbx + linnea_quic_conn.ctrl_skip]      ; the declared payload length
+    test rcx, rcx
+    jz .cw_loop                       ; no element id can fit: not a priority frame
+    cmp rcx, LINNEA_QUIC_PU_BUF
+    ja .cw_loop                       ; far too long to be one either
+    mov [rbx + linnea_quic_conn.ctrl_pucap], rbp     ; capture, remembering which type
+    mov qword [rbx + linnea_quic_conn.ctrl_pulen], 0
+    jmp .cw_loop
 .cw_ok:
     mov [rbx + linnea_quic_conn.ctrl_off], r14
     xor eax, eax
+    jmp .cw_ret
+.cw_ret_off:                          ; an error, but the walk did consume bytes
+    mov [rbx + linnea_quic_conn.ctrl_off], r14
     jmp .cw_ret
 .cw_no_settings:
     mov eax, LINNEA_H3_ERR_MISSING_SETTINGS
@@ -2474,6 +2543,109 @@ linnea_quic_server_datagram:
 .cw_unexpected:
     mov eax, LINNEA_H3_ERR_FRAME_UNEXPECTED
 .cw_ret:
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; .pu_apply() -> eax = 0, or the HTTP/3 error code to close with. Acts on the
+; whole PRIORITY_UPDATE payload sitting in the connection's .ctrl_pu, and clears
+; the capture. rbx = conn on entry; the walk's r12/r13/r14 are preserved.
+;
+; The payload is varint(prioritized element id) then a priority field value in
+; the same syntax the `priority` header uses, so the same parser reads it (RFC
+; 9218 7.2). The update is applied to the response stream's open slot if it has
+; one, and otherwise remembered: the control stream and the request stream are
+; independent, so an update can overtake the request it reprioritises, and RFC
+; 9218 7 asks that the signal be kept rather than dropped.
+.pu_apply:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+    mov rbx, [cur_conn]
+    mov rbp, [rbx + linnea_quic_conn.ctrl_pucap]     ; which of the two types
+    mov qword [rbx + linnea_quic_conn.ctrl_pucap], 0 ; capture consumed either way
+    lea rdi, [rbx + linnea_quic_conn.ctrl_pu]
+    mov rsi, [rbx + linnea_quic_conn.ctrl_pulen]
+    add rsi, rdi
+    call linnea_quic_varint_decode    ; rax = element id, rdx = its length
+    test rdx, rdx
+    jz .pu_ok                         ; a truncated id: nothing to act on
+    mov r13, rax                      ; the element id
+    ; the rest of the payload is the priority field value; an empty one is legal
+    ; and simply means the defaults
+    lea rdi, [rbx + linnea_quic_conn.ctrl_pu]
+    add rdi, rdx
+    mov rsi, [rbx + linnea_quic_conn.ctrl_pulen]
+    sub rsi, rdx
+    call linnea_quic_parse_priority   ; rax = urgency, rdx = incremental
+    mov r14, rax
+    shl rdx, 8
+    or r14, rdx                       ; packed urgency | incremental << 8
+    ; A push id can name nothing here: we never send PUSH_PROMISE, so no push has
+    ; ever been promised on this connection and RFC 9218 7.2 makes any push id an
+    ; H3_ID_ERROR. No conforming client can reach this.
+    cmp rbp, LINNEA_H3_FRAME_PRIORITY_UPDATE_PUSH
+    je .pu_id_error
+    ; and a request id must be a client-initiated bidirectional stream (low two
+    ; bits 00) — any other id does not name a request, whatever it names
+    test r13, 3
+    jnz .pu_id_error
+    ; an open response slot for that stream takes the new values at once: the
+    ; pump reads urgency and incremental afresh every time it picks a stream, so
+    ; nothing else has to be resorted
+    lea rax, [rbx + linnea_quic_conn.tx_streams]
+    mov ecx, LINNEA_QUIC_TXSTREAMS
+.pu_slot:
+    cmp qword [rax + linnea_quic_txstream.active], 0
+    je .pu_slot_next
+    cmp [rax + linnea_quic_txstream.sid], r13
+    je .pu_slot_hit
+.pu_slot_next:
+    add rax, linnea_quic_txstream_size
+    dec ecx
+    jnz .pu_slot
+    jmp .pu_pend                      ; no slot open (yet): remember it
+.pu_slot_hit:
+    mov rdx, r14
+    and rdx, 0xff
+    mov [rax + linnea_quic_txstream.urgency], rdx
+    mov rdx, r14
+    shr rdx, 8
+    mov [rax + linnea_quic_txstream.incremental], rdx
+    jmp .pu_ok
+.pu_pend:
+    ; keep the most recent value per stream: overwrite this stream's entry if it
+    ; already has one, else take the next ring slot (evicting the oldest)
+    lea rax, [rbx + linnea_quic_conn.pu_sid]
+    lea rdx, [r13 + 1]                ; ids are stored as id + 1, so 0 means empty
+    xor ecx, ecx
+.pu_pend_scan:
+    cmp [rax + rcx * 8], rdx
+    je .pu_pend_store
+    inc ecx
+    cmp ecx, LINNEA_QUIC_PU_PEND
+    jb .pu_pend_scan
+    mov rcx, [rbx + linnea_quic_conn.pu_next]
+    lea r8, [rcx + 1]
+    cmp r8, LINNEA_QUIC_PU_PEND
+    jb .pu_pend_wrap
+    xor r8d, r8d
+.pu_pend_wrap:
+    mov [rbx + linnea_quic_conn.pu_next], r8
+.pu_pend_store:
+    mov [rax + rcx * 8], rdx
+    mov [rbx + linnea_quic_conn.pu_val + rcx * 8], r14
+.pu_ok:
+    xor eax, eax
+    jmp .pu_ret
+.pu_id_error:
+    mov eax, LINNEA_H3_ERR_ID
+.pu_ret:
     pop rbp
     pop r14
     pop r13
