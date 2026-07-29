@@ -144,6 +144,17 @@ SETTINGS = b"\x00\x04\x00"  # control stream type, then an empty SETTINGS frame
 CASES = [
     # legal on a control stream: skipped by length, connection unharmed
     ("GREASE frame ignored", [SETTINGS + vlq(0x21) + vlq(2) + b"xx"], None),
+    # PRIORITY_UPDATE (RFC 9218) is what Chrome actually puts on its control
+    # stream, and its type is a FOUR-byte varint — the case that proves the walk
+    # accumulates a multi-byte type, not just the one-byte types above
+    ("PRIORITY_UPDATE ignored",
+     [SETTINGS + vlq(0xF0700) + vlq(4) + b"0=\xe2\x81"], None),
+    ("PRIORITY_UPDATE, type split across frames",
+     [SETTINGS + vlq(0xF0700)[:2], vlq(0xF0700)[2:] + vlq(1) + b"0"], None),
+    # a GREASE type at the top of the varint range: 8 bytes of type alone
+    ("8-byte type varint ignored",
+     [SETTINGS + (0xC000000000000000 | 0x1F * 7 + 0x21).to_bytes(8, "big")
+      + vlq(1) + b"x"], None),
     ("CANCEL_PUSH accepted", [SETTINGS + b"\x03\x01\x00"], None),
     ("GOAWAY accepted", [SETTINGS + b"\x07\x01\x00"], None),
     ("MAX_PUSH_ID accepted", [SETTINGS + b"\x0d\x01\x00"], None),
