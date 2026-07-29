@@ -39,7 +39,8 @@ os.set_inheritable(pw, True)
 
 env = dict(os.environ)
 env["LINNEA_UPGRADE"] = f"{lfd};{zomb.pid};{pr}:{pw}:0"
-srv = subprocess.Popen(["bin/linnea", config], pass_fds=[lfd, pr, pw], env=env,
+srv = subprocess.Popen(["bin/linnea", "--config", config],
+                       pass_fds=[lfd, pr, pw], env=env,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(0.6)
 assert srv.poll() is None, "server did not survive the steering handoff"

@@ -61,13 +61,42 @@ extern linnea_network_listen_all
 extern linnea_connections_init
 extern linnea_h2p_init
 extern linnea_uring_run
+extern linnea_print_stdout
 extern linnea_error_usage
 extern linnea_error_exit
 extern linnea_string_from_u64
 
 section .rodata
 
+; The option spellings. The configuration comes from -c/--config and nothing
+; else: a bare path used to be accepted too, and one way of naming the config is
+; less to explain than two.
+;
+; That withdrawal has an operational edge. A master from BEFORE these flags
+; re-execs its replacement as `linnea <config>` and validates it with
+; `linnea -t <config>`, both of which this binary now refuses — so a hot upgrade
+; ONTO this generation is rejected (logged, old generation keeps serving) and the
+; first deploy of it has to be a restart. Every upgrade after that is this binary
+; onto itself, using the long forms below.
+opt_c_short:    db "-c", 0
+opt_config:     db "--config", 0
+opt_config_eq:  db "--config=", 0
 opt_t:          db "-t", 0
+opt_test:       db "--test", 0
+opt_b_short:    db "-b", 0
+opt_bpf:        db "--bpf-probe", 0
+opt_h_short:    db "-h", 0
+opt_help:       db "--help", 0
+
+help_msg:
+    db "usage: linnea --config <config.json> [options]", 10, 10
+    db "  -c, --config <path>  read the configuration from <path>", 10
+    db "  -t, --test           check the configuration and certificates, then exit", 10
+    db "  -b, --bpf-probe      check that BPF reuseport steering loads, then exit", 10
+    db "  -h, --help           print this and exit", 10, 10
+    db "The configuration is named with -c/--config; there is no bare-path form.", 10
+help_msg_len    equ $ - help_msg
+
 env_prefix:     db "LINNEA_UPGRADE="
 env_prefix_len  equ $ - env_prefix
 
@@ -107,6 +136,7 @@ worker_spawned: resq LINNEA_MAX_WORKERS  ; CLOCK_MONOTONIC ns at spawn
 master_pid:     resq 1
 argv0_ptr:      resq 1
 config_ptr:     resq 1
+cli_mode:       resq 1     ; 0 = run, 1 = --test, 2 = --bpf-probe
 upgrade_env:    resq 1                   ; the LINNEA_UPGRADE value, or 0
 old_pids:       resq LINNEA_MAX_WORKERS  ; previous generation, to drain
 old_pid_count:  resq 1
@@ -137,9 +167,9 @@ adopt_workers:  resq 1                   ; how many rows it carried
 wait_status:    resd 1
 check_status:   resd 1
 sa_buf:         resb 32                  ; struct kernel_sigaction
-exec_argv:      resq 4
+exec_argv:      resq 6
 exec_envp:      resq 2
-chk_argv:       resq 4
+chk_argv:       resq 6
 chk_envp:       resq 2
 ; "LINNEA_UPGRADE=fds;pids". Sized against what build_upgrade_env can actually
 ; write, in BYTES rather than entries: up to 512 listener fds (the cap it
@@ -162,35 +192,24 @@ _start:
     lea rsi, [rsp + 16]
     lea rsi, [rsi + r15 * 8]   ; &envp[0]
     call scan_env
-    cmp r15, 2
-    jl .usage
-    ; config-check mode: `linnea -t <config>` parses and validates only
-    mov rsi, [rsp + 16]        ; argv[1]
-    cmp byte [rsi], '-'
-    jne .normal_args
-    cmp byte [rsi + 1], 'b'
-    je .bpf_probe
-    cmp byte [rsi + 1], 't'
-    jne .normal_args
-    cmp byte [rsi + 2], 0
-    jne .normal_args
-    cmp r15, 3
-    jl .usage
-    mov rax, [rsp + 24]        ; argv[2]
-    mov [config_ptr], rax
-    jmp check_config
-.bpf_probe:                    ; `linnea -b`: verify BPF reuseport steering loads
-    cmp byte [rsi + 2], 0
-    jne .normal_args
+    lea rdi, [rsp + 16]        ; &argv[1]
+    mov rsi, r15
+    dec rsi                    ; how many arguments follow argv[0]
+    call parse_args            ; fills config_ptr and cli_mode, or exits
+    cmp qword [cli_mode], 2
+    je .bpf_probe              ; the probe needs no configuration
+    cmp qword [config_ptr], 0
+    je .usage
+    cmp qword [cli_mode], 1
+    je check_config
+    jmp .run
+.bpf_probe:                    ; verify BPF reuseport steering loads
     call linnea_bpf_probe
     mov edi, eax
     neg edi                    ; exit 0 when the probe returned 0
     mov eax, LINNEA_SYS_EXIT
     syscall
-.normal_args:
-    mov rax, [rsp + 16]        ; argv[1] = config path
-    mov [config_ptr], rax
-
+.run:
     mov rdi, [config_ptr]
     call linnea_file_map_readonly
     mov r12, rax               ; ptr
@@ -352,6 +371,7 @@ _start:
 
 .usage:
     jmp linnea_error_usage
+
 .wait_fail:
     lea rdi, [msg_wait]
     mov esi, msg_wait_len
@@ -360,6 +380,156 @@ _start:
     lea rdi, [msg_storm]
     mov esi, msg_storm_len
     jmp linnea_error_exit
+
+; parse_args(rdi = &argv[1], rsi = count) — sets config_ptr and cli_mode, prints
+; the help and exits 0 for --help, or leaves through the usage message. Options
+; may appear in any order and before or after a bare path.
+;
+; Naming the configuration twice is refused rather than resolved last-wins: two
+; paths on one command line means the operator believes something about which one
+; is in force, and guessing is the mistake that gets a server serving the wrong root.
+parse_args:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi                     ; &argv[i]
+    mov r12, rsi                     ; arguments remaining
+    mov qword [cli_mode], 0
+.pa_next:
+    test r12, r12
+    jz .pa_done
+    mov r13, [rbx]
+    add rbx, 8
+    dec r12
+    cmp byte [r13], '-'
+    jne .pa_bad                      ; the configuration is named by -c/--config
+    cmp byte [r13 + 1], 0
+    je .pa_bad                       ; a lone "-" names nothing
+    ; --config=<path>, which has to be tested before the bare --config
+    mov rdi, r13
+    lea rsi, [opt_config_eq]
+    call arg_prefix                  ; rax = past the prefix, or 0
+    test rax, rax
+    jz .pa_try_config
+    cmp byte [rax], 0
+    je .pa_bad                       ; "--config=" with nothing after it
+    mov r14, rax
+    jmp .pa_set_config
+.pa_try_config:
+    mov rdi, r13
+    lea rsi, [opt_config]
+    call arg_is
+    test eax, eax
+    jnz .pa_config_arg
+    mov rdi, r13
+    lea rsi, [opt_c_short]
+    call arg_is
+    test eax, eax
+    jz .pa_try_test
+.pa_config_arg:
+    test r12, r12
+    jz .pa_bad                       ; the flag was last: no path follows it
+    mov r14, [rbx]
+    add rbx, 8
+    dec r12
+.pa_set_config:
+    cmp qword [config_ptr], 0
+    jne .pa_bad                      ; the configuration was already named
+    mov [config_ptr], r14
+    jmp .pa_next
+.pa_try_test:
+    mov rdi, r13
+    lea rsi, [opt_test]
+    call arg_is
+    test eax, eax
+    jnz .pa_mode_test
+    mov rdi, r13
+    lea rsi, [opt_t]
+    call arg_is
+    test eax, eax
+    jnz .pa_mode_test
+    mov rdi, r13
+    lea rsi, [opt_bpf]
+    call arg_is
+    test eax, eax
+    jnz .pa_mode_bpf
+    mov rdi, r13
+    lea rsi, [opt_b_short]
+    call arg_is
+    test eax, eax
+    jnz .pa_mode_bpf
+    mov rdi, r13
+    lea rsi, [opt_help]
+    call arg_is
+    test eax, eax
+    jnz .pa_help
+    mov rdi, r13
+    lea rsi, [opt_h_short]
+    call arg_is
+    test eax, eax
+    jnz .pa_help
+    jmp .pa_bad                      ; an option we do not know
+.pa_mode_test:
+    mov qword [cli_mode], 1
+    jmp .pa_next
+.pa_mode_bpf:
+    mov qword [cli_mode], 2
+    jmp .pa_next
+.pa_help:
+    lea rdi, [help_msg]              ; help is not an error: stdout, exit 0
+    mov esi, help_msg_len
+    call linnea_print_stdout
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+.pa_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.pa_bad:
+    jmp linnea_error_usage
+
+; arg_is(rdi = argument, rsi = NUL-terminated option) -> rax = 1 when equal.
+arg_is:
+    xor ecx, ecx
+.ai_next:
+    mov al, [rdi + rcx]
+    mov dl, [rsi + rcx]
+    cmp al, dl
+    jne .ai_no
+    test al, al
+    jz .ai_yes
+    inc rcx
+    jmp .ai_next
+.ai_no:
+    xor eax, eax
+    ret
+.ai_yes:
+    mov eax, 1
+    ret
+
+; arg_prefix(rdi = argument, rsi = NUL-terminated prefix)
+;   -> rax = the argument just past the prefix, or 0 when it does not match.
+arg_prefix:
+    xor ecx, ecx
+.ap_next:
+    mov dl, [rsi + rcx]
+    test dl, dl
+    jz .ap_yes
+    mov al, [rdi + rcx]
+    cmp al, dl
+    jne .ap_no
+    inc rcx
+    jmp .ap_next
+.ap_no:
+    xor eax, eax
+    ret
+.ap_yes:
+    lea rax, [rdi + rcx]
+    ret
 
 ; spawn_worker(rdi=slot) — fork one worker into the given slot. Returns
 ; in the master; the child never returns.
@@ -509,9 +679,11 @@ do_upgrade:
     call build_upgrade_env
     mov rax, [argv0_ptr]
     mov [exec_argv], rax
+    lea rax, [opt_config]            ; emit the long form; the replacement also
+    mov [exec_argv + 8], rax         ; accepts the bare path an older master sends
     mov rax, [config_ptr]
-    mov [exec_argv + 8], rax
-    mov qword [exec_argv + 16], 0
+    mov [exec_argv + 16], rax
+    mov qword [exec_argv + 24], 0
     lea rax, [env_buf]
     mov [exec_envp], rax
     mov qword [exec_envp + 8], 0
@@ -541,12 +713,14 @@ do_upgrade:
 .check_child:
     mov rax, [argv0_ptr]
     mov [chk_argv], rax
-    lea rax, [opt_t]
+    lea rax, [opt_test]
     mov [chk_argv + 8], rax
-    mov rax, [config_ptr]
+    lea rax, [opt_config]
     mov [chk_argv + 16], rax
-    mov qword [chk_argv + 24], 0
-    mov qword [chk_envp], 0    ; a clean env: `-t` reads none
+    mov rax, [config_ptr]
+    mov [chk_argv + 24], rax
+    mov qword [chk_argv + 32], 0
+    mov qword [chk_envp], 0    ; a clean env: --test reads none
     mov eax, LINNEA_SYS_EXECVE
     mov rdi, [argv0_ptr]
     lea rsi, [chk_argv]

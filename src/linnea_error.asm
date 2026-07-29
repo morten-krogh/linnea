@@ -21,7 +21,8 @@ extern linnea_parser_state
 
 section .rodata
 
-usage_msg:      db "usage: linnea <config.json>", 10
+usage_msg:      db "usage: linnea --config <config.json> [options]", 10
+                db "try 'linnea --help' for the options", 10
 usage_msg_len   equ $ - usage_msg
 prefix_msg:     db "linnea: "
 prefix_len      equ $ - prefix_msg

@@ -50,75 +50,75 @@ workers_of() { pgrep -P "$1" 2>/dev/null | sort | tr '\n' ' '; }
 
 # --- config parsing and validation ---
 run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test locations=3" \
-    timeout 0.5 $BIN test/configs/listen.json
+    timeout 0.5 $BIN --config test/configs/listen.json
 run_test "config dump"     124 stdout "config: 3 servers timeout=2 max_connections=64" \
-    timeout 0.5 $BIN test/configs/listen.json
+    timeout 0.5 $BIN --config test/configs/listen.json
 run_test "location dump"   124 stdout "location 1: prefix=/sub root=test/www" \
-    timeout 0.5 $BIN test/configs/listen.json
+    timeout 0.5 $BIN --config test/configs/listen.json
 run_test "bad timeout"     1 stderr "timeout must be between 1 and 3600" \
-    $BIN test/configs/bad-timeout.json
+    $BIN --config test/configs/bad-timeout.json
 run_test "workers dump"    124 stdout "workers=2" \
-    timeout 0.5 $BIN test/configs/listen.json
+    timeout 0.5 $BIN --config test/configs/listen.json
 run_test "bad workers"     1 stderr "workers must be between 1 and 256" \
-    $BIN test/configs/bad-workers.json
+    $BIN --config test/configs/bad-workers.json
 run_test "invalid host"    1 stderr "invalid host address" \
-    $BIN test/configs/bad-host.json
+    $BIN --config test/configs/bad-host.json
 # a hard fd limit below the configured pool is fatal: the pool could never
 # fill, and accept would fail with EMFILE while the server thought it had room
 run_test "fd limit too low" 1 stderr "file descriptor limit too low" \
-    bash -c "ulimit -n 200; exec $BIN test/configs/listen.json"
+    bash -c "ulimit -n 200; exec $BIN --config test/configs/listen.json"
 # a low SOFT limit is not fatal — a process may raise its own up to the hard
 # limit, so the server does that for itself rather than refusing to start
 run_test "fd soft limit raised" 124 stdout "config:" \
-    bash -c "ulimit -S -n 64; exec timeout 0.5 $BIN test/configs/listen.json"
+    bash -c "ulimit -S -n 64; exec timeout 0.5 $BIN --config test/configs/listen.json"
 run_test "missing argv"    1 stderr "usage:" \
     $BIN
 run_test "missing file"    1 stderr "cannot open config file" \
-    $BIN test/configs/does-not-exist.json
+    $BIN --config test/configs/does-not-exist.json
 run_test "truncated json"  1 stderr "parse error at line" \
-    $BIN test/configs/truncated.json
+    $BIN --config test/configs/truncated.json
 run_test "port too large"  1 stderr "port" \
-    $BIN test/configs/bad-port-large.json
+    $BIN --config test/configs/bad-port-large.json
 run_test "port zero"       1 stderr "port" \
-    $BIN test/configs/bad-port-zero.json
+    $BIN --config test/configs/bad-port-zero.json
 run_test "empty servers"   1 stderr "at least one server" \
-    $BIN test/configs/empty-servers.json
+    $BIN --config test/configs/empty-servers.json
 run_test "unknown key"     1 stderr "unknown key" \
-    $BIN test/configs/unknown-key.json
+    $BIN --config test/configs/unknown-key.json
 run_test "escape sequence" 1 stderr "escape sequences not supported" \
-    $BIN test/configs/escape.json
+    $BIN --config test/configs/escape.json
 run_test "location no prefix" 1 stderr "location requires prefix and exactly one of root, proxy or redirect" \
-    $BIN test/configs/location-missing-prefix.json
+    $BIN --config test/configs/location-missing-prefix.json
 run_test "location root+proxy" 1 stderr "location requires prefix and exactly one of root, proxy or redirect" \
-    $BIN test/configs/location-both-kinds.json
+    $BIN --config test/configs/location-both-kinds.json
 run_test "location root+redirect" 1 stderr "location requires prefix and exactly one of root, proxy or redirect" \
-    $BIN test/configs/location-root-and-redirect.json
+    $BIN --config test/configs/location-root-and-redirect.json
 run_test "redirect dump"   124 stdout "prefix=/old redirect=https://example.com" \
-    timeout 0.5 $BIN test/configs/listen.json
+    timeout 0.5 $BIN --config test/configs/listen.json
 run_test "bad redirect target" 1 stderr "redirect target must start with http:// or https://" \
-    $BIN test/configs/bad-redirect-target.json
+    $BIN --config test/configs/bad-redirect-target.json
 run_test "bad proxy address" 1 stderr "invalid proxy address" \
-    $BIN test/configs/bad-proxy-addr.json
+    $BIN --config test/configs/bad-proxy-addr.json
 run_test "prefix not absolute" 1 stderr "location prefix must start with '/'" \
-    $BIN test/configs/location-bad-prefix.json
+    $BIN --config test/configs/location-bad-prefix.json
 run_test "empty locations"  1 stderr "at least one location" \
-    $BIN test/configs/empty-locations.json
+    $BIN --config test/configs/empty-locations.json
 # the middle server reuses the hostname on another port, which is fine;
 # the clash is on the shared listener, case-insensitively
 run_test "duplicate hostname" 1 stderr "duplicate hostname DUP.Test on 127.0.0.1:47080" \
-    $BIN test/configs/dup-hostname.json
+    $BIN --config test/configs/dup-hostname.json
 
 # --- TLS config: "cert" and "key" are both-or-neither, and servers sharing
 # --- a listener must agree (SNI picks the cert within a TLS listener,
 # --- but TLS and plaintext cannot share a socket)
 run_test "tls dump"        124 stdout "tls=on cert=test/tls/server.crt" \
-    timeout 0.5 $BIN test/configs/tls.json
+    timeout 0.5 $BIN --config test/configs/tls.json
 run_test "sni dump"        124 stdout "hostname=sni.test tls=on cert=test/tls/sni.crt" \
-    timeout 0.5 $BIN test/configs/tls-sni.json
+    timeout 0.5 $BIN --config test/configs/tls-sni.json
 run_test "tls cert without key" 1 stderr "server needs both cert and key, or neither" \
-    $BIN test/configs/bad-cert-only.json
+    $BIN --config test/configs/bad-cert-only.json
 run_test "tls listener mismatch" 1 stderr "servers sharing a listener must all set TLS or none" \
-    $BIN test/configs/bad-tls-mismatch.json
+    $BIN --config test/configs/bad-tls-mismatch.json
 
 # --- crypto self-test: known-answer vectors for the TLS primitives ---
 # Runs the pre-built binary (built by `make test`/`make selftest`); the
@@ -388,7 +388,7 @@ fi
 # so this also covers SO_REUSEPORT steering.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/mk_test_image.py test/www/linnea.png >/dev/null    # served over h3
-    $BIN test/configs/tls-h3.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-h3.json >/dev/null 2>&1 &
     h3_pid=$!
     sleep 0.5
     python3 test/quic/h3_e2e_test.py 47452 >/dev/null 2>&1
@@ -705,7 +705,7 @@ fi
 # 28-byte sockaddr_in6 handling on the receive, conn.peer and sendto-reply paths.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN test/configs/tls-h3-v6.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-h3-v6.json >/dev/null 2>&1 &
     v6_pid=$!
     sleep 0.5
     python3 test/quic/h3_ipv6_test.py 47455 >/dev/null 2>&1
@@ -728,7 +728,7 @@ fi
 # whole-file GET into a 206.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN test/configs/tls-h3-drain.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-h3-drain.json >/dev/null 2>&1 &
     tr_master=$!
     sleep 0.5
     timeout 60 python3 test/quic/h3_trailer_test.py 47453 >/dev/null 2>&1
@@ -749,7 +749,7 @@ fi
 # keeps the signalling deterministic; the test kills the master itself.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN test/configs/tls-h3-drain.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-h3-drain.json >/dev/null 2>&1 &
     ga_master=$!
     sleep 0.5
     python3 test/quic/h3_goaway_test.py 47453 $ga_master >/dev/null 2>&1
@@ -772,7 +772,7 @@ fi
 # (H3_NO_ERROR), and only then exits.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN test/configs/tls-h3-drain.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-h3-drain.json >/dev/null 2>&1 &
     di_master=$!
     sleep 0.5
     timeout 40 python3 test/quic/h3_drain_inflight_test.py 47453 $di_master >/dev/null 2>&1
@@ -810,7 +810,7 @@ fi
 # peer closes) delivers every byte.
 rm -f test/linnea.log
 python3 -c "open('test/www/h2drain.bin','wb').write(bytes(3000000))"
-$BIN test/configs/tls-h3-drain.json >/dev/null 2>&1 &
+$BIN --config test/configs/tls-h3-drain.json >/dev/null 2>&1 &
 h2d_master=$!
 sleep 0.5
 timeout 60 python3 test/tls/h2_drain_slow.py test/tls/server.crt 47453 $h2d_master >/dev/null 2>&1
@@ -828,7 +828,7 @@ rm -f test/linnea.log test/www/h2drain.bin
 # exercises the raised cap; the curl check confirms the same chain over h2/TCP.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN test/configs/tls-h3-bigcert.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-h3-bigcert.json >/dev/null 2>&1 &
     bc_pid=$!
     sleep 0.6
     python3 test/quic/h3_bigcert_test.py 47454 >/dev/null 2>&1
@@ -904,7 +904,7 @@ open('test/www/enc.txt.br', 'wb').write(b'br payload')
 PY
 python3 test/proxy_backend.py >/dev/null 2>&1 &
 backend_pid=$!
-$BIN test/configs/listen.json >/dev/null 2>&1 &
+$BIN --config test/configs/listen.json >/dev/null 2>&1 &
 server_pid=$!
 sleep 0.3
 
@@ -936,7 +936,7 @@ check "shared listener bound once" $?
 
 # --- bind conflict against the running server ---
 run_test "address in use"  1 stderr "cannot bind to 127.0.0.1:47080 (errno 98)" \
-    $BIN test/configs/dup-bind.json
+    $BIN --config test/configs/dup-bind.json
 
 # --- static file serving ---
 resp=$(curl -s --max-time 2 http://127.0.0.1:47080/hello.txt)
@@ -1606,7 +1606,7 @@ rm -f "$LOG" test/www/big.txt test/www/upload.bin test/www/upload2.bin test/www/
 # it: every byte rearms it, so a trickled request head keeps its slot forever.
 # limits.json sets a long idle timeout on purpose, so only the head deadline can
 # be what closes the trickling connection.
-$BIN test/configs/limits.json >/dev/null 2>&1 &
+$BIN --config test/configs/limits.json >/dev/null 2>&1 &
 limits_pid=$!
 sleep 0.5
 python3 test/limits_test.py 47470 >/dev/null 2>&1
@@ -1618,7 +1618,7 @@ wait $limits_pid 2>/dev/null
 # A client dribbling ClientHello bytes rearms only the per-op idle timeout; the
 # head deadline (stamped at accept) must cut it, while a real handshake serves.
 if python3 -c 'import ssl' 2>/dev/null; then
-    $BIN test/configs/tls-slowhead.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-slowhead.json >/dev/null 2>&1 &
     slowhs_pid=$!
     sleep 0.5
     timeout 40 python3 test/tls/tls_slow_handshake.py test/tls/server.crt 47455 3 \
@@ -1633,7 +1633,7 @@ fi
 # must complete it, refuse new connections meanwhile, and exit after.
 python3 -c "open('test/www/drain.bin','w').write('D' * 3000000)"
 rm -f "$LOG"
-$BIN test/configs/listen.json >/dev/null 2>&1 &
+$BIN --config test/configs/listen.json >/dev/null 2>&1 &
 drain_master=$!
 sleep 0.3
 curl -s --max-time 30 --limit-rate 500k http://127.0.0.1:47080/drain.bin -o /tmp/drain_out &
@@ -1661,7 +1661,7 @@ rm -f /tmp/drain_out test/www/drain.bin "$LOG"
 # Before, every accept landed on one worker's ring and multi-core TCP
 # scaling was theoretical. 24 held connections must reach BOTH workers.
 rm -f "$LOG"
-$BIN test/configs/listen.json >/dev/null 2>&1 &
+$BIN --config test/configs/listen.json >/dev/null 2>&1 &
 spread_master=$!
 sleep 0.3
 spread_workers=$(pgrep -P $spread_master | sort | tr '\n' ' ')
@@ -1691,11 +1691,45 @@ kill $spread_master 2>/dev/null
 wait $spread_master 2>/dev/null
 
 # --- config-check mode: `linnea -t` accepts good, rejects bad ---
-$BIN -t test/configs/listen.json >/dev/null 2>&1
+$BIN --test --config test/configs/listen.json >/dev/null 2>&1
 check "config check accepts a good config" $?
-$BIN -t test/configs/bad-timeout.json >/dev/null 2>&1
+$BIN --test --config test/configs/bad-timeout.json >/dev/null 2>&1
 [ $? -ne 0 ]
 check "config check rejects a bad config" $?
+
+# --- the command line (Q150) -------------------------------------------
+# The configuration is named by -c/--config and nothing else. A bare path used
+# to work and no longer does, which is a deliberate withdrawal: one way of
+# naming the config is less to explain than two. It also means a hot upgrade
+# from a master that predates these flags is REFUSED (it re-execs its
+# replacement with a bare path), so that generation deploys by restart.
+for form in "--test --config test/configs/listen.json" \
+            "-t -c test/configs/listen.json" \
+            "--config=test/configs/listen.json --test" \
+            "--config test/configs/listen.json -t"; do
+    $BIN $form >/dev/null 2>&1
+    check "cli: '$form' checks the config" $?
+done
+# --help goes to stdout and exits 0; a usage error goes to stderr and exits 1
+out=$($BIN --help 2>/dev/null); rc=$?
+[ $rc -eq 0 ] && printf '%s' "$out" | grep -q -- "--bpf-probe"
+check "cli: --help prints the options to stdout, exit 0" $?
+$BIN -h >/dev/null 2>&1
+check "cli: -h is the same as --help" $?
+for bad in "--bogus x" "-x x" "--config" "-c" "--config=" "-" \
+           "test/configs/listen.json" \
+           "-t test/configs/listen.json" \
+           "--config test/configs/listen.json test/configs/listen.json" \
+           "-c test/configs/listen.json --config test/configs/listen.json"; do
+    $BIN $bad >/dev/null 2>&1
+    [ $? -eq 1 ]
+    check "cli: '$bad' is a usage error" $?
+done
+$BIN 2>&1 >/dev/null | grep -q "usage: linnea"
+check "cli: no arguments prints usage on stderr" $?
+timeout 0.5 $BIN --config test/configs/listen.json >/dev/null 2>&1
+[ $? -eq 124 ]
+check "cli: --config starts the server" $?
 
 # --- stop is prompt: an idle keep-alive connection must not hold it ---
 # SIGTERM closes connections that are merely parked, so a stop takes about
@@ -1703,7 +1737,7 @@ check "config check rejects a bad config" $?
 # is the patient drain used for the hot upgrade, where the new generation
 # is already serving; it leaves those connections alone.
 rm -f "$LOG"
-$BIN test/configs/listen.json >/dev/null 2>&1 &
+$BIN --config test/configs/listen.json >/dev/null 2>&1 &
 stop_master=$!
 sleep 0.3
 stop_workers=$(pgrep -P $stop_master | tr '\n' ' ')
@@ -1732,7 +1766,7 @@ wait $stop_master 2>/dev/null
 # they must be told to reopen it: without that they keep filling the renamed
 # inode and the fresh file stays empty.
 rm -f "$LOG" "$LOG.rot"
-$BIN test/configs/listen.json >/dev/null 2>&1 &
+$BIN --config test/configs/listen.json >/dev/null 2>&1 &
 rot_master=$!
 sleep 0.3
 curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null
@@ -1763,7 +1797,7 @@ rm -f "$LOG.rot"
 # the signal lands must finish, and no new request may be refused.
 rm -f "$LOG"
 python3 -c "open('test/www/up.bin','w').write('U' * 3000000)"
-$BIN test/configs/listen.json >/dev/null 2>&1 &
+$BIN --config test/configs/listen.json >/dev/null 2>&1 &
 up_master=$!
 sleep 0.3
 old_workers=$(pgrep -P $up_master | tr '\n' ' ')
@@ -1920,7 +1954,7 @@ else
     python3 -c "open('test/www/big.txt','w').write('B'*100000)"
     python3 test/proxy_backend.py >/dev/null 2>&1 &
     tls_backend_pid=$!
-    $BIN test/configs/tls.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls.json >/dev/null 2>&1 &
     tls_server_pid=$!
     sleep 0.3
     CA=test/tls/server.crt
@@ -2207,7 +2241,7 @@ rm -f /tmp/upload3_echo.bin
 
     # HTTP/2 connection bring-up: a separate http2:1 server. ALPN selects
     # h2; preface + SETTINGS + PING exchange; a request draws GOAWAY.
-    $BIN test/configs/tls-h2.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-h2.json >/dev/null 2>&1 &
     h2_pid=$!
     sleep 0.3
     timeout 10 python3 test/tls/h2_bringup.py $CA 47446 >/dev/null 2>&1
@@ -2565,7 +2599,7 @@ PYEOF
     # a trickler about head_timeout after its last honest burst: h1 closes,
     # h2 fails the stream 408 and the connection and slot live on. A
     # full-speed upload must be untouched. Own server: head_timeout=3.
-    $BIN test/configs/tls-slowbody.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-slowbody.json >/dev/null 2>&1 &
     slowbody_pid=$!
     sleep 0.3
     timeout 60 python3 test/tls/slow_body.py $CA 47457 >/dev/null 2>&1
@@ -2579,7 +2613,7 @@ PYEOF
     rm -f "$LOG" test/www/big.txt
 
     # --- SNI: two TLS vhosts share 127.0.0.1:47444, each with its own cert
-    $BIN test/configs/tls-sni.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-sni.json >/dev/null 2>&1 &
     sni_server_pid=$!
     sleep 0.3
     subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 \
@@ -2634,7 +2668,7 @@ PYEOF
     # worker-PID check is not ceremony: the first version of this crashed the
     # worker (the 421 path skipped the vhost the response builder reads), and
     # a crash looks exactly like a closed connection from the client side.
-    $BIN test/configs/tls-coalesce.json >/dev/null 2>&1 &
+    $BIN --config test/configs/tls-coalesce.json >/dev/null 2>&1 &
     coal_h2_pid=$!
     sleep 0.4
     md_before=$(workers_of $sni_server_pid)
@@ -2661,7 +2695,7 @@ PYEOF
     # h3 connection serves both (what a browser coalesces). Own server: the
     # two vhosts differ from the SNI pair in using the same cert.
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
-        $BIN test/configs/tls-coalesce.json >/dev/null 2>&1 &
+        $BIN --config test/configs/tls-coalesce.json >/dev/null 2>&1 &
         coal_pid=$!
         sleep 0.4
         timeout 60 python3 test/quic/h3_coalesce_test.py 47459 >/dev/null 2>&1
@@ -2694,7 +2728,7 @@ EOF
 # The startup check now makes an EMFILE from the *configured* pool impossible,
 # so squeeze the running worker instead — which is the case that remains real:
 # a system-wide ENFILE, or an operator lowering the limit under a live process.
-$BIN $emf >test/emfile.err 2>&1 &
+$BIN --config $emf >test/emfile.err 2>&1 &
 emf_pid=$!
 sleep 0.6
 emf_w=$(workers_of $emf_pid | awk '{print $1}')
