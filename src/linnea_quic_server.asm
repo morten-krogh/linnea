@@ -115,6 +115,7 @@ extern linnea_quic_build_ack
 extern linnea_quic_ack_ranges
 extern linnea_quic_rtx_record
 extern linnea_quic_rtx_ack_range
+extern linnea_quic_txchunk_room
 extern linnea_quic_txchunk_record
 extern linnea_quic_txchunk_ack
 extern linnea_quic_txchunk_clear
@@ -3494,8 +3495,15 @@ tx_pump:
     ja .tp_ret
     mov [s_tp_off], rax               ; hold offset and length across the emit call
     mov [s_tp_len], r13
+    ; and a slot to track it in: sending a chunk we cannot record would leave it
+    ; outside both the in-flight total and the loss timer, so if it were lost the
+    ; stream would stop there with the peer waiting on a gap nothing refills
+    mov rdi, rbx                      ; conn
+    call linnea_quic_txchunk_room
+    test rax, rax
+    jz .tp_ret                        ; table full: send no more until acks free slots
     mov rdi, rbp                      ; stream ctx
-    mov rsi, rax                      ; stream offset
+    mov rsi, [s_tp_off]               ; stream offset
     mov rdx, r13                      ; chunk length
     call tx_emit_chunk                ; rax = the packet number it went out under
     mov [s_txc_pn], rax

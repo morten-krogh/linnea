@@ -17,6 +17,7 @@ default rel
 global linnea_quic_rtx_record
 global linnea_quic_rtx_ack_range
 global linnea_quic_rtx_inflight
+global linnea_quic_txchunk_room
 global linnea_quic_txchunk_record
 global linnea_quic_txchunk_ack
 global linnea_quic_txchunk_clear
@@ -30,10 +31,33 @@ section .text
 ; to size for a real congestion window (hundreds of packets). bytes_in_flight is
 ; maintained here so the pump can gate on cwnd without scanning.
 
+; linnea_quic_txchunk_room(rdi = conn) -> rax = 1 when a slot is free, else 0.
+; The pump asks this BEFORE it sends: a chunk that goes out but finds no slot is
+; untracked, so it is never retransmitted when lost and never counted against
+; bytes_in_flight. The congestion window alone does not bound the slot count —
+; cwnd tops out at SLOTS * TX_CHUNK, but a chunk may be far smaller than
+; TX_CHUNK (a stream's tail, or all its flow-control room), so many short chunks
+; exhaust the table with the window barely touched.
+linnea_quic_txchunk_room:
+    lea rax, [rdi + linnea_quic_conn.tx_infl]
+    mov ecx, LINNEA_QUIC_TXINFL_SLOTS
+.tr_scan:
+    cmp qword [rax + linnea_quic_txchunk.in_use], 0
+    je .tr_free
+    add rax, linnea_quic_txchunk_size
+    dec ecx
+    jnz .tr_scan
+    xor eax, eax
+    ret
+.tr_free:
+    mov eax, 1
+    ret
+
 ; linnea_quic_txchunk_record(rdi=conn, rsi=pn, rdx=offset, rcx=len, r8=now ms,
-;   r9=stream index) -> rax = 1 recorded, 0 = table full (the pump checks room
-;   before sending). len is added to both the connection-wide in-flight total and
-;   the recording stream's own counter, so each stream knows when it is drained.
+;   r9=stream index) -> rax = 1 recorded, 0 = table full (the pump has already
+;   checked room with linnea_quic_txchunk_room). len is added to both the
+;   connection-wide in-flight total and the recording stream's own counter, so
+;   each stream knows when it is drained.
 linnea_quic_txchunk_record:
     lea rax, [rdi + linnea_quic_conn.tx_infl]
     mov r10d, LINNEA_QUIC_TXINFL_SLOTS
