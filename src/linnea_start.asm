@@ -141,7 +141,13 @@ exec_argv:      resq 4
 exec_envp:      resq 2
 chk_argv:       resq 4
 chk_envp:       resq 2
-env_buf:        resb 4096                ; "LINNEA_UPGRADE=fds;pids"
+; "LINNEA_UPGRADE=fds;pids". Sized against what build_upgrade_env can actually
+; write, in BYTES rather than entries: up to 512 listener fds (the cap it
+; enforces) at ":" + 10 digits, 256 worker pids (LINNEA_MAX_WORKERS) at ":" + 20,
+; plus the prefix, the worker count and the bpf tail — about 11.5 KB. At 4096 a
+; plausible config (256 workers over 2 servers, 4-digit fds, 7-digit pids) ran
+; several hundred bytes past the end.
+env_buf:        resb 16384
 time_scratch:   resq 2
 affinity_mask:  resb 128
 fd_rlimit:      resq 2         ; struct rlimit64 {cur, max} for RLIMIT_NOFILE
