@@ -4,7 +4,7 @@
 # error of type H3_MISSING_SETTINGS. linnea now reads the client's control stream
 # and enforces this. We check both outcomes: a control stream that opens with
 # SETTINGS is accepted and the request is served, and one whose first frame is
-# something else ends the connection with H3_MISSING_SETTINGS (0x105).
+# something else ends the connection with H3_MISSING_SETTINGS (0x10a).
 # Usage: h3_settings_test.py <port>
 import socket
 import ssl
@@ -111,8 +111,8 @@ except socket.timeout:
 s.close()
 term = conn._close_event
 assert term is not None, "server did not close the connection"
-assert isinstance(term, ConnectionTerminated) and term.error_code == 0x105, \
-    f"{term!r} (want H3_MISSING_SETTINGS 0x105)"
+assert isinstance(term, ConnectionTerminated) and term.error_code == 0x10a, \
+    f"{term!r} (want H3_MISSING_SETTINGS 0x10a)"
 
 # --- invalid: closing the control stream is H3_CLOSED_CRITICAL_STREAM ---
 # The frame is a valid control stream (SETTINGS first) but carries FIN, which

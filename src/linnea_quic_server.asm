@@ -1921,6 +1921,8 @@ linnea_quic_server_datagram:
     je .req_toolarge
     cmp rax, -LINNEA_H3_ERR_QPACK
     je .req_qpack_bad
+    cmp rax, -LINNEA_H3_ERR_UNEXPECTED
+    je .req_frame_unexpected
     ; Anything else is a malformed request: a truncated frame, or no HEADERS at
     ; all. Both entries to .serve_bidi require the FIN, so the stream is whole
     ; and nothing more is coming — dropping it here left the client waiting on
@@ -1933,6 +1935,10 @@ linnea_quic_server_datagram:
     jmp .stream_scan
 .req_qpack_bad:
     mov edi, LINNEA_H3_ERR_QPACK_DECOMP
+    jmp .h3_close
+.req_frame_unexpected:
+    ; a frame illegal on a request stream — a connection error, not a stream one
+    mov edi, LINNEA_H3_ERR_FRAME_UNEXPECTED
     jmp .h3_close
 .misdirected:
     ; the access line names the vhost that DID answer — this connection's own,

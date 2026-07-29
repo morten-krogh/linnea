@@ -294,7 +294,7 @@ fi
 # DATA/unknown frames, and QPACK-decodes the HEADERS frame to the request.
 if python3 -c 'import pylsqpack' 2>/dev/null && [ -x ./bin/linnea-h3test ]; then
     python3 test/quic/h3_test.py >/dev/null 2>&1
-    check "h3: request HEADERS frame parsed and decoded (skips DATA/unknown)" $?
+    check "h3: request HEADERS frame parsed and decoded (skips GREASE/unknown)" $?
 else
     check "h3 framing test (skipped: pylsqpack/binary unavailable)" 0
 fi

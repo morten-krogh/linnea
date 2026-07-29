@@ -22,9 +22,10 @@ LINNEA_H3_STREAM_QPACK_DEC  equ 0x03
 ; HTTP/3 error codes (RFC 9114 8.1), sent in an application CONNECTION_CLOSE
 ; when a peer breaks a control-stream rule.
 LINNEA_H3_ERR_NO_ERROR         equ 0x0100  ; orderly close (the drain's goodbye)
-LINNEA_H3_ERR_MISSING_SETTINGS equ 0x0105  ; control stream opened without SETTINGS
 LINNEA_H3_ERR_STREAM_CREATION  equ 0x0103  ; a second control stream
 LINNEA_H3_ERR_CLOSED_CRITICAL  equ 0x0104  ; a critical stream (control/QPACK) closed
+LINNEA_H3_ERR_FRAME_UNEXPECTED equ 0x0105  ; a frame illegal in the stream it arrived on
+LINNEA_H3_ERR_MISSING_SETTINGS equ 0x010a  ; control stream opened without SETTINGS
 LINNEA_H3_ERR_QPACK_DECOMP     equ 0x0200  ; QPACK could not decode a field section
 
 ; linnea_h3_read_headers(rdi=stream ptr, rsi=stream len, rdx=req *linnea_h2_req)
@@ -46,6 +47,10 @@ LINNEA_H3_ERR_QPACK    equ 3
 ; reported as a decompression failure: RFC 9114 4.2.2 wants a 431 or a stream
 ; reset, and killing the connection would take every other request with it.
 LINNEA_H3_ERR_TOOLARGE equ 4
+; A frame that must not appear on a request stream (RFC 9114 7.2): the reserved
+; HTTP/2 types, or a control/push frame. Unlike the malformed-request sentinels
+; above, this ends the CONNECTION with H3_FRAME_UNEXPECTED, not the stream.
+LINNEA_H3_ERR_UNEXPECTED equ 5
 
 ; Largest POST body echoed back inline; a larger one (whose echo would not fit
 ; one response packet) gets a small receipt — its length and a hash — instead.

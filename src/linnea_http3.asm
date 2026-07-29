@@ -139,7 +139,18 @@ linnea_h3_read_headers:
     je .headers
     cmp rbx, LINNEA_H3_FRAME_DATA
     je .data
-    add r12, rax                     ; skip any other frame's payload
+    ; Neither HEADERS nor DATA. A request stream carries only those two; the
+    ; reserved HTTP/2 types (0x02/0x06/0x08/0x09, RFC 9114 7.2.8) and the
+    ; control/push frames — CANCEL_PUSH/SETTINGS/PUSH_PROMISE/GOAWAY (0x03..0x07)
+    ; and MAX_PUSH_ID (0x0d) — are a connection error H3_FRAME_UNEXPECTED here.
+    ; GREASE (0x1f*N+0x21) and any other unknown type MUST be ignored (7.2, 9).
+    cmp rbx, 0x0d
+    je .frame_unexpected
+    mov rcx, rbx
+    sub rcx, 2
+    cmp rcx, 7                        ; original type in 0x02..0x09
+    jbe .frame_unexpected
+    add r12, rax                     ; grease / unknown: skip its payload
     jmp .frame
 .headers:
     ; A HEADERS after the first is a trailer section (RFC 9114 4.1). We serve
@@ -182,7 +193,7 @@ linnea_h3_read_headers:
 .data:
     ; capture the first DATA frame after HEADERS as the request body
     test r15d, r15d
-    jz .data_skip                    ; DATA before HEADERS: not a body, skip it
+    jz .frame_unexpected             ; DATA before HEADERS (RFC 9114 4.1)
     cmp qword [rsp], 0
     jne .data_skip                   ; a body is already captured
     mov [rsp], r12                   ; body ptr
@@ -193,6 +204,9 @@ linnea_h3_read_headers:
 .trailer_skip:                       ; a dead-end reached only by the jump in
     add r12, rax                     ; .headers: advance past the trailer's
     jmp .frame                       ; field section without decoding it
+.frame_unexpected:                   ; a dead-end reached only by explicit jumps
+    mov rax, -LINNEA_H3_ERR_UNEXPECTED
+    jmp .ret
 .done:
     test r15d, r15d
     jz .noheaders
