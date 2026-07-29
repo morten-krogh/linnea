@@ -25,22 +25,43 @@ def headers_frame(headers):
     return vlq(0x01) + vlq(len(fields)) + fields
 
 
+def data_frame(body):
+    return vlq(0x00) + vlq(len(body)) + body
+
+
 REQ = [(b":method", b"GET"), (b":path", b"/hello.txt"), (b":scheme", b"https"),
        (b":authority", b"linnea.amberbio.com"), (b"accept", b"*/*")]
 WANT = ["GET", "/hello.txt", "https", "linnea.amberbio.com"]
 
 hf = headers_frame(REQ)
+# The body is the concatenation of every DATA frame's payload (RFC 9114 4.1),
+# however the encoder chose to split it — the last line of the harness's output
+# is the body linnea recovered.
+big = bytes((i * 7 + 3) % 26 + 97 for i in range(900))
 CASES = [
-    ("plain", hf),
+    ("plain", hf, WANT + [""]),
     # an unknown (grease) frame type before HEADERS must be skipped
-    ("skip-unknown", vlq(0x21) + vlq(3) + b"\x00\x00\x00" + hf),
+    ("skip-unknown", vlq(0x21) + vlq(3) + b"\x00\x00\x00" + hf, WANT + [""]),
+    ("one-data", hf + data_frame(b"ABCDEFGH"), WANT + ["ABCDEFGH"]),
+    ("split-data", hf + data_frame(b"ABCD") + data_frame(b"EFGH"),
+     WANT + ["ABCDEFGH"]),
+    # three frames, the middle one empty, and a trailing grease frame between two
+    # of them: the payloads still join in order and nothing else leaks in
+    ("split-data-gaps",
+     hf + data_frame(b"AB") + data_frame(b"") + vlq(0x21) + vlq(2) + b"xx"
+        + data_frame(b"CD") + data_frame(b"EF"),
+     WANT + ["ABCDEF"]),
+    # a split whose pieces are long enough that the moves overlap heavily
+    ("split-data-big",
+     hf + b"".join(data_frame(big[i:i + 100]) for i in range(0, len(big), 100)),
+     WANT + [big.decode()]),
 ]
 
 fails = 0
-for label, stream in CASES:
+for label, stream, want in CASES:
     r = subprocess.run(["./bin/linnea-h3test"], input=stream, capture_output=True)
     got = r.stdout.decode().splitlines()
-    if r.returncode != 0 or got != WANT:
+    if r.returncode != 0 or got != want:
         fails += 1
         print(f"FAIL {label}: rc={r.returncode} got={got}", file=sys.stderr)
 

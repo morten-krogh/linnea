@@ -60,15 +60,20 @@ while conn.next_event() is not None:
 clock = [0.4]   # a monotonic clock shared across requests, for aioquic's pacer
 
 
-def post_echo(body):
+def post_echo(body, chunk=0):
     enc = pylsqpack.Encoder()
     enc.apply_settings(max_table_capacity=0, blocked_streams=0)
     _, fields = enc.encode(0, [(b":method", b"POST"), (b":path", b"/submit"),
                                (b":scheme", b"https"), (b":authority", b"h3.test")])
-    # a HEADERS frame followed by a DATA frame carrying the body; a large body's
-    # DATA frame is split by QUIC across several packets, which the server must
-    # reassemble in offset order before it can decode the request.
-    stream = vlq(1) + vlq(len(fields)) + fields + vlq(0) + vlq(len(body)) + body
+    # a HEADERS frame followed by the DATA frames carrying the body; a large
+    # body's DATA frame is split by QUIC across several packets, which the server
+    # must reassemble in offset order before it can decode the request. With
+    # chunk set, the body is split across that many DATA frames instead of one —
+    # the server must join their payloads back into a single body.
+    pieces = [body] if not chunk else [body[i:i + chunk]
+                                       for i in range(0, len(body), chunk)]
+    data = b"".join(vlq(0) + vlq(len(p)) + p for p in pieces)
+    stream = vlq(1) + vlq(len(fields)) + fields + data
     bidi = conn.get_next_available_stream_id()
     conn.send_stream_data(bidi, stream, end_stream=True)
     # aioquic paces sending, so a single flush releases only part of a large
@@ -121,5 +126,16 @@ for byte in big:
 hd, data = post_echo(big)
 assert hd.get(b":status") == b"200", hd
 assert data == f"{len(big)} {h}".encode(), f"receipt {data!r}, want {len(big)} {h}"
+
+# the same body split across many DATA frames must echo the same receipt: the
+# body is the concatenation of the frames' payloads, not just the first one
+hd, data = post_echo(big, chunk=64)
+assert hd.get(b":status") == b"200", hd
+assert data == f"{len(big)} {h}".encode(), f"split receipt {data!r}, want {len(big)} {h}"
+
+# a small split body echoes back whole, byte for byte
+hd, data = post_echo(b"linnea joins split data frames", chunk=7)
+assert hd.get(b":status") == b"200", hd
+assert data == b"linnea joins split data frames", data
 s.close()
 print("ok")

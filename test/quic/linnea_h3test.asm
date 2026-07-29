@@ -1,8 +1,9 @@
 ; linnea_h3test.asm — test-only: read HTTP/3 request-stream bytes on stdin,
 ; parse the frame layer with linnea_h3_read_headers (which QPACK-decodes the
-; HEADERS frame), and print the recovered pseudo-headers. Exits non-zero on a
-; parse/decode error. Driven by h3_test.py, which frames a HEADERS frame around
-; a pylsqpack field section (plus a leading DATA/unknown frame to be skipped).
+; HEADERS frame), and print the recovered pseudo-headers followed by the request
+; body. Exits non-zero on a parse/decode error. Driven by h3_test.py, which
+; frames a HEADERS frame around a pylsqpack field section (plus a leading
+; DATA/unknown frame to be skipped, or DATA frames whose bodies must join).
 
 %include "linnea_syscall.inc"
 %include "linnea_hpack.inc"
@@ -14,6 +15,7 @@ section .bss
 inbuf:    resb 8192
 scratch:  resb 8192
 req:      resb linnea_h2_req_size
+nl:       resb 1
 
 section .text
 _start:
@@ -39,6 +41,8 @@ _start:
     call linnea_h3_read_headers
     test rax, rax
     jnz .fail
+    mov r13, r8                      ; the request body, printed last
+    mov r14, r9
     mov rdi, [req + linnea_h2_req.method_ptr]
     mov rsi, [req + linnea_h2_req.method_len]
     call .putline
@@ -50,6 +54,9 @@ _start:
     call .putline
     mov rdi, [req + linnea_h2_req.auth_ptr]
     mov rsi, [req + linnea_h2_req.auth_len]
+    call .putline
+    mov rdi, r13                     ; body bytes as one line (empty if none)
+    mov rsi, r14
     call .putline
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
@@ -65,10 +72,10 @@ _start:
     mov edi, 1
     syscall
 .nl:
-    mov byte [inbuf + 8100], 10
+    mov byte [nl], 10
     mov eax, LINNEA_SYS_WRITE
     mov edi, 1
-    lea rsi, [inbuf + 8100]
+    lea rsi, [nl]
     mov edx, 1
     syscall
     pop rsi

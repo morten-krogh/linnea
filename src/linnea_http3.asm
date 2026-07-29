@@ -92,10 +92,12 @@ section .text
 ;   -> rax = 0 | -err, and on success r8 = request-body ptr, r9 = body length
 ;   (0 if none). Each frame is varint(type) varint(length) payload. Decode the
 ;   first HEADERS frame's field section into req via QPACK, and capture the first
-;   DATA frame after it as the body (r8/r9 point into the stream — the body is
-;   not copied). DATA before HEADERS, and any other frame type, are skipped. Only
-;   a single DATA frame within these stream bytes is captured: a body split
-;   across DATA frames or QUIC packets is not reassembled.
+;   DATA frames after it as the body. r8 points into the stream: the first DATA
+;   payload stays where it is and any later one is moved down onto the end of it,
+;   so the body reads as one run without a copy elsewhere. DATA before HEADERS is
+;   a connection error; unknown frame types are skipped. The QUIC layer hands us
+;   a stream that is already whole (it only serves on the FIN), so these bytes
+;   hold the entire request.
 ; Body ptr/len live in stack locals [rsp]/[rsp+8] during the walk (all callee-
 ; saved registers are already in use) and move to r8/r9 at return.
 linnea_h3_read_headers:
@@ -191,15 +193,32 @@ linnea_h3_read_headers:
     add r12, rbp                     ; past the field section
     jmp .frame
 .data:
-    ; capture the first DATA frame after HEADERS as the request body
+    ; the DATA frames after HEADERS carry the request body, which is the
+    ; concatenation of their payloads (RFC 9114 4.1) — an encoder may split one
+    ; body across any number of them
     test r15d, r15d
     jz .frame_unexpected             ; DATA before HEADERS (RFC 9114 4.1)
     cmp qword [rsp], 0
-    jne .data_skip                   ; a body is already captured
+    jne .data_join                   ; a body is already started: append to it
     mov [rsp], r12                   ; body ptr
     mov [rsp + 8], rax               ; body len
-.data_skip:
     add r12, rax
+    jmp .frame
+.data_join:
+    ; The payloads are already contiguous but for the frame headers between them,
+    ; so squeeze this one down onto the end of the body in place rather than
+    ; copying the body elsewhere. The destination is the body's end, which is
+    ; below this payload by at least the two bytes of its own frame header, so a
+    ; forward copy is safe on the overlap. It also stays within this frame: the
+    ; last byte written is at most the payload's own last byte, so the frames
+    ; still to be walked are untouched.
+    mov rdi, [rsp]
+    add rdi, [rsp + 8]               ; dst = end of the body so far
+    mov rsi, r12                     ; src = this payload
+    mov rcx, rax
+    add [rsp + 8], rax               ; the body grows by this payload
+    add r12, rax                     ; cursor past it, in the original layout
+    rep movsb
     jmp .frame
 .trailer_skip:                       ; a dead-end reached only by the jump in
     add r12, rax                     ; .headers: advance past the trailer's
