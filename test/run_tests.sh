@@ -1319,6 +1319,26 @@ check_http "target: OPTIONS * with two Hosts is 400" "400 Bad Request" "$resp"
 resp=$(raw_http 'OPTIONS * HTTP/1.1\r\nHost: one.test\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n')
 check_http "target: OPTIONS * with a chunked body is 501" "501 Not Implemented" "$resp"
 
+# --- the method is a token (RFC 9110 9.1). The request-line parse only bounded
+# it to printable ASCII, so every delimiter got through — including the double
+# quote, which the access line writes the method inside, splitting its own
+# quoted field. An unknown but well-formed method still reaches the 405.
+resp=$(raw_http 'PROPFIND /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "method: an unknown token method is 405, not 400" "405 Method Not Allowed" "$resp"
+resp=$(raw_http '!#$%&\x27*+-.^_`|~ /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "method: every tchar punctuation is still a method" "405 Method Not Allowed" "$resp"
+resp=$(raw_http 'GE"T /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "method: a double quote is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'GE/T /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "method: a delimiter is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'GE\x1bT /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "method: a control byte is 400" "400 Bad Request" "$resp"
+# None of those reached the access log, which is what the quote could break.
+# Matched through cat -v so the ESC shows as ^[, and with -F so the quote and
+# the brackets are literal — "GE alone would match every ordinary GET line.
+! cat -v "$LOG" | grep -qF -e '"GE"T' -e '"GE/T' -e '"GE^[T'
+check "method: no malformed method reaches the access log" $?
+
 # --- Host header rules (Q123, RFC 9112 3.2): every request we accept is
 # HTTP/1.1, so exactly one Host field line is mandatory and its value must
 # look like an authority. A missing or repeated Host used to be served

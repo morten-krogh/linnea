@@ -40,7 +40,7 @@ def probe(name, fields):
             if t==3 and sid==1: verdict="RST_STREAM(err=%d)"%int.from_bytes(p[:4],"big"); break
             if t==7: verdict="GOAWAY (connection error)"; break
             if t==1 and sid==1:
-                for c in (b"200",b"400",b"404",b"421",b"431"): 
+                for c in (b"200",b"400",b"404",b"405",b"421",b"431"):
                     if c in p: verdict="served %s"%c.decode(); break
                 if verdict: break
     except Exception as e:
@@ -82,13 +82,28 @@ CASES = [
     # is just a field value, so an ESC used to reach the access log
     ("control byte in :path", M+S+A+h(b":path",b"/hello\x1b.txt"), "RST"),
     ("space in :path", M+S+A+h(b":path",b"/hello .txt"), "RST"),
+    # :method is a token (RFC 9110 9.1) and was never checked at all. A field
+    # value only has CR/LF/NUL refused, so a control byte rode into the access
+    # log where h1's request line would have refused it — and a double quote,
+    # which is a delimiter and so never legal, split the quoting of the very
+    # log line the method is written into.
+    ("control byte in :method", S+A+P+h(b":method",b"GE\x1bT"), "RST"),
+    ("double quote in :method", S+A+P+h(b":method",b'GE"T'), "RST"),
+    ("delimiter in :method", S+A+P+h(b":method",b"GE/T"), "RST"),
+    ("empty :method", S+A+P+h(b":method",b""), "RST"),
+    # an unknown but well-formed token is NOT malformed — it is a 405
+    ("unknown token method served 405", S+A+P+h(b":method",b"PROPFIND"), "405"),
+    ("tchar punctuation is a method",
+     S+A+P+h(b":method",b"!#$%&'*+-.^_`|~"), "405"),
 ]
 
 fails=0
 for name, fields, want in CASES:
     verdict, alive = probe(name, fields)
-    ok = (verdict == "served 200") if want == "200" else \
-         (verdict is not None and verdict.startswith("RST") and alive == "yes")
+    if want == "RST":
+        ok = verdict is not None and verdict.startswith("RST") and alive == "yes"
+    else:
+        ok = verdict == "served " + want
     print(f"{'ok  ' if ok else 'FAIL'} {name}: {verdict} (alive={alive}), want {want}")
     fails += not ok
 if fails:

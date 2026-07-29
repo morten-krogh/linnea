@@ -100,6 +100,7 @@ extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_from_hex_u64
 extern linnea_string_equal
+extern linnea_string_is_token
 extern linnea_string_iequal
 extern linnea_time_http_date
 extern linnea_time_parse_http_date
@@ -566,6 +567,15 @@ linnea_http_handle:
     jz .resp_400
     cmp r15, LINNEA_HTTP_MAX_METHOD
     ja .resp_400
+    ; The loop above only bounded the method to printable ASCII, which admits
+    ; every delimiter — so a method could carry a double quote, and the access
+    ; line writes the method inside quotes, splitting its own field. A method is
+    ; a token (RFC 9110 9.1), so hold it to one.
+    mov rdi, r14               ; the method bytes, at in_buf[0]
+    mov rsi, r15
+    call linnea_string_is_token
+    test eax, eax
+    jz .resp_400
     mov [rsp + 104], r15       ; method = in_buf[0 .. len)
     ; GET, HEAD, or 405 (checked after the head parses cleanly)
     mov qword [rsp], -1

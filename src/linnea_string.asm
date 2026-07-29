@@ -8,8 +8,49 @@ global linnea_string_iequal
 global linnea_string_copy
 global linnea_string_from_u64
 global linnea_string_from_hex_u64
+global linnea_string_is_token
+
+section .rodata
+
+; RFC 9110 5.6.2 tchar, as a 256-bit set: bit (c & 7) of byte (c >> 3) is set
+; when c may appear in a token. Everything else is out — the control bytes and
+; DEL, SP, the high half, and the delimiters "(),/:;<=>?@[\]{} and the quote.
+; A bitmap rather than a chain of range compares because the excluded set is
+; scattered through the printable range; getting that wrong by hand is how a
+; delimiter slips through.
+tchar_map:      db 0x00, 0x00, 0x00, 0x00, 0xfa, 0x6c, 0xff, 0x03   ; 0x00-0x3f
+                db 0xfe, 0xff, 0xff, 0xc7, 0xff, 0xff, 0xff, 0x57   ; 0x40-0x7f
+                db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   ; 0x80-0xbf
+                db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   ; 0xc0-0xff
 
 section .text
+
+; linnea_string_is_token(rdi = ptr, rsi = len) -> rax = 1 when those bytes are a
+; non-empty RFC 9110 5.6.2 token, else 0. Touches only caller-saved registers.
+;
+; A method is a token, and nothing checked that. The access log writes the method
+; verbatim inside quotes, so a method carrying a double quote — a delimiter, so
+; never legal — split the log line's own quoting, and an ESC or backspace rode
+; into the log on h2/h3 where the h1 request-line parse would have refused it.
+linnea_string_is_token:
+    test rsi, rsi
+    jz .nt_no                        ; a token is at least one character
+.nt_next:
+    movzx eax, byte [rdi]
+    mov ecx, eax
+    shr ecx, 3                       ; which byte of the set
+    and eax, 7                       ; which bit within it
+    movzx edx, byte [tchar_map + rcx]
+    bt edx, eax
+    jnc .nt_no
+    inc rdi
+    dec rsi
+    jnz .nt_next
+    mov eax, 1
+    ret
+.nt_no:
+    xor eax, eax
+    ret
 
 ; linnea_string_length(rdi=cstr) -> rax=len
 linnea_string_length:

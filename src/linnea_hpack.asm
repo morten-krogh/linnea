@@ -27,6 +27,8 @@ global emit_field
 global linnea_hpack_req_check
 global hpack_dyn_reset
 
+extern linnea_string_is_token
+
 section .rodata
 pseudo_method:  db ":method"
 pseudo_path:    db ":path"
@@ -1087,6 +1089,20 @@ linnea_hpack_req_check:
     inc rsi
     dec rcx
     jnz .pv_scan
+.method_check:
+    ; :method is a token and must be present (RFC 9110 9.1, RFC 9113 8.3.1).
+    ; Nothing checked it: a field value only has CR/LF/NUL refused, so a method
+    ; could carry a control byte — which h1's request line cannot — or a double
+    ; quote, which breaks the quoting of the access line the method is written
+    ; into. The presence half also matters for HTTP/3, which had no check of its
+    ; own (HTTP/2 tests method_ptr separately after this returns).
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    test rdi, rdi
+    jz .bad
+    mov rsi, [rbx + linnea_h2_req.method_len]
+    call linnea_string_is_token       ; leaves rbx alone, and the single push at
+    test eax, eax                     ; entry is what keeps this call 16-aligned
+    jz .bad
 .ok:
     xor eax, eax
     pop rbx
