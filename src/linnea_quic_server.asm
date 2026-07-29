@@ -1528,6 +1528,17 @@ linnea_quic_server_datagram:
     call linnea_quic_ack_ranges      ; rax = pairs written into ack_ranges
     test rax, rax
     jz .acks_done
+    ; RFC 9000 13.1: a peer must not acknowledge a packet number we have not
+    ; sent. ack_ranges[8] is the largest acked; pn_1rtt is our NEXT number, so
+    ; a valid largest is strictly below it. Without this a peer that acks, say,
+    ; 2^62 makes tx_detect_loss below treat every in-flight chunk as lost and
+    ; resend the whole table on each such ACK — a bandwidth burn that a spoofed
+    ; source (the address is validated, but the ACK contents are the peer's)
+    ; could aim at a third party.
+    mov rcx, [cur_conn]
+    mov rcx, [rcx + linnea_quic_conn.pn_1rtt]
+    cmp [ack_ranges + 8], rcx
+    jae .ack_violation
     lea rbx, [ack_ranges]
     mov rbp, rax                     ; pair count
     mov qword [s_cc_acked], 0        ; response-stream bytes this ACK releases
@@ -1549,6 +1560,11 @@ linnea_quic_server_datagram:
     test rdi, rdi
     jz .ack_detect
     call cc_on_ack
+    jmp .ack_detect
+.ack_violation:
+    mov edi, 0x0a                    ; PROTOCOL_VIOLATION (RFC 9000 20.1)
+    mov esi, 0x02                    ; the ACK frame triggered it
+    jmp .transport_close
 .ack_detect:
     ; then presume-lost and retransmit anything left far behind the largest acked
     ; (RFC 9002 6.1.1) — prompt recovery instead of waiting out the PTO backoff.
