@@ -563,7 +563,7 @@ linnea_quic_server_datagram:
     mov r13, rdi                     ; datagram length
     mov [s_dgram_len], r13           ; ...also saved: reloaded in the 0-RTT walk
     mov r12d, ecx                    ; udp socket
-    ; record the sender: the pool allocator and .refresh_peer read it here
+    ; record the sender: the pool allocator and the 1-RTT migration path read it here
     cmp rdx, 28
     jbe .dg_plen
     mov edx, 28
@@ -610,8 +610,7 @@ linnea_quic_server_datagram:
     call linnea_quic_conn_lookup_odcid
     test rax, rax
     jz .demux_new
-    mov [cur_conn], rax
-    call .refresh_peer
+    mov [cur_conn], rax              ; the address is NOT adopted here: see .long_in
     jmp .long_in
 .demux_new:
     ; An unknown connection id with a long header. Check the version first: if it is
@@ -783,8 +782,19 @@ linnea_quic_server_datagram:
     call send_stateless_reset
     jmp .done
 .demux_found:
-    call .refresh_peer
+    mov [cur_conn], rax
 .long_in:
+    ; Long-header packets are the handshake flights, and none of them authenticates
+    ; its sender: Initial keys come from the connection id, which travels in the
+    ; clear, so anyone who has seen a packet of this handshake can forge one. So the
+    ; peer address is NOT adopted from a long-header packet — it stays the address
+    ; the connection was opened from (recorded by the allocator, and validated by
+    ; the Retry token when a Retry happened). Otherwise an attacker who had seen one
+    ; datagram could replay it from an address of their choosing and our whole
+    ; server flight would follow, both derailing the handshake and reflecting at
+    ; whatever the amplification budget allows. RFC 9000 9 forbids migrating before
+    ; the handshake is confirmed in any case; a real client stays put, and the
+    ; address moves only after a 1-RTT packet authenticates, at .oi_ok.
     ; select this connection's QUIC version for every key derivation below (Initial,
     ; Handshake, 0-RTT, 1-RTT): v2 uses a different salt and different labels.
     mov rax, [cur_conn]
@@ -2361,22 +2371,6 @@ linnea_quic_server_datagram:
     mov rdi, [cur_conn]
     call linnea_quic_conn_free
     jmp .done
-
-; .refresh_peer(rax = conn) — make it the current connection and record the
-; address this datagram came from, so replies follow a peer that has migrated.
-.refresh_peer:
-    mov [cur_conn], rax
-    mov rcx, [salen]
-    cmp rcx, 28
-    jbe .rp_len
-    mov ecx, 28
-.rp_len:
-    mov [rax + linnea_quic_conn.peer_len], rcx
-    lea rdi, [rax + linnea_quic_conn.peer]
-    lea rsi, [sa]
-    rep movsb
-    ret
-
 
 ; .ch_reassemble(rax = CRYPTO fragment ptr, rdx = length, r8 = offset,
 ;   r9 = Initial packet number) -> rax = 1 once the ClientHello is complete, else
