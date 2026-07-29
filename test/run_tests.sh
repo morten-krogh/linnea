@@ -708,6 +708,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     sleep 0.5
     timeout 60 python3 test/quic/h3_trailer_test.py 47453 >/dev/null 2>&1
     check "h3 (io_uring): trailers do not influence the response" $?
+    # Q136: frames illegal on a request stream (reserved h2 types, control/push
+    # frames, DATA before HEADERS) are a connection error H3_FRAME_UNEXPECTED,
+    # not silently ignored; GREASE/unknown stay ignored.
+    timeout 90 python3 test/quic/h3_frame_reject_test.py 47453 >/dev/null 2>&1
+    check "h3 (io_uring): illegal request-stream frames rejected (0x105)" $?
     kill $tr_master 2>/dev/null
     wait $tr_master 2>/dev/null
     for p in $(pgrep -f 'tls-h3-drain'); do kill -9 $p 2>/dev/null; done
