@@ -51,6 +51,7 @@ extern linnea_time_http_now
 extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_iequal
+extern linnea_string_equal
 extern linnea_memory_map
 extern linnea_log_stamp
 extern linnea_log_write
@@ -968,11 +969,14 @@ h2_serve:
     ; is_head = method == "HEAD". The GET/HEAD gate applies to static files
     ; alone and moves past the location match: a proxy location forwards any
     ; method to its upstream.
+    ; Compared case-SENSITIVELY: a method is case-sensitive (RFC 9110 9.1), and
+    ; iequal is for header names. h1 and h3 both match exactly, so a lowercase
+    ; "get" was a 405 there and a 200 here — h2 was the lenient odd one out.
     mov rdi, [r12 + linnea_h2_req.method_ptr]
     mov rsi, [r12 + linnea_h2_req.method_len]
     lea rdx, [method_head_h2]
     mov ecx, 4
-    call linnea_string_iequal
+    call linnea_string_equal
     mov [rsp + S_HEAD], rax
     mov rdi, rbx
     mov rsi, r12
@@ -1028,7 +1032,7 @@ h2_serve:
     mov rsi, [r12 + linnea_h2_req.method_len]
     lea rdx, [method_get_h2]
     mov ecx, 3
-    call linnea_string_iequal
+    call linnea_string_equal         ; case-sensitive: see the HEAD test above
     test rax, rax
     jz .resp_405
 .static_go:

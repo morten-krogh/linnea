@@ -57,6 +57,8 @@ body_404:      db "404 Not Found", 10
 body_404_len   equ $ - body_404
 body_400:      db "400 Bad Request", 10
 body_400_len   equ $ - body_400
+body_405:      db "405 Method Not Allowed", 10
+body_405_len   equ $ - body_405
 proto_h3: db "HTTP/3"
 proto_h3_len equ $ - proto_h3
 body_421: db "421 Misdirected Request", 10
@@ -496,6 +498,27 @@ linnea_h3_serve:
     call linnea_h3_build_response
     jmp .sret
 .not_post:
+    ; Static files answer GET and HEAD, exactly as the h1 and h2 static paths
+    ; do. Only POST (above) and those two ever meant anything here, but nothing
+    ; said so: every other method fell through and was served as if it were a
+    ; GET, so a PROPFIND, PUT or DELETE against a static file came back 200 with
+    ; the file's body while h1 and h2 both answered 405. The method is matched
+    ; exactly, not case-insensitively — RFC 9110 9.1 makes it case-sensitive,
+    ; and the POST and HEAD tests around it already compare exactly.
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    cmp qword [rbx + linnea_h2_req.method_len], 3
+    jne .method_head
+    cmp word [rdi], 'GE'
+    jne .resp_405
+    cmp byte [rdi + 2], 'T'
+    jne .resp_405
+    jmp .method_ok
+.method_head:
+    cmp qword [rbx + linnea_h2_req.method_len], 4
+    jne .resp_405
+    cmp dword [rdi], 0x44414548      ; "HEAD", little-endian
+    jne .resp_405
+.method_ok:
     ; path buffer = root ++ (decoded path)
     lea rdi, [h3_path_buf]
     mov rcx, rdx                     ; root length (rsi = root ptr)
@@ -770,6 +793,15 @@ linnea_h3_serve:
     mov ecx, txt_plain_len
     lea r8, [body_404]
     mov r9d, body_404_len
+    call linnea_h3_build_response
+    jmp .sret
+.resp_405:
+    mov rdi, r12
+    mov esi, 405
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_405]
+    mov r9d, body_405_len
     call linnea_h3_build_response
     jmp .sret
 .bad:

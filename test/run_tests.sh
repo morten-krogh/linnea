@@ -470,6 +470,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_priority_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): responses scheduled by RFC 9218 priority" $?
 
+    # static files answer GET and HEAD (and h3's own POST echo); every other
+    # method used to fall through and be SERVED AS A GET, body and all, where
+    # h1 and h2 both answer 405. The method is matched case-sensitively.
+    timeout 200 python3 test/quic/h3_method_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): unknown methods get 405, not the file" $?
+
     # and the client can change its mind afterwards: a PRIORITY_UPDATE on the
     # control stream reprioritises a response already streaming, and one that
     # overtakes the request it names is kept and applied when that stream opens
@@ -1333,6 +1339,9 @@ resp=$(raw_http 'GE/T /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "method: a delimiter is 400" "400 Bad Request" "$resp"
 resp=$(raw_http 'GE\x1bT /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "method: a control byte is 400" "400 Bad Request" "$resp"
+# a method is case-sensitive (RFC 9110 9.1), so "get" is not GET
+resp=$(raw_http 'get /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "method: lowercase get is 405, not a served file" "405 Method Not Allowed" "$resp"
 # None of those reached the access log, which is what the quote could break.
 # Matched through cat -v so the ESC shows as ^[, and with -F so the quote and
 # the brackets are literal — "GE alone would match every ordinary GET line.

@@ -95,6 +95,11 @@ CASES = [
     ("unknown token method served 405", S+A+P+h(b":method",b"PROPFIND"), "405"),
     ("tchar punctuation is a method",
      S+A+P+h(b":method",b"!#$%&'*+-.^_`|~"), "405"),
+    # a method is case-sensitive (RFC 9110 9.1). h2 compared it with iequal, so
+    # a lowercase "get" served the file here while h1 and h3 answered 405.
+    ("lowercase get is not GET", S+A+P+h(b":method",b"get"), "405"),
+    ("lowercase head is not HEAD", S+A+P+h(b":method",b"head"), "405"),
+    ("POST to a static file is 405", S+A+P+h(b":method",b"POST"), "405"),
 ]
 
 fails=0
