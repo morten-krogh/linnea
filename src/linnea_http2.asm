@@ -1735,6 +1735,15 @@ h2_serve:
     lea rdx, [h2_numbuf]
     mov rcx, [rsp + S_CLEN]
     call h2_enc_hdr
+    ; a 405 names the methods the resource does take (RFC 9110 15.5.6); "allow"
+    ; is HPACK static index 22, so only the value is a literal
+    cmp qword [rsp + S_LSTAT], 405
+    jne .no_allow_h2
+    mov esi, 22                      ; allow
+    lea rdx, [allow_val_h2]
+    mov ecx, allow_val_h2_len
+    call h2_enc_hdr
+.no_allow_h2:
     call h2_enc_date_server
     mov rbp, rdi
     sub rbp, r13                     ; payload length
@@ -4512,6 +4521,11 @@ body_400: db "400 Bad Request", 10
 body_400_len equ $ - body_400
 body_404: db "404 Not Found", 10
 body_404_len equ $ - body_404
+; A 405 must say what the resource does allow (RFC 9110 15.5.6). Static files
+; answer GET and HEAD; h3's POST echo is not a thing this resource supports, so
+; it is deliberately not listed here either.
+allow_val_h2:     db "GET, HEAD"
+allow_val_h2_len  equ $ - allow_val_h2
 body_405: db "405 Method Not Allowed", 10
 body_405_len equ $ - body_405
 

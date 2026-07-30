@@ -52,6 +52,13 @@ qpack_srv_name: db "linnea"
 qpack_srv_name_len equ $ - qpack_srv_name
 crange_name:    db "content-range"
 crange_name_len equ $ - crange_name
+; A 405 must say what the resource does allow (RFC 9110 15.5.6). Static files
+; answer GET and HEAD; POST is h3's own echo and not something the resource
+; supports, so it is deliberately not listed.
+allow_name:     db "allow"
+allow_name_len  equ $ - allow_name
+allow_value:    db "GET, HEAD"
+allow_value_len equ $ - allow_value
 
 section .bss
 ; set by the h3 serve path once it has computed the opened file's validators
@@ -276,7 +283,8 @@ qenc_str:
 ; content-type (name ref 44) and content-length (name ref 4) with literal
 ; values — either is skipped when its pointer is 0 (a 304 carries neither).
 ; When linnea_qpack_crange_ptr is set, content-range follows (a literal name:
-; RFC 9204's static table has no content-range entry). When
+; RFC 9204's static table has no content-range entry). A 405 carries allow,
+; also a literal name for the same reason. When
 ; linnea_qpack_send_validators is set (the serve path computed them for the
 ; file it opened), accept-ranges (indexed 32, skipped on a 304), etag (name
 ; ref 7), last-modified (name ref 10) and — when linnea_qpack_ccontrol_ptr
@@ -392,6 +400,24 @@ linnea_qpack_encode_response:
     call qenc_str
     mov rbx, rdi
 .no_crange:
+    ; --- allow, on a 405. RFC 9110 15.5.6 requires it, and like content-range
+    ; the name is a literal: RFC 9204's static table has no allow entry. ---
+    cmp r12d, 405
+    jne .no_allow
+    mov rdi, rbx
+    mov rax, allow_name_len          ; literal field line with literal name
+    mov cl, 3                        ; (001 N H namelen(3)), name not Huffman
+    mov dl, 0x20
+    call qenc_int
+    lea rsi, [allow_name]
+    mov rdx, allow_name_len
+    mov rcx, rdx
+    rep movsb
+    lea rsi, [allow_value]
+    mov rdx, allow_value_len
+    call qenc_str
+    mov rbx, rdi
+.no_allow:
     ; --- validators, when the serve path computed them for this response ---
     cmp qword [linnea_qpack_send_validators], 0
     je .no_validators

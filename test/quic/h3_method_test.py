@@ -8,6 +8,10 @@
 #
 # The method is also matched exactly. RFC 9110 9.1 makes it case-sensitive, so a
 # lowercase "get" is not GET and does not serve a file.
+#
+# And a 405 must name the methods the resource does take (RFC 9110 15.5.6). h1
+# always sent that Allow header; h2 and h3 did not until now, so every case here
+# asserts its presence on a 405 and its absence everywhere else.
 # Usage: h3_method_test.py <port>
 import socket
 import ssl
@@ -40,7 +44,7 @@ def rvlq(b, i):
 
 
 def probe(method):
-    """Returns the status as a string, or 'RESET 0x…' when the stream failed."""
+    """Returns (status or 'RESET 0x…', the allow header or None)."""
     cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
     cfg.verify_mode = ssl.CERT_NONE
     cfg.server_name = "localhost"
@@ -100,6 +104,7 @@ def probe(method):
         flush()
         if done:
             break
+    allow = None
     if verdict is None:
         i = 0
         while i < len(resp):
@@ -107,36 +112,42 @@ def probe(method):
             ln, i = rvlq(resp, i)
             if ty == 1:
                 _, hh = pylsqpack.Decoder(0, 0).feed_header(0, resp[i:i + ln])
-                verdict = dict(hh).get(b":status", b"?").decode()
+                h = dict(hh)
+                verdict = h.get(b":status", b"?").decode()
+                if b"allow" in h:
+                    allow = h[b"allow"].decode()
                 break
             i += ln
     s.close()
-    return verdict or "no reply"
+    return verdict or "no reply", allow
 
 
+# (method, expected status, expected allow header). RFC 9110 15.5.6: a 405 must
+# say what the resource does take, and nothing else should claim to.
 CASES = [
-    (b"GET", "200"),
-    (b"HEAD", "200"),
+    (b"GET", "200", None),
+    (b"HEAD", "200", None),
     # POST echoes its request body — h3's own observable that DATA frames are
     # captured, and the one method h3 answers that h1 and h2 refuse
-    (b"POST", "200"),
+    (b"POST", "200", None),
     # every other method is a 405, where each used to be served as a GET
-    (b"PUT", "405"),
-    (b"DELETE", "405"),
-    (b"PROPFIND", "405"),
-    (b"OPTIONS", "405"),
-    (b"PATCH", "405"),
+    (b"PUT", "405", "GET, HEAD"),
+    (b"DELETE", "405", "GET, HEAD"),
+    (b"PROPFIND", "405", "GET, HEAD"),
+    (b"OPTIONS", "405", "GET, HEAD"),
+    (b"PATCH", "405", "GET, HEAD"),
     # a method is case-sensitive (RFC 9110 9.1), so these are not GET or HEAD
-    (b"get", "405"),
-    (b"Get", "405"),
-    (b"head", "405"),
+    (b"get", "405", "GET, HEAD"),
+    (b"Get", "405", "GET, HEAD"),
+    (b"head", "405", "GET, HEAD"),
 ]
 
 fails = 0
-for method, want in CASES:
-    got = probe(method)
-    ok = got == want
-    print(f"{'ok  ' if ok else 'FAIL'} {method.decode() or '(empty)':10} -> {got}, want {want}")
+for method, want, want_allow in CASES:
+    got, allow = probe(method)
+    ok = got == want and allow == want_allow
+    print(f"{'ok  ' if ok else 'FAIL'} {method.decode() or '(empty)':10} -> {got} "
+          f"allow={allow!r}, want {want} allow={want_allow!r}")
     fails += not ok
 if fails:
     sys.exit(1)

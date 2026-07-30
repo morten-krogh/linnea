@@ -1331,6 +1331,8 @@ check_http "target: OPTIONS * with a chunked body is 501" "501 Not Implemented" 
 # quoted field. An unknown but well-formed method still reaches the 405.
 resp=$(raw_http 'PROPFIND /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "method: an unknown token method is 405, not 400" "405 Method Not Allowed" "$resp"
+# RFC 9110 15.5.6: a 405 must name what the resource does take
+check_http "method: the 405 carries Allow" "Allow: GET, HEAD" "$resp"
 resp=$(raw_http '!#$%&\x27*+-.^_`|~ /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "method: every tchar punctuation is still a method" "405 Method Not Allowed" "$resp"
 resp=$(raw_http 'GE"T /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
@@ -2578,6 +2580,22 @@ PYEOF
         | grep -i '^content-type' | tr -d '\r')
     printf '%s' "$ct" | grep -qF "application/wasm"
     check "http2 mime table has the same types (.wasm)" $?
+
+    # RFC 9110 15.5.6: a 405 must name what the resource does take. h1 always
+    # sent Allow; h2 sent none, so a client could not tell what to retry with.
+    al=$(timeout 10 curl -si --http2 --cacert $CA \
+        --resolve localhost:47443:127.0.0.1 -X PROPFIND \
+        https://localhost:47443/hello.txt | tr -d '\r')
+    printf '%s' "$al" | grep -q "405" && printf '%s' "$al" | grep -qi "^allow: GET, HEAD"
+    check "http2 405 carries Allow: GET, HEAD" $?
+    # and nothing else claims to: a 200 and a 404 carry no allow
+    for u in /hello.txt /nope.txt; do
+        n=$(timeout 10 curl -si --http2 --cacert $CA \
+            --resolve localhost:47443:127.0.0.1 https://localhost:47443$u \
+            | tr -d '\r' | grep -ci "^allow:")
+        [ "$n" -eq 0 ]
+        check "http2 no Allow on a normal response ($u)" $?
+    done
     rm -f test/www/probe.wasm
 
     # Q120: h2 requests reach the access log — static and proxied alike, in
