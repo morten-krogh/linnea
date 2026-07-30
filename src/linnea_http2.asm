@@ -781,11 +781,10 @@ h2_build_request:
 
 .block_big:
     ; A block too large to hold. The frames are still consumed (nothing is
-    ; copied) until END_HEADERS, and the stream is answered 431 below: the
-    ; connection lives on. The block goes UNDECODED — safe from HPACK desync
-    ; only because we advertise HEADER_TABLE_SIZE 0, so a conforming encoder
-    ; never touches the dynamic table; one that inserts anyway is caught by
-    ; the decoder's insert guard on its next block (COMPRESSION_ERROR).
+    ; copied) until END_HEADERS, and the stream is answered 431 at .too_big,
+    ; which also decides whether the connection can live on: the block goes
+    ; UNDECODED, so any insert it carried entered the peer's dynamic table and
+    ; not ours.
     mov qword [rsp + L_BIG], 1
     jmp .after_append
 
@@ -881,6 +880,18 @@ h2_build_request:
     jmp .ret
 
 .too_big:
+    ; Skipping the block is survivable only while OUR table is empty. Empty, a
+    ; dynamic reference from the peer can only land out of range, and that is
+    ; already a connection error — a loud, safe failure. With entries in the
+    ; table the same reference could instead resolve to the WRONG entry and be
+    ; served as a request the client never sent, silently. So an unread block
+    ; on a connection whose table holds anything ends the connection instead.
+    ; (In practice the table is always empty: we advertise HEADER_TABLE_SIZE 0
+    ; and a conforming encoder inserts nothing, so real clients keep the 431.)
+    mov rdi, rbx
+    call h2_dyn_for                  ; -> rax = this connection's table
+    cmp qword [rax + linnea_hpack_dyn.count], 0
+    jne .err
     ; the stream id still advances the strictly-increasing floor: this stream
     ; was answered, so a later HEADERS reusing its id must be refused
     mov r8, [rsp + L_SID]

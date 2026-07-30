@@ -1,11 +1,15 @@
 ; linnea_hpack.asm — HPACK (RFC 7541) decoder, HTTP/2 request path (M16).
 ;
 ; Decodes one header block (already reassembled from HEADERS + CONTINUATION)
-; into request pseudo-headers. We advertise SETTINGS_HEADER_TABLE_SIZE = 0,
-; so the dynamic table is always empty (see linnea_hpack.inc): the field
-; representations are all parsed, but indexed references resolve only
-; against the 61-entry static table and incremental-indexing inserts are
-; discarded. That makes the decoder stateless across header blocks.
+; into request pseudo-headers.
+;
+; We advertise SETTINGS_HEADER_TABLE_SIZE = 0, so a conforming encoder stops
+; inserting once it has applied that setting — but it is entitled to use the
+; 4096-octet default until then, so the decoder keeps a REAL dynamic table and
+; is stateful across the header blocks of a connection. That state is the thing
+; to protect: a block we start decoding must be walked to its end even when the
+; request is doomed, or our table falls behind the peer's and a later block
+; decodes against the wrong entries. See .fault.
 ;
 ; Register discipline: linnea_hpack_decode keeps req in rbx, the input
 ; cursor in r12, the input end in r13 (callee-saved). hpack_int / hpack_str
@@ -52,6 +56,11 @@ hdr_upg:        db "upgrade"
 
 section .bss
 lit_form:      resq 1
+; The first field fault of the block in progress, or 0. A bad or over-limit
+; field does NOT stop the walk (see .fault), so the fault waits here until the
+; block has been read to its end. A file-scope slot for the same reason
+; lit_form is one: one decode runs at a time.
+dec_fault:     resq 1
 
 section .text
 
@@ -65,6 +74,7 @@ linnea_hpack_decode:
     mov rbx, rdx                    ; req
     mov r12, rdi                    ; cur
     lea r13, [rdi + rsi]            ; end
+    mov qword [dec_fault], 0
 
 .next:
     cmp r12, r13
@@ -104,7 +114,7 @@ linnea_hpack_decode:
     lea rsi, [r14 + r10]            ; value ptr
     mov rdi, r11                    ; value len
     call emit_field
-    jc .err_limit
+    jc .fault
     jmp .next
 
 ; An index past the static table names an entry the peer inserted earlier on
@@ -117,7 +127,7 @@ linnea_hpack_decode:
     call hpack_dyn_get              ; -> rax = name, rdx = nlen, rsi = value,
     jc .err_index                   ;    rdi = vlen; CF = out of range
     call emit_field
-    jc .err_limit
+    jc .fault
     jmp .next
 
 ; --- 6.2.x Literal Header Field ------------------------------------------
@@ -202,7 +212,7 @@ linnea_hpack_decode:
     pop rax
 .lit_emit:
     call emit_field
-    jc .err_limit
+    jc .fault
     jmp .next
 
 ; --- 6.3 Dynamic Table Size Update ---------------------------------------
@@ -227,8 +237,21 @@ linnea_hpack_decode:
     jmp .next
 
 .ok:
-    xor eax, eax
+    mov rax, [dec_fault]             ; 0, or the fault the walk deferred
     jmp .ret
+.fault:
+    ; The field is bad — malformed, or past our list bound — but the block is
+    ; NOT abandoned here. HPACK is stateful: every literal-with-incremental-
+    ; indexing still to come in this block enters the encoder's dynamic table
+    ; whether or not we like this request, so returning now would leave our
+    ; table short of the peer's and silently decode a LATER request against the
+    ; wrong entries. Walk the rest for its table side effects and report the
+    ; first fault at the end, where RFC 9113 8.1.1 can fail just the stream
+    ; because the field section did, in the end, decode.
+    cmp qword [dec_fault], 0
+    jne .next                        ; keep the first cause, not the last
+    mov qword [dec_fault], -LINNEA_HPACK_ERR_LIMIT
+    jmp .next
 .lit_desync:
     add rsp, 32                     ; drop the saved name/value ptr+len (4 qwords)
     ; fall through: an out-of-sync dynamic table is a COMPRESSION_ERROR
@@ -242,8 +265,6 @@ linnea_hpack_decode:
 .err_index:
     mov rax, -LINNEA_HPACK_ERR_INDEX
     jmp .ret
-.err_limit:
-    mov rax, -LINNEA_HPACK_ERR_LIMIT
 .ret:
     pop r15
     pop r14

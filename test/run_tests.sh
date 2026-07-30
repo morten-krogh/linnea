@@ -2572,6 +2572,15 @@ PYEOF
     timeout 90 python3 test/tls/h2_authority.py $CA 47443 >/dev/null 2>&1
     check "http2 authority rules (stream errors, connection survives)" $?
 
+    # HPACK is stateful, so a block we REJECT must still be walked to its end:
+    # the inserts after the offending field reach the peer's dynamic table
+    # whether we like the request or not. Stopping early left our table behind
+    # the peer's, and a later request referencing a dynamic index then decoded
+    # against the wrong entry — the probe sees a 'range' header from the
+    # rejected request applied to a later one, turning its 200 into a 206.
+    timeout 30 python3 test/tls/hpack_sync.py $CA 47443 >/dev/null 2>&1
+    check "http2 HPACK table stays in sync across a rejected block" $?
+
     # Q130: h2/h3 read a SEPARATE mime table from h1's, so the types are
     # checked here too — a type added to one table only is the easy mistake.
     printf 'x' > test/www/probe.wasm
