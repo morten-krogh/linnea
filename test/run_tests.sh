@@ -549,6 +549,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_migration_spoof_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): unauthenticated source does not redirect the connection" $?
 
+    # and the replayed half: a captured 1-RTT datagram resent from another source
+    # carries a VALID tag, so authenticity alone cannot gate the address change.
+    # RFC 9000 12.3 (discard an already-processed packet number) + 9.3 (only the
+    # highest-numbered packet may move the address) are what close it.
+    python3 test/quic/h3_replay_spoof_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): replayed packet does not redirect the connection" $?
+
     # the same for the handshake flights: no long-header packet authenticates its
     # sender, so neither a replayed Initial nor a forged Handshake may move the
     # peer address (RFC 9000 9 — no migration before the handshake is confirmed)

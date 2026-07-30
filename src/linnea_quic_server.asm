@@ -111,6 +111,7 @@ extern linnea_quic_crypto_frame
 extern linnea_quic_stream_frame
 extern linnea_quic_close_frame
 extern linnea_quic_ack_record
+extern linnea_quic_ack_seen
 extern linnea_quic_build_ack
 extern linnea_quic_ack_ranges
 extern linnea_quic_rtx_record
@@ -1503,14 +1504,39 @@ linnea_quic_server_datagram:
     test rax, rax
     js .done
 .oi_ok:
-    ; The packet authenticated: only now adopt its source as the peer address, so a
-    ; migrated client's replies follow it. A spoofed 1-RTT packet cannot produce a
-    ; valid AEAD tag, so it never reaches here and can no longer redirect our sends
-    ; (RFC 9000 9.3). Anti-amplification is deliberately NOT re-armed on a change:
-    ; we run no PATH_CHALLENGE validation, so throttling a validated migration to 3x
-    ; would wedge it, and only an authenticated peer can move the address.
-    mov r10, rax                     ; hold the frame-byte count across the copy
+    mov r10, rax                     ; hold the frame-byte count across the calls
+    mov r11, rdx                     ; and the packet number
+    ; The packet authenticated — but authentic is not the same as fresh. A 1-RTT
+    ; datagram captured off the wire and replayed carries a valid AEAD tag, because
+    ; it is a bit-for-bit copy of one that genuinely had one, so "only an
+    ; authenticated peer can move the address" does not hold against replay. That
+    ; was the whole bug: an attacker who had seen ONE datagram could resend it from
+    ; a spoofed source and the connection followed them.
+    ;
+    ; RFC 9000 12.3: a packet number we have already processed MUST be discarded.
+    ; A conforming peer never reuses a number — a retransmission carries the same
+    ; frames under a new one — so this can only ever drop a duplicate or a replay,
+    ; never a packet we still needed.
+    CONNLEA rdi, rx_have
+    mov rsi, r11
+    call linnea_quic_ack_seen
+    test rax, rax
+    jnz .done
+    ; Only the highest-numbered packet may move the peer address (RFC 9000 9.3),
+    ; so a reordered older one cannot drag the connection back to an address the
+    ; peer has already left. Judged BEFORE ack_record below raises the largest.
     mov rax, [cur_conn]
+    cmp qword [rax + linnea_quic_conn.rx_have], 0
+    je .oi_adopt                     ; the first packet is the highest there is
+    mov rcx, [rax + linnea_quic_conn.rx_largest]
+    cmp r11, rcx
+    jbe .oi_addr_done
+.oi_adopt:
+    ; Only now adopt its source as the peer address, so a migrated client's replies
+    ; follow it. Anti-amplification is deliberately NOT re-armed on a change: we run
+    ; no PATH_CHALLENGE validation, so throttling a validated migration to 3x would
+    ; wedge it. What makes that safe is freshness, checked above — not the AEAD tag
+    ; alone, which a replay also satisfies.
     mov rcx, [salen]
     cmp rcx, 28
     jbe .oi_plen
@@ -1520,11 +1546,12 @@ linnea_quic_server_datagram:
     lea rdi, [rax + linnea_quic_conn.peer]
     lea rsi, [sa]
     rep movsb
+.oi_addr_done:
     mov rax, r10                     ; frame-byte count
     ; note it as received, so our next packet can acknowledge it — otherwise the
     ; peer keeps retransmitting a request we have already answered
     push rax
-    mov rsi, rdx
+    mov rsi, r11
     CONNLEA rdi, rx_have
     call linnea_quic_ack_record
     pop rax

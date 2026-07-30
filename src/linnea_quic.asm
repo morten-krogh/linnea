@@ -18,6 +18,7 @@ global linnea_quic_crypto_frame
 global linnea_quic_stream_frame
 global linnea_quic_close_frame
 global linnea_quic_ack_record
+global linnea_quic_ack_seen
 global linnea_quic_build_ack
 global linnea_quic_ack_ranges
 global linnea_quic_recv_initial
@@ -724,6 +725,44 @@ linnea_quic_ack_record:
     mov qword [rdi + 16], 0
     mov [rdi + 8], rsi
 .ar_done:
+    ret
+
+; linnea_quic_ack_seen(rdi=state, rsi=packet number) -> rax = 1 when this number
+; has already been recorded in this space, 0 when it is new. Clobbers rax, rcx
+; only, so a caller may hold values in the other registers across the call.
+;
+; RFC 9000 12.3 does not ask "is this a duplicate" but the stronger "are we
+; CERTAIN it is not one" — a packet must be discarded unless the receiver knows
+; it has not already processed that number. The 64-bit window is the extent of
+; that certainty, so a number that has fallen off the bottom of it answers 1:
+; one we can no longer describe is one we cannot vouch for, and the safe answer
+; is to drop it.
+;
+; Dropping duplicates cannot stall a conforming peer, because a packet number is
+; never reused (12.3 again) — a retransmission carries the same frames under a
+; NEW number. So everything this rejects is either a network duplicate, whose
+; frames we have already acted on, or a replay.
+linnea_quic_ack_seen:
+    cmp qword [rdi], 0
+    je .as_new                       ; nothing received yet: everything is new
+    mov rax, [rdi + 8]               ; largest
+    cmp rsi, rax
+    ja .as_new                       ; above the largest: certainly new
+    je .as_seen                      ; the largest itself
+    sub rax, rsi
+    dec rax                          ; offset below the largest
+    cmp rax, 64
+    jae .as_seen                     ; outside the window: not certain, so drop
+    mov rcx, rax
+    mov rax, [rdi + 16]              ; mask: bit i = packet (largest - 1 - i)
+    shr rax, cl
+    and eax, 1                       ; the bit is the answer, zero-extended
+    ret
+.as_seen:
+    mov eax, 1
+    ret
+.as_new:
+    xor eax, eax
     ret
 
 ; linnea_quic_build_ack(rdi=out, rsi=state) -> rax = bytes written (0 if
