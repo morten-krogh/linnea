@@ -789,6 +789,23 @@ h2_build_request:
     jmp .after_append
 
 .assembled:
+    ; Stream-id rules first (RFC 9113 5.1.1): a client's stream is odd, and
+    ; numerically above every stream it has already opened. An id breaking
+    ; either says the peer's stream numbering is broken, which is a CONNECTION
+    ; error — no per-stream answer can repair it, and the next id is not to be
+    ; trusted either. This used to run AFTER the malformed-request checks, so a
+    ; malformed request on an EVEN id was answered with a stream reset, and
+    ; stamped h2_last_stream with an even number on its way out.
+    ; Still checked once the block is whole, so a partial-block retry cannot
+    ; double-count the floor; now also before the decode, so a bad id costs
+    ; nothing. Every path below is past this, so the floor is stamped once here
+    ; rather than again on each of them.
+    mov r8, [rsp + L_SID]
+    test r8, 1
+    jz .err                          ; even id: connection error
+    cmp r8, [rbx + linnea_connection.h2_last_stream]
+    jbe .err                         ; not strictly increasing
+    mov [rbx + linnea_connection.h2_last_stream], r8
     cmp qword [rsp + L_BIG], 0
     jne .too_big
     ; zero the whole req struct — a count derived from the struct size, so a
@@ -829,16 +846,6 @@ h2_build_request:
     cmp qword [rsp + REQ + linnea_h2_req.path_ptr], 0
     je .malformed_stream
 
-    ; stream-id validation (RFC 9113 5.1.1): a client stream must be odd and
-    ; numerically greater than every stream it has opened. Checked here (once
-    ; the block is whole) so a partial-block retry does not double-count.
-    mov r8, [rsp + L_SID]
-    test r8, 1
-    jz .err                          ; even id: connection error
-    cmp r8, [rbx + linnea_connection.h2_last_stream]
-    jbe .err                         ; not strictly increasing
-    mov [rbx + linnea_connection.h2_last_stream], r8
-
     ; --- serve the request: write the response at the out cursor --------
     mov rdi, rbx                     ; conn
     lea rsi, [rsp + REQ]             ; decoded request
@@ -864,12 +871,8 @@ h2_build_request:
     jne .err
 .malformed_stream:
     ; RFC 9113 8.1.1: a malformed request is a stream error. The connection
-    ; and its HPACK state are fine, so every other stream carries on.
-    mov r8, [rsp + L_SID]
-    cmp r8, [rbx + linnea_connection.h2_last_stream]
-    jbe .ms_stamped
-    mov [rbx + linnea_connection.h2_last_stream], r8
-.ms_stamped:
+    ; and its HPACK state are fine, so every other stream carries on. The id
+    ; was validated and stamped at .assembled, so there is nothing to do here.
     mov rdi, [rsp + L_OUT]
     mov rsi, [rsp + L_SID]
     mov edx, LINNEA_H2_PROTOCOL_ERROR
@@ -892,13 +895,6 @@ h2_build_request:
     call h2_dyn_for                  ; -> rax = this connection's table
     cmp qword [rax + linnea_hpack_dyn.count], 0
     jne .err
-    ; the stream id still advances the strictly-increasing floor: this stream
-    ; was answered, so a later HEADERS reusing its id must be refused
-    mov r8, [rsp + L_SID]
-    cmp r8, [rbx + linnea_connection.h2_last_stream]
-    jbe .tb_stamped
-    mov [rbx + linnea_connection.h2_last_stream], r8
-.tb_stamped:
     mov rdi, rbx
     mov rsi, [rsp + L_SID]
     mov rdx, [rsp + L_OUT]

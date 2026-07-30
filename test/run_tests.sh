@@ -2572,6 +2572,15 @@ PYEOF
     timeout 90 python3 test/tls/h2_authority.py $CA 47443 >/dev/null 2>&1
     check "http2 authority rules (stream errors, connection survives)" $?
 
+    # RFC 9113 5.1.1: a client's stream id is odd and above the floor, and
+    # breaking either is a CONNECTION error. Both were checked AFTER the
+    # malformed-request tests, so a malformed request on an even id drew only a
+    # stream reset and stamped the floor with an even number. The last case
+    # guards the other side: a malformed request on a VALID id must still fail
+    # only its stream.
+    timeout 60 python3 test/tls/h2_stream_id.py $CA 47443 >/dev/null 2>&1
+    check "http2 stream-id rules are connection errors" $?
+
     # HPACK is stateful, so a block we REJECT must still be walked to its end:
     # the inserts after the offending field reach the peer's dynamic table
     # whether we like the request or not. Stopping early left our table behind
