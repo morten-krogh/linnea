@@ -2581,6 +2581,13 @@ PYEOF
     timeout 30 python3 test/tls/hpack_sync.py $CA 47443 >/dev/null 2>&1
     check "http2 HPACK table stays in sync across a rejected block" $?
 
+    # ...and across the arena's wrap. The arena was a bump allocator that
+    # reclaimed only when the table emptied, so an entry landing at the end was
+    # silently not stored while the peer DID store it — leaving our table an
+    # entry behind and every later dynamic index resolving to the wrong header.
+    timeout 240 python3 test/tls/hpack_arena.py $CA 47443 >/dev/null 2>&1
+    check "http2 HPACK entries survive the arena wrapping" $?
+
     # Q130: h2/h3 read a SEPARATE mime table from h1's, so the types are
     # checked here too — a type added to one table only is the easy mistake.
     printf 'x' > test/www/probe.wasm

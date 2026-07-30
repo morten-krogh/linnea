@@ -124,6 +124,7 @@ linnea_hpack_decode:
     test rdi, rdi
     jz .err_index                   ; no table (HTTP/3): undecodable
     lea rsi, [rax - HPACK_STATIC_COUNT - 1]     ; 0 = newest
+    mov rdx, rbx                    ; req, whose scratch receives the copy
     call hpack_dyn_get              ; -> rax = name, rdx = nlen, rsi = value,
     jc .err_index                   ;    rdi = vlen; CF = out of range
     call emit_field
@@ -175,6 +176,7 @@ linnea_hpack_decode:
     test rdi, rdi
     jz .err_index
     lea rsi, [rax - HPACK_STATIC_COUNT - 1]
+    mov rdx, rbx                    ; req, whose scratch receives the copy
     call hpack_dyn_get              ; -> rax = name ptr, rdx = name len
     jc .err_index
     mov r14, rax
@@ -713,28 +715,116 @@ hpack_dyn_reset:
     mov qword [rdi + linnea_hpack_dyn.max], LINNEA_HPACK_DYN_CAP
     ret
 
-; hpack_dyn_get(rdi = table*, rsi = i, 0 = newest)
+; di_ring_copy(rbx = table, rdi = arena cursor, rsi = source, rcx = length)
+;   -> rdi advanced past the bytes written, wrapping at the end of the arena.
+; Splits the copy when it reaches the end. Touches rax/rcx/rdx/rsi/rdi/r8.
+di_ring_copy:
+    test rcx, rcx
+    jz .rc_done
+    lea rax, [rbx + linnea_hpack_dyn.arena]
+    lea rdx, [rax + LINNEA_HPACK_DYN_CAP]    ; one past the arena
+    mov r8, rdx
+    sub r8, rdi                              ; bytes left before the wrap
+    cmp rcx, r8
+    jbe .rc_tail                             ; fits without wrapping
+    sub rcx, r8                              ; the part past the end
+    push rcx
+    mov rcx, r8
+    rep movsb                                ; fill to the end
+    pop rcx
+    lea rdi, [rbx + linnea_hpack_dyn.arena]  ; and resume at the start
+.rc_tail:
+    rep movsb
+.rc_done:
+    ret
+
+; hpack_dyn_get(rdi = table*, rsi = i, 0 = newest, rdx = req)
 ;   -> rax = name ptr, rdx = name len, rsi = value ptr, rdi = value len.
-; CF set when i is past the live entries. Caller-saved only.
+; CF set when i is past the live entries, or the req's scratch cannot take the
+; copy. The entry is copied into that scratch, so the pointers stay valid for
+; as long as every other decoded pointer does.
 hpack_dyn_get:
-    cmp rsi, [rdi + linnea_hpack_dyn.count]
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi                                ; table
+    mov r14, rdx                                ; req, for its scratch
+    cmp rsi, [rbx + linnea_hpack_dyn.count]
     jae .dg_bad
-    mov rax, [rdi + linnea_hpack_dyn.head]
+    mov rax, [rbx + linnea_hpack_dyn.head]
     sub rax, rsi
     jns .dg_slot
     add rax, LINNEA_HPACK_DYN_MAX               ; wrapped
 .dg_slot:
-    mov r8, [rdi + linnea_hpack_dyn.off + rax * 8]
-    mov rdx, [rdi + linnea_hpack_dyn.nlen + rax * 8]
-    mov r9, [rdi + linnea_hpack_dyn.vlen + rax * 8]
-    lea rax, [rdi + linnea_hpack_dyn.arena]
-    add rax, r8                                 ; name ptr
+    mov r12, [rbx + linnea_hpack_dyn.off + rax * 8]
+    mov r13, [rbx + linnea_hpack_dyn.nlen + rax * 8]
+    mov r15, [rbx + linnea_hpack_dyn.vlen + rax * 8]
+    ; The entry is COPIED into the request's scratch rather than pointed at in
+    ; place. Two reasons, and the first is the load-bearing one: the pointers
+    ; handed back here end up in the req and are read long after this call — by
+    ; the serve, and by the proxy header rebuild — whereas the arena is a ring
+    ; that a later insert in the SAME header block can evict and write over. It
+    ; also frees the arena to store an entry across the wrap. linnea_hpack.inc
+    ; has always said a decoded pointer references the input block, the static
+    ; blob or scratch; the arena was never on that list.
+    mov rdi, [r14 + linnea_h2_req.scratch]
+    mov rax, [r14 + linnea_h2_req.scratch_end]
+    sub rax, rdi
+    mov rcx, r13
+    add rcx, r15
+    cmp rcx, rax
+    ja .dg_bad                                  ; scratch exhausted
+    push rdi                                    ; where the copy begins
+    ; the entry's bytes may straddle the end of the ring
+    lea rsi, [rbx + linnea_hpack_dyn.arena]
+    add rsi, r12
+    call dg_ring_read                           ; name ++ value, rcx bytes
+    pop rax                                     ; name ptr, in scratch
+    mov rdi, [r14 + linnea_h2_req.scratch]
+    add rdi, r13
+    add rdi, r15
+    mov [r14 + linnea_h2_req.scratch], rdi      ; bump past the copy
+    mov rdx, r13                                ; name len
     lea rsi, [rax + rdx]                        ; value follows the name
-    mov rdi, r9
+    mov rdi, r15                                ; value len
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     clc
     ret
 .dg_bad:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     stc
+    ret
+
+; dg_ring_read(rbx = table, rsi = arena cursor, rdi = destination, rcx = length)
+; Reads rcx bytes from the ring starting at rsi, wrapping at the arena's end.
+dg_ring_read:
+    test rcx, rcx
+    jz .rr_done
+    lea rax, [rbx + linnea_hpack_dyn.arena]
+    lea rdx, [rax + LINNEA_HPACK_DYN_CAP]
+    mov r8, rdx
+    sub r8, rsi                                 ; bytes before the wrap
+    cmp rcx, r8
+    jbe .rr_tail
+    sub rcx, r8
+    push rcx
+    mov rcx, r8
+    rep movsb
+    pop rcx
+    lea rsi, [rbx + linnea_hpack_dyn.arena]     ; resume at the start
+.rr_tail:
+    rep movsb
+.rr_done:
     ret
 
 ; hpack_dyn_evict(rdi = table*) — drop oldest entries until the live size is
@@ -794,30 +884,50 @@ hpack_dyn_insert:
     call hpack_dyn_evict            ; bring the size back within max
     cmp qword [rbx + linnea_hpack_dyn.count], LINNEA_HPACK_DYN_MAX
     jae .di_drop                    ; entry slots exhausted
-    ; the arena is a bump allocator: compact by wrapping to the start when the
-    ; live entries have all been evicted, else refuse (rare: a long-lived
-    ; connection whose peer keeps inserting)
-    mov rax, [rbx + linnea_hpack_dyn.used]
-    lea rcx, [r13 + r15]
+    ; The arena is a RING. .used is the write cursor; an evicted entry's bytes
+    ; are reclaimed simply by the cursor coming round to them again, so a peer
+    ; that keeps inserting no longer walks the cursor off the end. It was a bump
+    ; allocator that only reset at count == 0, which is why a table left enabled
+    ; would eventually refuse an entry the peer HAD stored and kill the
+    ; connection — see .di_drop.
+    ;
+    ; There is always room. Every entry costs its bytes + 32 against .max, and
+    ; eviction above has already brought .size within .max <= CAP, so the bytes
+    ; actually stored are size - 32*entries, i.e. at least 32 per entry below
+    ; CAP. The check below is a belt-and-braces guard, not a live path.
+    lea rax, [r13 + r15]             ; L: the bytes this entry occupies
+    mov rcx, [rbx + linnea_hpack_dyn.size]
+    sub rcx, rax
+    sub rcx, 32                      ; .size already counts this entry: drop it
+    mov rdx, [rbx + linnea_hpack_dyn.count]
+    shl rdx, 5                       ; 32 bytes of per-entry overhead
+    sub rcx, rdx                     ; rcx = bytes the live entries occupy
     add rcx, rax
     cmp rcx, LINNEA_HPACK_DYN_CAP
-    jbe .di_space
-    cmp qword [rbx + linnea_hpack_dyn.count], 0
-    jne .di_drop
-    xor eax, eax                    ; the table is empty: start over
-    mov [rbx + linnea_hpack_dyn.used], rax
-.di_space:
-    ; copy name ++ value into the arena
+    ja .di_drop                      ; unreachable while max <= CAP
+    ; write name ++ value at the cursor, splitting across the end if it lands
+    ; there. Nothing outside this file reads the arena — hpack_dyn_get copies
+    ; out — so an entry that straddles the wrap costs only this second movsb.
+    mov rax, [rbx + linnea_hpack_dyn.used]
+    push rax                         ; the offset this entry starts at
     lea rdi, [rbx + linnea_hpack_dyn.arena]
     add rdi, rax
-    push rax
-    mov rsi, r12
+    mov rsi, r12                     ; name
     mov rcx, r13
-    rep movsb
-    mov rsi, r14
+    call di_ring_copy
+    mov rsi, r14                     ; value, continuing from where name ended
     mov rcx, r15
-    rep movsb
-    pop rax
+    call di_ring_copy
+    ; advance the cursor by L, modulo the arena
+    mov rax, [rbx + linnea_hpack_dyn.used]
+    lea rax, [rax + r13]
+    add rax, r15
+    cmp rax, LINNEA_HPACK_DYN_CAP
+    jb .di_cursor
+    sub rax, LINNEA_HPACK_DYN_CAP
+.di_cursor:
+    mov [rbx + linnea_hpack_dyn.used], rax
+    pop rax                          ; the entry's starting offset
     ; claim the newest slot
     mov rcx, [rbx + linnea_hpack_dyn.head]
     cmp qword [rbx + linnea_hpack_dyn.count], 0
@@ -835,8 +945,6 @@ hpack_dyn_insert:
     mov [rbx + linnea_hpack_dyn.nlen + rcx * 8], r13
     mov [rbx + linnea_hpack_dyn.vlen + rcx * 8], r15
     inc qword [rbx + linnea_hpack_dyn.count]
-    lea rax, [r13 + r15]
-    add [rbx + linnea_hpack_dyn.used], rax
     xor eax, eax                    ; stored: in sync with the peer
     jmp .di_ret
 .di_drop:
