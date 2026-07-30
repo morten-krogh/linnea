@@ -2605,6 +2605,13 @@ PYEOF
     timeout 240 python3 test/tls/hpack_arena.py $CA 47443 >/dev/null 2>&1
     check "http2 HPACK entries survive the arena wrapping" $?
 
+    # We advertise HEADER_TABLE_SIZE 4096, so the table is load-bearing for real
+    # traffic rather than dead state: this drives eviction from "drop one" to
+    # "drop everything", the entry-slot ceiling, size updates down to 0 and back,
+    # and reads back a marker by dynamic index after every phase.
+    timeout 400 python3 test/tls/hpack_stress.py $CA 47443 >/dev/null 2>&1
+    check "http2 HPACK dynamic table under sustained use" $?
+
     # Q130: h2/h3 read a SEPARATE mime table from h1's, so the types are
     # checked here too — a type added to one table only is the easy mistake.
     printf 'x' > test/www/probe.wasm

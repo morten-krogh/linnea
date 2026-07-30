@@ -132,11 +132,19 @@ linnea_h2_init:
     mov byte [rax + 3], LINNEA_H2_FT_SETTINGS
     mov byte [rax + 4], 0
     mov dword [rax + 5], 0          ; stream 0
-    ; HEADER_TABLE_SIZE = 0: the peer's HPACK encoder gets no dynamic table,
-    ; so our decoder never has to keep one (see linnea_hpack.inc).
+    ; HEADER_TABLE_SIZE = 4096, the protocol default. The decoder has always
+    ; kept a real table — it must, because an encoder may use the 4096 default
+    ; until it has applied whatever we advertise — but advertising 0 told a
+    ; conforming peer never to insert, which left the compression the table
+    ; exists for unused: a browser's cookie and user-agent are identical on
+    ; every request of a page load, and indexed they cost one byte each.
+    ; This makes the table load-bearing for real traffic rather than dead
+    ; state, which is why the arena had to become a ring first (Q153) and why
+    ; hpack_stress.py drives eviction, the slot ceiling, the wrap and the
+    ; copy-out the way an encoder using its full allowance would.
     mov byte [rax + 9], 0
     mov byte [rax + 10], LINNEA_H2_SETTINGS_HEADER_TABLE_SIZE
-    mov dword [rax + 11], 0         ; value 0
+    mov dword [rax + 11], 0x00100000    ; value 4096, big-endian
     ; MAX_CONCURRENT_STREAMS = LINNEA_H2_MAX_STREAMS (16): the size of our
     ; per-connection body-streaming pool.
     mov byte [rax + 15], 0
