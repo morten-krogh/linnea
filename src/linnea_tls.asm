@@ -80,6 +80,18 @@ cv_prefix:    times 64 db 0x20
 cv_prefix_len equ $ - cv_prefix
 
 ccs_record:   db 0x14, 0x03, 0x03, 0x00, 0x01, 0x01
+; The HelloRetryRequest "random" (RFC 8446 4.1.3): SHA-256 of "HelloRetryRequest".
+; A HRR *is* a ServerHello on the wire — this value in the random field is the
+; only thing that distinguishes the two.
+hrr_random:   db 0xCF,0x21,0xAD,0x74,0xE5,0x9A,0x61,0x11
+              db 0xBE,0x1D,0x8C,0x02,0x1E,0x65,0xB8,0x91
+              db 0xC2,0xA2,0x11,0x16,0x7A,0xBB,0x8C,0x5E
+              db 0x07,0x9E,0x09,0xE2,0xC8,0xA8,0x33,0x9C
+; The synthetic-transcript prefix for a retried handshake (RFC 8446 4.4.1):
+; message_hash, a zero byte, then the 16-bit length 0x0020 of the SHA-256 that
+; follows. ClientHello1 is replaced by its own hash so the server need not keep
+; the first hello around.
+hrr_msg_hash: db 0xFE, 0x00, 0x00, 0x20
 
 section .bss
 
@@ -175,6 +187,8 @@ linnea_tls_hs_init:
     mov dword [rdi + linnea_tls_hs.sni_len], 0
     mov dword [rdi + linnea_tls_hs.psk_flags], 0
     mov dword [rdi + linnea_tls_hs.resumed], 0
+    mov dword [rdi + linnea_tls_hs.hrr], 0      ; up_buf is reused across
+                                                ; connections: never inherit it
     mov qword [rdi + linnea_tls_hs.alpn_name], 0
     mov dword [rdi + linnea_tls_hs.alpn_is_h2], 0
     mov dword [rdi + linnea_tls_hs.alpn_h2_ok], 0   ; accept path may raise it
@@ -236,7 +250,28 @@ linnea_tls_hs_input:
     jb .ret                     ; need the record header
     movzx eax, byte [rbx]
     cmp al, LINNEA_TLS_CT_HANDSHAKE
+    je .ch_hs_rec
+    ; A ChangeCipherSpec here is middlebox compatibility: RFC 8446 D.4 has the
+    ; client send one immediately before its second flight, so it arrives
+    ; between our HelloRetryRequest and ClientHello2. Skip the record whole.
+    ; Only after a retry — before one, nothing but handshake belongs here, and
+    ; the plain-HTTP-on-the-TLS-port diagnosis below stays intact.
+    cmp al, LINNEA_TLS_CT_CCS
     jne .ch_not_tls             ; plain HTTP or noise on the TLS port
+    cmp dword [rbp + linnea_tls_hs.hrr], 0
+    je .ch_not_tls
+    movzx r13d, byte [rbx + 3]
+    shl r13d, 8
+    mov al, [rbx + 4]
+    mov r13b, al
+    lea rax, [r13 + 5]
+    cmp rax, r12
+    ja .ret                     ; wait for the whole record before dropping it
+    add [rbp + linnea_tls_hs.consumed], rax
+    add rbx, rax
+    sub r12, rax
+    jmp .ch_rec
+.ch_hs_rec:
     movzx r13d, byte [rbx + 3]  ; record length, big-endian
     shl r13d, 8
     mov al, [rbx + 4]
@@ -297,9 +332,13 @@ linnea_tls_hs_input:
     pop rdx
     pop rsi
     mov rdi, rbp
-    call parse_ch               ; rax = -1 ok, else alert descriptor
+    call parse_ch               ; rax = -1 ok, -2 retry, else alert descriptor
     cmp rax, -1
-    jne .ch_alert
+    je .ch_parsed
+    cmp rax, -2
+    je .ch_hrr
+    jmp .ch_alert
+.ch_parsed:
 
     ; SNI vhost selection: if the embedder installed a hook, let it swap
     ; the certificate for the requested name before the flight is built.
@@ -331,6 +370,76 @@ linnea_tls_hs_input:
     mov rdx, [rsp + IN_OCAP]
     call build_flight
     mov dword [rbp + linnea_tls_hs.state], LINNEA_TLS_WAIT_FIN
+    jmp .ret
+
+; ---- HelloRetryRequest: ask again for a share in the group we want --------
+; The client offered x25519 but sent a share for something else, so RFC 8446
+; 4.1.4 wants a retry rather than the fatal alert this used to send.
+;
+; The transcript needs the special handling of 4.4.1 first. ClientHello1 has
+; already been absorbed above, and it must now be replaced by
+;   message_hash || 00 00 20 || Hash(ClientHello1)
+; so that the eventual key schedule hashes the retried exchange the way the
+; client will. Take the hash of what we have (which is exactly CH1), start the
+; transcript over, and feed it the synthetic message.
+.ch_hrr:
+    sub rsp, 32
+    mov rdi, rbp                ; H(ClientHello1)
+    mov rsi, rsp
+    call tls_th
+    lea rdi, [rbp + linnea_tls_hs.transcript]
+    call linnea_sha256_init
+    mov rdi, rbp
+    lea rsi, [hrr_msg_hash]     ; fe 00 00 20
+    mov edx, 4
+    call tls_absorb
+    mov rdi, rbp
+    mov rsi, rsp                ; ...followed by the hash itself
+    mov edx, 32
+    call tls_absorb
+    add rsp, 32
+
+    ; build it into msg_buf, which is free again now the hello is parsed, then
+    ; absorb it: the transcript is message_hash || HRR, and ClientHello2 will
+    ; extend it when it arrives.
+    lea rdi, [rbp + linnea_tls_hs.msg_buf]
+    call build_hrr
+    mov r13, rax                ; HRR message length
+    mov rdi, rbp
+    lea rsi, [rbp + linnea_tls_hs.msg_buf]
+    mov rdx, r13
+    call tls_absorb
+    ; keep this exact point of the transcript: a resumption binder in
+    ; ClientHello2 is computed over it plus the truncated hello (4.2.11.2), and
+    ; by the time try_resume runs the live transcript has swallowed all of CH2
+    lea rdi, [rbp + linnea_tls_hs.tr_hrr]
+    lea rsi, [rbp + linnea_tls_hs.transcript]
+    mov rcx, linnea_sha256_ctx_size
+    rep movsb
+
+    ; emit it as a plaintext handshake record, then the middlebox-compatibility
+    ; CCS (RFC 8446 D.4 puts it after the server's FIRST handshake message,
+    ; which is this one — build_flight skips its own once hrr is set).
+    mov r15, [rsp + IN_OUT]
+    mov byte [r15], LINNEA_TLS_CT_HANDSHAKE
+    mov word [r15 + 1], 0x0303
+    mov eax, r13d
+    xchg al, ah                 ; record length, big-endian
+    mov [r15 + 3], ax
+    lea rdi, [r15 + 5]
+    lea rsi, [rbp + linnea_tls_hs.msg_buf]
+    mov rcx, r13
+    rep movsb
+    lea rdi, [r15 + 5 + r13]
+    lea rsi, [ccs_record]
+    mov rcx, 6
+    rep movsb
+    lea rax, [r13 + 11]         ; 5 record header + HRR + 6 CCS
+    mov [rbp + linnea_tls_hs.out_len], rax
+
+    ; wait for ClientHello2 in the same state, with the assembly buffer empty
+    mov dword [rbp + linnea_tls_hs.hrr], 1
+    mov dword [rbp + linnea_tls_hs.msg_len], 0
     jmp .ret
 
 .ch_not_tls:
@@ -642,6 +751,8 @@ parse_ch:
     je .ext_pskmodes
     cmp r12d, 0x10             ; application_layer_protocol_negotiation
     je .ext_alpn
+    cmp r12d, 0x0a             ; supported_groups
+    je .ext_groups
     test r12d, r12d             ; server_name
     jz .ext_sni
     jmp .ext_skip
@@ -716,6 +827,42 @@ parse_ch:
 .ks_next:
     mov rsi, rcx
     jmp .ks_loop
+; supported_groups (RFC 8446 4.2.7). Only read to answer one question: does the
+; client speak x25519? A client may list a group it did not send a share for —
+; OpenSSL sends a share for its FIRST configured group only — and the two cases
+; need opposite answers. Offering x25519 without a share earns a
+; HelloRetryRequest; not offering it at all is a genuine handshake_failure.
+; Without this extension parsed the server cannot tell them apart, which is why
+; `-groups P-256:X25519` used to be refused outright.
+.ext_groups:
+    test r14d, 0x20000
+    jnz .ext_dup
+    or r14d, 0x20000
+    lea rax, [rbx + 2]
+    cmp rax, [rsp]
+    ja .pop_decode
+    movzx eax, byte [rbx]       ; NamedGroupList length
+    shl eax, 8
+    mov al, [rbx + 1]
+    lea rcx, [rbx + 2 + rax]
+    cmp rcx, [rsp]
+    jne .pop_decode
+    test eax, 1
+    jnz .pop_decode             ; a list of 2-byte ids cannot be odd
+    test eax, eax
+    jz .pop_illegal             ; and MUST NOT be empty (4.2.7)
+    lea rsi, [rbx + 2]
+    mov r10, rcx
+.sg_loop:
+    cmp rsi, r10
+    jae .ext_skip
+    cmp word [rsi], 0x1d00      ; group 0x001d (x25519), big-endian
+    jne .sg_next
+    or r14d, 8                  ; the client can do x25519, share or not
+    jmp .ext_skip
+.sg_next:
+    add rsi, 2
+    jmp .sg_loop
 .ext_sa:
     test r14d, 0x400
     jnz .ext_dup
@@ -936,7 +1083,18 @@ parse_ch:
     test r14d, 2                ; supported_versions offered TLS 1.3?
     jz .protocol_version
     test r14d, 1                ; an x25519 key share present?
-    jz .handshake_fail
+    jnz .have_share
+    ; No usable share. RFC 8446 4.1.4 MUST: when the server picks a group the
+    ; client supports but sent no share for, the answer is a HelloRetryRequest,
+    ; not an alert. This is not an exotic path — a client listing P-256 ahead of
+    ; x25519 supports both and simply guessed wrong about which we would pick.
+    test r14d, 8                ; x25519 in supported_groups?
+    jz .handshake_fail          ; genuinely cannot do our group: 4.1.1 alert
+    cmp dword [rbp + linnea_tls_hs.hrr], 0
+    jne .handshake_fail         ; already retried; 4.1.4 allows exactly one
+    mov rax, -2                 ; tell hs_input to retry rather than fail
+    jmp .pret
+.have_share:
     ; signature_algorithms must offer ecdsa_secp256r1_sha256, unless this
     ; is the trace (which injects its key and diverges after ServerHello)
     test dword [rbp + linnea_tls_hs.flags], LINNEA_TLS_FLAG_TRACE
@@ -1003,7 +1161,11 @@ parse_ch:
 %define TR_TH     144
 %define TR_EXP    176          ; recomputed binder
 %define TR_SNIH   208          ; hash of the current SNI
-%define TR_FRAME  248          ; keeps rsp 16-aligned at the inner calls
+%define TR_CTX    216          ; SHA-256 context, only used on a retried
+                               ; handshake (the binder transcript continues
+                               ; from the snapshot rather than starting fresh)
+%define TR_FRAME  328          ; 216 + ctx, rounded to keep rsp 16-aligned at
+                               ; the inner calls exactly as 248 did
 try_resume:
     push rbx
     push rbp
@@ -1078,11 +1240,32 @@ try_resume:
     mov qword [rsp], 32
     call linnea_tls_hkdf_expand_label
     add rsp, 16
-    ; th = SHA256(truncated ClientHello)
+    ; th = the transcript through the truncated ClientHello (RFC 8446 4.2.11.2).
+    ; On a first flight that is the truncated hello and nothing else. After a
+    ; HelloRetryRequest it is message_hash || HRR || Truncate(ClientHello2), so
+    ; resume from the snapshot taken when the retry went out — hashing the hello
+    ; alone would fail every binder and silently cost a retried client its
+    ; resumption, on every connection it ever makes.
+    cmp dword [rbp + linnea_tls_hs.hrr], 0
+    jne .th_after_hrr
     mov rdi, [rbp + linnea_tls_hs.ch_base]
     mov rsi, [rbp + linnea_tls_hs.binders_off]
     lea rdx, [rsp + TR_TH]
     call linnea_sha256
+    jmp .th_done
+.th_after_hrr:
+    lea rdi, [rsp + TR_CTX]
+    lea rsi, [rbp + linnea_tls_hs.tr_hrr]
+    mov rcx, linnea_sha256_ctx_size
+    rep movsb
+    lea rdi, [rsp + TR_CTX]
+    mov rsi, [rbp + linnea_tls_hs.ch_base]
+    mov rdx, [rbp + linnea_tls_hs.binders_off]
+    call linnea_sha256_update
+    lea rdi, [rsp + TR_CTX]
+    lea rsi, [rsp + TR_TH]
+    call linnea_sha256_final
+.th_done:
     ; expected binder = HMAC(finished_key, th)
     lea rdi, [rsp + TR_FKEY]
     mov esi, 32
@@ -1487,11 +1670,17 @@ build_flight:
     mov rcx, r12
     rep movsb
     lea r15, [r15 + 5 + r12]
-    lea rdi, [r15]              ; ChangeCipherSpec (middlebox compatibility)
+    ; ChangeCipherSpec (middlebox compatibility). RFC 8446 D.4 places it after
+    ; the server's FIRST handshake message; on a retried handshake that was the
+    ; HelloRetryRequest, which already sent one, so this ServerHello must not.
+    cmp dword [rbp + linnea_tls_hs.hrr], 0
+    jne .no_ccs
+    lea rdi, [r15]
     lea rsi, [ccs_record]
     mov rcx, 6
     rep movsb
     add r15, 6
+.no_ccs:
     lea rdi, [rbp + linnea_tls_hs.wkeys]   ; sealed handshake flight
     mov esi, LINNEA_TLS_CT_HANDSHAKE
     lea rdx, [rbp + linnea_tls_hs.msg_buf]
@@ -1573,6 +1762,46 @@ build_sh:
     mov [rbx + 3], cl
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; build_hrr(rdi=dest) -> rax = HelloRetryRequest message length. Expects rbp = hs.
+;
+; On the wire this is a ServerHello (RFC 8446 4.1.4): same type byte, same
+; legacy fields, same session-id echo, and the special random above in place of
+; a real one. The extensions differ — supported_versions as usual, and a
+; key_share carrying only the 2-byte group we want a share for, with no
+; key_exchange of our own, since we have not chosen a private key yet.
+build_hrr:
+    push rbx
+    mov rbx, rdi               ; message base
+    mov byte [rbx], 0x02       ; server_hello; length filled in at the end
+    mov word [rbx + 4], 0x0303 ; legacy_version
+    lea rdi, [rbx + 6]
+    lea rsi, [hrr_random]      ; the "this is a retry" random
+    mov rcx, 32
+    rep movsb                  ; rdi -> rbx + 38
+    mov eax, [rbp + linnea_tls_hs.sid_len]
+    mov [rdi], al
+    inc rdi
+    lea rsi, [rbp + linnea_tls_hs.sid]   ; echo legacy_session_id
+    mov rcx, rax
+    rep movsb
+    mov word [rdi], 0x0113     ; cipher_suite 0x1301 (big-endian in memory)
+    mov byte [rdi + 2], 0x00   ; legacy_compression_method
+    mov word [rdi + 3], 0x0c00 ; extensions length = 12
+    mov word [rdi + 5], 0x2b00 ; supported_versions ext type 0x002b
+    mov word [rdi + 7], 0x0200 ; ext length 2
+    mov word [rdi + 9], 0x0403 ; selected_version 0x0304
+    mov word [rdi + 11], 0x3300 ; key_share ext type 0x0033
+    mov word [rdi + 13], 0x0200 ; ext length 2
+    mov word [rdi + 15], 0x1d00 ; selected_group 0x001d (x25519)
+    lea rax, [rdi + 17]
+    sub rax, rbx               ; total length
+    lea rcx, [rax - 4]         ; 24-bit handshake length = total - 4
+    mov byte [rbx + 1], 0
+    mov [rbx + 2], ch
+    mov [rbx + 3], cl
     pop rbx
     ret
 

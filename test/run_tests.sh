@@ -1855,6 +1855,11 @@ rm -f /tmp/up_out test/www/up.bin "$LOG"
 # Needs the openssl CLI (cert generation + s_client) and python3 ssl,
 # both already test-only dependencies. Skips cleanly if either is absent.
 TLSBIN=./bin/linnea-tlstest
+# Build it here rather than trusting whatever is on disk. It links src/linnea_tls.o
+# but `make` alone does not produce it, so an out-of-date binary sits there looking
+# perfectly runnable and quietly exercises the PREVIOUS TLS code — every check below
+# passing against a build that no longer matches the source.
+make -s tlstest >/dev/null 2>&1
 if [ -x "$TLSBIN" ] && command -v openssl >/dev/null 2>&1; then
     tlsdir=$(mktemp -d)
     if openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -1871,6 +1876,45 @@ if [ -x "$TLSBIN" ] && command -v openssl >/dev/null 2>&1; then
               -tls1_3 -quiet 2>/dev/null)
         [ "$got" = "linnea-tls" ]
         check "tls openssl handshake + echo" $?
+
+        # HelloRetryRequest (RFC 8446 4.1.4). OpenSSL sends a key_share for its
+        # FIRST -groups entry only, so a client listing P-256 ahead of x25519
+        # supports our group but guessed wrong about it. That MUST draw a retry;
+        # it used to draw a fatal handshake_failure, locking the client out.
+        got=$(printf 'linnea-hrr' | timeout 8 openssl s_client \
+              -connect 127.0.0.1:$tport -CAfile "$tlsdir/c.pem" \
+              -groups P-256:X25519 -tls1_3 -quiet 2>/dev/null)
+        [ "$got" = "linnea-hrr" ]
+        check "tls HelloRetryRequest: P-256-first client completes" $?
+
+        # the same with several groups ahead of x25519, so the retry is not an
+        # artefact of the two-group case
+        got=$(printf 'linnea-hrr2' | timeout 8 openssl s_client \
+              -connect 127.0.0.1:$tport -CAfile "$tlsdir/c.pem" \
+              -groups P-521:P-384:P-256:X25519 -tls1_3 -quiet 2>/dev/null)
+        [ "$got" = "linnea-hrr2" ]
+        check "tls HelloRetryRequest: several groups before x25519" $?
+
+        # a session must still resume across a retry. The binder is computed over
+        # message_hash || HRR || Truncate(ClientHello2); hashing ClientHello2 on
+        # its own fails it silently, and since such a client is retried on every
+        # connection it would never resume at all.
+        printf 'x' | timeout 8 openssl s_client -connect 127.0.0.1:$tport \
+              -CAfile "$tlsdir/c.pem" -groups P-256:X25519 -tls1_3 \
+              -sess_out "$tlsdir/s.pem" >/dev/null 2>&1
+        printf 'x' | timeout 8 openssl s_client -connect 127.0.0.1:$tport \
+              -CAfile "$tlsdir/c.pem" -groups P-256:X25519 -tls1_3 \
+              -sess_in "$tlsdir/s.pem" 2>&1 | grep -q 'Reused, TLSv1.3'
+        check "tls session resumes across a HelloRetryRequest" $?
+
+        # a client that genuinely cannot do x25519 must still be refused: a
+        # retry would ask for a group it has already declined, and 4.1.4 allows
+        # exactly one, so looping is not an option either
+        timeout 8 openssl s_client -connect 127.0.0.1:$tport \
+              -CAfile "$tlsdir/c.pem" -groups P-256 -tls1_3 \
+              </dev/null >/dev/null 2>&1
+        [ $? -ne 0 ]
+        check "tls no shared group is still a handshake failure" $?
 
         # python ssl: assert protocol + cipher, echo 4B and 16KB
         timeout 8 python3 - "$tlsdir/c.pem" $tport <<'PYEOF'

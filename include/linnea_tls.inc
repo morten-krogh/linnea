@@ -156,6 +156,16 @@ struc linnea_tls_hs
     .binders_off: resq 1    ; truncated-CH length for the binder hash
     .psk_flags:  resd 1     ; bit0 offer recorded, bit1 psk_dhe_ke offered
     .resumed:    resd 1     ; 1 = PSK accepted: no cert, SH carries 0x29
+    ; HelloRetryRequest (RFC 8446 4.1.4). 1 once one has been sent, which both
+    ; refuses a second (4.1.4 allows exactly one) and tells build_flight the
+    ; middlebox-compatibility CCS has already gone out after the HRR (D.4).
+    .hrr:        resd 1
+    ; The transcript as it stood just after the HelloRetryRequest, i.e.
+    ; message_hash || HelloRetryRequest. A resumption binder is computed over
+    ; the transcript through the truncated ClientHello (RFC 8446 4.2.11.2), so
+    ; on a retried handshake it must continue from here rather than hashing
+    ; ClientHello2 alone.
+    .tr_hrr:     resb linnea_sha256_ctx_size
     ; ALPN (RFC 7301): the selected protocol as a length-prefixed name to
     ; echo in EncryptedExtensions, or 0 for none. Set by parse_ch.
     .alpn_name:  resq 1
