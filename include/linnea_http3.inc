@@ -60,10 +60,6 @@ LINNEA_H3_ERR_TOOLARGE equ 4
 ; above, this ends the CONNECTION with H3_FRAME_UNEXPECTED, not the stream.
 LINNEA_H3_ERR_UNEXPECTED equ 5
 
-; Largest POST body echoed back inline; a larger one (whose echo would not fit
-; one response packet) gets a small receipt — its length and a hash — instead.
-LINNEA_H3_ECHO_MAX     equ 1024
-
 ; A response body up to this size is written into the response packet directly
 ; (one packet, as ever). A larger body is not copied at all: linnea_h3_serve
 ; hands back the file mapping and writes only the stream's head — the HEADERS

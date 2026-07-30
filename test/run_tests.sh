@@ -439,9 +439,10 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     timeout 180 python3 test/quic/h3_ctrl_frames_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): control-stream frames walked and validated" $?
 
-    # request bodies: a POST's DATA frames are captured and echoed back intact
+    # request bodies: POST is a 405 now, but the body must still be reassembled
+    # whole and the stream answered, with its flow-control credit settled
     python3 test/quic/h3_body_test.py 47452 >/dev/null 2>&1
-    check "h3 (io_uring): request body captured and echoed (POST)" $?
+    check "h3 (io_uring): a multi-packet request body is consumed and answered" $?
 
     # large responses: a 600 KB file streams as ack-clocked STREAM-frame chunks
     # (each datagram under the 1200-byte floor); one dropped chunk is rebuilt

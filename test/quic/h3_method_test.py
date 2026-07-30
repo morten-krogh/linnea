@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # HTTP/3 request methods. h3 serves static files, and static files answer GET and
-# HEAD — the same rule h1 and h2 apply. Nothing enforced it: only POST (which
-# echoes its body, the observable that proves DATA frames are captured) and HEAD
-# were ever recognised, and every other method fell through to be served AS IF IT
-# WERE A GET. So `PROPFIND /hello.txt` came back 200 with the file's contents,
-# where h1 and h2 both answer 405.
+# HEAD — the same rule h1 and h2 apply, POST included. Nothing enforced it: only
+# POST (which echoed its body back) and HEAD were ever recognised, and every
+# other method fell through to be served AS IF IT WERE A GET. So
+# `PROPFIND /hello.txt` came back 200 with the file's contents, where h1 and h2
+# both answer 405.
 #
 # The method is also matched exactly. RFC 9110 9.1 makes it case-sensitive, so a
 # lowercase "get" is not GET and does not serve a file.
@@ -127,9 +127,11 @@ def probe(method):
 CASES = [
     (b"GET", "200", None),
     (b"HEAD", "200", None),
-    # POST echoes its request body — h3's own observable that DATA frames are
-    # captured, and the one method h3 answers that h1 and h2 refuse
-    (b"POST", "200", None),
+    # POST too: a static file does not take one. h3 used to echo the request
+    # body back instead, which was the observable that DATA frames are captured
+    # rather than a feature — and meant a POST reflected the caller's own bytes
+    # with a 200 where h1 and h2 both answered 405.
+    (b"POST", "405", "GET, HEAD"),
     # every other method is a 405, where each used to be served as a GET
     (b"PUT", "405", "GET, HEAD"),
     (b"DELETE", "405", "GET, HEAD"),
