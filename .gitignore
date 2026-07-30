@@ -35,6 +35,7 @@
 .\#*
 # Server log files
 *.log
+*.log.rot
 test/www/big.txt
 test/www/big2.txt
 test/www/med.txt

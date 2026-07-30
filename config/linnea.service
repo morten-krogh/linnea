@@ -5,10 +5,6 @@
 #   sudo systemctl enable --now linnea
 # Routine deploy after a rebuild — zero downtime, no dropped connections:
 #   make && sudo make install && sudo systemctl reload linnea
-# ONE-TIME EXCEPTION for the generation that introduced --config: a master
-# without the flags re-execs its replacement with a bare path, which the new
-# binary refuses, so a reload onto it is rejected (logged; the old generation
-# carries on serving). Install this unit and use restart for that one deploy.
 # reload sends SIGUSR2: the master re-execs the new binary in place (same
 # PID), the new generation adopts the still-open listeners and starts
 # serving, then the old workers drain. If the new binary rejects the
@@ -47,11 +43,6 @@ Group=linnea
 # the config's root and log paths are relative to this directory
 WorkingDirectory=/home/linnea/linnea
 ExecStart=/usr/local/bin/linnea --config /home/linnea/linnea/config/linnea-tls.json
-# The configuration is named by --config; there is no bare-path form. This line
-# and the binary must therefore be updated TOGETHER, and the generation that
-# introduced the flags deploys by restart, not reload: a master that predates
-# them re-execs its replacement with a bare path, which the new binary refuses,
-# so the upgrade is rejected and the old generation keeps serving.
 # An ExecStartPre=/usr/local/bin/linnea --test --config <path> would refuse to
 # start on a bad config rather than failing in ExecStart; left off by default.
 # reload = zero-downtime binary upgrade (SIGUSR2, re-exec in place). The

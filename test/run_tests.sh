@@ -1697,12 +1697,11 @@ $BIN --test --config test/configs/bad-timeout.json >/dev/null 2>&1
 [ $? -ne 0 ]
 check "config check rejects a bad config" $?
 
-# --- the command line (Q150) -------------------------------------------
-# The configuration is named by -c/--config and nothing else. A bare path used
-# to work and no longer does, which is a deliberate withdrawal: one way of
-# naming the config is less to explain than two. It also means a hot upgrade
-# from a master that predates these flags is REFUSED (it re-execs its
-# replacement with a bare path), so that generation deploys by restart.
+# --- the command line -------------------------------------------------
+# The configuration is named by -c/--config and nothing else. Every spelling of
+# a config check must agree, and every malformed command line — an unknown
+# option, a flag with no value, a config named twice, a bare path — must be a
+# usage error rather than something the server guesses its way through.
 for form in "--test --config test/configs/listen.json" \
             "-t -c test/configs/listen.json" \
             "--config=test/configs/listen.json --test" \

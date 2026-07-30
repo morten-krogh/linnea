@@ -21,7 +21,7 @@
 ; alongside the draining one's (the old sockets leave the group as the
 ; old workers close them), spawns new workers, then SIGQUITs the old
 ; ones, which drain with the old code still mapped. Before committing
-; the master runs the new binary in config-check mode (`-t`); if it
+; the master runs the new binary in config-check mode (`--test`); if it
 ; rejects the config the upgrade is refused and the old generation keeps
 ; serving. Legacy fallback: an upgrade env carrying real listener fds
 ; (a pre-Q122 generation) is adopted shared, exactly as before, and that
@@ -69,15 +69,9 @@ extern linnea_string_from_u64
 section .rodata
 
 ; The option spellings. The configuration comes from -c/--config and nothing
-; else: a bare path used to be accepted too, and one way of naming the config is
-; less to explain than two.
-;
-; That withdrawal has an operational edge. A master from BEFORE these flags
-; re-execs its replacement as `linnea <config>` and validates it with
-; `linnea -t <config>`, both of which this binary now refuses — so a hot upgrade
-; ONTO this generation is rejected (logged, old generation keeps serving) and the
-; first deploy of it has to be a restart. Every upgrade after that is this binary
-; onto itself, using the long forms below.
+; else — one way of naming it is less to explain than two — and the long forms
+; are what the hot upgrade emits, both for its config-check child and for the
+; re-exec that replaces this process.
 opt_c_short:    db "-c", 0
 opt_config:     db "--config", 0
 opt_config_eq:  db "--config=", 0
@@ -93,8 +87,7 @@ help_msg:
     db "  -c, --config <path>  read the configuration from <path>", 10
     db "  -t, --test           check the configuration and certificates, then exit", 10
     db "  -b, --bpf-probe      check that BPF reuseport steering loads, then exit", 10
-    db "  -h, --help           print this and exit", 10, 10
-    db "The configuration is named with -c/--config; there is no bare-path form.", 10
+    db "  -h, --help           print this and exit", 10
 help_msg_len    equ $ - help_msg
 
 env_prefix:     db "LINNEA_UPGRADE="
@@ -383,7 +376,7 @@ _start:
 
 ; parse_args(rdi = &argv[1], rsi = count) — sets config_ptr and cli_mode, prints
 ; the help and exits 0 for --help, or leaves through the usage message. Options
-; may appear in any order and before or after a bare path.
+; may appear in any order.
 ;
 ; Naming the configuration twice is refused rather than resolved last-wins: two
 ; paths on one command line means the operator believes something about which one
@@ -610,7 +603,7 @@ spawn_worker:
     mov esi, msg_fork_len
     jmp linnea_error_exit
 
-; ---- config-check mode (`linnea -t <config>`) -----------------------
+; ---- config-check mode (`linnea --test --config <path>`) ------------
 ; Parse, validate, and load the TLS material, then exit 0. Any fault
 ; exits non-zero via linnea_error_exit. The upgrading master runs this
 ; against the NEW binary before committing, so a broken config or a bad
@@ -679,8 +672,8 @@ do_upgrade:
     call build_upgrade_env
     mov rax, [argv0_ptr]
     mov [exec_argv], rax
-    lea rax, [opt_config]            ; emit the long form; the replacement also
-    mov [exec_argv + 8], rax         ; accepts the bare path an older master sends
+    lea rax, [opt_config]            ; the replacement takes its config the one
+    mov [exec_argv + 8], rax         ; way there is, same as any other caller
     mov rax, [config_ptr]
     mov [exec_argv + 16], rax
     mov qword [exec_argv + 24], 0
