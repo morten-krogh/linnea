@@ -71,6 +71,14 @@ struc linnea_h2_stream
     .body_rem:  resq 1   ; body bytes not yet framed
     .flags:     resq 1   ; bit 0 = set END_STREAM on the final DATA frame
     .up:        resq 1   ; proxied stream: upstream slot index + 1 (0 = static)
+    ; RFC 9218 priority, taken from the request's `priority` field at slot
+    ; allocation (default urgency 3, non-incremental). The scheduler serves the
+    ; lowest urgency first; within one urgency a non-incremental response runs
+    ; to completion in arrival order and incremental ones share the connection
+    ; window in turn — the same policy h3's pump applies, so the two protocols
+    ; schedule concurrent responses alike.
+    .urgency:     resq 1   ; 0 (highest) .. 7 (lowest), default 3
+    .incremental: resq 1   ; 1 = deliver progressively, sharing the window
 endstruc
 
 LINNEA_H2_STREAM_END    equ 1       ; .flags bit 0

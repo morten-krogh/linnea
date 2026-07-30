@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-# HTTP/2 multiplexing (M18): concurrent streams interleaved, rapid-reset
-# defense, and pool exhaustion. Exits 0 on success.
+# HTTP/2 multiplexing (M18): concurrent streams all make progress and complete,
+# rapid-reset defense, and pool exhaustion. Exits 0 on success.
+#
+# This does NOT test interleaving, despite how the check below reads: at ~7 DATA
+# frames per 100 KB stream, several streams show up in any 24-frame window
+# whether they are interleaved or run one after another. What it does test is
+# that no stream starves. The scheduling policy itself — sequential by default,
+# interleaved when `i` is set, urgency first — is h2_priority.py.
 # Usage: h2_multiplex.py <cafile> <port>   (server must serve /big.txt = 100000 B)
 import ssl, socket, struct, sys
 
@@ -78,7 +84,7 @@ def test_concurrent():
             break
     s.close()
     assert all(v == 100000 for v in got.values()), got
-    assert len(set(order[:24])) > 1, "DATA frames not interleaved: %r" % order[:24]
+    assert len(set(order[:24])) > 1, "only one stream made progress: %r" % order[:24]
 
 
 def test_rapid_reset():

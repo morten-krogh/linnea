@@ -2454,6 +2454,13 @@ PY
     timeout 30 python3 test/tls/h2_multiplex.py $CA 47446 >/dev/null 2>&1
     check "http2 multiplexing (concurrent streams, rapid-reset, pool cap)" $?
 
+    # RFC 9218 scheduling, the same policy h3's pump applies: the default
+    # priority is NON-incremental, so concurrent responses complete one at a
+    # time in arrival order; u=0 jumps the queue; i opts back in to sharing the
+    # window. h2 parsed the priority field and then ignored it entirely.
+    timeout 200 python3 test/tls/h2_priority.py $CA 47446 >/dev/null 2>&1
+    check "http2 responses scheduled by RFC 9218 priority" $?
+
     # M19: fuzz the frame layer and HPACK decoder — malformed streams must
     # never crash the worker; a live h2 GET still serves between batches.
     # 150s, not 60: since unknown frame types are discarded rather than drawing

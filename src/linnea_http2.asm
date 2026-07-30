@@ -52,6 +52,7 @@ extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_iequal
 extern linnea_string_equal
+extern linnea_quic_parse_priority
 extern linnea_memory_map
 extern linnea_log_stamp
 extern linnea_log_write
@@ -1283,6 +1284,7 @@ h2_serve:
     ; register the body in a pool slot; the scheduler streams it as DATA
     mov rdi, rbx
     mov esi, [rsp + S_SID]
+    mov rdx, r12                     ; req, for its priority field
     call h2_slot_alloc               ; -> rax = slot* or 0 (pool full)
     test rax, rax
     jz .refused
@@ -1445,6 +1447,7 @@ h2_serve:
     mov r14, rdx                     ; its index
     mov rdi, rbx
     mov rsi, [rsp + S_SID]
+    mov rdx, r12                     ; req, for its priority field
     call h2_slot_alloc               ; the stream slot (windows + scheduling)
     test rax, rax
     jz .drain_refuse                 ; stream pool full (the h2p slot was
@@ -3743,6 +3746,9 @@ h2_slot_find:
     ret
 
 ; h2_slot_alloc(rdi=conn, esi=stream id) -> rax = slot* or 0 (pool full).
+; h2_slot_alloc(rdi=conn, rsi=stream id, rdx=req) -> rax = slot* or 0 (pool
+; full). Also records the request's RFC 9218 priority on the slot, so the two
+; call sites cannot drift apart on how a response gets scheduled.
 h2_slot_alloc:
     lea rax, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]
     mov ecx, LINNEA_H2_MAX_STREAMS
@@ -3756,6 +3762,21 @@ h2_slot_alloc:
     ret
 .sa_free:
     mov [rax + linnea_h2_stream.id], rsi
+    mov qword [rax + linnea_h2_stream.urgency], 3      ; RFC 9218 defaults
+    mov qword [rax + linnea_h2_stream.incremental], 0
+    test rdx, rdx
+    jz .sa_ret                       ; no request (never happens today)
+    mov rdi, [rdx + linnea_h2_req.prio_ptr]
+    test rdi, rdi
+    jz .sa_ret                       ; no `priority` field: keep the defaults
+    push rax                         ; (also what leaves the call 16-aligned)
+    mov rsi, [rdx + linnea_h2_req.prio_len]
+    call linnea_quic_parse_priority  ; rax = urgency, rdx = incremental
+    mov rcx, rax
+    pop rax
+    mov [rax + linnea_h2_stream.urgency], rcx
+    mov [rax + linnea_h2_stream.incremental], rdx
+.sa_ret:
     ret
 
 ; h2_schedule(rdi=conn) -> rax = 1 if a DATA frame was queued (out_ptr /
@@ -3768,6 +3789,9 @@ h2_schedule:
     push r13
     push r14
     push r15
+    sub rsp, 32                      ; [0]=best key, [8]=best slot, [16]=its cursor
+    mov qword [rsp], -1              ; no candidate yet (every real key is lower)
+    mov qword [rsp + 8], 0
     mov rbx, rdi
     lea r12, [rdi + linnea_connection.up_buf + LINNEA_H2_POOL_OFF]  ; pool base
     ; reap slots whose body is fully framed (their last DATA has drained)
@@ -3811,7 +3835,7 @@ h2_schedule:
     xor r14d, r14d                   ; slots examined
 .scan:
     cmp r14d, LINNEA_H2_MAX_STREAMS
-    jae .none
+    jae .scan_done
     mov rax, r13
     and eax, LINNEA_H2_MAX_STREAMS - 1   ; MAX_STREAMS is a power of two (16)
     imul rax, rax, linnea_h2_stream_size
@@ -3850,7 +3874,7 @@ h2_schedule:
     jz .scan_next
     test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_NO_BODY
     jnz .scan_next                   ; HEADERS already carried END_STREAM
-    jmp .emit                        ; an empty final DATA carries END_STREAM
+    jmp .scan_cand                   ; an empty final DATA carries END_STREAM
 .scan_static:
     cmp qword [r15 + linnea_h2_stream.body_rem], 0
     je .scan_next
@@ -3858,11 +3882,42 @@ h2_schedule:
 .scan_win:
     cmp qword [r15 + linnea_h2_stream.swnd], 0
     jle .scan_next
-    jmp .emit
+.scan_cand:
+    ; This slot can send. Score it: priority key = urgency<<40 |
+    ; incremental<<39 | tiebreak, lowest wins — the same key h3's pump uses.
+    ; The tiebreak keeps order within one urgency: a non-incremental stream is
+    ; ranked by its stream id, so the earliest arrival runs to completion first,
+    ; while an incremental one is ranked by its distance past the round-robin
+    ; cursor, so equal peers take turns.
+    mov rax, [r15 + linnea_h2_stream.urgency]
+    shl rax, 40
+    mov rcx, [r15 + linnea_h2_stream.incremental]
+    shl rcx, 39
+    or rax, rcx
+    cmp qword [r15 + linnea_h2_stream.incremental], 0
+    jne .scan_key_incr
+    mov rcx, [r15 + linnea_h2_stream.id]
+    jmp .scan_key
+.scan_key_incr:
+    mov rcx, r14                     ; slots examined = distance past the cursor
+.scan_key:
+    mov rdx, 0x7FFFFFFFFF            ; keep the tiebreak inside its 39-bit field
+    and rcx, rdx
+    or rax, rcx
+    cmp rax, [rsp]
+    jae .scan_next                   ; no better than the best so far
+    mov [rsp], rax
+    mov [rsp + 8], r15
+    mov [rsp + 16], r13
 .scan_next:
     inc r13
     inc r14d
     jmp .scan
+.scan_done:
+    cmp qword [rsp + 8], 0
+    je .none                         ; nothing servable
+    mov r15, [rsp + 8]
+    mov r13, [rsp + 16]
 .emit:
     ; chunk = min(cwnd, swnd, body_rem, MAX_FRAME)
     mov rax, [rbx + linnea_connection.h2_cwnd]
@@ -3950,14 +4005,21 @@ h2_schedule:
     ; releases it
     or qword [rax + linnea_h2p.flags], LINNEA_H2P_F_REAP
 .emit_static:
-    ; advance the round-robin cursor past this slot
+    ; Rotate the cursor past this slot only if it is incremental, so its
+    ; equal-urgency peers get the next turn. A non-incremental stream leaves the
+    ; cursor alone and keeps winning its urgency until it is done (RFC 9218 4.1
+    ; — the client asked for one response in full before the others).
+    cmp qword [r15 + linnea_h2_stream.incremental], 0
+    je .emit_done
     inc r13
     mov [rbx + linnea_connection.h2_rr_cursor], r13
+.emit_done:
     mov eax, 1
     jmp .sched_ret
 .none:
     xor eax, eax
 .sched_ret:
+    add rsp, 32                      ; the best-candidate frame
     pop r15
     pop r14
     pop r13
