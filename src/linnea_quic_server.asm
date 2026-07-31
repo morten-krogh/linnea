@@ -2006,10 +2006,22 @@ linnea_quic_server_datagram:
     ; Anything else is a malformed request: a truncated frame, or no HEADERS at
     ; all. Both entries to .serve_bidi require the FIN, so the stream is whole
     ; and nothing more is coming — dropping it here left the client waiting on
-    ; a request that would never be answered. Reset the stream instead, which
-    ; also settles the flow-control credit its bytes are holding.
+    ; a request that would never be answered. Reset the stream instead.
+    ;
+    ; Final Size is ours, not the peer's (RFC 9000 19.4): it is "the final size
+    ; of the stream by the RESET_STREAM sender", and on a client-initiated
+    ; bidirectional stream our RESET_STREAM ends only the server-to-client
+    ; direction. This used to send the length of the CLIENT's request, on the
+    ; reasoning that the reset settles the credit those bytes hold — but that is
+    ; the receive direction, which a reset of our own sending direction does not
+    ; touch. The peer then charged its connection-level window up to 8 KB for
+    ; data it would never be sent, on every malformed request, and a client whose
+    ; initial_max_stream_data_bidi_remote sits below that MUST close the
+    ; connection with FLOW_CONTROL_ERROR (4.5). No response is open here — the
+    ; duplicate guard above has already sent that case elsewhere — so nothing has
+    ; gone out this way and the true final size is zero.
     mov rdi, [s_sid]
-    mov rsi, [s_slen]                ; final size: what the stream did carry
+    xor esi, esi                     ; nothing was sent in the direction we reset
     mov edx, 0x10e                   ; H3_MESSAGE_ERROR (RFC 9114 8.1)
     call tx_reset_stream_code
     jmp .stream_scan

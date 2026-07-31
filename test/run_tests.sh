@@ -573,6 +573,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_frame_walk_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): coalesced frames do not hide the rest of the packet" $?
 
+    # RESET_STREAM's Final Size is OURS, not the peer's (RFC 9000 19.4). Resetting
+    # a malformed request reported the client's request length, so the peer held
+    # connection-level credit for data it would never be sent — and one large
+    # enough obliges a conforming client to close with FLOW_CONTROL_ERROR.
+    python3 test/quic/h3_reset_final_size_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): RESET_STREAM reports our own final size" $?
+
     # the same for the handshake flights: no long-header packet authenticates its
     # sender, so neither a replayed Initial nor a forged Handshake may move the
     # peer address (RFC 9000 9 — no migration before the handshake is confirmed)
