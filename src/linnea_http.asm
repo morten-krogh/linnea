@@ -491,6 +491,106 @@ section .text
 ;   [rsp+296] Host field lines seen (RFC 9112 3.2 wants exactly one)
 ;   [rsp+304] asterisk-form: the target was "*", so the request is about the
 ;             server itself rather than any resource (OPTIONS *)
+
+; http_conn_option_named(rdi = field name, rsi = name length, rbx = connection)
+;   -> eax = 1 when the client's Connection field lists this name.
+;
+; RFC 9110 7.6.1 MUST: an intermediary parses Connection before forwarding and
+; removes every field the value names, then Connection itself. Only Connection
+; and Expect were being dropped, so a client sending
+;     Connection: X-Auth-Bypass
+;     X-Auth-Bypass: 1
+; had X-Auth-Bypass delivered to the backend as an ordinary end-to-end field.
+; That is the header-smuggling shape the requirement exists to close: the client
+; marks a field hop-by-hop, we forward it anyway, and the backend cannot tell it
+; was never meant to arrive.
+;
+; `upgrade` is deliberately not matched. The upgrade path re-emits Connection:
+; upgrade itself and relies on the client's Upgrade field being forwarded, so
+; treating that one token as a removal instruction would break the tunnel the
+; server is setting up — there the intermediary is a participant, not a
+; bystander.
+;
+; Everything the loop needs lives in callee-saved registers, so no value has to
+; be pushed across the comparison calls and the stack parity the caller left is
+; untouched.
+http_conn_option_named:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi                      ; the name we are asking about
+    mov r13, rsi
+    mov r14, [rbx + linnea_connection.conn_opts]
+    test r14, r14
+    jz .cn_no                         ; no Connection field at all
+    mov r15, r14
+    add r15, [rbx + linnea_connection.conn_opts_len]   ; value end
+.cn_tok:
+    cmp r14, r15
+    jae .cn_no
+    movzx ecx, byte [r14]
+    cmp cl, ','
+    je .cn_step
+    cmp cl, ' '
+    je .cn_step
+    cmp cl, 9
+    je .cn_step
+    mov rbp, r14                      ; token start; find its end
+.cn_end:
+    cmp rbp, r15
+    jae .cn_have
+    movzx ecx, byte [rbp]
+    cmp cl, ','
+    je .cn_have
+    cmp cl, ' '
+    je .cn_have
+    cmp cl, 9
+    je .cn_have
+    inc rbp
+    jmp .cn_end
+.cn_have:
+    mov rcx, rbp
+    sub rcx, r14                      ; token length
+    cmp rcx, r13
+    jne .cn_next                      ; lengths differ: cannot match
+    mov rdi, r12
+    mov rsi, r13
+    mov rdx, r14
+    call linnea_string_iequal
+    test eax, eax
+    jz .cn_next
+    ; a match — unless it is `upgrade`, which this server forwards on purpose
+    mov rdi, r14
+    mov rsi, rbp
+    sub rsi, r14
+    lea rdx, [hn_upgrade]
+    mov ecx, 7
+    call linnea_string_iequal
+    test eax, eax
+    jnz .cn_no                        ; the upgrade token names a field we keep
+    mov eax, 1
+    jmp .cn_ret
+.cn_next:
+    mov r14, rbp                      ; resume after this token
+    jmp .cn_tok
+.cn_step:
+    inc r14
+    jmp .cn_tok
+.cn_no:
+    xor eax, eax
+.cn_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+
 linnea_http_handle:
     push rbx
     push r12
@@ -517,6 +617,7 @@ linnea_http_handle:
     mov qword [rsp + 208], 0   ; no Accept-Encoding yet
     mov qword [rsp + 224], 0   ; nothing negotiated
     mov qword [rsp + 232], 0   ; no upgrade asked
+    mov qword [rbx + linnea_connection.conn_opts], 0      ; no Connection field yet
     mov qword [rsp + 240], 0   ; no Range yet
     mov qword [rsp + 256], 0   ; no If-Range yet
     mov ecx, [rbx + linnea_connection.server]
@@ -752,6 +853,11 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jz .try_content_len
+    ; keep the value: every token in it names a field the proxy must not forward
+    mov rax, [rsp + 72]
+    mov [rbx + linnea_connection.conn_opts], rax
+    mov rax, [rsp + 80]
+    mov [rbx + linnea_connection.conn_opts_len], rax
     mov rdi, [rsp + 72]
     mov rsi, [rsp + 80]
     lea rdx, [hv_close]
@@ -1845,7 +1951,15 @@ linnea_http_handle:
     inc r8
     jmp .proxy_colon_scan
 .proxy_colon_found:
-    mov r9, r8                 ; colon offset; iequal clobbers r8
+    ; Keep the colon offset in r10. iequal clobbers r8 — which the old comment
+    ; here noted — but it clobbers r9 as well, and only sometimes: it writes r9b
+    ; solely once the two lengths it was given match, returning untouched when
+    ; they differ. So r9 survived most comparisons and was quietly destroyed by
+    ; the ones that got as far as comparing bytes, which is why a field name of
+    ; exactly 10 characters (the length of "connection") reached the Expect test
+    ; with a garbage length. r10 is one of the two registers iequal never uses.
+    mov r10, r8                ; colon offset, safe across the comparisons below
+    mov r9, r8
     mov rax, r8
     sub rax, rcx               ; header name length
     lea rdi, [r14 + rcx]
@@ -1859,7 +1973,7 @@ linnea_http_handle:
     ; upstream to authorize: forwarding Expect would only invite a 100
     ; Continue, which this exchange has no way to handle.
     mov rcx, [rsp + 56]
-    mov rax, r9
+    mov rax, r10
     sub rax, rcx
     lea rdi, [r14 + rcx]
     mov rsi, rax
@@ -1868,6 +1982,15 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jnz .proxy_next_line
+    ; and every field the client's own Connection value names (RFC 9110 7.6.1)
+    mov rcx, [rsp + 56]
+    mov rax, r10
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    call http_conn_option_named
+    test eax, eax
+    jnz .proxy_next_line              ; hop-by-hop: it stops here
 .proxy_copy_line:
     mov rcx, [rsp + 56]
     mov rdx, [rsp + 64]

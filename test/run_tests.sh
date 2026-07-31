@@ -1480,6 +1480,13 @@ check_http "proxy closes upstream"  "Connection: close" "$resp"
 resp=$(curl -s --max-time 3 -d 'hello body' http://127.0.0.1:47080/api/echo)
 check_http "proxy forwards body" "hello body" "$resp"
 
+# ...but a field the client's own Connection names is hop-by-hop and MUST be
+# removed before forwarding (RFC 9110 7.6.1). Only Connection and Expect were
+# dropped, so a client could mark any field hop-by-hop and have it delivered to
+# the backend anyway — the header-smuggling shape that rule exists to close.
+timeout 60 python3 test/tls/h1_proxy_hop_by_hop.py 47080 >/dev/null 2>&1
+check "proxy removes the fields Connection names" $?
+
 # a HEAD response is head-only even though the backend sends Content-Length:
 # waiting for that body would hang until the idle timeout
 resp=$(curl -si --max-time 3 -I http://127.0.0.1:47080/api/simple)

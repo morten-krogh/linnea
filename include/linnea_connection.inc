@@ -88,6 +88,13 @@ struc linnea_connection
     .up_status:     resq 1         ; upstream status code, for the log
     .is_head:       resq 1         ; 1 = the client sent HEAD (no body relay)
     ; --- upgrade tunnel (websockets etc.) ----------------------------
+    ; The client's Connection field value, so the proxy rewriter can honour
+    ; RFC 9110 7.6.1: every field this names is hop-by-hop and MUST be removed
+    ; before forwarding. Without it the rewriter dropped only Connection itself
+    ; and passed the named fields straight to the backend — which is exactly the
+    ; header-smuggling primitive that requirement exists to close.
+    .conn_opts:     resq 1         ; -> the field value, 0 = no Connection field
+    .conn_opts_len: resq 1
     .upgrade:       resq 1         ; 1 = the client asked to upgrade and the
                                    ; wish was forwarded; a 101 starts a tunnel
     .ws_c2u_busy:   resq 1         ; an op is in flight client->upstream
