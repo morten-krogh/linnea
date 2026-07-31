@@ -1026,39 +1026,15 @@ linnea_quic_server_datagram:
     ; (Chrome begins at 1), and acking a packet it never sent (e.g. 0) is an invalid
     ; ACK the client rejects (QUIC_INVALID_ACK_DATA). The numbers are tiny (a handful
     ; of Initials per ClientHello), so each varint is one byte and the ACK stays five.
-    mov byte [payload], 0x02
-    mov dword [payload + 1], 0
+    ; keep the ServerHello: a retransmission of this flight has to rebuild the
+    ; Initial that carries it, and sh_buf is scratch clobbered between datagrams
     mov rax, [cur_conn]
-    movzx ecx, byte [rax + linnea_quic_conn.ch_maxpn]
-    mov [payload + 1], cl            ; Largest Acknowledged
-    mov rdx, [rax + linnea_quic_conn.ch_maxpn]
-    sub rdx, [rax + linnea_quic_conn.ch_minpn]
-    mov [payload + 4], dl            ; First ACK Range = largest - smallest
-    mov byte [payload + 5], 0x06
-    mov byte [payload + 6], 0x00
-    mov eax, [s_sh_len]              ; CRYPTO length varint (2-byte: 0x4000 | len)
-    shl eax, 8
-    or eax, 0x40
-    mov [payload + 7], ax
-    lea rdi, [payload + 9]
-    lea rsi, [sh_buf]
     mov ecx, [s_sh_len]
-    rep movsb                        ; payload length = 9 + SH
-    call .build_initial_header       ; -> rcx = header length (uses s_cscid_*)
-    sub rsp, 16
-    CONNLEA rax, ini_server
-    mov [rsp], rax
-    mov qword [rsp + 8], 0           ; Initial packet number is 0 (full pn for the nonce)
-    lea rdi, [outpkt]
-    lea rsi, [hdr]
-    mov rdx, rcx
-    mov ecx, 1
-    lea r8, [payload]
-    mov r9d, [s_sh_len]
-    add r9d, 9                        ; ACK(5) + CRYPTO header(4) + SH
-    call linnea_quic_protect         ; rax = Initial packet length
-    add rsp, 16
-    mov [s_ini_len], rax
+    mov [rax + linnea_quic_conn.sh_len], rcx
+    lea rdi, [rax + linnea_quic_conn.sh_msg]
+    lea rsi, [sh_buf]
+    rep movsb
+    call .build_initial_packet       ; -> outpkt, s_ini_len; consumes conn.pn_ini
 
     ; ===== handshake keys and messages =====
     ; th = H(CH || SH)
@@ -1169,6 +1145,12 @@ linnea_quic_server_datagram:
     mov qword [rbx + linnea_quic_conn.flight_off], 0
     mov qword [rbx + linnea_quic_conn.flight_pn], 0
     call .send_flight                                 ; hsmsg is still the built flight
+    ; arm the probe timer: until the client's Finished arrives, this flight is
+    ; unacknowledged and the sweep must be willing to send it again
+    call now_ms
+    mov rbx, [cur_conn]
+    mov [rbx + linnea_quic_conn.flight_ms], rax
+    mov qword [rbx + linnea_quic_conn.flight_tries], 0
     ; save the transcript through the server Finished; the client's Finished
     ; MAC covers exactly this (H(CH || SH || EE || Cert || CertVerify || Fin)).
     lea rsi, [hsmsg]
@@ -2972,8 +2954,93 @@ linnea_quic_server_datagram:
     rep movsb
     ret
 
+; .build_initial_packet — the Initial carrying ACK(client Initials) + CRYPTO
+; (ServerHello), protected into outpkt with s_ini_len set. Expects the message in
+; sh_buf with its length in s_sh_len. Takes its packet number from conn.pn_ini and
+; advances it, so a retransmission never reuses one (RFC 9000 12.3).
+.build_initial_packet:
+    ; This block ran inline until it had to be shared with the retransmit path.
+    ; Becoming a callee costs 8 bytes of stack for the return address, which left
+    ; linnea_quic_protect — and the SSE it reaches — running one call deeper and
+    ; misaligned. Put rsp back on a 16-byte boundary.
+    sub rsp, 8
+    mov byte [payload], 0x02
+    mov dword [payload + 1], 0
+    mov rax, [cur_conn]
+    movzx ecx, byte [rax + linnea_quic_conn.ch_maxpn]
+    mov [payload + 1], cl            ; Largest Acknowledged
+    mov rdx, [rax + linnea_quic_conn.ch_maxpn]
+    sub rdx, [rax + linnea_quic_conn.ch_minpn]
+    mov [payload + 4], dl            ; First ACK Range = largest - smallest
+    mov byte [payload + 5], 0x06
+    mov byte [payload + 6], 0x00
+    mov eax, [s_sh_len]              ; CRYPTO length varint (2-byte: 0x4000 | len)
+    shl eax, 8
+    or eax, 0x40
+    mov [payload + 7], ax
+    lea rdi, [payload + 9]
+    lea rsi, [sh_buf]
+    mov ecx, [s_sh_len]
+    rep movsb                        ; payload length = 9 + SH
+    call .build_initial_header       ; -> rcx = header length
+    sub rsp, 16
+    CONNLEA rax, ini_server
+    mov [rsp], rax
+    mov rax, [cur_conn]              ; full pn for the nonce
+    mov rax, [rax + linnea_quic_conn.pn_ini]
+    mov [rsp + 8], rax
+    lea rdi, [outpkt]
+    lea rsi, [hdr]
+    mov rdx, rcx
+    mov ecx, 1
+    lea r8, [payload]
+    mov r9d, [s_sh_len]
+    add r9d, 9                        ; ACK(5) + CRYPTO header(4) + SH
+    call linnea_quic_protect         ; rax = Initial packet length
+    add rsp, 16
+    mov [s_ini_len], rax
+    mov rcx, [cur_conn]
+    inc qword [rcx + linnea_quic_conn.pn_ini]
+    add rsp, 8
+    ret
+
+; .retx_hs_flight — resend the whole server flight after a PTO (RFC 9000 13.3,
+; RFC 9002 6.2). There was no loss recovery for the Initial or Handshake spaces
+; at all: .send_flight ran once when the flight was built and once when the
+; amplification budget released its tail, and the sweep walked only the 1-RTT
+; rings. So a lost first datagram simply ended the handshake — the client
+; retransmitted its ClientHello until it gave up on HTTP/3 and fell back to TCP.
+;
+; Everything needed is connection state: the ServerHello above, and the Handshake
+; half which .recompose_flight rebuilds from flight_tail plus the vhost's
+; certificate. Both go out under fresh packet numbers. Expects rbx = conn,
+; r12d = fd; clobbers freely.
+.retx_hs_flight:
+    ; This is a callee, so rsp arrives 8 off a 16-byte boundary; the builders it
+    ; calls reach SSE, and .build_initial_packet re-aligns only for the depth of
+    ; the first-flight path. Put rsp back before calling anything.
+    sub rsp, 8
+    mov [cur_conn], rbx
+    mov al, [rbx + linnea_quic_conn.is_v2]
+    mov [quic_v2_active], al          ; salt/labels/type codes for this connection
+    mov rax, [rbx + linnea_quic_conn.sh_len]
+    mov [s_sh_len], rax
+    lea rdi, [sh_buf]
+    lea rsi, [rbx + linnea_quic_conn.sh_msg]
+    mov rcx, rax
+    rep movsb
+    call .build_initial_packet
+    ; the builders owe us nothing, rbx included — reach the connection through
+    ; cur_conn rather than assuming it survived
+    mov rax, [cur_conn]
+    mov qword [rax + linnea_quic_conn.flight_off], 0   ; resend the flight whole
+    call .recompose_flight
+    call .send_flight
+    add rsp, 8
+    ret
+
 ; .build_initial_header -> rcx = header length; DCID = client SCID, SCID = ours,
-; length field = pn(1)+payload(99)+tag(16) = 116, packet number 0.
+; length field = pn(1)+payload(99)+tag(16) = 116, packet number from conn.pn_ini.
 .build_initial_header:
     mov byte [hdr], 0xc0             ; v1: long Initial (type bits 00, 1-byte pn),
     mov dword [hdr + 1], 0x01000000  ; version 0x00000001
@@ -3001,7 +3068,9 @@ linnea_quic_server_datagram:
     or edx, 0x40
     mov [rdi + 1], dl                ; 0x40 | (len >> 8)
     mov [rdi + 2], al                ; len & 0xff
-    mov byte [rdi + 3], 0x00         ; packet number 0
+    mov rax, [cur_conn]              ; 1-byte packet number; a few retries at most
+    mov rax, [rax + linnea_quic_conn.pn_ini]
+    mov [rdi + 3], al
     lea rcx, [rdi + 4]
     lea rax, [hdr]
     sub rcx, rax                     ; header length
@@ -4252,6 +4321,51 @@ linnea_quic_server_rtx_sweep:
     mov rdi, rbx
     call linnea_quic_dbg_conn
 .sw_no_dbg:
+    ; --- the server's own handshake flight, while it is still unacknowledged ---
+    ; A connection sitting in ST_HANDSHAKE has told the client everything it knows
+    ; and heard nothing back. The 1-RTT rings below are empty for it, so without
+    ; this it had no loss recovery whatsoever.
+    cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_HANDSHAKE
+    jne .sw_hs_done
+    mov rax, [rbx + linnea_quic_conn.flight_ms]
+    test rax, rax
+    jz .sw_hs_done                    ; nothing outstanding
+    mov rcx, r15
+    sub rcx, rax                      ; age in ms
+    mov rdx, [rbx + linnea_quic_conn.flight_tries]
+    cmp rdx, LINNEA_QUIC_PTO_CAP
+    jbe .sw_hs_shift
+    mov edx, LINNEA_QUIC_PTO_CAP
+.sw_hs_shift:
+    mov rax, LINNEA_QUIC_PTO_MS
+    xchg rcx, rdx                     ; cl = backoff shift, rdx = age
+    shl rax, cl
+    cmp rdx, rax
+    jb .sw_hs_done                    ; not yet due
+    cmp qword [rbx + linnea_quic_conn.flight_tries], LINNEA_QUIC_PTO_MAX
+    jae .sw_hs_give_up
+    ; the flight rebuild reaches through vhost_slot and build_cert, neither of
+    ; which owes this loop its registers — save what the sweep still needs
+    push r12                          ; fd
+    push r13                          ; connection index
+    push r15                          ; now, ms
+    push rbx
+    ; the flight builders are locals of linnea_quic_server_datagram, so the sweep
+    ; has to name the scope it is reaching into
+    call linnea_quic_server_datagram.retx_hs_flight
+    pop rbx
+    pop r15
+    pop r13
+    pop r12
+    mov [rbx + linnea_quic_conn.flight_ms], r15
+    inc qword [rbx + linnea_quic_conn.flight_tries]
+    jmp .sw_hs_done
+.sw_hs_give_up:
+    ; stop probing and let the idle sweep reclaim the slot; the peer is gone or
+    ; the path is black-holing us, and more copies of a 1150-byte flight would
+    ; only be an amplification gift
+    mov qword [rbx + linnea_quic_conn.flight_ms], 0
+.sw_hs_done:
     lea r14, [rbx + linnea_quic_conn.sent]
     xor ebp, ebp                      ; slot
 .sw_rec:

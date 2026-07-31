@@ -556,6 +556,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_replay_spoof_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): replayed packet does not redirect the connection" $?
 
+    # the server's own first flight must survive being lost. There was no loss
+    # recovery for the Initial or Handshake spaces at all, so dropping that one
+    # ~1150-byte datagram ended the handshake and the client fell back to TCP.
+    python3 test/quic/h3_hs_rtx_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): a lost handshake flight is retransmitted" $?
+
     # the same for the handshake flights: no long-header packet authenticates its
     # sender, so neither a replayed Initial nor a forged Handshake may move the
     # peer address (RFC 9000 9 — no migration before the handshake is confirmed)

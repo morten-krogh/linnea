@@ -347,6 +347,18 @@ struc linnea_quic_conn
     .flight_ee_len: resq 1          ; EncryptedExtensions length (Certificate follows it)
     .flight_cv_len: resq 1          ; CertificateVerify length (Finished's 36 follow it)
     .flight_tail: resb LINNEA_QUIC_FLIGHT_TAIL   ; EE || CertVerify || Finished
+    ; What a retransmission of the server's first flight needs (RFC 9000 13.3,
+    ; RFC 9002 6.2). The Handshake half recomposes from the fields above, but the
+    ; ServerHello lived only in per-datagram scratch, so the Initial carrying it
+    ; could not be rebuilt — and losing that one ~1150-byte datagram, the most
+    ; drop-prone of the connection, killed the handshake outright.
+    .sh_len:     resq 1              ; 90 fresh, 96 with the PSK extension
+    .sh_msg:     resb 128
+    .pn_ini:     resq 1              ; next Initial packet number we send; a
+                                     ; retransmission MUST NOT reuse one (12.3)
+    .flight_ms:  resq 1              ; CLOCK_MONOTONIC ms the flight last went
+                                     ; out; 0 = nothing outstanding to probe
+    .flight_tries: resq 1            ; PTO backoff for the flight
     ; request-stream reassembly: LINNEA_QUIC_RA_CTXS streams reassemble at once
     ; Stream ids the peer has cancelled (RESET_STREAM / STOP_SENDING), as a
     ; small ring. A cancel can arrive before the request that produced it has
