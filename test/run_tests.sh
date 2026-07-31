@@ -565,6 +565,14 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_hs_rtx_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): a lost handshake flight is retransmitted" $?
 
+    # Frames coalesced ahead of a request must not hide it (RFC 9000 12.4). Six
+    # scanners each carried a partial frame-length table and stopped at the first
+    # type theirs did not list, so a CONNECTION_CLOSE hid what followed it and an
+    # unknown type hid the rest of the packet from all six — silently, with the
+    # packet acknowledged, so the client never retried.
+    python3 test/quic/h3_frame_walk_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): coalesced frames do not hide the rest of the packet" $?
+
     # the same for the handshake flights: no long-header packet authenticates its
     # sender, so neither a replayed Initial nor a forged Handshake may move the
     # peer address (RFC 9000 9 — no migration before the handshake is confirmed)

@@ -25,6 +25,8 @@ extern linnea_quic_ack_record
 extern linnea_quic_ack_seen
 extern linnea_quic_rtt_sample
 extern linnea_quic_pto_ms
+extern linnea_quic_frame_skip
+extern linnea_quic_frames_check
 extern linnea_quic_reset_scan
 extern linnea_quic_path_seen
 extern linnea_quic_path_data
@@ -90,6 +92,31 @@ prio_bare_i: db "i"
 prio_bare_i_len equ $ - prio_bare_i
 prio_bad:  db "u=9"                   ; out of range: falls back to the default
 prio_bad_len equ $ - prio_bad
+
+; --- frame-length table fixtures (RFC 9000 19) ---
+fk_pad:     db 0x00
+fk_ping:    db 0x01
+fk_hd:      db 0x1e
+fk_pc:      db 0x1a, 1,2,3,4,5,6,7,8
+fk_maxdata: db 0x10, 0x41, 0x2C                       ; MAX_DATA 300 (2-byte varint)
+fk_reset:   db 0x04, 0x03, 0x01, 0x05                 ; RESET_STREAM, three varints
+fk_close:   db 0x1c, 0x01, 0x00, 0x00                 ; transport close, empty reason
+fk_closea:  db 0x1d, 0x01, 0x00                       ; application close
+fk_stream:  db 0x0a, 0x03, 0x02, 0xAB, 0xCD           ; STREAM|LEN, sid 3, 2 bytes
+fk_strnol:  db 0x08, 0x03, 0xAA, 0xBB, 0xCC           ; STREAM, no LEN: runs to the end
+fk_ncid:    db 0x18, 0x01, 0x00, 0x04, 0xDE,0xAD,0xBE,0xEF
+            db 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0       ; 16-byte reset token
+fk_ack:     db 0x02, 0x07, 0x00, 0x01, 0x02, 0x00, 0x00
+fk_ackecn:  db 0x03, 0x07, 0x00, 0x00, 0x02, 0x01, 0x02, 0x03
+fk_unk:     db 0x22                                   ; not a type RFC 9000 defines
+fk_trunc:   db 0x10                                   ; MAX_DATA with its varint missing
+; a CONNECTION_CLOSE behind a STREAM frame, then MAX_DATA behind the close: the
+; exact shape the partial per-scanner tables used to lose
+fk_seq_ok:  db 0x01, 0x0a, 0x03, 0x02, 0xAB, 0xCD, 0x1c, 0x01, 0x00, 0x00, 0x10, 0x41, 0x2C
+fk_seq_ok_len equ $ - fk_seq_ok
+fk_seq_bad: db 0x01, 0x22, 0x10, 0x41, 0x2C           ; an unknown type in the middle
+fk_seq_bad_len equ $ - fk_seq_bad
+
 msg_head:  db "quic-rtx "
 msg_head_len equ $ - msg_head
 msg_slash: db "/"
@@ -143,6 +170,13 @@ section .text
     lea rdi, [conn]
     mov esi, %1
     call linnea_quic_pto_ms
+%endmacro
+
+
+%macro FSKIP 2                          ; %1 = fixture, %2 = bytes available
+    lea rdi, [%1]
+    lea rsi, [%1 + %2]
+    call linnea_quic_frame_skip
 %endmacro
 
 ; record one packet: rsi = pn, into conn with the shared payload at now = 0.
@@ -611,6 +645,64 @@ _start:
     mov qword [conn + linnea_quic_conn.rttvar], 60000
     PTO 1
     EXPECT rax, LINNEA_QUIC_PTO_CEIL
+
+
+    ; --- the shared frame-length table (RFC 9000 19) ---
+    ; Six scanners used to carry partial copies of this and stop at the first
+    ; type theirs did not list. Every length here is one of those copies' gaps.
+    FSKIP fk_pad, 1
+    EXPECT rax, 1                       ; PADDING
+    FSKIP fk_ping, 1
+    EXPECT rax, 1                       ; PING
+    FSKIP fk_hd, 1
+    EXPECT rax, 1                       ; HANDSHAKE_DONE
+    FSKIP fk_pc, 9
+    EXPECT rax, 9                       ; PATH_CHALLENGE
+    FSKIP fk_maxdata, 3
+    EXPECT rax, 3                       ; MAX_DATA
+    FSKIP fk_reset, 4
+    EXPECT rax, 4                       ; RESET_STREAM
+    FSKIP fk_close, 4
+    EXPECT rax, 4                       ; CONNECTION_CLOSE — unknown to four walks
+    FSKIP fk_closea, 3
+    EXPECT rax, 3                       ; CONNECTION_CLOSE (application)
+    FSKIP fk_stream, 5
+    EXPECT rax, 5                       ; STREAM with a length
+    FSKIP fk_strnol, 5
+    EXPECT rax, 5                       ; STREAM without one: runs to the end
+    FSKIP fk_ncid, 24
+    EXPECT rax, 24                      ; NEW_CONNECTION_ID
+    FSKIP fk_ack, 7
+    EXPECT rax, 7                       ; ACK
+    FSKIP fk_ackecn, 8
+    EXPECT rax, 8                       ; ACK with ECN counts
+
+    ; a type RFC 9000 does not define is reported, with the type for the close
+    FSKIP fk_unk, 1
+    EXPECT rax, -1
+    EXPECT rdx, 0x22
+    ; and a frame that runs off the end is truncation, not an unknown type
+    FSKIP fk_trunc, 1
+    EXPECT rax, 0
+    ; the same MAX_DATA, one byte short of complete
+    FSKIP fk_maxdata, 2
+    EXPECT rax, 0
+
+    ; a lie about a length must not walk past the buffer
+    FSKIP fk_stream, 3                  ; claims 2 bytes of data that are not there
+    EXPECT rax, 0
+
+    ; whole payloads: the shape that used to lose frames must now walk clean
+    lea rdi, [fk_seq_ok]
+    mov esi, fk_seq_ok_len
+    call linnea_quic_frames_check
+    EXPECT rax, 0
+    ; ...and an unknown type anywhere in it is a connection error, named
+    lea rdi, [fk_seq_bad]
+    mov esi, fk_seq_bad_len
+    call linnea_quic_frames_check
+    EXPECT rax, -1
+    EXPECT rdx, 0x22
 
     ; print "quic-rtx <pass>/<total>\n"
     lea rdi, [msg_head]

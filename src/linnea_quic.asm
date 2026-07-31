@@ -17,6 +17,8 @@ global linnea_quic_unprotect_short
 global linnea_quic_crypto_frame
 global linnea_quic_stream_frame
 global linnea_quic_close_frame
+global linnea_quic_frame_skip
+global linnea_quic_frames_check
 global linnea_quic_ack_record
 global linnea_quic_ack_seen
 global linnea_quic_rtt_sample
@@ -499,7 +501,16 @@ linnea_quic_stream_frame:
     je .ss_v1
     cmp bl, 0x19                     ; RETIRE_CONNECTION_ID (1 varint)
     je .ss_v1
-    jmp .ss_none                     ; a frame we do not recognise: stop
+    ; a type this scanner does not itself handle: step over it by its true
+    ; length instead of stopping, so whatever the peer coalesced behind it
+    ; is still reached. Only a genuinely unknown or truncated frame ends the
+    ; walk here — the connection error for the former is raised once, by the
+    ; receive path, not separately by each of these scanners.
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .ss_none
+    add rdi, rax
+    jmp .ss_scan
 .ss_skip1:
     inc rdi
     jmp .ss_scan
@@ -1006,7 +1017,16 @@ linnea_quic_ack_ranges:
     je .av1
     cmp al, 0x19                     ; RETIRE_CONNECTION_ID (1 varint)
     je .av1
-    jmp .ret                         ; truly unknown (e.g. CONNECTION_CLOSE): stop
+    ; a type this scanner does not itself handle: step over it by its true
+    ; length instead of stopping, so whatever the peer coalesced behind it
+    ; is still reached. Only a genuinely unknown or truncated frame ends the
+    ; walk here — the connection error for the former is raised once, by the
+    ; receive path, not separately by each of these scanners.
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .ret
+    add rdi, rax
+    jmp .scan
 .skip1:
     inc rdi
     jmp .scan
@@ -1202,7 +1222,16 @@ linnea_quic_close_frame:
     je .cf_ack
     cmp bl, 0x03                     ; ACK with ECN
     je .cf_ack
-    jmp .cf_none
+    ; a type this scanner does not itself handle: step over it by its true
+    ; length instead of stopping, so whatever the peer coalesced behind it
+    ; is still reached. Only a genuinely unknown or truncated frame ends the
+    ; walk here — the connection error for the former is raised once, by the
+    ; receive path, not separately by each of these scanners.
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .cf_none
+    add rdi, rax
+    jmp .cf_scan
 .cf_skip1:
     inc rdi
     jmp .cf_scan
@@ -1290,7 +1319,16 @@ linnea_quic_crypto_frame:
     je .ack
     cmp bl, 0x03                     ; ACK with ECN counts
     je .ack
-    jmp .none                        ; any other frame: stop
+    ; a type this scanner does not itself handle: step over it by its true
+    ; length instead of stopping, so whatever the peer coalesced behind it
+    ; is still reached. Only a genuinely unknown or truncated frame ends the
+    ; walk here — the connection error for the former is raised once, by the
+    ; receive path, not separately by each of these scanners.
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .none
+    add rdi, rax
+    jmp .scan
 .skip1:
     inc rdi
     jmp .scan
@@ -1976,7 +2014,16 @@ linnea_quic_flow_scan:
     je .fw_v1
     cmp bl, 0x19                     ; RETIRE_CONNECTION_ID (1 varint)
     je .fw_v1
-    jmp .fw_done                     ; unknown (e.g. CONNECTION_CLOSE): stop
+    ; a type this scanner does not itself handle: step over it by its true
+    ; length instead of stopping, so whatever the peer coalesced behind it
+    ; is still reached. Only a genuinely unknown or truncated frame ends the
+    ; walk here — the connection error for the former is raised once, by the
+    ; receive path, not separately by each of these scanners.
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .fw_done
+    add rdi, rax
+    jmp .fw_scan
 .fw_skip1:
     inc rdi
     jmp .fw_scan
@@ -2226,7 +2273,16 @@ linnea_quic_reset_scan:
     je .rs_v1
     cmp bl, 0x19                     ; RETIRE_CONNECTION_ID
     je .rs_v1
-    jmp .rs_done                     ; unknown (e.g. CONNECTION_CLOSE): stop
+    ; a type this scanner does not itself handle: step over it by its true
+    ; length instead of stopping, so whatever the peer coalesced behind it
+    ; is still reached. Only a genuinely unknown or truncated frame ends the
+    ; walk here — the connection error for the former is raised once, by the
+    ; receive path, not separately by each of these scanners.
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .rs_done
+    add rdi, rax
+    jmp .rs_scan
 .rs_skip1:
     inc rdi
     jmp .rs_scan
@@ -2871,6 +2927,293 @@ linnea_quic_varint_decode:
 .err:
     xor eax, eax
     xor edx, edx
+    ret
+
+; linnea_quic_frame_skip(rdi = frame, rsi = end of the frame bytes) -> rax
+;     > 0  the frame's total length, type byte included
+;       0  the frame runs past `end`: truncated
+;      -1  the type is not one RFC 9000 19 defines
+;
+; The one place that knows how long every frame is. Six scanners each carried
+; their own partial copy of this and stopped dead at the first type their copy
+; did not list, which had two consequences. A CONNECTION_CLOSE — unknown to four
+; of them — hid every frame behind it. And a genuinely unknown type hid the rest
+; of the packet from ALL six, so a peer coalescing any extension, GREASE or
+; DATAGRAM frame ahead of its STREAM frame lost the request outright; the packet
+; was still acknowledged, so it was never resent and the exchange simply stalled.
+;
+; Lengths that come off the wire are checked against the space remaining rather
+; than added to the cursor first: a varint may be up to 2^62, and `add` then
+; `cmp` would wrap past the end and read on.
+; rdi is restored on every exit, so a scanner may call this mid-loop and simply
+; add the result to its own cursor. The fourth stack slot keeps rsp's parity as
+; the caller left it.
+linnea_quic_frame_skip:
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+    mov r12, rdi                     ; frame start, for the length at the end
+    cmp rdi, rsi
+    jae .fs_trunc
+    movzx ebx, byte [rdi]            ; frame type
+    inc rdi
+    ; --- no payload ---
+    test bl, bl
+    jz .fs_done                      ; PADDING
+    cmp bl, 0x01
+    je .fs_done                      ; PING
+    cmp bl, 0x1e
+    je .fs_done                      ; HANDSHAKE_DONE
+    ; --- fixed 8-byte payload ---
+    cmp bl, 0x1a
+    je .fs_8                         ; PATH_CHALLENGE
+    cmp bl, 0x1b
+    je .fs_8                         ; PATH_RESPONSE
+    ; --- shapes of their own ---
+    cmp bl, 0x02
+    je .fs_ack
+    cmp bl, 0x03
+    je .fs_ack                       ; ACK with ECN counts
+    mov eax, ebx
+    and eax, 0xf8
+    cmp eax, 0x08
+    je .fs_stream                    ; STREAM 0x08-0x0f
+    cmp bl, 0x06
+    je .fs_crypto
+    cmp bl, 0x07
+    je .fs_token                     ; NEW_TOKEN
+    cmp bl, 0x18
+    je .fs_ncid                      ; NEW_CONNECTION_ID
+    cmp bl, 0x1c
+    je .fs_close_t                   ; CONNECTION_CLOSE (transport)
+    cmp bl, 0x1d
+    je .fs_close_a                   ; CONNECTION_CLOSE (application)
+    ; --- a plain run of varints ---
+    mov r13d, 1
+    cmp bl, 0x10                     ; MAX_DATA
+    je .fs_varints
+    cmp bl, 0x12                     ; MAX_STREAMS bidi
+    je .fs_varints
+    cmp bl, 0x13                     ; MAX_STREAMS uni
+    je .fs_varints
+    cmp bl, 0x14                     ; DATA_BLOCKED
+    je .fs_varints
+    cmp bl, 0x16                     ; STREAMS_BLOCKED bidi
+    je .fs_varints
+    cmp bl, 0x17                     ; STREAMS_BLOCKED uni
+    je .fs_varints
+    cmp bl, 0x19                     ; RETIRE_CONNECTION_ID
+    je .fs_varints
+    mov r13d, 2
+    cmp bl, 0x05                     ; STOP_SENDING
+    je .fs_varints
+    cmp bl, 0x11                     ; MAX_STREAM_DATA
+    je .fs_varints
+    cmp bl, 0x15                     ; STREAM_DATA_BLOCKED
+    je .fs_varints
+    mov r13d, 3
+    cmp bl, 0x04                     ; RESET_STREAM
+    je .fs_varints
+    jmp .fs_unknown
+.fs_varints:                         ; r13 varints, nothing after them
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    dec r13
+    jnz .fs_varints
+    jmp .fs_done
+.fs_8:
+    mov rax, rsi
+    sub rax, rdi
+    cmp rax, 8
+    jb .fs_trunc
+    add rdi, 8
+    jmp .fs_done
+.fs_crypto:                          ; offset, length, then that many bytes
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+.fs_token:                           ; NEW_TOKEN joins here: length, then bytes
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    mov r13, rsi
+    sub r13, rdi                     ; bytes remaining
+    cmp rax, r13
+    ja .fs_trunc
+    add rdi, rax
+    jmp .fs_done
+.fs_stream:
+    call linnea_quic_varint_decode   ; stream id
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    test bl, 0x04                    ; OFF bit
+    jz .fs_stream_len
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+.fs_stream_len:
+    test bl, 0x02                    ; LEN bit
+    jnz .fs_stream_counted
+    mov rdi, rsi                     ; no length: the frame runs to the end
+    jmp .fs_done
+.fs_stream_counted:
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    mov r13, rsi
+    sub r13, rdi
+    cmp rax, r13
+    ja .fs_trunc
+    add rdi, rax
+    jmp .fs_done
+.fs_ncid:                            ; seq, retire-prior-to, len(1), cid, token(16)
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    cmp rdi, rsi
+    jae .fs_trunc
+    movzx eax, byte [rdi]            ; connection id length
+    inc rdi
+    mov r13, rsi
+    sub r13, rdi
+    cmp rax, r13
+    ja .fs_trunc
+    add rdi, rax
+    mov r13, rsi
+    sub r13, rdi
+    cmp r13, 16                      ; stateless reset token
+    jb .fs_trunc
+    add rdi, 16
+    jmp .fs_done
+.fs_close_t:                         ; error code, then the offending frame type
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+.fs_close_a:                         ; the application form has no frame type
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; reason length
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    mov r13, rsi
+    sub r13, rdi
+    cmp rax, r13
+    ja .fs_trunc
+    add rdi, rax
+    jmp .fs_done
+.fs_ack:
+    call linnea_quic_varint_decode   ; Largest Acknowledged
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Delay
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Count
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    mov r13, rax                     ; ranges still to walk
+    call linnea_quic_varint_decode   ; First ACK Range
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+.fs_ack_range:
+    test r13, r13
+    jz .fs_ack_ecn
+    call linnea_quic_varint_decode   ; Gap
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    call linnea_quic_varint_decode   ; ACK Range Length
+    test rdx, rdx
+    jz .fs_trunc
+    add rdi, rdx
+    dec r13                          ; each pass consumes bytes, so a huge
+    jmp .fs_ack_range                ; count runs out of packet, not of time
+.fs_ack_ecn:
+    cmp bl, 0x03
+    jne .fs_done
+    mov r13d, 3                      ; ECT(0), ECT(1) and CE counts
+    jmp .fs_varints
+.fs_done:
+    mov rax, rdi
+    sub rax, r12
+    mov rdi, r12                     ; the caller keeps its cursor
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.fs_trunc:
+    xor eax, eax
+    mov rdi, r12
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.fs_unknown:
+    mov rax, -1
+    mov rdx, rbx                     ; the type, for the CONNECTION_CLOSE we owe
+    mov rdi, r12
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_frames_check(rdi = frames, rsi = length) -> rax = 0 when every
+; frame is one RFC 9000 defines, or -1 with rdx = the offending type.
+;
+; RFC 9000 12.4 MUST: an unknown frame type is a connection error of type
+; FRAME_ENCODING_ERROR. A truncated frame stops the walk without complaint,
+; which is what every scanner already did — being strict there is a separate
+; change and a wider blast radius than this one.
+linnea_quic_frames_check:
+    push rbx
+    push r12
+    lea r12, [rdi + rsi]             ; end
+    mov rbx, rdi
+.fc_loop:
+    cmp rbx, r12
+    jae .fc_ok
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_frame_skip
+    cmp rax, -1
+    je .fc_bad
+    test rax, rax
+    jz .fc_ok                        ; truncated: nothing more to judge
+    add rbx, rax
+    jmp .fc_loop
+.fc_ok:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+.fc_bad:
+    mov rax, -1
+    pop r12
+    pop rbx
     ret
 
 ; linnea_quic_varint_encode(rdi=dst, rsi=value) -> rax = bytes written.

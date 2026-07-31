@@ -112,6 +112,7 @@ extern linnea_quic_stream_frame
 extern linnea_quic_close_frame
 extern linnea_quic_ack_record
 extern linnea_quic_ack_seen
+extern linnea_quic_frames_check
 extern linnea_quic_rtt_sample
 extern linnea_quic_pto_ms
 extern linnea_quic_ack_delay
@@ -1542,6 +1543,19 @@ linnea_quic_server_datagram:
     call linnea_quic_ack_record
     pop rax
     mov r14, rax                     ; frame bytes
+    ; RFC 9000 12.4 MUST: a frame of unknown type is a connection error of type
+    ; FRAME_ENCODING_ERROR. Judged once, here, rather than by each of the six
+    ; scanners below — they disagreed about what "unknown" meant, and every one
+    ; of them answered it by silently abandoning the rest of the packet.
+    lea rdi, [plaintext]
+    mov rsi, r14
+    call linnea_quic_frames_check
+    test rax, rax
+    jz .frames_ok
+    mov edi, 0x07                    ; FRAME_ENCODING_ERROR
+    mov esi, edx                     ; the type we could not parse
+    jmp .transport_close
+.frames_ok:
     ; ingest the peer's ACK: release every buffered packet it acknowledges, so
     ; we stop holding (and, once the PTO timer exists, retransmitting) frames
     ; that have already arrived.
