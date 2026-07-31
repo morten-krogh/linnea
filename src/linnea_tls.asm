@@ -1114,9 +1114,25 @@ parse_ch:
     jmp .ok
 .alpn_try_h11:
     test r14d, 0x10000         ; http/1.1 offered?
-    jz .ok
+    jz .alpn_none
     lea rax, [alpn_http11]
     mov [rbp + linnea_tls_hs.alpn_name], rax
+    jmp .ok
+.alpn_none:
+    ; The client offered a list and we speak nothing on it. RFC 7301 3.2: the
+    ; server "SHALL respond with a fatal no_application_protocol alert". The
+    ; handshake used to complete with no protocol selected, and the server then
+    ; spoke HTTP/1 at whatever arrived — so a client offering only h2 to a vhost
+    ; with HTTP/2 turned off had its connection preface answered with a 400,
+    ; which tells it nothing about what actually went wrong.
+    ;
+    ; No ALPN extension at all is a different thing and stays silent: the client
+    ; has stated no requirement, so there is nothing to fail. 0x4000 is the
+    ; extension's own duplicate marker, which is exactly "it was present".
+    test r14d, 0x4000
+    jz .ok
+    mov eax, LINNEA_TLS_A_NO_APP_PROTOCOL
+    jmp .pret
 .ok:
     mov rax, -1
     jmp .pret

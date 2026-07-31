@@ -579,6 +579,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_field_rules_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): request field rules" $?
 
+    # The server must not name a protocol the client never offered (RFC 7301
+    # 3.2): build_ee wrote "h3" into EncryptedExtensions without ever reading
+    # the client's list, so a doq or hq-interop client was told it had h3.
+    python3 test/quic/h3_alpn_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): ALPN is checked, not assumed" $?
+
     # RESET_STREAM's Final Size is OURS, not the peer's (RFC 9000 19.4). Resetting
     # a malformed request reported the client's request length, so the peer held
     # connection-level credit for data it would never be sent — and one large
@@ -1921,6 +1927,12 @@ if [ -x "$TLSBIN" ] && command -v openssl >/dev/null 2>&1; then
         [ "$got" = "linnea-tls" ]
         check "tls openssl handshake + echo" $?
 
+        # An ALPN mismatch SHALL be a fatal no_application_protocol alert (RFC
+        # 7301 3.2). The handshake used to complete with no protocol selected and
+        # the server then spoke HTTP/1 at whatever arrived.
+        timeout 30 python3 test/tls/alpn_mismatch.py "$tlsdir/c.pem" $tport >/dev/null 2>&1
+        check "tls ALPN mismatch is a fatal alert" $?
+
         # HelloRetryRequest (RFC 8446 4.1.4). OpenSSL sends a key_share for its
         # FIRST -groups entry only, so a client listing P-256 ahead of x25519
         # supports our group but guessed wrong about it. That MUST draw a retry;
@@ -2711,6 +2723,7 @@ PYEOF
     # unused, or HPACK's connection-wide table falls out of step.
     timeout 60 python3 test/tls/h2_trailers.py $CA 47443 >/dev/null 2>&1
     check "http2 trailer sections do not kill the connection" $?
+
 
     # HPACK is stateful, so a block we REJECT must still be walked to its end:
     # the inserts after the offending field reach the peer's dynamic table

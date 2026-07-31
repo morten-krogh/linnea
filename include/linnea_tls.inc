@@ -122,6 +122,7 @@ LINNEA_TLS_A_DECODE_ERROR        equ 50
 LINNEA_TLS_A_DECRYPT_ERROR       equ 51
 LINNEA_TLS_A_PROTOCOL_VERSION    equ 70
 LINNEA_TLS_A_INTERNAL_ERROR      equ 80
+LINNEA_TLS_A_NO_APP_PROTOCOL     equ 120   ; RFC 7301 3.2
 
 ; Per-connection handshake state. The traffic secrets stay resident
 ; because the kTLS handoff needs the application secrets after

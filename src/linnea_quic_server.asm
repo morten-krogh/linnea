@@ -113,6 +113,7 @@ extern linnea_quic_close_frame
 extern linnea_quic_ack_record
 extern linnea_quic_ack_seen
 extern linnea_quic_frames_check
+extern linnea_quic_alpn_has
 extern linnea_quic_frames_ack_eliciting
 extern linnea_quic_rtt_sample
 extern linnea_quic_pto_ms
@@ -177,6 +178,7 @@ extern linnea_quic_hs_psk
 extern linnea_quic_early_ok
 extern linnea_quic_resume_issued
 section .rodata
+quic_alpn_h3:   db "h3"        ; the one application protocol this server offers
 ; Retry integrity tag key and nonce, fixed by the RFC per QUIC version:
 ; v1 RFC 9001 5.8, v2 RFC 9369 3.3. They authenticate a Retry to any client
 ; without a shared secret — the tag proves only that the packet was not mangled,
@@ -894,6 +896,33 @@ linnea_quic_server_datagram:
     call linnea_quic_conn_free
     jmp .done
 .ks_ok:
+    ; The client must actually have offered h3. linnea_quic_build_ee wrote "h3"
+    ; into EncryptedExtensions unconditionally, without ever looking at the
+    ; list — so a client offering only hq-interop or doq was told h3 had been
+    ; selected, which RFC 7301 3.2 forbids outright: a server must not name a
+    ; protocol the client did not advertise. linnea_quic_alpn_has has existed
+    ; all along and had no caller.
+    ;
+    ; RFC 9001 8.1 wants this refused with a no_application_protocol alert
+    ; carried in a CONNECTION_CLOSE (QUIC error 0x0178). There is no path from a
+    ; TLS-level failure to a CONNECTION_CLOSE in the handshake spaces yet — both
+    ; close paths run through emit_1rtt, which needs keys that do not exist at
+    ; this point — so this drops the connection the way every other handshake
+    ; refusal here does. Silent, but no longer a lie.
+    mov rdi, [ch_out + linnea_quic_ch.alpn_ptr]
+    test rdi, rdi
+    jz .alpn_bad                      ; no ALPN at all: h3 is not optional here
+    mov rsi, [ch_out + linnea_quic_ch.alpn_len]
+    lea rdx, [quic_alpn_h3]
+    mov ecx, 2
+    call linnea_quic_alpn_has
+    test rax, rax
+    jnz .alpn_ok
+.alpn_bad:
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
+.alpn_ok:
     ; select the vhost by SNI — it fixes the certificate, signing key and document
     ; root this connection is served under, so a name gets its own origin's cert.
     mov rdi, [ch_out + linnea_quic_ch.sni_ptr]
