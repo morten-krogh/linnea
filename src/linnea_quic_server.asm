@@ -112,6 +112,10 @@ extern linnea_quic_stream_frame
 extern linnea_quic_close_frame
 extern linnea_quic_ack_record
 extern linnea_quic_ack_seen
+extern linnea_quic_rtt_sample
+extern linnea_quic_pto_ms
+extern linnea_quic_ack_delay
+extern linnea_quic_rtx_sent_ms
 extern linnea_quic_build_ack
 extern linnea_quic_ack_ranges
 extern linnea_quic_rtx_record
@@ -1559,6 +1563,48 @@ linnea_quic_server_datagram:
     mov rcx, [rcx + linnea_quic_conn.pn_1rtt]
     cmp [ack_ranges + 8], rcx
     jae .ack_violation
+    ; --- round-trip measurement (RFC 9002 5.1), before anything is freed ---
+    ; A sample comes only from a newly acknowledged largest: if we are still
+    ; holding that packet number it has not been acknowledged before, and since a
+    ; retransmission always goes out under a fresh number the measurement is
+    ; unambiguous. Nothing was measured here at all until now — the probe timeout
+    ; was a flat 250 ms, so any path slower than that retransmitted everything
+    ; spuriously and halved its congestion window on each pass.
+    push rax                          ; pair count
+    push rbx                          ; ...and a second qword, so rsp stays
+                                      ; 16-aligned across the calls below
+    mov rdi, [cur_conn]
+    mov rsi, [ack_ranges + 8]         ; largest acknowledged
+    call linnea_quic_rtx_sent_ms      ; rax = when it went out, or 0
+    test rax, rax
+    jz .rtt_done                      ; already acked, or never ours
+    mov rbx, rax
+    call now_ms
+    sub rax, rbx                      ; latest_rtt
+    js .rtt_done                      ; a clock that went backwards: no sample
+    ; The peer's Ack Delay is in units of 2^ack_delay_exponent microseconds, and
+    ; we advertise no exponent so the default 3 stands: raw * 8 / 1000 ms, i.e.
+    ; raw / 125. Subtract it only while that leaves the sample at or above the
+    ; minimum seen, per 5.3 — a delay big enough to push it below is not credible.
+    mov rcx, [linnea_quic_ack_delay]
+    shr rcx, 7                        ; ~ raw / 128, a hair under raw / 125
+    cmp rcx, LINNEA_QUIC_MAX_ACK_DELAY
+    jbe .rtt_delay_ok
+    mov ecx, LINNEA_QUIC_MAX_ACK_DELAY ; 5.3: never more than the peer may delay
+.rtt_delay_ok:
+    mov rdi, [cur_conn]
+    mov rdx, rax
+    sub rdx, rcx
+    js .rtt_sample                    ; would go negative: use the raw sample
+    cmp rdx, [rdi + linnea_quic_conn.min_rtt]
+    jb .rtt_sample
+    mov rax, rdx                      ; adjusted sample
+.rtt_sample:
+    mov rsi, rax
+    call linnea_quic_rtt_sample
+.rtt_done:
+    pop rbx
+    pop rax                           ; pair count
     lea rbx, [ack_ranges]
     mov rbp, rax                     ; pair count
     mov qword [s_cc_acked], 0        ; response-stream bytes this ACK releases
@@ -4337,7 +4383,15 @@ linnea_quic_server_rtx_sweep:
     jbe .sw_hs_shift
     mov edx, LINNEA_QUIC_PTO_CAP
 .sw_hs_shift:
-    mov rax, LINNEA_QUIC_PTO_MS
+    ; a peer may not delay acknowledging Initial or Handshake packets, so the
+    ; max_ack_delay term of 6.2.1 does not apply to this flight
+    push rcx
+    push rdx
+    mov rdi, rbx
+    xor esi, esi
+    call linnea_quic_pto_ms
+    pop rdx
+    pop rcx
     xchg rcx, rdx                     ; cl = backoff shift, rdx = age
     shl rax, cl
     cmp rdx, rax
@@ -4379,7 +4433,14 @@ linnea_quic_server_rtx_sweep:
     jbe .sw_shift
     mov ecx, LINNEA_QUIC_PTO_CAP
 .sw_shift:
-    mov rdx, LINNEA_QUIC_PTO_MS
+    push rax                          ; age
+    push rcx                          ; backoff shift
+    mov rdi, rbx
+    mov esi, 1                        ; application space: include max_ack_delay
+    call linnea_quic_pto_ms
+    mov rdx, rax
+    pop rcx
+    pop rax
     shl rdx, cl
     cmp rax, rdx
     jb .sw_rec_next                   ; not yet due
@@ -4418,7 +4479,14 @@ linnea_quic_server_rtx_sweep:
     jbe .sw_tc_shift
     mov ecx, LINNEA_QUIC_PTO_CAP
 .sw_tc_shift:
-    mov rdx, LINNEA_QUIC_PTO_MS
+    push rax
+    push rcx
+    mov rdi, rbx
+    mov esi, 1
+    call linnea_quic_pto_ms
+    mov rdx, rax
+    pop rcx
+    pop rax
     shl rdx, cl
     cmp rax, rdx
     jb .sw_tc_next                    ; not yet due

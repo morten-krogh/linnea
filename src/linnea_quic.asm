@@ -19,6 +19,9 @@ global linnea_quic_stream_frame
 global linnea_quic_close_frame
 global linnea_quic_ack_record
 global linnea_quic_ack_seen
+global linnea_quic_rtt_sample
+global linnea_quic_pto_ms
+global linnea_quic_ack_delay
 global linnea_quic_build_ack
 global linnea_quic_ack_ranges
 global linnea_quic_recv_initial
@@ -740,6 +743,93 @@ linnea_quic_ack_record:
 .ar_done:
     ret
 
+; linnea_quic_rtt_sample(rdi = conn, rsi = latest_rtt in ms) — fold one round-trip
+; measurement into the connection's estimate (RFC 9002 5.3).
+;
+; The first sample seeds the estimate outright; later ones are the standard
+; exponential averages, rttvar over the deviation and srtt over the sample. Both
+; are computed in milliseconds, so the shifts below are the 1/4 and 1/8 weights
+; the RFC names, with the divisions rounding down — a millisecond of bias in the
+; conservative direction is not worth a wider representation.
+;
+; A sample of 0 (a reply inside the same millisecond, which is ordinary on
+; loopback) is kept rather than discarded: it is a true measurement, and the
+; floor that keeps the probe timeout sane lives in linnea_quic_pto_ms.
+linnea_quic_rtt_sample:
+    cmp qword [rdi + linnea_quic_conn.rtt_have], 0
+    jne .rs_later
+    mov qword [rdi + linnea_quic_conn.rtt_have], 1
+    mov [rdi + linnea_quic_conn.srtt], rsi
+    mov [rdi + linnea_quic_conn.min_rtt], rsi
+    mov rax, rsi
+    shr rax, 1                       ; rttvar = latest / 2
+    mov [rdi + linnea_quic_conn.rttvar], rax
+    ret
+.rs_later:
+    mov rax, [rdi + linnea_quic_conn.min_rtt]
+    cmp rsi, rax
+    jae .rs_var
+    mov [rdi + linnea_quic_conn.min_rtt], rsi
+.rs_var:
+    ; rttvar = 3/4 * rttvar + 1/4 * |srtt - latest|
+    mov rax, [rdi + linnea_quic_conn.srtt]
+    mov rcx, rax
+    sub rcx, rsi                     ; srtt - latest
+    jns .rs_abs
+    neg rcx
+.rs_abs:
+    mov rdx, [rdi + linnea_quic_conn.rttvar]
+    lea rdx, [rdx + rdx * 2]         ; 3 * rttvar
+    add rdx, rcx
+    shr rdx, 2
+    mov [rdi + linnea_quic_conn.rttvar], rdx
+    ; srtt = 7/8 * srtt + 1/8 * latest
+    lea rcx, [rax * 8]
+    sub rcx, rax                     ; 7 * srtt
+    add rcx, rsi
+    shr rcx, 3
+    mov [rdi + linnea_quic_conn.srtt], rcx
+    ret
+
+; linnea_quic_pto_ms(rdi = conn, esi = 1 to include the peer's max_ack_delay)
+;   -> rax = probe timeout in milliseconds, before backoff.
+;
+; PTO = smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay
+; (RFC 9002 6.2.1). The ack delay belongs only to the application space: a peer
+; may not delay acknowledging Initial or Handshake packets, so those pass esi = 0.
+; Before any sample the kInitialRtt defaults stand in, which is deliberately
+; slower than the flat 250 ms this replaced — the RFC would rather wait than
+; retransmit into a path it has not measured.
+linnea_quic_pto_ms:
+    mov rax, [rdi + linnea_quic_conn.srtt]
+    cmp qword [rdi + linnea_quic_conn.rtt_have], 0
+    jne .pto_have
+    mov eax, LINNEA_QUIC_INITIAL_RTT
+    mov ecx, LINNEA_QUIC_INITIAL_RTT / 2
+    jmp .pto_var
+.pto_have:
+    mov rcx, [rdi + linnea_quic_conn.rttvar]
+.pto_var:
+    shl rcx, 2                       ; 4 * rttvar
+    cmp rcx, LINNEA_QUIC_TIMER_GRAN
+    jae .pto_add
+    mov ecx, LINNEA_QUIC_TIMER_GRAN
+.pto_add:
+    add rax, rcx
+    test esi, esi
+    jz .pto_clamp
+    add rax, LINNEA_QUIC_MAX_ACK_DELAY
+.pto_clamp:
+    cmp rax, LINNEA_QUIC_PTO_FLOOR
+    jae .pto_hi
+    mov eax, LINNEA_QUIC_PTO_FLOOR
+.pto_hi:
+    cmp rax, LINNEA_QUIC_PTO_CEIL
+    jbe .pto_ret
+    mov eax, LINNEA_QUIC_PTO_CEIL
+.pto_ret:
+    ret
+
 ; linnea_quic_ack_seen(rdi=state, rsi=packet number) -> rax = 1 when this number
 ; has already been recorded in this space, 0 when it is new. Clobbers rax, rcx
 ; only, so a caller may hold values in the other registers across the call.
@@ -860,6 +950,7 @@ linnea_quic_ack_ranges:
     mov r14, rdx                     ; out cursor
     mov rbp, rcx                     ; max pairs
     xor r15d, r15d                   ; pairs written
+    mov qword [linnea_quic_ack_delay], 0
 .scan:
     cmp rdi, rsi
     jae .ret
@@ -1025,6 +1116,8 @@ linnea_quic_ack_ranges:
     test rdx, rdx
     jz .ret
     add rdi, rdx
+    mov [linnea_quic_ack_delay], rax ; raw; the caller scales by the exponent
+
     call linnea_quic_varint_decode   ; ACK Range Count
     test rdx, rdx
     jz .ret
@@ -2823,6 +2916,10 @@ linnea_quic_retry_scid_len: resq 1
 ; PATH_CHALLENGE captured by linnea_quic_reset_scan (which fully walks the frames):
 ; the 8 challenge bytes and a flag, so the receive path can echo them back in a
 ; PATH_RESPONSE (RFC 9000 8.2). Reset at the start of each scan.
+; The Ack Delay of the last ACK frame walked, as the raw varint. Scaling is the
+; caller's: the units are 2^ack_delay_exponent microseconds, and since we never
+; send an ack_delay_exponent transport parameter the default of 3 applies.
+linnea_quic_ack_delay:  resq 1
 linnea_quic_path_seen:  resq 1
 linnea_quic_path_data:  resb 8
 tp_srt:                 resb 16    ; stateless_reset_token scratch for the tp build

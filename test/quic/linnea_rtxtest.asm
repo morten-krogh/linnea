@@ -23,6 +23,8 @@ extern linnea_quic_parse_priority
 extern linnea_quic_ack_ranges
 extern linnea_quic_ack_record
 extern linnea_quic_ack_seen
+extern linnea_quic_rtt_sample
+extern linnea_quic_pto_ms
 extern linnea_quic_reset_scan
 extern linnea_quic_path_seen
 extern linnea_quic_path_data
@@ -35,6 +37,15 @@ extern linnea_print_u64_stdout
     mov r11, %2
     cmp %1, r11
     jne %%bad
+    inc r15d
+%%bad:
+%endmacro
+
+%macro EXPECT_ABOVE 2                   ; tally a "greater than" expectation
+    inc r14d
+    mov r11, %2
+    cmp %1, r11
+    jbe %%bad
     inc r15d
 %%bad:
 %endmacro
@@ -119,6 +130,19 @@ section .text
     mov rsi, %1
     call linnea_quic_ack_seen
     EXPECT rax, %2
+%endmacro
+
+
+%macro RTT 1                            ; fold one round-trip sample, in ms
+    lea rdi, [conn]
+    mov rsi, %1
+    call linnea_quic_rtt_sample
+%endmacro
+
+%macro PTO 1                            ; %1 = 1 to include the peer's max_ack_delay
+    lea rdi, [conn]
+    mov esi, %1
+    call linnea_quic_pto_ms
 %endmacro
 
 ; record one packet: rsi = pn, into conn with the shared payload at now = 0.
@@ -516,6 +540,77 @@ _start:
     AS_REC 100
     AS_REC 165                          ; delta 65: offset 64, genuinely outside
     EXPECT_SEEN 100, 1                  ; ...so "cannot tell" -> seen
+
+
+    ; --- RTT estimation (RFC 9002 5.3, 6.2.1) ---
+    ; Before any sample the kInitialRtt defaults stand in: srtt 333, rttvar 166,
+    ; so PTO = 333 + 4*166 = 997, and 1022 once the peer's max_ack_delay applies.
+    ; This is deliberately slower than the flat 250 ms it replaced — the RFC
+    ; would rather wait than retransmit into a path it has not measured.
+    mov qword [conn + linnea_quic_conn.rtt_have], 0
+    mov qword [conn + linnea_quic_conn.srtt], 0
+    mov qword [conn + linnea_quic_conn.rttvar], 0
+    mov qword [conn + linnea_quic_conn.min_rtt], 0
+    PTO 0
+    EXPECT rax, 997
+    PTO 1
+    EXPECT rax, 1022
+
+    ; the first sample is adopted outright: srtt = latest, rttvar = latest/2
+    RTT 100
+    EXPECT qword [conn + linnea_quic_conn.srtt], 100
+    EXPECT qword [conn + linnea_quic_conn.rttvar], 50
+    EXPECT qword [conn + linnea_quic_conn.min_rtt], 100
+    PTO 0
+    EXPECT rax, 300                     ; 100 + 4*50
+
+    ; a second identical sample: rttvar decays toward 0, srtt holds
+    RTT 100
+    EXPECT qword [conn + linnea_quic_conn.srtt], 100
+    EXPECT qword [conn + linnea_quic_conn.rttvar], 37   ; (3*50 + 0) / 4
+
+    ; a faster sample lowers min_rtt and pulls srtt down by an eighth of the gap
+    RTT 60
+    EXPECT qword [conn + linnea_quic_conn.min_rtt], 60
+    EXPECT qword [conn + linnea_quic_conn.srtt], 95     ; (7*100 + 60) / 8
+    EXPECT qword [conn + linnea_quic_conn.rttvar], 37   ; (3*37 + 40) / 4
+
+    ; min_rtt never rises again on a slower sample
+    RTT 500
+    EXPECT qword [conn + linnea_quic_conn.min_rtt], 60
+
+    ; a long-RTT path settles high, so its probes stop firing spuriously —
+    ; this is the case the flat 250 ms got wrong, halving cwnd on every pass
+    mov qword [conn + linnea_quic_conn.rtt_have], 0
+    mov qword [conn + linnea_quic_conn.srtt], 0
+    mov qword [conn + linnea_quic_conn.rttvar], 0
+    mov qword [conn + linnea_quic_conn.min_rtt], 0
+    mov r12d, 40
+.rtt_settle:
+    RTT 400
+    dec r12d
+    jnz .rtt_settle
+    EXPECT qword [conn + linnea_quic_conn.srtt], 400
+    PTO 1
+    mov rcx, rax
+    EXPECT_ABOVE rcx, 400               ; a 400 ms path must not probe under 400 ms
+
+    ; the floor holds when a link is faster than the timer can express
+    mov qword [conn + linnea_quic_conn.rtt_have], 0
+    mov qword [conn + linnea_quic_conn.srtt], 0
+    mov qword [conn + linnea_quic_conn.rttvar], 0
+    mov qword [conn + linnea_quic_conn.min_rtt], 0
+    RTT 0
+    EXPECT qword [conn + linnea_quic_conn.srtt], 0      ; a real 0 ms measurement
+    PTO 0
+    EXPECT rax, LINNEA_QUIC_PTO_FLOOR   ; ...but never probe that fast
+
+    ; and the ceiling caps a pathological estimate before backoff multiplies it
+    mov qword [conn + linnea_quic_conn.rtt_have], 1
+    mov qword [conn + linnea_quic_conn.srtt], 60000
+    mov qword [conn + linnea_quic_conn.rttvar], 60000
+    PTO 1
+    EXPECT rax, LINNEA_QUIC_PTO_CEIL
 
     ; print "quic-rtx <pass>/<total>\n"
     lea rdi, [msg_head]

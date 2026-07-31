@@ -96,9 +96,24 @@ flush(t)                                         # ack it so probing can stop
 s.close()
 
 assert resp, "server never retransmitted the dropped reply"
-# It must have waited for the probe timeout, not just sent a second copy at once.
-assert got_at - dropped_at > 0.15, \
+# It must have waited for a probe timeout rather than sending a second copy at
+# once. The bound is deliberately loose: the probe timeout is no longer a flat
+# 250 ms but smoothed_rtt + 4*rttvar + max_ack_delay (RFC 9002 6.2.1), and over
+# loopback the measured round trip is under a millisecond, so a correct server
+# probes after a few tens of milliseconds here. That is the point of measuring —
+# a fast path should not wait a quarter second — so the assertion checks only
+# that a timeout was waited on at all, which an immediate duplicate (~1 ms)
+# still fails.
+assert got_at - dropped_at > 0.015, \
     f"reply came back in {got_at - dropped_at:.3f}s — too soon to be a probe"
+# ...and the other side of the same coin: the estimate must actually be in use.
+# With no RTT sample the server falls back to kInitialRtt, which puts the probe
+# near a second; over loopback a measured one puts it near a twentieth of that.
+# So a probe this prompt is only possible if a round trip was measured and fed
+# into the timeout — end-to-end proof that the estimator is live, not just that
+# its arithmetic is right (linnea-rtxtest covers that).
+assert got_at - dropped_at < 0.5, \
+    f"probe took {got_at - dropped_at:.3f}s — the RTT estimate is not being used"
 
 frames = []
 i = 0

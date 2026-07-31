@@ -86,6 +86,16 @@ LINNEA_QUIC_ACK_MAXR    equ 16      ; ACK ranges decoded from one incoming frame
 ; congested path is not lost again just because the first probe was early) up to
 ; a cap, and after a maximum number of attempts the packet is abandoned — a peer
 ; that has vanished should not be probed until the idle sweep reclaims it.
+; Loss-recovery timing (RFC 9002 5, 6.2). The probe timeout used to be the flat
+; LINNEA_QUIC_PTO_MS below with no RTT measured anywhere, which meant any path
+; slower than a quarter second retransmitted everything spuriously and halved its
+; congestion window each time — a collapse on exactly the links least able to
+; absorb one. It is now derived per connection from measured round trips.
+LINNEA_QUIC_INITIAL_RTT equ 333     ; kInitialRtt, used until the first sample
+LINNEA_QUIC_TIMER_GRAN  equ 1       ; kGranularity, milliseconds
+LINNEA_QUIC_MAX_ACK_DELAY equ 25    ; the peer's default when it advertises none
+LINNEA_QUIC_PTO_FLOOR   equ 20      ; never probe faster than this
+LINNEA_QUIC_PTO_CEIL    equ 8000    ; nor slower, before backoff
 LINNEA_QUIC_PTO_MS      equ 250     ; base probe timeout, milliseconds
 LINNEA_QUIC_PTO_CAP     equ 4       ; largest backoff shift (250ms << 4 = 4s)
 LINNEA_QUIC_PTO_MAX     equ 6       ; attempts before a packet is given up on
@@ -359,6 +369,15 @@ struc linnea_quic_conn
     .flight_ms:  resq 1              ; CLOCK_MONOTONIC ms the flight last went
                                      ; out; 0 = nothing outstanding to probe
     .flight_tries: resq 1            ; PTO backoff for the flight
+    ; Round-trip estimate (RFC 9002 5). All milliseconds; srtt == 0 means no
+    ; sample has been taken yet and the kInitialRtt defaults apply.
+    .rtt_have:   resq 1              ; 1 once a sample exists. A separate flag
+                                     ; because 0 ms is a REAL measurement on
+                                     ; loopback and fast LANs, so srtt == 0
+                                     ; cannot double as "not measured yet"
+    .srtt:       resq 1              ; smoothed_rtt
+    .rttvar:     resq 1              ; rttvar
+    .min_rtt:    resq 1              ; the smallest round trip seen
     ; request-stream reassembly: LINNEA_QUIC_RA_CTXS streams reassemble at once
     ; Stream ids the peer has cancelled (RESET_STREAM / STOP_SENDING), as a
     ; small ring. A cancel can arrive before the request that produced it has

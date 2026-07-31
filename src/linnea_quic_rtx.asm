@@ -17,6 +17,7 @@ default rel
 global linnea_quic_rtx_record
 global linnea_quic_rtx_ack_range
 global linnea_quic_rtx_inflight
+global linnea_quic_rtx_sent_ms
 global linnea_quic_txchunk_room
 global linnea_quic_txchunk_record
 global linnea_quic_txchunk_ack
@@ -184,6 +185,50 @@ linnea_quic_rtx_ack_range:
     add rax, linnea_quic_sent_size
     dec ecx
     jnz .scan
+    ret
+
+; linnea_quic_rtx_sent_ms(rdi=conn, rsi=pn) -> rax = the CLOCK_MONOTONIC ms at
+; which packet `pn` was last sent, or 0 if we are not holding it.
+;
+; This is what turns an ACK into a round-trip measurement, so it must be asked
+; BEFORE the ack helpers above free the entry. Both tables are searched: a small
+; reply or control frame sits in the sent ring, a response-stream chunk in the
+; in-flight table, and either may be the largest packet an ACK covers.
+;
+; Only the latest send time is kept per entry, never the original — which is
+; exactly right. RFC 9002 5.1 takes a sample only from a newly acknowledged
+; packet, and a retransmission goes out under a fresh packet number, so a pn that
+; is still here has been sent once and the ambiguity Karn's algorithm exists to
+; avoid cannot arise. Matching .pn0 would reintroduce it, so it is deliberately
+; not consulted here even though txchunk_ack must consult it for freeing.
+linnea_quic_rtx_sent_ms:
+    lea rax, [rdi + linnea_quic_conn.sent]
+    mov ecx, LINNEA_QUIC_RTX_SLOTS
+.rs_scan:
+    cmp qword [rax + linnea_quic_sent.in_use], 0
+    je .rs_next
+    cmp [rax + linnea_quic_sent.pn], rsi
+    jne .rs_next
+    mov rax, [rax + linnea_quic_sent.sent_ms]
+    ret
+.rs_next:
+    add rax, linnea_quic_sent_size
+    dec ecx
+    jnz .rs_scan
+    lea rax, [rdi + linnea_quic_conn.tx_infl]
+    mov ecx, LINNEA_QUIC_TXINFL_SLOTS
+.rs_chunk:
+    cmp qword [rax + linnea_quic_txchunk.in_use], 0
+    je .rs_chunk_next
+    cmp [rax + linnea_quic_txchunk.pn], rsi
+    jne .rs_chunk_next
+    mov rax, [rax + linnea_quic_txchunk.sent_ms]
+    ret
+.rs_chunk_next:
+    add rax, linnea_quic_txchunk_size
+    dec ecx
+    jnz .rs_chunk
+    xor eax, eax                      ; not ours, or already acknowledged
     ret
 
 ; linnea_quic_rtx_inflight(rdi=conn) -> rax = buffered (unacknowledged) packets.
