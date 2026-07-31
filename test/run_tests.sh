@@ -2649,6 +2649,12 @@ PYEOF
     timeout 60 python3 test/tls/h2_stream_id.py $CA 47443 >/dev/null 2>&1
     check "http2 stream-id rules are connection errors" $?
 
+    # A GOAWAY must name the highest stream we might have acted on (RFC 9113 6.8).
+    # Every error GOAWAY said 0 — "nothing was processed" — so a client would
+    # retry everything in flight, including a proxied POST already executed.
+    timeout 60 python3 test/tls/h2_goaway_last_stream.py $CA 47443 >/dev/null 2>&1
+    check "http2 GOAWAY names the last processed stream" $?
+
     # HPACK is stateful, so a block we REJECT must still be walked to its end:
     # the inserts after the offending field reach the peer's dynamic table
     # whether we like the request or not. Stopping early left our table behind

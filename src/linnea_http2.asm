@@ -582,7 +582,25 @@ linnea_h2_handle:
     mov byte [r13 + 3], LINNEA_H2_FT_GOAWAY
     mov byte [r13 + 4], 0
     mov dword [r13 + 5], 0
-    mov dword [r13 + 9], 0           ; last_stream_id 0
+    ; The last stream id must be the highest we might have acted on (RFC 9113
+    ; 6.8). This said 0, which claims we processed nothing — so a client is
+    ; entitled to retry every request in flight, including a proxied POST the
+    ; upstream has already executed. Reporting the highest id we have seen is
+    ; also the safe direction to be wrong in: too high merely costs a request a
+    ; retry it could have had, while too low duplicates non-idempotent work.
+    ; h2_last_stream is stamped before the malformed-request checks, so a stream
+    ; whose own fault caused this is included, which is what we want.
+    mov rcx, [rbx + linnea_connection.h2_last_stream]
+    mov rdx, rcx
+    shr rcx, 24
+    mov [r13 + 9], cl
+    mov rcx, rdx
+    shr rcx, 16
+    mov [r13 + 10], cl
+    mov rcx, rdx
+    shr rcx, 8
+    mov [r13 + 11], cl
+    mov [r13 + 12], dl
     mov dword [r13 + 13], LINNEA_H2_PROTOCOL_ERROR << 24   ; big-endian
     add r13, 17
     mov qword [rbx + linnea_connection.h2_state], LINNEA_H2_CLOSING
