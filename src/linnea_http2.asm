@@ -830,9 +830,27 @@ h2_build_request:
     mov r8, [rsp + L_SID]
     test r8, 1
     jz .err                          ; even id: connection error
+    mov qword [h2_req_trail], 0
+    ; A HEADERS arriving on a stream that is still taking body bytes is a
+    ; TRAILER section (RFC 9113 8.1), not a new request. Its id is one we have
+    ; already seen, so the strictly-increasing test below called it broken
+    ; numbering and took the WHOLE CONNECTION down — every concurrent stream
+    ; with it — for something the RFC explicitly allows. Any client that sends
+    ; trailers met that: gRPC-web, a chunked upload declaring its length after
+    ; the fact. HTTP/3 has handled trailers since Q134; HTTP/2 did not.
+    mov rdi, rbx
+    mov esi, r8d
+    call h2p_find_collect            ; -> the slot still taking this stream's body
+    test rax, rax
+    jz .req_new_stream
+    mov qword [h2_req_trail], 1
+    jmp .req_id_ok
+.req_new_stream:
+    mov r8, [rsp + L_SID]            ; reload: the probe above owns the registers
     cmp r8, [rbx + linnea_connection.h2_last_stream]
     jbe .err                         ; not strictly increasing
     mov [rbx + linnea_connection.h2_last_stream], r8
+.req_id_ok:
     cmp qword [rsp + L_BIG], 0
     jne .too_big
     ; zero the whole req struct — a count derived from the struct size, so a
@@ -862,6 +880,8 @@ h2_build_request:
     call linnea_hpack_decode
     test rax, rax
     js .decode_err
+    cmp qword [h2_req_trail], 0
+    jne .trailer_block
     ; the rules the field-by-field pass cannot see: an authority from one
     ; source or the other, agreeing and plausible
     lea rdi, [rsp + REQ]
@@ -882,6 +902,42 @@ h2_build_request:
     mov rdx, rax                     ; response length
     mov rax, r12
     sub rax, [rsp + L_START]         ; bytes consumed
+    jmp .ret
+
+.trailer_block:
+    ; The trailer's fields were decoded for one reason only: HPACK is stateful,
+    ; and a block we do not use must still be walked to its end or the dynamic
+    ; table desynchronises and every later request on the connection decodes to
+    ; nonsense. That is what Q152 settled. Nothing here reaches the request.
+    ;
+    ; "Pseudo-header fields MUST NOT appear in a trailer section" (8.1), and a
+    ; message that breaks that is malformed — a stream error, not a connection
+    ; one.
+    cmp qword [rsp + REQ + linnea_h2_req.method_ptr], 0
+    jne .malformed_stream
+    cmp qword [rsp + REQ + linnea_h2_req.path_ptr], 0
+    jne .malformed_stream
+    cmp qword [rsp + REQ + linnea_h2_req.scheme_ptr], 0
+    jne .malformed_stream
+    cmp qword [rsp + REQ + linnea_h2_req.auth_ptr], 0
+    jne .malformed_stream
+    ; 8.1 requires END_STREAM on a trailer section, so this is where the body
+    ; ends — the same completion the last DATA frame would have performed.
+    cmp dword [h2_req_es], 0
+    je .trailer_ret
+    mov rdi, rbx
+    mov esi, [rsp + L_SID]
+    call h2p_find_collect
+    test rax, rax
+    jz .trailer_ret
+    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
+    jnz .trailer_ret                 ; a streamed upload ends on its own clock
+    mov rdi, rax
+    call h2p_finalize
+.trailer_ret:
+    xor edx, edx                     ; nothing to write: a trailer has no reply
+    mov rax, r12
+    sub rax, [rsp + L_START]         ; but the frames are consumed
     jmp .ret
 
 .decode_err:
@@ -4701,6 +4757,7 @@ h2_crbuf:     resb 80                ; "bytes first-last/size" / "bytes */size"
 h2_locbuf:    resb 2560              ; a redirect's Location value
 h2_hdrs_buf:  resb 8192              ; proxy: the rebuilt h1 header lines
 h2_req_es:    resd 1                 ; END_STREAM was set on the HEADERS frame
+h2_req_trail: resq 1                 ; ...and that HEADERS was a trailer section
 h2p_pool:     resq 1                 ; the upstream slot array (one mmap)
 h2_dyn_pool:  resq 1                 ; per-connection HPACK dynamic tables
 h2_upload_pool: resq 1               ; per-connection streaming-upload buffers

@@ -2704,6 +2704,14 @@ PYEOF
     timeout 60 python3 test/tls/h2_field_rules.py $CA 47443 >/dev/null 2>&1
     check "http2 request field rules" $?
 
+    # A trailer section is allowed (RFC 9113 8.1) and used to draw a GOAWAY: its
+    # stream id is one already seen, which the strictly-increasing test called
+    # broken numbering, taking every concurrent stream down with it. The last
+    # case checks the subtle half — the trailer's fields are decoded even though
+    # unused, or HPACK's connection-wide table falls out of step.
+    timeout 60 python3 test/tls/h2_trailers.py $CA 47443 >/dev/null 2>&1
+    check "http2 trailer sections do not kill the connection" $?
+
     # HPACK is stateful, so a block we REJECT must still be walked to its end:
     # the inserts after the offending field reach the peer's dynamic table
     # whether we like the request or not. Stopping early left our table behind
