@@ -580,6 +580,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_reset_final_size_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): RESET_STREAM reports our own final size" $?
 
+    # An ack-eliciting packet MUST be acknowledged (RFC 9000 13.2.1). An ACK was
+    # only built when the server had something of its own to send, so a lone PING
+    # (a browser keepalive) or a lone stream reset drew nothing and the peer
+    # resent it with a doubling timeout for the life of the connection.
+    python3 test/quic/h3_ack_eliciting_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): a packet with nothing to answer is still acked" $?
+
     # the same for the handshake flights: no long-header packet authenticates its
     # sender, so neither a replayed Initial nor a forged Handshake may move the
     # peer address (RFC 9000 9 — no migration before the handshake is confirmed)

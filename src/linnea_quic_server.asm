@@ -113,6 +113,7 @@ extern linnea_quic_close_frame
 extern linnea_quic_ack_record
 extern linnea_quic_ack_seen
 extern linnea_quic_frames_check
+extern linnea_quic_frames_ack_eliciting
 extern linnea_quic_rtt_sample
 extern linnea_quic_pto_ms
 extern linnea_quic_ack_delay
@@ -252,6 +253,9 @@ s_tp_len:    resq 1                   ; and its length, for the in-flight record
 s_prio_u:    resq 1                   ; a request's parsed urgency (0-7)
 s_prio_i:    resq 1                   ; and incremental flag (0/1), for the slot fill
 s_ini_pn:    resq 1                   ; the Initial packet number being reassembled
+s_ack_elicit: resq 1                  ; 1 when the 1-RTT packet in hand must be acked
+s_pn_before:  resq 1                  ; conn.pn_1rtt before we processed it, so the
+                                      ; exit can tell whether anything was sent
 s_hs_type:   resq 1                   ; long-header Handshake type bits for this version
 s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK freed
 fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow scan
@@ -1556,6 +1560,17 @@ linnea_quic_server_datagram:
     mov esi, edx                     ; the type we could not parse
     jmp .transport_close
 .frames_ok:
+    ; RFC 9000 13.2.1 MUST: an ack-eliciting packet has to be acknowledged. Note
+    ; both whether this one is, and our packet number before any of it is acted
+    ; on — comparing that number at the exit is how we tell whether anything we
+    ; sent in reply already carried the acknowledgement.
+    lea rdi, [plaintext]
+    mov rsi, r14
+    call linnea_quic_frames_ack_eliciting
+    mov [s_ack_elicit], rax
+    mov rax, [cur_conn]
+    mov rax, [rax + linnea_quic_conn.pn_1rtt]
+    mov [s_pn_before], rax
     ; ingest the peer's ACK: release every buffered packet it acknowledges, so
     ; we stop holding (and, once the PTO timer exists, retransmitting) frames
     ; that have already arrived.
@@ -1779,13 +1794,13 @@ linnea_quic_server_datagram:
     lea r14, [plaintext]             ; scan cursor
 .stream_scan:
     cmp r14, r15
-    jae .done
+    jae .rtt_finish
     mov rdi, r14
     mov rsi, r15
     sub rsi, r14
     call linnea_quic_stream_frame    ; rax=data, rdx=len, r8=stream id, r9=next
     test rax, rax
-    jz .done                         ; no further STREAM frames
+    jz .rtt_finish                   ; no further STREAM frames
     mov r14, r9                      ; resume point for the next frame
     mov [s_sid], r8
     mov [s_sdata], rax
@@ -3221,6 +3236,32 @@ linnea_quic_server_datagram:
 .cfin_next:
     mov r15, [s_walk_next]           ; resume the coalesced-packet walk
     jmp .walk
+; --- nothing of ours acknowledged this packet, so acknowledge it on its own ---
+; An ACK used to be built only when the server independently had something to
+; send. A packet carrying only a PING (which is what a browser keepalive is),
+; MAX_DATA, RESET_STREAM or NEW_CONNECTION_ID therefore went unacknowledged: the
+; peer's loss detection declared it lost and resent it, with the probe timeout
+; doubling each time, for the life of the connection. Browsers meet this on every
+; keepalive and every reload-cancel storm.
+;
+; The ACK packet is emitted untracked — it is not itself ack-eliciting, so there
+; is nothing for the peer to acknowledge back and nothing for us to retransmit.
+.rtt_finish:
+    cmp qword [s_ack_elicit], 0
+    je .done
+    mov rax, [cur_conn]
+    mov rax, [rax + linnea_quic_conn.pn_1rtt]
+    cmp rax, [s_pn_before]
+    jne .done                        ; we sent something; it carried the ack
+    lea rdi, [strm_pay]
+    CONNLEA rsi, rx_have
+    call linnea_quic_build_ack
+    test rax, rax
+    jz .done                         ; nothing recorded to acknowledge yet
+    lea rsi, [strm_pay]
+    mov [s_pl_ptr], rsi
+    mov [s_pl_len], rax
+    call emit_1rtt
 .done:
     add rsp, 8
     pop rbp

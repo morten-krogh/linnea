@@ -19,6 +19,7 @@ global linnea_quic_stream_frame
 global linnea_quic_close_frame
 global linnea_quic_frame_skip
 global linnea_quic_frames_check
+global linnea_quic_frames_ack_eliciting
 global linnea_quic_ack_record
 global linnea_quic_ack_seen
 global linnea_quic_rtt_sample
@@ -839,6 +840,51 @@ linnea_quic_pto_ms:
     jbe .pto_ret
     mov eax, LINNEA_QUIC_PTO_CEIL
 .pto_ret:
+    ret
+
+; linnea_quic_frames_ack_eliciting(rdi = frames, rsi = length) -> rax = 1 when
+; this packet must be acknowledged, 0 when it need not be.
+;
+; RFC 9000 2: a packet carrying only ACK, PADDING and CONNECTION_CLOSE frames is
+; not ack-eliciting. Everything else is — a PING keepalive, MAX_DATA, a stream
+; reset — and 13.2.1 makes acknowledging it a MUST. The receive path had no way
+; to ask this before, so it only ever acknowledged a packet when it happened to
+; have something of its own to send back.
+linnea_quic_frames_ack_eliciting:
+    push rbx
+    push r12
+    lea r12, [rdi + rsi]             ; end
+    mov rbx, rdi
+.ae_loop:
+    cmp rbx, r12
+    jae .ae_no
+    movzx eax, byte [rbx]
+    test al, al
+    jz .ae_next                      ; PADDING
+    cmp al, 0x02
+    je .ae_next                      ; ACK
+    cmp al, 0x03
+    je .ae_next                      ; ACK with ECN counts
+    cmp al, 0x1c
+    je .ae_next                      ; CONNECTION_CLOSE (transport)
+    cmp al, 0x1d
+    je .ae_next                      ; CONNECTION_CLOSE (application)
+    mov eax, 1                       ; anything else obliges an acknowledgement
+    pop r12
+    pop rbx
+    ret
+.ae_next:
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .ae_no                       ; truncated or unknown: already judged
+    add rbx, rax
+    jmp .ae_loop
+.ae_no:
+    xor eax, eax
+    pop r12
+    pop rbx
     ret
 
 ; linnea_quic_ack_seen(rdi=state, rsi=packet number) -> rax = 1 when this number
