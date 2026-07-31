@@ -573,6 +573,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_frame_walk_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): coalesced frames do not hide the rest of the packet" $?
 
+    # the same field rules over HTTP/3 (RFC 9114 4.2, 4.3.1) — one shared
+    # decoder, and this side had it worse: the connection-specific names were
+    # matched only inside the proxy rebuild, which HTTP/3 never enters at all.
+    python3 test/quic/h3_field_rules_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): request field rules" $?
+
     # RESET_STREAM's Final Size is OURS, not the peer's (RFC 9000 19.4). Resetting
     # a malformed request reported the client's request length, so the peer held
     # connection-level credit for data it would never be sent — and one large
@@ -2690,6 +2696,13 @@ PYEOF
     # connection window drifted above the peer's by every error body it had sent.
     timeout 120 python3 test/tls/h2_error_flow_control.py $CA 47443 >/dev/null 2>&1
     check "http2 error bodies respect the flow-control window" $?
+
+    # Request-field rules the shared HPACK/QPACK decoder enforces: :scheme must
+    # be present, :path must not be empty, connection-specific fields are
+    # malformed (TE only for "trailers"), a space may not sit in a field name and
+    # a value may not begin or end with whitespace (RFC 9113 8.2-8.3).
+    timeout 60 python3 test/tls/h2_field_rules.py $CA 47443 >/dev/null 2>&1
+    check "http2 request field rules" $?
 
     # HPACK is stateful, so a block we REJECT must still be walked to its end:
     # the inserts after the offending field reach the peer's dynamic table

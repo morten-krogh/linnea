@@ -32,6 +32,7 @@ global linnea_hpack_req_check
 global hpack_dyn_reset
 
 extern linnea_string_is_token
+extern linnea_string_iequal
 
 section .rodata
 pseudo_method:  db ":method"
@@ -47,6 +48,7 @@ hdr_ifr:        db "if-range"
 hdr_ae:         db "accept-encoding"
 ; names stripped from the proxy header rebuild (hop-by-hop / managed)
 hdr_te:         db "te"
+hdr_trailers:   db "trailers"   ; the one TE value RFC 9113 8.2.2 permits
 hdr_conn:       db "connection"
 hdr_ka:         db "keep-alive"
 hdr_cl2:        db "content-length"
@@ -304,7 +306,12 @@ emit_field:
     jae .ef_name_ok
     movzx r8d, byte [rax + rcx]
     cmp r8b, 0x20
-    jb .ef_bad                       ; CR, LF, NUL, any control byte
+    jbe .ef_bad                      ; CR, LF, NUL, any control byte — and SP
+                                     ; itself: 8.2.1 excludes 0x00-0x20
+                                     ; INCLUSIVE, and `jb` let 0x20 through, so
+                                     ; a name like "x foo" reached the proxy
+                                     ; rebuild and was written into an HTTP/1.1
+                                     ; head no other parser would read the same
     cmp r8b, 0x7f
     jae .ef_bad
     cmp r8b, 'A'
@@ -334,6 +341,100 @@ emit_field:
     inc rcx
     jmp .ef_val_scan
 .ef_val_ok:
+    ; A field value must not begin or end with SP or HTAB (RFC 9113 8.2.1 /
+    ; RFC 9114 4.2). Only CR, LF and NUL were refused, so such a value was
+    ; forwarded verbatim into the request head we build for an upstream, where
+    ; where it is the next parser's guess what the value actually was.
+    test rdi, rdi
+    jz .ef_val_edges_ok
+    movzx r8d, byte [rsi]
+    cmp r8b, 0x20
+    je .ef_bad
+    cmp r8b, 0x09
+    je .ef_bad
+    movzx r8d, byte [rsi + rdi - 1]
+    cmp r8b, 0x20
+    je .ef_bad
+    cmp r8b, 0x09
+    je .ef_bad
+.ef_val_edges_ok:
+    ; --- connection-specific fields (RFC 9113 8.2.2 / RFC 9114 4.2) ---------
+    ; "Any message containing connection-specific header fields MUST be treated
+    ; as malformed." These names were matched only inside the proxy rebuild, and
+    ; only to skip them from the head sent upstream — so on a static request, or
+    ; on HTTP/3 (which never sets hb_start, so the block never ran at all), they
+    ; were simply served. Stripping them stopped the smuggle into an h1 upstream;
+    ; it did not make the request the malformed one the RFC says it is.
+    cmp byte [rax], ':'
+    je .ef_conn_ok                   ; a pseudo-header is none of these
+    cmp rdx, 2
+    je .ef_chk_te
+    cmp rdx, 7
+    je .ef_chk_upg
+    cmp rdx, 10
+    je .ef_chk_10
+    cmp rdx, 16
+    je .ef_chk_pconn
+    cmp rdx, 17
+    je .ef_chk_tenc
+    jmp .ef_conn_ok
+.ef_chk_upg:
+    lea r9, [hdr_upg]
+    jmp .ef_conn_probe
+.ef_chk_pconn:
+    lea r9, [hdr_pconn]
+    jmp .ef_conn_probe
+.ef_chk_tenc:
+    lea r9, [hdr_tenc]
+    jmp .ef_conn_probe
+.ef_chk_10:
+    push rsi
+    push rdi
+    lea r9, [hdr_conn]
+    call name_eq
+    pop rdi
+    pop rsi
+    je .ef_malformed
+    lea r9, [hdr_ka]
+.ef_conn_probe:
+    push rsi
+    push rdi
+    call name_eq
+    pop rdi
+    pop rsi
+    je .ef_malformed
+    jmp .ef_conn_ok
+.ef_chk_te:
+    push rsi
+    push rdi
+    lea r9, [hdr_te]
+    call name_eq
+    pop rdi
+    pop rsi
+    jne .ef_conn_ok
+    ; TE is the single exception 8.2.2 allows, and only for one value: it "MUST
+    ; NOT contain any value other than trailers". Compared case-insensitively —
+    ; it is a token, and refusing "Trailers" would reject a conforming peer.
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    mov r8, rsi                      ; value pointer
+    mov r9, rdi                      ; value length
+    mov rdi, r8
+    mov rsi, r9
+    lea rdx, [hdr_trailers]
+    mov ecx, 8
+    call linnea_string_iequal
+    mov r8d, eax                     ; the verdict, before the pops below put
+                                     ; the saved name pointer back into rax
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
+    test r8d, r8d
+    jz .ef_malformed
+.ef_conn_ok:
     mov r8, [rbx + linnea_h2_req.nheaders]
     inc r8
     cmp r8, LINNEA_HPACK_MAX_HEADERS
@@ -637,7 +738,16 @@ emit_field:
     stc
     ret
 .ef_bad:
-    stc                              ; a malformed field: reject the request
+    ; A syntax fault is a MALFORMED request, not a resource limit. Setting only
+    ; the carry left HTTP/3 unable to tell the two apart: linnea_qpack_decode
+    ; maps every carry to the limit error, and the h3 path answered an uppercase
+    ; name or a space in a value with "431 Request Header Fields Too Large" —
+    ; which is not what went wrong and tells the client to shrink headers that
+    ; were never too big. RFC 9114 4.1.2 wants a stream error, and .malformed is
+    ; what the h3 path reads to raise one. HTTP/2 already reset the stream on the
+    ; carry alone, so nothing changes there.
+    mov qword [rbx + linnea_h2_req.malformed], 1
+    stc
     ret
 
 ; pseudo_bit(rax = name, rdx = name length) -> r8 = the LINNEA_H2_PS_* bit for
@@ -1205,10 +1315,10 @@ linnea_hpack_req_check:
     ; never have written. A URI has no room for either byte anyway (RFC 3986 2).
     mov rsi, [rbx + linnea_h2_req.path_ptr]
     test rsi, rsi
-    jz .ok
+    jz .scheme_check                 ; absent: judged below, not waved through
     mov rcx, [rbx + linnea_h2_req.path_len]
     test rcx, rcx
-    jz .ok
+    jz .scheme_check
 .pv_scan:
     movzx eax, byte [rsi]
     cmp al, 0x20
@@ -1218,6 +1328,26 @@ linnea_hpack_req_check:
     inc rsi
     dec rcx
     jnz .pv_scan
+.scheme_check:
+    ; :scheme and a non-empty :path are required for an http/https request
+    ; (RFC 9113 8.3.1, RFC 9114 4.3.1), and a request omitting a mandatory
+    ; pseudo-header is malformed. :scheme was decoded into the request struct
+    ; and then read nowhere in the whole tree, so its absence was never noticed;
+    ; an empty :path was served as though the client had asked for "/". Both are
+    ; MUSTs and both used to be answered with an ordinary 200.
+    ;
+    ; The VALUE of :scheme is deliberately left alone: 8.3.1 says outright that
+    ; it "is not restricted to http and https schemed URIs", so a gateway may
+    ; legitimately be handed another one. Only its presence is required.
+    ;
+    ; CONNECT omits both by design (8.5), and is already refused before this —
+    ; so requiring them here does not change what a CONNECT gets.
+    cmp qword [rbx + linnea_h2_req.scheme_ptr], 0
+    je .bad
+    cmp qword [rbx + linnea_h2_req.path_ptr], 0
+    je .bad
+    cmp qword [rbx + linnea_h2_req.path_len], 0
+    je .bad
 .method_check:
     ; :method is a token and must be present (RFC 9110 9.1, RFC 9113 8.3.1).
     ; Nothing checked it: a field value only has CR/LF/NUL refused, so a method
