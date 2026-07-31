@@ -121,8 +121,11 @@ run_test "tls listener mismatch" 1 stderr "servers sharing a listener must all s
     $BIN --config test/configs/bad-tls-mismatch.json
 
 # --- crypto self-test: known-answer vectors for the TLS primitives ---
-# Runs the pre-built binary (built by `make test`/`make selftest`); the
-# heavy differential/fuzz harnesses under test/crypto/ run on demand.
+# Build the unit-test binaries here rather than trusting what is on disk. `make`
+# does not produce them, and the checks below only test for existence — so a tree
+# that has been cleaned reports a failure that looks like a real one, while a
+# STALE binary is worse: it passes, silently testing code that no longer exists.
+make -s bin/linnea-selftest bin/linnea-quictest bin/linnea-rtxtest >/dev/null 2>&1
 if [ -x ./bin/linnea-selftest ]; then
     if ./bin/linnea-selftest >/tmp/linnea_selftest.out 2>&1; then
         check "crypto selftest ($(tr '\n' ' ' </tmp/linnea_selftest.out))" 0
