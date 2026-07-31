@@ -1284,7 +1284,12 @@ resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test\r\nContent-Length: 5\
 n=$(printf '%s' "$resp" | grep -c "200 OK")
 [ "$n" -eq 2 ]
 check "body discarded, keep-alive" $?
-check_http "chunked 501" "501 Not Implemented" "$(raw_http 'GET / HTTP/1.1\r\nHost: one.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n')"
+# Chunked bodies used to be 501 and this test asserted it. Receiving and
+# decoding the coding is a MUST (RFC 9112 7.1), so the expectation moves with
+# the behaviour: a complete chunked body is served, and a coding we genuinely do
+# not implement is what keeps the 501.
+check_http "chunked body decoded and served" "200 OK" "$(raw_http 'GET / HTTP/1.1\r\nHost: one.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n')"
+check_http "an unimplemented coding is still 501" "501 Not Implemented" "$(raw_http 'GET / HTTP/1.1\r\nHost: one.test\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n')"
 # A static location cannot stream a body, so one it cannot buffer with the
 # head is refused; a proxy location streams the same body instead (below).
 check_http "body too large 413" "413 Content Too Large" "$(raw_http 'GET / HTTP/1.1\r\nHost: one.test\r\nContent-Length: 20000\r\n\r\n')"
@@ -1373,8 +1378,10 @@ resp=$(raw_http 'OPTIONS * HTTP/1.1\r\n\r\n')
 check_http "target: OPTIONS * without a Host is 400" "400 Bad Request" "$resp"
 resp=$(raw_http 'OPTIONS * HTTP/1.1\r\nHost: one.test\r\nHost: evil.test\r\n\r\n')
 check_http "target: OPTIONS * with two Hosts is 400" "400 Bad Request" "$resp"
+# ...and the same here: the body is decoded, so OPTIONS * answers about the
+# server as it always should have. The 501 was the coding being refused.
 resp=$(raw_http 'OPTIONS * HTTP/1.1\r\nHost: one.test\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n')
-check_http "target: OPTIONS * with a chunked body is 501" "501 Not Implemented" "$resp"
+check_http "target: OPTIONS * with a chunked body is answered" "200 OK" "$resp"
 
 # --- the method is a token (RFC 9110 9.1). The request-line parse only bounded
 # it to printable ASCII, so every delimiter got through — including the double
@@ -1498,6 +1505,14 @@ check_http "proxy forwards body" "hello body" "$resp"
 # the backend anyway — the header-smuggling shape that rule exists to close.
 timeout 60 python3 test/tls/h1_proxy_hop_by_hop.py 47080 >/dev/null 2>&1
 check "proxy removes the fields Connection names" $?
+
+# Chunked request bodies (RFC 9112 7.1 MUST). Any Transfer-Encoding at all used
+# to be 501, so every client that sends a body of unknown length up front was
+# refused: curl -T -, fetch() with a ReadableStream, most libraries handed a
+# stream. The arrival-pattern cases are the ones that matter — a body comes in
+# as many reads as the network likes.
+timeout 120 python3 test/tls/h1_chunked_request.py 47080 >/dev/null 2>&1
+check "h1 decodes chunked request bodies" $?
 
 # a HEAD response is head-only even though the backend sends Content-Length:
 # waiting for that body would hang until the idle timeout

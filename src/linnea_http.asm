@@ -243,6 +243,9 @@ hdr_close_len   equ $ - hdr_close
 
 ; Rewritten heads end their last copied header line with CRLF, so these
 ; carry no leading CRLF of their own.
+hdr_cl_up:      db "Content-Length: "
+hdr_cl_up_len   equ $ - hdr_cl_up
+hdr_crlf_up:    db 13, 10
 hdr_up_close:   db "Connection: close", 13, 10, 13, 10
 hdr_up_close_len equ $ - hdr_up_close
 hdr_up_keepalive: db "Connection: keep-alive", 13, 10, 13, 10
@@ -290,6 +293,7 @@ hn_upgrade:     db "upgrade"       ; the header name and the Connection token
 hn_range:       db "range"
 hn_if_range:    db "if-range"
 hv_close:       db "close"
+hv_chunked:     db "chunked"
 slash_ch:       db "/"
 zero_ch:        db "0"
 
@@ -1061,7 +1065,20 @@ linnea_http_handle:
     mov [rsp + 128], rax
     jmp .header_next
 .te_header:
-    or qword [rsp + 136], 2    ; chunked etc. are not implemented
+    ; "chunked" is the one coding we implement (RFC 9112 7.1 makes receiving it
+    ; a MUST); anything else still earns a 501. Bit 2 is "a coding we cannot
+    ; do", bit 4 is "chunked".
+    mov rdi, [rsp + 72]
+    mov rsi, [rsp + 80]
+    lea rdx, [hv_chunked]
+    mov ecx, 7
+    call linnea_string_iequal
+    test eax, eax
+    jz .te_unsupported
+    or qword [rsp + 136], 4
+    jmp .header_next
+.te_unsupported:
+    or qword [rsp + 136], 2
 .header_next:
     add r15, 2                 ; past the CRLF
     jmp .header_loop
@@ -1104,7 +1121,14 @@ linnea_http_handle:
     dec rcx
     jnz .host_char
     test qword [rsp + 136], 2
-    jnz .resp_501
+    jnz .resp_501                      ; a coding we do not implement
+    ; Transfer-Encoding and Content-Length together is the classic smuggling
+    ; setup: RFC 9112 6.1 says the message framing is invalid, answer 400 and
+    ; close. It used to fall out as a 501 because any TE at all was refused.
+    mov rax, [rsp + 136]
+    and rax, 5
+    cmp rax, 5
+    je .resp_400
     ; "OPTIONS *" asks about the server, not about a resource (RFC 9112
     ; 3.2.4): there is no path to route, so answer it here. Any other method
     ; with an asterisk target is nonsense and stays a 400.
@@ -1127,6 +1151,55 @@ linnea_http_handle:
     ; arrives — the routing below sends anything else to a 413.
     mov qword [rsp + 288], 0   ; streaming the request body?
     mov qword [rbx + linnea_connection.req_body_rem], 0
+    test qword [rsp + 136], 4
+    jz .not_chunked
+    ; --- chunked: decode it in place, then carry on as any other body -------
+    ; Afterwards the buffer holds the body exactly as though the client had
+    ; declared a Content-Length, so nothing downstream needs to know this
+    ; happened. The decoded form is always shorter than the encoded one, so it
+    ; cannot overflow what has already been received.
+    lea rdi, [rbx + linnea_connection.in_buf]
+    add rdi, [rbx + linnea_connection.head_len]
+    mov rsi, [rbx + linnea_connection.in_len]
+    sub rsi, [rbx + linnea_connection.head_len]
+    call chunked_decode              ; rax = decoded, rdx = encoded
+    cmp rax, -2
+    je .resp_400                     ; malformed framing
+    cmp rax, -1
+    jne .chunked_done
+    ; not all here yet. If the buffer is already full it never will be: this
+    ; body is larger than we buffer, and only a proxy could have streamed it —
+    ; which the chunked path does not do yet.
+    mov rcx, [rbx + linnea_connection.in_len]
+    cmp rcx, LINNEA_CONN_IN_BUF
+    jae .resp_413
+    mov eax, LINNEA_HTTP_NEED_MORE
+    jmp .ret
+.chunked_done:
+    ; slide anything pipelined behind it down over the framing we removed
+    push rax
+    push rdx
+    mov rcx, [rbx + linnea_connection.in_len]
+    sub rcx, [rbx + linnea_connection.head_len]
+    sub rcx, rdx                     ; bytes sitting after the encoded body
+    jz .chunked_compacted
+    lea rdi, [rbx + linnea_connection.in_buf]
+    add rdi, [rbx + linnea_connection.head_len]
+    add rdi, rax                     ; just past the decoded body
+    lea rsi, [rbx + linnea_connection.in_buf]
+    add rsi, [rbx + linnea_connection.head_len]
+    add rsi, rdx                     ; just past the encoded body
+    rep movsb
+.chunked_compacted:
+    pop rdx
+    pop rax
+    mov rcx, rdx
+    sub rcx, rax                     ; framing bytes that have gone
+    sub [rbx + linnea_connection.in_len], rcx
+    mov [rsp + 128], rax             ; the decoded length IS the Content-Length
+    and qword [rsp + 136], ~4        ; and it is an ordinary body from here on
+    or qword [rsp + 136], 8          ; ...but the proxy still owes it a length
+.not_chunked:
     mov rax, [rbx + linnea_connection.head_len]
     add rax, [rsp + 128]
     cmp rax, LINNEA_CONN_IN_BUF
@@ -1982,6 +2055,20 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jnz .proxy_next_line
+    ; Transfer-Encoding never goes upstream: the body was decoded on the way in,
+    ; so forwarding the header would promise the backend a framing that is no
+    ; longer there. A Content-Length describing the decoded body is emitted with
+    ; the Connection header below instead.
+    mov rcx, [rsp + 56]
+    mov rax, r10
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_transfer_enc]
+    mov ecx, 17
+    call linnea_string_iequal
+    test eax, eax
+    jnz .proxy_next_line
     ; and every field the client's own Connection value names (RFC 9110 7.6.1)
     mov rcx, [rsp + 56]
     mov rax, r10
@@ -2005,6 +2092,24 @@ linnea_http_handle:
     mov [rsp + 56], rdx
     jmp .proxy_hdr_loop
 .proxy_hdr_done:
+    ; A body that arrived chunked has been decoded, and its Transfer-Encoding
+    ; was dropped above — so the backend needs a length, and the client sent no
+    ; Content-Length header for the copy loop to forward.
+    test qword [rsp + 136], 8
+    jz .proxy_no_clen
+    lea rdi, [hdr_cl_up]
+    mov esi, hdr_cl_up_len
+    call .append
+    mov rdi, [rsp + 128]             ; the decoded length
+    lea rsi, [num_buf]
+    call linnea_string_from_u64      ; rax = digits written
+    lea rdi, [num_buf]
+    mov rsi, rax
+    call .append
+    lea rdi, [hdr_crlf_up]
+    mov esi, 2
+    call .append
+.proxy_no_clen:
     cmp qword [rbx + linnea_connection.upgrade], 0
     jne .proxy_conn_upgrade
     lea rdi, [hdr_up_close]    ; one request per upstream connection
@@ -2950,4 +3055,172 @@ linnea_http_proxy_head:
     mov rdi, r15
     rep movsb
     mov r15, rdi
+    ret
+
+; ===================================================================
+; chunked_decode(rdi = body start, rsi = bytes available)
+;   -> rax = decoded length, rdx = encoded bytes the body occupied
+;      rax = -1  the body is not complete yet: ask for more
+;      rax = -2  malformed framing
+;
+; RFC 9112 7.1 MUST: "A server MUST be able to receive and decode the chunked
+; transfer coding." Nothing here could: any Transfer-Encoding at all was
+; answered 501, so every client that sends a body of unknown length up front —
+; curl -T -, fetch() with a ReadableStream, most libraries handed a stream —
+; was refused outright.
+;
+; Two passes, and the first one MUST NOT write. A body arrives across as many
+; reads as the network feels like, and the caller re-parses from the start of
+; the body each time more turns up; a walk that slid chunks down as it went
+; would leave the buffer half-decoded, and the retry would parse the wreckage
+; and call it malformed. So the first pass only measures, and nothing moves
+; until the terminating chunk has actually been seen.
+;
+; Every length off the wire is checked against the bytes remaining BEFORE it is
+; added to a cursor: a chunk size is up to 16 hex digits, and add-then-compare
+; would wrap past the end and read on.
+chunked_decode:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov r12, rdi                      ; body start
+    lea r13, [rdi + rsi]              ; end of what has arrived
+    xor ebp, ebp                      ; pass: 0 = measure, 1 = move
+.cd_pass:
+    mov r14, r12                      ; read cursor
+    mov r15, r12                      ; write cursor
+.cd_chunk:
+    xor ebx, ebx                      ; chunk size
+    xor ecx, ecx                      ; hex digits seen
+.cd_size:
+    cmp r14, r13
+    jae .cd_more
+    movzx eax, byte [r14]
+    cmp al, '0'
+    jb .cd_size_done
+    cmp al, '9'
+    jbe .cd_digit
+    or al, 0x20                       ; fold A-F to a-f
+    cmp al, 'a'
+    jb .cd_size_done
+    cmp al, 'f'
+    ja .cd_size_done
+    sub al, 'a' - 10
+    jmp .cd_accum
+.cd_digit:
+    sub al, '0'
+.cd_accum:
+    cmp rbx, 0x0fffffffffffffff
+    ja .cd_bad                        ; a size no body could ever have
+    shl rbx, 4
+    movzx eax, al
+    or rbx, rax
+    inc rcx
+    inc r14
+    jmp .cd_size
+.cd_size_done:
+    test rcx, rcx
+    jz .cd_bad                        ; no digits: not a chunk header
+.cd_ext:                              ; chunk-ext runs to the CRLF, ignored
+    cmp r14, r13
+    jae .cd_more
+    cmp byte [r14], 13
+    je .cd_size_crlf
+    cmp byte [r14], 10
+    je .cd_bad                        ; a bare LF is not a line ending here
+    inc r14
+    jmp .cd_ext
+.cd_size_crlf:
+    lea rax, [r14 + 2]
+    cmp rax, r13
+    ja .cd_more
+    cmp byte [r14 + 1], 10
+    jne .cd_bad
+    add r14, 2
+    test rbx, rbx
+    jz .cd_last                       ; a zero-size chunk ends the body
+    mov rax, r13
+    sub rax, r14                      ; bytes actually here
+    cmp rbx, rax
+    ja .cd_more                       ; the data has not all arrived
+    test ebp, ebp
+    jz .cd_skip_data                  ; measuring: touch nothing
+    mov rcx, rbx
+    mov rdi, r15
+    mov rsi, r14
+    rep movsb                         ; slide it down over its header
+    mov r15, rdi
+    jmp .cd_after_data
+.cd_skip_data:
+    add r15, rbx
+.cd_after_data:
+    add r14, rbx
+    lea rax, [r14 + 2]
+    cmp rax, r13
+    ja .cd_more
+    cmp byte [r14], 13
+    jne .cd_bad
+    cmp byte [r14 + 1], 10
+    jne .cd_bad
+    add r14, 2
+    jmp .cd_chunk
+.cd_last:
+    ; the trailer section: field lines until an empty one. They are dropped — a
+    ; trailer that reached the request could change the answer to it, the same
+    ; rule HTTP/2 and HTTP/3 follow for theirs.
+.cd_trailer:
+    cmp r14, r13
+    jae .cd_more
+    cmp byte [r14], 13
+    je .cd_trailer_end
+.cd_trailer_line:
+    cmp r14, r13
+    jae .cd_more
+    cmp byte [r14], 13
+    je .cd_trailer_crlf
+    inc r14
+    jmp .cd_trailer_line
+.cd_trailer_crlf:
+    lea rax, [r14 + 2]
+    cmp rax, r13
+    ja .cd_more
+    cmp byte [r14 + 1], 10
+    jne .cd_bad
+    add r14, 2
+    jmp .cd_trailer
+.cd_trailer_end:
+    lea rax, [r14 + 2]
+    cmp rax, r13
+    ja .cd_more
+    cmp byte [r14 + 1], 10
+    jne .cd_bad
+    add r14, 2
+    ; the body is whole. On the measuring pass, go round again and move it.
+    test ebp, ebp
+    jnz .cd_done
+    mov ebp, 1
+    jmp .cd_pass
+.cd_done:
+    mov rax, r15
+    sub rax, r12                      ; decoded length
+    mov rdx, r14
+    sub rdx, r12                      ; what the encoded body occupied
+    jmp .cd_ret
+.cd_more:
+    mov rax, -1
+    xor edx, edx
+    jmp .cd_ret
+.cd_bad:
+    mov rax, -2
+    xor edx, edx
+.cd_ret:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
