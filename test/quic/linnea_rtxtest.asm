@@ -21,6 +21,8 @@ extern linnea_quic_txchunk_clear
 extern linnea_quic_flow_scan
 extern linnea_quic_parse_priority
 extern linnea_quic_ack_ranges
+extern linnea_quic_ack_record
+extern linnea_quic_ack_seen
 extern linnea_quic_reset_scan
 extern linnea_quic_path_seen
 extern linnea_quic_path_data
@@ -94,8 +96,30 @@ conn:      resb linnea_quic_conn_size
 pairs:     resb LINNEA_QUIC_ACK_MAXR * 16
 flow_out:  resb 16                 ; [max_data, max_stream_data] from a flow scan
 rid_out:   resq 16                 ; reset-stream ids (unused here; a valid dest)
+as_state:  resq 3                  ; have / largest / mask — the whole receive window
 
 section .text
+
+
+; --- receive-window helpers: the three qwords linnea_quic_ack_record keeps ---
+%macro AS_INIT 0
+    mov qword [as_state], 0
+    mov qword [as_state + 8], 0
+    mov qword [as_state + 16], 0
+%endmacro
+
+%macro AS_REC 1                         ; note packet number %1 as received
+    lea rdi, [as_state]
+    mov rsi, %1
+    call linnea_quic_ack_record
+%endmacro
+
+%macro EXPECT_SEEN 2                    ; ack_seen(%1) must answer %2
+    lea rdi, [as_state]
+    mov rsi, %1
+    call linnea_quic_ack_seen
+    EXPECT rax, %2
+%endmacro
 
 ; record one packet: rsi = pn, into conn with the shared payload at now = 0.
 %macro RECORD 1
@@ -434,6 +458,64 @@ _start:
     mov ecx, 16
     call linnea_quic_reset_scan
     EXPECT qword [linnea_quic_path_seen], 0
+
+    ; --- the receive window: which packet numbers do we know we have processed?
+    ; RFC 9000 12.3 asks for certainty, not for a duplicate check, so the answers
+    ; are "new", "seen", and — outside the 64-packet window — "cannot tell, so
+    ; treat as seen". Knowing exactly would cost unbounded memory; this costs 24
+    ; bytes and drops what it cannot vouch for.
+
+    ; nothing received yet: everything is new
+    AS_INIT
+    EXPECT_SEEN 0, 0
+    EXPECT_SEEN 12345, 0
+
+    ; a straight run 0..199 leaves largest=199 and the 64 below it known
+    AS_INIT
+    mov ebx, 0
+.as_fill:
+    AS_REC rbx
+    inc ebx
+    cmp ebx, 200
+    jb .as_fill
+    EXPECT_SEEN 199, 1                  ; the largest itself
+    EXPECT_SEEN 198, 1                  ; first inside the window
+    EXPECT_SEEN 135, 1                  ; last inside the window (offset 63)
+    EXPECT_SEEN 134, 1                  ; past it: unknowable, so "seen"
+    EXPECT_SEEN 500, 0                  ; above the largest: certainly new
+
+    ; a gap inside the window stays known-not-seen, and filling it is recorded
+    AS_INIT
+    AS_REC 100
+    AS_REC 101
+    AS_REC 103
+    EXPECT_SEEN 102, 0                  ; skipped, still describable
+    EXPECT_SEEN 101, 1
+    AS_REC 102                          ; arrives late (reordering)
+    EXPECT_SEEN 102, 1
+
+    ; an old number we truly never saw is still dropped: uncertainty resolves the
+    ; safe way, and it costs nothing because ack_record already refused to
+    ; acknowledge anything that far back, so the peer must resend it regardless
+    AS_INIT
+    AS_REC 1000
+    EXPECT_SEEN 10, 1
+
+    ; the .ar_reset boundary. A delta of exactly 64 puts the OLD largest at
+    ; offset 63 — still inside the new window. Clearing the mask wholesale
+    ; forgot it and made that one packet replayable once.
+    AS_INIT
+    AS_REC 100
+    AS_REC 163                          ; delta 63: shift path keeps the bit
+    EXPECT_SEEN 100, 1
+    AS_INIT
+    AS_REC 100
+    AS_REC 164                          ; delta 64: reset path must keep it too
+    EXPECT_SEEN 100, 1
+    AS_INIT
+    AS_REC 100
+    AS_REC 165                          ; delta 65: offset 64, genuinely outside
+    EXPECT_SEEN 100, 1                  ; ...so "cannot tell" -> seen
 
     ; print "quic-rtx <pass>/<total>\n"
     lea rdi, [msg_head]

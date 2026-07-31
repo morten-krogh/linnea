@@ -722,7 +722,20 @@ linnea_quic_ack_record:
     mov [rdi + 8], rsi
     ret
 .ar_reset:
-    mov qword [rdi + 16], 0
+    ; The old window has fallen off wholesale — except at a delta of exactly 64,
+    ; where the previous largest lands at offset 63 and is still inside the new
+    ; window. Clearing the mask outright would forget it, and ack_seen would then
+    ; report that packet as new: replayable once, for a peer whose numbers jump
+    ; exactly 64. (The reset path exists at all because shl masks its count to
+    ; six bits, so shifting by 64 would be a no-op rather than a clear — which is
+    ; why 64 cannot simply join the shift path above.)
+    xor edx, edx
+    cmp rcx, 64
+    jne .ar_reset_store
+    mov rdx, 1
+    shl rdx, 63                      ; keep the old largest at its new offset
+.ar_reset_store:
+    mov [rdi + 16], rdx
     mov [rdi + 8], rsi
 .ar_done:
     ret
