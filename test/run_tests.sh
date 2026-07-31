@@ -2739,6 +2739,13 @@ PYEOF
     timeout 60 python3 test/tls/h2_trailers.py $CA 47443 >/dev/null 2>&1
     check "http2 trailer sections do not kill the connection" $?
 
+    # Every TLS connection must end with close_notify (RFC 8446 6.1) or the peer
+    # cannot tell a finished response from a cut one. The alert may only be
+    # written where no other send is outstanding, so the cases after a large
+    # response and after h2 traffic are the ones that matter.
+    timeout 90 python3 test/tls/close_notify.py $CA 47443 >/dev/null 2>&1
+    check "tls connections end with close_notify" $?
+
 
     # HPACK is stateful, so a block we REJECT must still be walked to its end:
     # the inserts after the offending field reach the peer's dynamic table

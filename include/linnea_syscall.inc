@@ -21,6 +21,11 @@ LINNEA_SYS_KILL      equ 62
 LINNEA_SYS_ACCEPT    equ 43
 LINNEA_SYS_SOCKET    equ 41
 LINNEA_SYS_SENDTO    equ 44
+LINNEA_SYS_SENDMSG   equ 46
+LINNEA_MSG_DONTWAIT  equ 0x40
+; Without MSG_NOSIGNAL a write to a peer that has already gone raises SIGPIPE,
+; whose default action kills the process outright.
+LINNEA_MSG_NOSIGNAL  equ 0x4000
 LINNEA_SYS_RECVFROM  equ 45
 LINNEA_SYS_SHUTDOWN  equ 48
 LINNEA_SYS_BIND      equ 49

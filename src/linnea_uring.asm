@@ -80,6 +80,7 @@ extern linnea_tls_hs_init
 extern linnea_tls_hs_input
 extern linnea_tls_drain_early
 extern linnea_ktls_enable
+extern linnea_ktls_close_notify
 extern linnea_h2_init
 extern linnea_h2_busy
 extern linnea_h2_handle
@@ -2102,6 +2103,24 @@ linnea_uring_run:
     mov qword [r12 + linnea_connection.h2_closing], 1
     jmp .wait
 .conn_close_now:
+    ; Say goodbye (RFC 8446 6.1). This is the ONLY safe point: reaching here
+    ; means the h2 busy check above has already passed, so no recv or send of
+    ; ours is outstanding on this socket, and an HTTP/1 connection is one
+    ; operation at a time by construction. An earlier attempt sent the alert
+    ; from the branch just above — which is entered precisely BECAUSE ops are in
+    ; flight — and spliced it into the middle of a record the kernel was still
+    ; framing. The suite came apart differently on every run until this moved.
+    ;
+    ; Only where kTLS is carrying records: on a plaintext listener these two
+    ; bytes would be two bytes of garbage on the end of the response.
+    cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_KTLS
+    jne .cn_sent
+    cmp qword [r12 + linnea_connection.close_notified], 0
+    jne .cn_sent
+    mov qword [r12 + linnea_connection.close_notified], 1
+    mov edi, [r12 + linnea_connection.fd]
+    call linnea_ktls_close_notify
+.cn_sent:
     mov qword [r12 + linnea_connection.h2_closing], 0
     mov qword [r12 + linnea_connection.linger], 0
     call ring_check_overflow   ; a teardown is a regular, cheap place to notice

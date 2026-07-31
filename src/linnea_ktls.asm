@@ -25,6 +25,7 @@ default rel
 
 global linnea_tls_setup
 global linnea_ktls_enable
+global linnea_ktls_close_notify
 
 extern linnea_file_map_readonly
 extern linnea_file_unmap
@@ -349,5 +350,58 @@ install_direction:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+
+; linnea_ktls_close_notify(edi = fd) — send a TLS close_notify alert.
+;
+; RFC 8446 6.1 MUST: "Each party MUST send a close_notify alert before closing
+; its write side of the connection." Without it every connection ends as a
+; truncation from the peer's point of view, and a response that is neither
+; length- nor chunk-delimited has no defence against a truncation attack.
+;
+; With kTLS the kernel builds the record, so send() can only emit application
+; data; the record type rides in a control message instead.
+;
+; The CALLER owns the one thing that makes this safe: it must run only where no
+; other send is outstanding on this socket. Interleaving an alert with a send
+; the kernel is still framing splices it into the middle of a record, and the
+; peer sees corruption rather than a goodbye.
+;
+; Layout: msghdr(56) | iovec(16) | cmsghdr+data(24) | payload(2).
+linnea_ktls_close_notify:
+    push rbx
+    mov ebx, edi                      ; fd
+    sub rsp, 112
+    mov byte [rsp + 96], 1            ; legacy level "warning" (8446 6 ignores it)
+    mov byte [rsp + 97], LINNEA_TLS_A_CLOSE_NOTIFY
+    lea rax, [rsp + 96]
+    mov [rsp + 56], rax               ; iov_base
+    mov qword [rsp + 64], 2           ; iov_len
+    mov qword [rsp + 72], 17          ; cmsg_len = CMSG_LEN(1)
+    mov dword [rsp + 80], LINNEA_SOL_TLS
+    mov dword [rsp + 84], LINNEA_TLS_SET_RECORD_TYPE
+    mov byte [rsp + 88], LINNEA_TLS_CT_ALERT
+    mov qword [rsp + 0], 0            ; msg_name
+    mov dword [rsp + 8], 0            ; msg_namelen
+    lea rax, [rsp + 56]
+    mov [rsp + 16], rax               ; msg_iov
+    mov qword [rsp + 24], 1           ; msg_iovlen
+    lea rax, [rsp + 72]
+    mov [rsp + 32], rax               ; msg_control
+    mov qword [rsp + 40], 24          ; msg_controllen = CMSG_SPACE(1)
+    mov dword [rsp + 48], 0           ; msg_flags
+    mov eax, LINNEA_SYS_SENDMSG
+    mov edi, ebx
+    lea rsi, [rsp]
+    ; MSG_NOSIGNAL is load-bearing, not tidiness. The whole point of this call is
+    ; that the connection is ending, and the peer is very often gone already —
+    ; it reset the stream, or hung up first. Without the flag that write raises
+    ; SIGPIPE, whose default action kills the worker. MSG_DONTWAIT because a
+    ; full send buffer is not worth stalling the event loop over.
+    mov edx, LINNEA_MSG_DONTWAIT | LINNEA_MSG_NOSIGNAL
+    syscall
+    add rsp, 112
     pop rbx
     ret
