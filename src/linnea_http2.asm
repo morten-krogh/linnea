@@ -983,6 +983,40 @@ h2_build_request:
 %define S_ENC   120             ; coding served (0 plain, 1 gzip, 2 br)
 %define S_LSTAT 128             ; access log: numeric status (0 = do not log)
 %define S_LBYTES 136            ; access log: body bytes
+; h2_data_window_take(rdi = conn, rsi = body length) -> rax = 1 when the body may
+; go out now, 0 when it must be withheld. Debits the connection window on success.
+;
+; RFC 9113 6.9.1 MUST NOT: a sender must not send a flow-controlled frame carrying
+; more than the receiver has advertised room for. The inline bodies — the 4xx and
+; 5xx pages, the 431, the proxy's own errors — wrote their DATA straight at the
+; out cursor and were charged against nothing at all. Two things followed. A peer
+; advertising a zero window was sent one anyway, which is the standard h2spec
+; 6.9.1 failure. And on a long-lived connection the server's idea of the
+; connection window drifted above the peer's real one by the sum of every error
+; body it had ever sent, until the peer — counting honestly — closed with
+; FLOW_CONTROL_ERROR.
+;
+; These streams never take a pool slot, so nothing has gone out on them and their
+; stream window is still exactly the peer's advertised initial value. Both windows
+; are checked signed: h2_cwnd legitimately goes negative when the peer shrinks
+; SETTINGS_INITIAL_WINDOW_SIZE under data already in flight.
+h2_data_window_take:
+    test rsi, rsi
+    jz .dw_yes                        ; an empty body consumes no window at all
+    mov rax, [rdi + linnea_connection.h2_cwnd]
+    cmp rax, rsi
+    jl .dw_no
+    mov rax, [rdi + linnea_connection.h2_init_swnd]
+    cmp rax, rsi
+    jl .dw_no
+    sub [rdi + linnea_connection.h2_cwnd], rsi
+.dw_yes:
+    mov eax, 1
+    ret
+.dw_no:
+    xor eax, eax
+    ret
+
 h2_serve:
     push rbx
     push r12
@@ -1751,6 +1785,17 @@ h2_serve:
     add ecx, edx
     sub ecx, '0' * 111               ; the three digits' ASCII bias
     mov [rsp + S_LSTAT], rcx
+    ; The body is flow-controlled. If the peer has no room for it, answer with an
+    ; empty one rather than sending it regardless: the status is what an error
+    ; response is for, content-length then agrees at 0, and a zero-length DATA
+    ; frame consumes no window, so END_STREAM still arrives.
+    mov rdi, rbx
+    mov rsi, r15
+    call h2_data_window_take
+    test eax, eax
+    jnz .body_fits
+    xor r15d, r15d
+.body_fits:
     mov [rsp + S_LBYTES], r15
     mov rdi, r15
     lea rsi, [h2_numbuf]
@@ -2673,8 +2718,18 @@ h2_431_stream:
     imul rax, rax, linnea_config_server_size
     lea rax, [rax + linnea_config_instance + linnea_config.servers]
     mov [h2_cur_srv], rax
+    ; the body is flow-controlled (RFC 9113 6.9.1): withhold it if the peer has
+    ; advertised no room, and let content-length agree at 0
+    mov qword [h2_err_blen], body_431_len
+    mov rdi, rbx
+    mov esi, body_431_len
+    call h2_data_window_take
+    test eax, eax
+    jnz .b431_fits
+    mov qword [h2_err_blen], 0
+.b431_fits:
     ; content-length text
-    mov edi, body_431_len
+    mov rdi, [h2_err_blen]
     lea rsi, [h2_numbuf]
     call linnea_string_from_u64
     mov r13, rax                     ; its length
@@ -2721,7 +2776,8 @@ h2_431_stream:
     lea rdi, [rdi + rcx + 9]
     mov byte [rdi], 0
     mov byte [rdi + 1], 0
-    mov byte [rdi + 2], body_431_len
+    mov rax, [h2_err_blen]
+    mov [rdi + 2], al
     mov byte [rdi + 3], LINNEA_H2_FT_DATA
     mov byte [rdi + 4], LINNEA_H2_FLAG_END_STREAM
     mov rax, r12
@@ -2736,7 +2792,7 @@ h2_431_stream:
     mov [rdi + 8], r12b
     add rdi, 9
     lea rsi, [body_431]
-    mov ecx, body_431_len
+    mov rcx, [h2_err_blen]
     rep movsb
     mov r13, rdi
     sub r13, r14                     ; total bytes written
@@ -3640,6 +3696,7 @@ h2p_emit_error:
     push r13
     push r14
     push r15
+    mov [h2_err_conn], rdx           ; kept: rdx is reused before the body is sized
     mov rbx, rsi                     ; slot
     mov rax, [rbx + linnea_h2p.srv]
     mov [h2_cur_srv], rax
@@ -3664,7 +3721,6 @@ h2p_emit_error:
     lea r12, [body_408]
     mov r13d, body_408_len
 .ee_status:
-    mov [rbx + linnea_h2p.lg_bytes], r13   ; the synthetic body, for the access line
     lea rdi, [h2p_stbuf]             ; the status as three digits
     xor edx, edx
     mov ecx, 100
@@ -3679,6 +3735,18 @@ h2p_emit_error:
     mov [rdi + 1], al
     add dl, '0'
     mov [rdi + 2], dl
+    ; Flow control, now that the status is safely in h2p_stbuf: rax carried it
+    ; into the division above, so this could not go any earlier. Sized before
+    ; content-length and the access line, so both describe what actually goes out
+    ; (RFC 9113 6.9.1).
+    mov rdi, [h2_err_conn]
+    mov rsi, r13
+    call h2_data_window_take
+    test eax, eax
+    jnz .ee_body_fits
+    xor r13d, r13d
+.ee_body_fits:
+    mov [rbx + linnea_h2p.lg_bytes], r13   ; the synthetic body, for the access line
     mov rdi, r13                     ; content-length text
     lea rsi, [h2p_numbuf]
     call linnea_string_from_u64
@@ -4626,6 +4694,8 @@ body_405_len equ $ - body_405
 
 section .bss
 h2_path_buf:  resb LINNEA_HTTP2_PATH_BUF
+h2_err_conn:  resq 1                  ; the connection an inline error is answering
+h2_err_blen:  resq 1                  ; its body length after the flow-control check
 h2_numbuf:    resb 24
 h2_crbuf:     resb 80                ; "bytes first-last/size" / "bytes */size"
 h2_locbuf:    resb 2560              ; a redirect's Location value

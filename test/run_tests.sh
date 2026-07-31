@@ -2684,6 +2684,13 @@ PYEOF
     timeout 60 python3 test/tls/h2_goaway_last_stream.py $CA 47443 >/dev/null 2>&1
     check "http2 GOAWAY names the last processed stream" $?
 
+    # Inline error bodies are flow-controlled too (RFC 9113 6.9.1). They were
+    # written straight at the out cursor and charged against nothing, so a peer
+    # advertising a zero window was sent one anyway, and the server's idea of the
+    # connection window drifted above the peer's by every error body it had sent.
+    timeout 120 python3 test/tls/h2_error_flow_control.py $CA 47443 >/dev/null 2>&1
+    check "http2 error bodies respect the flow-control window" $?
+
     # HPACK is stateful, so a block we REJECT must still be walked to its end:
     # the inserts after the offending field reach the peer's dynamic table
     # whether we like the request or not. Stopping early left our table behind
