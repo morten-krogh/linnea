@@ -973,8 +973,24 @@ with gzip.open('test/www/enc.txt.gz', 'wb') as f:
     f.write(b'gzip payload')
 open('test/www/enc.txt.br', 'wb').write(b'br payload')
 PY
+# The suite runs two backends in turn, both on 47100: one for the plain-HTTP
+# block and a second for the TLS block. SO_REUSEADDR lets the second past a
+# TIME_WAIT, but not past a first that is still listening — and the backend's
+# output goes to /dev/null, so a failed bind is invisible until every proxied
+# request in the rest of the run answers 502. Seen once: 23 failures, all
+# proxy, none reproducible. Wait for it to actually accept.
+backend_ready() {
+    for _ in $(seq 1 60); do
+        (echo > /dev/tcp/127.0.0.1/47100) >/dev/null 2>&1 && return 0
+        sleep 0.1
+    done
+    echo "WARNING: the proxy backend never came up on 47100" >&2
+    return 1
+}
+
 python3 test/proxy_backend.py >/dev/null 2>&1 &
 backend_pid=$!
+backend_ready
 $BIN --config test/configs/listen.json >/dev/null 2>&1 &
 server_pid=$!
 sleep 0.3
@@ -1568,6 +1584,13 @@ check "Connection: close is honoured anywhere in the list" $?
 timeout 60 python3 test/tls/canned_response_headers.py 47080 >/dev/null 2>&1
 check "canned responses carry Date and announce a close" $?
 
+# RFC 9110 10.1.1 MUST: answer a 100-continue expectation with 100 or a final
+# status. The field was never inspected, so the server waited for a body the
+# client was withholding while the client waited for permission to send it —
+# a full second added to every such request, for clients that recover at all.
+timeout 60 python3 test/tls/expect_continue.py 47080 >/dev/null 2>&1
+check "Expect: 100-continue is answered" $?
+
 # Chunked request bodies (RFC 9112 7.1 MUST). Any Transfer-Encoding at all used
 # to be 501, so every client that sends a body of unknown length up front was
 # refused: curl -T -, fetch() with a ReadableStream, most libraries handed a
@@ -1734,6 +1757,11 @@ grep -qF ': idle timeout' "$LOG"
 check "termination idle timeout" $?
 
 kill $server_pid $backend_pid 2>/dev/null
+# the next block binds 47100 again, so let this one's listener go first
+for _ in $(seq 1 60); do
+    (echo > /dev/tcp/127.0.0.1/47100) >/dev/null 2>&1 || break
+    sleep 0.1
+done
 wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
 rm -f "$LOG" test/www/big.txt test/www/upload.bin test/www/upload2.bin test/www/h2range.bin test/www/huge.bin test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
@@ -2218,6 +2246,7 @@ else
     python3 -c "open('test/www/big.txt','w').write('B'*100000)"
     python3 test/proxy_backend.py >/dev/null 2>&1 &
     tls_backend_pid=$!
+    backend_ready
     $BIN --config test/configs/tls.json >/dev/null 2>&1 &
     tls_server_pid=$!
     sleep 0.3

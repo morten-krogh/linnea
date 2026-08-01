@@ -309,6 +309,9 @@ hn_content_len: db "content-length"
 hn_transfer_enc: db "transfer-encoding"
 hn_host:        db "host"
 hn_expect:      db "expect"
+hv_100_continue: db "100-continue"
+resp_100:       db "HTTP/1.1 100 Continue", 13, 10, 13, 10
+resp_100_len    equ $ - resp_100
 hn_if_none_match: db "if-none-match"
 hn_if_mod_since: db "if-modified-since"
 hn_accept_enc:  db "accept-encoding"
@@ -1110,6 +1113,13 @@ linnea_http_handle:
     jnz .ifr_header
     mov rdi, [rsp + 56]
     mov rsi, [rsp + 64]
+    lea rdx, [hn_expect]
+    mov ecx, 6
+    call linnea_string_iequal
+    test eax, eax
+    jnz .expect_header
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
     lea rdx, [hn_if_match]
     mov ecx, 8
     call linnea_string_iequal
@@ -1140,6 +1150,18 @@ linnea_http_handle:
     mov [rsp + 88], rax
     mov rax, [rsp + 80]
     mov [rsp + 96], rax
+    jmp .header_next
+.expect_header:
+    ; the only expectation defined is 100-continue (10.1.1); any other value
+    ; would be a 417, and none exists to send
+    mov rdi, [rsp + 72]
+    mov rsi, [rsp + 80]
+    lea rdx, [hv_100_continue]
+    mov ecx, 12
+    call linnea_string_iequal
+    test eax, eax
+    jz .header_next
+    or qword [rsp + 232], 4    ; the client is waiting for permission
     jmp .header_next
 .ifm_header:                   ; first occurrence wins, as for Host
     cmp qword [rsp + 312], 0
@@ -1333,6 +1355,11 @@ linnea_http_handle:
     mov rcx, [rbx + linnea_connection.in_len]
     cmp rcx, LINNEA_CONN_IN_BUF
     jae .resp_413
+    test qword [rsp + 232], 4        ; waiting on our permission to send it?
+    jz .chunked_wait
+    mov rdi, rbx
+    call http_send_continue
+.chunked_wait:
     mov eax, LINNEA_HTTP_NEED_MORE
     jmp .ret
 .chunked_done:
@@ -1366,6 +1393,11 @@ linnea_http_handle:
     ja .body_stream
     cmp rax, [rbx + linnea_connection.in_len]
     jbe .body_ready
+    test qword [rsp + 232], 4        ; waiting on our permission to send it?
+    jz .body_wait
+    mov rdi, rbx
+    call http_send_continue
+.body_wait:
     mov eax, LINNEA_HTTP_NEED_MORE
     jmp .ret
 .body_stream:
@@ -1380,6 +1412,12 @@ linnea_http_handle:
     mov [rsp + 128], rcx       ; what .proxy_start queues behind the head
     mov rax, [rbx + linnea_connection.in_len]
 .body_ready:
+    ; the body is in hand, so this request wants no further permission. Cleared
+    ; here rather than per handler call: the head is re-parsed on every recv
+    ; while a body is still arriving, and clearing there would send a fresh 100
+    ; on each one. Cleared at all, rather than never, so the SECOND request on a
+    ; keep-alive connection still gets its own.
+    mov qword [rbx + linnea_connection.continue_sent], 0
     mov [rbx + linnea_connection.head_len], rax
     ; strip the query string for routing; [rsp+144] keeps the raw length
     ; for proxying and the access log
@@ -2682,6 +2720,44 @@ linnea_http_handle:
 
 
 
+
+; http_send_continue(rdi = conn*) — send the 100 (Continue) interim response,
+; once per request.
+;
+; RFC 9110 10.1.1: a server receiving a 100-continue expectation MUST answer
+; either 100 or a final status. This answered neither — the field was never
+; inspected, and hn_expect existed only so the proxy rewriter could strip it —
+; so the server sat waiting for a body the client was deliberately withholding
+; while the client sat waiting for permission to send it. curl breaks that with
+; its own one-second timeout, which is a second added to every such request;
+; a client without that fallback gets nothing until the connection dies.
+;
+; Written straight to the socket rather than through out_buf: this is an INTERIM
+; response, and the response machinery is built around one final head per
+; request. It is safe here because nothing else is in flight — the loop is
+; reading the request, so no send is armed — and a TLS connection is in kTLS by
+; the time a request is being parsed, so the socket write is an encrypted record
+; like any other. MSG_NOSIGNAL because a dead peer must not kill the worker,
+; which is the lesson Q174 paid for.
+;
+; A failure here costs nothing: the client falls back to the behaviour it had
+; before this existed, which is to send the body after its own timeout.
+http_send_continue:
+    cmp qword [rdi + linnea_connection.continue_sent], 0
+    jne .sc_done
+    mov qword [rdi + linnea_connection.continue_sent], 1
+    push rdi
+    mov edi, [rdi + linnea_connection.fd]
+    lea rsi, [resp_100]
+    mov edx, resp_100_len
+    mov r10d, LINNEA_MSG_DONTWAIT | LINNEA_MSG_NOSIGNAL
+    xor r8d, r8d
+    xor r9d, r9d
+    mov eax, LINNEA_SYS_SENDTO
+    syscall
+    pop rdi
+.sc_done:
+    ret
 
 ; http_error_blob(rdi=conn*, rsi=blob, rdx=blob len, rcx=server* or 0)
 ;   -> rax = response ptr, rdx = response length
