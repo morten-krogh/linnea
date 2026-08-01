@@ -111,6 +111,7 @@ section .text
 ; preface. The caller sends out_ptr/out_rem, then reads.
 linnea_h2_init:
     mov qword [rdi + linnea_connection.h2_state], LINNEA_H2_PREFACE
+    mov qword [rdi + linnea_connection.h2_saw_settings], 0
     mov qword [rdi + linnea_connection.h2_cwnd], LINNEA_H2_INIT_WINDOW
     mov qword [rdi + linnea_connection.h2_rr_cursor], 0
     mov qword [rdi + linnea_connection.h2_last_stream], 0
@@ -211,8 +212,13 @@ linnea_h2_handle:
     or eax, ecx
     movzx ecx, byte [rsi + 2]
     or eax, ecx
-    cmp eax, LINNEA_CONN_IN_BUF - 9  ; frame we could never buffer
-    ja .goaway_frame_size            ; RFC 9113 4.2: over the frame size limit
+    ; RFC 9113 4.2: a frame larger than SETTINGS_MAX_FRAME_SIZE is a
+    ; FRAME_SIZE_ERROR. We advertise no MAX_FRAME_SIZE, so the protocol default
+    ; of 2^14 is what a peer must respect — but the bound here was the input
+    ; buffer (17399), so a thousand bytes over the limit we publish were
+    ; accepted anyway. Judged against what we advertise, not what we can hold.
+    cmp eax, LINNEA_H2_MAX_FRAME
+    ja .goaway_frame_size
     lea rcx, [rax + 9]               ; whole frame size
     mov rdx, r14
     sub rdx, r12
@@ -221,6 +227,18 @@ linnea_h2_handle:
     mov r11, rcx                     ; frame size
     movzx r9d, byte [rsi + 3]        ; type
     movzx r10d, byte [rsi + 4]       ; flags
+    ; RFC 9113 3.4: the client's connection preface is the magic string AND a
+    ; SETTINGS frame, and "clients and servers MUST treat an invalid connection
+    ; preface as a connection error of type PROTOCOL_ERROR". Only the magic
+    ; string was checked, so a client could open with anything at all and be
+    ; served — including a peer that is not speaking HTTP/2 but happens to
+    ; start with those 24 bytes.
+    cmp qword [rbx + linnea_connection.h2_saw_settings], 0
+    jne .f_dispatch
+    cmp r9d, LINNEA_H2_FT_SETTINGS
+    jne .goaway_close
+    mov qword [rbx + linnea_connection.h2_saw_settings], 1
+.f_dispatch:
     cmp r9d, LINNEA_H2_FT_SETTINGS
     je .f_settings
     cmp r9d, LINNEA_H2_FT_PING

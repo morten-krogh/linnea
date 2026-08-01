@@ -168,6 +168,67 @@ def stream_error(payload, budget=3.0):
 
 fails = 0
 
+# RFC 9113 3.4: the client preface is the magic string AND a SETTINGS frame.
+# Only the string was checked, so a peer could open with anything.
+def preface_then(first_frame, budget=3.0):
+    ctx = ssl.create_default_context(cafile=ca)
+    ctx.check_hostname = False
+    ctx.set_alpn_protocols(["h2"])
+    s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=10),
+                        server_hostname="localhost")
+    s.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + first_frame)
+    s.settimeout(budget)
+    buf = b""
+    try:
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= 9:
+                ln = int.from_bytes(buf[:3], "big")
+                if len(buf) < 9 + ln:
+                    break
+                ftype, body = buf[3], buf[9:9 + ln]
+                buf = buf[9 + ln:]
+                if ftype == FT_GOAWAY and len(body) >= 8:
+                    s.close()
+                    return int.from_bytes(body[4:8], "big")
+    except (socket.timeout, OSError):
+        pass
+    s.close()
+    return None
+
+
+code = preface_then(fr(FT_PING, 0, 0, b"12345678"))
+if code == PROTOCOL_ERROR:
+    print("ok   a preface not followed by SETTINGS is refused")
+else:
+    print(f"FAIL a preface followed by PING gave {NAMES.get(code, code)}, "
+          f"want PROTOCOL_ERROR")
+    fails += 1
+
+code = preface_then(fr(FT_SETTINGS, 0, 0) + fr(FT_PING, 0, 0, b"12345678"))
+if code is None:
+    print("ok   ...and a proper preface is accepted")
+else:
+    print(f"FAIL a proper preface drew {NAMES.get(code, code)}")
+    fails += 1
+
+# RFC 9113 4.2: a frame over SETTINGS_MAX_FRAME_SIZE (we advertise none, so the
+# 2^14 default) is a FRAME_SIZE_ERROR; the bound used to be the input buffer.
+# DATA, not PING: a 16385-byte PING is a FRAME_SIZE_ERROR anyway from PING's
+# own length rule, so it would pass with or without the limit being enforced.
+# DATA has no fixed length, so the only thing that can reject it is the frame
+# size limit itself.
+code = goaway_code(fr(FT_DATA, 0, 1, b"x" * 16385))
+if code == FRAME_SIZE_ERROR:
+    print("ok   a frame over 2^14 draws FRAME_SIZE_ERROR")
+else:
+    print(f"FAIL a 16385-byte DATA frame gave {NAMES.get(code, code)}, want "
+          f"FRAME_SIZE_ERROR")
+    fails += 1
+
 # RFC 9113 6.9: a zero increment is a STREAM error; only one on the connection
 # window is a connection error. Getting this wrong means one misbehaving stream
 # destroys every concurrent stream on the connection.

@@ -118,6 +118,7 @@ struc linnea_connection
     ; --- TLS: the handshake state overlays up_buf, so only a phase flag
     ; lives here (see LINNEA_TLS_PHASE_* below).
     .tls_phase:     resq 1
+    .h2_saw_settings: resq 1       ; the client's preface SETTINGS has arrived
     .continue_sent: resq 1         ; the 100 (Continue) interim response has
                                    ; gone out for the request being read
     .close_notified: resq 1        ; the close_notify alert has gone out
