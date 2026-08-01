@@ -107,6 +107,22 @@ CASES = [
      fr(FT_WINDOW, 0, 0, struct.pack(">I", 0x7fffffff)), FLOW_CONTROL_ERROR),
     ("a header block the HPACK decoder cannot read",
      fr(FT_HEADERS, 0x4 | 0x1, 1, HPACK_ROT), COMPRESSION_ERROR),
+    # RFC 9113 6.5 / 6.7: a SETTINGS or PING frame naming a stream is a
+    # connection error — the field was read for DATA and HEADERS but ignored
+    # for these two, so a connection-level frame could claim a stream.
+    ("SETTINGS naming a stream", fr(FT_SETTINGS, 0, 1), PROTOCOL_ERROR),
+    ("PING naming a stream", fr(FT_PING, 0, 1, b"12345678"), PROTOCOL_ERROR),
+    # 6.4: RST_STREAM is exactly 4 octets; unchecked, its error code came from
+    # whatever followed the frame in the buffer
+    ("RST_STREAM with a 3-byte payload",
+     fr(FT_RST, 0, 1, b"\x00\x00\x00"), FRAME_SIZE_ERROR),
+    # 6.5.2 bounds these two, and only INITIAL_WINDOW_SIZE was checked
+    ("SETTINGS_ENABLE_PUSH = 2",
+     fr(FT_SETTINGS, 0, 0, b"\x00\x02\x00\x00\x00\x02"), PROTOCOL_ERROR),
+    ("SETTINGS_MAX_FRAME_SIZE below 2^14",
+     fr(FT_SETTINGS, 0, 0, b"\x00\x05\x00\x00\x00\x01"), PROTOCOL_ERROR),
+    ("SETTINGS_MAX_FRAME_SIZE above 2^24-1",
+     fr(FT_SETTINGS, 0, 0, b"\x00\x05\x01\x00\x00\x00"), PROTOCOL_ERROR),
     ("a HEADERS frame with PRIORITY set but no room for it",
      fr(FT_HEADERS, 0x20, 1, b"\x00\x00"), FRAME_SIZE_ERROR),
     # controls: these were already right and must stay PROTOCOL_ERROR

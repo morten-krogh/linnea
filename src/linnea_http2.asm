@@ -327,6 +327,12 @@ linnea_h2_handle:
     mov [rax + linnea_h2_stream.swnd], rdx
     jmp .f_ignore
 .f_rst:
+    ; RFC 9113 6.4: "A RST_STREAM frame with a length other than 4 octets MUST
+    ; be treated as a connection error of type FRAME_SIZE_ERROR." Unchecked, so
+    ; a short one had its error code read from whatever followed it in the
+    ; buffer — the next frame's header, or a stale tail.
+    cmp r11, 13                      ; 9-byte header + 4-byte error code
+    jne .goaway_frame_size
     ; RST_STREAM: drop the stream's slot. Rate-based rapid-reset guard
     ; (CVE-2023-44487): resets get a budget of LIMIT plus one token per eight
     ; streams that completed. A reset flood (few/no completions) still trips
@@ -531,6 +537,15 @@ linnea_h2_handle:
     add r12, r11
     jmp .frames
 .f_settings:
+    ; RFC 9113 6.5: "If an endpoint receives a SETTINGS frame whose Stream
+    ; Identifier field is anything other than 0x00, the endpoint MUST respond
+    ; with a connection error of type PROTOCOL_ERROR." The field was read for
+    ; DATA, HEADERS and RST_STREAM but ignored here and on PING, so a frame that
+    ; belongs to the connection was accepted while claiming a stream.
+    mov eax, [rsi + 5]
+    bswap eax
+    and eax, 0x7fffffff
+    jnz .goaway_close
     test r10b, LINNEA_H2_FLAG_ACK
     jnz .f_settings_ack
     ; parse the settings entries [rsi+9 .. rsi+r11) — honour
@@ -547,10 +562,9 @@ linnea_h2_handle:
     shl edx, 8
     movzx r8d, byte [rax + 1]
     or edx, r8d
-    cmp edx, LINNEA_H2_SETTINGS_INITIAL_WINDOW_SIZE
-    jne .set_next
-    movzx r8d, byte [rax + 2]        ; value (32-bit, big-endian)
-    shl r8d, 8
+    mov r9d, edx                     ; the setting id, across the value decode
+    movzx r8d, byte [rax + 2]        ; value (32-bit, big-endian), decoded for
+    shl r8d, 8                       ; every setting now: 6.5.2 bounds three
     movzx edx, byte [rax + 3]
     or r8d, edx
     shl r8d, 8
@@ -559,6 +573,15 @@ linnea_h2_handle:
     shl r8d, 8
     movzx edx, byte [rax + 5]
     or r8d, edx
+    ; RFC 9113 6.5.2 gives three settings a legal range, and only one of them
+    ; was checked. A value outside the other two was accepted in silence, which
+    ; is the peer being told its configuration was understood when it was not.
+    cmp r9d, LINNEA_H2_SETTINGS_ENABLE_PUSH
+    je .set_push
+    cmp r9d, LINNEA_H2_SETTINGS_MAX_FRAME_SIZE
+    je .set_maxframe
+    cmp r9d, LINNEA_H2_SETTINGS_INITIAL_WINDOW_SIZE
+    jne .set_next
     cmp r8d, 0x7fffffff
     ja .goaway_flow_control          ; RFC 9113 6.5.2: above 2^31-1
     push rax
@@ -568,6 +591,16 @@ linnea_h2_handle:
     call h2_apply_init_window        ; adjust init window + open streams
     pop rcx
     pop rax
+    jmp .set_next
+.set_push:
+    cmp r8d, 1                       ; 6.5.2: "any value other than 0 or 1"
+    ja .goaway_close
+    jmp .set_next
+.set_maxframe:
+    cmp r8d, 16384                   ; 6.5.2: 2^14 .. 2^24-1 inclusive
+    jb .goaway_close
+    cmp r8d, 16777215
+    ja .goaway_close
 .set_next:
     add rax, 6
     jmp .set_loop
@@ -587,6 +620,10 @@ linnea_h2_handle:
     cmp r11, 17                      ; PING carries exactly 8 bytes (RFC 9113 6.7);
     jne .goaway_frame_size           ; else the echo below reads past the frame and
                                      ; returns 8 stale in_buf bytes to the peer
+    mov eax, [rsi + 5]               ; 6.7: a PING naming a stream is a
+    bswap eax                        ; connection error, as for SETTINGS
+    and eax, 0x7fffffff
+    jnz .goaway_close
     test r10b, LINNEA_H2_FLAG_ACK
     jnz .f_ignore
     mov byte [r13], 0                ; PING ACK: length 8
