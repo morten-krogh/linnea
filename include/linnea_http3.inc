@@ -32,7 +32,9 @@ LINNEA_H3_ERR_NO_ERROR         equ 0x0100  ; orderly close (the drain's goodbye)
 LINNEA_H3_ERR_STREAM_CREATION  equ 0x0103  ; a second control stream
 LINNEA_H3_ERR_CLOSED_CRITICAL  equ 0x0104  ; a critical stream (control/QPACK) closed
 LINNEA_H3_ERR_FRAME_UNEXPECTED equ 0x0105  ; a frame illegal in the stream it arrived on
+LINNEA_H3_ERR_FRAME            equ 0x0106  ; a frame's payload does not match its length
 LINNEA_H3_ERR_ID               equ 0x0108  ; an id a frame named cannot exist
+LINNEA_H3_ERR_SETTINGS         equ 0x0109  ; a reserved or repeated setting identifier
 LINNEA_H3_ERR_MISSING_SETTINGS equ 0x010a  ; control stream opened without SETTINGS
 LINNEA_H3_ERR_QPACK_DECOMP     equ 0x0200  ; QPACK could not decode a field section
 

@@ -2591,7 +2591,13 @@ linnea_quic_server_datagram:
     jne .cw_loop
     cmp qword [rbx + linnea_quic_conn.ctrl_pucap], 0
     je .cw_loop
+    cmp qword [rbx + linnea_quic_conn.ctrl_pucap], LINNEA_H3_FRAME_SETTINGS
+    jne .cw_pu_apply
+    call .settings_apply              ; eax = 0, or the code to close with
+    jmp .cw_applied
+.cw_pu_apply:
     call .pu_apply                    ; eax = 0, or the code to close with
+.cw_applied:
     test eax, eax
     jnz .cw_ret_off
     jmp .cw_loop
@@ -2632,6 +2638,17 @@ linnea_quic_server_datagram:
     cmp rbp, LINNEA_H3_FRAME_SETTINGS
     jne .cw_no_settings               ; the stream opened with something else
     mov qword [rbx + linnea_quic_conn.ctrl_settings], 1
+    ; Capture the payload rather than skip it: the frame type was checked all
+    ; along, but its CONTENTS never were, so a peer could send identifiers HTTP/3
+    ; reserves — or the same one twice — and be told nothing was wrong.
+    mov rcx, [rbx + linnea_quic_conn.ctrl_skip]
+    test rcx, rcx
+    jz .cw_loop                       ; an empty SETTINGS frame is perfectly legal
+    cmp rcx, LINNEA_QUIC_PU_BUF
+    ja .cw_loop                       ; more than we buffer: skip it, as the walk
+                                      ; does with anything it cannot hold
+    mov qword [rbx + linnea_quic_conn.ctrl_pucap], LINNEA_H3_FRAME_SETTINGS
+    mov qword [rbx + linnea_quic_conn.ctrl_pulen], 0
     jmp .cw_loop
 .cw_settings_seen:
     cmp rbp, LINNEA_H3_FRAME_SETTINGS
@@ -2698,6 +2715,101 @@ linnea_quic_server_datagram:
 ; whole PRIORITY_UPDATE payload sitting in the connection's .ctrl_pu, and clears
 ; the capture. rbx = conn on entry; the walk's r12/r13/r14 are preserved.
 ;
+; .settings_apply() -> eax = 0, or the H3 error code to close the connection
+; with. Walks the captured SETTINGS payload as (identifier, value) varint pairs.
+;
+; The walk validated which FRAMES may appear on the control stream; the payload
+; of the one frame that carries configuration was skipped whole. So a peer could
+; send SETTINGS_MAX_CONCURRENT_STREAMS — an HTTP/2 identifier HTTP/3 reserves
+; precisely so that an HTTP/2-shaped implementation is caught rather than
+; silently misunderstood — and hear nothing back.
+;
+;   0x02..0x05   reserved (7.2.4.1): the HTTP/2 settings with no HTTP/3
+;                equivalent. Receipt MUST be H3_SETTINGS_ERROR.
+;   a repeat     the same identifier twice (7.2.4). A receiver MAY treat this
+;                as H3_SETTINGS_ERROR, and we do.
+;   truncated    an identifier with no value, or a varint running past the
+;                frame: H3_FRAME_ERROR (7.1).
+;   anything else is ignored, which is what GREASE requires (7.2.4.1).
+;
+; The values themselves are read and not acted on. The only one that would ask
+; anything of us is MAX_FIELD_SECTION_SIZE, and 4.2.2 makes that a SHOULD on the
+; sender: our response field sections run a few hundred bytes, far below any
+; limit a client actually advertises, so there is nothing to enforce yet and a
+; stored-but-unused field would only mislead.
+;
+; Five pushes plus the 256-byte seen-list keeps rsp 16-aligned for the calls.
+.settings_apply:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+    sub rsp, 256                      ; up to 32 identifiers already seen
+    mov rbx, [cur_conn]
+    mov qword [rbx + linnea_quic_conn.ctrl_pucap], 0   ; capture consumed
+    lea r12, [rbx + linnea_quic_conn.ctrl_pu]
+    mov r13, [rbx + linnea_quic_conn.ctrl_pulen]
+    add r13, r12                      ; payload end
+    xor r14d, r14d                    ; identifiers seen so far
+.sa_loop:
+    cmp r12, r13
+    jae .sa_ok
+    mov rdi, r12
+    mov rsi, r13
+    call linnea_quic_varint_decode    ; rax = identifier, rdx = bytes used
+    test rdx, rdx
+    jz .sa_frame_err                  ; a varint running past the frame
+    add r12, rdx
+    mov rbp, rax                      ; hold the identifier across the value
+    cmp r12, r13
+    jae .sa_frame_err                 ; an identifier with no value at all
+    mov rdi, r12
+    mov rsi, r13
+    call linnea_quic_varint_decode    ; rax = value (read, not acted on)
+    test rdx, rdx
+    jz .sa_frame_err
+    add r12, rdx
+    ; the HTTP/2 identifiers HTTP/3 reserves (7.2.4.1). 0x01 and 0x06 are real
+    ; HTTP/3 settings (QPACK capacity, max field section size), so the reserved
+    ; run is exactly 0x02 through 0x05.
+    cmp rbp, 0x02
+    jb .sa_seen_scan
+    cmp rbp, 0x05
+    jbe .sa_settings_err
+.sa_seen_scan:
+    ; the same identifier twice
+    xor ecx, ecx
+.sa_seen_loop:
+    cmp rcx, r14
+    jae .sa_seen_add
+    cmp [rsp + rcx * 8], rbp
+    je .sa_settings_err
+    inc rcx
+    jmp .sa_seen_loop
+.sa_seen_add:
+    cmp r14, 32
+    jae .sa_loop                      ; the list is full: stop recording, keep walking
+    mov [rsp + r14 * 8], rbp
+    inc r14
+    jmp .sa_loop
+.sa_frame_err:
+    mov eax, LINNEA_H3_ERR_FRAME
+    jmp .sa_ret
+.sa_settings_err:
+    mov eax, LINNEA_H3_ERR_SETTINGS
+    jmp .sa_ret
+.sa_ok:
+    xor eax, eax
+.sa_ret:
+    add rsp, 256
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; The payload is varint(prioritized element id) then a priority field value in
 ; the same syntax the `priority` header uses, so the same parser reads it (RFC
 ; 9218 7.2). The update is applied to the response stream's open slot if it has

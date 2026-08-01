@@ -134,4 +134,85 @@ term = conn._close_event
 assert term is not None, "server did not close the connection on control-stream FIN"
 assert isinstance(term, ConnectionTerminated) and term.error_code == 0x104, \
     f"{term!r} (want H3_CLOSED_CRITICAL_STREAM 0x104)"
+
+
+# --- the SETTINGS payload itself (RFC 9114 7.2.4 / 7.2.4.1) ----------------
+# The walk checked which FRAMES may appear on the control stream but skipped the
+# payload of the one frame that carries configuration, so a peer could send an
+# identifier HTTP/3 reserves — or the same one twice — and hear nothing back.
+def control_close_code(payload, budget=4):
+    """Open a control stream carrying one SETTINGS frame; return the close code."""
+    conn, s = handshake(port)
+    uni = conn.get_next_available_stream_id(is_unidirectional=True)
+    conn.send_stream_data(uni, b"\x00" + vlq(4) + vlq(len(payload)) + payload)
+    flush(conn, s, port, 0.4)
+    try:
+        for _ in range(budget):
+            r, _ = s.recvfrom(4096)
+            conn.receive_datagram(r, ("127.0.0.1", port), now=0.5)
+            if conn._close_event is not None:
+                break
+    except socket.timeout:
+        pass
+    s.close()
+    ev = conn._close_event
+    return getattr(ev, "error_code", None)
+
+
+SETTINGS_ERROR, FRAME_ERROR = 0x109, 0x106
+
+# Collected rather than asserted one at a time, so a run against a build that
+# does not parse the payload reports every case instead of stopping at the first.
+payload_cases = [
+    # an HTTP/2 identifier HTTP/3 reserves: 0x02 was ENABLE_PUSH. Reserving these
+    # is precisely so an HTTP/2-shaped peer is caught rather than misunderstood.
+    ("reserved identifier 0x02", vlq(0x02) + vlq(1), SETTINGS_ERROR),
+    ("reserved identifier 0x05", vlq(0x05) + vlq(1), SETTINGS_ERROR),
+    ("the same identifier twice",
+     vlq(0x06) + vlq(100) + vlq(0x06) + vlq(200), SETTINGS_ERROR),
+    # the payload ends mid-pair (7.1)
+    ("an identifier with no value", vlq(0x06), FRAME_ERROR),
+]
+problems = []
+for label, payload, want in payload_cases:
+    got = control_close_code(payload)
+    if got != want:
+        problems.append(f"{label}: got {got!r}, want 0x{want:x}")
+assert not problems, "; ".join(problems)
+
+# ...and the settings a real client sends must still be accepted, GREASE and all
+conn, s = handshake(port)
+uni = conn.get_next_available_stream_id(is_unidirectional=True)
+good = (vlq(0x01) + vlq(0) + vlq(0x06) + vlq(16384)
+        + vlq(0x07) + vlq(0) + vlq(0x21) + vlq(0))     # 0x21 is GREASE: ignored
+conn.send_stream_data(uni, b"\x00" + vlq(4) + vlq(len(good)) + good)
+enc = pylsqpack.Encoder()
+enc.apply_settings(max_table_capacity=0, blocked_streams=0)
+_, fields = enc.encode(0, [(b":method", b"GET"), (b":path", b"/hello.txt"),
+                           (b":scheme", b"https"), (b":authority", b"h3.test")])
+bidi = conn.get_next_available_stream_id()
+conn.send_stream_data(bidi, vlq(1) + vlq(len(fields)) + fields, end_stream=True)
+flush(conn, s, port, 0.4)
+r, _ = s.recvfrom(4096)
+conn.receive_datagram(r, ("127.0.0.1", port), now=0.5)
+resp = b""
+ev = conn.next_event()
+while ev is not None:
+    if isinstance(ev, StreamDataReceived) and ev.stream_id == bidi:
+        resp += ev.data
+    ev = conn.next_event()
+s.close()
+assert conn._close_event is None, f"a valid SETTINGS frame was refused: {conn._close_event!r}"
+frames = []
+i = 0
+while i < len(resp):
+    ty, i = rvlq(resp, i)
+    ln, i = rvlq(resp, i)
+    frames.append((ty, resp[i:i + ln]))
+    i += ln
+hdr = next(p for ty, p in frames if ty == 1)
+dec = pylsqpack.Decoder(0, 0)
+_, headers = dec.feed_header(0, hdr)
+assert dict(headers).get(b":status") == b"200", dict(headers)
+
 print("ok")
