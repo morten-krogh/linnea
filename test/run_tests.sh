@@ -1561,6 +1561,13 @@ check "If-Match and If-Unmodified-Since are evaluated" $?
 timeout 60 python3 test/tls/connection_close_token.py 47080 >/dev/null 2>&1
 check "Connection: close is honoured anywhere in the list" $?
 
+# RFC 9110 6.6.1: Date on everything outside 1xx/5xx. The canned blobs are
+# assembled ahead of time, so they shipped without one while every dynamically
+# built response had it. RFC 9112 9.6: and a response that closes must say so —
+# the OPTIONS * blob closed while claiming, in a comment, that it did not.
+timeout 60 python3 test/tls/canned_response_headers.py 47080 >/dev/null 2>&1
+check "canned responses carry Date and announce a close" $?
+
 # Chunked request bodies (RFC 9112 7.1 MUST). Any Transfer-Encoding at all used
 # to be 501, so every client that sends a body of unknown length up front was
 # refused: curl -T -, fetch() with a ReadableStream, most libraries handed a

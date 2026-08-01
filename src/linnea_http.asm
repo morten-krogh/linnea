@@ -134,12 +134,19 @@ resp_404:       db "HTTP/1.1 404 Not Found", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_404_len    equ $ - resp_404
 ; "OPTIONS *": what this server supports, as a whole. Bodiless, like every
-; other canned response, and it keeps the connection (nothing went wrong).
+; other canned response.
+;
+; It says "Connection: close" because it DOES close: every blob goes through
+; .resp_static, which clears keep_alive unconditionally. The comment here used
+; to claim the opposite — "it keeps the connection (nothing went wrong)" — and
+; RFC 9112 9.6 requires a server that will close to send the close option, so
+; the two disagreeing left a client waiting on a socket already on its way out.
 slash_target:   db "/"
 resp_options:   db "HTTP/1.1 200 OK", 13, 10
                 db "Allow: GET, HEAD, OPTIONS", 13, 10
                 db "Server: linnea", 13, 10
-                db "Content-Length: 0", 13, 10, 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
 resp_options_len equ $ - resp_options
 resp_405:       db "HTTP/1.1 405 Method Not Allowed", 13, 10
                 db "Allow: GET, HEAD", 13, 10
@@ -2675,20 +2682,17 @@ linnea_http_handle:
 ; 4 accounts for, and each header literal carries its own leading CRLF. With
 ; no headers configured the blob is returned untouched, straight from rodata.
 http_error_blob:
-    test rcx, rcx
-    jz .heb_asis
-    cmp qword [rcx + linnea_config_server.hsts_len], 0
-    jne .heb_copy
-    cmp qword [rcx + linnea_config_server.nosniff], 0
-    jne .heb_copy
-.heb_asis:
-    mov rax, rsi
-    ret
+    ; Always assembled, never returned straight from rodata: RFC 9110 6.6.1
+    ; makes Date mandatory on everything a server with a clock sends outside
+    ; 1xx and 5xx, and a date is not something a constant can carry. The blobs
+    ; shipped without one — 400, 404, 405, 413, 414, 431 and the OPTIONS * 200
+    ; — while every dynamically built response had it right, so the gap was
+    ; exactly the responses assembled ahead of time.
 .heb_copy:
     push rbx
     push r12
     push r15
-    mov rbx, rcx                     ; server*
+    mov rbx, rcx                     ; server*, or 0 before one is matched
     mov r12, rdi                     ; conn*
     lea r15, [rdi + linnea_connection.out_buf]
     mov rdi, r15                     ; the blob without its blank line
@@ -2696,6 +2700,8 @@ http_error_blob:
     sub rcx, 4
     rep movsb
     mov r15, rdi
+    test rbx, rbx
+    jz .heb_blank                    ; no vhost yet: Date, and nothing else
     cmp qword [rbx + linnea_config_server.hsts_len], 0
     je .heb_nosniff
     lea rsi, [hdr_hsts]
@@ -2715,6 +2721,16 @@ http_error_blob:
     mov r15, rdi
 .heb_blank:
     mov rdi, r15
+    lea rsi, [hdr_date]              ; carries its own leading CRLF
+    mov ecx, hdr_date_len
+    rep movsb
+    mov r15, rdi
+    call linnea_time_http_now        ; -> rax = the cached IMF-fixdate
+    mov rdi, r15
+    mov rsi, rax
+    mov ecx, LINNEA_HTTP_DATE_LEN
+    rep movsb
+    mov r15, rdi
     lea rsi, [crlfcrlf]
     mov ecx, 4
     rep movsb

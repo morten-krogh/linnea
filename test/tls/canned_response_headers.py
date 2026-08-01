@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Canned responses must carry Date, and must say so when they close.
+
+RFC 9110 6.6.1: an origin server with a clock MUST send Date on everything
+outside 1xx and 5xx. The canned blobs are assembled ahead of time, so they
+shipped without one — 400, 404, 405, 413, 414, 431 and the OPTIONS * 200 — while
+every dynamically built response (200/206/301/304/416) had it right. A response
+with no Date cannot have its freshness calculated, so a shared cache has to
+guess or refuse to store it.
+
+RFC 9112 9.6: a server that will close MUST send the close connection option.
+The OPTIONS * blob carried no Connection field while .resp_static closed the
+connection regardless — its comment claimed it kept the connection, and the code
+disagreed.
+
+usage: canned_response_headers.py <port>
+"""
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+HOST = b"one.test"
+
+WDAY = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def send(raw, budget=2.5):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.settimeout(budget)
+    s.sendall(raw)
+    start = time.time()
+    out = b""
+    closed = None
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d:
+                closed = time.time() - start
+                break
+            out += d
+    except socket.timeout:
+        pass
+    s.close()
+    head = out.split(b"\r\n\r\n")[0].decode("latin1", "replace")
+    if not head:
+        return None, {}, closed
+    status = int(head.split()[1])
+    fields = {}
+    for line in head.split("\r\n")[1:]:
+        name, _, value = line.partition(":")
+        fields[name.strip().lower()] = value.strip()
+    return status, fields, closed
+
+
+CASES = [
+    ("404", b"GET /nope-does-not-exist HTTP/1.1\r\nHost: one.test\r\n\r\n", 404),
+    ("405", b"DELETE /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n", 405),
+    ("400 (no Host)", b"GET /hello.txt HTTP/1.1\r\n\r\n", 400),
+    ("414/400 (over-long target)",
+     b"GET /" + b"a" * 4000 + b" HTTP/1.1\r\nHost: one.test\r\n\r\n", None),
+    ("OPTIONS *", b"OPTIONS * HTTP/1.1\r\nHost: one.test\r\n\r\n", 200),
+]
+
+fails = 0
+for label, raw, want in CASES:
+    status, fields, closed = send(raw)
+    if status is None:
+        print(f"FAIL {label}: no response at all")
+        fails += 1
+        continue
+    if want is not None and status != want:
+        print(f"FAIL {label}: status {status}, want {want}")
+        fails += 1
+        continue
+
+    date = fields.get("date")
+    ok_date = bool(date) and date[:3] in WDAY and date.endswith("GMT")
+    if not ok_date:
+        print(f"FAIL {label} ({status}): Date is {date!r} — 6.6.1 requires one")
+        fails += 1
+        continue
+
+    # ...and if the response closes, it has to say so
+    if closed is not None and fields.get("connection", "").lower() != "close":
+        print(f"FAIL {label} ({status}): closed the socket but answered "
+              f"Connection: {fields.get('connection')!r}")
+        fails += 1
+        continue
+
+    print(f"ok   {label} ({status}): Date present"
+          + (", and says close" if closed is not None else ", connection kept"))
+
+# a 5xx is exempt from Date (6.6.1), so its absence there is not a failure —
+# but the blob path is shared, so check it does not regress into no-response
+status, fields, _ = send(b"GET /api/dead HTTP/1.1\r\nHost: one.test\r\n\r\n")
+if status in (502, 504, 404):
+    print(f"ok   an upstream failure still answers ({status})")
+else:
+    print(f"FAIL upstream failure gave {status}")
+    fails += 1
+
+sys.exit(1 if fails else 0)
