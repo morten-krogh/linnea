@@ -1113,8 +1113,11 @@ check_http "older date 200"      "hello from linnea" "$resp"
 # an unparseable date must be ignored, not treated as a condition
 resp=$(curl -si --max-time 2 -H "If-Modified-Since: not a date" http://127.0.0.1:47080/hello.txt)
 check_http "bad date ignored"    "hello from linnea" "$resp"
+# An rfc850 date now PARSES (RFC 9110 5.6.7); 1994 is simply older than the
+# file, so the body is still what comes back. The name said "ignored" when the
+# format was rejected outright — the outcome is the same, the reason is not.
 resp=$(curl -si --max-time 2 -H "If-Modified-Since: Sunday, 06-Nov-94 08:49:37 GMT" http://127.0.0.1:47080/hello.txt)
-check_http "rfc850 date ignored" "hello from linnea" "$resp"
+check_http "rfc850 date parses, and 1994 is older" "hello from linnea" "$resp"
 # If-None-Match wins outright when both are present
 resp=$(curl -si --max-time 2 -H 'If-None-Match: "x"' -H "If-Modified-Since: $lastmod" http://127.0.0.1:47080/hello.txt)
 check_http "if-none-match wins"  "hello from linnea" "$resp"
@@ -1533,6 +1536,12 @@ check "proxy removes hop-by-hop fields, both directions" $?
 # transformed a message.
 timeout 60 python3 test/tls/proxy_via.py 47080 >/dev/null 2>&1
 check "proxy adds Via to the request and the response" $?
+
+# RFC 9110 5.6.7 MUST: all three HTTP-date formats parse. Only IMF-fixdate did,
+# so a conditional request carrying an obsolete form was answered
+# unconditionally — the client got the whole body instead of its 304.
+timeout 60 python3 test/tls/http_date_formats.py 47080 >/dev/null 2>&1
+check "all three HTTP-date formats are accepted" $?
 
 # Chunked request bodies (RFC 9112 7.1 MUST). Any Transfer-Encoding at all used
 # to be 501, so every client that sends a body of unknown length up front was

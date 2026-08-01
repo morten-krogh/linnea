@@ -269,10 +269,20 @@ linnea_time_http_now:
     ret
 
 ; linnea_time_parse_http_date(rdi=ptr, rsi=len) -> rax = unix seconds, or -1
-; Accepts only IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT"), the format
-; every client sends today and the only one linnea hands out. The obsolete
-; RFC 850 and asctime forms parse as invalid, which callers must treat the
-; way the RFC requires: ignore the header and answer unconditionally.
+;
+; RFC 9110 5.6.7 MUST: "A recipient that parses a timestamp value in an HTTP
+; field MUST accept all three HTTP-date formats." Only IMF-fixdate was accepted;
+; the two obsolete forms parsed as invalid, so a conditional request carrying one
+; was answered unconditionally — a client with a valid cached copy got the whole
+; body back instead of a 304.
+;
+;   IMF-fixdate  Sun, 06 Nov 1994 08:49:37 GMT   (what we send, and what
+;                                                 everything modern sends)
+;   RFC 850      Sunday, 06-Nov-94 08:49:37 GMT  (two-digit year)
+;   asctime      Sun Nov  6 08:49:37 1994        (space-padded day, no zone)
+;
+; The obsolete forms are rewritten into an IMF-shaped scratch buffer and parsed
+; by the same code, so there is one date parser rather than three.
 linnea_time_parse_http_date:
     push rbx
     push r12
@@ -280,8 +290,17 @@ linnea_time_parse_http_date:
     push r14
     push r15
     cmp rsi, LINNEA_HTTP_DATE_LEN
-    jne .bad
+    jne .obsolete
+    cmp byte [rdi + 3], ','
+    jne .obsolete
     mov rbx, rdi
+    jmp .imf
+.obsolete:
+    call .normalise            ; -> rax = 1 and date_scratch filled, or 0
+    test eax, eax
+    jz .bad
+    lea rbx, [date_scratch]
+.imf:
     ; fixed layout: the separators must be exactly where they belong
     cmp byte [rbx + 3], ','
     jne .bad
@@ -387,6 +406,185 @@ linnea_time_parse_http_date:
     pop rbx
     ret
 
+; .normalise(rdi = ptr, rsi = len) -> eax = 1 with date_scratch holding an
+; IMF-fixdate rendering of an obsolete timestamp, or 0 if it is neither form.
+; The weekday is copied through without checking: the IMF parse never validates
+; it either, and 5.6.7 says a recipient "MUST ignore" a weekday that disagrees
+; with the date.
+.normalise:
+    ; asctime first: a fixed 24 bytes, "Www Mmm DD HH:MM:SS YYYY", no zone
+    cmp rsi, 24
+    jne .n_rfc850
+    cmp byte [rdi + 3], ' '
+    jne .n_rfc850
+    cmp byte [rdi + 7], ' '
+    jne .n_rfc850
+    cmp byte [rdi + 10], ' '
+    jne .n_rfc850
+    cmp byte [rdi + 19], ' '
+    jne .n_rfc850
+    lea rsi, [date_scratch]
+    mov eax, [rdi]             ; weekday, 3 bytes (the 4th is overwritten below)
+    mov [rsi], eax
+    mov word [rsi + 3], ', '
+    mov al, [rdi + 8]          ; day, space-padded in this form
+    cmp al, ' '
+    jne .n_asc_day
+    mov al, '0'
+.n_asc_day:
+    mov [rsi + 5], al
+    mov al, [rdi + 9]
+    mov [rsi + 6], al
+    mov byte [rsi + 7], ' '
+    mov eax, [rdi + 4]         ; month name
+    mov [rsi + 8], al
+    shr eax, 8
+    mov [rsi + 9], al
+    shr eax, 8
+    mov [rsi + 10], al
+    mov byte [rsi + 11], ' '
+    mov eax, [rdi + 20]        ; year, four digits
+    mov [rsi + 12], eax
+    mov byte [rsi + 16], ' '
+    mov rax, [rdi + 11]        ; HH:MM:SS
+    mov [rsi + 17], rax
+    mov byte [rsi + 25], ' '
+    mov dword [rsi + 26], 'GMT'    ; writes a fourth byte, inside the buffer
+    mov eax, 1
+    ret
+.n_rfc850:
+    ; "Weekday, DD-Mon-YY HH:MM:SS GMT" — the weekday is spelled out, so the
+    ; only fixed part is the 22 bytes after the comma and space.
+    cmp rsi, 3
+    jbe .n_no
+    mov rcx, rsi
+    xor edx, edx               ; index of the comma
+.n_comma:
+    cmp rdx, rcx
+    jae .n_no
+    cmp byte [rdi + rdx], ','
+    je .n_comma_found
+    inc rdx
+    jmp .n_comma
+.n_comma_found:
+    cmp rdx, 3                 ; a weekday name is at least three letters
+    jb .n_no
+    lea r8, [rdx + 2]          ; -> the day-of-month digits
+    mov r9, rsi
+    sub r9, r8
+    cmp r9, 22                 ; "06-Nov-94 08:49:37 GMT"
+    jne .n_no
+    cmp byte [rdi + rdx + 1], ' '
+    jne .n_no
+    add r8, rdi                ; absolute pointer to "DD-Mon-YY ..."
+    cmp byte [r8 + 2], '-'
+    jne .n_no
+    cmp byte [r8 + 6], '-'
+    jne .n_no
+    cmp byte [r8 + 9], ' '
+    jne .n_no
+    lea rsi, [date_scratch]
+    mov eax, [rdi]             ; the first three letters of the weekday name
+    mov [rsi], eax
+    mov word [rsi + 3], ', '
+    mov al, [r8]               ; day
+    mov [rsi + 5], al
+    mov al, [r8 + 1]
+    mov [rsi + 6], al
+    mov byte [rsi + 7], ' '
+    mov al, [r8 + 3]           ; month name
+    mov [rsi + 8], al
+    mov al, [r8 + 4]
+    mov [rsi + 9], al
+    mov al, [r8 + 5]
+    mov [rsi + 10], al
+    mov byte [rsi + 11], ' '
+    push rsi
+    push r8
+    lea rdi, [r8 + 7]          ; the two YEAR digits, not the day's
+    call .century              ; -> eax = the century to prefix, e.g. 1900/2000
+    pop r8
+    pop rsi
+    ; write the four-digit year: century + the two digits as they stand
+    mov ecx, eax
+    mov eax, ecx
+    xor edx, edx
+    mov r9d, 1000
+    div r9d                    ; thousands
+    add al, '0'
+    mov [rsi + 12], al
+    mov eax, edx
+    xor edx, edx
+    mov r9d, 100
+    div r9d                    ; hundreds
+    add al, '0'
+    mov [rsi + 13], al
+    mov al, [r8 + 7]           ; the two digits the timestamp carried
+    mov [rsi + 14], al
+    mov al, [r8 + 8]
+    mov [rsi + 15], al
+    mov byte [rsi + 16], ' '
+    mov rax, [r8 + 10]         ; HH:MM:SS
+    mov [rsi + 17], rax
+    mov byte [rsi + 25], ' '
+    mov dword [rsi + 26], 'GMT'
+    mov eax, 1
+    ret
+.n_no:
+    xor eax, eax
+    ret
+
+; .century(rdi = pointer to the two year digits) -> eax = the century to prefix.
+;
+; 5.6.7: a two-digit year "that appears to be more than 50 years in the future"
+; means the most recent past year with those digits. So the same century as now,
+; stepped back one if that lands too far ahead. The current year is taken from
+; the epoch seconds directly — a division by the mean year length is a day or so
+; out at a new year, and the boundary it feeds is fifty years away.
+;
+; The digits are passed in rather than read at a fixed offset from the timestamp:
+; the first cut of this read the DAY of the month instead, so "06-Nov-94" was
+; windowed on 06, kept the current century and became 2094 — a date in the
+; future, which turned an If-Modified-Since for 1994 into a 304.
+.century:
+    push rbx
+    push r12
+    mov r12, rdi
+    sub rsp, 16
+    mov qword [rsp], 0
+    mov qword [rsp + 8], 0
+    mov edi, 0                 ; CLOCK_REALTIME
+    mov rsi, rsp
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    syscall
+    mov rax, [rsp]
+    xor edx, edx
+    mov rcx, 31556952          ; mean tropical year, in seconds
+    div rcx
+    add rax, 1970              ; current year, near enough for a 50-year window
+    mov ebx, eax
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    imul eax, eax, 100         ; the current century, e.g. 2000
+    ; year = century + digits; step back a century if that is >50 years ahead
+    movzx ecx, byte [r12]
+    sub ecx, '0'
+    imul ecx, ecx, 10
+    movzx edx, byte [r12 + 1]
+    sub edx, '0'
+    add ecx, edx               ; the two digits as a number
+    add ecx, eax               ; candidate year
+    lea edx, [rbx + 50]
+    cmp ecx, edx
+    jbe .cent_done
+    sub eax, 100
+.cent_done:
+    add rsp, 16
+    pop r12
+    pop rbx
+    ret
+
 ; .num2(rdi=ptr) -> eax = two-digit value, or -1 if either byte is not a digit
 .num2:
     movzx eax, byte [rdi]
@@ -405,5 +603,8 @@ linnea_time_parse_http_date:
     ret
 
 section .bss
+; an obsolete timestamp, rewritten into IMF-fixdate shape (+3 slack for the
+; four-byte 'GMT' store)
+date_scratch:   resb 32
 now_date_sec: resq 1                  ; the second now_date_buf was formatted for
 now_date_buf: resb LINNEA_HTTP_DATE_LEN
