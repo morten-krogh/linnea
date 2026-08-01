@@ -3,8 +3,12 @@
 # dropped (the client would otherwise wait forever). RFC 9114 distinguishes:
 #   - DATA before any HEADERS is an invalid frame sequence (4.1), a CONNECTION
 #     error H3_FRAME_UNEXPECTED (0x105).
-#   - a truncated HEADERS frame is a malformed request, a STREAM reset
-#     (H3_MESSAGE_ERROR 0x10e).
+#   - a truncated HEADERS frame is a CONNECTION error H3_FRAME_ERROR (0x106):
+#     7.1 says that when a stream terminates cleanly with its last frame cut
+#     short, that is a connection error. This file used to expect a stream reset
+#     with H3_MESSAGE_ERROR, which is the code for a request that decoded and
+#     then broke a rule — a different fault, and one that tells the client its
+#     request was to blame rather than the framing. See h3_stream_codes_test.py.
 # Both used to be silently dropped.
 # Usage: h3_malformed_test.py <port>
 import socket
@@ -84,7 +88,7 @@ def ask(payload):
 
 for payload, what, expect in (
         (vlq(0) + vlq(4) + b"body", "DATA with no HEADERS", ("killed", 0x105)),
-        (vlq(1) + vlq(50) + b"\x00\x00", "truncated HEADERS frame", ("reset", None))):
+        (vlq(1) + vlq(50) + b"\x00\x00", "truncated HEADERS frame", ("killed", 0x106))):
     got = ask(payload)
     assert got is not None, f"{what}: no answer at all — the client would hang"
     assert got[0] == expect[0], f"{what}: expected {expect[0]}, got {got}"

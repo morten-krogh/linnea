@@ -600,6 +600,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_reset_final_size_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): RESET_STREAM reports our own final size" $?
 
+    # ...and the code that reset carries has to say WHICH thing went wrong: a
+    # truncated last frame is a connection error (7.1), a stream that never
+    # carried HEADERS is H3_REQUEST_INCOMPLETE so the client may retry (4.1),
+    # and only a request that decodes and then breaks a rule is MESSAGE_ERROR.
+    python3 test/quic/h3_stream_codes_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): a failed request stream names its fault" $?
+
     # An ack-eliciting packet MUST be acknowledged (RFC 9000 13.2.1). An ACK was
     # only built when the server had something of its own to send, so a lone PING
     # (a browser keepalive) or a lone stream reset drew nothing and the peer

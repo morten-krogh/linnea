@@ -2066,6 +2066,15 @@ linnea_quic_server_datagram:
     je .req_qpack_bad
     cmp rax, -LINNEA_H3_ERR_UNEXPECTED
     je .req_frame_unexpected
+    ; the last frame on a cleanly terminated stream was cut short (7.1)
+    cmp rax, -LINNEA_H3_ERR_TRUNCATED
+    je .req_truncated
+    ; the stream ended without a HEADERS frame at all, so there was never enough
+    ; of a message to answer: 4.1 asks for H3_REQUEST_INCOMPLETE, which tells the
+    ; client the request may be retried. H3_MESSAGE_ERROR — what this used to
+    ; send — says the opposite, that the request itself was at fault.
+    cmp rax, -LINNEA_H3_ERR_NOHEADERS
+    je .req_incomplete
     ; Anything else is a malformed request: a truncated frame, or no HEADERS at
     ; all. Both entries to .serve_bidi require the FIN, so the stream is whole
     ; and nothing more is coming — dropping it here left the client waiting on
@@ -2085,9 +2094,18 @@ linnea_quic_server_datagram:
     ; gone out this way and the true final size is zero.
     mov rdi, [s_sid]
     xor esi, esi                     ; nothing was sent in the direction we reset
-    mov edx, 0x10e                   ; H3_MESSAGE_ERROR (RFC 9114 8.1)
+    mov edx, LINNEA_H3_ERR_MESSAGE   ; the request decoded but breaks a rule
     call tx_reset_stream_code
     jmp .stream_scan
+.req_incomplete:
+    mov rdi, [s_sid]
+    xor esi, esi                     ; nothing was sent in the direction we reset
+    mov edx, LINNEA_H3_ERR_REQ_INCOMPLETE
+    call tx_reset_stream_code
+    jmp .stream_scan
+.req_truncated:
+    mov edi, LINNEA_H3_ERR_FRAME
+    jmp .h3_close
 .req_qpack_bad:
     mov edi, LINNEA_H3_ERR_QPACK_DECOMP
     jmp .h3_close

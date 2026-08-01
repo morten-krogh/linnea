@@ -36,6 +36,8 @@ LINNEA_H3_ERR_FRAME            equ 0x0106  ; a frame's payload does not match it
 LINNEA_H3_ERR_ID               equ 0x0108  ; an id a frame named cannot exist
 LINNEA_H3_ERR_SETTINGS         equ 0x0109  ; a reserved or repeated setting identifier
 LINNEA_H3_ERR_MISSING_SETTINGS equ 0x010a  ; control stream opened without SETTINGS
+LINNEA_H3_ERR_REQ_INCOMPLETE   equ 0x010d  ; the stream ended before a whole message
+LINNEA_H3_ERR_MESSAGE          equ 0x010e  ; the message decoded but breaks a rule
 LINNEA_H3_ERR_QPACK_DECOMP     equ 0x0200  ; QPACK could not decode a field section
 
 ; linnea_h3_read_headers(rdi=stream ptr, rsi=stream len, rdx=req *linnea_h2_req)
@@ -61,6 +63,12 @@ LINNEA_H3_ERR_TOOLARGE equ 4
 ; HTTP/2 types, or a control/push frame. Unlike the malformed-request sentinels
 ; above, this ends the CONNECTION with H3_FRAME_UNEXPECTED, not the stream.
 LINNEA_H3_ERR_UNEXPECTED equ 5
+; The last frame on the stream was cut short — a frame header that runs off the
+; end, or a declared payload longer than the bytes that arrived. RFC 9114 7.1 is
+; explicit that when a stream terminates cleanly and its last frame was
+; truncated, that is a CONNECTION error of type H3_FRAME_ERROR. Kept apart from
+; the malformed-request sentinel above because that one fails only the stream.
+LINNEA_H3_ERR_TRUNCATED equ 6
 
 ; A response body up to this size is written into the response packet directly
 ; (one packet, as ever). A larger body is not copied at all: linnea_h3_serve

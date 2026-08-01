@@ -24,6 +24,7 @@
 # with nothing, so the same check runs against a much larger request body.
 #
 # Usage: h3_reset_final_size_test.py <port>
+import pylsqpack
 import socket
 import ssl
 import sys
@@ -92,9 +93,22 @@ def malformed_request(padding):
     assert conn._handshake_confirmed, "handshake failed"
 
     # An HTTP/3 frame of an unknown-but-skippable type carrying `padding` bytes,
-    # then a HEADERS frame whose declared length runs past the end of the stream.
+    # then a COMPLETE HEADERS frame whose field section breaks a message rule:
+    # a connection-specific field, which RFC 9114 4.2 forbids outright.
+    #
+    # This used to send a HEADERS frame whose declared length ran past the end
+    # of the stream. That is now a CONNECTION error (7.1: a stream that
+    # terminates cleanly with its last frame truncated), so it no longer reaches
+    # the reset path this test exists to check. The property is unchanged — the
+    # Final Size of a reset is what WE sent, not what the client sent — but it
+    # has to be provoked by a request that is malformed rather than truncated.
+    enc = pylsqpack.Encoder()
+    enc.apply_settings(max_table_capacity=0, blocked_streams=0)
+    _, fields = enc.encode(0, [(b":method", b"GET"), (b":path", b"/hello.txt"),
+                               (b":scheme", b"https"), (b":authority", b"h3.test"),
+                               (b"connection", b"keep-alive")])
     body = b"\x21" + (0x4000 | padding).to_bytes(2, "big") + b"A" * padding
-    body += b"\x01" + (0x4000 | 4096).to_bytes(2, "big") + b"B" * 8
+    body += b"\x01" + (0x4000 | len(fields)).to_bytes(2, "big") + fields
 
     sid = conn.get_next_available_stream_id()
     conn.send_stream_data(sid, body, end_stream=True)

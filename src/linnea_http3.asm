@@ -123,7 +123,7 @@ linnea_h3_read_headers:
     mov rsi, r13
     call linnea_quic_varint_decode
     test rdx, rdx
-    jz .err
+    jz .truncated
     mov rbx, rax                     ; frame type
     add r12, rdx
     ; frame length
@@ -131,13 +131,13 @@ linnea_h3_read_headers:
     mov rsi, r13
     call linnea_quic_varint_decode
     test rdx, rdx
-    jz .err
+    jz .truncated
     add r12, rdx                     ; -> payload
     ; the payload must fit in the remaining stream bytes
     mov rcx, r13
     sub rcx, r12
     cmp rax, rcx
-    ja .err
+    ja .truncated
     cmp rbx, LINNEA_H3_FRAME_HEADERS
     je .headers
     cmp rbx, LINNEA_H3_FRAME_DATA
@@ -240,6 +240,13 @@ linnea_h3_read_headers:
     jmp .ret
 .noheaders:
     mov rax, -LINNEA_H3_ERR_NOHEADERS
+    jmp .ret
+.truncated:
+    ; a frame header running off the end, or a declared payload longer than what
+    ; arrived. Both entries here require the FIN, so the stream has terminated
+    ; cleanly and its last frame is cut short — RFC 9114 7.1 makes that a
+    ; connection error, not a stream one.
+    mov rax, -LINNEA_H3_ERR_TRUNCATED
     jmp .ret
 .err:
     mov rax, -LINNEA_H3_ERR
