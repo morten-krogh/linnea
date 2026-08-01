@@ -1527,6 +1527,13 @@ check_http "proxy forwards body" "hello body" "$resp"
 timeout 60 python3 test/tls/h1_proxy_hop_by_hop.py 47080 >/dev/null 2>&1
 check "proxy removes hop-by-hop fields, both directions" $?
 
+# RFC 9110 7.6.3 MUST: a proxy names itself and the protocol it received on, in
+# each message it forwards. Without it a proxied request is indistinguishable
+# from a direct one — no loop detection, and no way to tell which hop
+# transformed a message.
+timeout 60 python3 test/tls/proxy_via.py 47080 >/dev/null 2>&1
+check "proxy adds Via to the request and the response" $?
+
 # Chunked request bodies (RFC 9112 7.1 MUST). Any Transfer-Encoding at all used
 # to be 501, so every client that sends a body of unknown length up front was
 # refused: curl -T -, fetch() with a ReadableStream, most libraries handed a
@@ -2453,6 +2460,13 @@ rm -f /tmp/upload3_echo.bin
         -w '%{http_code}\n' $args)
     [ "$(echo "$codes" | grep -c '^200$')" -eq 12 ]
     check "http2 proxy: bodiless HEAD responses free their slot" $?
+    # ...and the Via entry names HTTP/2 there, since that is what the request
+    # arrived on, while the response says 1.1 — what the backend answered on.
+    body=$(h2p "$P/api/headers")
+    echo "$body" | grep -qi '^Via: 2 linnea' \
+        && h2p -D - -o /dev/null "$P/api/simple" | grep -qi '^via: 1.1 linnea'
+    check "http2 proxy: Via names h2 upstream and 1.1 downstream" $?
+
     # a redirect location over h2 (also newly reachable: h2 used to 404 it)
     hdrs=$(h2p -D - -o /dev/null "$P/old/page.html")
     echo "$hdrs" | grep -qi '^HTTP/2 301' \

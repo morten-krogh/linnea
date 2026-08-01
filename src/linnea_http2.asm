@@ -2279,6 +2279,9 @@ h2p_finalize:
     add rdi, 2
     pop rax                                ; (balance the pushed cursor)
 .fin_nobody:
+    lea rsi, [h2p_via]                     ; RFC 9110 7.6.3: name this hop
+    mov ecx, h2p_via_len
+    rep movsb
     lea rsi, [h2p_conn_close]              ; "Connection: close" CRLF CRLF
     mov ecx, h2p_conn_close_len
     rep movsb
@@ -2357,6 +2360,9 @@ h2p_finalize_stream:
     rep movsb
     mov word [rdi], 0x0a0d
     add rdi, 2
+    lea rsi, [h2p_via]               ; RFC 9110 7.6.3: name this hop
+    mov ecx, h2p_via_len
+    rep movsb
     lea rsi, [h2p_conn_close]        ; "Connection: close" CRLF CRLF
     mov ecx, h2p_conn_close_len
     rep movsb
@@ -3667,6 +3673,14 @@ h2p_emit_headers:
     lea r14, [rbp + 2]
     jmp .eh_line
 .eh_done:
+    ; the hop this response crossed (RFC 9110 7.6.3), naming the version the
+    ; upstream answered on. `via` is static-table 60, so the name costs a byte.
+    mov rdi, r15
+    mov esi, 60
+    lea rdx, [h2p_via_val]
+    mov ecx, h2p_via_val_len
+    call h2_enc_hdr
+    mov r15, rdi
     ; our own security headers ride a proxied response too — they describe
     ; the origin, not the backend — but only when the backend did not set
     ; them itself, so an app that sends its own policy still wins
@@ -4749,6 +4763,13 @@ h2p_http11:      db " HTTP/1.1", 13, 10, "Host: "
 h2p_http11_len   equ $ - h2p_http11
 h2p_clen:        db "Content-Length: "
 h2p_clen_len     equ $ - h2p_clen
+; The request reached us over HTTP/2, so that is what our Via entry names
+; (RFC 9110 7.6.3). The response side uses the static-table "via" instead, and
+; says 1.1 — the version the upstream answered on.
+h2p_via:         db "Via: 2 linnea", 13, 10
+h2p_via_len      equ $ - h2p_via
+h2p_via_val:     db "1.1 linnea"
+h2p_via_val_len  equ $ - h2p_via_val
 h2p_conn_close:  db "Connection: close", 13, 10, 13, 10
 h2p_conn_close_len equ $ - h2p_conn_close
 h2p_hn_te:       db "transfer-encoding"

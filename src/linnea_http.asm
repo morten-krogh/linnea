@@ -243,6 +243,19 @@ hdr_close_len   equ $ - hdr_close
 
 ; Rewritten heads end their last copied header line with CRLF, so these
 ; carry no leading CRLF of their own.
+; RFC 9110 7.6.3 MUST: an intermediary adds a Via entry naming the protocol it
+; received the message over and a name for itself. Without it a request that
+; crosses this proxy is indistinguishable from one that reached the backend
+; directly, which is what the field exists to prevent (loop detection, and
+; knowing which hop to blame). Via is list-valued, so emitting our own line
+; alongside any the client already sent is the same thing as appending to it
+; (5.3) and needs no splicing.
+;
+; The received-protocol is exact rather than assumed: this handler admits only
+; HTTP/1.1 requests, and an upstream response is HTTP/1.1 by the time the
+; rewriter has accepted it.
+hdr_via_11:     db "Via: 1.1 linnea", 13, 10
+hdr_via_11_len  equ $ - hdr_via_11
 hdr_cl_up:      db "Content-Length: "
 hdr_cl_up_len   equ $ - hdr_cl_up
 hdr_crlf_up:    db 13, 10
@@ -2187,6 +2200,9 @@ linnea_http_handle:
     mov esi, 2
     call .append
 .proxy_no_clen:
+    lea rdi, [hdr_via_11]            ; we forwarded this hop (RFC 9110 7.6.3)
+    mov esi, hdr_via_11_len
+    call .append
     cmp qword [rbx + linnea_connection.upgrade], 0
     jne .proxy_conn_upgrade
     lea rdi, [hdr_up_close]    ; one request per upstream connection
@@ -3055,6 +3071,9 @@ linnea_http_proxy_head:
     mov qword [rbx + linnea_connection.body_rem], -1
     mov qword [rbx + linnea_connection.keep_alive], 0
 .conn_hdr:
+    lea rdi, [hdr_via_11]            ; and this one, on the way back
+    mov esi, hdr_via_11_len
+    call .append
     cmp qword [rbx + linnea_connection.keep_alive], 0
     je .close_hdr
     lea rdi, [hdr_up_keepalive]
