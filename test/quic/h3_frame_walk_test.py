@@ -259,4 +259,26 @@ else:
           f"silently dropped")
     fails += 1
 
+# --- 4: a frame that runs past the end of its packet ------------------------
+# A CRYPTO frame (0x06) at offset 0 declaring a 4 MB payload. The packet is
+# ~1200 bytes, so the frame extends far beyond it however much follows in the
+# same packet — which makes this deterministic wherever the injection lands.
+#
+# 12.4 makes an undecodable frame FRAME_ENCODING_ERROR. This used to stop the
+# walk silently: everything behind the bad frame went unread while the packet
+# was still acknowledged, so the peer never resent what it believed had arrived.
+truncated = varint(0) + varint(4 * 1024 * 1024)
+status, body, closed = run([(0x06, truncated)], budget=6.0)
+if closed == FRAME_ENCODING_ERROR:
+    print("ok   a frame running past the packet draws FRAME_ENCODING_ERROR")
+elif closed is not None:
+    print(f"FAIL a frame running past the packet closed with {closed:#x}, want "
+          f"{FRAME_ENCODING_ERROR:#x} (FRAME_ENCODING_ERROR)")
+    fails += 1
+else:
+    print(f"FAIL a frame running past the packet drew no connection error "
+          f"(status={status}, body={body[:40]!r}) — the walk stopped quietly and "
+          f"the packet was acknowledged anyway")
+    fails += 1
+
 sys.exit(1 if fails else 0)

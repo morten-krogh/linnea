@@ -108,6 +108,13 @@ fk_ncid:    db 0x18, 0x01, 0x00, 0x04, 0xDE,0xAD,0xBE,0xEF
             db 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0       ; 16-byte reset token
 fk_ack:     db 0x02, 0x07, 0x00, 0x01, 0x02, 0x00, 0x00
 fk_ackecn:  db 0x03, 0x07, 0x00, 0x00, 0x02, 0x01, 0x02, 0x03
+; ACK with three ranges: largest 10, delay 0, range count 2, first range 1,
+; then two (gap, length) pairs. Browsers send multi-range ACKs routinely, and
+; since a frame we mis-measure is now a connection error rather than a quiet
+; stop, the walk over the ranges has to be exact.
+fk_ack3:    db 0x02, 0x0a, 0x00, 0x02, 0x01, 0x00, 0x01, 0x00, 0x01
+; CONNECTION_CLOSE carrying a reason phrase, which is the common shape
+fk_closer:  db 0x1c, 0x01, 0x00, 0x02, 'n', 'o'
 fk_unk:     db 0x22                                   ; not a type RFC 9000 defines
 fk_trunc:   db 0x10                                   ; MAX_DATA with its varint missing
 ; a CONNECTION_CLOSE behind a STREAM frame, then MAX_DATA behind the close: the
@@ -116,6 +123,11 @@ fk_seq_ok:  db 0x01, 0x0a, 0x03, 0x02, 0xAB, 0xCD, 0x1c, 0x01, 0x00, 0x00, 0x10,
 fk_seq_ok_len equ $ - fk_seq_ok
 fk_seq_bad: db 0x01, 0x22, 0x10, 0x41, 0x2C           ; an unknown type in the middle
 fk_seq_bad_len equ $ - fk_seq_bad
+; a payload whose last frame is cut short: PING, then a MAX_DATA missing its
+; varint. RFC 9000 12.4 makes that a connection error too — it used to stop the
+; walk quietly, so everything behind it went unread while the packet was acked.
+fk_seq_trunc: db 0x01, 0x10
+fk_seq_trunc_len equ $ - fk_seq_trunc
 
 msg_head:  db "quic-rtx "
 msg_head_len equ $ - msg_head
@@ -676,6 +688,10 @@ _start:
     EXPECT rax, 7                       ; ACK
     FSKIP fk_ackecn, 8
     EXPECT rax, 8                       ; ACK with ECN counts
+    FSKIP fk_ack3, 9
+    EXPECT rax, 9                       ; ACK carrying three ranges
+    FSKIP fk_closer, 6
+    EXPECT rax, 6                       ; CONNECTION_CLOSE with a reason phrase
 
     ; a type RFC 9000 does not define is reported, with the type for the close
     FSKIP fk_unk, 1
@@ -703,6 +719,14 @@ _start:
     call linnea_quic_frames_check
     EXPECT rax, -1
     EXPECT rdx, 0x22
+    ; ...and so is a last frame that runs past the end of the payload. The type
+    ; reported is 0, which 19.19 defines as "the frame type is unknown" — the
+    ; bytes naming it may be the very ones that did not fit.
+    lea rdi, [fk_seq_trunc]
+    mov esi, fk_seq_trunc_len
+    call linnea_quic_frames_check
+    EXPECT rax, -1
+    EXPECT rdx, 0
 
     ; print "quic-rtx <pass>/<total>\n"
     lea rdi, [msg_head]

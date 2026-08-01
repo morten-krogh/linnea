@@ -3230,10 +3230,20 @@ linnea_quic_frame_skip:
 ; linnea_quic_frames_check(rdi = frames, rsi = length) -> rax = 0 when every
 ; frame is one RFC 9000 defines, or -1 with rdx = the offending type.
 ;
-; RFC 9000 12.4 MUST: an unknown frame type is a connection error of type
-; FRAME_ENCODING_ERROR. A truncated frame stops the walk without complaint,
-; which is what every scanner already did — being strict there is a separate
-; change and a wider blast radius than this one.
+; RFC 9000 12.4 MUST: a frame that cannot be decoded is a connection error of
+; type FRAME_ENCODING_ERROR. Two ways to fail that: a type RFC 9000 19 does not
+; define, and a frame that runs past the end of the packet it arrived in.
+;
+; The second used to stop the walk without complaint, which is what every
+; scanner did before there was one table. A frame extending beyond the packet
+; cannot be parsed, and everything behind it in that packet is then unreadable
+; too — so continuing quietly means acknowledging a packet whose contents we
+; never saw, and the peer never resends what it believes arrived.
+;
+; rdx is the frame type to name in the CONNECTION_CLOSE. For a truncated frame
+; that type may itself be the thing that did not fit, so it is reported as 0 —
+; which 19.19 defines as exactly that: "the value 0 is used when the frame type
+; is unknown".
 linnea_quic_frames_check:
     push rbx
     push r12
@@ -3248,11 +3258,17 @@ linnea_quic_frames_check:
     cmp rax, -1
     je .fc_bad
     test rax, rax
-    jz .fc_ok                        ; truncated: nothing more to judge
+    jz .fc_trunc                     ; runs past the packet: unparseable
     add rbx, rax
     jmp .fc_loop
 .fc_ok:
     xor eax, eax
+    pop r12
+    pop rbx
+    ret
+.fc_trunc:
+    xor edx, edx                     ; type unknown (19.19)
+    mov rax, -1
     pop r12
     pop rbx
     ret
