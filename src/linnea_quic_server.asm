@@ -318,6 +318,7 @@ retry_aad:   resb 160                ; the Retry pseudo-packet the tag covers
 s_cert_len:  resq 1
 s_priv:      resq 1
 s_ini_len:   resq 1
+s_ini_paylen: resq 1        ; Initial payload bytes (no pn, no tag)
 s_hsmsg_len: resq 1
 s_hs_chunk:  resq 1              ; byte length of the flight chunk being framed
 s_cv_off:    resq 1              ; hsmsg offset of CertVerify while staging the tail
@@ -886,53 +887,17 @@ linnea_quic_server_datagram:
     mov rsi, rdx
     lea rdx, [ch_out]
     call linnea_quic_ch_parse
-    ; A ClientHello with no usable x25519 key_share cannot key the ECDHE. Never
-    ; hand a null share to x25519 (it would dereference address 0 and crash the
-    ; worker); drop the datagram and reclaim the slot. This is the one client we
-    ; cannot serve — every browser and QUIC library offers x25519.
-    cmp qword [ch_out + linnea_quic_ch.ks_ptr], 0
-    jne .ks_ok
-    mov rdi, [cur_conn]
-    call linnea_quic_conn_free
-    jmp .done
-.ks_ok:
-    ; The client must actually have offered h3. linnea_quic_build_ee wrote "h3"
-    ; into EncryptedExtensions unconditionally, without ever looking at the
-    ; list — so a client offering only hq-interop or doq was told h3 had been
-    ; selected, which RFC 7301 3.2 forbids outright: a server must not name a
-    ; protocol the client did not advertise. linnea_quic_alpn_has has existed
-    ; all along and had no caller.
-    ;
-    ; RFC 9001 8.1 wants this refused with a no_application_protocol alert
-    ; carried in a CONNECTION_CLOSE (QUIC error 0x0178). There is no path from a
-    ; TLS-level failure to a CONNECTION_CLOSE in the handshake spaces yet — both
-    ; close paths run through emit_1rtt, which needs keys that do not exist at
-    ; this point — so this drops the connection the way every other handshake
-    ; refusal here does. Silent, but no longer a lie.
-    mov rdi, [ch_out + linnea_quic_ch.alpn_ptr]
-    test rdi, rdi
-    jz .alpn_bad                      ; no ALPN at all: h3 is not optional here
-    mov rsi, [ch_out + linnea_quic_ch.alpn_len]
-    lea rdx, [quic_alpn_h3]
-    mov ecx, 2
-    call linnea_quic_alpn_has
-    test rax, rax
-    jnz .alpn_ok
-.alpn_bad:
-    mov rdi, [cur_conn]
-    call linnea_quic_conn_free
-    jmp .done
-.alpn_ok:
-    ; select the vhost by SNI — it fixes the certificate, signing key and document
-    ; root this connection is served under, so a name gets its own origin's cert.
-    mov rdi, [ch_out + linnea_quic_ch.sni_ptr]
-    mov rsi, [ch_out + linnea_quic_ch.sni_len]
-    call select_vhost
-    mov rcx, [cur_conn]
-    mov [rcx + linnea_quic_conn.vhost], rax
-    ; the client's SCID sits after its DCID in the received header. Copy it to a
+    ; The client's SCID sits after its DCID in the received header. Copy it to a
     ; stable buffer: we reuse it as the DCID of every packet we send back, but
     ; dgram is overwritten by each recvfrom.
+    ;
+    ; This runs BEFORE the refusals below, not after them as it used to. A
+    ; CONNECTION_CLOSE addressed with an empty DCID is a packet the client cannot
+    ; match to any connection, so it discards it without a word and the refusal
+    ; is silence all over again — which is exactly what the first cut of
+    ; .initial_close did: 40 bytes on the wire, dropped on arrival. Nothing here
+    ; depends on the ClientHello being acceptable; it is a property of the packet
+    ; that carried it.
     movzx eax, byte [linnea_quic_rxbuf + 5]
     lea rsi, [linnea_quic_rxbuf + 6 + rax]
     movzx ecx, byte [rsi]            ; SCID length (raw wire byte, 0..255)
@@ -947,6 +912,60 @@ linnea_quic_server_datagram:
     mov [rax + linnea_quic_conn.dcid_len], rcx
     lea rdi, [rax + linnea_quic_conn.dcid]
     rep movsb                        ; copy the SCID out of dgram
+    ; A ClientHello with no usable x25519 key_share cannot key the ECDHE. Never
+    ; hand a null share to x25519 (it would dereference address 0 and crash the
+    ; worker). This is the one client we cannot serve — every browser and QUIC
+    ; library offers x25519 — but it is now TOLD so, with the handshake_failure
+    ; (40) that RFC 8446 4.1.1 names for "cannot negotiate an acceptable set of
+    ; parameters", rather than left to time out against a silent server.
+    ;
+    ; The conformant answer for a client that supports x25519 and merely guessed
+    ; a different group is a HelloRetryRequest, which the TCP path gained in
+    ; Q159 and this one still lacks; QUIC's ClientHello parse does not read
+    ; supported_groups, so the two cases are indistinguishable here exactly as
+    ; they were on TCP before that fix.
+    cmp qword [ch_out + linnea_quic_ch.ks_ptr], 0
+    jne .ks_ok
+    mov edi, 0x0100 + 40             ; handshake_failure
+    call .initial_close
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
+.ks_ok:
+    ; The client must actually have offered h3. linnea_quic_build_ee wrote "h3"
+    ; into EncryptedExtensions unconditionally, without ever looking at the
+    ; list — so a client offering only hq-interop or doq was told h3 had been
+    ; selected, which RFC 7301 3.2 forbids outright: a server must not name a
+    ; protocol the client did not advertise. linnea_quic_alpn_has has existed
+    ; all along and had no caller.
+    ;
+    ; RFC 9001 8.1 wants this refused with a no_application_protocol alert
+    ; carried in a CONNECTION_CLOSE (QUIC error 0x0178), which .initial_close
+    ; now sends: the Initial space is keyed off the client's own DCID, so it is
+    ; writable even here.
+    mov rdi, [ch_out + linnea_quic_ch.alpn_ptr]
+    test rdi, rdi
+    jz .alpn_bad                      ; no ALPN at all: h3 is not optional here
+    mov rsi, [ch_out + linnea_quic_ch.alpn_len]
+    lea rdx, [quic_alpn_h3]
+    mov ecx, 2
+    call linnea_quic_alpn_has
+    test rax, rax
+    jnz .alpn_ok
+.alpn_bad:
+    mov edi, 0x0100 + 120            ; no_application_protocol
+    call .initial_close
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
+.alpn_ok:
+    ; select the vhost by SNI — it fixes the certificate, signing key and document
+    ; root this connection is served under, so a name gets its own origin's cert.
+    mov rdi, [ch_out + linnea_quic_ch.sni_ptr]
+    mov rsi, [ch_out + linnea_quic_ch.sni_len]
+    call select_vhost
+    mov rcx, [cur_conn]
+    mov [rcx + linnea_quic_conn.vhost], rax
     ; SNI hash, computed once: it seeds any ticket we issue and (on a resumption
     ; offer) checks the presented ticket's server_name binding.
     mov rdi, [ch_out + linnea_quic_ch.sni_ptr]
@@ -3097,7 +3116,10 @@ linnea_quic_server_datagram:
     lea rdi, [payload + 9]
     lea rsi, [sh_buf]
     mov ecx, [s_sh_len]
-    rep movsb                        ; payload length = 9 + SH
+    rep movsb
+    mov rax, [s_sh_len]
+    add rax, 9                       ; ACK(5) + CRYPTO header(4) + SH
+    mov [s_ini_paylen], rax
     call .build_initial_header       ; -> rcx = header length
     sub rsp, 16
     CONNLEA rax, ini_server
@@ -3115,6 +3137,62 @@ linnea_quic_server_datagram:
     call linnea_quic_protect         ; rax = Initial packet length
     add rsp, 16
     mov [s_ini_len], rax
+    mov rcx, [cur_conn]
+    inc qword [rcx + linnea_quic_conn.pn_ini]
+    add rsp, 8
+    ret
+
+; .initial_close(edi = QUIC error code) — end the handshake with something the
+; peer can actually read.
+;
+; RFC 9001 4.8: a TLS alert raised during the handshake becomes a QUIC
+; connection error of 0x0100 + the alert description. Every handshake-space
+; refusal here used to just drop the connection and go silent, because the only
+; close path was emit_1rtt and 1-RTT keys do not exist yet — so a client we had
+; decided not to serve sat retransmitting its ClientHello until it gave up, with
+; nothing anywhere to say why. Initial keys come from the client's own DCID, so
+; this space can always be written, whatever else has failed.
+;
+; Frame type 0x1c, the transport form: 0x1d carries an application error and RFC
+; 9000 12.5 forbids it in Initial and Handshake packets. cur_conn selects the
+; connection, r12d is the UDP socket. The caller still frees the connection.
+.initial_close:
+    sub rsp, 8                       ; a callee: put rsp back on a 16-byte boundary
+    mov byte [payload], 0x1c
+    ; error code as a 2-byte varint — 0x0100+alert is 256..511, which never fits
+    ; the 1-byte form and always fits the 2-byte one
+    mov eax, edi
+    mov edx, eax
+    shr edx, 8
+    or edx, 0x40
+    mov [payload + 1], dl
+    mov [payload + 2], al
+    mov byte [payload + 3], 0x00     ; the frame type that triggered it: none
+    mov byte [payload + 4], 0x00     ; reason phrase length
+    mov qword [s_ini_paylen], 5
+    call .build_initial_header       ; -> rcx = header length
+    sub rsp, 16
+    CONNLEA rax, ini_server
+    mov [rsp], rax
+    mov rax, [cur_conn]              ; full pn for the nonce
+    mov rax, [rax + linnea_quic_conn.pn_ini]
+    mov [rsp + 8], rax
+    lea rdi, [outpkt]
+    lea rsi, [hdr]
+    mov rdx, rcx
+    mov ecx, 1
+    lea r8, [payload]
+    mov r9d, 5
+    call linnea_quic_protect         ; rax = Initial packet length
+    add rsp, 16
+    mov rdx, rax                     ; datagram length, before rax is the syscall
+    mov eax, SYS_SENDTO
+    mov edi, r12d
+    lea rsi, [outpkt]
+    xor r10d, r10d
+    CONNLEA r8, peer
+    CONNGET r9, peer_len
+    syscall
     mov rcx, [cur_conn]
     inc qword [rcx + linnea_quic_conn.pn_ini]
     add rsp, 8
@@ -3176,9 +3254,12 @@ linnea_quic_server_datagram:
     mov ecx, LINNEA_QUIC_SCID_LEN
     rep movsb
     mov byte [rdi], 0x00             ; token length
-    ; length varint = pn(1) + payload(9 + SH) + tag(16) = 26 + SH; a 2-byte varint
-    mov eax, [s_sh_len]
-    add eax, 26
+    ; length varint = pn(1) + payload + tag(16); a 2-byte varint. The payload
+    ; length is a variable rather than "9 + SH" because the first flight is no
+    ; longer the only thing sent in this space — .initial_close writes a
+    ; CONNECTION_CLOSE here too.
+    mov eax, [s_ini_paylen]
+    add eax, 17
     mov edx, eax
     shr edx, 8
     or edx, 0x40

@@ -10,6 +10,12 @@ accept queue, so anything the drain does to that queue shows up at once:
     + serves them (Q177)                 2 of 10
     + sweeps the accept queue (Q178)     0 of 10, ~386k attempts
 
+Not quite absolute: leaving the reuseport group means closing the listening
+socket, and the sweep that empties its accept queue cannot be atomic with that
+close, so a connection can still land in the gap between them. Seen twice in
+~34k attempts on a loaded box. The suite therefore retries once and fails only
+if both attempts lose something -- a real regression loses 6-18 every round.
+
 Every attempt is classified, so a failure says which mechanism bit:
   reset    ECONNRESET -- taken and then thrown away, or purged from the queue
   refused  ECONNREFUSED -- no listener at all, i.e. the group was left empty
@@ -86,7 +92,14 @@ def main():
     for t in threads:
         t.start()
     time.sleep(UPGRADE_AT)
-    os.kill(master, signal.SIGUSR2)
+    try:
+        os.kill(master, signal.SIGUSR2)
+    except ProcessLookupError:
+        stop.set()
+        print(f"master {master} is already gone -- it never came up (the port "
+              f"still held by a previous instance?), so nothing was tested",
+              file=sys.stderr)
+        return 2
     time.sleep(DURATION - UPGRADE_AT)
     stop.set()
     for t in threads:

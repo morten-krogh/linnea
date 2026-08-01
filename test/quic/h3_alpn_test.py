@@ -7,11 +7,10 @@
 # 3.2 forbids outright. linnea_quic_alpn_has had existed all along with no caller.
 #
 # RFC 9001 8.1 wants this refused with a no_application_protocol alert carried in
-# a CONNECTION_CLOSE (QUIC error 0x0178). There is no path from a TLS-level
-# failure to a CONNECTION_CLOSE in the handshake spaces yet — both close paths
-# need 1-RTT keys that do not exist at that point — so the connection is dropped
-# the way every other handshake refusal here is. Silent, but no longer a lie;
-# the alert is tracked separately in the audit.
+# a CONNECTION_CLOSE (QUIC error 0x0178), which the server now sends — see
+# h3_hs_close_test.py, which checks the error code itself. This file stays on the
+# narrower question it was written for: that the handshake does not complete with
+# a protocol the client never offered.
 #
 # Usage: h3_alpn_test.py <port>
 import socket
