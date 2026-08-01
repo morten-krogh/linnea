@@ -57,8 +57,10 @@ CASES = [
     ("404", b"GET /nope-does-not-exist HTTP/1.1\r\nHost: one.test\r\n\r\n", 404),
     ("405", b"DELETE /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n", 405),
     ("400 (no Host)", b"GET /hello.txt HTTP/1.1\r\n\r\n", 400),
-    ("414/400 (over-long target)",
-     b"GET /" + b"a" * 4000 + b" HTTP/1.1\r\nHost: one.test\r\n\r\n", None),
+    # RFC 9112 3.2 names 414 for this, not 400: 400 tells the client its
+    # request was malformed, so it gives up instead of shortening the URL.
+    ("414 (over-long target)",
+     b"GET /" + b"a" * 4000 + b" HTTP/1.1\r\nHost: one.test\r\n\r\n", 414),
     ("OPTIONS *", b"OPTIONS * HTTP/1.1\r\nHost: one.test\r\n\r\n", 200),
 ]
 

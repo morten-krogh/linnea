@@ -819,8 +819,20 @@ linnea_http_handle:
     mov [rsp + 144], rax       ; raw length, kept when the query is stripped
     test rax, rax
     jz .resp_400
+    ; RFC 9112 3.2: "A server that receives a request-target longer than any
+    ; URI it wishes to parse MUST respond with a 414 (URI Too Long)." This said
+    ; 400, which tells the client its request was malformed — so it stops rather
+    ; than shortening the URL, and a long signed URL looks like a client bug.
+    ; The 414 blob was already here, reachable only from the redirect-overflow
+    ; guard further down.
+    ;
+    ; The cap itself stays at 2048. RFC 9112 3 RECOMMENDS supporting at least
+    ; 8000, and raising it here is cheap (path_buf is one per worker and in_buf
+    ; is 17408), but h2 bounds :path at 2048 and h3's bound is implicit in
+    ; linnea_static_normalize's buffer — so lifting only h1 would mean a URL
+    ; that works over one protocol and not another. Left together, deliberately.
     cmp rax, LINNEA_HTTP_MAX_TARGET
-    ja .resp_400
+    ja .resp_414
     inc r15                    ; skip the SP
 
     ; --- request-target forms (RFC 9112 3.2) ----------------------
