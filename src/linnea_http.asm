@@ -993,16 +993,37 @@ linnea_http_handle:
     inc rdx
     jmp .conn_tok_end
 .conn_tok_have:
+    ; The token has to survive the comparisons: linnea_string_iequal returns in
+    ; rax and clobbers the registers holding the bounds, so both ends are
+    ; spilled before the first call and re-derived for the second.
+    mov [rsp + 344], rax       ; token start
+    mov [rsp + 56], rdx        ; token end, and where the scan resumes
     mov rdi, rax
     mov rsi, rdx
     sub rsi, rax               ; token length
-    mov [rsp + 56], rdx        ; resume after this token
     lea rdx, [hn_upgrade]
     mov ecx, 7
     call linnea_string_iequal
     test eax, eax
-    jz .conn_tok_start
+    jz .conn_tok_close
     or qword [rsp + 232], 1    ; the client asks to upgrade
+    jmp .conn_tok_start
+.conn_tok_close:
+    ; "close" is a connection option like any other (RFC 9112 9.1), so it can
+    ; sit anywhere in the list. Only a value that was ENTIRELY "close" used to
+    ; count, and this loop — which was already walking the tokens — tested for
+    ; nothing but "upgrade". So `Connection: keep-alive, close` was answered
+    ; `Connection: keep-alive` and the socket was held to the idle timeout,
+    ; against the explicit wish of the client that sent it.
+    mov rdi, [rsp + 344]
+    mov rsi, [rsp + 56]
+    sub rsi, rdi               ; token length
+    lea rdx, [hv_close]
+    mov ecx, 5
+    call linnea_string_iequal
+    test eax, eax
+    jz .conn_tok_start
+    mov qword [rsp + 24], 0    ; the client asked to close
     jmp .conn_tok_start
 .conn_tok_skip:
     inc qword [rsp + 56]

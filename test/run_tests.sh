@@ -1555,6 +1555,12 @@ check "all three HTTP-date formats are accepted" $?
 timeout 60 python3 test/tls/preconditions.py 47080 >/dev/null 2>&1
 check "If-Match and If-Unmodified-Since are evaluated" $?
 
+# RFC 9112 9.1: Connection is a token LIST and `close` may sit anywhere in it.
+# Only a value that was entirely "close" counted, so `keep-alive, close` was
+# answered `Connection: keep-alive` and the socket held to the idle timeout.
+timeout 60 python3 test/tls/connection_close_token.py 47080 >/dev/null 2>&1
+check "Connection: close is honoured anywhere in the list" $?
+
 # Chunked request bodies (RFC 9112 7.1 MUST). Any Transfer-Encoding at all used
 # to be 501, so every client that sends a body of unknown length up front was
 # refused: curl -T -, fetch() with a ReadableStream, most libraries handed a
