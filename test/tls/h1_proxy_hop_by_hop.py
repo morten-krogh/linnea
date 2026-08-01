@@ -61,8 +61,8 @@ def case(label, extra, must_be_gone=(), must_remain=()):
     leaked = [n for n in must_be_gone if (n.lower() + ":") in lower]
     missing = [n for n in must_remain if (n.lower() + ":") not in lower]
     if leaked:
-        print(f"FAIL {label}: {', '.join(leaked)} reached the backend although "
-              f"the client marked it hop-by-hop")
+        print(f"FAIL {label}: {', '.join(leaked)} reached the backend, "
+              f"but must not cross a hop")
         fails += 1
     elif missing:
         print(f"FAIL {label}: {', '.join(missing)} did not reach the backend, "
@@ -104,5 +104,68 @@ case("Keep-Alive named by the client is removed",
 case("Connection: upgrade does not strip the Upgrade field",
      b"Connection: upgrade\r\nUpgrade: websocket\r\n",
      must_remain=["Upgrade"])
+
+
+# --- fields that are hop-by-hop in THEMSELVES (RFC 9110 7.6.1) -------------
+# The Connection-named half above was Q168. These need no Connection entry at
+# all: they are connection-specific by definition, and forwarding them hands the
+# backend framing and connection instructions meant for a hop it never shared.
+case("Keep-Alive is removed even when Connection does not name it",
+     b"Keep-Alive: timeout=5, max=100\r\n",
+     must_be_gone=["Keep-Alive"])
+
+case("TE is removed even when Connection does not name it",
+     b"TE: gzip\r\n",
+     must_be_gone=["TE"])
+
+case("Trailer, Proxy-Connection and Proxy-Authorization are removed",
+     b"Trailer: X-Late\r\nProxy-Connection: keep-alive\r\n"
+     b"Proxy-Authorization: Basic Zm9vOmJhcg==\r\n",
+     must_be_gone=["Trailer", "Proxy-Connection", "Proxy-Authorization"])
+
+# ...while an ordinary field alongside them still goes through, so the filter
+# is not simply eating everything
+case("an ordinary field survives beside them",
+     b"Keep-Alive: timeout=5\r\nX-Ordinary: kept\r\n",
+     must_be_gone=["Keep-Alive"],
+     must_remain=["X-Ordinary"])
+
+
+# --- and the same on the way back -----------------------------------------
+def client_saw(path):
+    """Return the response head the CLIENT receives for a proxied request."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.settimeout(3)
+    s.sendall(b"GET " + path + b" HTTP/1.1\r\nHost: " + HOST
+              + b"\r\nConnection: close\r\n\r\n")
+    out = b""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            out += d
+    except socket.timeout:
+        pass
+    s.close()
+    head, _, _ = out.partition(b"\r\n\r\n")
+    return head.decode("latin1", "replace")
+
+
+head = client_saw(b"/api/hopresp")
+lower = head.lower()
+fields = [line.split(":", 1)[0].strip().lower()
+          for line in head.split("\r\n")[1:] if ":" in line]
+leaked = [n for n in ("Keep-Alive", "TE", "Trailer", "Proxy-Connection",
+                      "Proxy-Authenticate") if n.lower() in fields]
+if leaked:
+    print(f"FAIL the response relayed {', '.join(leaked)} — those describe the "
+          f"backend's connection to us, not ours to the client")
+    fails += 1
+elif "x-kept" not in fields:
+    print("FAIL the response lost X-Kept, which nothing asked to have removed")
+    fails += 1
+else:
+    print("ok   hop-by-hop response fields are not relayed to the client")
 
 sys.exit(1 if fails else 0)

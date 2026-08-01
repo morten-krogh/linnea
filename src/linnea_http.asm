@@ -292,6 +292,31 @@ hn_accept_enc:  db "accept-encoding"
 hn_upgrade:     db "upgrade"       ; the header name and the Connection token
 hn_range:       db "range"
 hn_if_range:    db "if-range"
+; Fields that are hop-by-hop in themselves, whatever Connection says. RFC 9110
+; 7.6.1 makes an intermediary drop the fields a Connection value NAMES — that is
+; http_conn_option_named — but these are connection-specific on their own and
+; must not be forwarded even when the peer never lists them. A client that sends
+; `Keep-Alive: timeout=5` or `TE: gzip` without naming it in Connection had it
+; relayed to the backend verbatim, which is the same smuggling surface 7.6.1
+; exists to close: the backend reads framing or connection instructions that were
+; meant for the hop it never shared.
+;
+; Length-prefixed and contiguous so the walk needs no pointer table. Terminated
+; by a zero length.
+;
+; Upgrade is deliberately NOT here, in either direction: this proxy tunnels
+; websockets, and the 101 path emits only "Connection: upgrade", so the backend's
+; own Upgrade header has to reach the client through the copy loop for the
+; handshake to complete. Connection and Transfer-Encoding are absent too — both
+; are already handled where the rewriters replace them.
+hop_by_hop_names:
+    db 10, "keep-alive"
+    db  2, "te"
+    db  7, "trailer"
+    db 16, "proxy-connection"
+    db 18, "proxy-authenticate"
+    db 19, "proxy-authorization"
+    db  0
 hv_close:       db "close"
 hv_chunked:     db "chunked"
 slash_ch:       db "/"
@@ -495,6 +520,49 @@ section .text
 ;   [rsp+296] Host field lines seen (RFC 9112 3.2 wants exactly one)
 ;   [rsp+304] asterisk-form: the target was "*", so the request is about the
 ;             server itself rather than any resource (OPTIONS *)
+
+; http_hop_by_hop(rdi = field name, rsi = name length) -> rax = 1 if the field
+; must not cross this hop, whatever Connection says. See hop_by_hop_names.
+;
+; Touches neither r10 nor r13 — the two rewriters keep their colon offset in
+; those across the comparisons, and linnea_string_iequal leaves them alone.
+http_hop_by_hop:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8                 ; 4 pushes + the return address: re-align to 16
+    mov r12, rdi
+    mov r13, rsi
+    lea rbx, [hop_by_hop_names]
+.hb_loop:
+    movzx r14d, byte [rbx]     ; this entry's name length
+    test r14d, r14d
+    jz .hb_no                  ; the zero terminator: nothing matched
+    cmp r13, r14
+    jne .hb_next               ; lengths differ, so the names cannot match
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [rbx + 1]
+    mov ecx, r14d
+    call linnea_string_iequal
+    test eax, eax
+    jnz .hb_yes
+.hb_next:
+    lea rbx, [rbx + r14 + 1]
+    jmp .hb_loop
+.hb_yes:
+    mov eax, 1
+    jmp .hb_ret
+.hb_no:
+    xor eax, eax
+.hb_ret:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; http_conn_option_named(rdi = field name, rsi = name length, rbx = connection)
 ;   -> eax = 1 when the client's Connection field lists this name.
@@ -2069,6 +2137,15 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jnz .proxy_next_line
+    ; fields that are hop-by-hop in themselves, named in Connection or not
+    mov rcx, [rsp + 56]
+    mov rax, r10
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    call http_hop_by_hop
+    test eax, eax
+    jnz .proxy_next_line
     ; and every field the client's own Connection value names (RFC 9110 7.6.1)
     mov rcx, [rsp + 56]
     mov rax, r10
@@ -2843,6 +2920,17 @@ linnea_http_proxy_head:
     call linnea_string_iequal
     test eax, eax
     jnz .next_line             ; ours replaces it
+    ; The response side leaked these just as the request side did: a backend
+    ; answering `Keep-Alive: timeout=5` had it relayed to a client whose
+    ; connection to us has nothing to do with ours to the backend.
+    mov rcx, [rsp + 24]
+    mov rax, r13
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    call http_hop_by_hop
+    test eax, eax
+    jnz .next_line
     mov rcx, [rsp + 24]
     mov rax, r13
     sub rax, rcx

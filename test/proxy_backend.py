@@ -138,6 +138,16 @@ def respond(conn, head, body, extra=b""):
         # Echo the request head, to prove headers are forwarded.
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
                      % (len(head), head))
+    elif path.endswith(b"/hopresp"):
+        # Hop-by-hop fields in a RESPONSE. They describe the backend's
+        # connection to us, not ours to the client, so none may be relayed on.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                     b"Keep-Alive: timeout=5, max=100\r\n"
+                     b"TE: gzip\r\n"
+                     b"Trailer: X-Late\r\n"
+                     b"Proxy-Connection: keep-alive\r\n"
+                     b"Proxy-Authenticate: Basic realm=\"backend\"\r\n"
+                     b"X-Kept: yes\r\n\r\nbody")
     elif path.endswith(b"/chunked"):
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
                      b"7\r\nchunked\r\n5\r\n body\r\n0\r\n\r\n")

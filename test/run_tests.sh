@@ -1518,7 +1518,7 @@ check_http "proxy forwards body" "hello body" "$resp"
 # dropped, so a client could mark any field hop-by-hop and have it delivered to
 # the backend anyway — the header-smuggling shape that rule exists to close.
 timeout 60 python3 test/tls/h1_proxy_hop_by_hop.py 47080 >/dev/null 2>&1
-check "proxy removes the fields Connection names" $?
+check "proxy removes hop-by-hop fields, both directions" $?
 
 # Chunked request bodies (RFC 9112 7.1 MUST). Any Transfer-Encoding at all used
 # to be 501, so every client that sends a body of unknown length up front was
