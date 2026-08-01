@@ -1929,6 +1929,21 @@ kill $up_master 2>/dev/null
 wait $up_master 2>/dev/null
 rm -f /tmp/up_out test/www/up.bin "$LOG"
 
+# The same handover under real concurrency. One-at-a-time curl caught the
+# drain's resets about once in a dozen suite runs, which is not enough signal
+# to tell a fix from luck; 40 clients in flight fill the accept queue and make
+# it deterministic. Every attempt must be answered — a reset here means the
+# drain threw away a connection it had already taken, or the listener close
+# purged the queue behind it.
+$BIN --config test/configs/listen.json >/dev/null 2>&1 &
+burst_master=$!
+sleep 0.5
+burst_out=$(timeout 60 python3 test/upgrade_burst.py $burst_master 47080 2>&1)
+check "upgrade under load loses no connection ($burst_out)" $?
+kill $burst_master 2>/dev/null
+wait $burst_master 2>/dev/null
+rm -f "$LOG"
+
 # --- TLS 1.3: the standalone echo server against real clients ---
 # Needs the openssl CLI (cert generation + s_client) and python3 ssl,
 # both already test-only dependencies. Skips cleanly if either is absent.

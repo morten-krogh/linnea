@@ -668,13 +668,19 @@ linnea_uring_run:
     mov esi, log_drain_len
     call linnea_log_write
     ; Leave the reuseport group FIRST: until this worker's listeners are
-    ; closed the kernel keeps hashing new connections to them, and a draining
-    ; worker refuses what it accepts — during a hot upgrade those are exactly
-    ; the requests the new generation should have got. Closing hands the group
-    ; back to the sockets still serving. (Anything already queued on these
-    ; sockets is reset; that window is microseconds, against a whole drain.)
+    ; closed the kernel keeps hashing new connections to them, and during a hot
+    ; upgrade those are exactly the requests the new generation should have got.
+    ; Closing hands the group back to the sockets still serving.
     ; The fd is cleared so the accept completion below does not close it a
     ; second time — by then the number may belong to someone else entirely.
+    ;
+    ; But close() on a listening socket RESETS everything still sitting in its
+    ; accept queue, and those are live requests — a client that connected and
+    ; sent a request it will never get an answer to. So sweep the queue first
+    ; and set each one up as an ordinary connection; the drain then finishes
+    ; them like any other open connection. What is left is the gap between the
+    ; sweep coming up empty and the close on the next line, which really is the
+    ; couple of microseconds the old comment here claimed for the whole thing.
     xor r13d, r13d
 .close_listeners:
     cmp r13, [rbx + linnea_config.server_count]
@@ -687,10 +693,29 @@ linnea_uring_run:
     cmp edi, -1
     je .close_listeners_next
     mov dword [rax + linnea_config_server.listen_fd], -1
-    push rax
+    mov r14d, edi              ; the listening fd, across the sweep's calls
+    ; accept() would block on an empty queue, and the queue is empty exactly
+    ; when we want to stop. The socket is about to be closed, so nothing here
+    ; outlives the next few instructions.
+    mov eax, LINNEA_SYS_FCNTL
+    mov esi, LINNEA_F_SETFL
+    mov edx, LINNEA_O_NONBLOCK
+    syscall
+.drain_queue:
+    mov eax, LINNEA_SYS_ACCEPT
+    mov edi, r14d
+    xor esi, esi               ; the peer address is read back from the fd
+    xor edx, edx
+    syscall
+    test eax, eax
+    js .drain_queue_done       ; EAGAIN: nothing left queued
+    mov r15d, eax
+    call setup_accepted_conn   ; r13d is already this server's index
+    jmp .drain_queue
+.drain_queue_done:
+    mov edi, r14d
     mov eax, LINNEA_SYS_CLOSE
     syscall
-    pop rax
 .close_listeners_next:
     inc r13
     jmp .close_listeners
@@ -788,81 +813,11 @@ linnea_uring_run:
     ; the drain flag went up was thrown away. The only difference from a normal
     ; accept is that we never re-arm afterwards; see .accept_rearm.
     cmp dword [drain_flag], 0
-    jnz .accept_alloc
+    jnz .accept_setup
     mov dword [accept_err_streak], 0   ; accepting again: end any backoff
-.accept_alloc:
-    call linnea_connection_alloc
-    test rax, rax
-    jz .conn_limit
-    mov dword [conn_full_warned], 0
-    mov r12, rax               ; connection*
-    mov [r12 + linnea_connection.fd], r15d
-    mov [r12 + linnea_connection.server], r13d
-    mov qword [r12 + linnea_connection.sni_vhost], 0
-    mov edi, r15d
-    lea rsi, [r12 + linnea_connection.peer]
-    call linnea_network_peer_format
-    mov [r12 + linnea_connection.peer_len], rax
-    ; the source address alone (no port), and how many connections it already
-    ; holds. Without this one host can take the whole pool with perfectly
-    ; well-formed traffic and everyone else is refused.
-    mov edi, [r12 + linnea_connection.fd]
-    lea rsi, [r12 + linnea_connection.peer_ip]
-    call linnea_network_peer_addr
-    mov [r12 + linnea_connection.peer_ip_len], rax
-    test rax, rax
-    jz .accept_counted         ; address unreadable: nothing to count it against
-    lea rdi, [r12 + linnea_connection.peer_ip]
-    mov rsi, rax
-    call linnea_connection_count_ip    ; this connection is already among them
-    cmp rax, [max_per_ip]
-    jbe .accept_counted
-    ; over the cap: hand the slot back and drop the connection without a log
-    ; line — logging every refusal would turn a flood into disk exhaustion
-    mov rdi, r12
-    call linnea_connection_free
-    mov edi, r15d
-    mov eax, LINNEA_SYS_CLOSE
-    syscall
+.accept_setup:
+    call setup_accepted_conn           ; r15d = fd, r13d = server index
     jmp .accept_rearm
-.accept_counted:
-    ; the head clock starts now: it covers the TLS handshake and the first
-    ; request head, and is rearmed per head below
-    call linnea_uring_now
-    mov [r12 + linnea_connection.req_start], rax
-    mov rdi, r12
-    call linnea_uring_log_accept
-    ; TLS listeners begin a userspace handshake before any HTTP; its state
-    ; overlays up_buf (no proxying can be active yet). The accepting server
-    ; is the listener owner; its cert is the default until the ClientHello
-    ; names a vhost and the SNI hook below picks that vhost's cert instead.
-    mov eax, [r12 + linnea_connection.server]
-    imul rax, rax, linnea_config_server_size
-    lea rax, [rbx + rax + linnea_config.servers]
-    cmp dword [rax + linnea_config_server.tls], 0
-    je .accept_recv
-    lea rdi, [r12 + linnea_connection.up_buf]
-    mov rsi, [rax + linnea_config_server.cert_list]
-    mov rdx, [rax + linnea_config_server.cert_list_len]
-    mov rcx, [rax + linnea_config_server.key_priv]
-    xor r8d, r8d
-    call linnea_tls_hs_init
-    lea rax, [linnea_uring_sni_select]
-    mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_cb], rax
-    mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_ctx], r12
-    ; Offer h2 in ALPN whenever it is enabled: since Q86 a proxy location is
-    ; served over h2 too (each stream runs its own HTTP/1.1 upstream
-    ; exchange), so a proxy vhost no longer has to stay on HTTP/1.1. A
-    ; WebSocket upgrade still arrives on its own h1 connection, because we do
-    ; not advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441).
-    mov eax, [rbx + linnea_config.http2]
-.set_alpn:
-    mov [r12 + linnea_connection.up_buf + linnea_tls_hs.alpn_h2_ok], eax
-    mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
-.accept_recv:
-    mov rdi, r12
-    call linnea_uring_arm_recv
-    call linnea_uring_submit_now
 .accept_rearm:
     cmp dword [drain_flag], 0
     jnz .accept_drain_tail     ; draining: serve what we took, but take no more
@@ -923,19 +878,6 @@ linnea_uring_run:
     call linnea_uring_arm_accept
     call linnea_uring_submit_now
     jmp .wait
-.conn_limit:
-    mov edi, r15d
-    mov eax, LINNEA_SYS_CLOSE
-    syscall
-    ; warn once per spell of fullness, not once per refused connection
-    cmp dword [conn_full_warned], 0
-    jne .accept_rearm
-    mov dword [conn_full_warned], 1
-    lea rdi, [warn_full]
-    mov esi, warn_full_len
-    call linnea_print_stderr
-    jmp .accept_rearm
-
 ; --- recv completion: r13 = connection index, r15d = bytes or -errno --
 ; A fired idle timeout surfaces here as -ECANCELED and closes the
 ; connection like any other recv failure.
@@ -2305,6 +2247,112 @@ linnea_uring_arm_link_timeout:
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     pop rbx
     ret
+
+; setup_accepted_conn(r15d = accepted fd, r13d = server index)
+;
+; Everything that turns a freshly accepted socket into a live connection:
+; take a slot, format the peer, enforce the per-address cap, start the head
+; clock, begin a TLS handshake if this listener wants one, and arm the first
+; recv. It is a routine rather than straight-line code inside the accept
+; completion because there are now TWO ways in -- that completion, and the
+; sweep of the accept queue a draining worker makes before it closes its
+; listening socket (Q178).
+;
+; Reads r13d/r15d and leaves both alone; rbx and r12 are saved and restored.
+setup_accepted_conn:
+    push r12
+    push rbx
+    sub rsp, 8                 ; 2 pushes + the return address: re-align to 16
+    lea rbx, [linnea_config_instance]
+    call linnea_connection_alloc
+    test rax, rax
+    jz .su_full
+    mov dword [conn_full_warned], 0
+    mov r12, rax               ; connection*
+    mov [r12 + linnea_connection.fd], r15d
+    mov [r12 + linnea_connection.server], r13d
+    mov qword [r12 + linnea_connection.sni_vhost], 0
+    mov edi, r15d
+    lea rsi, [r12 + linnea_connection.peer]
+    call linnea_network_peer_format
+    mov [r12 + linnea_connection.peer_len], rax
+    ; the source address alone (no port), and how many connections it already
+    ; holds. Without this one host can take the whole pool with perfectly
+    ; well-formed traffic and everyone else is refused.
+    mov edi, [r12 + linnea_connection.fd]
+    lea rsi, [r12 + linnea_connection.peer_ip]
+    call linnea_network_peer_addr
+    mov [r12 + linnea_connection.peer_ip_len], rax
+    test rax, rax
+    jz .su_counted         ; address unreadable: nothing to count it against
+    lea rdi, [r12 + linnea_connection.peer_ip]
+    mov rsi, rax
+    call linnea_connection_count_ip    ; this connection is already among them
+    cmp rax, [max_per_ip]
+    jbe .su_counted
+    ; over the cap: hand the slot back and drop the connection without a log
+    ; line — logging every refusal would turn a flood into disk exhaustion
+    mov rdi, r12
+    call linnea_connection_free
+    mov edi, r15d
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    jmp .su_done
+.su_counted:
+    ; the head clock starts now: it covers the TLS handshake and the first
+    ; request head, and is rearmed per head below
+    call linnea_uring_now
+    mov [r12 + linnea_connection.req_start], rax
+    mov rdi, r12
+    call linnea_uring_log_accept
+    ; TLS listeners begin a userspace handshake before any HTTP; its state
+    ; overlays up_buf (no proxying can be active yet). The accepting server
+    ; is the listener owner; its cert is the default until the ClientHello
+    ; names a vhost and the SNI hook below picks that vhost's cert instead.
+    mov eax, [r12 + linnea_connection.server]
+    imul rax, rax, linnea_config_server_size
+    lea rax, [rbx + rax + linnea_config.servers]
+    cmp dword [rax + linnea_config_server.tls], 0
+    je .su_recv
+    lea rdi, [r12 + linnea_connection.up_buf]
+    mov rsi, [rax + linnea_config_server.cert_list]
+    mov rdx, [rax + linnea_config_server.cert_list_len]
+    mov rcx, [rax + linnea_config_server.key_priv]
+    xor r8d, r8d
+    call linnea_tls_hs_init
+    lea rax, [linnea_uring_sni_select]
+    mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_cb], rax
+    mov [r12 + linnea_connection.up_buf + linnea_tls_hs.select_ctx], r12
+    ; Offer h2 in ALPN whenever it is enabled: since Q86 a proxy location is
+    ; served over h2 too (each stream runs its own HTTP/1.1 upstream
+    ; exchange), so a proxy vhost no longer has to stay on HTTP/1.1. A
+    ; WebSocket upgrade still arrives on its own h1 connection, because we do
+    ; not advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441).
+    mov eax, [rbx + linnea_config.http2]
+    mov [r12 + linnea_connection.up_buf + linnea_tls_hs.alpn_h2_ok], eax
+    mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_HS
+.su_recv:
+    mov rdi, r12
+    call linnea_uring_arm_recv
+    call linnea_uring_submit_now
+    jmp .su_done
+.su_full:
+    mov edi, r15d
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    ; warn once per spell of fullness, not once per refused connection
+    cmp dword [conn_full_warned], 0
+    jne .su_done
+    mov dword [conn_full_warned], 1
+    lea rdi, [warn_full]
+    mov esi, warn_full_len
+    call linnea_print_stderr
+.su_done:
+    add rsp, 8
+    pop rbx
+    pop r12
+    ret
+
 
 ; linnea_uring_arm_accept(rdi=server index)
 ; Queue a multishot accept for the server's listener. Caller submits.

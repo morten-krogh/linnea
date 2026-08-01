@@ -16,6 +16,8 @@ LINNEA_SYS_RT_SIGRETURN equ 15
 LINNEA_SYS_PAUSE     equ 34
 LINNEA_SYS_FCNTL     equ 72
 LINNEA_F_SETFD       equ 2       ; fcntl: set the fd flags (FD_CLOEXEC is bit 0)
+LINNEA_F_SETFL       equ 4       ; fcntl: set the file status flags
+LINNEA_O_NONBLOCK    equ 0o4000  ; ...of which this is the one we ever set
 LINNEA_SYS_EXECVE    equ 59
 LINNEA_SYS_KILL      equ 62
 LINNEA_SYS_ACCEPT    equ 43
