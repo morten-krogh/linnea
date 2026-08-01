@@ -973,9 +973,15 @@ check_http() {
 }
 
 # raw_http <request> — send bytes, print the full response.
-# printf %b keeps literal '%' in the request while expanding \r\n.
+# The request carries literal \r\n escapes; raw_http.py expands them.
 raw_http() {
-    timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/47080; printf %b '$1' >&3; cat <&3"
+    # See test/raw_http.py: the bash /dev/tcp one-liner this replaces gave the
+    # connect, the write and the read a single two-second budget, and `cat` only
+    # ever escaped a keep-alive response by being killed at the deadline. Under
+    # load the deadline beat the response and the test saw an empty string with
+    # its stderr discarded — a flake that cost this suite a different test on
+    # three separate runs and reproduced on none of them in isolation.
+    python3 test/raw_http.py "$1"
 }
 
 # --- log file ---
