@@ -253,8 +253,6 @@ linnea_h2_handle:
     mov eax, [rsi + 9]
     bswap eax
     and eax, 0x7fffffff              ; 31-bit increment (top bit reserved)
-    test eax, eax
-    jz .goaway_close
     movzx edx, byte [rsi + 5]        ; target stream id
     and edx, 0x7f
     shl edx, 8
@@ -266,6 +264,16 @@ linnea_h2_handle:
     shl edx, 8
     movzx ecx, byte [rsi + 8]
     or edx, ecx
+    ; RFC 9113 6.9: an increment of 0 is a STREAM error of type PROTOCOL_ERROR;
+    ; only one on the connection window is a connection error. The zero test
+    ; used to run before the id was even parsed, so a single misbehaving stream
+    ; took down every concurrent stream sharing the connection.
+    test eax, eax
+    jnz .f_window_nonzero
+    test edx, edx
+    jz .goaway_close                 ; on the connection window: 6.9 says fatal
+    jmp .f_window_rst                ; on a stream: reset that stream alone
+.f_window_nonzero:
     test edx, edx
     jnz .f_window_stream
     ; RFC 9113 6.9.1: a flow-control window may not exceed 2^31-1. The spec
@@ -279,6 +287,29 @@ linnea_h2_handle:
     cmp rcx, 0x7fffffff
     jg .goaway_flow_control          ; RFC 9113 6.9.1: window past 2^31-1
     mov [rbx + linnea_connection.h2_cwnd], rcx
+    jmp .f_ignore
+.f_window_rst:
+    ; RST_STREAM(PROTOCOL_ERROR) for the offending stream, then straight on to
+    ; the next frame. The 13 bytes fit inside the 32 the loop reserves at the
+    ; top of every iteration, so this cannot run past out_buf however many bad
+    ; WINDOW_UPDATEs arrive.
+    mov byte [r13], 0
+    mov byte [r13 + 1], 0
+    mov byte [r13 + 2], 4
+    mov byte [r13 + 3], LINNEA_H2_FT_RST_STREAM
+    mov byte [r13 + 4], 0
+    mov ecx, edx
+    shr ecx, 24
+    mov [r13 + 5], cl
+    mov ecx, edx
+    shr ecx, 16
+    mov [r13 + 6], cl
+    mov ecx, edx
+    shr ecx, 8
+    mov [r13 + 7], cl
+    mov [r13 + 8], dl
+    mov dword [r13 + 9], LINNEA_H2_PROTOCOL_ERROR << 24   ; big-endian
+    add r13, 13
     jmp .f_ignore
 .f_window_stream:
     push rax                         ; increment

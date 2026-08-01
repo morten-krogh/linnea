@@ -116,7 +116,61 @@ CASES = [
      fr(FT_RST, 0, 0, struct.pack(">I", PROTOCOL_ERROR)), PROTOCOL_ERROR),
 ]
 
+
+def stream_error(payload, budget=3.0):
+    """Send payload; return ("rst", code) or ("goaway", code) — whichever comes."""
+    s = connect()
+    try:
+        s.sendall(payload)
+    except OSError:
+        pass
+    s.settimeout(budget)
+    buf = b""
+    try:
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= 9:
+                ln = int.from_bytes(buf[:3], "big")
+                if len(buf) < 9 + ln:
+                    break
+                ftype, body = buf[3], buf[9:9 + ln]
+                buf = buf[9 + ln:]
+                if ftype == FT_RST and len(body) >= 4:
+                    s.close()
+                    return "rst", int.from_bytes(body[:4], "big")
+                if ftype == FT_GOAWAY and len(body) >= 8:
+                    s.close()
+                    return "goaway", int.from_bytes(body[4:8], "big")
+    except (socket.timeout, OSError):
+        pass
+    s.close()
+    return None, None
+
+
 fails = 0
+
+# RFC 9113 6.9: a zero increment is a STREAM error; only one on the connection
+# window is a connection error. Getting this wrong means one misbehaving stream
+# destroys every concurrent stream on the connection.
+kind, code = stream_error(fr(FT_WINDOW, 0, 1, struct.pack(">I", 0)))
+if kind == "rst" and code == PROTOCOL_ERROR:
+    print("ok   a zero WINDOW_UPDATE on a stream resets that stream")
+else:
+    print(f"FAIL a zero WINDOW_UPDATE on a stream gave {kind} "
+          f"{NAMES.get(code, code)}, want rst PROTOCOL_ERROR")
+    fails += 1
+
+kind, code = stream_error(fr(FT_WINDOW, 0, 0, struct.pack(">I", 0)))
+if kind == "goaway" and code == PROTOCOL_ERROR:
+    print("ok   ...and on the connection window it is still fatal")
+else:
+    print(f"FAIL a zero WINDOW_UPDATE on stream 0 gave {kind} "
+          f"{NAMES.get(code, code)}, want goaway PROTOCOL_ERROR")
+    fails += 1
+
 for name, payload, want in CASES:
     got = goaway_code(payload)
     if got == want:
