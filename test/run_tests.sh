@@ -1895,9 +1895,16 @@ for i in $(seq 1 60); do
     # runs, two of them under CPU load, zero refusals), so the next red run
     # should say whether the server refused (curl 7) or the client simply ran
     # out of its 3s patience on a loaded box (curl 28).
-    if ! curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null; then
+    #
+    # Take curl's status into up_rc on the very next line. Reading $? inside
+    # the `if` body gets the status of the counter assignment -- which is
+    # always 0 -- so this diagnostic used to record "curl0" for every failure
+    # and answer none of the question it was added to answer.
+    curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null
+    up_rc=$?
+    if [ $up_rc -ne 0 ]; then
         up_fails=$((up_fails + 1))
-        up_why="$up_why $i:curl$?"
+        up_why="$up_why $i:curl$up_rc"
     fi
     sleep 0.03
 done
@@ -1976,7 +1983,16 @@ if [ -x "$TLSBIN" ] && command -v openssl >/dev/null 2>&1; then
         # message_hash || HRR || Truncate(ClientHello2); hashing ClientHello2 on
         # its own fails it silently, and since such a client is retried on every
         # connection it would never resume at all.
-        printf 'x' | timeout 8 openssl s_client -connect 127.0.0.1:$tport \
+        #
+        # Hold stdin open past the handshake: s_client exits the moment stdin
+        # hits EOF, and if NewSessionTicket has not landed by then -sess_out
+        # writes NO FILE AT ALL and the resume below cannot succeed. That is a
+        # race in the test, not the server -- it cost this check about 1 run in
+        # 13, and a no-retry control flaked at the same rate, so it never had
+        # anything to do with the retry. -ign_eof also fixes it but waits out
+        # the full 8s timeout, since the echo server closes only when we do.
+        { printf 'x'; sleep 0.5; } | timeout 8 openssl s_client \
+              -connect 127.0.0.1:$tport \
               -CAfile "$tlsdir/c.pem" -groups P-256:X25519 -tls1_3 \
               -sess_out "$tlsdir/s.pem" >/dev/null 2>&1
         printf 'x' | timeout 8 openssl s_client -connect 127.0.0.1:$tport \
