@@ -778,11 +778,19 @@ linnea_uring_run:
 
 ; --- accept completion: r13 = server index, r15d = connection fd ------
 .on_accept:
-    cmp dword [drain_flag], 0
-    jnz .accept_drain
     test r15d, r15d
-    js .accept_err
+    js .accept_failed
+    ; A connection the kernel has ALREADY handed us is an open connection, and
+    ; a drain finishes open connections — so serve it. Refusing it (close on an
+    ; accepted fd, which the peer sees as a reset) is what made the hot upgrade
+    ; drop about one request in ten right at the handover: multishot accept
+    ; keeps completing into the CQ ring, and every completion that landed after
+    ; the drain flag went up was thrown away. The only difference from a normal
+    ; accept is that we never re-arm afterwards; see .accept_rearm.
+    cmp dword [drain_flag], 0
+    jnz .accept_alloc
     mov dword [accept_err_streak], 0   ; accepting again: end any backoff
+.accept_alloc:
     call linnea_connection_alloc
     test rax, rax
     jz .conn_limit
@@ -856,21 +864,22 @@ linnea_uring_run:
     call linnea_uring_arm_recv
     call linnea_uring_submit_now
 .accept_rearm:
+    cmp dword [drain_flag], 0
+    jnz .accept_drain_tail     ; draining: serve what we took, but take no more
     test r14d, LINNEA_IORING_CQE_F_MORE
     jnz .wait
     mov rdi, r13               ; kernel disarmed the multishot: re-arm
     call linnea_uring_arm_accept
     call linnea_uring_submit_now
     jmp .wait
-.accept_drain:
-    ; draining: refuse a raced-in connection, and once this accept is
-    ; finished (the cancel's -ECANCELED, or any final completion) close
-    ; our copy of the listening socket instead of re-arming
-    test r15d, r15d
-    js .accept_drain_done
-    mov edi, r15d
-    mov eax, LINNEA_SYS_CLOSE
-    syscall
+.accept_failed:
+    ; during a drain a negative result is the cancel's -ECANCELED, which is how
+    ; the accept ends; outside one it is a real accept error
+    cmp dword [drain_flag], 0
+    je .accept_err
+.accept_drain_tail:
+    ; once this accept is finished (the cancel's -ECANCELED, or any final
+    ; completion) close our copy of the listening socket instead of re-arming
     test r14d, LINNEA_IORING_CQE_F_MORE
     jnz .wait                  ; multishot still armed; the cancel ends it
 .accept_drain_done:
