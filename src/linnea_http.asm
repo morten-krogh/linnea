@@ -109,6 +109,7 @@ extern linnea_time_http_now
 ; linnea_static.asm so the h3 test binaries link without this file's deps
 extern linnea_http_ae_accepts
 extern linnea_http_inm_match
+extern linnea_http_etag_match
 extern linnea_http_ifrange_match
 extern linnea_http_range_parse
 extern linnea_log_write
@@ -200,6 +201,8 @@ hdr_301_tail:   db 13, 10, "Content-Length: 0", 13, 10
 hdr_301_tail_len equ $ - hdr_301_tail
 status_206:     db "HTTP/1.1 206 Partial Content", 13, 10, "Content-Type: "
 status_206_len  equ $ - status_206
+status_412:     db "HTTP/1.1 412 Precondition Failed"
+status_412_len  equ $ - status_412
 status_304:     db "HTTP/1.1 304 Not Modified"
 status_304_len  equ $ - status_304
 status_416:     db "HTTP/1.1 416 Range Not Satisfiable", 13, 10
@@ -305,6 +308,8 @@ hn_accept_enc:  db "accept-encoding"
 hn_upgrade:     db "upgrade"       ; the header name and the Connection token
 hn_range:       db "range"
 hn_if_range:    db "if-range"
+hn_if_match:    db "if-match"
+hn_if_unmod:    db "if-unmodified-since"
 ; Fields that are hop-by-hop in themselves, whatever Connection says. RFC 9110
 ; 7.6.1 makes an intermediary drop the fields a Connection value NAMES — that is
 ; http_conn_option_named — but these are connection-specific on their own and
@@ -531,6 +536,8 @@ section .text
 ;   [rsp+272] body offset   [rsp+280] body length (the whole file, or the
 ;             satisfiable range of a 206)
 ;   [rsp+296] Host field lines seen (RFC 9112 3.2 wants exactly one)
+;   [rsp+312] If-Match ptr (0 = absent)          [rsp+320] its len
+;   [rsp+328] If-Unmodified-Since ptr (0 = absent) [rsp+336] its len
 ;   [rsp+304] asterisk-form: the target was "*", so the request is about the
 ;             server itself rather than any resource (OPTIONS *)
 
@@ -682,7 +689,7 @@ linnea_http_handle:
     push r13
     push r14
     push r15
-    sub rsp, 320
+    sub rsp, 352               ; +32 for the two precondition fields
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -815,6 +822,8 @@ linnea_http_handle:
     ; accept, and asterisk-form is how OPTIONS asks about the server itself.
     ; Both are recognised here, before the target is used for anything.
     mov qword [rsp + 304], 0   ; not an OPTIONS * request
+    mov qword [rsp + 312], 0   ; If-Match absent
+    mov qword [rsp + 328], 0   ; If-Unmodified-Since absent
     mov rax, [rsp + 8]
     cmp qword [rsp + 16], 1
     jne .not_asterisk
@@ -1059,6 +1068,20 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jnz .ifr_header
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_if_match]
+    mov ecx, 8
+    call linnea_string_iequal
+    test eax, eax
+    jnz .ifm_header
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
+    lea rdx, [hn_if_unmod]
+    mov ecx, 19
+    call linnea_string_iequal
+    test eax, eax
+    jnz .ius_header
 .try_host:
     ; Host? Counted, not just captured: a second Host field line is a request
     ; smuggling primitive (an intermediary may route on the other one), so
@@ -1077,6 +1100,22 @@ linnea_http_handle:
     mov [rsp + 88], rax
     mov rax, [rsp + 80]
     mov [rsp + 96], rax
+    jmp .header_next
+.ifm_header:                   ; first occurrence wins, as for Host
+    cmp qword [rsp + 312], 0
+    jne .header_next
+    mov rax, [rsp + 72]
+    mov [rsp + 312], rax
+    mov rax, [rsp + 80]
+    mov [rsp + 320], rax
+    jmp .header_next
+.ius_header:
+    cmp qword [rsp + 328], 0
+    jne .header_next
+    mov rax, [rsp + 72]
+    mov [rsp + 328], rax
+    mov rax, [rsp + 80]
+    mov [rsp + 336], rax
     jmp .header_next
 .inm_header:                   ; first occurrence wins, as for Host
     cmp qword [rsp + 176], 0
@@ -1637,6 +1676,35 @@ linnea_http_handle:
     lea rsi, [date_buf]
     call linnea_time_http_date
     ; --- conditional request: If-None-Match wins over If-Modified-Since -
+    ; RFC 9110 13.2.2 evaluates the preconditions in order, and If-Match comes
+    ; first: it asks "only if the representation is still the one I hold", so a
+    ; mismatch is 412 and nothing further is considered. If-Unmodified-Since is
+    ; the same question asked with a date, and is consulted only when If-Match
+    ; is absent. Neither was read at all — a conditional PUT-style request was
+    ; answered as though it carried no condition, which is exactly the lost
+    ; update the fields exist to prevent.
+    cmp qword [rsp + 312], 0
+    je .check_ius
+    mov rdi, [rsp + 312]
+    mov rsi, [rsp + 320]
+    lea rdx, [etag_buf]
+    mov rcx, [etag_len]
+    mov r8d, 1                 ; If-Match compares strongly (13.1.1)
+    call linnea_http_etag_match
+    test eax, eax
+    jz .resp_412
+    jmp .check_inm             ; If-Match present: If-Unmodified-Since is skipped
+.check_ius:
+    cmp qword [rsp + 328], 0
+    je .check_inm
+    mov rdi, [rsp + 328]
+    mov rsi, [rsp + 336]
+    call linnea_time_parse_http_date
+    cmp rax, -1
+    je .check_inm              ; unparseable: ignored, as for the other dates
+    cmp [statbuf + LINNEA_STAT_ST_MTIME], rax
+    ja .resp_412               ; modified since: the client's assumption is stale
+.check_inm:
     cmp qword [rsp + 176], 0
     je .check_ims
     mov rdi, [rsp + 176]
@@ -1971,6 +2039,44 @@ linnea_http_handle:
     mov [rbx + linnea_connection.out_rem], rcx
     mov qword [rsp + 112], 304
     mov qword [rsp + 32], 0    ; a 304 carries no body
+    jmp .log_request
+
+; --- 412: a precondition the client set was not met --------------------
+; Modelled on the 304 above: the file is closed unread, the connection is
+; kept, and no body is sent. RFC 9110 15.5.13 wants the validators too — a
+; client that guessed wrong should be able to see what the current
+; representation actually is without a second round trip.
+.resp_412:
+    mov rdi, [rsp + 56]        ; the file is not going to be read
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    mov rax, [rsp + 24]
+    mov [rbx + linnea_connection.keep_alive], rax
+    mov qword [rbx + linnea_connection.file_rem], 0
+    lea r15, [rbx + linnea_connection.out_buf]
+    lea rdi, [status_412]
+    mov esi, status_412_len
+    call .append
+    call .append_validators
+    mov rdi, [rsp + 120]       ; the serving vhost
+    call .append_server_date
+    cmp qword [rsp + 24], 0
+    je .conn_close_412
+    lea rdi, [hdr_keepalive]
+    mov esi, hdr_keepalive_len
+    jmp .conn_hdr_412
+.conn_close_412:
+    lea rdi, [hdr_close]
+    mov esi, hdr_close_len
+.conn_hdr_412:
+    call .append
+    lea rax, [rbx + linnea_connection.out_buf]
+    mov [rbx + linnea_connection.out_ptr], rax
+    mov rcx, r15
+    sub rcx, rax
+    mov [rbx + linnea_connection.out_rem], rcx
+    mov qword [rsp + 112], 412
+    mov qword [rsp + 32], 0    ; no body
     jmp .log_request
 
 ; --- 416: the range misses the file entirely ---------------------------
@@ -2379,7 +2485,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 320
+    add rsp, 352
     pop r15
     pop r14
     pop r13

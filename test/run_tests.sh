@@ -1543,6 +1543,13 @@ check "proxy adds Via to the request and the response" $?
 timeout 60 python3 test/tls/http_date_formats.py 47080 >/dev/null 2>&1
 check "all three HTTP-date formats are accepted" $?
 
+# RFC 9110 13.1.1 / 13.1.4: If-Match and If-Unmodified-Since were never read, so
+# a request carrying one was answered as though it had no condition at all —
+# the lost update those fields exist to prevent. 13.2.2 also fixes the order:
+# a failing If-Match is a 412 even when an If-None-Match would have said 304.
+timeout 60 python3 test/tls/preconditions.py 47080 >/dev/null 2>&1
+check "If-Match and If-Unmodified-Since are evaluated" $?
+
 # Chunked request bodies (RFC 9112 7.1 MUST). Any Transfer-Encoding at all used
 # to be 501, so every client that sends a body of unknown length up front was
 # refused: curl -T -, fetch() with a ReadableStream, most libraries handed a

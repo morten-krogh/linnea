@@ -21,6 +21,7 @@ global linnea_static_etag_len
 global linnea_static_lastmod
 global linnea_http_ae_accepts
 global linnea_http_inm_match
+global linnea_http_etag_match
 global linnea_http_ifrange_match
 global linnea_http_range_parse
 
@@ -587,8 +588,17 @@ linnea_http_ae_accepts:
 ; comparison is weak (RFC 9110 13.1.2): the W/ prefix does not affect a
 ; match, so it is simply skipped. The etag we are handed carries its
 ; quotes, and so does each candidate.
+;
+; linnea_http_etag_match takes the same arguments plus r8 = 1 for a STRONG
+; comparison, which is what If-Match wants (13.1.1): a weak candidate can never
+; match, so it is skipped rather than compared. inm_match is that routine with
+; the flag cleared.
 ; Locals: [rsp+0] closing-quote offset (linnea_string_equal clobbers rcx)
+;         [rsp+8] strong flag — a register would not survive the compare, which
+;                 is the same reason the offset above is spilled
 linnea_http_inm_match:
+    xor r8d, r8d               ; weak comparison
+linnea_http_etag_match:
     push rbx
     push r12
     push r13
@@ -599,6 +609,7 @@ linnea_http_inm_match:
     mov r12, rsi               ; value len
     mov r13, rdx               ; our etag
     mov r14, rcx               ; our etag len
+    mov [rsp + 8], r8          ; strong?
     xor r15d, r15d             ; cursor
 .next:
     cmp r15, r12
@@ -618,13 +629,33 @@ linnea_http_inm_match:
     cmp al, '*'
     je .yes                    ; matches any representation, and we have one
     cmp al, 'W'
-    jne .quoted
+    jne .strong_ok
     lea rax, [r15 + 1]
     cmp rax, r12
     jae .no
     cmp byte [rbx + rax], '/'
     jne .no
     add r15, 2
+    ; a weak tag under a strong comparison cannot match anything, but the tags
+    ; after it still can — so step over this one rather than failing the list
+    cmp qword [rsp + 8], 0
+    je .quoted
+    cmp r15, r12
+    jae .no
+    cmp byte [rbx + r15], '"'
+    jne .no
+    lea rcx, [r15 + 1]
+.weak_skip:
+    cmp rcx, r12
+    jae .no
+    cmp byte [rbx + rcx], '"'
+    je .weak_skipped
+    inc rcx
+    jmp .weak_skip
+.weak_skipped:
+    lea r15, [rcx + 1]
+    jmp .next
+.strong_ok:
 .quoted:
     cmp r15, r12
     jae .no
