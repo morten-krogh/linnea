@@ -44,6 +44,7 @@ LINNEA_H2_PROTOCOL_ERROR   equ 1
 LINNEA_H2_INTERNAL_ERROR   equ 2
 LINNEA_H2_FLOW_CONTROL_ERR equ 3
 LINNEA_H2_FRAME_SIZE_ERROR equ 6
+LINNEA_H2_COMPRESSION_ERR  equ 9
 LINNEA_H2_REFUSED_STREAM   equ 7
 LINNEA_H2_ENHANCE_CALM     equ 11
 
@@ -113,7 +114,8 @@ LINNEA_H2_MAX_CONT     equ 16     ; CONTINUATION frames per HEADERS (flood guard
 
 ; h2_build_request outcomes (negative sentinels vs a byte count)
 LINNEA_H2_REQ_MORE   equ -1      ; header block not fully buffered yet
-LINNEA_H2_REQ_ERR    equ -2      ; malformed: connection error, GOAWAY
+LINNEA_H2_REQ_ERR    equ -2      ; connection error; the code to report is
+                                 ; left in h2_goaway_code by the failing site
 
 ; --- proxy-over-h2 (Q86) --------------------------------------------------
 ; A stream routed to a proxy location runs an h1 exchange with the upstream

@@ -2686,6 +2686,12 @@ PY
     check "http2 fuzz (malformed frames + HPACK survive, server serves)" $?
 
     # M20: strict stream-id validation + honouring SETTINGS_INITIAL_WINDOW_SIZE.
+    # A connection error must carry the code RFC 9113 names for it. Every fault
+    # reported PROTOCOL_ERROR, because the reason was never threaded through to
+    # the single site that writes the GOAWAY.
+    timeout 30 python3 test/tls/h2_error_codes.py $CA 47446 >/dev/null 2>&1
+    check "http2 connection errors carry the RFC's code" $?
+
     timeout 20 python3 test/tls/h2_conformance.py $CA 47446 >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
 

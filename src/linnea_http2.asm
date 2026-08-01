@@ -211,7 +211,7 @@ linnea_h2_handle:
     movzx ecx, byte [rsi + 2]
     or eax, ecx
     cmp eax, LINNEA_CONN_IN_BUF - 9  ; frame we could never buffer
-    ja .goaway_close
+    ja .goaway_frame_size            ; RFC 9113 4.2: over the frame size limit
     lea rcx, [rax + 9]               ; whole frame size
     mov rdx, r14
     sub rdx, r12
@@ -248,7 +248,7 @@ linnea_h2_handle:
     ; WINDOW_UPDATE: grow the connection window (stream 0) or a streaming
     ; response's window. A zero increment is a protocol error.
     cmp r11, 13                      ; exactly 4 payload bytes (RFC 9113 6.9);
-    jne .goaway_close                ; else the read below runs past the frame
+    jne .goaway_frame_size           ; else the read below runs past the frame
     mov eax, [rsi + 9]
     bswap eax
     and eax, 0x7fffffff              ; 31-bit increment (top bit reserved)
@@ -276,7 +276,7 @@ linnea_h2_handle:
     mov rcx, [rbx + linnea_connection.h2_cwnd]
     add rcx, rax
     cmp rcx, 0x7fffffff
-    jg .goaway_close
+    jg .goaway_flow_control          ; RFC 9113 6.9.1: window past 2^31-1
     mov [rbx + linnea_connection.h2_cwnd], rcx
     jmp .f_ignore
 .f_window_stream:
@@ -290,7 +290,8 @@ linnea_h2_handle:
     mov rdx, [rax + linnea_h2_stream.swnd]
     add rdx, rcx
     cmp rdx, 0x7fffffff
-    jg .goaway_close
+    jg .goaway_flow_control          ; 6.9.1 allows ending the connection for
+                                     ; this, so long as the code says why
     mov [rax + linnea_h2_stream.swnd], rdx
     jmp .f_ignore
 .f_rst:
@@ -303,7 +304,8 @@ linnea_h2_handle:
     shr rax, 3                       ; done_count / 8
     add rax, LINNEA_H2_RST_LIMIT
     cmp [rbx + linnea_connection.h2_rst_count], rax
-    ja .goaway_close
+    ja .goaway_calm                  ; RFC 9113 7: ENHANCE_YOUR_CALM is exactly
+                                     ; "you are generating excessive load"
     movzx edx, byte [rsi + 5]
     and edx, 0x7f
     shl edx, 8
@@ -361,7 +363,8 @@ linnea_h2_handle:
     cmp rax, LINNEA_H2_REQ_MORE
     je .flush                        ; block not fully buffered: return MORE
     cmp rax, LINNEA_H2_REQ_ERR
-    je .goaway_close
+    je .goaway_emit                  ; h2_build_request left the code in
+                                     ; h2_goaway_code: do not overwrite it
     add r12, rax                     ; consume the whole HEADERS(+CONT) run
     add r13, rdx                     ; response bytes appended at the cursor
     jmp .frames
@@ -393,7 +396,8 @@ linnea_h2_handle:
     test r10b, LINNEA_H2_FLAG_PADDED
     jz .fd_nopad
     test eax, eax
-    jz .goaway_close                 ; PADDED but empty payload
+    jz .goaway_frame_size            ; PADDED but no room for the pad length:
+                                     ; RFC 9113 4.2, too small for mandatory data
     movzx r8d, byte [rcx]
     inc rcx
     dec eax
@@ -506,7 +510,7 @@ linnea_h2_handle:
     sub rdx, rax
     jz .set_done
     cmp rdx, 6
-    jb .goaway_close                 ; FRAME_SIZE_ERROR: partial entry
+    jb .goaway_frame_size            ; RFC 9113 6.5: not a multiple of 6
     movzx edx, byte [rax]            ; setting id (16-bit)
     shl edx, 8
     movzx r8d, byte [rax + 1]
@@ -524,7 +528,7 @@ linnea_h2_handle:
     movzx edx, byte [rax + 5]
     or r8d, edx
     cmp r8d, 0x7fffffff
-    ja .goaway_close                 ; FLOW_CONTROL_ERROR: window too large
+    ja .goaway_flow_control          ; RFC 9113 6.5.2: above 2^31-1
     push rax
     push rcx
     mov rdi, rbx
@@ -544,12 +548,12 @@ linnea_h2_handle:
     jmp .frames
 .f_settings_ack:
     cmp r11, 9                       ; a SETTINGS ACK must carry no payload
-    jne .goaway_close                ; FRAME_SIZE_ERROR
+    jne .goaway_frame_size           ; RFC 9113 6.5
     add r12, r11
     jmp .frames
 .f_ping:
     cmp r11, 17                      ; PING carries exactly 8 bytes (RFC 9113 6.7);
-    jne .goaway_close                ; else the echo below reads past the frame and
+    jne .goaway_frame_size           ; else the echo below reads past the frame and
                                      ; returns 8 stale in_buf bytes to the peer
     test r10b, LINNEA_H2_FLAG_ACK
     jnz .f_ignore
@@ -567,15 +571,32 @@ linnea_h2_handle:
 .f_goaway:
     add r12, r11
     jmp .close                       ; peer is going away
+; Typed entries to the GOAWAY below. RFC 9113 names a specific code for most of
+; these faults, and every one of them used to arrive here as PROTOCOL_ERROR
+; because the reason was not threaded through. It matters on the wire: a peer
+; that reads FRAME_SIZE_ERROR knows its framing is wrong, where PROTOCOL_ERROR
+; sends it looking at its request semantics.
+.goaway_frame_size:
+    mov dword [h2_goaway_code], LINNEA_H2_FRAME_SIZE_ERROR
+    jmp .goaway_emit
+.goaway_flow_control:
+    mov dword [h2_goaway_code], LINNEA_H2_FLOW_CONTROL_ERR
+    jmp .goaway_emit
+.goaway_compression:
+    mov dword [h2_goaway_code], LINNEA_H2_COMPRESSION_ERR
+    jmp .goaway_emit
+.goaway_calm:
+    mov dword [h2_goaway_code], LINNEA_H2_ENHANCE_CALM
+    jmp .goaway_emit
 .goaway_close:
     ; Queue GOAWAY and close once it is sent. Every jump here is a protocol
     ; fault, so the code must not be NO_ERROR: a conforming peer reads that as
     ; a graceful shutdown, retries the offending request on a fresh connection
     ; and — since the fault is deterministic — never stops. It also left real
     ; faults indistinguishable from an orderly close in a capture.
-    ; PROTOCOL_ERROR for all of them: more specific codes (COMPRESSION_ERROR,
-    ; FRAME_SIZE_ERROR, FLOW_CONTROL_ERROR) would need the reason threaded
-    ; through each of the sites that jump here.
+    ; This is the PROTOCOL_ERROR entry; the typed ones are above.
+    mov dword [h2_goaway_code], LINNEA_H2_PROTOCOL_ERROR
+.goaway_emit:
     mov byte [r13], 0
     mov byte [r13 + 1], 0
     mov byte [r13 + 2], 8
@@ -601,7 +622,9 @@ linnea_h2_handle:
     shr rcx, 8
     mov [r13 + 11], cl
     mov [r13 + 12], dl
-    mov dword [r13 + 13], LINNEA_H2_PROTOCOL_ERROR << 24   ; big-endian
+    mov ecx, [h2_goaway_code]
+    bswap ecx
+    mov [r13 + 13], ecx              ; error code, big-endian
     add r13, 17
     mov qword [rbx + linnea_connection.h2_state], LINNEA_H2_CLOSING
 
@@ -721,7 +744,7 @@ h2_build_request:
     cmp rax, rdx
     jb .more                         ; wait for the rest of the frame
     cmp ecx, LINNEA_CONN_IN_BUF - 9
-    ja .err
+    ja .err_size                     ; RFC 9113 4.2: over the frame size limit
     movzx r9d, byte [r12 + 3]        ; type
     movzx r10d, byte [r12 + 4]       ; flags
     cmp qword [rsp + L_CONT], 0
@@ -750,7 +773,8 @@ h2_build_request:
     test r10b, LINNEA_H2_FLAG_PADDED
     jz .no_pad
     test r11d, r11d
-    jz .err
+    jz .err_size                     ; PADDED with no room for the pad length:
+                                     ; RFC 9113 4.2, too small for mandatory data
     movzx edx, byte [rsi]            ; pad length
     inc rsi
     dec r11d
@@ -760,7 +784,7 @@ h2_build_request:
     test r10b, LINNEA_H2_FLAG_PRIORITY
     jz .append
     cmp r11d, 5
-    jb .err
+    jb .err_size                     ; PRIORITY set but no room for its 5 bytes
     add rsi, 5                       ; skip the priority fields
     sub r11d, 5
     jmp .append
@@ -803,7 +827,8 @@ h2_build_request:
     test r10b, LINNEA_H2_FLAG_END_HEADERS
     jnz .assembled
     cmp qword [rsp + L_CONT], LINNEA_H2_MAX_CONT
-    ja .err                          ; CONTINUATION flood
+    ja .err_calm                     ; CONTINUATION flood — RFC 9113 7:
+                                     ; ENHANCE_YOUR_CALM is the load signal
     jmp .frame_loop
 
 .block_big:
@@ -951,7 +976,8 @@ h2_build_request:
     ; conforming block that is simply too big: answer the stream. Everything
     ; else is real HPACK rot and stays a connection error.
     cmp rax, -LINNEA_HPACK_ERR_LIMIT
-    jne .err
+    jne .err_comp                    ; real HPACK rot: RFC 9113 4.3 names
+                                     ; COMPRESSION_ERROR for a decoding failure
 .malformed_stream:
     ; RFC 9113 8.1.1: a malformed request is a stream error. The connection
     ; and its HPACK state are fine, so every other stream carries on. The id
@@ -989,7 +1015,22 @@ h2_build_request:
 .more:
     mov rax, LINNEA_H2_REQ_MORE
     jmp .ret
+; The reason travels in h2_goaway_code rather than in rax: the caller has one
+; error return to check, and each site here names the code RFC 9113 gives it.
 .err:
+    mov dword [h2_goaway_code], LINNEA_H2_PROTOCOL_ERROR
+    mov rax, LINNEA_H2_REQ_ERR
+    jmp .ret
+.err_size:
+    mov dword [h2_goaway_code], LINNEA_H2_FRAME_SIZE_ERROR
+    mov rax, LINNEA_H2_REQ_ERR
+    jmp .ret
+.err_calm:
+    mov dword [h2_goaway_code], LINNEA_H2_ENHANCE_CALM
+    mov rax, LINNEA_H2_REQ_ERR
+    jmp .ret
+.err_comp:
+    mov dword [h2_goaway_code], LINNEA_H2_COMPRESSION_ERR
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
     add rsp, 392
@@ -4750,6 +4791,7 @@ body_405_len equ $ - body_405
 
 section .bss
 h2_path_buf:  resb LINNEA_HTTP2_PATH_BUF
+h2_goaway_code: resd 1                ; the code the GOAWAY below reports
 h2_err_conn:  resq 1                  ; the connection an inline error is answering
 h2_err_blen:  resq 1                  ; its body length after the flow-control check
 h2_numbuf:    resb 24
