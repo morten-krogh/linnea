@@ -41,6 +41,7 @@ extern linnea_static_mtime
 extern linnea_static_etag
 extern linnea_static_etag_len
 extern linnea_http_inm_match
+extern linnea_http_etag_match
 extern linnea_http_range_parse
 extern linnea_http_ifrange_match
 extern linnea_time_parse_http_date
@@ -316,8 +317,18 @@ linnea_h3_build_headers:
     ; rdx = ct_ptr, rcx = ct_len already
     lea r8, [clen_buf]
     mov r9, rbp
-    cmp r15d, 304                    ; a 304 restates only the validators, not
-    jne .enc                         ; the representation's type or length
+    ; A 304 restates only the validators, not the representation's type or
+    ; length — and a 412 is the same shape: bodiless, and about the condition
+    ; rather than the resource. Both call sites leave rdx/rcx unset because of
+    ; this, so a status that reaches .enc without them carries a garbage
+    ; content-type pointer into the encoder. That killed the worker the first
+    ; time 412 was added here, right after the access line had already logged
+    ; the response as served.
+    cmp r15d, 304
+    je .no_repr
+    cmp r15d, 412
+    jne .enc
+.no_repr:
     xor edx, edx
     xor r8d, r8d
 .enc:
@@ -526,6 +537,32 @@ linnea_h3_serve:
     mov rsi, rbp
     call linnea_static_validators
     mov qword [linnea_qpack_send_validators], 1
+    ; If-Match first, then If-Unmodified-Since when it is absent (13.2.2); a
+    ; failure is 412 and beats an If-None-Match that would have said 304. Same
+    ; evaluation as h1 (Q187) and h2, so the answer no longer depends on which
+    ; protocol carried the request.
+    mov rdi, [rbx + linnea_h2_req.ifm_ptr]
+    test rdi, rdi
+    jz .chk_ius
+    mov rsi, [rbx + linnea_h2_req.ifm_len]
+    lea rdx, [linnea_static_etag]
+    mov rcx, [linnea_static_etag_len]
+    mov r8d, 1                       ; If-Match compares strongly (13.1.1)
+    call linnea_http_etag_match
+    test eax, eax
+    jz .h3_412
+    jmp .chk_inm
+.chk_ius:
+    mov rdi, [rbx + linnea_h2_req.ius_ptr]
+    test rdi, rdi
+    jz .chk_inm
+    mov rsi, [rbx + linnea_h2_req.ius_len]
+    call linnea_time_parse_http_date
+    cmp rax, -1
+    je .chk_inm                      ; unparseable: ignored, as elsewhere
+    cmp [linnea_static_mtime], rax
+    ja .h3_412
+.chk_inm:
     mov rdi, [rbx + linnea_h2_req.inm_ptr]
     test rdi, rdi
     jz .chk_ims
@@ -726,6 +763,23 @@ linnea_h3_serve:
     mov rdi, r12                     ; out
     mov esi, 304
     xor r8d, r8d                     ; no content-length (none is encoded)
+    call linnea_h3_build_headers     ; rax = response length (headers only)
+    jmp .sret
+
+.h3_412:
+    ; a precondition the client set is not met: unmap and answer a bodiless
+    ; 412. The validators stay on (15.5.13) so a client that guessed wrong can
+    ; see what the representation actually is.
+    cmp r15, 1
+    jbe .h3_412_nomap                ; empty-file sentinel: nothing was mapped
+    mov rdi, r15
+    mov rsi, rbp
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+.h3_412_nomap:
+    mov rdi, r12                     ; out
+    mov esi, 412
+    xor r8d, r8d                     ; no content-length
     call linnea_h3_build_headers     ; rax = response length (headers only)
     jmp .sret
 

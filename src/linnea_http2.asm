@@ -44,6 +44,7 @@ extern linnea_static_etag
 extern linnea_static_etag_len
 extern linnea_static_lastmod
 extern linnea_http_inm_match
+extern linnea_http_etag_match
 extern linnea_http_range_parse
 extern linnea_http_ifrange_match
 extern linnea_time_parse_http_date
@@ -1247,6 +1248,33 @@ h2_serve:
     mov rdi, [linnea_static_mtime]
     mov rsi, rdx
     call linnea_static_validators
+    ; If-Match first, then If-Unmodified-Since when it is absent (13.2.2). A
+    ; failure is 412 and ends the evaluation — in particular it beats an
+    ; If-None-Match that would otherwise have produced a 304. h1 got this in
+    ; Q187; without it here the same request gets a different answer depending
+    ; on which protocol carried it.
+    mov rdi, [r12 + linnea_h2_req.ifm_ptr]
+    test rdi, rdi
+    jz .chk_ius
+    mov rsi, [r12 + linnea_h2_req.ifm_len]
+    lea rdx, [linnea_static_etag]
+    mov rcx, [linnea_static_etag_len]
+    mov r8d, 1                       ; If-Match compares strongly (13.1.1)
+    call linnea_http_etag_match
+    test eax, eax
+    jz .h2_412
+    jmp .chk_inm
+.chk_ius:
+    mov rdi, [r12 + linnea_h2_req.ius_ptr]
+    test rdi, rdi
+    jz .chk_inm
+    mov rsi, [r12 + linnea_h2_req.ius_len]
+    call linnea_time_parse_http_date
+    cmp rax, -1
+    je .chk_inm                      ; unparseable: ignored, as elsewhere
+    cmp [linnea_static_mtime], rax
+    ja .h2_412
+.chk_inm:
     mov rdi, [r12 + linnea_h2_req.inm_ptr]
     test rdi, rdi
     jz .chk_ims
@@ -1802,6 +1830,39 @@ h2_serve:
     lea rdx, [h2_ae_name]
     mov ecx, h2_ae_name_len
     call h2_enc_hdr
+    mov rbp, rdi
+    sub rbp, r15                     ; payload length
+    mov r8b, LINNEA_H2_FLAG_END_HEADERS | LINNEA_H2_FLAG_END_STREAM
+    jmp .flags
+
+.h2_412:
+    ; a precondition the client set is not met: unmap and answer a bodiless
+    ; 412 carrying the current validators, so a client that guessed wrong can
+    ; see what the representation actually is (RFC 9110 15.5.13)
+    cmp qword [rsp + S_SIZE], 0
+    je .h2_412_nomap                 ; empty file: sentinel base, nothing mapped
+    mov rdi, [rsp + S_BASE]
+    mov rsi, [rsp + S_SIZE]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+.h2_412_nomap:
+    mov rdi, [rsp + S_OUT]
+    add rdi, 9
+    mov r15, rdi                     ; payload start
+    mov esi, 8                       ; :status
+    lea rdx, [status_412_h2]
+    mov qword [rsp + S_LSTAT], 412
+    mov ecx, 3
+    call h2_enc_hdr
+    mov esi, 34                      ; etag
+    lea rdx, [linnea_static_etag]
+    mov rcx, [linnea_static_etag_len]
+    call h2_enc_hdr
+    mov esi, 44                      ; last-modified
+    lea rdx, [linnea_static_lastmod]
+    mov ecx, LINNEA_HTTP_DATE_LEN
+    call h2_enc_hdr
+    call h2_enc_date_server
     mov rbp, rdi
     sub rbp, r15                     ; payload length
     mov r8b, LINNEA_H2_FLAG_END_HEADERS | LINNEA_H2_FLAG_END_STREAM
@@ -4722,6 +4783,7 @@ index_html_h2:   db "index.html"
 status_200_h2:   db "200"
 status_206_h2:   db "206"
 status_304_h2:   db "304"
+status_412_h2:   db "412"
 status_400_h2:   db "400"
 status_404_h2:   db "404"
 status_405_h2:   db "405"

@@ -607,6 +607,11 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_stream_codes_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): a failed request stream names its fault" $?
 
+    # ...and the same preconditions over h3, so the answer does not depend on
+    # which protocol carried the request (RFC 9110 13.1.1, 13.1.4, 13.2.2).
+    python3 test/quic/h3_preconditions_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): If-Match and If-Unmodified-Since" $?
+
     # An ack-eliciting packet MUST be acknowledged (RFC 9000 13.2.1). An ACK was
     # only built when the server had something of its own to send, so a lone PING
     # (a browser keepalive) or a lone stream reset drew nothing and the peer
@@ -2532,6 +2537,22 @@ rm -f /tmp/upload3_echo.bin
         -H 'If-None-Match: "stale"' "$u/hello.txt")
     [ "$sc" = "200" ]
     check "http2 stale etag 200" $?
+
+    # If-Match / If-Unmodified-Since over h2 (RFC 9110 13.1.1, 13.1.4). h1 got
+    # these in Q187; until h2 and h3 followed, the same request got a different
+    # answer depending on which protocol carried it.
+    sc=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
+        -H "If-Match: $h2etag" "$u/hello.txt")
+    sc2=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
+        -H 'If-Match: "0000000000000000"' "$u/hello.txt")
+    sc3=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
+        -H 'If-Unmodified-Since: Wed, 01 Jan 2020 00:00:00 GMT' "$u/hello.txt")
+    # 13.2.2: a failing If-Match wins over an If-None-Match that would say 304
+    sc4=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
+        -H 'If-Match: "0000000000000000"' -H "If-None-Match: $h2etag" \
+        "$u/hello.txt")
+    [ "$sc" = "200" ] && [ "$sc2" = "412" ] && [ "$sc3" = "412" ] && [ "$sc4" = "412" ]
+    check "http2 preconditions: If-Match/If-Unmodified-Since ($sc/$sc2/$sc3/$sc4)" $?
     h2lm=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null "$u/hello.txt" \
         | grep -i '^last-modified:' | tr -d '\r' | cut -d' ' -f2-)
     sc=$(curl -s -o /dev/null --http2 --cacert $CA $rl -w '%{http_code}' \
