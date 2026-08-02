@@ -67,6 +67,20 @@ ackframe_ncid: db 0x18, 0x01, 0x00, 0x04, 0xAA, 0xBB, 0xCC, 0xDD
                db 0x10, 0x41, 0x2C
                db 0x02, 0x07, 0x00, 0x01, 0x02, 0x00, 0x00
 ackframe_ncid_len equ $ - ackframe_ncid
+; RFC 9000 19.3.1 underflow: a First ACK Range larger than Largest Acknowledged
+; puts the smallest below packet 0. Largest=3, Delay=0, RangeCount=0, First=5.
+ack_uf_first:  db 0x02, 0x03, 0x00, 0x00, 0x05
+ack_uf_first_len equ $ - ack_uf_first
+; ...and the same underflow hidden in a LATER pair (the Q135 guard saw only
+; pair 0): a valid first range [7,7], then Gap=10 drives the next largest
+; (7 - 10 - 2) below zero.
+ack_uf_gap:    db 0x02, 0x07, 0x00, 0x01, 0x00, 0x0A, 0x00
+ack_uf_gap_len equ $ - ack_uf_gap
+; a legal two-pair ACK whose SECOND pair sits right at the boundary — proves the
+; guard does not reject valid ranges. Largest=7, First=0 ([7,7]); Gap=4,
+; Length=1: next largest = 7-4-2 = 1, smallest = 0, so [0,1]. Nothing underflows.
+ack_boundary:  db 0x02, 0x07, 0x00, 0x01, 0x00, 0x04, 0x01
+ack_boundary_len equ $ - ack_boundary
 ; flow_scan must reach flow-control credit bundled behind other frames, as a real
 ; browser sends it. NEW_CONNECTION_ID(seq 1, retire 0, cid len 4, 16-byte token),
 ; then MAX_DATA=300 (0x412c), then MAX_STREAM_DATA(stream 0)=500 (0x41f4).
@@ -292,6 +306,32 @@ _start:
     EXPECT rax, 3
     mov rax, [pairs + 24]
     EXPECT rax, 3
+
+    ; --- underflow: a First ACK Range past the largest is FRAME_ENCODING_ERROR ---
+    lea rdi, [ack_uf_first]
+    mov esi, ack_uf_first_len
+    lea rdx, [pairs]
+    mov ecx, LINNEA_QUIC_ACK_MAXR
+    call linnea_quic_ack_ranges
+    EXPECT rax, -1                    ; the caller maps -1 to a connection close
+    ; ...and an underflow buried in a later pair, not just pair 0
+    lea rdi, [ack_uf_gap]
+    mov esi, ack_uf_gap_len
+    lea rdx, [pairs]
+    mov ecx, LINNEA_QUIC_ACK_MAXR
+    call linnea_quic_ack_ranges
+    EXPECT rax, -1
+    ; ...while a legal two-pair ACK ending exactly at packet 0 is accepted
+    lea rdi, [ack_boundary]
+    mov esi, ack_boundary_len
+    lea rdx, [pairs]
+    mov ecx, LINNEA_QUIC_ACK_MAXR
+    call linnea_quic_ack_ranges
+    EXPECT rax, 2
+    mov rax, [pairs + 16]
+    EXPECT rax, 0                     ; pair 1 smallest is exactly packet 0
+    mov rax, [pairs + 24]
+    EXPECT rax, 1                     ; pair 1 largest
 
     ; --- the two together: buffer 3,5,7; ingest the ACK; all released ---
     RECORD 3

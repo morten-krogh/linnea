@@ -1193,9 +1193,14 @@ linnea_quic_ack_ranges:
     test rdx, rdx
     jz .ret
     add rdi, rdx
-    ; first range: [largest - first, largest]
+    ; first range: [largest - first, largest]. RFC 9000 19.3.1: a First ACK
+    ; Range larger than Largest Acknowledged would put the smallest below packet
+    ; 0, which MUST be FRAME_ENCODING_ERROR — the borrow out of the subtract is
+    ; exactly that condition. Left unchecked, the wrap produces a huge unsigned
+    ; smallest and the caller frees every buffered packet in [0, 2^64).
     mov r8, r12
     sub r8, rax                      ; smallest
+    jc .ack_underflow
     mov r9, r12                      ; largest
     mov rbx, r8                      ; remember the smallest for the next gap
     call .emit
@@ -1212,16 +1217,27 @@ linnea_quic_ack_ranges:
     jz .ret
     add rdi, rdx
     mov r11, rax                     ; length (r11 survives varint_decode)
-    ; next range: largest = prev smallest - gap - 2, smallest = largest - length
+    ; next range: largest = prev smallest - gap - 2, smallest = largest - length.
+    ; Each subtraction can drop below packet 0 — Gap alone, the fixed 2, or the
+    ; range Length — and any of them is FRAME_ENCODING_ERROR (19.3.1). The Q135
+    ; guard in the caller only inspected pair 0, so a hostile peer could put the
+    ; underflow in a later pair; with 16 pairs each subtracting ~2^62 the wrap
+    ; synthesises a range over every in-flight number, freeing the whole table.
     mov r9, rbx
     sub r9, r10
+    jc .ack_underflow
     sub r9, 2
+    jc .ack_underflow
     mov r8, r9
     sub r8, r11
+    jc .ack_underflow
     mov rbx, r8
     call .emit
     dec r13
     jmp .rloop
+.ack_underflow:
+    mov r15, -1                      ; distinct from 0 (no ACK): the caller closes
+    jmp .ret
 .ret:
     mov rax, r15
     pop rbp

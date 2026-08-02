@@ -1628,6 +1628,7 @@ linnea_quic_server_datagram:
     mov ecx, LINNEA_QUIC_ACK_MAXR
     call linnea_quic_ack_ranges      ; rax = pairs written into ack_ranges
     test rax, rax
+    js .ack_underflow                ; a range dropped below packet 0 (19.3.1)
     jz .acks_done
     ; RFC 9000 13.1: a peer must not acknowledge a packet number we have not
     ; sent. ack_ranges[8] is the largest acked; pn_1rtt is our NEXT number, so
@@ -1707,6 +1708,10 @@ linnea_quic_server_datagram:
 .ack_violation:
     mov edi, 0x0a                    ; PROTOCOL_VIOLATION (RFC 9000 20.1)
     mov esi, 0x02                    ; the ACK frame triggered it
+    jmp .transport_close
+.ack_underflow:
+    mov edi, 0x07                    ; FRAME_ENCODING_ERROR (RFC 9000 19.3.1)
+    mov esi, 0x02                    ; the malformed ACK frame
     jmp .transport_close
 .ack_detect:
     ; then presume-lost and retransmit anything left far behind the largest acked
