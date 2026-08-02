@@ -653,6 +653,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_key_update_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): follows a client-initiated 1-RTT key update" $?
 
+    # quic-11: once the handshake is confirmed the server discards its Initial and
+    # Handshake keys (RFC 9001 4.9/4.9.1) and drops any long-header packet rather
+    # than AEAD-processing it under keys that are supposed to be gone. A burst of
+    # such packets on an established connection must not disturb it.
+    python3 test/quic/h3_post_handshake_long.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): long-header packets after confirmation are dropped" $?
+
     # a 1-RTT packet for a connection id we hold no state for gets a stateless reset
     # (RFC 9000 §10.3), so the peer fails fast instead of waiting out its idle timeout.
     python3 test/quic/h3_stateless_reset_test.py 47452 >/dev/null 2>&1

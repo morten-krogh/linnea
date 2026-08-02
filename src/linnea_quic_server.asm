@@ -1334,6 +1334,18 @@ linnea_quic_server_datagram:
 ; a leading Initial packet, then carries its Finished in a coalesced Handshake
 ; packet, so we must skip past the Initial to reach it.
 .try_handshake:
+    ; Once the handshake is confirmed the server has sent HANDSHAKE_DONE, and RFC
+    ; 9001 4.9.1 then makes it discard its Handshake keys — after which it MUST NOT
+    ; process a packet in that space. Initial keys went even earlier (4.9, on the
+    ; first Handshake packet) and 0-RTT keys with them. Every long-header packet
+    ; belongs to one of those three now-dead spaces, so a confirmed connection
+    ; drops the whole datagram rather than AEAD-processing it under keys that are
+    ; supposed to be gone. A conforming client stops sending them on HANDSHAKE_DONE;
+    ; if that frame was lost the loss timer resends it as a 1-RTT packet, and the
+    ; client's retransmitted Handshake/Initial here is simply discarded.
+    mov rax, [cur_conn]
+    cmp qword [rax + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
+    je .done
     ; the long-header type bits for a Handshake packet are 0x20 in v1, but v2 (RFC
     ; 9369) shifts every long-header type up by one, so 0x30. Compute the value for
     ; this connection's version once and match against it while walking the datagram.
