@@ -504,6 +504,19 @@ linnea_h2_handle:
     imul r8, r8, LINNEA_BODY_NS_PER_BYTE
     add [rdi + linnea_h2p.rq_start], r8
     or qword [rdi + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
+    test r10b, LINNEA_H2_FLAG_END_STREAM
+    jz .fd_done                      ; more body to come
+    cmp qword [rdi + linnea_h2p.rq_rem], 0
+    jne .fd_short                    ; ended early: fewer bytes than declared
+    jmp .fd_done
+.fd_short:
+    ; RFC 9113 8.1.1: content-length that does not equal the sum of the DATA
+    ; payloads is malformed. END_STREAM was not looked at here at all, so a body
+    ; that stopped short simply never completed — the request waited, holding an
+    ; upstream slot, until the body clock timed it out at 408. Failing it now
+    ; says what actually happened, and frees the slot at once.
+    mov qword [rdi + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [rdi + linnea_h2p.status], 400
     jmp .fd_done
 .fd_collect:
     mov r8, [rdi + linnea_h2p.len]
@@ -526,6 +539,15 @@ linnea_h2_handle:
     pop rdi
     test r10b, LINNEA_H2_FLAG_END_STREAM
     jz .fd_done                      ; more body to come
+    ; ...and what arrived must be what was declared, when a length was given.
+    ; This path measures the body and forwards its own count, so a mismatch used
+    ; to be silently rewritten rather than refused.
+    mov r8, [rdi + linnea_h2p.rq_declared]
+    cmp r8, -1
+    je .fd_finalize                  ; no content-length: nothing to reconcile
+    cmp r8, [rdi + linnea_h2p.len]
+    jne .fd_short
+.fd_finalize:
     push r11
     call h2p_finalize                ; body complete: terminate and connect
     pop r11
@@ -1757,6 +1779,7 @@ h2_serve:
     mov qword [r13 + linnea_h2p.rq_rem], 0
     mov qword [r13 + linnea_h2p.rq_credit], 0
     mov qword [r13 + linnea_h2p.rq_buf], 0
+    mov qword [r13 + linnea_h2p.rq_declared], -1
     mov qword [r13 + linnea_h2p.lg_bytes], 0
     mov rcx, [rsp + S_HEAD]
     imul rcx, rcx, LINNEA_H2P_F_IS_HEAD
@@ -1834,6 +1857,7 @@ h2_serve:
     call h2p_dec_u64                 ; -> rax = the value, or -1
     cmp rax, -1
     je .proxy_done                   ; unparseable: collect and re-derive
+    mov [r13 + linnea_h2p.rq_declared], rax   ; judged at END_STREAM (8.1.1)
     test rax, rax
     jz .proxy_nobody
     ; claim the connection's upload buffer; without it (a second concurrent

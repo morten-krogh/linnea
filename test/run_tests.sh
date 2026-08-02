@@ -2792,6 +2792,14 @@ PY
     timeout 30 python3 test/tls/h2_error_codes.py $CA 47446 >/dev/null 2>&1
     check "http2 connection errors carry the RFC's code" $?
 
+    # RFC 9113 8.1.1: content-length must equal the sum of the DATA payloads.
+    # An over-long body was already refused; one that stopped SHORT was not
+    # noticed at all — the request sat holding an upstream slot until the body
+    # clock timed it out, reporting a timeout for a framing fault visible at
+    # once. Runs against the proxy vhost, which is where bodies go.
+    timeout 60 python3 test/tls/h2_content_length.py $CA 47443 >/dev/null 2>&1
+    check "http2 content-length is reconciled with the DATA sent" $?
+
     timeout 20 python3 test/tls/h2_conformance.py $CA 47446 >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
 

@@ -228,6 +228,14 @@ struc linnea_h2p
     ; stream 0 — and it must, or the connection window never recovers. It
     ; outlives the slot's tenancy and is cleared per connection.
     .rq_owed:   resq 1
+    ; The content-length the client declared, or -1 when it declared none.
+    ; RFC 9113 8.1.1 makes a body whose DATA payloads do not sum to it
+    ; malformed, and that has to be judged at END_STREAM — the streaming path
+    ; already refuses a body that overruns the declared length, but a body that
+    ; stops SHORT was simply never completed, and the request sat until the body
+    ; clock timed it out. The collecting path did not know the declared length
+    ; at all: it measured what arrived and forwarded that.
+    .rq_declared: resq 1
     .lg_bytes:  resq 1            ; body bytes framed to the client, for the
                                   ; access line (.off gets rebased by the
                                   ; buffer compaction, so it cannot serve)
