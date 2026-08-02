@@ -46,6 +46,7 @@ extern linnea_quic_varint_decode
 extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
 extern linnea_quic_unprotect_short
+extern linnea_quic_stream_frame
 
 ; ---- kinds, for the per-probe report line -------------------------------
 K_OK   equ 0            ; the server did what the RFC requires
@@ -262,6 +263,14 @@ n_h3_flight:  db "QUIC handshake flight (server Finished decrypted)"
 n_h3_flight_len equ $ - n_h3_flight
 n_h3_1rtt:    db "QUIC handshake complete (client Finished -> 1-RTT)"
 n_h3_1rtt_len equ $ - n_h3_1rtt
+n_h3_get:     db "HTTP/3 GET / (control stream + QPACK request)"
+n_h3_get_len equ $ - n_h3_get
+
+; QPACK static index -> :status, mirroring the server's encoder table.
+qpack_idx2status:
+    dw 24,103, 25,200, 26,304, 27,404, 28,503
+    dw 63,100, 64,204, 65,206, 66,302, 67,400, 68,403, 69,421, 70,425, 71,500
+qpack_idx2status_end:
 err_h3_tls: db "error: h3 requires https:// (QUIC over UDP)", 10
 err_h3_tls_len equ $ - err_h3_tls
 
@@ -369,6 +378,10 @@ q_srv_scid: resb 20                     ; the server's chosen connection id (our
 q_srv_scid_len: resq 1
 q_cli_hs_pn: resq 1                     ; our next client Handshake packet number
 q_acked:    resq 1                      ; 1 once we have sent a Handshake ACK
+q_cli_ap_pn: resq 1                     ; our next client 1-RTT packet number
+fs_scratch: resb 768                    ; the request QPACK field section
+h3buf:      resb 4096                   ; response stream-0 data, reassembled
+h3buf_len:  resq 1
 
 section .text
 
@@ -4355,6 +4368,365 @@ quic_finish:
     pop rbp
     ret
 
+; quic_send_1rtt(edi=fd, rsi=payload, rdx=payload len) -> rax = 0 ok / -1.
+; Builds a short-header (1-RTT) packet with the application keys and sends it.
+quic_send_1rtt:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    and rsp, -16
+    mov ebx, edi
+    mov r14, rsi
+    mov r13, rdx
+    lea rdi, [qhdr]
+    mov byte [rdi], 0x40                  ; short header: fixed bit, pnlen-1 = 0
+    inc rdi
+    mov rcx, [q_srv_scid_len]             ; DCID = the server's connection id
+    lea rsi, [q_srv_scid]
+    rep movsb
+    mov rax, [q_cli_ap_pn]
+    mov [rdi], al                         ; 1-byte packet number
+    inc rdi
+    lea rax, [qhdr]
+    mov rdx, rdi
+    sub rdx, rax                          ; header length
+    sub rsp, 16
+    lea rax, [q_ap_ckeys]
+    mov [rsp], rax
+    mov rax, [q_cli_ap_pn]
+    mov [rsp + 8], rax
+    lea rdi, [qpkt]
+    lea rsi, [qhdr]
+    mov ecx, 1
+    mov r8, r14
+    mov r9, r13
+    call linnea_quic_protect
+    add rsp, 16
+    mov r12, rax
+    inc qword [q_cli_ap_pn]
+    mov eax, LINNEA_SYS_SENDTO
+    mov edi, ebx
+    lea rsi, [qpkt]
+    mov rdx, r12
+    mov r10d, LINNEA_MSG_NOSIGNAL
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    xor eax, eax
+    test rax, rax
+    lea rsp, [rbp - 32]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; qpack_status_lookup(rdi=static index) -> rax = :status, or -1.
+qpack_status_lookup:
+    lea rsi, [qpack_idx2status]
+    lea rcx, [qpack_idx2status_end]
+.l:
+    cmp rsi, rcx
+    jae .none
+    movzx eax, word [rsi]
+    cmp rax, rdi
+    je .hit
+    add rsi, 4
+    jmp .l
+.hit:
+    movzx eax, word [rsi + 2]
+    ret
+.none:
+    mov rax, -1
+    ret
+
+; qpack_find_status(rdi=field section, rsi=len) -> rax = :status, or -1.
+; A capacity-0 QPACK decoder: skips the 2-byte prefix, then walks field lines
+; (indexed / literal-with-name-ref / literal-with-literal-name) for :status.
+qpack_find_status:
+    push rbx
+    push r12
+    push r13
+    lea r13, [rdi + rsi]                  ; end
+    lea rbx, [rdi + 2]                    ; cursor, past Insert-Count + Base
+.walk:
+    cmp rbx, r13
+    jae .none
+    movzx eax, byte [rbx]
+    test al, 0x80
+    jnz .indexed
+    mov ecx, eax
+    and ecx, 0xc0
+    cmp ecx, 0x40
+    je .litnameref
+    mov ecx, eax
+    and ecx, 0xe0
+    cmp ecx, 0x20
+    je .litlitname
+    jmp .none                            ; post-base / unsupported
+.indexed:
+    mov r12d, eax
+    and r12d, 0x40                        ; T: static table?
+    mov rsi, rbx
+    mov rdi, r13
+    mov ecx, 6
+    call hp_int                          ; rax = index, rsi advanced
+    jc .none
+    mov rbx, rsi
+    test r12d, r12d
+    jz .walk                             ; dynamic index: we keep no table
+    mov rdi, rax
+    call qpack_status_lookup
+    cmp rax, -1
+    jne .found
+    jmp .walk
+.litnameref:
+    mov r12d, eax
+    and r12d, 0x10                        ; T: static table?
+    mov rsi, rbx
+    mov rdi, r13
+    mov ecx, 4
+    call hp_int                          ; rax = name index, rsi advanced
+    jc .none
+    mov rbx, rsi
+    mov r8, rax                          ; name index
+    cmp rbx, r13
+    jae .none
+    movzx r9d, byte [rbx]                 ; value length (H=0 assumed)
+    and r9d, 0x7f
+    inc rbx
+    test r12d, r12d
+    jz .skipval
+    cmp r8, 24                            ; :status name reference?
+    jne .skipval
+    xor eax, eax
+    xor ecx, ecx
+.digit:
+    cmp rcx, r9
+    jae .found_adv
+    movzx edx, byte [rbx + rcx]
+    sub edx, '0'
+    imul eax, eax, 10
+    add eax, edx
+    inc rcx
+    jmp .digit
+.found_adv:
+    add rbx, r9
+    jmp .found
+.skipval:
+    add rbx, r9
+    jmp .walk
+.litlitname:
+    mov rsi, rbx
+    mov rdi, r13
+    mov ecx, 3
+    call hp_int                          ; name length
+    jc .none
+    mov rbx, rsi
+    add rbx, rax
+    mov rsi, rbx
+    mov rdi, r13
+    mov ecx, 7
+    call hp_int                          ; value length
+    jc .none
+    mov rbx, rsi
+    add rbx, rax
+    jmp .walk
+.found:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.none:
+    mov rax, -1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; parse_h3_headers(rdi=stream data, rsi=len) -> rax = :status, or -1 if there is
+; no complete HEADERS frame yet. Walks HTTP/3 frames to the first HEADERS (0x01).
+parse_h3_headers:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    lea r13, [rdi + rsi]
+.fr:
+    cmp rbx, r13
+    jae .none
+    mov rdi, rbx
+    mov rsi, r13
+    call linnea_quic_varint_decode        ; frame type
+    test rdx, rdx
+    jz .none
+    add rbx, rdx
+    mov r12, rax                          ; type
+    mov rdi, rbx
+    mov rsi, r13
+    call linnea_quic_varint_decode        ; frame length
+    test rdx, rdx
+    jz .none
+    add rbx, rdx
+    lea rcx, [rbx + rax]
+    cmp rcx, r13
+    ja .none                             ; frame not fully arrived
+    cmp r12, 0x01
+    jne .skip
+    mov rdi, rbx
+    mov rsi, rax
+    call qpack_find_status
+    jmp .out
+.skip:
+    add rbx, rax
+    jmp .fr
+.none:
+    mov rax, -1
+.out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; quic_h3_get(edi=fd) -> rax = :status of the GET / response, or -1. Opens the
+; client control stream (SETTINGS) and sends a QPACK-encoded GET on stream 0,
+; then reassembles stream-0 data across 1-RTT packets and decodes :status.
+quic_h3_get:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    and rsp, -16
+    mov ebx, edi
+    mov qword [h3buf_len], 0
+    ; --- QPACK field section for "GET / :authority=host" ---
+    lea rdi, [fs_scratch]
+    mov byte [rdi], 0x00                  ; Required Insert Count
+    mov byte [rdi + 1], 0x00             ; Base
+    mov byte [rdi + 2], 0xd1             ; :method GET   (static 17)
+    mov byte [rdi + 3], 0xd7             ; :scheme https (static 23)
+    mov byte [rdi + 4], 0xc1             ; :path /       (static 1)
+    mov byte [rdi + 5], 0x50             ; :authority: literal, name ref static 0
+    add rdi, 6
+    mov rax, [host_len]
+    mov [rdi], al                        ; value length (H=0, < 127)
+    inc rdi
+    mov rsi, [host_ptr]
+    mov rcx, [host_len]
+    rep movsb
+    lea rax, [fs_scratch]
+    mov r14, rdi
+    sub r14, rax                         ; field-section length
+    ; --- 1-RTT payload: control STREAM(2) + request STREAM(0) ---
+    lea rdi, [qpay]
+    mov byte [rdi], 0x0a                 ; STREAM, LEN, no OFF/FIN
+    mov byte [rdi + 1], 0x02             ; stream id 2 (client uni: control)
+    mov byte [rdi + 2], 0x03             ; length 3
+    mov byte [rdi + 3], 0x00             ; control stream type
+    mov byte [rdi + 4], 0x04             ; SETTINGS frame
+    mov byte [rdi + 5], 0x00             ; SETTINGS length 0
+    add rdi, 6
+    mov byte [rdi], 0x0b                 ; STREAM, LEN, FIN
+    mov byte [rdi + 1], 0x00             ; stream id 0 (client bidi: request)
+    lea rax, [r14 + 2]                   ; 0x01 + fslen-varint(1) + field section
+    mov [rdi + 2], al                    ; STREAM data length (< 63)
+    mov byte [rdi + 3], 0x01             ; HEADERS frame
+    mov [rdi + 4], r14b                  ; HEADERS length (fslen, < 63)
+    add rdi, 5
+    lea rsi, [fs_scratch]
+    mov rcx, r14
+    rep movsb
+    lea rax, [qpay]
+    mov rdx, rdi
+    sub rdx, rax                         ; payload length
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    ; --- read 1-RTT packets, reassemble stream 0, decode :status ---
+    mov r12d, 6                          ; datagram budget
+.loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 2000
+    syscall
+    test rax, rax
+    jle .fail
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle .fail
+    mov rsi, rax
+    call quic_find_1rtt                   ; rax = 1-RTT ptr, rdx = len
+    test rax, rax
+    jz .next
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [q_ap_skeys]
+    lea rcx, [qplain]
+    mov r8d, 8
+    mov r9, [q_cli_ap_pn]                 ; a nearby expected pn for reconstruction
+    call linnea_quic_unprotect_short      ; rax = frame bytes
+    test rax, rax
+    js .next
+    ; walk STREAM frames; accumulate stream-0 data into h3buf
+    lea r13, [qplain]                     ; frame cursor
+    mov r14, rax                          ; frames length
+    add r14, r13                          ; frames end
+.frames:
+    mov rdi, r13
+    mov rsi, r14
+    sub rsi, r13
+    jle .decode
+    call linnea_quic_stream_frame         ; rax=data, rdx=len, r8=id, r9=next
+    test rax, rax
+    jz .decode
+    mov r13, r9                           ; resume after this STREAM frame
+    test r8, r8
+    jnz .frames                          ; not the request stream
+    ; append rax..rax+rdx to h3buf
+    mov rcx, [h3buf_len]
+    lea rdi, [h3buf + rcx]
+    mov rsi, rax
+    mov rcx, rdx
+    add [h3buf_len], rdx
+    rep movsb
+    jmp .frames
+.decode:
+    lea rdi, [h3buf]
+    mov rsi, [h3buf_len]
+    call parse_h3_headers                 ; rax = status or -1
+    cmp rax, -1
+    jne .done
+.next:
+    dec r12d
+    jnz .loop
+.fail:
+    mov rax, -1
+.done:
+    lea rsp, [rbp - 32]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
 ; h3_battery(): the HTTP/3 probe set.
 h3_battery:
     call probe_h3_handshake
@@ -4432,14 +4804,31 @@ probe_h3_handshake:
     jz .done
     mov edi, ebx
     call quic_finish                      ; rax = 1 if a 1-RTT packet decrypted
+    mov r12, rax                          ; keep across report_plain
     mov dil, K_OK
-    test rax, rax
+    test r12, r12
     jnz .rep3
     mov dil, K_DEV
 .rep3:
     lea rsi, [n_h3_1rtt]
     mov edx, n_h3_1rtt_len
     call report_plain
+    ; part 4: an actual HTTP/3 GET / over 1-RTT, decode :status
+    test r12, r12
+    jz .done                             ; no 1-RTT, cannot request
+    mov edi, ebx
+    call quic_h3_get                      ; rax = :status or -1
+    mov r12, rax
+    mov dil, K_OK
+    cmp rax, 200
+    je .rep4
+    mov dil, K_DEV
+.rep4:
+    lea rsi, [n_h3_get]
+    mov edx, n_h3_get_len
+    mov rcx, r12                          ; observed status
+    mov r9d, 200                          ; expected
+    call report
 .done:
     mov edi, ebx
     call close_fd
