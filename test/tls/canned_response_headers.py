@@ -102,4 +102,31 @@ else:
     print(f"FAIL upstream failure gave {status}")
     fails += 1
 
+
+# --- a field name is a token (RFC 9110 5.1, 5.6.2) -------------------------
+# The name loop admitted every printable byte but ':', so the delimiters all
+# passed — and such a name is forwarded verbatim when proxying, which is two
+# hops disagreeing about where a field name ends.
+for bad in ('X(bad)name', 'X"quoted"', 'X,comma', 'X/slash', 'X[bracket]',
+            'X@at', 'X\\backslash', 'X=equals', 'X{brace}'):
+    status, _, _ = send(f"GET /hello.txt HTTP/1.1\r\nHost: one.test\r\n"
+                        f"{bad}: v\r\n\r\n".encode())
+    if status == 400:
+        print(f"ok   a field name containing {bad[1:]!r} is refused")
+    else:
+        print(f"FAIL {bad!r} gave {status}, want 400 — it would be forwarded "
+              f"verbatim to the backend")
+        fails += 1
+
+# ...and every character that IS a token character must still be accepted
+ok_name = "X-Weird!#$%&'*+-.^_`|~9"
+status, _, _ = send(f"GET /hello.txt HTTP/1.1\r\nHost: one.test\r\n"
+                    f"{ok_name}: v\r\n\r\n".encode())
+if status == 200:
+    print("ok   a name using every token character is accepted")
+else:
+    print(f"FAIL a legal token name gave {status}, want 200 — the check is too "
+          f"strict and would refuse conforming clients")
+    fails += 1
+
 sys.exit(1 if fails else 0)

@@ -909,6 +909,21 @@ linnea_http_handle:
     sub r8, rcx                ; name len
     test r8, r8
     jz .resp_400
+    ; A field name is a token (RFC 9110 5.1, 5.6.2). The loop above admits every
+    ; printable byte but ':', so the delimiters ( ) , " / [ ] { } @ \ = all
+    ; passed — and a name carrying one is copied verbatim to the upstream when
+    ; proxying, which is the classic parser-differential setup: two hops
+    ; disagreeing about where a field name ends. The method has been checked with
+    ; this same helper all along; field names were not.
+    push rcx
+    push r8
+    lea rdi, [r14 + rcx]
+    mov rsi, r8
+    call linnea_string_is_token
+    pop r8
+    pop rcx
+    test eax, eax
+    jz .resp_400
     inc r15                    ; skip ':'
 .ows_loop:
     cmp r15, r13
