@@ -17,12 +17,23 @@
 default rel
 
 %include "linnea_syscall.inc"
+%include "linnea_tls.inc"
 
 global _start
 
 extern linnea_print_stdout
 extern linnea_print_stderr
 extern linnea_string_from_u64
+; --- reused crypto for the TLS 1.3 client ---
+extern linnea_tls_hkdf_expand_label
+extern linnea_tls_derive_secret
+extern linnea_tls_keys_init
+extern linnea_tls_seal
+extern linnea_tls_open
+extern linnea_x25519
+extern linnea_sha256
+extern linnea_hkdf_extract
+extern linnea_hmac_sha256
 
 ; ---- kinds, for the per-probe report line -------------------------------
 K_OK   equ 0            ; the server did what the RFC requires
@@ -173,6 +184,28 @@ f_host_lf_len equ $ - f_host_lf
 f_lf:       db 10
 f_end_lf:   db 10
 
+; --- TLS 1.3 client constants ---
+empty_hash: db 0xe3,0xb0,0xc4,0x42,0x98,0xfc,0x1c,0x14,0x9a,0xfb,0xf4,0xc8
+            db 0x99,0x6f,0xb9,0x24,0x27,0xae,0x41,0xe4,0x64,0x9b,0x93,0x4c
+            db 0xa4,0x95,0x99,0x1b,0x78,0x52,0xb8,0x55      ; SHA-256("")
+zeros32_p:  times 32 db 0
+x25519_base: db 9
+             times 31 db 0
+lbl_derived: db "derived"
+lbl_c_hs:    db "c hs traffic"
+lbl_s_hs:    db "s hs traffic"
+lbl_c_ap:    db "c ap traffic"
+lbl_s_ap:    db "s ap traffic"
+lbl_finished: db "finished"
+alpn_h11:    db "http/1.1"
+alpn_h11_len equ $ - alpn_h11
+; fixed middle of the ClientHello: cipher suites, compression (the parts with no
+; variable content). cipher_suites len 2 = {0x1301}, compression len 1 = {0x00}.
+ch_suites:  db 0x00, 0x02, 0x13, 0x01, 0x01, 0x00
+ch_suites_len equ $ - ch_suites
+err_tls:    db "error: TLS handshake failed", 10
+err_tls_len equ $ - err_tls
+
 section .bss
 alignb 16
 sa:         resb 16                     ; sockaddr_in
@@ -199,6 +232,34 @@ path_len:   resq 1                      ; ...and length
 req_cur:    resq 1                      ; request-assembly cursor into reqbuf
 n_total:    resd 1
 n_dev:      resd 1
+
+; --- TLS 1.3 client state (one connection at a time, so globals suffice) ---
+use_tls:    resq 1                      ; 1 when the URL scheme is https
+tls_priv:   resb 32                     ; our x25519 private key
+tls_pub:    resb 32                     ; our x25519 public key
+tls_srvpub: resb 32                     ; the server's key_share
+tls_shared: resb 32                     ; ECDH shared secret
+tls_random: resb 32                     ; client random
+tls_sessid: resb 32                     ; legacy session id (middlebox compat)
+tr_buf:     resb 16384                  ; handshake transcript (all HS messages)
+tr_len:     resq 1
+th_buf:     resb 32                     ; a transcript hash
+sec_early:  resb 32
+sec_derived: resb 32
+sec_hs:     resb 32
+sec_master: resb 32
+sec_chs:    resb 32
+sec_shs:    resb 32
+sec_cap:    resb 32
+sec_sap:    resb 32
+fin_key:    resb 32
+alignb 16
+tls_wkeys:  resb linnea_tls_keys_size   ; client write direction
+tls_rkeys:  resb linnea_tls_keys_size   ; client read direction
+tls_rec:    resb 20480                  ; one incoming TLS record (header + payload)
+hs_plain:   resb 20480                  ; decrypted server flight (handshake msgs)
+hs_plain_len: resq 1
+tls_pt:     resb 20480                  ; decrypted application record plaintext
 
 section .text
 
@@ -867,6 +928,14 @@ tcp_connect:
     syscall
     test rax, rax
     js .fail_close
+    ; on https, run the TLS handshake before handing the fd back
+    cmp qword [use_tls], 0
+    je .ok
+    mov edi, ebx
+    call tls_handshake
+    test rax, rax
+    js .fail_close
+.ok:
     mov eax, ebx
     pop rbx
     ret
@@ -879,8 +948,14 @@ tcp_connect:
     pop rbx
     ret
 
-; send_bytes(edi=fd, rsi=ptr, rdx=len) -> rax = 0 ok, -1 on error
+; send_bytes(edi=fd, rsi=ptr, rdx=len) -> rax = 0 ok, -1 on error.
+; The probes' sender: raw TCP, or one sealed TLS record over https.
 send_bytes:
+    cmp qword [use_tls], 0
+    jne tls_app_send
+    ; fall through to send_raw
+; send_raw(edi=fd, rsi=ptr, rdx=len) -> rax = 0 ok, -1 on error (raw TCP)
+send_raw:
     push rbx
     push r12
     push r13
@@ -971,6 +1046,8 @@ wait_readable_or_closed:
 ;   -> rax = total bytes read (stored length in r-none; parse_status reads
 ;      respbuf and the length from resp_total)
 read_response:
+    cmp qword [use_tls], 0
+    jne tls_app_recv                      ; https: read + decrypt TLS records
     push rbx
     push r12
     push r13
@@ -1322,8 +1399,19 @@ parse_url:
     push r13
     push r14
     mov rbx, rdi                          ; cursor
+    mov qword [use_tls], 0
 
-    ; scheme must be http://
+    ; scheme: http:// or https://
+    mov rsi, rbx
+    lea rdi, [sch_https]
+    mov edx, sch_https_len
+    call memeq
+    test rax, rax
+    jz .try_http
+    mov qword [use_tls], 1
+    add rbx, sch_https_len
+    jmp .scheme_ok
+.try_http:
     mov rsi, rbx
     lea rdi, [sch_http]
     mov edx, sch_http_len
@@ -1331,6 +1419,7 @@ parse_url:
     test rax, rax
     jz .bad_scheme
     add rbx, sch_http_len
+.scheme_ok:
 
     ; host runs until ':' or '/' or NUL
     mov r12, rbx                          ; host start
@@ -1367,7 +1456,11 @@ parse_url:
 .host_set:
 
     ; optional :port
-    mov dword [conn_port], 80
+    mov dword [conn_port], 80             ; default for http
+    cmp qword [use_tls], 0
+    je .port_default_set
+    mov dword [conn_port], 443            ; default for https
+.port_default_set:
     movzx eax, byte [rbx]
     cmp al, ':'
     jne .port_done
@@ -1777,6 +1870,648 @@ dns_query:
     pop rbx
     ret
 
+; =======================================================================
+; TLS 1.3 client (AES-128-GCM, x25519, no certificate verification)
+; =======================================================================
+; tr_add(rsi=ptr, rdx=len): append handshake bytes to the transcript buffer
+tr_add:
+    push rdi
+    push rcx
+    mov rdi, [tr_len]
+    lea rdi, [tr_buf + rdi]
+    mov rcx, rdx
+    rep movsb
+    add [tr_len], rdx
+    pop rcx
+    pop rdi
+    ret
+
+; read_full(edi=fd, rsi=buf, rdx=n) -> rax = 0 ok, -1 on EOF/error
+read_full:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12, rsi
+    mov r13, rdx
+.loop:
+    test r13, r13
+    jz .ok
+    mov eax, LINNEA_SYS_READ
+    mov edi, ebx
+    mov rsi, r12
+    mov rdx, r13
+    syscall
+    test rax, rax
+    jle .fail
+    add r12, rax
+    sub r13, rax
+    jmp .loop
+.ok:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.fail:
+    mov rax, -1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; read_tls_record(edi=fd) -> rax = outer content type (-1 on EOF/error).
+; The whole record lands at tls_rec; rec_total gets header(5)+payload length.
+read_tls_record:
+    push rbx
+    mov ebx, edi
+    mov edi, ebx
+    lea rsi, [tls_rec]
+    mov edx, 5
+    call read_full
+    test rax, rax
+    js .fail
+    movzx eax, byte [tls_rec + 3]
+    shl eax, 8
+    movzx ecx, byte [tls_rec + 4]
+    or eax, ecx                           ; payload length
+    cmp eax, 20480 - 5
+    ja .fail
+    mov [rec_total], rax                  ; payload length (temporarily)
+    test eax, eax
+    jz .empty
+    mov edi, ebx
+    lea rsi, [tls_rec + 5]
+    mov edx, [rec_total]
+    call read_full
+    test rax, rax
+    js .fail
+.empty:
+    mov rax, [rec_total]
+    add rax, 5
+    mov [rec_total], rax
+    movzx eax, byte [tls_rec]             ; outer content type
+    pop rbx
+    ret
+.fail:
+    mov rax, -1
+    pop rbx
+    ret
+
+; tls_handshake(edi=fd) -> rax = 0 on success, -1 on failure.
+; A full 1-RTT TLS 1.3 handshake with no certificate verification (this is a
+; prober): x25519 key exchange, AES-128-GCM, ALPN http/1.1, SNI = urlhost.
+tls_handshake:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    and rsp, -16                          ; force 16-alignment for the SSE crypto
+    mov r15d, edi                         ; fd
+
+    ; --- x25519 keypair ---
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_priv]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    and byte [tls_priv], 248              ; clamp
+    and byte [tls_priv + 31], 127
+    or byte [tls_priv + 31], 64
+    lea rdi, [tls_pub]
+    lea rsi, [tls_priv]
+    lea rdx, [x25519_base]
+    call linnea_x25519
+    ; client random + legacy session id
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_random]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_sessid]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    mov qword [tr_len], 0
+
+    ; --- build + send ClientHello ---
+    call build_clienthello                ; rax = total record length
+    mov edi, r15d
+    lea rsi, [reqbuf]
+    mov rdx, rax
+    call send_raw
+    test rax, rax
+    js .fail
+
+    ; --- ServerHello (plaintext handshake record) ---
+    mov edi, r15d
+    call read_tls_record
+    cmp rax, 22
+    jne .fail
+    ; transcript += the ServerHello handshake bytes
+    lea rsi, [tls_rec + 5]
+    mov rdx, [rec_total]
+    sub rdx, 5
+    push rsi
+    push rdx
+    call tr_add
+    pop rdx
+    pop rsi
+    call parse_serverhello                ; rsi=HS ptr, rdx=HS len -> tls_srvpub
+    test rax, rax
+    js .fail
+
+    ; --- key schedule ---
+    ; shared = x25519(priv, srvpub)
+    lea rdi, [tls_shared]
+    lea rsi, [tls_priv]
+    lea rdx, [tls_srvpub]
+    call linnea_x25519
+    ; early = HKDF-Extract("", zeros)
+    lea rdi, [zeros32_p]
+    xor esi, esi
+    lea rdx, [zeros32_p]
+    mov ecx, 32
+    lea r8, [sec_early]
+    call linnea_hkdf_extract
+    ; derived = Derive-Secret(early, "derived", H(""))
+    lea rdi, [sec_early]
+    lea rsi, [lbl_derived]
+    mov edx, 7
+    lea rcx, [empty_hash]
+    lea r8, [sec_derived]
+    call linnea_tls_derive_secret
+    ; hs = HKDF-Extract(derived, shared)
+    lea rdi, [sec_derived]
+    mov esi, 32
+    lea rdx, [tls_shared]
+    mov ecx, 32
+    lea r8, [sec_hs]
+    call linnea_hkdf_extract
+    ; th = H(CH || SH)
+    lea rdi, [tr_buf]
+    mov rsi, [tr_len]
+    lea rdx, [th_buf]
+    call linnea_sha256
+    ; c_hs, s_hs
+    lea rdi, [sec_hs]
+    lea rsi, [lbl_c_hs]
+    mov edx, 12
+    lea rcx, [th_buf]
+    lea r8, [sec_chs]
+    call linnea_tls_derive_secret
+    lea rdi, [sec_hs]
+    lea rsi, [lbl_s_hs]
+    mov edx, 12
+    lea rcx, [th_buf]
+    lea r8, [sec_shs]
+    call linnea_tls_derive_secret
+    ; derived2, master
+    lea rdi, [sec_hs]
+    lea rsi, [lbl_derived]
+    mov edx, 7
+    lea rcx, [empty_hash]
+    lea r8, [sec_derived]                  ; reuse sec_derived as derived2
+    call linnea_tls_derive_secret
+    lea rdi, [sec_derived]
+    mov esi, 32
+    lea rdx, [zeros32_p]
+    mov ecx, 32
+    lea r8, [sec_master]
+    call linnea_hkdf_extract
+    ; handshake traffic keys: write = c_hs, read = s_hs
+    lea rdi, [tls_wkeys]
+    lea rsi, [sec_chs]
+    call linnea_tls_keys_init
+    lea rdi, [tls_rkeys]
+    lea rsi, [sec_shs]
+    call linnea_tls_keys_init
+
+    ; --- read the encrypted server flight until Finished ---
+    mov qword [hs_plain_len], 0
+    mov qword [parse_off], 0
+.flight_read:
+    mov edi, r15d
+    call read_tls_record
+    test rax, rax
+    js .fail
+    cmp rax, 20
+    je .flight_read                        ; ChangeCipherSpec: ignore
+    cmp rax, 23
+    jne .fail
+    lea rdi, [tls_rkeys]
+    lea rsi, [tls_rec]
+    mov rdx, [rec_total]
+    mov rcx, [hs_plain_len]
+    lea rcx, [hs_plain + rcx]
+    call linnea_tls_open                   ; rax = len, rdx = inner type
+    test rax, rax
+    js .fail
+    cmp rdx, 22                            ; inner type must be handshake
+    jne .fail
+    add [hs_plain_len], rax
+.walk:
+    mov r12, [parse_off]
+    mov r13, [hs_plain_len]
+    lea rax, [r12 + 4]
+    cmp rax, r13
+    ja .flight_read                        ; need more bytes for a header
+    movzx ecx, byte [hs_plain + r12 + 1]   ; msg length (24-bit)
+    shl ecx, 8
+    movzx eax, byte [hs_plain + r12 + 2]
+    or ecx, eax
+    shl ecx, 8
+    movzx eax, byte [hs_plain + r12 + 3]
+    or ecx, eax                            ; ecx = msg body length
+    lea rax, [r12 + 4]
+    add rax, rcx                           ; end of this message
+    cmp rax, r13
+    ja .flight_read                        ; message not fully arrived
+    ; absorb this whole handshake message into the transcript
+    lea rsi, [hs_plain + r12]
+    lea rdx, [rcx + 4]
+    push rcx
+    call tr_add
+    pop rcx
+    movzx eax, byte [hs_plain + r12]       ; message type
+    lea r12, [r12 + rcx + 4]
+    mov [parse_off], r12
+    cmp eax, 0x14                          ; Finished
+    je .flight_done
+    jmp .walk
+.flight_done:
+
+    ; --- application traffic secrets (th2 = H(CH..server Finished)) ---
+    lea rdi, [tr_buf]
+    mov rsi, [tr_len]
+    lea rdx, [th_buf]
+    call linnea_sha256
+    lea rdi, [sec_master]
+    lea rsi, [lbl_c_ap]
+    mov edx, 12
+    lea rcx, [th_buf]
+    lea r8, [sec_cap]
+    call linnea_tls_derive_secret
+    lea rdi, [sec_master]
+    lea rsi, [lbl_s_ap]
+    mov edx, 12
+    lea rcx, [th_buf]
+    lea r8, [sec_sap]
+    call linnea_tls_derive_secret
+
+    ; --- client Finished (still under the handshake write keys) ---
+    ; finished_key = HKDF-Expand-Label(c_hs, "finished", "", 32)
+    lea rdi, [sec_chs]
+    lea rsi, [lbl_finished]
+    mov edx, 8
+    xor ecx, ecx
+    xor r8d, r8d
+    lea r9, [fin_key]
+    sub rsp, 16
+    mov qword [rsp], 32
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    ; verify_data = HMAC(finished_key, th2) -> reqbuf+4 (after the 4-byte header)
+    lea rdi, [fin_key]
+    mov esi, 32
+    lea rdx, [th_buf]
+    mov ecx, 32
+    lea r8, [reqbuf + 4]
+    call linnea_hmac_sha256
+    mov byte [reqbuf], 0x14                ; Finished
+    mov byte [reqbuf + 1], 0
+    mov byte [reqbuf + 2], 0
+    mov byte [reqbuf + 3], 32
+    ; seal (inner type 22) with the handshake write keys, send
+    lea rdi, [tls_wkeys]
+    mov esi, 22
+    lea rdx, [reqbuf]
+    mov ecx, 36
+    lea r8, [tls_rec]
+    call linnea_tls_seal                   ; rax = record length
+    mov edi, r15d
+    lea rsi, [tls_rec]
+    mov rdx, rax
+    call send_raw
+    test rax, rax
+    js .fail
+
+    ; --- switch to application traffic keys ---
+    lea rdi, [tls_wkeys]
+    lea rsi, [sec_cap]
+    call linnea_tls_keys_init
+    lea rdi, [tls_rkeys]
+    lea rsi, [sec_sap]
+    call linnea_tls_keys_init
+
+    xor eax, eax
+    lea rsp, [rbp - 40]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+.fail:
+    mov rax, -1
+    lea rsp, [rbp - 40]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; parse_serverhello(rsi=HS ptr, rdx=HS len) -> rax = 0 ok / -1.
+; Extracts the server's x25519 key_share into tls_srvpub.
+parse_serverhello:
+    push rbx
+    push r12
+    mov rbx, rsi                           ; cursor
+    lea r12, [rsi + rdx]                   ; end
+    ; skip: type(1) len(3) legacy_version(2) random(32)
+    add rbx, 4 + 2 + 32
+    cmp rbx, r12
+    jae .fail
+    movzx eax, byte [rbx]                  ; session id length
+    inc rbx
+    add rbx, rax                           ; skip session id
+    add rbx, 2 + 1                         ; cipher suite(2) + compression(1)
+    cmp rbx, r12
+    jae .fail
+    ; extensions: total length (2), then ext entries
+    add rbx, 2                             ; skip the extensions-length field
+.ext:
+    lea rax, [rbx + 4]
+    cmp rax, r12
+    ja .fail                               ; no key_share found
+    movzx eax, byte [rbx]                  ; ext type high
+    shl eax, 8
+    movzx ecx, byte [rbx + 1]
+    or eax, ecx                            ; ext type
+    movzx edx, byte [rbx + 2]              ; ext data length
+    shl edx, 8
+    movzx ecx, byte [rbx + 3]
+    or edx, ecx
+    add rbx, 4                             ; -> ext data
+    cmp eax, 0x0033                        ; key_share
+    je .keyshare
+    add rbx, rdx                           ; skip this extension
+    jmp .ext
+.keyshare:
+    ; ext data: group(2) keylen(2) key[keylen]
+    lea rax, [rbx + 4 + 32]
+    cmp rax, r12
+    ja .fail
+    lea rdi, [tls_srvpub]
+    lea rsi, [rbx + 4]                     ; skip group(2)+keylen(2)
+    mov ecx, 32
+    rep movsb
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+.fail:
+    mov rax, -1
+    pop r12
+    pop rbx
+    ret
+
+; build_clienthello() -> rax = total record length (record at reqbuf).
+; Also appends the ClientHello handshake message to the transcript.
+build_clienthello:
+    push rbx
+    push r12
+    push r13
+    mov r12, [urlhost_len]                 ; SNI host length
+    lea rdi, [reqbuf + 5]                  ; write cursor (past record header)
+    mov byte [rdi], 0x01                   ; ClientHello
+    lea r13, [rdi + 1]                     ; hs length-24 slot
+    add rdi, 4                             ; past type + len24
+    ; body
+    mov byte [rdi], 0x03                   ; legacy_version 0x0303
+    mov byte [rdi + 1], 0x03
+    add rdi, 2
+    lea rsi, [tls_random]                  ; random[32]
+    mov ecx, 32
+    rep movsb                              ; rdi advanced by 32
+    mov byte [rdi], 32                     ; session id length
+    inc rdi
+    lea rsi, [tls_sessid]
+    mov ecx, 32
+    rep movsb
+    lea rsi, [ch_suites]                   ; suites + compression (6 bytes)
+    mov ecx, ch_suites_len
+    rep movsb
+    ; extensions length slot
+    mov rbx, rdi                           ; ext-length-16 slot
+    add rdi, 2
+    ; -- SNI --
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x00               ; server_name
+    lea rax, [r12 + 5]                     ; ext data len = 5 + hostlen
+    mov [rdi + 2], ah
+    mov [rdi + 3], al
+    lea rax, [r12 + 3]                     ; server_name_list len = 3 + hostlen
+    mov [rdi + 4], ah
+    mov [rdi + 5], al
+    mov byte [rdi + 6], 0x00               ; name type host_name
+    mov rax, r12                           ; name length
+    mov [rdi + 7], ah
+    mov [rdi + 8], al
+    add rdi, 9
+    lea rsi, [urlhost]
+    mov rcx, r12
+    rep movsb
+    ; -- supported_versions --
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x2b
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x03
+    mov byte [rdi + 4], 0x02
+    mov byte [rdi + 5], 0x03
+    mov byte [rdi + 6], 0x04
+    add rdi, 7
+    ; -- supported_groups (x25519) --
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x0a
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x04
+    mov byte [rdi + 4], 0x00
+    mov byte [rdi + 5], 0x02
+    mov byte [rdi + 6], 0x00
+    mov byte [rdi + 7], 0x1d
+    add rdi, 8
+    ; -- signature_algorithms (ecdsa_secp256r1_sha256) --
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x0d
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x04
+    mov byte [rdi + 4], 0x00
+    mov byte [rdi + 5], 0x02
+    mov byte [rdi + 6], 0x04
+    mov byte [rdi + 7], 0x03
+    add rdi, 8
+    ; -- key_share --
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x33
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x26               ; ext data len = 38
+    mov byte [rdi + 4], 0x00
+    mov byte [rdi + 5], 0x24               ; client_shares len = 36
+    mov byte [rdi + 6], 0x00
+    mov byte [rdi + 7], 0x1d               ; group x25519
+    mov byte [rdi + 8], 0x00
+    mov byte [rdi + 9], 0x20               ; key length 32
+    add rdi, 10
+    lea rsi, [tls_pub]
+    mov ecx, 32
+    rep movsb
+    ; -- ALPN http/1.1 --
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x10
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x0b               ; ext data len = 11
+    mov byte [rdi + 4], 0x00
+    mov byte [rdi + 5], 0x09               ; ALPN list len = 9
+    mov byte [rdi + 6], alpn_h11_len       ; proto length = 8
+    add rdi, 7
+    lea rsi, [alpn_h11]
+    mov ecx, alpn_h11_len
+    rep movsb
+    ; --- backpatch lengths ---
+    ; extensions length = rdi - (rbx + 2)
+    mov rax, rdi
+    sub rax, rbx
+    sub rax, 2
+    mov [rbx], ah
+    mov [rbx + 1], al
+    ; handshake body length (24-bit) = rdi - (r13 + 3)
+    mov rax, rdi
+    sub rax, r13
+    sub rax, 3
+    mov byte [r13], 0                      ; high byte (always 0 here)
+    mov ecx, eax
+    shr ecx, 8
+    mov [r13 + 1], cl
+    mov [r13 + 2], al
+    ; record header
+    mov byte [reqbuf], 0x16
+    mov byte [reqbuf + 1], 0x03
+    mov byte [reqbuf + 2], 0x01
+    mov rax, rdi
+    lea rcx, [reqbuf + 5]
+    sub rax, rcx                            ; record payload length
+    mov [reqbuf + 3], ah
+    mov [reqbuf + 4], al
+    ; transcript += the ClientHello handshake message (reqbuf+5 .. rdi)
+    lea rsi, [reqbuf + 5]
+    mov rdx, rax
+    push rax
+    call tr_add
+    pop rax
+    add rax, 5                              ; total record length
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tls_app_send(edi=fd, rsi=ptr, rdx=len) -> rax = 0 ok / -1
+; Seals the payload as one application_data record and sends it.
+tls_app_send:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    and rsp, -16                          ; align for the SSE seal
+    mov ebx, edi
+    mov r12, rsi
+    mov r13, rdx
+    lea rdi, [tls_wkeys]
+    mov esi, 23
+    mov rdx, r12
+    mov rcx, r13
+    lea r8, [tls_rec]
+    call linnea_tls_seal
+    mov edi, ebx
+    lea rsi, [tls_rec]
+    mov rdx, rax
+    call send_raw
+    lea rsp, [rbp - 24]
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; tls_app_recv(edi=fd): read + decrypt application records into respbuf until a
+; quiet period or close. Sets resp_total, like read_response.
+tls_app_recv:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    and rsp, -16                          ; align for the SSE open
+    mov ebx, edi
+    mov qword [resp_total], 0
+    mov r13d, 3000
+.loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, r13d
+    syscall
+    test rax, rax
+    jle .done
+    mov edi, ebx
+    call read_tls_record
+    test rax, rax
+    js .done
+    cmp rax, 20
+    je .next                               ; CCS
+    cmp rax, 23
+    jne .done
+    lea rdi, [tls_rkeys]
+    lea rsi, [tls_rec]
+    mov rdx, [rec_total]
+    lea rcx, [tls_pt]
+    call linnea_tls_open                   ; rax=len, rdx=inner type
+    test rax, rax
+    js .done
+    cmp rdx, 21
+    je .done                               ; alert (close_notify)
+    cmp rdx, 23
+    jne .next                              ; e.g. post-handshake NewSessionTicket
+    ; append plaintext to respbuf
+    mov rcx, [resp_total]
+    lea rdi, [respbuf + rcx]
+    lea rsi, [tls_pt]
+    mov rcx, rax
+    rep movsb
+    add [resp_total], rax
+.next:
+    mov r13d, 400
+    jmp .loop
+.done:
+    mov rax, [resp_total]
+    lea rsp, [rbp - 24]
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
 ; memeq(rsi=a, rdi=b, edx=len) -> rax=1 if the len bytes match
 memeq:
     xor eax, eax
@@ -1799,3 +2534,5 @@ defslash:  db "/"
 
 section .bss
 resp_total: resq 1
+parse_off:  resq 1                      ; handshake-message parse cursor
+rec_total:  resq 1                      ; length of the last TLS record read

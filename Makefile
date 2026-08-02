@@ -283,7 +283,9 @@ h3resp: $(H3RESP_BIN)
 
 # --- HTTP compliance prober (own _start; a client, not part of the server) ---
 PROBE_BIN  = bin/linnea-probe
-PROBE_OBJS = test/probe/linnea_probe.o src/linnea_print.o src/linnea_string.o
+PROBE_OBJS = test/probe/linnea_probe.o src/linnea_print.o src/linnea_string.o \
+             src/linnea_tls_kdf.o src/linnea_tls_record.o src/linnea_aesgcm.o \
+             src/linnea_sha256.o src/linnea_x25519.o src/linnea_fe25519.o
 
 test/probe/linnea_probe.o: test/probe/linnea_probe.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
