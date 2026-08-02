@@ -284,6 +284,21 @@ version_11:     db "HTTP/1.1"          ; 8 bytes, compared as one qword
 version_10:     db "HTTP/1.0"          ; accepted from an upstream, rewritten
 crlf:           db 13, 10
 crlfcrlf:       db 13, 10, 13, 10
+; The methods RFC 9110 defines, plus PATCH (RFC 5789). A method in this list is
+; one we recognise but do not serve here, which is 405 with an Allow header; one
+; that is not is 501, because 15.6.2 makes that "the appropriate response when
+; the server does not recognize the request method". Answering 405 to both told
+; a client that FROB is a real method simply not allowed on this resource.
+; Length-prefixed and contiguous, terminated by a zero length. Case-sensitive:
+; RFC 9110 9.1 makes the method case-sensitive, so "get" is not GET.
+known_methods:  db 4, "POST"
+                db 3, "PUT"
+                db 6, "DELETE"
+                db 7, "CONNECT"
+                db 7, "OPTIONS"
+                db 5, "TRACE"
+                db 5, "PATCH"
+                db 0
 method_get:     db "GET"
 method_head:    db "HEAD"
 index_html:     db "index.html"
@@ -797,6 +812,35 @@ linnea_http_handle:
     jne .method_known
     mov qword [rsp], 1         ; HEAD
 .method_known:
+    cmp qword [rsp], -1
+    jne .method_classified     ; GET or HEAD: nothing to look up
+    ; not GET or HEAD: recognised (405) or not (501)? r14/r15 are the method
+    ; bytes and length, and both are callee-saved, so only the walk's own
+    ; cursor needs saving across the compare — which keeps the pushes even and
+    ; the stack aligned for it.
+    lea r9, [known_methods]
+.km_loop:
+    movzx ecx, byte [r9]
+    test ecx, ecx
+    jz .km_unknown
+    cmp rcx, r15
+    jne .km_next
+    push r9
+    push rcx
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [r9 + 1]
+    call linnea_string_equal   ; case-sensitive: a method is (9.1)
+    pop rcx
+    pop r9
+    test eax, eax
+    jnz .method_classified     ; a method we know: the 405 already set stands
+.km_next:
+    lea r9, [r9 + rcx + 1]
+    jmp .km_loop
+.km_unknown:
+    mov qword [rsp], -2        ; unrecognised: 501
+.method_classified:
     inc r15                    ; skip the SP
 
     ; --- target ---------------------------------------------------
@@ -1671,8 +1715,10 @@ linnea_http_handle:
     ; --- static location ---------------------------------------------
     cmp qword [rsp + 288], 0
     jne .resp_413              ; only a proxy streams a body this large
+    cmp qword [rsp], -2
+    je .resp_501               ; a method we do not recognise at all (15.6.2)
     cmp qword [rsp], -1
-    je .resp_405               ; files are GET/HEAD only
+    je .resp_405               ; a method we know, but files are GET/HEAD only
     mov rdi, r15               ; path end, from the match above
     mov r9, [rsp + 168]        ; directory flag
     test r9d, r9d

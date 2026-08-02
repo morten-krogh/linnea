@@ -129,4 +129,23 @@ else:
           f"strict and would refuse conforming clients")
     fails += 1
 
+
+# --- 405 for a method we know, 501 for one we do not (RFC 9110 15.6.2) -----
+# Both used to be 405 with an Allow header, which tells a client that FROB is a
+# real method simply not permitted here.
+for method, want in (("POST", 405), ("PUT", 405), ("DELETE", 405),
+                     ("OPTIONS", 405), ("TRACE", 405), ("PATCH", 405),
+                     ("CONNECT", 405),
+                     ("FROB", 501), ("get", 501), ("XYZZY", 501)):
+    status, f6, _ = send(f"{method} /hello.txt HTTP/1.1\r\nHost: one.test\r\n"
+                         f"\r\n".encode())
+    if status != want:
+        print(f"FAIL {method} gave {status}, want {want}")
+        fails += 1
+    elif want == 405 and not f6.get("allow"):
+        print(f"FAIL {method} gave 405 without an Allow header (15.5.6)")
+        fails += 1
+    else:
+        print(f"ok   {method} -> {status}")
+
 sys.exit(1 if fails else 0)

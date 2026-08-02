@@ -1437,22 +1437,31 @@ check_http "target: OPTIONS * with a chunked body is answered" "200 OK" "$resp"
 # --- the method is a token (RFC 9110 9.1). The request-line parse only bounded
 # it to printable ASCII, so every delimiter got through — including the double
 # quote, which the access line writes the method inside, splitting its own
-# quoted field. An unknown but well-formed method still reaches the 405.
+# quoted field. An unknown but well-formed method still parses as a method.
+#
+# Its ANSWER is 501, not 405: 15.6.2 makes 501 "the appropriate response when
+# the server does not recognize the request method", where 405 says the method
+# is known and merely not allowed here. These checks asserted 405 for both,
+# which told a client PROPFIND was a real method this resource declines.
 resp=$(raw_http 'PROPFIND /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
-check_http "method: an unknown token method is 405, not 400" "405 Method Not Allowed" "$resp"
-# RFC 9110 15.5.6: a 405 must name what the resource does take
+check_http "method: an unknown token method is 501, not 400" "501 Not Implemented" "$resp"
+# RFC 9110 15.5.6: a 405 must name what the resource does take — so it is asked
+# with a method we DO recognise
+resp=$(raw_http 'POST /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "method: a known method gets 405" "405 Method Not Allowed" "$resp"
 check_http "method: the 405 carries Allow" "Allow: GET, HEAD" "$resp"
 resp=$(raw_http '!#$%&\x27*+-.^_`|~ /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
-check_http "method: every tchar punctuation is still a method" "405 Method Not Allowed" "$resp"
+check_http "method: every tchar punctuation is still a method" "501 Not Implemented" "$resp"
 resp=$(raw_http 'GE"T /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "method: a double quote is 400" "400 Bad Request" "$resp"
 resp=$(raw_http 'GE/T /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "method: a delimiter is 400" "400 Bad Request" "$resp"
 resp=$(raw_http 'GE\x1bT /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "method: a control byte is 400" "400 Bad Request" "$resp"
-# a method is case-sensitive (RFC 9110 9.1), so "get" is not GET
+# a method is case-sensitive (RFC 9110 9.1), so "get" is not GET — and not a
+# method we recognise at all, which is 501
 resp=$(raw_http 'get /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
-check_http "method: lowercase get is 405, not a served file" "405 Method Not Allowed" "$resp"
+check_http "method: lowercase get is 501, not a served file" "501 Not Implemented" "$resp"
 # None of those reached the access log, which is what the quote could break.
 # Matched through cat -v so the ESC shows as ^[, and with -F so the quote and
 # the brackets are literal — "GE alone would match every ordinary GET line.
