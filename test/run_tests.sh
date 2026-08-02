@@ -863,6 +863,28 @@ else
     check "h3 in-flight drain test (skipped: deps unavailable)" 0
 fi
 
+# GOAWAY must stop processing what it disowns (h3-7, RFC 9114 5.2): on a
+# draining connection a request at/above the GOAWAY's stream id draws
+# RESET_STREAM(H3_REQUEST_REJECTED), not a response — else a client that
+# retried it elsewhere (as the GOAWAY instructs) runs it twice. The window
+# only exists on a connection the drain sweep left alive, so the test holds a
+# stalled response in flight across the drain, then checks the disowned
+# stream is rejected AND the in-flight response still completes.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    rm -f test/linnea.log
+    $BIN --config test/configs/tls-h3-drain.json >/dev/null 2>&1 &
+    gr_master=$!
+    sleep 0.5
+    timeout 60 python3 test/quic/h3_goaway_reject_test.py 47453 $gr_master >/dev/null 2>&1
+    check "h3 (io_uring): drain rejects disowned streams (0x10b), serves owned" $?
+    kill $gr_master 2>/dev/null
+    wait $gr_master 2>/dev/null
+    pkill -f tls-h3-drain 2>/dev/null
+    rm -f test/linnea.log
+else
+    check "h3 GOAWAY reject test (skipped: deps unavailable)" 0
+fi
+
 # Steering handoff across a hot upgrade (Q118): a master handed the previous
 # generation's bpf map+program in LINNEA_UPGRADE stamps its connection ids from
 # the other half of the index space (base 64), so the draining generation's

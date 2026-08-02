@@ -36,6 +36,7 @@ LINNEA_H3_ERR_FRAME            equ 0x0106  ; a frame's payload does not match it
 LINNEA_H3_ERR_ID               equ 0x0108  ; an id a frame named cannot exist
 LINNEA_H3_ERR_SETTINGS         equ 0x0109  ; a reserved or repeated setting identifier
 LINNEA_H3_ERR_MISSING_SETTINGS equ 0x010a  ; control stream opened without SETTINGS
+LINNEA_H3_ERR_REQ_REJECTED     equ 0x010b  ; not processed — safe to retry elsewhere
 LINNEA_H3_ERR_REQ_INCOMPLETE   equ 0x010d  ; the stream ended before a whole message
 LINNEA_H3_ERR_MESSAGE          equ 0x010e  ; the message decoded but breaks a rule
 LINNEA_H3_ERR_QPACK_DECOMP     equ 0x0200  ; QPACK could not decode a field section

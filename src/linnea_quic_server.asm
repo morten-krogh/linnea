@@ -2209,6 +2209,24 @@ linnea_quic_server_datagram:
     call .send_1rtt
     jmp .stream_scan
 .req_ok:
+    ; Draining: the GOAWAY promised that streams at or above h3_goaway_id would
+    ; not be processed (RFC 9114 5.2), so serving one anyway means the client
+    ; may see the same request run twice — here and on the connection it retried
+    ; on. Reject it with H3_REQUEST_REJECTED, the code 5.2 names as telling the
+    ; client the request was not processed and may be retried. Below the id the
+    ; request is one the GOAWAY promised TO finish, so it is served as ever.
+    cmp dword [linnea_quic_draining], 0
+    je .req_owned
+    mov rax, [cur_conn]
+    mov rdx, [s_sid]
+    cmp rdx, [rax + linnea_quic_conn.h3_goaway_id]
+    jb .req_owned
+    mov rdi, [s_sid]
+    xor esi, esi                     ; nothing was sent in the direction we reset
+    mov edx, LINNEA_H3_ERR_REQ_REJECTED
+    call tx_reset_stream_code
+    jmp .stream_scan
+.req_owned:
     mov [s_body_ptr], r8             ; keep the body across the response build
     mov [s_body_len], r9
     ; the access line's who-and-what: peer text, method, target. The vhost's
