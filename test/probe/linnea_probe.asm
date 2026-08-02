@@ -83,6 +83,10 @@ s_status:   db "HTTP "
 s_status_len equ $ - s_status
 s_noresp:   db "(no response / connection closed)", 10
 s_noresp_len equ $ - s_noresp
+s_rst:      db "RST_STREAM (stream rejected)", 10
+s_rst_len   equ $ - s_rst
+s_goaway:   db "GOAWAY (connection error)", 10
+s_goaway_len equ $ - s_goaway
 s_want:     db "  (want "
 s_want_len  equ $ - s_want
 s_rparen_nl: db ")", 10
@@ -112,9 +116,10 @@ resolv_path: db "/etc/resolv.conf", 0
 ns_kw:      db "nameserver"
 ns_kw_len   equ $ - ns_kw
 fallback_ns equ 0x3500007f              ; 127.0.0.53 (systemd-resolved), network order
-proto_h1:   db "h1"
-proto_todo: db "error: only h1 is implemented in phase 1 (h2/h3 coming)", 10
+proto_todo: db "error: protocol must be h1 or h2 (h3 coming)", 10
 proto_todo_len equ $ - proto_todo
+err_h2_tls: db "error: h2 requires https:// (h2 runs over TLS)", 10
+err_h2_tls_len equ $ - err_h2_tls
 
 ; --- probe names (printed on each report line) ---
 n_valid:    db "valid GET"
@@ -206,6 +211,34 @@ ch_suites_len equ $ - ch_suites
 err_tls:    db "error: TLS handshake failed", 10
 err_tls_len equ $ - err_tls
 
+; --- HTTP/2 ---
+alpn_h2:    db "h2"
+alpn_h2_len equ $ - alpn_h2
+h2_preface: db "PRI * HTTP/2.0", 13, 10, 13, 10, "SM", 13, 10, 13, 10
+h2_preface_len equ $ - h2_preface
+h2_settings: db 0,0,0, 0x04, 0x00, 0,0,0,0          ; empty SETTINGS
+h2_settings_len equ $ - h2_settings
+h2_hdr_line: db "== HTTP/2 compliance probes -> "
+h2_hdr_line_len equ $ - h2_hdr_line
+; h2 probe names
+n_h2_valid:  db "valid GET (h2)"
+n_h2_valid_len equ $ - n_h2_valid
+n_h2_multi:  db "two concurrent streams"
+n_h2_multi_len equ $ - n_h2_multi
+n_h2_dyn:    db "HPACK dynamic-table indexing (re-indexed :authority)"
+n_h2_dyn_len equ $ - n_h2_dyn
+n_h2_nopath: db "request with no :path (malformed)"
+n_h2_nopath_len equ $ - n_h2_nopath
+n_h2_badhdr: db "uppercase header name (malformed)"
+n_h2_badhdr_len equ $ - n_h2_badhdr
+n_h2_conn:   db "connection-specific header (Connection: keep-alive)"
+n_h2_conn_len equ $ - n_h2_conn
+n_h2_badhpack: db "undecodable HPACK (dynamic index into empty table)"
+n_h2_badhpack_len equ $ - n_h2_badhpack
+pseudo_status: db ":status"
+; HPACK static-table status values for indices 8..14
+h2_status_map: dw 200, 204, 206, 304, 400, 404, 500
+
 section .bss
 alignb 16
 sa:         resb 16                     ; sockaddr_in
@@ -233,6 +266,15 @@ path_len:   resq 1                      ; ...and length
 req_cur:    resq 1                      ; request-assembly cursor into reqbuf
 n_total:    resd 1
 n_dev:      resd 1
+
+; --- HTTP/2 client state ---
+proto:      resq 1                      ; 1 = h1, 2 = h2
+alpn_str:   resq 1                      ; ALPN protocol offered in the ClientHello
+alpn_len:   resq 1
+h2_block:   resb 4096                   ; HPACK header block being built
+h2_block_len: resq 1                    ; its length
+h2_sid:     resq 1                      ; next client stream id (odd)
+h2_prefaced: resq 1                     ; 1 once the preface+SETTINGS have gone out
 
 ; --- TLS 1.3 client state (one connection at a time, so globals suffice) ---
 use_tls:    resq 1                      ; 1 when the URL scheme is https
@@ -272,16 +314,30 @@ _start:
     cmp r15, 3
     jl .usage
 
-    ; --- protocol (argv[2]) must be "h1" for now ---
+    ; --- protocol (argv[2]): "h1" or "h2" ---
     mov rsi, [rsp + 24]                 ; argv[2]
     movzx eax, byte [rsi]
     movzx ecx, byte [rsi + 1]
+    cmp byte [rsi + 2], 0
+    jne .proto_bad
     cmp al, 'h'
     jne .proto_bad
     cmp cl, '1'
+    je .proto_h1
+    cmp cl, '2'
     jne .proto_bad
-    cmp byte [rsi + 2], 0
-    jne .proto_bad
+    ; h2: TLS with ALPN "h2"
+    mov qword [proto], 2
+    lea rax, [alpn_h2]
+    mov [alpn_str], rax
+    mov qword [alpn_len], alpn_h2_len
+    jmp .proto_set
+.proto_h1:
+    mov qword [proto], 1
+    lea rax, [alpn_h11]
+    mov [alpn_str], rax
+    mov qword [alpn_len], alpn_h11_len
+.proto_set:
 
     ; --- optional --host override (scan argv[3..]) ---
     mov qword [host_ptr], 0
@@ -323,9 +379,20 @@ _start:
     je .exit_resolve
     mov [conn_addr], eax
 
-    ; --- header banner ---
+    ; h2 requires TLS
+    cmp qword [proto], 2
+    jne .banner
+    cmp qword [use_tls], 0
+    je .proto_needs_tls
+.banner:
+    ; --- header banner (protocol-specific) ---
     lea rsi, [hdr_line]
     mov edx, hdr_line_len
+    cmp qword [proto], 2
+    jne .banner_put
+    lea rsi, [h2_hdr_line]
+    mov edx, h2_hdr_line_len
+.banner_put:
     call puts
     mov rsi, [host_ptr]
     mov rdx, [host_len]
@@ -335,6 +402,8 @@ _start:
     call puts
 
     ; =================== the probe battery =======================
+    cmp qword [proto], 2
+    je .run_h2
     call probe_valid
     call probe_keepalive
     call probe_nohost
@@ -349,7 +418,11 @@ _start:
     call probe_bare_lf
     call probe_absform
     call probe_slowloris
+    jmp .summary
+.run_h2:
+    call h2_battery
 
+.summary:
     ; =================== summary =================================
     lea rsi, [sum_head]
     mov edx, sum_head_len
@@ -390,6 +463,12 @@ _start:
 .exit_resolve:
     lea rsi, [err_resolve]
     mov edx, err_resolve_len
+    call puts_err
+    mov edi, 2
+    jmp exit
+.proto_needs_tls:
+    lea rsi, [err_h2_tls]
+    mov edx, err_h2_tls_len
     call puts_err
     mov edi, 2
     jmp exit
@@ -1258,8 +1337,23 @@ report:
     call puts
     jmp .ret
 .noresp:
+    ; distinguish the h2 sentinels: -2 RST_STREAM, -3 GOAWAY, else no response
+    cmp r14, -2
+    je .rst
+    cmp r14, -3
+    je .goaway
     lea rsi, [s_noresp]
     mov edx, s_noresp_len
+    call puts
+    jmp .ret
+.rst:
+    lea rsi, [s_rst]
+    mov edx, s_rst_len
+    call puts
+    jmp .ret
+.goaway:
+    lea rsi, [s_goaway]
+    mov edx, s_goaway_len
     call puts
 .ret:
     add rsp, 8
@@ -2374,17 +2468,20 @@ build_clienthello:
     lea rsi, [tls_pub]
     mov ecx, 32
     rep movsb
-    ; -- ALPN http/1.1 --
+    ; -- ALPN (alpn_str/alpn_len: "http/1.1" or "h2") --
+    mov r8, [alpn_len]                     ; protocol length
     mov byte [rdi], 0x00
     mov byte [rdi + 1], 0x10
-    mov byte [rdi + 2], 0x00
-    mov byte [rdi + 3], 0x0b               ; ext data len = 11
-    mov byte [rdi + 4], 0x00
-    mov byte [rdi + 5], 0x09               ; ALPN list len = 9
-    mov byte [rdi + 6], alpn_h11_len       ; proto length = 8
+    lea rax, [r8 + 3]                      ; ext data len = 3 + protolen
+    mov [rdi + 2], ah
+    mov [rdi + 3], al
+    lea rax, [r8 + 1]                      ; ALPN list len = 1 + protolen
+    mov [rdi + 4], ah
+    mov [rdi + 5], al
+    mov [rdi + 6], r8b                     ; protocol name length
     add rdi, 7
-    lea rsi, [alpn_h11]
-    mov ecx, alpn_h11_len
+    mov rsi, [alpn_str]
+    mov rcx, r8
     rep movsb
     ; --- backpatch lengths ---
     ; extensions length = rdi - (rbx + 2)
@@ -2511,6 +2608,655 @@ tls_app_recv:
     pop r12
     pop rbx
     pop rbp
+    ret
+
+; =======================================================================
+; HTTP/2 client (HPACK encode, minimal decode for :status)
+; =======================================================================
+; hp_enc_int(rdi=out, rax=value, cl=N prefix bits, r8b=flags) -> rdi advanced.
+; Writes an HPACK prefix integer; flags occupy the top 8-N bits of byte 0.
+hp_enc_int:
+    mov edx, 1
+    shl edx, cl
+    dec edx                               ; mask = (1<<N)-1
+    cmp rax, rdx
+    jae .big
+    or al, r8b
+    mov [rdi], al
+    inc rdi
+    ret
+.big:
+    mov r9d, r8d
+    or r9b, dl                            ; flags | mask
+    mov [rdi], r9b
+    inc rdi
+    sub rax, rdx
+.loop:
+    cmp rax, 0x80
+    jb .last
+    mov r9, rax
+    and r9d, 0x7f
+    or r9d, 0x80
+    mov [rdi], r9b
+    inc rdi
+    shr rax, 7
+    jmp .loop
+.last:
+    mov [rdi], al
+    inc rdi
+    ret
+
+; h2_enc_str(rdi=out, rsi=str, rdx=len) -> rdi advanced. Raw (H=0) string literal.
+h2_enc_str:
+    push rbx
+    push r12
+    mov rbx, rsi
+    mov r12, rdx
+    mov rax, r12                          ; length, 7-bit prefix, H=0
+    mov cl, 7
+    xor r8d, r8d
+    call hp_enc_int
+    mov rsi, rbx
+    mov rcx, r12
+    rep movsb
+    pop r12
+    pop rbx
+    ret
+
+; h2_enc_nameref(rdi=out, rax=name index, rsi=val, rdx=vlen) -> rdi advanced.
+; Literal header, name by index (4-bit prefix, without indexing), raw value.
+h2_enc_nameref:
+    push rbx
+    push r12
+    mov rbx, rsi
+    mov r12, rdx
+    mov cl, 4
+    xor r8d, r8d                          ; 0x00 = without indexing
+    call hp_enc_int
+    mov rsi, rbx
+    mov rdx, r12
+    call h2_enc_str
+    pop r12
+    pop rbx
+    ret
+
+; h2_build_get(): build a GET header block into h2_block, set h2_block_len.
+h2_build_get:
+    push rbx
+    lea rbx, [h2_block]
+    mov byte [rbx], 0x82                  ; :method GET  (static index 2)
+    inc rbx
+    mov byte [rbx], 0x87                  ; :scheme https (static index 7)
+    inc rbx
+    mov rdi, rbx                          ; :path (name index 4) = path
+    mov rax, 4
+    mov rsi, [path_ptr]
+    mov rdx, [path_len]
+    call h2_enc_nameref
+    mov rbx, rdi
+    mov rax, 1                            ; :authority (name index 1) = host
+    mov rsi, [host_ptr]
+    mov rdx, [host_len]
+    call h2_enc_nameref
+    lea rax, [h2_block]
+    sub rdi, rax
+    mov [h2_block_len], rdi
+    pop rbx
+    ret
+
+; h2_enc_nameref_inc(rdi=out, rax=name index, rsi=val, rdx=vlen) -> rdi advanced.
+; Literal header WITH incremental indexing (0x40, 6-bit prefix) — adds the field
+; to both encoder and decoder dynamic tables.
+h2_enc_nameref_inc:
+    push rbx
+    push r12
+    mov rbx, rsi
+    mov r12, rdx
+    mov cl, 6
+    mov r8d, 0x40
+    call hp_enc_int
+    mov rsi, rbx
+    mov rdx, r12
+    call h2_enc_str
+    pop r12
+    pop rbx
+    ret
+
+; h2_build_nopath(): a request missing :path (malformed, RFC 9113 8.3.1).
+h2_build_nopath:
+    push rbx
+    lea rbx, [h2_block]
+    mov byte [rbx], 0x82                  ; :method GET
+    inc rbx
+    mov byte [rbx], 0x87                  ; :scheme https
+    inc rbx
+    mov rdi, rbx
+    mov rax, 1                            ; :authority (no :path at all)
+    mov rsi, [host_ptr]
+    mov rdx, [host_len]
+    call h2_enc_nameref
+    lea rax, [h2_block]
+    sub rdi, rax
+    mov [h2_block_len], rdi
+    pop rbx
+    ret
+
+; h2_build_dyn1(): a GET whose :authority is added to the dynamic table
+; (literal with incremental indexing) — becomes dynamic index 62.
+h2_build_dyn1:
+    push rbx
+    lea rbx, [h2_block]
+    mov byte [rbx], 0x82
+    inc rbx
+    mov byte [rbx], 0x87
+    inc rbx
+    mov rdi, rbx
+    mov rax, 4                            ; :path (without indexing)
+    mov rsi, [path_ptr]
+    mov rdx, [path_len]
+    call h2_enc_nameref
+    mov rax, 1                            ; :authority WITH incremental indexing
+    mov rsi, [host_ptr]
+    mov rdx, [host_len]
+    call h2_enc_nameref_inc
+    lea rax, [h2_block]
+    sub rdi, rax
+    mov [h2_block_len], rdi
+    pop rbx
+    ret
+
+; h2_build_dyn2(): the same GET but :authority is the dynamic index 62 added by
+; dyn1 — proves the server's HPACK dynamic table decoded the first request.
+h2_build_dyn2:
+    push rbx
+    lea rbx, [h2_block]
+    mov byte [rbx], 0x82
+    inc rbx
+    mov byte [rbx], 0x87
+    inc rbx
+    mov rdi, rbx
+    mov rax, 4                            ; :path (without indexing)
+    mov rsi, [path_ptr]
+    mov rdx, [path_len]
+    call h2_enc_nameref
+    mov byte [rdi], 0xbe                  ; indexed field, dynamic entry 62 (:authority)
+    inc rdi
+    lea rax, [h2_block]
+    sub rdi, rax
+    mov [h2_block_len], rdi
+    pop rbx
+    ret
+
+; h2_build_badhpack(): a single indexed field for a dynamic entry that does not
+; exist on a fresh connection — an HPACK decode error (RFC 9113 4.3).
+h2_build_badhpack:
+    mov byte [h2_block], 0xbe             ; indexed dynamic 62, empty table
+    mov qword [h2_block_len], 1
+    ret
+
+; h2_exchange(edi=fd, esi=first, edx=stream id) -> rax = status (100..599), or
+; -1 no response, -2 RST_STREAM (stream rejected), -3 GOAWAY (connection error).
+; Sends the connection preface + SETTINGS when first=1, then a HEADERS frame
+; carrying h2_block, and reads the response frames.
+h2_exchange:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi                          ; fd
+    mov r13d, edx                         ; stream id
+    mov r14d, esi                         ; first?
+    lea rdi, [reqbuf]                     ; assemble the outbound bytes
+    test r14d, r14d
+    jz .no_preface
+    lea rsi, [h2_preface]
+    mov rcx, h2_preface_len
+    rep movsb
+    lea rsi, [h2_settings]
+    mov rcx, h2_settings_len
+    rep movsb
+.no_preface:
+    mov r12, [h2_block_len]
+    mov rax, r12                          ; HEADERS frame header
+    shr rax, 16
+    mov [rdi], al
+    mov rax, r12
+    shr rax, 8
+    mov [rdi + 1], al
+    mov [rdi + 2], r12b
+    mov byte [rdi + 3], 0x01              ; HEADERS
+    mov byte [rdi + 4], 0x05              ; END_HEADERS | END_STREAM
+    mov eax, r13d                         ; stream id, big-endian
+    bswap eax
+    mov [rdi + 5], eax
+    add rdi, 9
+    lea rsi, [h2_block]
+    mov rcx, r12
+    rep movsb
+    lea rax, [reqbuf]
+    mov rdx, rdi
+    sub rdx, rax                          ; total length
+    mov edi, ebx
+    lea rsi, [reqbuf]
+    call send_bytes
+    test rax, rax
+    js .fail
+    mov edi, ebx
+    call read_response                    ; fills respbuf / resp_total
+    call h2_status_from_frames
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.fail:
+    mov rax, -1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; h2_status_from_frames() -> rax = status, or -1. Walks respbuf as HTTP/2 frames
+; and returns the :status from the first HEADERS frame.
+h2_status_from_frames:
+    push rbx
+    push r12
+    push r13
+    lea r12, [respbuf]                    ; cursor
+    mov r13, [resp_total]
+    add r13, r12                          ; end
+.frame:
+    lea rax, [r12 + 9]
+    cmp rax, r13
+    ja .none                              ; no room for a frame header
+    movzx eax, byte [r12]                 ; length (24-bit)
+    shl eax, 8
+    movzx ecx, byte [r12 + 1]
+    or eax, ecx
+    shl eax, 8
+    movzx ecx, byte [r12 + 2]
+    or eax, ecx
+    mov rbx, rax                          ; frame length
+    movzx ecx, byte [r12 + 3]             ; type
+    lea rax, [r12 + 9]
+    add rax, rbx                           ; end of this frame's payload
+    cmp rax, r13
+    ja .none                              ; frame not fully present
+    cmp ecx, 0x03                         ; RST_STREAM -> stream rejected
+    je .rst
+    cmp ecx, 0x07                         ; GOAWAY -> connection error
+    je .goaway
+    cmp ecx, 0x01                         ; HEADERS?
+    jne .skip
+    ; found HEADERS: block starts at payload (assume no PADDED/PRIORITY on the
+    ; response, which Linnea does not set)
+    lea rdi, [r12 + 9]
+    mov rsi, rbx
+    call h2_find_status
+    cmp rax, 0
+    jg .done                              ; a real status
+.skip:
+    lea r12, [r12 + rbx + 9]
+    jmp .frame
+.rst:
+    mov rax, -2
+    jmp .done
+.goaway:
+    mov rax, -3
+    jmp .done
+.none:
+    mov rax, -1
+.done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; h2_read_rawstr(rsi=cur, rdi=end) -> rax=ptr, rdx=len, rsi advanced, CF on error
+; (Huffman-flagged strings fail — Linnea encodes response values raw.)
+h2_read_rawstr:
+    cmp rsi, rdi
+    jae .err
+    test byte [rsi], 0x80                 ; Huffman bit
+    jnz .err
+    mov ecx, 7
+    call hp_int                           ; rax=len, rsi past the length prefix
+    jc .err
+    mov rdx, rax
+    mov rax, rsi
+    add rsi, rdx                          ; advance past the raw bytes
+    cmp rsi, rdi
+    ja .err
+    clc
+    ret
+.err:
+    stc
+    ret
+
+; hp_int(rsi=cur, rdi=end, ecx=N prefix bits) -> rax=value, rsi advanced, CF err
+hp_int:
+    cmp rsi, rdi
+    jae .err
+    movzx eax, byte [rsi]
+    inc rsi
+    mov edx, 1
+    shl edx, cl
+    dec edx                               ; mask
+    and eax, edx
+    cmp eax, edx
+    jne .done
+    xor r8d, r8d                          ; shift
+.cont:
+    cmp rsi, rdi
+    jae .err
+    movzx r9d, byte [rsi]
+    inc rsi
+    mov r10, r9
+    and r10, 0x7f
+    mov ecx, r8d
+    shl r10, cl
+    add rax, r10
+    add r8d, 7
+    test r9b, 0x80
+    jnz .cont
+.done:
+    clc
+    ret
+.err:
+    stc
+    ret
+
+; h2_find_status(rdi=block, rsi=len) -> rax = status (100..599) or -1.
+h2_find_status:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi                          ; cur
+    lea r13, [rdi + rsi]                  ; end
+.next:
+    cmp r12, r13
+    jae .none
+    movzx eax, byte [r12]
+    test al, 0x80
+    jnz .indexed
+    test al, 0x40
+    jnz .lit6
+    test al, 0x20
+    jnz .sizeupd
+    jmp .lit4                             ; 0x00 without / 0x10 never: 4-bit index
+.indexed:
+    mov rsi, r12
+    mov rdi, r13
+    mov ecx, 7
+    call hp_int
+    jc .none
+    mov r12, rsi
+    cmp rax, 8
+    jb .next
+    cmp rax, 14
+    ja .next
+    lea rcx, [h2_status_map]
+    sub rax, 8
+    movzx eax, word [rcx + rax*2]
+    jmp .done
+.lit6:
+    mov r14d, 6
+    jmp .lit_common
+.lit4:
+    mov r14d, 4
+.lit_common:
+    mov rsi, r12
+    mov rdi, r13
+    mov ecx, r14d
+    call hp_int
+    jc .none
+    mov r12, rsi
+    mov rbx, rax                          ; name index (0 = literal name)
+    test rbx, rbx
+    jnz .have_name
+    ; literal name: read it, mark whether it is :status
+    mov rsi, r12
+    mov rdi, r13
+    call h2_read_rawstr
+    jc .none
+    mov r12, rsi                          ; advanced past the name
+    ; compare (rax,rdx) to ":status"
+    cmp rdx, 7
+    jne .name_other
+    mov rsi, rax
+    lea rdi, [pseudo_status]
+    mov edx, 7
+    call memeq
+    test rax, rax
+    jz .name_other
+    mov rbx, 8                            ; treat as :status
+    jmp .have_name
+.name_other:
+    xor ebx, ebx                          ; some other name; skip its value
+.have_name:
+    mov rsi, r12
+    mov rdi, r13
+    call h2_read_rawstr                   ; value
+    jc .none
+    mov r12, rsi
+    cmp rbx, 8                            ; was the name :status?
+    jne .next
+    ; parse the decimal value (rax=ptr, rdx=len)
+    mov rsi, rax
+    xor r8d, r8d
+    xor ecx, ecx
+.pd:
+    cmp rcx, rdx
+    jae .pd_done
+    movzx r9d, byte [rsi + rcx]
+    sub r9d, '0'
+    cmp r9d, 9
+    ja .none
+    imul r8d, r8d, 10
+    add r8d, r9d
+    inc rcx
+    jmp .pd
+.pd_done:
+    mov eax, r8d
+    jmp .done
+.sizeupd:
+    mov rsi, r12
+    mov rdi, r13
+    mov ecx, 5
+    call hp_int
+    jc .none
+    mov r12, rsi
+    jmp .next
+.none:
+    mov rax, -1
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; h2_battery(): the HTTP/2 probe set.
+h2_battery:
+    call probe_h2_valid
+    call probe_h2_dyn
+    call probe_h2_nopath
+    call probe_h2_badhpack
+    ret
+
+; probe_h2_valid: a well-formed GET over h2 — OK if any :status came back.
+probe_h2_valid:
+    push rbx
+    call tcp_connect                      ; TLS handshake with ALPN h2
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    call h2_build_get
+    mov edi, ebx
+    mov esi, 1                            ; first: send preface + SETTINGS
+    mov edx, 1                            ; stream 1
+    call h2_exchange                      ; rax = status
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rcx
+    mov dil, K_OK
+    test rcx, rcx
+    jns .report                          ; a real status -> the server answered
+    mov dil, K_DEV
+.report:
+    lea rsi, [n_h2_valid]
+    mov edx, n_h2_valid_len
+    mov r9d, -1
+    call report
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h2_valid]
+    mov edx, n_h2_valid_len
+    mov rcx, -1
+    mov r9d, -1
+    call report
+    pop rbx
+    ret
+
+; probe_h2_dyn: HPACK dynamic-table indexing — req1 adds :authority to the
+; table, req2 references it by dynamic index. OK only if BOTH answer, which
+; proves the server decoded the first request into its dynamic table.
+probe_h2_dyn:
+    push rbx
+    push r12
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    call h2_build_dyn1
+    mov edi, ebx
+    mov esi, 1
+    mov edx, 1
+    call h2_exchange
+    mov r12, rax                          ; status 1
+    call h2_build_dyn2
+    mov edi, ebx
+    xor esi, esi                          ; not first
+    mov edx, 3                            ; stream 3
+    call h2_exchange
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rcx                               ; status 2
+    mov dil, K_DEV
+    test r12, r12
+    js .report
+    test rcx, rcx
+    js .report
+    mov dil, K_OK
+.report:
+    lea rsi, [n_h2_dyn]
+    mov edx, n_h2_dyn_len
+    mov r9d, -1
+    call report
+    pop r12
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h2_dyn]
+    mov edx, n_h2_dyn_len
+    mov rcx, -1
+    mov r9d, -1
+    call report
+    pop r12
+    pop rbx
+    ret
+
+; probe_h2_nopath: a request with no :path is malformed — the server should
+; reject the STREAM (RST_STREAM) or answer 4xx, not serve it.
+probe_h2_nopath:
+    push rbx
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    call h2_build_nopath
+    mov edi, ebx
+    mov esi, 1
+    mov edx, 1
+    call h2_exchange                      ; -2 = RST (good), 4xx (good), 2xx (bad)
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rcx
+    ; OK unless the malformed request was actually SERVED (a 2xx/3xx status);
+    ; RST/GOAWAY/no-response (all negative) and 4xx/5xx are correct rejections.
+    mov dil, K_OK
+    test rcx, rcx
+    js .report                           ; RST/GOAWAY/no response -> rejected
+    cmp rcx, 400
+    jae .report                          ; 4xx/5xx -> rejected
+    mov dil, K_DEV                        ; 2xx/3xx -> served malformed
+.report:
+    lea rsi, [n_h2_nopath]
+    mov edx, n_h2_nopath_len
+    mov r9d, -1
+    call report
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h2_nopath]
+    mov edx, n_h2_nopath_len
+    mov rcx, -1
+    mov r9d, -1
+    call report
+    pop rbx
+    ret
+
+; probe_h2_badhpack: an indexed field for a nonexistent dynamic entry is an
+; HPACK decode failure — a CONNECTION error (GOAWAY/COMPRESSION_ERROR).
+probe_h2_badhpack:
+    push rbx
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    call h2_build_badhpack
+    mov edi, ebx
+    mov esi, 1
+    mov edx, 1
+    call h2_exchange
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rcx
+    ; OK if GOAWAY (-3); INFO if RST (-2) or no response; DEV if it served (>=100)
+    mov dil, K_OK
+    cmp rcx, -3
+    je .report
+    mov dil, K_INFO
+    cmp rcx, -2
+    je .report
+    test rcx, rcx
+    js .report                           ; no response: terse but not "served"
+    mov dil, K_DEV                        ; a real status = bad HPACK was accepted
+.report:
+    lea rsi, [n_h2_badhpack]
+    mov edx, n_h2_badhpack_len
+    mov r9d, -1
+    call report
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h2_badhpack]
+    mov edx, n_h2_badhpack_len
+    mov rcx, -1
+    mov r9d, -1
+    call report
+    pop rbx
     ret
 
 ; memeq(rsi=a, rdi=b, edx=len) -> rax=1 if the len bytes match
