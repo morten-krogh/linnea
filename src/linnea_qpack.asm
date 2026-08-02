@@ -104,6 +104,13 @@ linnea_qpack_decode:
     jnz .err
     mov r12, rsi
     ; Delta Base: sign bit (bit 7) + 7-bit prefix integer; must be 0.
+    ; The sign used to be discarded (h3-14), accepting S=1 as though it were
+    ; S=0 — but with Required Insert Count 0 a set sign makes the Base
+    ; negative (0 - 0 - 1), which RFC 9204 4.5.1.2 forbids outright.
+    cmp r12, r13
+    jae .err
+    test byte [r12], 0x80
+    jnz .err
     mov rsi, r12
     mov rdi, r13
     mov ecx, 7

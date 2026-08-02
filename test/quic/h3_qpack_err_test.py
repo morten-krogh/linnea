@@ -79,4 +79,13 @@ ev = send_block(port, bytes([0x00, 0x00, 0x40, 0x01, 0x41]))
 assert ev is not None, "connection stayed up on a dynamic name reference"
 assert ev.error_code == 0x200, hex(ev.error_code)
 
+# A NEGATIVE Base (h3-14): Delta Base with the sign bit set. With Required
+# Insert Count 0, S=1 means Base = 0 - 0 - 1 = -1, which RFC 9204 4.5.1.2
+# forbids — but the sign bit used to be discarded, so 0x80 here decoded
+# exactly like 0x00 and the section was served. The field line is a valid
+# static reference (:method GET, index 17), so ONLY the sign is at fault.
+ev = send_block(port, bytes([0x00, 0x80, 0xC0 | 17]))
+assert ev is not None, "connection stayed up on a negative Base (sign bit discarded)"
+assert ev.error_code == 0x200, hex(ev.error_code)
+
 print("ok")
