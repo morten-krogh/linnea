@@ -138,6 +138,7 @@ def probe(chunks, stream_type_prefix=True):
 
 UNEXPECTED = 0x105          # H3_FRAME_UNEXPECTED
 STREAM_CREATION = 0x103     # H3_STREAM_CREATION_ERROR
+FRAME_ERROR = 0x106         # H3_FRAME_ERROR
 SETTINGS = b"\x00\x04\x00"  # control stream type, then an empty SETTINGS frame
 
 # (label, control-stream chunks, expected close code or None for "keeps serving")
@@ -159,9 +160,28 @@ CASES = [
     ("GOAWAY accepted", [SETTINGS + b"\x07\x01\x00"], None),
     ("MAX_PUSH_ID accepted", [SETTINGS + b"\x0d\x01\x00"], None),
     # a frame whose payload is longer than one STREAM frame is still skipped
-    # whole, so the frame after it is read as a frame and not as payload
+    # whole, so the frame after it is read as a frame and not as payload.
+    # (A GREASE type: h3-4 made a 32-byte MAX_PUSH_ID — the type this case
+    # used to wear — an error in its own right.)
     ("long payload spans frames",
-     [SETTINGS + b"\x0d\x20" + b"\x00" * 10, b"\x00" * 22 + b"\x03\x01\x00"], None),
+     [SETTINGS + vlq(0x21) + b"\x20" + b"\x00" * 10,
+      b"\x00" * 22 + b"\x03\x01\x00"], None),
+
+    # h3-4: CANCEL_PUSH, GOAWAY and MAX_PUSH_ID carry exactly one varint, and
+    # a payload longer or shorter than its fields is H3_FRAME_ERROR (7.1) —
+    # the payload used to be skipped by length whatever it held
+    ("GOAWAY with an empty payload", [SETTINGS + b"\x07\x00"], FRAME_ERROR),
+    ("MAX_PUSH_ID with bytes after its id",
+     [SETTINGS + b"\x0d\x03\x05\xaa\xbb"], FRAME_ERROR),
+    ("CANCEL_PUSH ending inside its varint",
+     [SETTINGS + b"\x03\x01\x40"], FRAME_ERROR),
+    ("GOAWAY longer than any varint",
+     [SETTINGS + b"\x07\x09" + b"\x00" * 9], FRAME_ERROR),
+    # ...while a multi-byte id of the declared length is perfectly legal,
+    # including split across STREAM frames (the capture path)
+    ("MAX_PUSH_ID with a 2-byte id", [SETTINGS + b"\x0d\x02\x40\x64"], None),
+    ("GOAWAY id split across frames",
+     [SETTINGS + b"\x07\x02\x40", b"\x64"], None),
 
     # request-stream frames have no business here (7.2.1, 7.2.2)
     ("DATA on the control stream", [SETTINGS + b"\x00\x01\x41"], UNEXPECTED),

@@ -2713,13 +2713,19 @@ linnea_quic_server_datagram:
     add r12, rcx
     sub r13, rcx
     add r14, rcx
-    ; the frame ends here: a captured PRIORITY_UPDATE is now whole, so act on it
+    ; the frame ends here: a captured frame is now whole, so act on it
     cmp qword [rbx + linnea_quic_conn.ctrl_skip], 0
     jne .cw_loop
-    cmp qword [rbx + linnea_quic_conn.ctrl_pucap], 0
-    je .cw_loop
-    cmp qword [rbx + linnea_quic_conn.ctrl_pucap], LINNEA_H3_FRAME_SETTINGS
-    jne .cw_pu_apply
+    mov rax, [rbx + linnea_quic_conn.ctrl_pucap]
+    test rax, rax
+    jz .cw_loop
+    cmp rax, LINNEA_H3_FRAME_SETTINGS
+    je .cw_settings_apply
+    cmp rax, LINNEA_H3_FRAME_PRIORITY_UPDATE
+    jae .cw_pu_apply
+    call .valen_apply                 ; CANCEL_PUSH / GOAWAY / MAX_PUSH_ID:
+    jmp .cw_applied                   ; the payload must be one whole varint
+.cw_settings_apply:
     call .settings_apply              ; eax = 0, or the code to close with
     jmp .cw_applied
 .cw_pu_apply:
@@ -2805,10 +2811,34 @@ linnea_quic_server_datagram:
     je .cw_prio
     cmp rbp, LINNEA_H3_FRAME_PRIORITY_UPDATE_PUSH
     je .cw_prio
-    ; CANCEL_PUSH, GOAWAY and MAX_PUSH_ID belong here, and an unknown type —
-    ; GREASE, or an extension we do not implement — must be ignored (9). Either
-    ; way the payload is discarded.
+    ; CANCEL_PUSH, GOAWAY and MAX_PUSH_ID belong here — and each carries
+    ; exactly one varint (7.2.3/7.2.6/7.2.7), which was never checked (h3-4):
+    ; the payload was skipped by length whatever it held, though 7.1 makes a
+    ; payload longer or shorter than its fields H3_FRAME_ERROR.
+    cmp rbp, LINNEA_H3_FRAME_CANCEL_PUSH
+    je .cw_varint_frame
+    cmp rbp, LINNEA_H3_FRAME_GOAWAY
+    je .cw_varint_frame
+    cmp rbp, LINNEA_H3_FRAME_MAX_PUSH_ID
+    je .cw_varint_frame
+    ; an unknown type — GREASE, or an extension we do not implement — must be
+    ; ignored (9); its payload is discarded
     jmp .cw_loop
+.cw_varint_frame:
+    ; no varint at all, or more bytes than any varint has (8), is refusable at
+    ; the header; an in-range payload is captured like SETTINGS and judged
+    ; whole at the frame's end, wherever its bytes land
+    mov rcx, [rbx + linnea_quic_conn.ctrl_skip]
+    test rcx, rcx
+    jz .cw_frame_err
+    cmp rcx, 8
+    ja .cw_frame_err
+    mov [rbx + linnea_quic_conn.ctrl_pucap], rbp
+    mov qword [rbx + linnea_quic_conn.ctrl_pulen], 0
+    jmp .cw_loop
+.cw_frame_err:
+    mov eax, LINNEA_H3_ERR_FRAME
+    jmp .cw_ret
 .cw_prio:
     mov rcx, [rbx + linnea_quic_conn.ctrl_skip]      ; the declared payload length
     test rcx, rcx
@@ -2867,6 +2897,28 @@ linnea_quic_server_datagram:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; .valen_apply() -> eax = 0, or the H3 error code to close with. The captured
+; frame — CANCEL_PUSH, GOAWAY or MAX_PUSH_ID — must be exactly one varint:
+; its first byte declares the varint's length, and RFC 9114 7.1 makes a
+; payload with bytes beyond its fields, or ending before them, H3_FRAME_ERROR
+; (h3-4; Q182 checked SETTINGS alone). The VALUE is read and not acted on —
+; we never promise a push, so there is no push state for any of the three to
+; name. rbx = conn; clears the capture; preserves the walk's r12/r13/r14.
+.valen_apply:
+    mov qword [rbx + linnea_quic_conn.ctrl_pucap], 0
+    movzx eax, byte [rbx + linnea_quic_conn.ctrl_pu]
+    shr eax, 6
+    mov ecx, eax
+    mov eax, 1
+    shl eax, cl                       ; the length the varint claims for itself
+    cmp rax, [rbx + linnea_quic_conn.ctrl_pulen]
+    jne .va_bad
+    xor eax, eax
+    ret
+.va_bad:
+    mov eax, LINNEA_H3_ERR_FRAME
     ret
 
 ; .ctrl_ro_capture() — the STREAM frame in the s_s* globals arrived ahead of
