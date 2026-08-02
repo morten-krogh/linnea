@@ -618,6 +618,14 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_critical_reset_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): resetting a critical stream is detected" $?
 
+    # h3-6: control-stream enforcement must survive reordering. A STREAM frame
+    # delivered (and acked) ahead of the walked prefix used to be dropped, and
+    # since a reordered frame comes only once, the hole was permanent — every
+    # control-stream rule quietly stopped being enforced there. Held now, and
+    # legal reordering must still close nothing.
+    python3 test/quic/h3_ctrl_reorder_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): control-stream rules survive reordering" $?
+
     # An ack-eliciting packet MUST be acknowledged (RFC 9000 13.2.1). An ACK was
     # only built when the server had something of its own to send, so a lone PING
     # (a browser keepalive) or a lone stream reset drew nothing and the peer

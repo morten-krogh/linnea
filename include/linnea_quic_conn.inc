@@ -134,6 +134,7 @@ LINNEA_QUIC_PU_PEND equ 8
 ; request is never retransmitted — it is lost, and the page stalls). Requests
 ; larger than the buffer, or a burst deeper than the contexts, are still dropped.
 LINNEA_QUIC_RA_BUF      equ 8192    ; reassembly capacity for one request stream
+LINNEA_QUIC_CTRL_RO     equ 512     ; reordered control-stream bytes held (h3-6)
 LINNEA_QUIC_RA_CTXS     equ 6       ; requests that can reassemble concurrently
 
 ; 0-RTT (early data): a resuming client can send its request in a 0-RTT packet
@@ -291,6 +292,20 @@ struc linnea_quic_conn
     .ctrl_pucap: resq 1
     .ctrl_pulen: resq 1
     .ctrl_pu:    resb LINNEA_QUIC_PU_BUF
+    ; Control-stream bytes that arrived ahead of the contiguous prefix. The
+    ; walk consumes only in-order bytes, but a reordered datagram is delivered
+    ; (and acked) exactly once — dropping its bytes left a permanent hole, and
+    ; rule enforcement on the control stream quietly ended there for the life
+    ; of the connection (h3-6). One bounded segment is held and merged as
+    ; neighbours arrive; .ctrl_ro_sid is the uni stream it belongs to (0 =
+    ; empty), which may be a stream not yet typed — its offset-0 frame naming
+    ; it the control stream may itself be the late one. A hole wider than the
+    ; buffer falls back to stopping the walk, which only a peer manufacturing
+    ; the gap would ever see: real control-stream traffic is a few bytes.
+    .ctrl_ro_sid:   resq 1
+    .ctrl_ro_start: resq 1
+    .ctrl_ro_len:   resq 1
+    .ctrl_ro_buf:   resb LINNEA_QUIC_CTRL_RO
     ; A PRIORITY_UPDATE may name a request stream whose response has not opened
     ; yet: the control stream and the request stream are separate, so the update
     ; can overtake the request that it reprioritises. RFC 9218 7 says to keep the

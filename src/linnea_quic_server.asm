@@ -2529,6 +2529,7 @@ linnea_quic_server_datagram:
     je .uni_qpack
     cmp cl, LINNEA_H3_STREAM_PUSH
     je .uni_push                     ; a push stream, from a client
+    call .uni_ro_drop                ; typed now, and not the control stream
     jmp .stream_scan                 ; grease/unknown: not interpreted
 .uni_push:
     ; only a server pushes, so a client-opened push stream is a connection error
@@ -2547,9 +2548,11 @@ linnea_quic_server_datagram:
     cmp cl, LINNEA_H3_STREAM_QPACK_ENC
     jne .uni_qpack_dec
     mov [rdx + linnea_quic_conn.qpack_enc_id], rax
+    call .uni_ro_drop                ; typed now, and not the control stream
     jmp .stream_scan
 .uni_qpack_dec:
     mov [rdx + linnea_quic_conn.qpack_dec_id], rax
+    call .uni_ro_drop                ; typed now, and not the control stream
     jmp .stream_scan                 ; otherwise nothing to read (zero table)
 .uni_cont:
     ; a continuation: only the control stream's closure is our concern here (we
@@ -2557,7 +2560,7 @@ linnea_quic_server_datagram:
     mov rdx, [cur_conn]
     mov rax, [rdx + linnea_quic_conn.ctrl_id]
     test rax, rax
-    jz .stream_scan
+    jz .uni_cont_untyped
     cmp rax, [s_sid]
     jne .stream_scan
     cmp qword [s_sfin], 0
@@ -2590,6 +2593,15 @@ linnea_quic_server_datagram:
     jz .stream_scan
     mov edi, eax
     jmp .h3_close
+.uni_cont_untyped:
+    ; No control stream is known yet, so this continuation cannot be typed —
+    ; its offset-0 frame, the one naming the stream's type, may itself be the
+    ; reordered-late one. If these bytes are the control stream's, dropping
+    ; them would leave the frame walk a hole nothing ever fills (h3-6): hold
+    ; them until the type arrives, and release them if the stream proves to
+    ; be something else.
+    call .ctrl_ro_capture
+    jmp .stream_scan
 .uni_critical_closed:
     mov edi, LINNEA_H3_ERR_CLOSED_CRITICAL
     jmp .h3_close
@@ -2625,7 +2637,7 @@ linnea_quic_server_datagram:
     mov r14, [rbx + linnea_quic_conn.ctrl_off]
     mov rax, [s_soff]
     cmp rax, r14
-    ja .cw_ok                         ; a hole: stop walking (see above)
+    ja .cw_hole                       ; ahead of the prefix: hold, don't drop
     ; bytes below .ctrl_off were walked already — a retransmission overlapping
     ; what we have. Skip that prefix; if the whole frame is old there is nothing
     ; new to do.
@@ -2766,8 +2778,39 @@ linnea_quic_server_datagram:
     mov [rbx + linnea_quic_conn.ctrl_pucap], rbp     ; capture, remembering which type
     mov qword [rbx + linnea_quic_conn.ctrl_pulen], 0
     jmp .cw_loop
+.cw_hole:
+    ; A STREAM frame ahead of .ctrl_off: a reordered datagram is delivered (and
+    ; acked) once, so dropping these bytes would leave a hole nothing ever
+    ; fills, and the walk — with every rule it enforces — would end here for
+    ; good (h3-6). Hold them instead; they are fed back in below the moment
+    ; the in-order bytes catch up.
+    call .ctrl_ro_capture
+    jmp .cw_ok
 .cw_ok:
     mov [rbx + linnea_quic_conn.ctrl_off], r14
+    ; held ahead-bytes may now be contiguous with the prefix: walk them too
+    mov rax, [rbx + linnea_quic_conn.ctrl_ro_sid]
+    test rax, rax
+    jz .cw_ok_done
+    cmp rax, [rbx + linnea_quic_conn.ctrl_id]
+    jne .cw_ok_done                   ; held for a stream not yet typed
+    mov rax, [rbx + linnea_quic_conn.ctrl_ro_start]
+    cmp rax, r14
+    ja .cw_ok_done                    ; the hole is not filled yet
+    mov rcx, [rbx + linnea_quic_conn.ctrl_ro_len]
+    add rcx, rax                      ; the segment's end offset
+    ; the segment is spent either way: walked now, or entirely stale
+    mov qword [rbx + linnea_quic_conn.ctrl_ro_sid], 0
+    mov qword [rbx + linnea_quic_conn.ctrl_ro_len], 0
+    cmp rcx, r14
+    jbe .cw_ok_done                   ; nothing beyond what was already walked
+    mov rdx, r14
+    sub rdx, rax                      ; already-walked prefix inside the segment
+    lea r12, [rbx + linnea_quic_conn.ctrl_ro_buf + rdx]
+    mov r13, rcx
+    sub r13, r14                      ; the fresh bytes
+    jmp .cw_loop
+.cw_ok_done:
     xor eax, eax
     jmp .cw_ret
 .cw_ret_off:                          ; an error, but the walk did consume bytes
@@ -2784,6 +2827,108 @@ linnea_quic_server_datagram:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; .ctrl_ro_capture() — the STREAM frame in the s_s* globals arrived ahead of
+; the walked prefix of a (possible) control stream: hold its bytes so the walk
+; can resume once the in-order bytes catch up (h3-6). One segment per
+; connection, merged with whatever it touches; bytes disjoint from a held
+; segment keep the lower-offset one (the first the walk will reach). A
+; segment can belong to a stream whose offset-0 type frame has not arrived —
+; .ctrl_walk's feed-in only consumes it once the stream proves to be the
+; control stream, and .uni_ro_drop releases it if it proves otherwise.
+; Reads cur_conn and the s_s* globals; no calls out, so alignment is free.
+.ctrl_ro_capture:
+    push rbx
+    push r12
+    push r13
+    mov rbx, [cur_conn]
+    mov r12, [s_sdata]
+    mov r13, [s_slen]
+    test r13, r13
+    jz .rc_done
+    mov rax, [s_soff]                 ; a: where the new bytes start
+    mov rdx, [rbx + linnea_quic_conn.ctrl_ro_sid]
+    test rdx, rdx
+    jz .rc_fresh
+    cmp rdx, [s_sid]
+    jne .rc_done                      ; the buffer already serves another stream
+    mov rsi, [rbx + linnea_quic_conn.ctrl_ro_start]
+    mov rcx, [rbx + linnea_quic_conn.ctrl_ro_len]
+    lea rdx, [rsi + rcx]              ; the held segment is [s, s+l)
+    cmp rax, rdx
+    ja .rc_done                       ; strictly after, a gap: drop the new bytes
+    lea rdx, [rax + r13]
+    cmp rdx, rsi
+    jb .rc_fresh                      ; strictly before, a gap: keep the lower
+    cmp rax, rsi
+    jae .rc_tail
+    ; the new bytes reach below the segment: shift the held data up so the
+    ; segment can begin at the lower offset
+    mov rdx, rsi
+    sub rdx, rax                      ; the shift
+    cmp rdx, LINNEA_QUIC_CTRL_RO
+    jae .rc_fresh                     ; the held data would shift entirely out
+    mov r8, LINNEA_QUIC_CTRL_RO
+    sub r8, rdx
+    cmp rcx, r8
+    jbe .rc_shift
+    mov rcx, r8                       ; what survives of the held data
+.rc_shift:
+    mov r9, rcx                       ; held bytes kept, across the copy
+    lea rsi, [rbx + linnea_quic_conn.ctrl_ro_buf + r9 - 1]
+    lea rdi, [rsi + rdx]
+    std
+    rep movsb                         ; overlapping right-shift: copy backward
+    cld
+    mov [rbx + linnea_quic_conn.ctrl_ro_start], rax
+    lea rcx, [rdx + r9]               ; segment length after the shift
+    mov [rbx + linnea_quic_conn.ctrl_ro_len], rcx
+    jmp .rc_tail
+.rc_fresh:
+    mov rdx, [s_sid]
+    mov [rbx + linnea_quic_conn.ctrl_ro_sid], rdx
+    mov [rbx + linnea_quic_conn.ctrl_ro_start], rax
+    mov qword [rbx + linnea_quic_conn.ctrl_ro_len], 0
+.rc_tail:
+    ; write the new bytes at their position in the segment (never past a gap:
+    ; every path here has them touching or inside the held range)
+    mov rsi, [rbx + linnea_quic_conn.ctrl_ro_start]
+    mov rdx, rax
+    sub rdx, rsi                      ; their position in the buffer
+    cmp rdx, LINNEA_QUIC_CTRL_RO
+    jae .rc_done                      ; starts past the buffer: nothing fits
+    mov rcx, LINNEA_QUIC_CTRL_RO
+    sub rcx, rdx                      ; room from there to the end
+    cmp r13, rcx
+    jbe .rc_write
+    mov r13, rcx                      ; clamp: the tail beyond is dropped
+.rc_write:
+    lea rdi, [rbx + linnea_quic_conn.ctrl_ro_buf + rdx]
+    mov rsi, r12
+    mov rcx, r13
+    rep movsb
+    add rdx, r13                      ; where the new bytes end, relative
+    cmp rdx, [rbx + linnea_quic_conn.ctrl_ro_len]
+    jbe .rc_done
+    mov [rbx + linnea_quic_conn.ctrl_ro_len], rdx
+.rc_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; .uni_ro_drop() — the stream just typed itself as something other than the
+; control stream: a segment held on its behalf will never be walked, so free
+; the buffer for the stream that may yet need it.
+.uni_ro_drop:
+    mov rdx, [cur_conn]
+    mov rax, [rdx + linnea_quic_conn.ctrl_ro_sid]
+    cmp rax, [s_sid]
+    jne .rd_done
+    mov qword [rdx + linnea_quic_conn.ctrl_ro_sid], 0
+    mov qword [rdx + linnea_quic_conn.ctrl_ro_len], 0
+.rd_done:
     ret
 
 ; .pu_apply() -> eax = 0, or the HTTP/3 error code to close with. Acts on the
