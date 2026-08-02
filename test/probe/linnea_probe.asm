@@ -43,6 +43,9 @@ extern linnea_quic_unprotect_hs
 extern linnea_quic_crypto_frame
 extern linnea_quic_varint_encode
 extern linnea_quic_varint_decode
+extern linnea_quic_hs_secrets
+extern linnea_quic_app_secrets
+extern linnea_quic_unprotect_short
 
 ; ---- kinds, for the per-probe report line -------------------------------
 K_OK   equ 0            ; the server did what the RFC requires
@@ -253,8 +256,12 @@ alpn_h3:    db "h3"
 alpn_h3_len equ $ - alpn_h3
 h3_hdr_line: db "== HTTP/3 compliance probes -> "
 h3_hdr_line_len equ $ - h3_hdr_line
-n_h3_initial: db "QUIC Initial handshake (ServerHello received)"
+n_h3_initial: db "QUIC Initial (ServerHello + Handshake keys)"
 n_h3_initial_len equ $ - n_h3_initial
+n_h3_flight:  db "QUIC handshake flight (server Finished decrypted)"
+n_h3_flight_len equ $ - n_h3_flight
+n_h3_1rtt:    db "QUIC handshake complete (client Finished -> 1-RTT)"
+n_h3_1rtt_len equ $ - n_h3_1rtt
 err_h3_tls: db "error: h3 requires https:// (QUIC over UDP)", 10
 err_h3_tls_len equ $ - err_h3_tls
 
@@ -339,6 +346,29 @@ qpkt:       resb 1500                   ; the protected packet to send
 qrx:        resb 2048                   ; a received datagram
 qplain:     resb 2048                   ; decrypted QUIC frames
 qvtmp:      resb 16                     ; varint scratch
+alignb 16
+q_hs_ckeys: resb linnea_quic_keys_size  ; client Handshake keys (we protect)
+q_hs_skeys: resb linnea_quic_keys_size  ; server Handshake keys (we open)
+q_ap_ckeys: resb linnea_quic_keys_size  ; client 1-RTT keys
+q_ap_skeys: resb linnea_quic_keys_size  ; server 1-RTT keys
+q_secrets:  resb 96                     ; c_hs || s_hs || handshake_secret
+q_fin_key:  resb 32                     ; client Finished MAC key
+qtr:        resb 8192                   ; TLS transcript (CH || SH || flight)
+qtr_len:    resq 1
+qhsc:       resb 8192                   ; reassembled Handshake CRYPTO stream
+qhsc_len:   resq 1                      ; contiguous bytes from offset 0
+q_hs_ready: resq 1                      ; 1 once Handshake keys are derived
+q_init_largest: resq 1                  ; largest Initial pn the server sent
+q_hs_largest:   resq 1                  ; largest Handshake pn the server sent
+q_fin_seen: resq 1                      ; 1 once the server Finished is reassembled
+q_pkt_type: resq 1                      ; the long-header type of the packet being walked
+q_sh_ptr:   resq 1                      ; ServerHello handshake message ptr/len
+q_sh_len:   resq 1
+qhsc_fin_end: resq 1                    ; offset in qhsc just past the server Finished
+q_srv_scid: resb 20                     ; the server's chosen connection id (our DCID)
+q_srv_scid_len: resq 1
+q_cli_hs_pn: resq 1                     ; our next client Handshake packet number
+q_acked:    resq 1                      ; 1 once we have sent a Handshake ACK
 
 section .text
 
@@ -3746,14 +3776,594 @@ quic_recv_serverhello:
     pop rbp
     ret
 
-; h3_battery(): the HTTP/3 probe set (phase 3a: the Initial handshake).
+; qtr_add(rsi=ptr, rdx=len): append to the TLS transcript buffer.
+qtr_add:
+    push rdi
+    push rcx
+    mov rdi, [qtr_len]
+    lea rdi, [qtr + rdi]
+    mov rcx, rdx
+    rep movsb
+    add [qtr_len], rdx
+    pop rcx
+    pop rdi
+    ret
+
+; quic_pkt_parse(rdi=pkt, rsi=end) -> rax = total packet length (0 if bad),
+; rdx = long-header type (0x00 Initial, 0x20 Handshake, ...); also q_pkt_type.
+quic_pkt_parse:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13, rsi
+    movzx ebx, byte [r12]
+    test bl, 0x80
+    jz .bad
+    mov edx, ebx
+    and edx, 0x30
+    mov [q_pkt_type], rdx
+    lea rdi, [r12 + 5]                    ; -> DCID length
+    cmp rdi, r13
+    jae .bad
+    movzx eax, byte [rdi]
+    lea rdi, [rdi + 1 + rax]              ; -> SCID length
+    cmp rdi, r13
+    jae .bad
+    movzx eax, byte [rdi]
+    lea rdi, [rdi + 1 + rax]              ; -> token len (Initial) / Length
+    cmp qword [q_pkt_type], 0x00
+    jne .len
+    mov rsi, r13
+    call linnea_quic_varint_decode        ; token length
+    test rdx, rdx
+    jz .bad
+    add rdi, rdx
+    add rdi, rax                          ; skip the token
+.len:
+    cmp rdi, r13
+    jae .bad
+    mov rsi, r13
+    call linnea_quic_varint_decode        ; Length (pn + payload + tag)
+    test rdx, rdx
+    jz .bad
+    add rdi, rdx
+    add rdi, rax                          ; -> end of this packet
+    cmp rdi, r13
+    ja .bad
+    mov rax, rdi
+    sub rax, r12                          ; total packet length
+    mov rdx, [q_pkt_type]
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.bad:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; quic_derive_hs(): from tls_srvpub + the CH||SH transcript, derive the
+; Handshake keys and the c_hs/s_hs/handshake secrets.
+quic_derive_hs:
+    lea rdi, [qtr]
+    mov rsi, [qtr_len]
+    lea rdx, [th_buf]
+    call linnea_sha256                    ; th = H(CH || SH)
+    lea rdi, [tls_srvpub]
+    lea rsi, [tls_priv]
+    lea rdx, [th_buf]
+    lea rcx, [q_hs_ckeys]
+    lea r8, [q_hs_skeys]
+    lea r9, [q_secrets]
+    call linnea_quic_hs_secrets
+    ret
+
+; quic_check_finished(): scan the reassembled Handshake CRYPTO for a complete
+; Finished (type 0x14); set q_fin_seen and qhsc_fin_end when found.
+quic_check_finished:
+    xor ecx, ecx
+.m:
+    lea rax, [rcx + 4]
+    cmp rax, [qhsc_len]
+    ja .ret
+    movzx eax, byte [qhsc + rcx]
+    movzx edx, byte [qhsc + rcx + 1]
+    shl edx, 8
+    movzx r8d, byte [qhsc + rcx + 2]
+    or edx, r8d
+    shl edx, 8
+    movzx r8d, byte [qhsc + rcx + 3]
+    or edx, r8d                           ; message body length
+    lea r9, [rcx + 4]
+    add r9, rdx                           ; end of this message
+    cmp r9, [qhsc_len]
+    ja .ret                               ; incomplete
+    cmp al, 0x14                          ; Finished
+    jne .next
+    mov qword [q_fin_seen], 1
+    mov [qhsc_fin_end], r9
+    ret
+.next:
+    mov rcx, r9
+    jmp .m
+.ret:
+    ret
+
+; quic_walk_datagram(rsi=datagram length): walk the coalesced packets in qrx,
+; decrypting the Initial (ServerHello -> derive Handshake keys) and Handshake
+; packets (CRYPTO -> reassemble into qhsc). Force-aligns rsp for the SSE crypto.
+quic_walk_datagram:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    and rsp, -16
+    lea r12, [qrx]
+    lea r13, [qrx + rsi]                  ; end
+.pkt:
+    cmp r12, r13
+    jae .done
+    test byte [r12], 0x80
+    jz .done                              ; short header / padding: stop
+    mov rdi, r12
+    mov rsi, r13
+    call quic_pkt_parse
+    test rax, rax
+    jz .done
+    mov rbx, rax                          ; packet total length
+    cmp qword [q_pkt_type], 0x00
+    je .initial
+    cmp qword [q_pkt_type], 0x20
+    je .handshake
+    jmp .adv
+.initial:
+    mov rdi, r12
+    mov rsi, rbx
+    lea rdx, [qi_skeys]
+    lea rcx, [qplain]
+    call linnea_quic_unprotect            ; rax = frames, rdx = pn
+    test rax, rax
+    js .adv
+    mov r14, rax                          ; frame bytes
+    cmp rdx, [q_init_largest]
+    jbe .init_pn_done
+    mov [q_init_largest], rdx
+.init_pn_done:
+    cmp qword [q_hs_ready], 0
+    jne .adv                              ; ServerHello handled already
+    ; capture the server's SCID (becomes our DCID for Handshake/1-RTT)
+    movzx eax, byte [r12 + 5]             ; DCID length
+    lea rcx, [r12 + 6 + rax]              ; -> SCID length
+    movzx edx, byte [rcx]
+    mov [q_srv_scid_len], rdx
+    lea rsi, [rcx + 1]
+    lea rdi, [q_srv_scid]
+    mov rcx, rdx
+    rep movsb
+    lea rdi, [qplain]
+    mov rsi, r14                          ; frame bytes
+    call linnea_quic_crypto_frame         ; rax = SH ptr, rdx = len
+    test rax, rax
+    jz .adv
+    mov [q_sh_ptr], rax
+    mov [q_sh_len], rdx
+    mov rsi, rax
+    call parse_serverhello                ; rsi=ptr, rdx=len -> tls_srvpub
+    mov qword [qtr_len], 0                ; transcript = CH || SH
+    lea rsi, [qch]
+    mov rdx, [qch_len]
+    call qtr_add
+    mov rsi, [q_sh_ptr]
+    mov rdx, [q_sh_len]
+    call qtr_add
+    call quic_derive_hs
+    mov qword [q_hs_ready], 1
+    jmp .adv
+.handshake:
+    cmp qword [q_hs_ready], 0
+    je .adv                               ; no Handshake keys yet
+    mov rdi, r12
+    mov rsi, rbx
+    lea rdx, [q_hs_skeys]
+    lea rcx, [qplain]
+    call linnea_quic_unprotect_hs         ; rax = frames, rdx = pn
+    test rax, rax
+    js .adv
+    cmp rdx, [q_hs_largest]
+    jbe .hs_pn_done
+    mov [q_hs_largest], rdx
+.hs_pn_done:
+    mov r14, rax                          ; frame bytes
+    lea rdi, [qplain]
+    mov rsi, r14
+    call linnea_quic_crypto_frame         ; rax = data, rdx = len, r8 = offset
+    test rax, rax
+    jz .adv
+    cmp r8, [qhsc_len]
+    jne .adv                              ; out of order: skip (Linnea is in order)
+    mov rsi, rax
+    mov rdi, [qhsc_len]
+    lea rdi, [qhsc + rdi]
+    mov rcx, rdx
+    rep movsb
+    add [qhsc_len], rdx
+    call quic_check_finished
+.adv:
+    add r12, rbx
+    jmp .pkt
+.done:
+    lea rsp, [rbp - 32]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; quic_ack_frame(rdi=out, rsi=largest) -> rax = new cursor. An ACK covering
+; every packet number from 0 to `largest`.
+quic_ack_frame:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
+    mov byte [rbx], 0x02
+    inc rbx
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_varint_encode        ; largest acknowledged
+    add rbx, rax
+    mov rdi, rbx
+    xor esi, esi
+    call linnea_quic_varint_encode        ; ack delay = 0
+    add rbx, rax
+    mov rdi, rbx
+    xor esi, esi
+    call linnea_quic_varint_encode        ; ack range count = 0
+    add rbx, rax
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_varint_encode        ; first ack range = largest
+    add rbx, rax
+    mov rax, rbx
+    pop r12
+    pop rbx
+    ret
+
+; quic_send_hs(edi=fd, rsi=payload, rdx=payload len) -> rax = 0 ok / -1.
+; Builds, protects (q_hs_ckeys) and sends one Handshake packet; bumps q_cli_hs_pn.
+quic_send_hs:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    and rsp, -16
+    mov ebx, edi
+    mov r14, rsi                          ; payload
+    mov r13, rdx                          ; payload length
+    lea rdi, [qhdr]
+    mov byte [rdi], 0xe0                  ; long | fixed | Handshake | pnlen-1=0
+    mov byte [rdi + 1], 0x00
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x00
+    mov byte [rdi + 4], 0x01
+    mov rcx, [q_srv_scid_len]
+    mov [rdi + 5], cl
+    lea rdi, [rdi + 6]
+    lea rsi, [q_srv_scid]
+    rep movsb
+    mov byte [rdi], 8                     ; our SCID length
+    inc rdi
+    lea rsi, [q_scid]
+    mov ecx, 8
+    rep movsb
+    lea rsi, [r13 + 1 + 16]               ; Length = pn(1) + payload + tag(16)
+    call linnea_quic_varint_encode
+    add rdi, rax
+    mov rax, [q_cli_hs_pn]
+    mov [rdi], al                         ; 1-byte packet number
+    inc rdi
+    lea rax, [qhdr]
+    mov rdx, rdi
+    sub rdx, rax                          ; header length
+    sub rsp, 16
+    lea rax, [q_hs_ckeys]
+    mov [rsp], rax
+    mov rax, [q_cli_hs_pn]
+    mov [rsp + 8], rax
+    lea rdi, [qpkt]
+    lea rsi, [qhdr]
+    mov ecx, 1
+    mov r8, r14
+    mov r9, r13
+    call linnea_quic_protect              ; rax = total packet length
+    add rsp, 16
+    mov r12, rax
+    inc qword [q_cli_hs_pn]
+    mov eax, LINNEA_SYS_SENDTO
+    mov edi, ebx
+    lea rsi, [qpkt]
+    mov rdx, r12
+    mov r10d, LINNEA_MSG_NOSIGNAL
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    js .fail
+    xor eax, eax
+    lea rsp, [rbp - 32]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+.fail:
+    mov rax, -1
+    lea rsp, [rbp - 32]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; quic_send_hs_ack(edi=fd): a Handshake packet carrying only an ACK, to validate
+; our address and lift the server's 3x anti-amplification limit mid-flight.
+quic_send_hs_ack:
+    push rbx
+    mov ebx, edi
+    lea rdi, [qpay]
+    mov rsi, [q_hs_largest]
+    call quic_ack_frame                   ; rax = end
+    lea rdx, [qpay]
+    sub rax, rdx                          ; ACK length
+    mov rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_hs
+    pop rbx
+    ret
+
+; quic_recv_flight(edi=fd) -> rax = 1 if the server Finished was decrypted.
+; Reads datagrams, deriving Handshake keys from the ServerHello and reassembling
+; the Handshake CRYPTO, until the server Finished arrives (or a timeout).
+quic_recv_flight:
+    push rbx
+    mov ebx, edi
+    mov qword [q_hs_ready], 0
+    mov qword [qhsc_len], 0
+    mov qword [q_fin_seen], 0
+    mov qword [q_init_largest], -1
+    mov qword [q_hs_largest], -1
+    mov qword [q_cli_hs_pn], 0
+    mov qword [q_acked], 0
+.loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 1500
+    syscall
+    test rax, rax
+    jle .stall
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle .stall
+    mov rsi, rax
+    call quic_walk_datagram
+    cmp qword [q_fin_seen], 0
+    je .loop
+    jmp .done
+.stall:
+    ; The flight stalled. If we have Handshake keys but not the Finished yet, the
+    ; server is holding back on the 3x anti-amplification limit — send a Handshake
+    ; ACK to validate our address, which lets it send the rest. Do this once.
+    cmp qword [q_fin_seen], 0
+    jne .done
+    cmp qword [q_hs_ready], 0
+    je .done
+    cmp qword [q_acked], 0
+    jne .done
+    mov qword [q_acked], 1
+    mov edi, ebx
+    call quic_send_hs_ack
+    jmp .loop
+.done:
+    mov rax, [q_fin_seen]
+    pop rbx
+    ret
+
+; quic_find_1rtt(rsi=datagram length) -> rax = ptr to the 1-RTT (short-header)
+; packet in qrx, rdx = its length; rax = 0 if none. Skips leading long-header
+; packets (a trailing Handshake ACK the server may coalesce).
+quic_find_1rtt:
+    push rbx
+    push r12
+    lea rbx, [qrx]
+    lea r12, [qrx + rsi]                  ; end
+.p:
+    cmp rbx, r12
+    jae .none
+    test byte [rbx], 0x80
+    jz .found
+    mov rdi, rbx
+    mov rsi, r12
+    call quic_pkt_parse                   ; rax = total length
+    test rax, rax
+    jz .none
+    add rbx, rax
+    jmp .p
+.found:
+    mov rax, rbx
+    mov rdx, r12
+    sub rdx, rbx
+    pop r12
+    pop rbx
+    ret
+.none:
+    xor eax, eax
+    xor edx, edx
+    pop r12
+    pop rbx
+    ret
+
+; quic_recv_1rtt(edi=fd) -> rax = 1 if a server 1-RTT packet decrypted with the
+; application keys (the handshake is complete). Tries a few datagrams.
+quic_recv_1rtt:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    and rsp, -16
+    mov ebx, edi
+    mov r12d, 4
+.loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 2000
+    syscall
+    test rax, rax
+    jle .no
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle .no
+    mov rsi, rax
+    call quic_find_1rtt                   ; rax = 1-RTT ptr, rdx = len
+    test rax, rax
+    jz .next
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [q_ap_skeys]
+    lea rcx, [qplain]
+    mov r8d, 8                            ; our SCID length (server's DCID)
+    xor r9d, r9d                          ; expected pn = 0
+    call linnea_quic_unprotect_short      ; rax = frames (or -1)
+    test rax, rax
+    jns .yes
+.next:
+    dec r12d
+    jnz .loop
+.no:
+    xor eax, eax
+    lea rsp, [rbp - 16]
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+.yes:
+    mov eax, 1
+    lea rsp, [rbp - 16]
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; quic_finish(edi=fd) -> rax = 1 if 1-RTT was established. Completes the
+; transcript, derives 1-RTT keys, sends the client Finished (with an ACK) in a
+; Handshake packet, and waits for a server 1-RTT packet.
+quic_finish:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    and rsp, -16
+    mov ebx, edi
+    ; transcript += the server flight (EE..server Finished)
+    lea rsi, [qhsc]
+    mov rdx, [qhsc_fin_end]
+    call qtr_add
+    lea rdi, [qtr]
+    mov rsi, [qtr_len]
+    lea rdx, [th_buf]
+    call linnea_sha256                    ; th2 = H(CH..server Finished)
+    lea rdi, [q_secrets + 64]             ; handshake secret
+    lea rsi, [th_buf]
+    lea rdx, [q_ap_ckeys]
+    lea rcx, [q_ap_skeys]
+    xor r8d, r8d                          ; skip client traffic-secret output
+    xor r9d, r9d                          ; skip server traffic-secret output
+    call linnea_quic_app_secrets          ; 1-RTT keys
+    ; finished_key = HKDF-Expand-Label(c_hs, "finished", "", 32)
+    lea rdi, [q_secrets]
+    lea rsi, [lbl_finished]
+    mov edx, 8
+    xor ecx, ecx
+    xor r8d, r8d
+    lea r9, [q_fin_key]
+    sub rsp, 16
+    mov qword [rsp], 32
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    ; payload = ACK + CRYPTO(client Finished)
+    lea rdi, [qpay]
+    mov rsi, [q_hs_largest]
+    call quic_ack_frame                   ; rax = cursor after the ACK
+    mov r12, rax                          ; CRYPTO frame start
+    mov byte [r12], 0x06                  ; CRYPTO
+    mov byte [r12 + 1], 0x00              ; offset 0
+    mov byte [r12 + 2], 36                ; length 36
+    mov byte [r12 + 3], 0x14              ; Finished
+    mov byte [r12 + 4], 0x00
+    mov byte [r12 + 5], 0x00
+    mov byte [r12 + 6], 0x20              ; verify_data length 32
+    lea rdi, [q_fin_key]                  ; verify_data = HMAC(fin_key, th2)
+    mov esi, 32
+    lea rdx, [th_buf]
+    mov ecx, 32
+    lea r8, [r12 + 7]
+    call linnea_hmac_sha256
+    lea rax, [r12 + 39]                   ; end of payload
+    lea rcx, [qpay]
+    sub rax, rcx
+    mov rdx, rax                          ; payload length
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_hs                     ; Handshake packet: ACK + Finished
+    mov edi, ebx
+    call quic_recv_1rtt                   ; rax = 1 if a 1-RTT packet decrypted
+    lea rsp, [rbp - 16]
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; h3_battery(): the HTTP/3 probe set.
 h3_battery:
-    call probe_h3_initial
+    call probe_h3_handshake
     ret
 
 ; probe_h3_initial: send a QUIC Initial and confirm a ServerHello comes back.
-probe_h3_initial:
+probe_h3_handshake:
     push rbx
+    push r12
     ; fresh x25519 keypair, client random, session id, DCID and SCID
     mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [tls_priv]
@@ -3795,22 +4405,45 @@ probe_h3_initial:
     call quic_send_initial
     test rax, rax
     js .closefail
+    ; part 1: the Initial exchange (ServerHello)
     mov edi, ebx
-    call quic_recv_serverhello            ; rax = 1 on success
-    push rax
-    mov edi, ebx
-    call close_fd
-    pop rcx
-    mov dil, K_OK
-    test rcx, rcx
-    jnz .report
-    mov dil, K_DEV
-.report:
+    call quic_recv_flight                 ; also derives Handshake keys en route
+    push rax                              ; 1 if the server Finished decrypted
     lea rsi, [n_h3_initial]
     mov edx, n_h3_initial_len
-    mov rcx, -1
-    mov r9d, -1
+    mov dil, K_OK
+    cmp qword [q_hs_ready], 0
+    jne .rep1
+    mov dil, K_DEV
+.rep1:
     call report_plain
+    ; part 2: the full server flight (EE/Cert/CertVerify/Finished decrypted)
+    pop r12                               ; 1 if the server Finished decrypted
+    mov dil, K_OK
+    test r12, r12
+    jnz .rep2
+    mov dil, K_DEV
+.rep2:
+    lea rsi, [n_h3_flight]
+    mov edx, n_h3_flight_len
+    call report_plain
+    ; part 3: send the client Finished and confirm 1-RTT (only if the flight came)
+    test r12, r12
+    jz .done
+    mov edi, ebx
+    call quic_finish                      ; rax = 1 if a 1-RTT packet decrypted
+    mov dil, K_OK
+    test rax, rax
+    jnz .rep3
+    mov dil, K_DEV
+.rep3:
+    lea rsi, [n_h3_1rtt]
+    mov edx, n_h3_1rtt_len
+    call report_plain
+.done:
+    mov edi, ebx
+    call close_fd
+    pop r12
     pop rbx
     ret
 .closefail:
@@ -3821,6 +4454,7 @@ probe_h3_initial:
     lea rsi, [n_h3_initial]
     mov edx, n_h3_initial_len
     call report_plain
+    pop r12
     pop rbx
     ret
 
