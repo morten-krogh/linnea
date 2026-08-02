@@ -211,6 +211,7 @@ alignb 16
 sa:         resb 16                     ; sockaddr_in
 respbuf:    resb RESP_CAP
 reqbuf:     resb REQ_CAP
+hs_buf:     resb 4096                    ; ClientHello/Finished assembly (keeps reqbuf free)
 numbuf:     resb 32
 pollfd:     resb 8
 timespec:   resb 16
@@ -2001,7 +2002,7 @@ tls_handshake:
     ; --- build + send ClientHello ---
     call build_clienthello                ; rax = total record length
     mov edi, r15d
-    lea rsi, [reqbuf]
+    lea rsi, [hs_buf]
     mov rdx, rax
     call send_raw
     test rax, rax
@@ -2175,21 +2176,21 @@ tls_handshake:
     mov qword [rsp], 32
     call linnea_tls_hkdf_expand_label
     add rsp, 16
-    ; verify_data = HMAC(finished_key, th2) -> reqbuf+4 (after the 4-byte header)
+    ; verify_data = HMAC(finished_key, th2) -> hs_buf+4 (after the 4-byte header)
     lea rdi, [fin_key]
     mov esi, 32
     lea rdx, [th_buf]
     mov ecx, 32
-    lea r8, [reqbuf + 4]
+    lea r8, [hs_buf + 4]
     call linnea_hmac_sha256
-    mov byte [reqbuf], 0x14                ; Finished
-    mov byte [reqbuf + 1], 0
-    mov byte [reqbuf + 2], 0
-    mov byte [reqbuf + 3], 32
+    mov byte [hs_buf], 0x14                ; Finished
+    mov byte [hs_buf + 1], 0
+    mov byte [hs_buf + 2], 0
+    mov byte [hs_buf + 3], 32
     ; seal (inner type 22) with the handshake write keys, send
     lea rdi, [tls_wkeys]
     mov esi, 22
-    lea rdx, [reqbuf]
+    lea rdx, [hs_buf]
     mov ecx, 36
     lea r8, [tls_rec]
     call linnea_tls_seal                   ; rax = record length
@@ -2283,14 +2284,14 @@ parse_serverhello:
     pop rbx
     ret
 
-; build_clienthello() -> rax = total record length (record at reqbuf).
+; build_clienthello() -> rax = total record length (record at hs_buf).
 ; Also appends the ClientHello handshake message to the transcript.
 build_clienthello:
     push rbx
     push r12
     push r13
     mov r12, [urlhost_len]                 ; SNI host length
-    lea rdi, [reqbuf + 5]                  ; write cursor (past record header)
+    lea rdi, [hs_buf + 5]                  ; write cursor (past record header)
     mov byte [rdi], 0x01                   ; ClientHello
     lea r13, [rdi + 1]                     ; hs length-24 slot
     add rdi, 4                             ; past type + len24
@@ -2402,16 +2403,16 @@ build_clienthello:
     mov [r13 + 1], cl
     mov [r13 + 2], al
     ; record header
-    mov byte [reqbuf], 0x16
-    mov byte [reqbuf + 1], 0x03
-    mov byte [reqbuf + 2], 0x01
+    mov byte [hs_buf], 0x16
+    mov byte [hs_buf + 1], 0x03
+    mov byte [hs_buf + 2], 0x01
     mov rax, rdi
-    lea rcx, [reqbuf + 5]
+    lea rcx, [hs_buf + 5]
     sub rax, rcx                            ; record payload length
-    mov [reqbuf + 3], ah
-    mov [reqbuf + 4], al
-    ; transcript += the ClientHello handshake message (reqbuf+5 .. rdi)
-    lea rsi, [reqbuf + 5]
+    mov [hs_buf + 3], ah
+    mov [hs_buf + 4], al
+    ; transcript += the ClientHello handshake message (hs_buf+5 .. rdi)
+    lea rsi, [hs_buf + 5]
     mov rdx, rax
     push rax
     call tr_add
