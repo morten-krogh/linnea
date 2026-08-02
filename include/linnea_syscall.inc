@@ -22,6 +22,10 @@ LINNEA_SYS_EXECVE    equ 59
 LINNEA_SYS_KILL      equ 62
 LINNEA_SYS_ACCEPT    equ 43
 LINNEA_SYS_SOCKET    equ 41
+LINNEA_SYS_CONNECT   equ 42      ; client-side: reach out to a server (linnea-probe)
+LINNEA_SYS_POLL      equ 7       ; readability wait with a timeout (linnea-probe)
+LINNEA_SYS_NANOSLEEP equ 35      ; deliberate pauses for slow-drip probes
+LINNEA_POLLIN        equ 1
 LINNEA_SYS_SENDTO    equ 44
 LINNEA_SYS_SENDMSG   equ 46
 LINNEA_MSG_DONTWAIT  equ 0x40

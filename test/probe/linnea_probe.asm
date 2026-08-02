@@ -1,0 +1,1483 @@
+; linnea_probe.asm — a standalone HTTP compliance prober.
+;
+;   linnea-probe <url> <protocol> [--host <name>]
+;
+; Opens connections to a live server and runs a battery of compliance probes —
+; valid requests, malformed ones, bad framing, slow drips — reporting for each
+; what the server did and whether it matches what the RFCs require. It is a
+; diagnostic, not a unit test: every probe prints a line, and the exit code is
+; the number of outright deviations (an invalid request ACCEPTED, or no answer
+; where one was due), so it can gate CI as well as be read by eye.
+;
+; Phase 1 speaks HTTP/1.1 over cleartext TCP. The host in the URL must be an
+; IPv4 literal or "localhost" (a DNS resolver and a TLS 1.3 client come with
+; phase 2, which is also where HTTP/2 lands; HTTP/3 is phase 3). Zero
+; dependencies, like the server: nasm + ld, no libc.
+
+default rel
+
+%include "linnea_syscall.inc"
+
+global _start
+
+extern linnea_print_stdout
+extern linnea_print_stderr
+extern linnea_string_from_u64
+
+; ---- kinds, for the per-probe report line -------------------------------
+K_OK   equ 0            ; the server did what the RFC requires
+K_DEV  equ 1            ; a deviation: invalid input accepted, or no answer due
+K_INFO equ 2            ; rejected, but with a different status than expected
+
+LINNEA_AF_INET_ equ 2
+SOCK_STREAM_    equ 1
+
+RESP_CAP        equ 65536
+REQ_CAP         equ 65536
+
+section .rodata
+
+usage_msg:  db "usage: linnea-probe <url> <protocol> [--host <name>]", 10
+            db "  <url>       http://<ipv4-or-localhost>[:port][/path]", 10
+            db "  <protocol>  h1 (h2/h3 not yet implemented)", 10
+usage_len   equ $ - usage_msg
+
+sch_http:   db "http://"
+sch_http_len equ $ - sch_http
+sch_https:  db "https://"
+sch_https_len equ $ - sch_https
+
+opt_host:   db "--host"
+opt_host_len equ $ - opt_host
+
+localhost_s: db "localhost"
+localhost_len equ $ - localhost_s
+localhost_addr equ 0x0100007f          ; 127.0.0.1 in network byte order
+
+; report-line prefixes
+pfx_ok:     db "[ OK ] "
+pfx_ok_len  equ $ - pfx_ok
+pfx_dev:    db "[DEV!] "
+pfx_dev_len equ $ - pfx_dev
+pfx_info:   db "[info] "
+pfx_info_len equ $ - pfx_info
+
+s_arrow:    db " -> "
+s_arrow_len equ $ - s_arrow
+s_status:   db "HTTP "
+s_status_len equ $ - s_status
+s_noresp:   db "(no response / connection closed)", 10
+s_noresp_len equ $ - s_noresp
+s_want:     db "  (want "
+s_want_len  equ $ - s_want
+s_rparen_nl: db ")", 10
+s_rparen_nl_len equ $ - s_rparen_nl
+s_nl:       db 10
+
+hdr_line:   db "== HTTP/1.1 compliance probes -> "
+hdr_line_len equ $ - hdr_line
+sum_head:   db 10, "== "
+sum_head_len equ $ - sum_head
+sum_probes: db " probes, "
+sum_probes_len equ $ - sum_probes
+sum_dev:    db " deviation(s)", 10
+sum_dev_len equ $ - sum_dev
+s_colon_sp: db ": "
+s_colon_sp_len equ $ - s_colon_sp
+
+err_scheme: db "error: url must start with http:// (https:// is phase 2)", 10
+err_scheme_len equ $ - err_scheme
+err_host:   db "error: host must be an IPv4 literal or localhost (DNS is phase 2)", 10
+err_host_len equ $ - err_host
+err_connect: db "error: could not connect to the server", 10
+err_connect_len equ $ - err_connect
+proto_h1:   db "h1"
+proto_todo: db "error: only h1 is implemented in phase 1 (h2/h3 coming)", 10
+proto_todo_len equ $ - proto_todo
+
+; --- probe names (printed on each report line) ---
+n_valid:    db "valid GET"
+n_valid_len equ $ - n_valid
+n_keepalive: db "keep-alive (two requests, one connection)"
+n_keepalive_len equ $ - n_keepalive
+n_nohost:   db "request with no Host header"
+n_nohost_len equ $ - n_nohost
+n_duphost:  db "request with two Host headers"
+n_duphost_len equ $ - n_duphost
+n_wsp:      db "whitespace before the header colon"
+n_wsp_len   equ $ - n_wsp
+n_nocolon:  db "header line with no colon"
+n_nocolon_len equ $ - n_nocolon
+n_badreqline: db "request line with no HTTP version"
+n_badreqline_len equ $ - n_badreqline
+n_unknownmeth: db "unknown method"
+n_unknownmeth_len equ $ - n_unknownmeth
+n_http10:   db "HTTP/1.0 request line"
+n_http10_len equ $ - n_http10
+n_badver:   db "bogus HTTP version (HTTP/9.9)"
+n_badver_len equ $ - n_badver
+n_longtarget: db "over-long request target (~9 KB)"
+n_longtarget_len equ $ - n_longtarget
+n_barelf:   db "bare-LF line endings"
+n_barelf_len equ $ - n_barelf
+n_absform:  db "absolute-form target"
+n_absform_len equ $ - n_absform
+n_slowloris: db "slow header drip (slowloris)"
+n_slowloris_len equ $ - n_slowloris
+s_closed_ok: db " (server closed the connection)", 10
+s_closed_ok_len equ $ - s_closed_ok
+s_stayed:   db " (server kept waiting through the drip window)", 10
+s_stayed_len equ $ - s_stayed
+
+; --- request fragments ---
+f_get_sp:   db "GET "
+f_get_sp_len equ $ - f_get_sp
+f_sp_h11_crlf: db " HTTP/1.1", 13, 10
+f_sp_h11_crlf_len equ $ - f_sp_h11_crlf
+f_sp_h10_crlf: db " HTTP/1.0", 13, 10
+f_sp_h10_crlf_len equ $ - f_sp_h10_crlf
+f_sp_h99_crlf: db " HTTP/9.9", 13, 10
+f_sp_h99_crlf_len equ $ - f_sp_h99_crlf
+f_host:     db "Host: "
+f_host_len  equ $ - f_host
+f_crlf:     db 13, 10
+f_crlf_len  equ $ - f_crlf
+f_close_hdr: db "Connection: close", 13, 10
+f_close_hdr_len equ $ - f_close_hdr
+f_end:      db 13, 10                   ; the blank line ending the head
+f_end_len   equ $ - f_end
+f_dummy_host2: db "Host: other.example", 13, 10
+f_dummy_host2_len equ $ - f_dummy_host2
+f_wsp_hdr:  db "X-Probe : value", 13, 10
+f_wsp_hdr_len equ $ - f_wsp_hdr
+f_nocolon_hdr: db "ThisHeaderHasNoColon", 13, 10
+f_nocolon_hdr_len equ $ - f_nocolon_hdr
+f_frob_sp:  db "FROBNICATE "
+f_frob_sp_len equ $ - f_frob_sp
+f_get_lf:   db "GET "                   ; bare-LF variant reuses the target
+f_get_lf_len equ $ - f_get_lf
+f_sp_h11_lf: db " HTTP/1.1", 10
+f_sp_h11_lf_len equ $ - f_sp_h11_lf
+f_host_lf:  db "Host: "
+f_host_lf_len equ $ - f_host_lf
+f_lf:       db 10
+f_end_lf:   db 10
+
+section .bss
+alignb 16
+sa:         resb 16                     ; sockaddr_in
+respbuf:    resb RESP_CAP
+reqbuf:     resb REQ_CAP
+numbuf:     resb 32
+pollfd:     resb 8
+timespec:   resb 16
+
+conn_addr:  resd 1                      ; server address (network order), for connect
+conn_port:  resd 1                      ; server port (host order)
+
+host_ptr:   resq 1                      ; Host-header value ptr...
+host_len:   resq 1                      ; ...and length (from the URL, or --host)
+path_ptr:   resq 1                      ; request-target ptr...
+path_len:   resq 1                      ; ...and length
+
+req_cur:    resq 1                      ; request-assembly cursor into reqbuf
+n_total:    resd 1
+n_dev:      resd 1
+
+section .text
+
+; =======================================================================
+; entry
+; =======================================================================
+_start:
+    mov r15, [rsp]                      ; argc
+    cmp r15, 3
+    jl .usage
+
+    ; --- protocol (argv[2]) must be "h1" for now ---
+    mov rsi, [rsp + 24]                 ; argv[2]
+    movzx eax, byte [rsi]
+    movzx ecx, byte [rsi + 1]
+    cmp al, 'h'
+    jne .proto_bad
+    cmp cl, '1'
+    jne .proto_bad
+    cmp byte [rsi + 2], 0
+    jne .proto_bad
+
+    ; --- optional --host override (scan argv[3..]) ---
+    mov qword [host_ptr], 0
+    mov rbx, 3                           ; arg index
+.scan_opts:
+    cmp rbx, r15
+    jae .opts_done
+    mov rdi, [rsp + 8 + rbx*8]           ; argv[rbx]
+    lea rsi, [opt_host]
+    mov edx, opt_host_len
+    call streq_z                         ; rax=1 if argv[rbx] == "--host"
+    test rax, rax
+    jz .scan_next
+    lea rcx, [rbx + 1]
+    cmp rcx, r15
+    jae .opts_done                       ; --host with no value: ignore
+    mov rdi, [rsp + 8 + rcx*8]           ; the host value
+    mov [host_ptr], rdi
+    mov rsi, rdi
+    call cstrlen
+    mov [host_len], rax
+    add rbx, 2
+    jmp .scan_opts
+.scan_next:
+    inc rbx
+    jmp .scan_opts
+.opts_done:
+
+    ; --- parse the URL (argv[1]) ---
+    mov rdi, [rsp + 16]                  ; argv[1]
+    call parse_url
+    test rax, rax
+    js .exit_err                         ; parse_url already printed the reason
+
+    ; --- header banner ---
+    lea rsi, [hdr_line]
+    mov edx, hdr_line_len
+    call puts
+    mov rsi, [host_ptr]
+    mov rdx, [host_len]
+    call puts
+    lea rsi, [s_nl]
+    mov edx, 1
+    call puts
+
+    ; =================== the probe battery =======================
+    call probe_valid
+    call probe_keepalive
+    call probe_nohost
+    call probe_duphost
+    call probe_wsp_colon
+    call probe_nocolon
+    call probe_badreqline
+    call probe_unknown_method
+    call probe_http10
+    call probe_badver
+    call probe_long_target
+    call probe_bare_lf
+    call probe_absform
+    call probe_slowloris
+
+    ; =================== summary =================================
+    lea rsi, [sum_head]
+    mov edx, sum_head_len
+    call puts
+    mov edi, [n_total]
+    call print_u32
+    lea rsi, [sum_probes]
+    mov edx, sum_probes_len
+    call puts
+    mov edi, [n_dev]
+    call print_u32
+    lea rsi, [sum_dev]
+    mov edx, sum_dev_len
+    call puts
+
+    mov edi, [n_dev]
+    cmp edi, 255
+    jbe .exit_n
+    mov edi, 255
+.exit_n:
+    jmp exit
+
+.usage:
+    lea rsi, [usage_msg]
+    mov edx, usage_len
+    call puts_err
+    mov edi, 2
+    jmp exit
+.proto_bad:
+    lea rsi, [proto_todo]
+    mov edx, proto_todo_len
+    call puts_err
+    mov edi, 2
+    jmp exit
+.exit_err:
+    mov edi, 2
+    jmp exit
+
+; =======================================================================
+; probes
+; =======================================================================
+; Each probe: assemble a request in reqbuf, run one exchange, classify the
+; observed status, and print a line. The "expected" status and whether a
+; rejection is expected drive classify_and_report.
+
+; a full, well-formed GET — the baseline: any HTTP status line is success.
+probe_valid:
+    push rbx
+    call req_begin
+    call add_get_target_h11
+    call add_host
+    call add_close
+    call add_end
+    call run_and_read                    ; rax = status (-1 none)
+    ; baseline: OK if we got any status at all
+    mov r8, rax                          ; observed
+    mov dil, K_OK
+    test rax, rax
+    jns .ok
+    mov dil, K_DEV
+.ok:
+    lea rsi, [n_valid]
+    mov edx, n_valid_len
+    mov rcx, r8
+    mov r9d, -1                          ; no single "expected" code
+    call report
+    pop rbx
+    ret
+
+; two requests on one keep-alive connection, both must answer
+probe_keepalive:
+    push rbx
+    push r12
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax                         ; fd
+    ; request 1 (keep-alive: no Connection: close)
+    call req_begin
+    call add_get_target_h11
+    call add_host
+    call add_end
+    mov edi, ebx
+    call send_req
+    mov edi, ebx
+    call read_response
+    call parse_status
+    mov r12, rax                         ; status 1
+    ; request 2 on the same fd
+    call req_begin
+    call add_get_target_h11
+    call add_host
+    call add_close
+    call add_end
+    mov edi, ebx
+    call send_req
+    mov edi, ebx
+    call read_response
+    mov edi, ebx
+    call close_fd                         ; close BEFORE parse: parse reads the
+    call parse_status                     ; buffer, and close would clobber rax
+    ; OK only if BOTH answered
+    mov dil, K_DEV
+    test r12, r12
+    js .report
+    test rax, rax
+    js .report
+    mov dil, K_OK
+.report:
+    lea rsi, [n_keepalive]
+    mov edx, n_keepalive_len
+    mov rcx, rax                          ; show the 2nd status
+    mov r9d, -1
+    call report
+    pop r12
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_keepalive]
+    mov edx, n_keepalive_len
+    mov rcx, -1
+    mov r9d, -1
+    call report
+    pop r12
+    pop rbx
+    ret
+
+; missing Host: RFC 9112 5.4 makes it a 400
+probe_nohost:
+    call req_begin
+    call add_get_target_h11
+    call add_close
+    call add_end
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_nohost]
+    mov edx, n_nohost_len
+    mov r9d, 400
+    call classify_reject
+    ret
+
+; two Host headers: 400
+probe_duphost:
+    call req_begin
+    call add_get_target_h11
+    call add_host
+    lea rsi, [f_dummy_host2]
+    mov edx, f_dummy_host2_len
+    call req_add
+    call add_close
+    call add_end
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_duphost]
+    mov edx, n_duphost_len
+    mov r9d, 400
+    call classify_reject
+    ret
+
+; whitespace before the colon (RFC 9112 5.1): 400
+probe_wsp_colon:
+    call req_begin
+    call add_get_target_h11
+    call add_host
+    lea rsi, [f_wsp_hdr]
+    mov edx, f_wsp_hdr_len
+    call req_add
+    call add_close
+    call add_end
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_wsp]
+    mov edx, n_wsp_len
+    mov r9d, 400
+    call classify_reject
+    ret
+
+; a header line with no colon: 400
+probe_nocolon:
+    call req_begin
+    call add_get_target_h11
+    call add_host
+    lea rsi, [f_nocolon_hdr]
+    mov edx, f_nocolon_hdr_len
+    call req_add
+    call add_close
+    call add_end
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_nocolon]
+    mov edx, n_nocolon_len
+    mov r9d, 400
+    call classify_reject
+    ret
+
+; request line with no HTTP version: 400
+probe_badreqline:
+    call req_begin
+    lea rsi, [f_get_sp]
+    mov edx, f_get_sp_len
+    call req_add
+    call add_target_only
+    lea rsi, [f_crlf]                    ; end the line straight after the target
+    mov edx, f_crlf_len
+    call req_add
+    call add_host
+    call add_close
+    call add_end
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_badreqline]
+    mov edx, n_badreqline_len
+    mov r9d, 400
+    call classify_reject
+    ret
+
+; an unknown method: RFC 9110 15.6.2 points to 501
+probe_unknown_method:
+    call req_begin
+    lea rsi, [f_frob_sp]
+    mov edx, f_frob_sp_len
+    call req_add
+    call add_target_only
+    lea rsi, [f_sp_h11_crlf]
+    mov edx, f_sp_h11_crlf_len
+    call req_add
+    call add_host
+    call add_close
+    call add_end
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_unknownmeth]
+    mov edx, n_unknownmeth_len
+    mov r9d, 501
+    call classify_reject
+    ret
+
+; an HTTP/1.0 request line — informational (behaviour varies by server)
+probe_http10:
+    call req_begin
+    lea rsi, [f_get_sp]
+    mov edx, f_get_sp_len
+    call req_add
+    call add_target_only
+    lea rsi, [f_sp_h10_crlf]
+    mov edx, f_sp_h10_crlf_len
+    call req_add
+    call add_host
+    call add_end
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_http10]
+    mov edx, n_http10_len
+    call report_info
+    ret
+
+; a nonsense version — 505 or 400
+probe_badver:
+    call req_begin
+    lea rsi, [f_get_sp]
+    mov edx, f_get_sp_len
+    call req_add
+    call add_target_only
+    lea rsi, [f_sp_h99_crlf]
+    mov edx, f_sp_h99_crlf_len
+    call req_add
+    call add_host
+    call add_close
+    call add_end
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_badver]
+    mov edx, n_badver_len
+    mov r9d, 505
+    call classify_reject
+    ret
+
+; an over-long request target: RFC 9112 3 -> 414
+probe_long_target:
+    call req_begin
+    lea rsi, [f_get_sp]
+    mov edx, f_get_sp_len
+    call req_add
+    ; a '/' then ~9000 'a'
+    mov rdi, [req_cur]
+    mov byte [rdi], '/'
+    inc rdi
+    mov ecx, 9000
+    mov al, 'a'
+    rep stosb
+    mov [req_cur], rdi
+    lea rsi, [f_sp_h11_crlf]
+    mov edx, f_sp_h11_crlf_len
+    call req_add
+    call add_host
+    call add_close
+    call add_end
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_longtarget]
+    mov edx, n_longtarget_len
+    mov r9d, 414
+    call classify_reject
+    ret
+
+; bare-LF line endings (no CR): RFC 9112 2.2 permits requiring CRLF -> 400
+probe_bare_lf:
+    call req_begin
+    lea rsi, [f_get_lf]
+    mov edx, f_get_lf_len
+    call req_add
+    call add_target_only
+    lea rsi, [f_sp_h11_lf]
+    mov edx, f_sp_h11_lf_len
+    call req_add
+    lea rsi, [f_host_lf]
+    mov edx, f_host_lf_len
+    call req_add
+    mov rsi, [host_ptr]
+    mov rdx, [host_len]
+    call req_add
+    lea rsi, [f_lf]
+    mov edx, 1
+    call req_add
+    lea rsi, [f_end_lf]
+    mov edx, 1
+    call req_add
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_barelf]
+    mov edx, n_barelf_len
+    mov r9d, 400
+    call classify_reject
+    ret
+
+; absolute-form target (RFC 9112 3.2.2): should still be served (2xx/3xx/404)
+probe_absform:
+    call req_begin
+    lea rsi, [f_get_sp]
+    mov edx, f_get_sp_len
+    call req_add
+    lea rsi, [sch_http]
+    mov edx, sch_http_len
+    call req_add
+    mov rsi, [host_ptr]
+    mov rdx, [host_len]
+    call req_add
+    mov rsi, [path_ptr]
+    mov rdx, [path_len]
+    call req_add
+    lea rsi, [f_sp_h11_crlf]
+    mov edx, f_sp_h11_crlf_len
+    call req_add
+    call add_host
+    call add_close
+    call add_end
+    call run_and_read
+    ; absolute-form is legal: OK if it did NOT 400
+    mov r8, rax
+    lea rsi, [n_absform]
+    mov edx, n_absform_len
+    mov dil, K_OK
+    test rax, rax
+    js .dev
+    cmp rax, 400
+    jne .ok
+.dev:
+    mov dil, K_DEV
+.ok:
+    mov rcx, r8
+    mov r9d, -1
+    call report
+    ret
+
+; slowloris: drip a partial request head, never finishing, and watch whether
+; the server enforces a header deadline by closing on us within the window.
+probe_slowloris:
+    push rbx
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax                         ; fd
+    ; send the request line, then dribble a header a few bytes at a time with
+    ; pauses, never sending the terminating blank line
+    call req_begin
+    call add_get_target_h11
+    call req_flush_to_fd_ebx             ; sends what is buffered so far
+    ; now drip "X-Drip: aaaa..." one small chunk at a time
+    mov r12d, 20                          ; chunks
+.drip:
+    mov edi, ebx
+    lea rsi, [f_crlf]                    ; harmless partial header bytes
+    mov edx, 1                            ; one byte at a time (just a CR-less drip)
+    call send_bytes
+    test rax, rax
+    js .closed                            ; server hung up on us: deadline enforced
+    mov edi, ebx
+    mov esi, 400                          ; check for a close between drips
+    call wait_readable_or_closed
+    cmp rax, 2                            ; 2 = peer closed
+    je .closed
+    dec r12d
+    jnz .drip
+    ; still open after the whole drip window: no deadline observed here
+    mov edi, ebx
+    call close_fd
+    mov dil, K_INFO
+    lea rsi, [n_slowloris]
+    mov edx, n_slowloris_len
+    lea r8, [s_stayed]
+    mov r9d, s_stayed_len
+    call report_tail
+    pop rbx
+    ret
+.closed:
+    mov edi, ebx
+    call close_fd
+    mov dil, K_OK
+    lea rsi, [n_slowloris]
+    mov edx, n_slowloris_len
+    lea r8, [s_closed_ok]
+    mov r9d, s_closed_ok_len
+    call report_tail
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_slowloris]
+    mov edx, n_slowloris_len
+    mov rcx, -1
+    mov r9d, -1
+    call report
+    pop rbx
+    ret
+
+; =======================================================================
+; request assembly
+; =======================================================================
+; req_begin: reset the assembly cursor
+req_begin:
+    lea rax, [reqbuf]
+    mov [req_cur], rax
+    ret
+
+; req_add(rsi=ptr, rdx=len): append bytes to the request buffer
+req_add:
+    mov rdi, [req_cur]
+    mov rcx, rdx
+    rep movsb
+    mov [req_cur], rdi
+    ret
+
+; add "GET <target> HTTP/1.1\r\n"
+add_get_target_h11:
+    push rbx
+    lea rsi, [f_get_sp]
+    mov edx, f_get_sp_len
+    call req_add
+    call add_target_only
+    lea rsi, [f_sp_h11_crlf]
+    mov edx, f_sp_h11_crlf_len
+    call req_add
+    pop rbx
+    ret
+
+; append just the request target (path)
+add_target_only:
+    mov rsi, [path_ptr]
+    mov rdx, [path_len]
+    call req_add
+    ret
+
+; append "Host: <host>\r\n"
+add_host:
+    push rbx
+    lea rsi, [f_host]
+    mov edx, f_host_len
+    call req_add
+    mov rsi, [host_ptr]
+    mov rdx, [host_len]
+    call req_add
+    lea rsi, [f_crlf]
+    mov edx, f_crlf_len
+    call req_add
+    pop rbx
+    ret
+
+add_close:
+    lea rsi, [f_close_hdr]
+    mov edx, f_close_hdr_len
+    call req_add
+    ret
+
+add_end:
+    lea rsi, [f_end]
+    mov edx, f_end_len
+    call req_add
+    ret
+
+; =======================================================================
+; one exchange: connect, send the assembled request, read, parse status
+; =======================================================================
+; run_and_read() -> rax = status code (-1 on no response / connect failure)
+run_and_read:
+    push rbx
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov edi, ebx
+    call send_req
+    mov edi, ebx
+    call read_response
+    mov edi, ebx
+    call close_fd
+    call parse_status
+    pop rbx
+    ret
+.fail:
+    mov rax, -1
+    pop rbx
+    ret
+
+; send_req(edi=fd): send the whole assembled request
+send_req:
+    push rbx
+    mov ebx, edi
+    lea rsi, [reqbuf]
+    mov rdx, [req_cur]
+    sub rdx, rsi                          ; length
+    mov edi, ebx
+    call send_bytes
+    pop rbx
+    ret
+
+; req_flush_to_fd_ebx(): send whatever is in reqbuf on fd in ebx (slowloris)
+req_flush_to_fd_ebx:
+    lea rsi, [reqbuf]
+    mov rdx, [req_cur]
+    sub rdx, rsi
+    mov edi, ebx
+    jmp send_bytes                        ; tail-call: returns to our caller
+
+; =======================================================================
+; sockets
+; =======================================================================
+; tcp_connect() -> rax = fd, or -1. Reads conn_addr / conn_port.
+tcp_connect:
+    push rbx
+    mov eax, LINNEA_SYS_SOCKET
+    mov edi, LINNEA_AF_INET_
+    mov esi, SOCK_STREAM_
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .fail
+    mov ebx, eax                          ; fd
+    mov word [sa], LINNEA_AF_INET_
+    mov eax, [conn_port]
+    xchg al, ah                           ; port -> big-endian
+    mov [sa + 2], ax
+    mov eax, [conn_addr]
+    mov [sa + 4], eax
+    xor eax, eax
+    mov [sa + 8], rax                     ; sin_zero
+    mov eax, LINNEA_SYS_CONNECT
+    mov edi, ebx
+    lea rsi, [sa]
+    mov edx, 16
+    syscall
+    test rax, rax
+    js .fail_close
+    mov eax, ebx
+    pop rbx
+    ret
+.fail_close:
+    mov eax, LINNEA_SYS_CLOSE
+    mov edi, ebx
+    syscall
+.fail:
+    mov rax, -1
+    pop rbx
+    ret
+
+; send_bytes(edi=fd, rsi=ptr, rdx=len) -> rax = 0 ok, -1 on error
+send_bytes:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12, rsi
+    mov r13, rdx
+.loop:
+    test r13, r13
+    jz .done
+    mov eax, LINNEA_SYS_SENDTO
+    mov edi, ebx
+    mov rsi, r12
+    mov rdx, r13
+    mov r10d, LINNEA_MSG_NOSIGNAL
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    js .err
+    jz .err
+    add r12, rax
+    sub r13, rax
+    jmp .loop
+.done:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.err:
+    mov rax, -1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; wait_readable_or_closed(edi=fd, esi=timeout_ms)
+;   -> rax = 1 readable(data), 0 timeout, 2 peer closed, -1 error
+; After poll reports readability, a one-byte MSG_PEEK recv distinguishes real
+; data (>0) from the EOF the peer's FIN produces (0).
+MSG_PEEK_ equ 2
+wait_readable_or_closed:
+    push rbx
+    push r12
+    mov ebx, edi                          ; fd
+    mov r12d, esi                          ; timeout ms (saved before poll clobbers esi)
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, r12d
+    syscall
+    test rax, rax
+    js .err
+    jz .timeout
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [respbuf]                     ; scratch for the peeked byte
+    mov edx, 1
+    mov r10d, MSG_PEEK_
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jz .closed
+    js .err
+    mov eax, 1
+    jmp .done
+.timeout:
+    xor eax, eax
+    jmp .done
+.closed:
+    mov eax, 2
+    jmp .done
+.err:
+    mov rax, -1
+.done:
+    pop r12
+    pop rbx
+    ret
+
+; =======================================================================
+; response parsing
+; =======================================================================
+; read_response(edi=fd): read into respbuf until a quiet period or EOF.
+;   -> rax = total bytes read (stored length in r-none; parse_status reads
+;      respbuf and the length from resp_total)
+read_response:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    xor r12d, r12d                        ; total
+    mov r13d, 3000                        ; first-byte timeout ms
+.loop:
+    ; poll for readability
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, r13d
+    syscall
+    test rax, rax
+    jle .done                             ; timeout or error: stop
+    ; read
+    mov eax, LINNEA_SYS_READ
+    mov edi, ebx
+    lea rsi, [respbuf]
+    add rsi, r12
+    mov edx, RESP_CAP
+    sub edx, r12d
+    syscall
+    test rax, rax
+    jle .done                             ; EOF or error
+    add r12, rax
+    cmp r12, RESP_CAP
+    jae .done
+    mov r13d, 400                          ; quiet timeout after first data
+    jmp .loop
+.done:
+    mov [resp_total], r12
+    mov rax, r12
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; parse_status() -> rax = status int, or -1. Reads respbuf / resp_total.
+; Expects "HTTP/1.x SP DDD ...".
+parse_status:
+    mov rcx, [resp_total]
+    cmp rcx, 12
+    jb .none
+    ; must start with "HTTP/"
+    cmp dword [respbuf], 0x50545448        ; "HTTP" little-endian
+    jne .none
+    cmp byte [respbuf + 4], '/'
+    jne .none
+    ; find the first space (after the version token)
+    lea rsi, [respbuf]
+    mov rdx, rsi
+    add rdx, rcx                           ; end
+    add rsi, 5                             ; past "HTTP/"
+.find_sp:
+    cmp rsi, rdx
+    jae .none
+    cmp byte [rsi], ' '
+    je .got_sp
+    inc rsi
+    jmp .find_sp
+.got_sp:
+    inc rsi                                ; first status digit
+    lea rax, [rsi + 3]
+    cmp rax, rdx
+    ja .none
+    ; three digits -> integer
+    xor eax, eax
+    mov ecx, 3
+.digits:
+    movzx r8d, byte [rsi]
+    sub r8d, '0'
+    cmp r8d, 9
+    ja .none
+    imul eax, eax, 10
+    add eax, r8d
+    inc rsi
+    dec ecx
+    jnz .digits
+    ret
+.none:
+    mov rax, -1
+    ret
+
+; =======================================================================
+; classification and reporting
+; =======================================================================
+; classify_reject(rsi=name, edx=namelen, rcx=observed, r9d=expected):
+; an invalid request we expect the server to REJECT with status r9d.
+;   observed == expected            -> OK
+;   observed >= 400 (other reject)  -> INFO (rejected, different code)
+;   observed 2xx/3xx (accepted!)    -> DEV
+;   no response                     -> DEV
+classify_reject:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rsi                          ; name
+    mov r13d, edx                         ; namelen
+    mov r14, rcx                          ; observed
+    mov ebx, r9d                          ; expected
+    ; decide kind in dil
+    mov dil, K_DEV
+    test r14, r14
+    js .info                              ; closed with no status: a terse but
+                                          ; legitimate rejection, not a deviation
+    cmp r14d, ebx
+    je .ok
+    cmp r14d, 400
+    jae .info
+    jmp .emit                             ; accepted (<400) -> DEV
+.ok:
+    mov dil, K_OK
+    jmp .emit
+.info:
+    mov dil, K_INFO
+.emit:
+    mov rsi, r12
+    mov edx, r13d
+    mov rcx, r14
+    mov r9d, ebx
+    call report
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; report_info(rsi=name, edx=namelen, rcx=observed): always INFO
+report_info:
+    mov dil, K_INFO
+    mov r9d, -1
+    jmp report
+
+; report(dil=kind, rsi=name, edx=namelen, rcx=observed, r9d=expected(-1 none))
+; prints "[kind] name -> HTTP NNN  (want MMM)\n", or "(no response)".
+report:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                            ; align
+    movzx ebx, dil                        ; kind
+    mov r12, rsi                          ; name
+    mov r13d, edx                         ; namelen
+    mov r14, rcx                          ; observed
+    mov r15d, r9d                         ; expected
+
+    inc dword [n_total]
+    cmp ebx, K_DEV
+    jne .prefix
+    inc dword [n_dev]
+.prefix:
+    ; prefix by kind
+    cmp ebx, K_OK
+    je .p_ok
+    cmp ebx, K_DEV
+    je .p_dev
+    lea rsi, [pfx_info]
+    mov edx, pfx_info_len
+    jmp .pput
+.p_ok:
+    lea rsi, [pfx_ok]
+    mov edx, pfx_ok_len
+    jmp .pput
+.p_dev:
+    lea rsi, [pfx_dev]
+    mov edx, pfx_dev_len
+.pput:
+    call puts
+    ; name
+    mov rsi, r12
+    mov edx, r13d
+    call puts
+    ; " -> "
+    lea rsi, [s_arrow]
+    mov edx, s_arrow_len
+    call puts
+    ; observed
+    test r14, r14
+    js .noresp
+    lea rsi, [s_status]
+    mov edx, s_status_len
+    call puts
+    mov edi, r14d
+    call print_u32
+    ; want MMM ?
+    cmp r15d, -1
+    je .endline
+    lea rsi, [s_want]
+    mov edx, s_want_len
+    call puts
+    mov edi, r15d
+    call print_u32
+    lea rsi, [s_rparen_nl]
+    mov edx, s_rparen_nl_len
+    call puts
+    jmp .ret
+.endline:
+    lea rsi, [s_nl]
+    mov edx, 1
+    call puts
+    jmp .ret
+.noresp:
+    lea rsi, [s_noresp]
+    mov edx, s_noresp_len
+    call puts
+.ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; report_tail(dil=kind, rsi=name, edx=namelen, r8=tail ptr, r9d=tail len):
+; like report but the detail is a literal string (used by slowloris).
+report_tail:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    movzx ebx, dil
+    mov r12, rsi
+    mov r13d, edx
+    mov r14, r8
+    mov r15d, r9d
+    inc dword [n_total]
+    cmp ebx, K_DEV
+    jne .prefix
+    inc dword [n_dev]
+.prefix:
+    cmp ebx, K_OK
+    je .p_ok
+    cmp ebx, K_INFO
+    je .p_info
+    lea rsi, [pfx_dev]
+    mov edx, pfx_dev_len
+    jmp .pput
+.p_ok:
+    lea rsi, [pfx_ok]
+    mov edx, pfx_ok_len
+    jmp .pput
+.p_info:
+    lea rsi, [pfx_info]
+    mov edx, pfx_info_len
+.pput:
+    call puts
+    mov rsi, r12
+    mov edx, r13d
+    call puts
+    mov rsi, r14
+    mov edx, r15d
+    call puts
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; =======================================================================
+; small helpers
+; =======================================================================
+; puts(rsi=ptr, rdx=len): the tool's internal print convention; shuffles to
+; linnea_print_stdout's (rdi=ptr, rsi=len). puts_err writes to stderr.
+puts:
+    mov rdi, rsi
+    mov rsi, rdx
+    jmp linnea_print_stdout
+puts_err:
+    mov rdi, rsi
+    mov rsi, rdx
+    jmp linnea_print_stderr
+
+; print_u32(edi=value): print the decimal number to stdout
+print_u32:
+    push rbx
+    sub rsp, 8
+    mov ecx, edi
+    mov rdi, rcx
+    lea rsi, [numbuf]
+    call linnea_string_from_u64          ; rax = len
+    lea rsi, [numbuf]
+    mov rdx, rax
+    call puts
+    add rsp, 8
+    pop rbx
+    ret
+
+; close_fd(edi=fd)
+close_fd:
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    ret
+
+; cstrlen(rsi=cstr) -> rax = length (NUL-terminated)
+cstrlen:
+    xor eax, eax
+.l:
+    cmp byte [rsi + rax], 0
+    je .d
+    inc rax
+    jmp .l
+.d:
+    ret
+
+; streq_z(rdi=cstr, rsi=fixed ptr, edx=fixed len) -> rax=1 if cstr equals the
+; fixed string exactly (cstr must be NUL right after)
+streq_z:
+    xor eax, eax
+    xor ecx, ecx
+.l:
+    cmp ecx, edx
+    jae .tail
+    mov r8b, [rdi + rcx]
+    cmp r8b, [rsi + rcx]
+    jne .no
+    inc ecx
+    jmp .l
+.tail:
+    cmp byte [rdi + rcx], 0
+    jne .no
+    mov eax, 1
+.no:
+    ret
+
+; exit(edi=code)
+exit:
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; =======================================================================
+; URL parsing
+; =======================================================================
+; parse_url(rdi=url cstr) -> rax = 0 ok / -1 error (prints its own message).
+; Fills conn_addr, conn_port, path_ptr/len, and host_ptr/len (unless --host
+; already set it). Accepts http://<ipv4-or-localhost>[:port][/path].
+parse_url:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi                          ; cursor
+
+    ; scheme must be http://
+    mov rsi, rbx
+    lea rdi, [sch_http]
+    mov edx, sch_http_len
+    call memeq
+    test rax, rax
+    jz .bad_scheme
+    add rbx, sch_http_len
+
+    ; host runs until ':' or '/' or NUL
+    mov r12, rbx                          ; host start
+.host_scan:
+    movzx eax, byte [rbx]
+    test al, al
+    je .host_end
+    cmp al, ':'
+    je .host_end
+    cmp al, '/'
+    je .host_end
+    inc rbx
+    jmp .host_scan
+.host_end:
+    mov r13, rbx
+    sub r13, r12                          ; host length
+    ; resolve the host to an address (localhost or IPv4 literal)
+    ; localhost?
+    cmp r13, localhost_len
+    jne .try_ipv4
+    mov rsi, r12
+    lea rdi, [localhost_s]
+    mov edx, localhost_len
+    call memeq
+    test rax, rax
+    jz .try_ipv4
+    mov dword [conn_addr], localhost_addr
+    jmp .have_addr
+.try_ipv4:
+    ; parse_ipv4 needs a NUL/'.'-delimited string; the host is followed by
+    ; ':' '/' or NUL, all of which stop it, so pass the pointer directly.
+    mov rdi, r12
+    call parse_ipv4_local
+    cmp rax, -1
+    je .bad_host
+    mov [conn_addr], eax
+.have_addr:
+    ; default Host header = the URL host (unless --host overrode it)
+    cmp qword [host_ptr], 0
+    jne .host_set
+    mov [host_ptr], r12
+    mov [host_len], r13
+.host_set:
+
+    ; optional :port
+    mov dword [conn_port], 80
+    movzx eax, byte [rbx]
+    cmp al, ':'
+    jne .port_done
+    inc rbx
+    xor r14d, r14d                         ; port accumulator
+.port_scan:
+    movzx eax, byte [rbx]
+    cmp al, '0'
+    jb .port_set
+    cmp al, '9'
+    ja .port_set
+    imul r14d, r14d, 10
+    sub eax, '0'
+    add r14d, eax
+    inc rbx
+    jmp .port_scan
+.port_set:
+    test r14d, r14d
+    jz .bad_host                           ; ":" with no digits
+    mov [conn_port], r14d
+.port_done:
+
+    ; path = from '/' to NUL, or "/" if absent
+    movzx eax, byte [rbx]
+    cmp al, '/'
+    je .have_path
+    lea rax, [defslash]
+    mov [path_ptr], rax
+    mov qword [path_len], 1
+    jmp .ok
+.have_path:
+    mov [path_ptr], rbx
+    mov rsi, rbx
+    call cstrlen
+    mov [path_len], rax
+.ok:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.bad_scheme:
+    lea rsi, [err_scheme]
+    mov edx, err_scheme_len
+    call puts_err
+    jmp .err
+.bad_host:
+    lea rsi, [err_host]
+    mov edx, err_host_len
+    call puts_err
+.err:
+    mov rax, -1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; parse_ipv4_local(rdi=str) -> rax = address in network byte order, or -1.
+; Reads four dotted decimal octets; stops at the first non-digit/non-dot, so a
+; host followed by ':' '/' or NUL parses cleanly. Each octet 0..255.
+parse_ipv4_local:
+    xor r8d, r8d                          ; result (network order: octet i in byte i)
+    xor r9d, r9d                          ; octet index
+.octet:
+    xor r11d, r11d                        ; octet value
+    xor r10d, r10d                        ; digit count
+.digit:
+    movzx eax, byte [rdi]
+    sub eax, '0'
+    cmp eax, 9
+    ja .end_digits
+    imul r11d, r11d, 10
+    add r11d, eax
+    cmp r11d, 255
+    ja .fail
+    inc r10d
+    inc rdi
+    jmp .digit
+.end_digits:
+    test r10d, r10d
+    jz .fail                              ; no digits in this octet
+    mov ecx, r9d
+    shl ecx, 3
+    shl r11d, cl
+    or r8d, r11d
+    inc r9d
+    movzx eax, byte [rdi]
+    cmp r9d, 4
+    je .last
+    cmp al, '.'
+    jne .fail
+    inc rdi
+    jmp .octet
+.last:
+    ; four octets read; the next byte must end the host token
+    test al, al
+    je .ok
+    cmp al, ':'
+    je .ok
+    cmp al, '/'
+    je .ok
+    jmp .fail
+.ok:
+    mov eax, r8d
+    ret
+.fail:
+    mov rax, -1
+    ret
+
+; memeq(rsi=a, rdi=b, edx=len) -> rax=1 if the len bytes match
+memeq:
+    xor eax, eax
+    xor ecx, ecx
+.l:
+    cmp ecx, edx
+    jae .yes
+    mov r8b, [rsi + rcx]
+    cmp r8b, [rdi + rcx]
+    jne .no
+    inc ecx
+    jmp .l
+.yes:
+    mov eax, 1
+.no:
+    ret
+
+section .rodata
+defslash:  db "/"
+
+section .bss
+resp_total: resq 1

@@ -281,8 +281,21 @@ $(H3RESP_BIN): $(H3RESP_OBJS)
 
 h3resp: $(H3RESP_BIN)
 
+# --- HTTP compliance prober (own _start; a client, not part of the server) ---
+PROBE_BIN  = bin/linnea-probe
+PROBE_OBJS = test/probe/linnea_probe.o src/linnea_print.o src/linnea_string.o
+
+test/probe/linnea_probe.o: test/probe/linnea_probe.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(PROBE_BIN): $(PROBE_OBJS)
+	$(LD) -o $@ $^
+
+probe: $(PROBE_BIN)
+
 clean:
 	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
+	      test/probe/*.o $(PROBE_BIN) \
 	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
 
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
