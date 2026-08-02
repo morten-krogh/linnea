@@ -31,9 +31,13 @@ K_INFO equ 2            ; rejected, but with a different status than expected
 
 LINNEA_AF_INET_ equ 2
 SOCK_STREAM_    equ 1
+SOCK_DGRAM_     equ 2
+O_RDONLY_       equ 0
 
 RESP_CAP        equ 65536
 REQ_CAP         equ 65536
+HOSTBUF_CAP     equ 256
+DNSBUF_CAP      equ 1024
 
 section .rodata
 
@@ -91,6 +95,12 @@ err_host:   db "error: host must be an IPv4 literal or localhost (DNS is phase 2
 err_host_len equ $ - err_host
 err_connect: db "error: could not connect to the server", 10
 err_connect_len equ $ - err_connect
+err_resolve: db "error: could not resolve the host (DNS)", 10
+err_resolve_len equ $ - err_resolve
+resolv_path: db "/etc/resolv.conf", 0
+ns_kw:      db "nameserver"
+ns_kw_len   equ $ - ns_kw
+fallback_ns equ 0x3500007f              ; 127.0.0.53 (systemd-resolved), network order
 proto_h1:   db "h1"
 proto_todo: db "error: only h1 is implemented in phase 1 (h2/h3 coming)", 10
 proto_todo_len equ $ - proto_todo
@@ -175,6 +185,12 @@ timespec:   resb 16
 conn_addr:  resd 1                      ; server address (network order), for connect
 conn_port:  resd 1                      ; server port (host order)
 
+urlhost:    resb HOSTBUF_CAP            ; the URL's host, NUL-terminated (for DNS)
+urlhost_len: resq 1
+dnsbuf:     resb DNSBUF_CAP             ; DNS query then response
+ns_sa:      resb 16                     ; nameserver sockaddr_in
+resolv_buf: resb 1024                   ; /etc/resolv.conf contents
+
 host_ptr:   resq 1                      ; Host-header value ptr...
 host_len:   resq 1                      ; ...and length (from the URL, or --host)
 path_ptr:   resq 1                      ; request-target ptr...
@@ -238,6 +254,13 @@ _start:
     test rax, rax
     js .exit_err                         ; parse_url already printed the reason
 
+    ; --- resolve the URL host to an address (IPv4 literal, localhost, or DNS) ---
+    lea rdi, [urlhost]
+    call dns_resolve
+    cmp rax, -1
+    je .exit_resolve
+    mov [conn_addr], eax
+
     ; --- header banner ---
     lea rsi, [hdr_line]
     mov edx, hdr_line_len
@@ -300,6 +323,12 @@ _start:
     mov edi, 2
     jmp exit
 .exit_err:
+    mov edi, 2
+    jmp exit
+.exit_resolve:
+    lea rsi, [err_resolve]
+    mov edx, err_resolve_len
+    call puts_err
     mov edi, 2
     jmp exit
 
@@ -1318,31 +1347,22 @@ parse_url:
 .host_end:
     mov r13, rbx
     sub r13, r12                          ; host length
-    ; resolve the host to an address (localhost or IPv4 literal)
-    ; localhost?
-    cmp r13, localhost_len
-    jne .try_ipv4
+    test r13, r13
+    jz .bad_host                          ; empty host
+    cmp r13, HOSTBUF_CAP - 1
+    jae .bad_host
+    ; copy the host into urlhost, NUL-terminated, for DNS and the Host header
+    mov [urlhost_len], r13
+    lea rdi, [urlhost]
     mov rsi, r12
-    lea rdi, [localhost_s]
-    mov edx, localhost_len
-    call memeq
-    test rax, rax
-    jz .try_ipv4
-    mov dword [conn_addr], localhost_addr
-    jmp .have_addr
-.try_ipv4:
-    ; parse_ipv4 needs a NUL/'.'-delimited string; the host is followed by
-    ; ':' '/' or NUL, all of which stop it, so pass the pointer directly.
-    mov rdi, r12
-    call parse_ipv4_local
-    cmp rax, -1
-    je .bad_host
-    mov [conn_addr], eax
-.have_addr:
+    mov rcx, r13
+    rep movsb
+    mov byte [rdi], 0
     ; default Host header = the URL host (unless --host overrode it)
     cmp qword [host_ptr], 0
     jne .host_set
-    mov [host_ptr], r12
+    lea rax, [urlhost]
+    mov [host_ptr], rax
     mov [host_len], r13
 .host_set:
 
@@ -1457,6 +1477,304 @@ parse_ipv4_local:
     ret
 .fail:
     mov rax, -1
+    ret
+
+; =======================================================================
+; DNS (A-record resolution over UDP)
+; =======================================================================
+; dns_resolve(rdi = hostname cstr) -> rax = IPv4 (network order) or -1.
+; An IPv4 literal or "localhost" resolve without a query.
+dns_resolve:
+    push rbx
+    mov rbx, rdi
+    mov rdi, rbx
+    call parse_ipv4_local
+    cmp rax, -1
+    jne .done                             ; a literal address
+    mov rdi, rbx
+    lea rsi, [localhost_s]
+    mov edx, localhost_len
+    call streq_z
+    test rax, rax
+    jz .dns
+    mov eax, localhost_addr
+    jmp .done
+.dns:
+    call nameserver_addr                  ; rax = nameserver (network order)
+    mov esi, eax
+    mov rdi, rbx
+    call dns_query                        ; rax = address or -1
+.done:
+    pop rbx
+    ret
+
+; nameserver_addr() -> rax = the first nameserver in /etc/resolv.conf, or the
+; systemd-resolved stub 127.0.0.53 if the file is missing or names none.
+nameserver_addr:
+    push rbx
+    mov eax, LINNEA_SYS_OPEN
+    lea rdi, [resolv_path]
+    xor esi, esi                          ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .fallback
+    mov ebx, eax                          ; fd
+    mov eax, LINNEA_SYS_READ
+    mov edi, ebx
+    lea rsi, [resolv_buf]
+    mov edx, 1023
+    syscall
+    mov r9, rax                           ; bytes read
+    mov eax, LINNEA_SYS_CLOSE
+    mov edi, ebx
+    push r9
+    syscall
+    pop r9
+    test r9, r9
+    jle .fallback
+    mov byte [resolv_buf + r9], 0         ; NUL-terminate
+    lea rbx, [resolv_buf]                 ; line cursor
+.line:
+    cmp byte [rbx], 0
+    je .fallback
+    ; does this line start with "nameserver"?
+    mov rsi, rbx
+    lea rdi, [ns_kw]
+    mov edx, ns_kw_len
+    call memeq
+    test rax, rax
+    jz .next_line
+    ; skip "nameserver" and any spaces/tabs
+    lea rdi, [rbx + ns_kw_len]
+.skip_ws:
+    movzx eax, byte [rdi]
+    cmp al, ' '
+    je .adv_ws
+    cmp al, 9
+    jne .parse_ns
+.adv_ws:
+    inc rdi
+    jmp .skip_ws
+.parse_ns:
+    call parse_ipv4_local                 ; rdi = the address text
+    cmp rax, -1
+    je .next_line
+    pop rbx
+    ret                                    ; rax = nameserver address
+.next_line:
+    ; advance to the start of the next line
+.nl_scan:
+    movzx eax, byte [rbx]
+    test al, al
+    je .fallback
+    inc rbx
+    cmp al, 10
+    jne .nl_scan
+    jmp .line
+.fallback:
+    mov eax, fallback_ns
+    pop rbx
+    ret
+
+; dns_query(rdi = hostname cstr, esi = nameserver addr) -> rax = A record
+; (network order) or -1. Builds a standard A query, sends it over UDP to
+; nameserver:53, and walks the answer section for the first A record.
+dns_query:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r14, rdi                          ; hostname
+    mov r15d, esi                         ; nameserver
+    ; --- build the query in dnsbuf ---
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [dnsbuf]
+    mov esi, 2                            ; a random 16-bit id
+    xor edx, edx
+    syscall
+    mov byte [dnsbuf + 2], 0x01           ; flags: recursion desired
+    mov byte [dnsbuf + 3], 0x00
+    mov byte [dnsbuf + 4], 0x00           ; qdcount = 1
+    mov byte [dnsbuf + 5], 0x01
+    xor eax, eax
+    mov [dnsbuf + 6], eax                 ; ancount = nscount = 0
+    mov [dnsbuf + 8], eax                 ; nscount = arcount = 0
+    mov word [dnsbuf + 10], 0
+    ; QNAME: length-prefixed labels
+    lea rdi, [dnsbuf + 12]                ; write cursor
+    mov rsi, r14                          ; hostname read cursor
+.qn_label:
+    mov rbx, rdi                          ; remember the length-byte slot
+    inc rdi                               ; leave room for the length
+    xor ecx, ecx                          ; label length
+.qn_char:
+    movzx eax, byte [rsi]
+    test al, al
+    je .qn_end
+    cmp al, '.'
+    je .qn_dot
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    inc ecx
+    jmp .qn_char
+.qn_dot:
+    mov [rbx], cl                         ; fill in the label length
+    inc rsi                               ; skip the '.'
+    jmp .qn_label
+.qn_end:
+    mov [rbx], cl                         ; last label length
+    mov byte [rdi], 0                     ; root label
+    inc rdi
+    mov word [rdi], 0x0100                ; QTYPE = A (0x0001, big-endian on wire)
+    mov word [rdi + 2], 0x0100            ; QCLASS = IN
+    add rdi, 4
+    lea r13, [dnsbuf]
+    sub rdi, r13                          ; r13d unused; rdi = query length
+    mov r13, rdi                          ; query length
+    ; --- send over UDP ---
+    mov eax, LINNEA_SYS_SOCKET
+    mov edi, LINNEA_AF_INET_
+    mov esi, SOCK_DGRAM_
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .fail
+    mov ebx, eax                          ; udp fd
+    mov word [ns_sa], LINNEA_AF_INET_
+    mov word [ns_sa + 2], 0x3500          ; port 53, big-endian
+    mov [ns_sa + 4], r15d                 ; nameserver address
+    xor eax, eax
+    mov [ns_sa + 8], rax
+    mov eax, LINNEA_SYS_SENDTO
+    mov edi, ebx
+    lea rsi, [dnsbuf]
+    mov rdx, r13
+    xor r10d, r10d
+    lea r8, [ns_sa]
+    mov r9d, 16
+    syscall
+    test rax, rax
+    js .fail_close
+    ; wait up to 2s for the reply
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 2000
+    syscall
+    test rax, rax
+    jle .fail_close
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [dnsbuf]
+    mov edx, DNSBUF_CAP
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    mov r13, rax                          ; response length
+    push rax
+    mov eax, LINNEA_SYS_CLOSE
+    mov edi, ebx
+    syscall
+    pop r13
+    cmp r13, 12
+    jb .fail
+    ; --- parse the answer section ---
+    movzx r12d, byte [dnsbuf + 6]         ; ancount (big-endian)
+    shl r12d, 8
+    movzx eax, byte [dnsbuf + 7]
+    or r12d, eax                          ; r12 = answer count
+    lea rsi, [dnsbuf + 12]                ; cursor past the header
+    lea rbx, [dnsbuf]
+    add rbx, r13                          ; end of the response
+    ; skip the question's QNAME (no compression) then QTYPE+QCLASS
+.q_skip:
+    cmp rsi, rbx
+    jae .fail
+    movzx eax, byte [rsi]
+    test al, al
+    je .q_skipped
+    inc rsi
+    add rsi, rax
+    jmp .q_skip
+.q_skipped:
+    add rsi, 5                            ; the root 0, then QTYPE(2)+QCLASS(2)
+    ; walk the answers
+.ans:
+    test r12d, r12d
+    jz .fail
+    cmp rsi, rbx
+    jae .fail
+    ; NAME: a compression pointer (11xxxxxx) is 2 bytes; else label sequence
+    movzx eax, byte [rsi]
+    mov ecx, eax
+    and ecx, 0xc0
+    cmp ecx, 0xc0
+    je .name_ptr
+.name_labels:
+    movzx eax, byte [rsi]
+    test al, al
+    je .name_done_labels
+    inc rsi
+    add rsi, rax
+    cmp rsi, rbx
+    jae .fail
+    jmp .name_labels
+.name_done_labels:
+    inc rsi                               ; the root 0
+    jmp .rr_fixed
+.name_ptr:
+    add rsi, 2
+.rr_fixed:
+    lea rax, [rsi + 10]                   ; TYPE(2) CLASS(2) TTL(4) RDLENGTH(2)
+    cmp rax, rbx
+    ja .fail
+    movzx eax, byte [rsi]                 ; TYPE high
+    shl eax, 8
+    movzx ecx, byte [rsi + 1]
+    or eax, ecx                           ; TYPE
+    movzx edx, byte [rsi + 8]             ; RDLENGTH high
+    shl edx, 8
+    movzx ecx, byte [rsi + 9]
+    or edx, ecx                           ; RDLENGTH
+    add rsi, 10                           ; -> RDATA
+    cmp eax, 1                            ; A record?
+    jne .rr_next
+    cmp edx, 4
+    jne .rr_next
+    lea rax, [rsi + 4]
+    cmp rax, rbx
+    ja .fail
+    mov eax, [rsi]                        ; the 4-byte address (already network order)
+    jmp .ok
+.rr_next:
+    add rsi, rdx                          ; skip RDATA
+    dec r12d
+    jmp .ans
+.ok:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.fail_close:
+    mov eax, LINNEA_SYS_CLOSE
+    mov edi, ebx
+    syscall
+.fail:
+    mov rax, -1
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; memeq(rsi=a, rdi=b, edx=len) -> rax=1 if the len bytes match
