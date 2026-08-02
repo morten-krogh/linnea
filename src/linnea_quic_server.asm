@@ -1315,9 +1315,21 @@ linnea_quic_server_datagram:
     mov rbx, [cur_conn]
     lea rdx, [rbx + linnea_quic_conn.zrtt_ckeys]
     lea rcx, [plaintext]
-    call linnea_quic_unprotect_hs    ; rax = frame bytes
+    call linnea_quic_unprotect_hs    ; rax = frame bytes, rdx = packet number
     test rax, rax
     js .early_done
+    ; RFC 9000 13.2.1: this packet MUST be acknowledged. 0-RTT shares the
+    ; Application packet number space with 1-RTT, so recording its number into
+    ; rx_have is enough — the ACK rides the HANDSHAKE_DONE packet, whose ACK is
+    ; built from rx_have at .do_cfin. The number used to be discarded, so the
+    ; client declared its early request lost and re-sent it in 1-RTT, where it
+    ; was served a SECOND time (harmless for the idempotent GET/HEAD that 0-RTT
+    ; carries, but a needless duplicate and a MUST unmet).
+    push rax                         ; frame count, across the record call
+    mov rsi, rdx                     ; the 0-RTT packet number
+    CONNLEA rdi, rx_have
+    call linnea_quic_ack_record
+    pop rax
     cmp rax, LINNEA_QUIC_EARLY_BUF
     ja .early_done                   ; oversized early data: drop it (served fresh)
     mov rbx, [cur_conn]

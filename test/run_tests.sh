@@ -745,6 +745,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_0rtt_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): serves a 0-RTT request (early data)" $?
 
+    # quic-6: the 0-RTT packet shares the Application pn space with 1-RTT and MUST
+    # be acknowledged (RFC 9000 13.2.1); the server used to discard its number, so
+    # the early request was never acked. The qlog must show the server ack cover
+    # the packet number the client sent its 0-RTT on.
+    python3 test/quic/h3_0rtt_ack_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): the 0-RTT packet is acknowledged" $?
+
     # BPF connection-ID steering: a connection survives the client migrating to a
     # fresh source port. Needs CAP_BPF on the binary (a rebuild drops the file
     # capability), so it is skipped when the steering program could not load.
