@@ -612,6 +612,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_preconditions_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): If-Match and If-Unmodified-Since" $?
 
+    # RFC 9114 6.2: a critical stream must not be closed BY ANY MEANS. Only a
+    # FIN was noticed, so a peer could RESET_STREAM its control stream and the
+    # connection carried on as though it still had one.
+    python3 test/quic/h3_critical_reset_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): resetting a critical stream is detected" $?
+
     # An ack-eliciting packet MUST be acknowledged (RFC 9000 13.2.1). An ACK was
     # only built when the server had something of its own to send, so a lone PING
     # (a browser keepalive) or a lone stream reset drew nothing and the peer

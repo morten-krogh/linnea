@@ -262,6 +262,13 @@ struc linnea_quic_conn
     .peer_len:   resq 1              ; sockaddr length
     .state:      resq 1
     .ctrl_id:    resq 1              ; the peer's control stream id, 0 until seen
+    ; The peer's QPACK stream ids, 0 until seen. Recorded only so that a
+    ; RESET_STREAM or STOP_SENDING naming one can be recognised: RFC 9114 6.2
+    ; forbids closing a critical stream by any means, and a reset is a closure.
+    ; Their contents still carry nothing we read (our table capacity is 0), which
+    ; is why the ids were not tracked before.
+    .qpack_enc_id: resq 1
+    .qpack_dec_id: resq 1
     ; The control stream's frame walk (RFC 9114 6.2.1). It carries a frame
     ; sequence like any other stream, but it never ends and arrives spread over
     ; STREAM frames, so it is walked as it streams rather than reassembled:

@@ -1736,12 +1736,39 @@ linnea_quic_server_datagram:
     mov rbx, rax                      ; count
     xor ebp, ebp                      ; index
 .reset_loop:
+    ; RFC 9114 6.2: a critical stream — the control stream and both QPACK
+    ; streams — must not be closed, and a RESET_STREAM or STOP_SENDING naming
+    ; one is a closure. Only a FIN was noticed, so a peer could reset the
+    ; control stream and the connection carried on as though it still had one.
     mov rdi, [cur_conn]
     mov rsi, [reset_ids + rbp * 8]
+    mov rax, [rdi + linnea_quic_conn.ctrl_id]
+    test rax, rax
+    jz .reset_chk_enc
+    cmp rax, rsi
+    je .reset_critical
+.reset_chk_enc:
+    mov rax, [rdi + linnea_quic_conn.qpack_enc_id]
+    test rax, rax
+    jz .reset_chk_dec
+    cmp rax, rsi
+    je .reset_critical
+.reset_chk_dec:
+    mov rax, [rdi + linnea_quic_conn.qpack_dec_id]
+    test rax, rax
+    jz .reset_ok
+    cmp rax, rsi
+    je .reset_critical
+.reset_ok:
     call reset_teardown
     inc rbp
     cmp rbp, rbx
     jb .reset_loop
+    jmp .reset_next
+.reset_critical:
+    mov edi, LINNEA_H3_ERR_CLOSED_CRITICAL
+    jmp .h3_close
+.reset_next:
 .no_resets:
     ; PATH_CHALLENGE -> PATH_RESPONSE (RFC 9000 8.2): echo the 8 challenge bytes so a
     ; peer validating this path (e.g. after a migration) confirms our address. The
@@ -2493,6 +2520,18 @@ linnea_quic_server_datagram:
 .uni_qpack:
     cmp qword [s_sfin], 0
     jne .uni_critical_closed         ; a QPACK stream must not be closed
+    ; Remember which stream this is, so a reset of it can be recognised later.
+    ; Nothing here reads the stream's contents — our QPACK capacity is 0, so a
+    ; conforming encoder sends none — but 6.2 forbids closing it by any means,
+    ; and a RESET_STREAM is a closure the FIN test above never sees.
+    mov rdx, [cur_conn]
+    mov rax, [s_sid]
+    cmp cl, LINNEA_H3_STREAM_QPACK_ENC
+    jne .uni_qpack_dec
+    mov [rdx + linnea_quic_conn.qpack_enc_id], rax
+    jmp .stream_scan
+.uni_qpack_dec:
+    mov [rdx + linnea_quic_conn.qpack_dec_id], rax
     jmp .stream_scan                 ; otherwise nothing to read (zero table)
 .uni_cont:
     ; a continuation: only the control stream's closure is our concern here (we
