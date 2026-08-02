@@ -47,6 +47,7 @@ extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
 extern linnea_quic_unprotect_short
 extern linnea_quic_stream_frame
+extern linnea_quic_frame_skip
 
 ; ---- kinds, for the per-probe report line -------------------------------
 K_OK   equ 0            ; the server did what the RFC requires
@@ -265,6 +266,10 @@ n_h3_1rtt:    db "QUIC handshake complete (client Finished -> 1-RTT)"
 n_h3_1rtt_len equ $ - n_h3_1rtt
 n_h3_get:     db "HTTP/3 GET / (control stream + QPACK request)"
 n_h3_get_len equ $ - n_h3_get
+n_h3_nopath:  db "HTTP/3 request with no :path -> rejected"
+n_h3_nopath_len equ $ - n_h3_nopath
+n_h3_badqp:   db "HTTP/3 undecodable QPACK -> connection closed"
+n_h3_badqp_len equ $ - n_h3_badqp
 
 ; QPACK static index -> :status, mirroring the server's encoder table.
 qpack_idx2status:
@@ -4727,9 +4732,322 @@ quic_h3_get:
     pop rbp
     ret
 
+; quic_h3_open() -> rax = a fd with the QUIC handshake driven to 1-RTT, or -1.
+; A fresh connection (new keys, DCID, SCID) for a negative probe. Duplicates the
+; setup in probe_h3_handshake deliberately, so a bug here cannot touch the proven
+; valid-request path.
+quic_h3_open:
+    push rbx
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_priv]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    and byte [tls_priv], 248
+    and byte [tls_priv + 31], 127
+    or byte [tls_priv + 31], 64
+    lea rdi, [tls_pub]
+    lea rsi, [tls_priv]
+    lea rdx, [x25519_base]
+    call linnea_x25519
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_random]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_sessid]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [q_dcid]
+    mov esi, 8
+    xor edx, edx
+    syscall
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [q_scid]
+    mov esi, 8
+    xor edx, edx
+    syscall
+    call udp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov edi, ebx
+    call quic_send_initial
+    test rax, rax
+    js .closefail
+    mov edi, ebx
+    call quic_recv_flight
+    test rax, rax
+    jz .closefail                         ; no server Finished
+    mov edi, ebx
+    call quic_finish
+    test rax, rax
+    jz .closefail                         ; 1-RTT not established
+    mov eax, ebx
+    pop rbx
+    ret
+.closefail:
+    mov edi, ebx
+    call close_fd
+.fail:
+    mov rax, -1
+    pop rbx
+    ret
+
+; quic_h3_classify(edi=fd) -> rax: a server :status (>0), -2 RESET_STREAM on our
+; request stream, -3 CONNECTION_CLOSE, or -1 nothing. Reads 1-RTT packets and
+; walks every frame (frame_skip knows all lengths; stream_frame extracts the data).
+quic_h3_classify:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    and rsp, -16
+    mov ebx, edi
+    mov qword [h3buf_len], 0
+    mov r15d, 8                           ; datagram budget
+.loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 2000
+    syscall
+    test rax, rax
+    jle .none
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle .none
+    mov rsi, rax
+    call quic_find_1rtt
+    test rax, rax
+    jz .next
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [q_ap_skeys]
+    lea rcx, [qplain]
+    mov r8d, 8
+    mov r9, [q_cli_ap_pn]
+    call linnea_quic_unprotect_short
+    test rax, rax
+    js .next
+    lea r13, [qplain]                     ; frame cursor
+    lea r14, [qplain]
+    add r14, rax                          ; frames end
+.frame:
+    cmp r13, r14
+    jae .next
+    movzx eax, byte [r13]
+    cmp al, 0x1c                          ; CONNECTION_CLOSE (transport)
+    je .closed
+    cmp al, 0x1d                          ; CONNECTION_CLOSE (application)
+    je .closed
+    cmp al, 0x04                          ; RESET_STREAM
+    je .reset
+    mov ecx, eax
+    and ecx, 0xf8
+    cmp ecx, 0x08                         ; STREAM
+    je .stream
+    mov rdi, r13                          ; anything else: skip by length
+    mov rsi, r14
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .next                            ; truncated / unknown: give up on packet
+    add r13, rax
+    jmp .frame
+.stream:
+    mov rdi, r13
+    mov rsi, r14
+    sub rsi, r13
+    call linnea_quic_stream_frame         ; rax=data, rdx=len, r8=id, r9=next
+    test rax, rax
+    jz .next
+    mov r13, r9
+    test r8, r8
+    jnz .frame                           ; not our request stream
+    mov rcx, [h3buf_len]
+    lea rdi, [h3buf + rcx]
+    mov rsi, rax
+    mov rcx, rdx
+    add [h3buf_len], rdx
+    rep movsb
+    lea rdi, [h3buf]
+    mov rsi, [h3buf_len]
+    call parse_h3_headers
+    cmp rax, -1
+    jne .out                             ; got a :status
+    jmp .frame
+.reset:
+    mov rax, -2
+    jmp .out
+.closed:
+    mov rax, -3
+    jmp .out
+.next:
+    dec r15d
+    jnz .loop
+.none:
+    mov rax, -1
+.out:
+    lea rsp, [rbp - 40]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; quic_h3_bad(esi=variant) -> rax: opens a fresh h3 connection, sends one bad
+; request, and classifies the response. variant 1 = no :path, 2 = undecodable
+; QPACK. Returns quic_h3_classify's verdict, or -1 if the handshake failed.
+quic_h3_bad:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    and rsp, -16
+    mov r12d, esi                         ; variant
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax                          ; fd
+    ; --- QPACK field section into fs_scratch ---
+    lea rdi, [fs_scratch]
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x00
+    add rdi, 2
+    cmp r12d, 2
+    je .badqpack
+    ; valid pseudo-headers minus :path (variant 1)
+    mov byte [rdi], 0xd1                  ; :method GET
+    mov byte [rdi + 1], 0xd7             ; :scheme https
+    add rdi, 2
+    cmp r12d, 1
+    je .authority                        ; variant 1: skip :path
+    ; (no other variant reaches here)
+.authority:
+    mov byte [rdi], 0x50                  ; :authority literal name-ref static 0
+    inc rdi
+    mov rax, [host_len]
+    mov [rdi], al
+    inc rdi
+    mov rsi, [host_ptr]
+    mov rcx, [host_len]
+    rep movsb
+    jmp .assemble
+.badqpack:
+    ; an indexed field line into the (empty, capacity-0) dynamic table
+    mov byte [rdi], 0x80                  ; indexed, T=0 dynamic, index 0
+    inc rdi
+.assemble:
+    lea rax, [fs_scratch]
+    mov r14, rdi
+    sub r14, rax                          ; field-section length
+    ; --- request STREAM(0) only (no control stream needed for a reject test) ---
+    lea rdi, [qpay]
+    mov byte [rdi], 0x0b                 ; STREAM, LEN, FIN
+    mov byte [rdi + 1], 0x00             ; stream id 0
+    lea rax, [r14 + 2]
+    mov [rdi + 2], al                    ; STREAM data length
+    mov byte [rdi + 3], 0x01            ; HEADERS frame
+    mov [rdi + 4], r14b                 ; HEADERS length
+    add rdi, 5
+    lea rsi, [fs_scratch]
+    mov rcx, r14
+    rep movsb
+    lea rax, [qpay]
+    mov rdx, rdi
+    sub rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify                 ; rax = verdict
+    mov r13, rax
+    mov edi, ebx
+    call close_fd
+    mov rax, r13
+    lea rsp, [rbp - 32]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+.fail:
+    mov rax, -1
+    lea rsp, [rbp - 32]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; probe_h3_nopath: a request missing :path must be rejected, never answered 2xx.
+probe_h3_nopath:
+    mov esi, 1
+    call quic_h3_bad                      ; rax = status | -2 | -3 | -1
+    mov dil, K_OK
+    ; DEVIATION only if the server ANSWERED 2xx/3xx to a malformed request
+    cmp rax, 200
+    jl .ok
+    cmp rax, 400
+    jl .dev
+.ok:
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+.rep:
+    lea rsi, [n_h3_nopath]
+    mov edx, n_h3_nopath_len
+    call report_plain
+    ret
+
+; probe_h3_badqpack: an undecodable QPACK field section is a connection error.
+probe_h3_badqpack:
+    mov esi, 2
+    call quic_h3_bad
+    mov dil, K_OK
+    cmp rax, 200                          ; answered 2xx/3xx = accepted bad input
+    jl .ok
+    cmp rax, 400
+    jl .dev
+.ok:
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+.rep:
+    lea rsi, [n_h3_badqp]
+    mov edx, n_h3_badqp_len
+    call report_plain
+    ret
+
 ; h3_battery(): the HTTP/3 probe set.
 h3_battery:
     call probe_h3_handshake
+    call probe_h3_nopath
+    call probe_h3_badqpack
     ret
 
 ; probe_h3_initial: send a QUIC Initial and confirm a ServerHello comes back.
