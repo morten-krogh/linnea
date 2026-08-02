@@ -653,6 +653,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_key_update_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): follows a client-initiated 1-RTT key update" $?
 
+    # quic-8: after sending a CONNECTION_CLOSE the server keeps the closing state
+    # for a while (RFC 9000 10.2), re-sending the close in response to the peer's
+    # packets — so the peer learns the real error even if the first close is lost,
+    # instead of the stateless reset a freed connection id would draw.
+    python3 test/quic/h3_closing_state_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): closing state re-sends the close, no stateless reset" $?
+
     # quic-11: once the handshake is confirmed the server discards its Initial and
     # Handshake keys (RFC 9001 4.9/4.9.1) and drops any long-header packet rather
     # than AEAD-processing it under keys that are supposed to be gone. A burst of

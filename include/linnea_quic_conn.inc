@@ -69,6 +69,13 @@ LINNEA_QUIC_FLIGHT_TAIL   equ 320   ; per-conn EE || CertVerify || Finished kept
 LINNEA_QUIC_ST_NEW       equ 0      ; allocated, nothing processed yet
 LINNEA_QUIC_ST_HANDSHAKE equ 1      ; server flight sent, awaiting the client
 LINNEA_QUIC_ST_CONNECTED equ 2      ; client Finished verified, 1-RTT keys live
+; Closing (RFC 9000 10.2.1): we have sent a CONNECTION_CLOSE and keep the slot
+; for a short while so the peer's still-in-flight packets draw the close again —
+; and so the peer learns the actual error we sent instead of a stateless reset
+; (which is what a freed slot's connection id produces). The slot is reclaimed
+; by the retransmission sweep once the closing period is up.
+LINNEA_QUIC_ST_CLOSING   equ 3
+LINNEA_QUIC_CLOSING_MS   equ 3000   ; >= 3x the initial PTO (RFC 9000 10.2)
 
 ; Loss recovery for the small-reply / control 1-RTT space. Every ack-eliciting
 ; packet we send here is kept until the peer acknowledges it, so a lost copy can
@@ -324,6 +331,14 @@ struc linnea_quic_conn
                                      ; labels and long-header packet-type codes
     .pn_1rtt:    resq 1              ; next 1-RTT packet number we send
     .last_active: resq 1             ; CLOCK_MONOTONIC seconds of the last packet
+    ; The closing state (RFC 9000 10.2.1). When we send a CONNECTION_CLOSE the
+    ; frame is kept here so a packet arriving afterwards can be answered with the
+    ; same close rather than a stateless reset; .close_deadline (CLOCK_MONOTONIC
+    ; ms) is when the sweep may free the slot. Our closes are at most 4 bytes
+    ; (transport: type, code, frame-type, empty reason), so 24 is ample headroom.
+    .close_len:      resq 1
+    .close_deadline: resq 1
+    .close_frame:    resb 24
     ; acknowledgement state for the 1-RTT space (see linnea_quic_ack_record):
     ; these three must stay adjacent and in this order.
     .rx_have:    resq 1

@@ -761,6 +761,8 @@ linnea_quic_server_datagram:
     call linnea_quic_conn_lookup
     test rax, rax
     jz .demux_short_reset            ; unknown connection: maybe a stateless reset
+    cmp qword [rax + linnea_quic_conn.state], LINNEA_QUIC_ST_CLOSING
+    je .closing_rx                   ; already closed: re-send the close, process nothing
     ; The 1-RTT keys do not exist until the client Finished is verified (.do_cfin
     ; sets ST_CONNECTED and derives ap_ckeys). Before that the key material is
     ; still the zeroed slot, and a zero AEAD/header-protection key is a KNOWN key:
@@ -796,6 +798,8 @@ linnea_quic_server_datagram:
     call send_stateless_reset
     jmp .done
 .demux_found:
+    cmp qword [rax + linnea_quic_conn.state], LINNEA_QUIC_ST_CLOSING
+    je .closing_rx
     mov [cur_conn], rax
 .long_in:
     ; Long-header packets are the handshake flights, and none of them authenticates
@@ -3293,21 +3297,22 @@ linnea_quic_server_datagram:
     ret
 
 ; .h3_close(edi = HTTP/3 error code) — end the connection with an application
-; CONNECTION_CLOSE (frame 0x1d) carrying the code, then free the slot. Sent via
-; emit_1rtt (no loss-recovery tracking): the connection is gone the moment this
-; is queued, so a lost close is not worth resending.
+; CONNECTION_CLOSE (frame 0x1d) carrying the code, then enter the closing state.
+; Sent via emit_1rtt (no loss-recovery tracking); the same frame is kept so the
+; closing state can re-send it if the peer keeps talking.
 .h3_close:
-    call send_app_close
-    mov rdi, [cur_conn]
-    call linnea_quic_conn_free
+    call send_app_close              ; leaves the frame in cc_pay / s_pl_len
+    lea rdi, [cc_pay]
+    mov rsi, [s_pl_len]
+    call .enter_closing
     jmp .done
 
 ; .transport_close(edi = transport error code, esi = triggering frame type) — end
 ; the connection with a TRANSPORT CONNECTION_CLOSE (frame 0x1c, RFC 9000 19.19):
 ; the error code, the frame type that caused it, and an empty reason phrase, then
-; free the slot. Our transport error codes and frame types are all < 64, so each is
-; a one-byte varint. Like .h3_close, sent via emit_1rtt with no loss tracking — the
-; connection is gone the moment this is queued.
+; enter the closing state. Our transport error codes and frame types are all < 64,
+; so each is a one-byte varint. Like .h3_close, sent via emit_1rtt with no loss
+; tracking — the retained frame carries the reliability instead.
 .transport_close:
     mov byte [cc_pay], 0x1c
     mov [cc_pay + 1], dil             ; transport error code
@@ -3317,14 +3322,66 @@ linnea_quic_server_datagram:
     mov [s_pl_ptr], rsi
     mov qword [s_pl_len], 4
     call emit_1rtt
+    lea rdi, [cc_pay]
+    mov esi, 4
+    call .enter_closing
+    jmp .done
+
+; enter_closing(rdi = close-frame ptr, rsi = length) — keep cur_conn's slot in
+; the closing state (RFC 9000 10.2) instead of freeing it now. The close frame is
+; copied in so a later packet can be answered with it (at .closing_rx), and a
+; deadline is set past which the retransmission sweep reclaims the slot. Holding
+; the slot means the peer learns the real error we sent rather than the stateless
+; reset a reused/freed connection id would draw. Uses cur_conn; preserves nothing
+; the callers need past the jmp .done that follows.
+.enter_closing:
+    push rbx
+    push r12
+    push r13
+    mov rbx, [cur_conn]
+    mov r12, rdi                      ; src
+    mov r13, rsi                      ; len
+    cmp r13, 24
+    jbe .ec_len_ok
+    mov r13d, 24                      ; clamp to the buffer (our closes are <= 4 bytes)
+.ec_len_ok:
+    mov [rbx + linnea_quic_conn.close_len], r13
+    lea rdi, [rbx + linnea_quic_conn.close_frame]
+    mov rsi, r12
+    mov rcx, r13
+    rep movsb
+    mov qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CLOSING
+    call now_ms
+    add rax, LINNEA_QUIC_CLOSING_MS
+    mov [rbx + linnea_quic_conn.close_deadline], rax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; the peer said goodbye: release its slot and stop reading this datagram. The
+; peer is draining and will not read anything we send, so nothing is retained —
+; a later stray packet from it drawing a stateless reset from us is harmless.
+.peer_closed:
     mov rdi, [cur_conn]
     call linnea_quic_conn_free
     jmp .done
 
-; the peer said goodbye: release its slot and stop reading this datagram
-.peer_closed:
-    mov rdi, [cur_conn]
-    call linnea_quic_conn_free
+; .closing_rx(rax = the closing connection) — a packet arrived for a connection
+; we have already closed. RFC 9000 10.2.1: re-send the CONNECTION_CLOSE we kept
+; (so a lost close still reaches the peer, and it learns the real error rather
+; than a stateless reset), process nothing else. Rate-limited to one per received
+; packet, and only for a packet large enough that the reply cannot amplify —
+; both as 10.2.1 asks.
+.closing_rx:
+    mov [cur_conn], rax
+    cmp r13, 22                       ; the close is ~30B protected; never amplify
+    jb .done
+    lea rsi, [rax + linnea_quic_conn.close_frame]
+    mov [s_pl_ptr], rsi
+    mov rcx, [rax + linnea_quic_conn.close_len]
+    mov [s_pl_len], rcx
+    call emit_1rtt
     jmp .done
 
 ; .ch_reassemble(rax = CRYPTO fragment ptr, rdx = length, r8 = offset,
@@ -5034,6 +5091,19 @@ linnea_quic_server_rtx_sweep:
     test rax, rax
     jz .sw_conn_next
     mov rbx, rax                      ; connection
+    ; a connection in the closing state (RFC 9000 10.2.1) holds its slot only
+    ; until the closing period is up; then the sweep reclaims it. Nothing else
+    ; below applies to it — it sends nothing but the retained close, and only in
+    ; response to a received packet (.closing_rx).
+    cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CLOSING
+    jne .sw_not_closing
+    mov rax, [rbx + linnea_quic_conn.close_deadline]
+    cmp r15, rax
+    jb .sw_conn_next                  ; still within the closing period
+    mov rdi, rbx
+    call linnea_quic_conn_free
+    jmp .sw_conn_next
+.sw_not_closing:
     cmp byte [qdbg_pass], 0           ; trace this live connection's state (dark unless
     je .sw_no_dbg                     ; the working-dir "linnea-qdbg" trigger file exists)
     mov rdi, rbx
