@@ -18,6 +18,7 @@ default rel
 
 %include "linnea_syscall.inc"
 %include "linnea_tls.inc"
+%include "linnea_quic.inc"
 
 global _start
 
@@ -34,6 +35,14 @@ extern linnea_x25519
 extern linnea_sha256
 extern linnea_hkdf_extract
 extern linnea_hmac_sha256
+; --- reused QUIC transport crypto for the HTTP/3 client ---
+extern linnea_quic_initial_secrets
+extern linnea_quic_protect
+extern linnea_quic_unprotect
+extern linnea_quic_unprotect_hs
+extern linnea_quic_crypto_frame
+extern linnea_quic_varint_encode
+extern linnea_quic_varint_decode
 
 ; ---- kinds, for the per-probe report line -------------------------------
 K_OK   equ 0            ; the server did what the RFC requires
@@ -239,6 +248,16 @@ pseudo_status: db ":status"
 ; HPACK static-table status values for indices 8..14
 h2_status_map: dw 200, 204, 206, 304, 400, 404, 500
 
+; --- HTTP/3 / QUIC ---
+alpn_h3:    db "h3"
+alpn_h3_len equ $ - alpn_h3
+h3_hdr_line: db "== HTTP/3 compliance probes -> "
+h3_hdr_line_len equ $ - h3_hdr_line
+n_h3_initial: db "QUIC Initial handshake (ServerHello received)"
+n_h3_initial_len equ $ - n_h3_initial
+err_h3_tls: db "error: h3 requires https:// (QUIC over UDP)", 10
+err_h3_tls_len equ $ - err_h3_tls
+
 section .bss
 alignb 16
 sa:         resb 16                     ; sockaddr_in
@@ -304,6 +323,23 @@ hs_plain:   resb 20480                  ; decrypted server flight (handshake msg
 hs_plain_len: resq 1
 tls_pt:     resb 20480                  ; decrypted application record plaintext
 
+; --- HTTP/3 / QUIC client state ---
+udp_fd:     resq 1
+q_dcid:     resb 8                      ; the DCID we pick (seeds the Initial keys)
+q_scid:     resb 8                      ; our source connection id
+alignb 16
+qi_ckeys:   resb linnea_quic_keys_size  ; client Initial keys (we protect with these)
+qi_skeys:   resb linnea_quic_keys_size  ; server Initial keys (we open with these)
+qch:        resb 2048                   ; the QUIC ClientHello handshake message
+qch_len:    resq 1
+qtp:        resb 512                    ; encoded client transport parameters
+qhdr:       resb 64                     ; a QUIC packet header being assembled
+qpay:       resb 1500                   ; a QUIC packet payload being assembled
+qpkt:       resb 1500                   ; the protected packet to send
+qrx:        resb 2048                   ; a received datagram
+qplain:     resb 2048                   ; decrypted QUIC frames
+qvtmp:      resb 16                     ; varint scratch
+
 section .text
 
 ; =======================================================================
@@ -324,6 +360,8 @@ _start:
     jne .proto_bad
     cmp cl, '1'
     je .proto_h1
+    cmp cl, '3'
+    je .proto_h3
     cmp cl, '2'
     jne .proto_bad
     ; h2: TLS with ALPN "h2"
@@ -331,6 +369,13 @@ _start:
     lea rax, [alpn_h2]
     mov [alpn_str], rax
     mov qword [alpn_len], alpn_h2_len
+    jmp .proto_set
+.proto_h3:
+    ; h3: QUIC/UDP with ALPN "h3"
+    mov qword [proto], 3
+    lea rax, [alpn_h3]
+    mov [alpn_str], rax
+    mov qword [alpn_len], alpn_h3_len
     jmp .proto_set
 .proto_h1:
     mov qword [proto], 1
@@ -379,9 +424,9 @@ _start:
     je .exit_resolve
     mov [conn_addr], eax
 
-    ; h2 requires TLS
-    cmp qword [proto], 2
-    jne .banner
+    ; h2 and h3 require the https scheme (TLS/QUIC)
+    cmp qword [proto], 1
+    je .banner
     cmp qword [use_tls], 0
     je .proto_needs_tls
 .banner:
@@ -389,9 +434,15 @@ _start:
     lea rsi, [hdr_line]
     mov edx, hdr_line_len
     cmp qword [proto], 2
-    jne .banner_put
+    jne .banner_try_h3
     lea rsi, [h2_hdr_line]
     mov edx, h2_hdr_line_len
+    jmp .banner_put
+.banner_try_h3:
+    cmp qword [proto], 3
+    jne .banner_put
+    lea rsi, [h3_hdr_line]
+    mov edx, h3_hdr_line_len
 .banner_put:
     call puts
     mov rsi, [host_ptr]
@@ -404,6 +455,8 @@ _start:
     ; =================== the probe battery =======================
     cmp qword [proto], 2
     je .run_h2
+    cmp qword [proto], 3
+    je .run_h3
     call probe_valid
     call probe_keepalive
     call probe_nohost
@@ -421,6 +474,9 @@ _start:
     jmp .summary
 .run_h2:
     call h2_battery
+    jmp .summary
+.run_h3:
+    call h3_battery
 
 .summary:
     ; =================== summary =================================
@@ -469,6 +525,11 @@ _start:
 .proto_needs_tls:
     lea rsi, [err_h2_tls]
     mov edx, err_h2_tls_len
+    cmp qword [proto], 3
+    jne .pnt_put
+    lea rsi, [err_h3_tls]
+    mov edx, err_h3_tls_len
+.pnt_put:
     call puts_err
     mov edi, 2
     jmp exit
@@ -3256,6 +3317,550 @@ probe_h2_badhpack:
     mov rcx, -1
     mov r9d, -1
     call report
+    pop rbx
+    ret
+
+; =======================================================================
+; HTTP/3 over QUIC (phase 3a: the Initial handshake exchange)
+; =======================================================================
+QINIT_HDRLEN equ 27                       ; byte0(1)+ver(4)+dcidlen(1)+dcid(8)
+                                          ; +scidlen(1)+scid(8)+tok(1)+len(2)+pn(1)
+QINIT_PAYLEN equ 1200 - QINIT_HDRLEN - 16 ; CRYPTO + PADDING, leaving room for the tag
+QINIT_LENGTH equ 1 + QINIT_PAYLEN + 16    ; pn(1) + payload + tag, the "Length" field
+
+; udp_connect() -> rax = fd or -1. A connected UDP socket to conn_addr:conn_port.
+udp_connect:
+    push rbx
+    mov eax, LINNEA_SYS_SOCKET
+    mov edi, LINNEA_AF_INET_
+    mov esi, SOCK_DGRAM_
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov word [sa], LINNEA_AF_INET_
+    mov eax, [conn_port]
+    xchg al, ah
+    mov [sa + 2], ax
+    mov eax, [conn_addr]
+    mov [sa + 4], eax
+    xor eax, eax
+    mov [sa + 8], rax
+    mov eax, LINNEA_SYS_CONNECT
+    mov edi, ebx
+    lea rsi, [sa]
+    mov edx, 16
+    syscall
+    test rax, rax
+    js .fail_close
+    mov eax, ebx
+    pop rbx
+    ret
+.fail_close:
+    mov eax, LINNEA_SYS_CLOSE
+    mov edi, ebx
+    syscall
+.fail:
+    mov rax, -1
+    pop rbx
+    ret
+
+; tp_int(rdi=cursor, rsi=id, rdx=value) -> rax = new cursor.
+; Appends one integer transport parameter: varint(id) varint(len) varint(value).
+tp_int:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi                          ; cursor
+    mov r12, rsi                          ; id
+    mov r13, rdx                          ; value
+    lea rdi, [qvtmp]                      ; encode the value to size it
+    mov rsi, r13
+    call linnea_quic_varint_encode
+    mov r14, rax                          ; value length
+    mov rdi, rbx                          ; id
+    mov rsi, r12
+    call linnea_quic_varint_encode
+    add rbx, rax
+    mov rdi, rbx                          ; len
+    mov rsi, r14
+    call linnea_quic_varint_encode
+    add rbx, rax
+    lea rsi, [qvtmp]                      ; value bytes
+    mov rdi, rbx
+    mov rcx, r14
+    rep movsb
+    mov rax, rdi
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; quic_build_tp(rdi=out) -> rax = length. Client transport parameters.
+quic_build_tp:
+    push rbx
+    mov rbx, rdi
+    mov rdi, rbx
+    mov esi, 0x01
+    mov edx, 30000
+    call tp_int                           ; max_idle_timeout
+    mov rdi, rax
+    mov esi, 0x03
+    mov edx, 1472
+    call tp_int                           ; max_udp_payload_size
+    mov rdi, rax
+    mov esi, 0x04
+    mov edx, 1048576
+    call tp_int                           ; initial_max_data
+    mov rdi, rax
+    mov esi, 0x05
+    mov edx, 262144
+    call tp_int                           ; bidi_local
+    mov rdi, rax
+    mov esi, 0x06
+    mov edx, 262144
+    call tp_int                           ; bidi_remote
+    mov rdi, rax
+    mov esi, 0x07
+    mov edx, 262144
+    call tp_int                           ; uni
+    mov rdi, rax
+    mov esi, 0x08
+    mov edx, 100
+    call tp_int                           ; max_streams_bidi
+    mov rdi, rax
+    mov esi, 0x09
+    mov edx, 100
+    call tp_int                           ; max_streams_uni
+    mov rdi, rax
+    mov esi, 0x0e
+    mov edx, 2
+    call tp_int                           ; active_connection_id_limit
+    ; 0x0f initial_source_connection_id = our SCID (raw)
+    mov byte [rax], 0x0f
+    mov byte [rax + 1], 8                 ; length
+    lea rdi, [rax + 2]
+    lea rsi, [q_scid]
+    mov ecx, 8
+    rep movsb
+    mov rax, rdi
+    sub rax, rbx
+    pop rbx
+    ret
+
+; quic_build_ch(rdi=out) -> rax = handshake message length. A bare TLS 1.3
+; ClientHello (no record header) carrying quic_transport_parameters and ALPN h3.
+quic_build_ch:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi                          ; message start
+    mov byte [r12], 0x01                  ; ClientHello
+    lea r13, [r12 + 1]                    ; length-24 slot
+    lea rdi, [r12 + 4]                    ; body cursor
+    mov byte [rdi], 0x03
+    mov byte [rdi + 1], 0x03
+    add rdi, 2
+    lea rsi, [tls_random]
+    mov ecx, 32
+    rep movsb
+    mov byte [rdi], 32
+    inc rdi
+    lea rsi, [tls_sessid]
+    mov ecx, 32
+    rep movsb
+    lea rsi, [ch_suites]
+    mov ecx, ch_suites_len
+    rep movsb
+    mov rbx, rdi                          ; ext-length-16 slot
+    add rdi, 2
+    ; SNI
+    mov r8, [urlhost_len]
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x00
+    lea rax, [r8 + 5]
+    mov [rdi + 2], ah
+    mov [rdi + 3], al
+    lea rax, [r8 + 3]
+    mov [rdi + 4], ah
+    mov [rdi + 5], al
+    mov byte [rdi + 6], 0x00
+    mov rax, r8
+    mov [rdi + 7], ah
+    mov [rdi + 8], al
+    add rdi, 9
+    lea rsi, [urlhost]
+    mov rcx, r8
+    rep movsb
+    ; supported_versions (TLS 1.3)
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x2b
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x03
+    mov byte [rdi + 4], 0x02
+    mov byte [rdi + 5], 0x03
+    mov byte [rdi + 6], 0x04
+    add rdi, 7
+    ; supported_groups (x25519)
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x0a
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x04
+    mov byte [rdi + 4], 0x00
+    mov byte [rdi + 5], 0x02
+    mov byte [rdi + 6], 0x00
+    mov byte [rdi + 7], 0x1d
+    add rdi, 8
+    ; signature_algorithms (ecdsa_secp256r1_sha256)
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x0d
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x04
+    mov byte [rdi + 4], 0x00
+    mov byte [rdi + 5], 0x02
+    mov byte [rdi + 6], 0x04
+    mov byte [rdi + 7], 0x03
+    add rdi, 8
+    ; key_share (x25519)
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x33
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x26
+    mov byte [rdi + 4], 0x00
+    mov byte [rdi + 5], 0x24
+    mov byte [rdi + 6], 0x00
+    mov byte [rdi + 7], 0x1d
+    mov byte [rdi + 8], 0x00
+    mov byte [rdi + 9], 0x20
+    add rdi, 10
+    lea rsi, [tls_pub]
+    mov ecx, 32
+    rep movsb
+    ; ALPN (alpn_str/alpn_len = h3)
+    mov r8, [alpn_len]
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x10
+    lea rax, [r8 + 3]
+    mov [rdi + 2], ah
+    mov [rdi + 3], al
+    lea rax, [r8 + 1]
+    mov [rdi + 4], ah
+    mov [rdi + 5], al
+    mov [rdi + 6], r8b
+    add rdi, 7
+    mov rsi, [alpn_str]
+    mov rcx, r8
+    rep movsb
+    ; quic_transport_parameters (0x0039)
+    push rdi
+    lea rdi, [qtp]
+    call quic_build_tp                    ; rax = tp length
+    pop rdi
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x39
+    mov rcx, rax                          ; tp length
+    mov [rdi + 2], ch
+    mov [rdi + 3], cl
+    add rdi, 4
+    lea rsi, [qtp]
+    rep movsb
+    ; backpatch extensions length = rdi - (rbx + 2)
+    mov rax, rdi
+    sub rax, rbx
+    sub rax, 2
+    mov [rbx], ah
+    mov [rbx + 1], al
+    ; backpatch handshake body length (24-bit) = rdi - (r13 + 3)
+    mov rax, rdi
+    sub rax, r13
+    sub rax, 3
+    mov byte [r13], 0
+    mov rcx, rax
+    shr rcx, 8
+    mov [r13 + 1], cl
+    mov [r13 + 2], al
+    mov rax, rdi
+    sub rax, r12                          ; total handshake message length
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; quic_send_initial(edi=fd) -> rax = 0 ok / -1. Builds, protects and sends the
+; client Initial (ClientHello in a CRYPTO frame, padded to 1200 bytes).
+quic_send_initial:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    and rsp, -16                          ; force alignment for the SSE crypto
+    mov ebx, edi
+    ; Initial keys from our chosen DCID
+    lea rdi, [q_dcid]
+    mov esi, 8
+    lea rdx, [qi_ckeys]
+    lea rcx, [qi_skeys]
+    call linnea_quic_initial_secrets
+    ; ClientHello
+    lea rdi, [qch]
+    call quic_build_ch
+    mov [qch_len], rax
+    ; payload: CRYPTO frame then PADDING
+    lea rdi, [qpay]
+    mov byte [rdi], 0x06                  ; CRYPTO
+    mov byte [rdi + 1], 0x00              ; offset 0
+    add rdi, 2
+    mov rsi, [qch_len]
+    call linnea_quic_varint_encode        ; length varint
+    add rdi, rax
+    lea rsi, [qch]
+    mov rcx, [qch_len]
+    rep movsb                             ; CRYPTO data
+    ; PADDING up to QINIT_PAYLEN
+    lea rax, [qpay]
+    add rax, QINIT_PAYLEN
+    sub rax, rdi                          ; bytes of padding
+    mov rcx, rax
+    xor al, al
+    rep stosb
+    ; header
+    lea rdi, [qhdr]
+    mov byte [rdi], 0xc0                  ; long | fixed | Initial | pnlen-1=0
+    mov byte [rdi + 1], 0x00
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x00
+    mov byte [rdi + 4], 0x01              ; version 1
+    mov byte [rdi + 5], 8                 ; DCID length
+    lea rax, [rdi + 6]
+    lea rsi, [q_dcid]
+    mov rdi, rax
+    mov ecx, 8
+    rep movsb
+    mov byte [rdi], 8                     ; SCID length
+    inc rdi
+    lea rsi, [q_scid]
+    mov ecx, 8
+    rep movsb
+    mov byte [rdi], 0                     ; token length 0
+    inc rdi
+    mov rsi, QINIT_LENGTH                 ; Length varint
+    call linnea_quic_varint_encode
+    add rdi, rax
+    mov byte [rdi], 0                     ; packet number = 0 (1 byte)
+    ; protect
+    sub rsp, 16
+    lea rax, [qi_ckeys]
+    mov [rsp], rax
+    mov qword [rsp + 8], 0                ; full packet number
+    lea rdi, [qpkt]
+    lea rsi, [qhdr]
+    mov edx, QINIT_HDRLEN
+    mov ecx, 1
+    lea r8, [qpay]
+    mov r9d, QINIT_PAYLEN
+    call linnea_quic_protect              ; rax = total packet length
+    add rsp, 16
+    mov r12, rax
+    ; send
+    mov eax, LINNEA_SYS_SENDTO
+    mov edi, ebx
+    lea rsi, [qpkt]
+    mov rdx, r12
+    mov r10d, LINNEA_MSG_NOSIGNAL
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    js .fail
+    xor eax, eax
+    lea rsp, [rbp - 24]
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+.fail:
+    mov rax, -1
+    lea rsp, [rbp - 24]
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; quic_recv_serverhello(edi=fd) -> rax = 1 if the server's Initial decrypted and
+; carried a ServerHello, else 0. Waits up to 3s for the response datagram.
+quic_recv_serverhello:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    and rsp, -16                          ; force alignment for the SSE crypto
+    mov ebx, edi
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 3000
+    syscall
+    test rax, rax
+    jle .no
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle .no
+    ; unprotect the first (Initial) packet with the server Initial keys
+    lea rdi, [qrx]
+    mov rsi, rax
+    lea rdx, [qi_skeys]
+    lea rcx, [qplain]
+    call linnea_quic_unprotect            ; rax = frame bytes, rdx = pn
+    test rax, rax
+    js .no
+    ; a CRYPTO frame (the ServerHello) among the frames?
+    lea rdi, [qplain]
+    mov rsi, rax
+    call linnea_quic_crypto_frame         ; rax = SH ptr (0 if none)
+    test rax, rax
+    jz .no
+    mov eax, 1
+    lea rsp, [rbp - 8]
+    pop rbx
+    pop rbp
+    ret
+.no:
+    xor eax, eax
+    lea rsp, [rbp - 8]
+    pop rbx
+    pop rbp
+    ret
+
+; h3_battery(): the HTTP/3 probe set (phase 3a: the Initial handshake).
+h3_battery:
+    call probe_h3_initial
+    ret
+
+; probe_h3_initial: send a QUIC Initial and confirm a ServerHello comes back.
+probe_h3_initial:
+    push rbx
+    ; fresh x25519 keypair, client random, session id, DCID and SCID
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_priv]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    and byte [tls_priv], 248
+    and byte [tls_priv + 31], 127
+    or byte [tls_priv + 31], 64
+    lea rdi, [tls_pub]
+    lea rsi, [tls_priv]
+    lea rdx, [x25519_base]
+    call linnea_x25519
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_random]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_sessid]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [q_dcid]
+    mov esi, 8
+    xor edx, edx
+    syscall
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [q_scid]
+    mov esi, 8
+    xor edx, edx
+    syscall
+    call udp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov edi, ebx
+    call quic_send_initial
+    test rax, rax
+    js .closefail
+    mov edi, ebx
+    call quic_recv_serverhello            ; rax = 1 on success
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rcx
+    mov dil, K_OK
+    test rcx, rcx
+    jnz .report
+    mov dil, K_DEV
+.report:
+    lea rsi, [n_h3_initial]
+    mov edx, n_h3_initial_len
+    mov rcx, -1
+    mov r9d, -1
+    call report_plain
+    pop rbx
+    ret
+.closefail:
+    mov edi, ebx
+    call close_fd
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h3_initial]
+    mov edx, n_h3_initial_len
+    call report_plain
+    pop rbx
+    ret
+
+; report_plain(dil=kind, rsi=name, edx=namelen): a report line with no status.
+report_plain:
+    push rbx
+    push r12
+    push r13
+    movzx ebx, dil
+    mov r12, rsi
+    mov r13d, edx
+    inc dword [n_total]
+    cmp ebx, K_DEV
+    jne .pfx
+    inc dword [n_dev]
+.pfx:
+    cmp ebx, K_OK
+    je .ok
+    cmp ebx, K_INFO
+    je .info
+    lea rsi, [pfx_dev]
+    mov edx, pfx_dev_len
+    jmp .put
+.ok:
+    lea rsi, [pfx_ok]
+    mov edx, pfx_ok_len
+    jmp .put
+.info:
+    lea rsi, [pfx_info]
+    mov edx, pfx_info_len
+.put:
+    call puts
+    mov rsi, r12
+    mov edx, r13d
+    call puts
+    lea rsi, [s_nl]
+    mov edx, 1
+    call puts
+    pop r13
+    pop r12
     pop rbx
     ret
 
