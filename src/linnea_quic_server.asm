@@ -2548,24 +2548,64 @@ linnea_quic_server_datagram:
     cmp cl, LINNEA_H3_STREAM_QPACK_ENC
     jne .uni_qpack_dec
     mov [rdx + linnea_quic_conn.qpack_enc_id], rax
+    ; Police what the stream carries (h3-8): the instructions were never read,
+    ; so an encoder inserting into — or sizing — the dynamic table we refused
+    ; was told nothing, and its table state and ours silently diverged.
+    call .qpack_enc_scan_all         ; this frame's bytes + any held segment
+    mov ecx, eax                     ; the verdict, across the drop's clobbers
     call .uni_ro_drop                ; typed now, and not the control stream
+    test ecx, ecx
+    jnz .uni_qpack_enc_bad
     jmp .stream_scan
 .uni_qpack_dec:
     mov [rdx + linnea_quic_conn.qpack_dec_id], rax
     call .uni_ro_drop                ; typed now, and not the control stream
     jmp .stream_scan                 ; otherwise nothing to read (zero table)
 .uni_cont:
-    ; a continuation: only the control stream's closure is our concern here (we
-    ; do not track QPACK stream ids, and their bodies carry nothing anyway).
+    ; a continuation: the control stream's closure and frame walk, the QPACK
+    ; streams' closure and (encoder-side) instruction policing, and — when no
+    ; control stream is known yet — bytes held for a stream whose type frame
+    ; is the late one.
     mov rdx, [cur_conn]
     mov rax, [rdx + linnea_quic_conn.ctrl_id]
     test rax, rax
-    jz .uni_cont_untyped
+    jz .uni_cont_qpackq              ; no control stream yet: qpack, or untyped
     cmp rax, [s_sid]
-    jne .stream_scan
+    jne .uni_cont_qpackq
     cmp qword [s_sfin], 0
     jne .uni_critical_closed
     jmp .uni_ctrl_walk               ; more control-stream frames to walk
+.uni_cont_qpackq:
+    ; a QPACK stream's continuation: a FIN here closes a critical stream just
+    ; as surely as one on the typing frame (RFC 9114 6.2 — "by any means"),
+    ; and the encoder stream's bytes are judged wherever they land in the
+    ; stream, since with a zero-capacity table position cannot change the
+    ; verdict (see .qpack_enc_scan)
+    mov rax, [rdx + linnea_quic_conn.qpack_enc_id]
+    cmp rax, [s_sid]
+    je .uni_cont_qpack_enc
+    mov rax, [rdx + linnea_quic_conn.qpack_dec_id]
+    cmp rax, [s_sid]
+    je .uni_cont_qpack_dec
+    ; neither control nor QPACK: a typed grease stream carries nothing we
+    ; police, but with no control stream known this may be ITS bytes running
+    ; ahead of their type frame — hold them (h3-6)
+    cmp qword [rdx + linnea_quic_conn.ctrl_id], 0
+    jne .stream_scan
+    jmp .uni_cont_untyped
+.uni_cont_qpack_dec:
+    cmp qword [s_sfin], 0
+    jne .uni_critical_closed
+    jmp .stream_scan                 ; decoder-stream bodies carry nothing we act on
+.uni_cont_qpack_enc:
+    cmp qword [s_sfin], 0
+    jne .uni_critical_closed
+    mov rdi, [s_sdata]
+    mov rsi, [s_slen]
+    call .qpack_enc_scan
+    test eax, eax
+    jnz .uni_qpack_enc_bad
+    jmp .stream_scan
 .uni_control:
     ; closing the control stream is a critical-stream error, whatever it carries
     cmp qword [s_sfin], 0
@@ -2930,6 +2970,60 @@ linnea_quic_server_datagram:
     mov qword [rdx + linnea_quic_conn.ctrl_ro_len], 0
 .rd_done:
     ret
+
+; .qpack_enc_scan(rdi = bytes, rsi = count) -> eax = 0 fine, 1 violation.
+; We advertise QPACK_MAX_TABLE_CAPACITY = 0, so the only instruction a
+; conforming encoder can ever send is Set Dynamic Table Capacity to 0 — the
+; single byte 0x20 (RFC 9204 4.3.1): any other capacity exceeds the maximum we
+; set, and Insert or Duplicate have no table to land in. A one-byte instruction
+; set makes the check position-independent, so each STREAM frame is judged as
+; it arrives — reordering needs no reassembly, and a continuation byte of some
+; would-be multi-byte instruction is preceded by a first byte that already
+; fails. The violation is QPACK_ENCODER_STREAM_ERROR (4.1.3).
+.qpack_enc_scan:
+    xor eax, eax
+    test rsi, rsi
+    jz .qes_done
+.qes_loop:
+    cmp byte [rdi], 0x20
+    jne .qes_bad
+    inc rdi
+    dec rsi
+    jnz .qes_loop
+    jmp .qes_done
+.qes_bad:
+    mov eax, 1
+.qes_done:
+    ret
+
+; .qpack_enc_scan_all() -> eax as above, judging BOTH the typing frame's
+; payload (the s_s* globals, past the stream-type byte) and any segment held
+; for this stream while it was untyped — bytes that arrived ahead of the type
+; frame would otherwise be dropped unjudged by .uni_ro_drop.
+.qpack_enc_scan_all:
+    mov rdi, [s_sdata]
+    inc rdi
+    mov rsi, [s_slen]
+    dec rsi
+    call .qpack_enc_scan
+    test eax, eax
+    jnz .qesa_done
+    mov rdx, [cur_conn]
+    mov rax, [rdx + linnea_quic_conn.ctrl_ro_sid]
+    cmp rax, [s_sid]
+    jne .qesa_ok
+    lea rdi, [rdx + linnea_quic_conn.ctrl_ro_buf]
+    mov rsi, [rdx + linnea_quic_conn.ctrl_ro_len]
+    call .qpack_enc_scan
+.qesa_done:
+    ret
+.qesa_ok:
+    xor eax, eax
+    ret
+
+.uni_qpack_enc_bad:
+    mov edi, LINNEA_H3_ERR_QPACK_ENC_STREAM
+    jmp .h3_close
 
 ; .pu_apply() -> eax = 0, or the HTTP/3 error code to close with. Acts on the
 ; whole PRIORITY_UPDATE payload sitting in the connection's .ctrl_pu, and clears

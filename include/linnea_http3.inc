@@ -40,6 +40,7 @@ LINNEA_H3_ERR_REQ_REJECTED     equ 0x010b  ; not processed — safe to retry els
 LINNEA_H3_ERR_REQ_INCOMPLETE   equ 0x010d  ; the stream ended before a whole message
 LINNEA_H3_ERR_MESSAGE          equ 0x010e  ; the message decoded but breaks a rule
 LINNEA_H3_ERR_QPACK_DECOMP     equ 0x0200  ; QPACK could not decode a field section
+LINNEA_H3_ERR_QPACK_ENC_STREAM equ 0x0201  ; an encoder instruction we cannot honour
 
 ; linnea_h3_read_headers(rdi=stream ptr, rsi=stream len, rdx=req *linnea_h2_req)
 ;   -> rax = 0 on success (a HEADERS frame was found and QPACK-decoded),

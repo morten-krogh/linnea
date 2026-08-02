@@ -618,6 +618,14 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_critical_reset_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): resetting a critical stream is detected" $?
 
+    # h3-8: the QPACK encoder stream must be read, not ignored. We advertise
+    # capacity 0, so the only legal instruction is Set Dynamic Table Capacity
+    # to 0; an insert or another capacity means the peer's table state and
+    # ours have silently diverged — QPACK_ENCODER_STREAM_ERROR. Also: a FIN
+    # on a LATER frame of a QPACK stream is a critical-stream closure too.
+    python3 test/quic/h3_qpack_enc_stream_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): QPACK encoder-stream instructions are policed" $?
+
     # h3-6: control-stream enforcement must survive reordering. A STREAM frame
     # delivered (and acked) ahead of the walked prefix used to be dropped, and
     # since a reordered frame comes only once, the hole was permanent — every
