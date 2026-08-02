@@ -163,4 +163,36 @@ else:
     print(f"FAIL a malformed request drew no reset (close={close})")
     fails += 1
 
+
+# --- nothing may follow the trailer section (RFC 9114 4.1) ----------------
+# A request stream is HEADERS, then DATA, then at most ONE trailer section and
+# nothing after it. The second HEADERS was skipped as a trailer and every one
+# after it was skipped again, so a stream could carry any number — and DATA
+# after the trailers was appended to the body as though it were part of it.
+H3_FRAME_UNEXPECTED = 0x105
+hdrs = headers_frame()
+data = b"\x00" + (0x4000 | 4).to_bytes(2, "big") + b"body"
+
+for label, body in (
+        ("a third HEADERS after the trailers", hdrs + data + hdrs + hdrs),
+        ("DATA after the trailers", hdrs + data + hdrs + data)):
+    reset, close = send_request_stream(body)
+    if close == H3_FRAME_UNEXPECTED:
+        print(f"ok   {label} ends the connection (0x{close:x})")
+    else:
+        got = f"0x{close:x}" if close is not None else "no close"
+        extra = f", reset 0x{reset['error']:x}" if reset else ""
+        print(f"FAIL {label}: {got}{extra}, want H3_FRAME_UNEXPECTED "
+              f"0x{H3_FRAME_UNEXPECTED:x}")
+        fails += 1
+
+# ...and a request WITH a legitimate trailer section is still served, so the
+# check has not simply outlawed trailers
+reset, close = send_request_stream(hdrs + data + hdrs)
+if close is None:
+    print("ok   a request with one trailer section is still accepted")
+else:
+    print(f"FAIL a legitimate trailer section ended the connection (0x{close:x})")
+    fails += 1
+
 sys.exit(1 if fails else 0)

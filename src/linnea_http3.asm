@@ -168,8 +168,18 @@ linnea_h3_read_headers:
     ; into the request struct: a trailing `range`/`if-none-match`/etc. would
     ; otherwise change the response the client never asked to change. Skip it
     ; unread; the request was already parsed from the first HEADERS.
+    ;
+    ; r15d is the position in that sequence: 0 = nothing yet, 1 = the request
+    ; headers are in, 2 = the trailers have been and gone. A request stream is
+    ; HEADERS, then DATA, then AT MOST ONE trailer section and nothing after it
+    ; — so a third HEADERS is an invalid sequence, which 4.1 makes a connection
+    ; error of type H3_FRAME_UNEXPECTED. Both of those used to be accepted: the
+    ; second HEADERS was skipped as a trailer and every one after it was skipped
+    ; again, so a stream could carry any number of them.
+    cmp r15d, 2
+    jae .frame_unexpected            ; a frame after the trailer section
     test r15d, r15d
-    jnz .trailer_skip
+    jnz .trailer_seen
     mov rdi, r12                     ; QPACK field section
     mov rsi, rax
     mov rdx, r14
@@ -206,6 +216,8 @@ linnea_h3_read_headers:
     ; body across any number of them
     test r15d, r15d
     jz .frame_unexpected             ; DATA before HEADERS (RFC 9114 4.1)
+    cmp r15d, 2
+    jae .frame_unexpected            ; ...and DATA after the trailer section
     cmp qword [rsp], 0
     jne .data_join                   ; a body is already started: append to it
     mov [rsp], r12                   ; body ptr
@@ -228,9 +240,10 @@ linnea_h3_read_headers:
     add r12, rax                     ; cursor past it, in the original layout
     rep movsb
     jmp .frame
-.trailer_skip:                       ; a dead-end reached only by the jump in
-    add r12, rax                     ; .headers: advance past the trailer's
-    jmp .frame                       ; field section without decoding it
+.trailer_seen:                       ; a dead-end reached only by the jump in
+    mov r15d, 2                      ; .headers: the trailer section closes the
+    add r12, rax                     ; stream's frame sequence, so advance past
+    jmp .frame                       ; its field section without decoding it
 .frame_unexpected:                   ; a dead-end reached only by explicit jumps
     mov rax, -LINNEA_H3_ERR_UNEXPECTED
     jmp .ret
