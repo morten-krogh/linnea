@@ -1956,10 +1956,48 @@ linnea_quic_parse_priority:
     ja .pp_adv
     cmp byte [rdi + 1], '='
     jne .pp_adv
-    movzx eax, byte [rdi + 2]
-    sub al, '0'
-    cmp al, 7                        ; unsigned: rejects non-digits and >7
-    ja .pp_adv
+    ; An RFC 8941 integer may carry leading zeros ("u=07" is the number 7) and
+    ; may run to more digits than 0-7 uses ("u=10"). Reading exactly one digit
+    ; got both wrong: 07 became 0 — the OPPOSITE end of the urgency scale —
+    ; and 10 became 1, where an out-of-range value must be ignored so the
+    ; default stands (RFC 9218 4.1). Read the whole run of digits.
+    add rdi, 2
+    xor eax, eax                     ; the accumulating value
+    xor ecx, ecx                     ; digits seen
+.pp_u_digit:
+    cmp rdi, r10
+    jae .pp_u_end
+    movzx edx, byte [rdi]
+    sub dl, '0'
+    cmp dl, 9
+    ja .pp_u_end
+    inc rdi
+    inc ecx
+    imul eax, eax, 10
+    movzx edx, dl
+    add eax, edx
+    cmp eax, 100                     ; already past any legal value: clamp so
+    jbe .pp_u_digit                  ; a 15-digit number cannot wrap to 0-7
+    mov eax, 100
+    jmp .pp_u_digit
+.pp_u_end:
+    test ecx, ecx
+    jz .pp_adv                       ; "u=" with no digits: not a number
+    cmp eax, 7
+    ja .pp_adv                       ; out of range: ignored, the default stands
+    ; the digits must end the member — end of value, a separator, or an RFC
+    ; 8941 parameter ("u=3;x") — else this was never a number ("u=3x")
+    cmp rdi, r10
+    jae .pp_u_set
+    movzx edx, byte [rdi]
+    cmp dl, ','
+    je .pp_u_set
+    cmp dl, ' '
+    je .pp_u_set
+    cmp dl, ';'
+    je .pp_u_set
+    jmp .pp_adv
+.pp_u_set:
     mov r8d, eax
     jmp .pp_adv
 .pp_i:

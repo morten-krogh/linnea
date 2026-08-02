@@ -175,4 +175,22 @@ conn.close()
 for d, _ in conn.datagrams_to_send(now=clk()):
     s.sendto(d, ("127.0.0.1", port))
 s.close()
+
+# --- 3: RFC 8941 numbers (h3-13). "u=07" IS the number 7 (leading zeros are
+# legal), and "u=10" is out of range so it is IGNORED and the default 3 stands
+# (RFC 9218 4.1). Reading a single digit got both wrong: 07 became urgency 0 —
+# the opposite end of the scale — and 10 became 1, so either would have jumped
+# the queue it belongs at the back of. Expected finish order: the default-3
+# pair in arrival order, then the u=07 (7) stream last.
+conn, s, clk, flush = connect()
+order = [(FILES[0][0], None), (FILES[1][0], b"u=07"), (FILES[2][0], b"u=10")]
+fin_order, _ = run(conn, s, clk, flush, order)
+want = [FILES[0][0], FILES[2][0], FILES[1][0]]
+assert fin_order == want, \
+    (f"RFC 8941 urgency numbers misread: finished "
+     f"{[n.decode() for n in fin_order]}, want {[n.decode() for n in want]}")
+conn.close()
+for d, _ in conn.datagrams_to_send(now=clk()):
+    s.sendto(d, ("127.0.0.1", port))
+s.close()
 print("ok")
