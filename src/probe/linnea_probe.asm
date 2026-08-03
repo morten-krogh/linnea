@@ -320,6 +320,10 @@ n_h3_nosig:   db "QUIC ClientHello without signature_algorithms -> aborted"
 n_h3_nosig_len equ $ - n_h3_nosig
 n_h3_trailer: db "HTTP/3 frame after the trailer section -> connection error"
 n_h3_trailer_len equ $ - n_h3_trailer
+n_h3_qpbase:  db "HTTP/3 negative QPACK Base -> connection closed"
+n_h3_qpbase_len equ $ - n_h3_qpbase
+n_h3_ctrllen: db "HTTP/3 control frame with a bad length -> connection closed"
+n_h3_ctrllen_len equ $ - n_h3_ctrllen
 
 ; QPACK static index -> :status, mirroring the server's encoder table.
 qpack_idx2status:
@@ -5794,12 +5798,194 @@ probe_h3_trailer:
     pop rbx
     ret
 
+; probe_h3_qpack_base (h3-14): with Required Insert Count 0, a set Delta Base sign
+; bit means Base = -1, which is forbidden (RFC 9204 4.5.1.2) — a QPACK decoding
+; failure, i.e. a connection error (QPACK_DECOMPRESSION_FAILED). Field section is
+; an otherwise valid GET; only the sign bit is wrong. OK iff the server closes the
+; connection; DEV if it serves the request (pre-fix discarded the sign bit).
+probe_h3_qpack_base:
+    push rbx
+    push r14
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    lea rdi, [fs_scratch]
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x80              ; Delta Base sign set, RIC 0 -> Base -1
+    mov byte [rdi + 2], 0xd1             ; :method GET
+    mov byte [rdi + 3], 0xd7             ; :scheme https
+    mov byte [rdi + 4], 0xc1             ; :path /
+    mov byte [rdi + 5], 0x50             ; :authority literal, name ref static 0
+    add rdi, 6
+    mov rax, [host_len]
+    mov [rdi], al
+    inc rdi
+    mov rsi, [host_ptr]
+    mov rcx, [host_len]
+    rep movsb
+    lea rax, [fs_scratch]
+    mov r14, rdi
+    sub r14, rax                         ; field-section length
+    lea rdi, [qpay]
+    mov byte [rdi], 0x0a                 ; control STREAM(2, SETTINGS)
+    mov byte [rdi + 1], 0x02
+    mov byte [rdi + 2], 0x03
+    mov byte [rdi + 3], 0x00
+    mov byte [rdi + 4], 0x04
+    mov byte [rdi + 5], 0x00
+    add rdi, 6
+    mov byte [rdi], 0x0b                 ; request STREAM(0, FIN)
+    mov byte [rdi + 1], 0x00
+    lea rax, [r14 + 2]
+    mov [rdi + 2], al
+    mov byte [rdi + 3], 0x01             ; HEADERS
+    mov [rdi + 4], r14b
+    add rdi, 5
+    lea rsi, [fs_scratch]
+    mov rcx, r14
+    rep movsb
+    lea rax, [qpay]
+    mov rdx, rdi
+    sub rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify
+    mov r14, rax
+    mov edi, ebx
+    call close_fd
+    cmp r14, -3
+    je .ok
+    cmp r14, 200
+    jl .info
+    cmp r14, 400
+    jl .dev
+    jmp .info
+.ok:
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_qpbase]
+    mov edx, n_h3_qpbase_len
+    call report_plain
+    pop r14
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h3_qpbase]
+    mov edx, n_h3_qpbase_len
+    call report_plain
+    pop r14
+    pop rbx
+    ret
+
+; probe_h3_ctrl_framelen (h3-4): a single-varint control frame (CANCEL_PUSH /
+; GOAWAY / MAX_PUSH_ID) must carry exactly one varint; an empty payload is a
+; connection error (H3_FRAME_ERROR, RFC 9114 7.1). Sends a MAX_PUSH_ID of length 0
+; on the control stream. OK iff the server closes; DEV if it serves the request
+; (pre-fix never length-checked these).
+probe_h3_ctrl_framelen:
+    push rbx
+    push r14
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    lea rdi, [fs_scratch]
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x00
+    mov byte [rdi + 2], 0xd1
+    mov byte [rdi + 3], 0xd7
+    mov byte [rdi + 4], 0xc1
+    mov byte [rdi + 5], 0x50
+    add rdi, 6
+    mov rax, [host_len]
+    mov [rdi], al
+    inc rdi
+    mov rsi, [host_ptr]
+    mov rcx, [host_len]
+    rep movsb
+    lea rax, [fs_scratch]
+    mov r14, rdi
+    sub r14, rax
+    lea rdi, [qpay]
+    mov byte [rdi], 0x0a                 ; control STREAM(2), data length 5
+    mov byte [rdi + 1], 0x02
+    mov byte [rdi + 2], 0x05
+    mov byte [rdi + 3], 0x00             ; control stream type
+    mov byte [rdi + 4], 0x04             ; SETTINGS
+    mov byte [rdi + 5], 0x00             ; SETTINGS length 0
+    mov byte [rdi + 6], 0x0d             ; MAX_PUSH_ID
+    mov byte [rdi + 7], 0x00             ; length 0 -> illegal (needs one varint)
+    add rdi, 8
+    mov byte [rdi], 0x0b                 ; request STREAM(0, FIN)
+    mov byte [rdi + 1], 0x00
+    lea rax, [r14 + 2]
+    mov [rdi + 2], al
+    mov byte [rdi + 3], 0x01
+    mov [rdi + 4], r14b
+    add rdi, 5
+    lea rsi, [fs_scratch]
+    mov rcx, r14
+    rep movsb
+    lea rax, [qpay]
+    mov rdx, rdi
+    sub rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify
+    mov r14, rax
+    mov edi, ebx
+    call close_fd
+    cmp r14, -3
+    je .ok
+    cmp r14, 200
+    jl .info
+    cmp r14, 400
+    jl .dev
+    jmp .info
+.ok:
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_ctrllen]
+    mov edx, n_h3_ctrllen_len
+    call report_plain
+    pop r14
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h3_ctrllen]
+    mov edx, n_h3_ctrllen_len
+    call report_plain
+    pop r14
+    pop rbx
+    ret
+
 ; h3_battery(): the HTTP/3 probe set.
 h3_battery:
     call probe_h3_handshake
     call probe_h3_nopath
     call probe_h3_badqpack
     call probe_h3_trailer
+    call probe_h3_qpack_base
+    call probe_h3_ctrl_framelen
     call probe_h3_no_sigalgs
     ret
 
