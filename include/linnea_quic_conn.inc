@@ -141,6 +141,13 @@ LINNEA_QUIC_PU_PEND equ 8
 ; request is never retransmitted — it is lost, and the page stalls). Requests
 ; larger than the buffer, or a burst deeper than the contexts, are still dropped.
 LINNEA_QUIC_RA_BUF      equ 8192    ; reassembly capacity for one request stream
+; Receive-side connection flow control (quic-9). We advertise INITIAL_MAX_DATA and
+; keep the ceiling FC_WINDOW ahead of what the peer has sent, re-granting via
+; MAX_DATA whenever a fresh grant would advance the ceiling by >= FC_GRANT_MIN.
+; Over-granting is safe: a stream is still capped at RA_BUF, so no extra is buffered.
+LINNEA_QUIC_INITIAL_MAX_DATA equ 1048576   ; must match initial_max_data in the TP
+LINNEA_QUIC_FC_WINDOW        equ 0x400000   ; 4 MiB ahead of received
+LINNEA_QUIC_FC_GRANT_MIN     equ 0x40000    ; 256 KiB minimum grant step
 LINNEA_QUIC_CTRL_RO     equ 512     ; reordered control-stream bytes held (h3-6)
 LINNEA_QUIC_RA_CTXS     equ 6       ; requests that can reassemble concurrently
 
@@ -440,6 +447,11 @@ struc linnea_quic_conn
     .fc_stream_init: resq 1         ; the initial per-stream window (new slots start here)
     .fc_conn_max:   resq 1          ; max total data the client will accept
     .fc_conn_sent:  resq 1          ; response-stream bytes sent against fc_conn_max
+    ; receive side (quic-9): the peer is flow-controlled by initial_max_data, which
+    ; we must raise with MAX_DATA as it sends, or it stalls once it hits the ceiling.
+    .fc_recv:       resq 1          ; cumulative client->server STREAM bytes (loose)
+    .fc_adv:        resq 1          ; connection-level ceiling we have advertised
+    .fc_pending:    resq 1          ; 1 = a MAX_DATA grant is queued for the next send
     ; congestion control shared by the open response streams (RFC 9002 NewReno):
     ; one packet-number space and one path, so one window over all of them.
     .cwnd:       resq 1             ; congestion window in bytes (0 = uninitialised)

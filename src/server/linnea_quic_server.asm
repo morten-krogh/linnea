@@ -224,6 +224,7 @@ expfin:      resb 64                  ; expected client Finished message
 onertt_pay:  resb 256                 ; ACK + HANDSHAKE_DONE + uni streams + NST CRYPTO
 onertt_pkt:  resb 4096                ; the protected 1-RTT packet
 strm_pay:    resb 4096                ; STREAM frame carrying the h3 response
+fc_grant_pay: resb 4096               ; MAX_DATA prepended to an outgoing payload (quic-9)
 req:         resb linnea_h2_req_size  ; decoded h3 request
 ; QPACK literal scratch: every Huffman-decoded header value of one request goes
 ; here. At 2048 an ordinary request with a large cookie overflowed it, and the
@@ -1003,6 +1004,11 @@ linnea_quic_server_datagram:
     mov qword [rbx + linnea_quic_conn.fc_stream_init], 0
     mov qword [rbx + linnea_quic_conn.fc_conn_max], 0
     mov qword [rbx + linnea_quic_conn.fc_conn_sent], 0
+    ; receive-side flow control (quic-9): we advertised initial_max_data as the
+    ; starting ceiling and have received nothing yet.
+    mov qword [rbx + linnea_quic_conn.fc_recv], 0
+    mov qword [rbx + linnea_quic_conn.fc_adv], LINNEA_QUIC_INITIAL_MAX_DATA
+    mov qword [rbx + linnea_quic_conn.fc_pending], 0
     mov qword [rbx + linnea_quic_conn.ms_bidi_max], LINNEA_QUIC_MS_INIT
     mov rdi, [ch_out + linnea_quic_ch.tp_ptr]
     test rdi, rdi
@@ -1930,6 +1936,22 @@ linnea_quic_server_datagram:
     mov [s_slen], rdx
     mov [s_soff], r10                ; data offset, for typing a uni stream
     mov [s_sfin], r11                ; FIN flag, for the critical-stream check
+    ; connection-level receive flow control (quic-9): count the bytes and, when a
+    ; fresh grant would advance the ceiling by at least FC_GRANT_MIN, queue a
+    ; MAX_DATA so the peer never stalls on initial_max_data. The count is loose
+    ; (a retransmit is double-counted) but that only grants sooner, which is safe.
+    mov rax, [cur_conn]
+    add [rax + linnea_quic_conn.fc_recv], rdx
+    mov rcx, [rax + linnea_quic_conn.fc_recv]
+    add rcx, LINNEA_QUIC_FC_WINDOW
+    sub rcx, [rax + linnea_quic_conn.fc_adv]
+    cmp rcx, LINNEA_QUIC_FC_GRANT_MIN
+    jb .fc_recv_done
+    mov rcx, [rax + linnea_quic_conn.fc_recv]
+    add rcx, LINNEA_QUIC_FC_WINDOW
+    mov [rax + linnea_quic_conn.fc_adv], rcx
+    mov qword [rax + linnea_quic_conn.fc_pending], 1
+.fc_recv_done:
     mov rax, r8
     and eax, 3
     jz .client_bidi                  ; client bidi stream: an HTTP/3 request
@@ -4082,6 +4104,26 @@ now_ms:
 ; Requires rsp 16-aligned at the call site (rsp % 16 == 8 on entry).
 emit_1rtt:
     push rbx
+    mov rbx, [cur_conn]
+    cmp qword [rbx + linnea_quic_conn.fc_pending], 0
+    je .no_grant
+    ; A MAX_DATA grant is queued (quic-9): prepend it to the payload the caller
+    ; built, so it rides the next 1-RTT packet we were going to send anyway.
+    mov qword [rbx + linnea_quic_conn.fc_pending], 0
+    lea rdi, [fc_grant_pay]
+    mov byte [rdi], 0x10             ; MAX_DATA
+    inc rdi
+    mov rsi, [rbx + linnea_quic_conn.fc_adv]
+    call linnea_quic_varint_encode   ; rax = varint length
+    add rdi, rax
+    mov rsi, [s_pl_ptr]
+    mov rcx, [s_pl_len]
+    rep movsb
+    lea rax, [fc_grant_pay]
+    mov [s_pl_ptr], rax
+    sub rdi, rax
+    mov [s_pl_len], rdi
+.no_grant:
     mov al, 0x41                      ; short header, 2-byte pn; key phase in bit 0x04
     mov rcx, [cur_conn]
     mov rcx, [rcx + linnea_quic_conn.key_phase]

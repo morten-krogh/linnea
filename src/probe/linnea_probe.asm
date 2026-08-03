@@ -349,6 +349,8 @@ prio_b:       db "u=1"                   ; urgency 1 (high) both pre- and post-f
 prio_b_len    equ $ - prio_b
 n_h3_urgency: db "HTTP/3 urgency: u=07 is low priority, not high"
 n_h3_urgency_len equ $ - n_h3_urgency
+n_h3_maxdata: db "HTTP/3 server grants connection credit (MAX_DATA)"
+n_h3_maxdata_len equ $ - n_h3_maxdata
 
 ; QPACK static index -> :status, mirroring the server's encoder table.
 qpack_idx2status:
@@ -6417,6 +6419,177 @@ probe_h3_urgency:
     pop rbx
     ret
 
+; quic_h3_find_maxdata(edi=fd) -> rax = 1 if any server 1-RTT packet carries a
+; MAX_DATA frame (0x10), else 0. Reads a few datagrams, ACKing as it goes.
+quic_h3_find_maxdata:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    and rsp, -16
+    mov ebx, edi
+    xor r15d, r15d
+    mov r12d, 10
+.loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 2000
+    syscall
+    test rax, rax
+    jle .no
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle .no
+    mov rsi, rax
+    call quic_find_1rtt
+    test rax, rax
+    jz .next
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [q_ap_skeys]
+    lea rcx, [qplain]
+    mov r8d, 8
+    mov r9, r15
+    call linnea_quic_unprotect_short
+    test rax, rax
+    js .next
+    mov r15, rdx
+    push rax
+    lea rdi, [qpay]
+    mov rsi, r15
+    call quic_ack_frame
+    lea rdx, [qpay]
+    sub rax, rdx
+    mov rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    pop rax
+    lea r13, [qplain]
+    lea r14, [qplain]
+    add r14, rax
+.fr:
+    cmp r13, r14
+    jae .next
+    cmp byte [r13], 0x10                  ; MAX_DATA
+    je .yes
+    mov rdi, r13
+    mov rsi, r14
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .next
+    add r13, rax
+    jmp .fr
+.next:
+    dec r12d
+    jnz .loop
+.no:
+    xor eax, eax
+    jmp .done
+.yes:
+    mov eax, 1
+.done:
+    lea rsp, [rbp - 40]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; probe_h3_maxdata (quic-9): a receiver must raise the peer's connection flow-
+; control limit with MAX_DATA as it consumes, or the peer stalls at
+; initial_max_data. Send one request and check the server grants credit. OK iff a
+; MAX_DATA frame comes back.
+probe_h3_maxdata:
+    push rbx
+    push r14
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    lea rdi, [fs_scratch]
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x00
+    mov byte [rdi + 2], 0xd1
+    mov byte [rdi + 3], 0xd7
+    mov byte [rdi + 4], 0xc1
+    mov byte [rdi + 5], 0x50
+    add rdi, 6
+    mov rax, [host_len]
+    mov [rdi], al
+    inc rdi
+    mov rsi, [host_ptr]
+    mov rcx, [host_len]
+    rep movsb
+    lea rax, [fs_scratch]
+    mov r14, rdi
+    sub r14, rax
+    lea rdi, [qpay]
+    mov byte [rdi], 0x0a
+    mov byte [rdi + 1], 0x02
+    mov byte [rdi + 2], 0x03
+    mov byte [rdi + 3], 0x00
+    mov byte [rdi + 4], 0x04
+    mov byte [rdi + 5], 0x00
+    add rdi, 6
+    mov byte [rdi], 0x0b
+    mov byte [rdi + 1], 0x00
+    lea rax, [r14 + 2]
+    mov [rdi + 2], al
+    mov byte [rdi + 3], 0x01
+    mov [rdi + 4], r14b
+    add rdi, 5
+    lea rsi, [fs_scratch]
+    mov rcx, r14
+    rep movsb
+    lea rax, [qpay]
+    mov rdx, rdi
+    sub rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_find_maxdata
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rax
+    mov dil, K_OK
+    test rax, rax
+    jnz .rep
+    mov dil, K_DEV
+.rep:
+    lea rsi, [n_h3_maxdata]
+    mov edx, n_h3_maxdata_len
+    call report_plain
+    pop r14
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h3_maxdata]
+    mov edx, n_h3_maxdata_len
+    call report_plain
+    pop r14
+    pop rbx
+    ret
+
 ; h3_battery(): the HTTP/3 probe set.
 h3_battery:
     call probe_h3_handshake
@@ -6426,6 +6599,7 @@ h3_battery:
     call probe_h3_qpack_base
     call probe_h3_ctrl_framelen
     call probe_h3_urgency
+    call probe_h3_maxdata
     call probe_h3_no_sigalgs
     ret
 
