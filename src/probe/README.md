@@ -3,7 +3,10 @@
 A standalone HTTP compliance prober. Point it at a live server and it runs a
 battery of conformance checks — valid requests, malformed requests, dynamic
 header-table encoding, slow/dribbled connections — across HTTP/1.1, HTTP/2 and
-HTTP/3, and reports where the server deviates from the specs.
+HTTP/3, and reports where the server deviates from the specs. Because it drives
+its own QUIC and TLS 1.3 stack, the HTTP/3 battery reaches into transport- and
+handshake-level conformance too — flow control, connection-id rotation, and
+ClientHello validation — the kind of thing off-the-shelf HTTP clients can't probe.
 
 It is the client-side sibling of the Linnea server: the same world of `nasm` +
 `ld`, no libc, no third-party code. It brings up TCP, TLS 1.3, and a from-scratch
@@ -54,22 +57,41 @@ reported as `[info]`, not penalised.
 
 ## What it checks
 
-**HTTP/1.1 (14 probes)** — valid GET; keep-alive reuse; missing `Host`;
+**HTTP/1.1 (19 probes)** — valid GET; keep-alive reuse; missing `Host`;
 duplicate `Host`; whitespace before the header colon; a colon-less header; a
-version-less request line; an unknown method; `HTTP/1.0`; a bogus version;
-an over-long request target; bare-LF line endings; absolute-form target; and a
-slowloris drip that watches whether the server times the request head out.
+version-less request line; an unknown method (→ 501); a known-but-declined method
+(`DELETE` → 405 with `Allow`); a field name containing a delimiter (→ 400);
+`HTTP/1.0`; a bogus version; an over-long request target (→ 414); bare-LF line
+endings; an absolute-form target; that an error response carries `Date`; that
+`Expect: 100-continue` draws an interim `100 Continue`; that `close` anywhere in a
+`Connection` list closes the socket; and a slowloris drip that watches whether the
+server times the request head out.
 
-**HTTP/2 (4 probes)** — a valid GET (→ 200); **HPACK dynamic-table indexing**
+**HTTP/2 (9 probes)** — a valid GET (→ 200); **HPACK dynamic-table indexing**
 (one request inserts `:authority` with incremental indexing, the next references
-it by dynamic index); a request with no `:path` (→ `RST_STREAM`); and an
-undecodable HPACK block (→ `GOAWAY`).
+it by dynamic index); a request with no `:path` (→ `RST_STREAM`); an undecodable
+HPACK block (→ `GOAWAY`); a wrong-length `WINDOW_UPDATE` (→ `GOAWAY(FRAME_SIZE_ERROR)`,
+i.e. the RFC's code, not a blanket `PROTOCOL_ERROR`); a zero `WINDOW_UPDATE`
+increment (→ `RST_STREAM`, the connection surviving); a `PING` bearing a stream id
+(→ `PROTOCOL_ERROR`); a wrong-length `RST_STREAM` (→ `FRAME_SIZE_ERROR`); and a
+`CONNECT` (→ 405, not a reset).
 
-**HTTP/3 (6 probes)** — the full QUIC/TLS 1.3 handshake in three verified
-stages (Initial + Handshake keys; server flight / server Finished decrypted;
-client Finished → 1-RTT keys), then a real GET over 1-RTT with a QPACK-encoded
-request (→ `:status 200`); a request with no `:path` (→ `RESET_STREAM`); and an
-undecodable QPACK field section (→ `CONNECTION_CLOSE`).
+**HTTP/3 (15 probes)** — the full QUIC/TLS 1.3 handshake in three verified stages
+(Initial + Handshake keys; server flight / server Finished decrypted; client
+Finished → 1-RTT keys), then a real GET over 1-RTT with a QPACK-encoded request
+(→ `:status 200`). Request-stream compliance: no `:path` (→ `RESET_STREAM`); an
+undecodable QPACK field section, a negative QPACK Base, and a frame after the
+trailer section (→ `CONNECTION_CLOSE`); a control-stream frame with a bad length
+(→ connection error); and **urgency scheduling** (`u=07` is *low* priority, not
+high — needs `--big`, see above).
+
+Because it drives its own QUIC stack, it also exercises transport- and
+TLS-handshake-level behaviour that most HTTP probers can't reach: the server
+grants connection flow-control credit (`MAX_DATA`); it issues a `NEW_CONNECTION_ID`
+and the probe **rotates its connection id onto it** and confirms the server still
+routes it; and the QUIC `ClientHello` is refused when it omits
+`signature_algorithms`, doesn't offer TLS 1.3, or offers no cipher the server
+implements — each verified by an explicit `CONNECTION_CLOSE`, not a silent drop.
 
 ## Building
 
