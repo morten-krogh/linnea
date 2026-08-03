@@ -177,6 +177,7 @@ extern linnea_quic_replay_check
 extern linnea_quic_hs_psk
 extern linnea_quic_early_ok
 extern linnea_quic_resume_issued
+extern linnea_quic_ticket_within_lifetime
 section .rodata
 quic_alpn_h3:   db "h3"        ; the one application protocol this server offers
 ; Retry integrity tag key and nonce, fixed by the RFC per QUIC version:
@@ -1068,6 +1069,19 @@ linnea_quic_server_datagram:
     add rsp, 16
     test rax, rax
     jz .no_resume
+    ; ticket lifetime (tls-7): the ticket verified, but a captured one must not
+    ; resume past its advertised lifetime — the sealing key never rotates. The 0-RTT
+    ; block below only gates EARLY data on the replay window; resumption itself was
+    ; unbounded. Mirrors the TCP try_resume check.
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    xor edi, edi                             ; CLOCK_REALTIME
+    lea rsi, [q_nst_ts]
+    syscall
+    mov rdi, [linnea_quic_resume_issued]
+    mov rsi, [q_nst_ts]                       ; now (seconds)
+    call linnea_quic_ticket_within_lifetime
+    test rax, rax
+    jz .no_resume                             ; expired / future-dated -> full handshake
     lea rax, [s_resume_psk]
     mov [linnea_quic_hs_psk], rax             ; resumed: seed the key schedule
     ; accept 0-RTT if the client also offered early_data. First defend against
@@ -4056,7 +4070,7 @@ linnea_quic_server_datagram:
     mov byte [q_nst_msg], 0x04       ; type new_session_ticket
     mov byte [q_nst_msg + 1], 0
     mov word [q_nst_msg + 2], 0x6300 ; body length 99, big-endian
-    mov eax, 86400                   ; ticket_lifetime seconds (1 day)
+    mov eax, LINNEA_QUIC_TICKET_LIFETIME   ; advertised == enforced (tls-7)
     bswap eax
     mov [q_nst_msg + 4], eax         ; ticket_lifetime, big-endian
     lea rdi, [q_nst_msg + 8]         ; ticket_age_add: 4 random bytes

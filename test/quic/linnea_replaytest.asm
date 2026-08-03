@@ -2,15 +2,20 @@
 ; linnea_quic_replay_check in isolation: a fresh binder is recorded, a repeat
 ; within the window is a replay, a different binder is fresh, an entry past its
 ; window is reusable, the register fails closed when full, and frees again once
-; its entries expire. Prints "quic-replay <pass>/<total>" and exits 1 on failure.
+; its entries expire. Also exercises linnea_quic_ticket_within_lifetime (tls-7):
+; a ticket at, before, and exactly on the lifetime boundary is fresh; one past it
+; is expired; a future-dated one is rejected. Prints "quic-replay <pass>/<total>"
+; and exits 1 on failure.
 
 default rel
 
 %include "linnea_syscall.inc"
+%include "linnea_quic.inc"
 
 global _start
 
 extern linnea_quic_replay_check
+extern linnea_quic_ticket_within_lifetime
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 
@@ -84,6 +89,33 @@ _start:
     ; once those entries expire, the register accepts again
     RCHECK 0x3333, 200000
     EXPECT rax, 1
+
+    ; --- ticket lifetime (tls-7): linnea_quic_ticket_within_lifetime ---
+    ; issued == now: fresh
+    mov rdi, 1000000
+    mov rsi, 1000000
+    call linnea_quic_ticket_within_lifetime
+    EXPECT rax, 1
+    ; one second short of the lifetime: fresh
+    mov rdi, 1000000
+    mov rsi, 1000000 + LINNEA_QUIC_TICKET_LIFETIME - 1
+    call linnea_quic_ticket_within_lifetime
+    EXPECT rax, 1
+    ; exactly at the lifetime boundary: still fresh (rejection is strict, ja)
+    mov rdi, 1000000
+    mov rsi, 1000000 + LINNEA_QUIC_TICKET_LIFETIME
+    call linnea_quic_ticket_within_lifetime
+    EXPECT rax, 1
+    ; one second past the lifetime: expired
+    mov rdi, 1000000
+    mov rsi, 1000000 + LINNEA_QUIC_TICKET_LIFETIME + 1
+    call linnea_quic_ticket_within_lifetime
+    EXPECT rax, 0
+    ; issued in the future (clock skew): rejected
+    mov rdi, 1000001
+    mov rsi, 1000000
+    call linnea_quic_ticket_within_lifetime
+    EXPECT rax, 0
 
     ; print "quic-replay <pass>/<total>\n"
     lea rdi, [msg_head]

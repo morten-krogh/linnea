@@ -21,6 +21,10 @@ LINNEA_QUIC_TICKET_LEN equ LINNEA_QUIC_TICKET_PT + 28
 ; bounds how long the replay strike register must remember a binder (RFC 9001
 ; 9.2). A resuming client past the window still resumes — just at 1-RTT.
 LINNEA_QUIC_REPLAY_WINDOW equ 10
+; A resumption ticket presented past this age is refused (RFC 8446 4.6.1): the
+; sealing key never rotates, so an unbounded lifetime lets a captured ticket resume
+; forever. Must match the ticket_lifetime advertised in the NewSessionTicket.
+LINNEA_QUIC_TICKET_LIFETIME equ 86400
 
 ; The pieces of a ClientHello the QUIC handshake needs.
 struc linnea_quic_ch

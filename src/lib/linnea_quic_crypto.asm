@@ -36,6 +36,7 @@ global linnea_quic_replay_check
 global linnea_quic_hs_psk
 global linnea_quic_early_ok
 global linnea_quic_resume_issued
+global linnea_quic_ticket_within_lifetime
 
 extern linnea_hkdf_extract
 extern linnea_tls_hkdf_expand_label
@@ -676,6 +677,24 @@ quic_ct_eq32:
 %define RS_TH    144
 %define RS_EXP   176                 ; recomputed binder (176..207)
 %define RS_OUT   208                 ; saved out-psk pointer (past RS_EXP)
+; linnea_quic_ticket_within_lifetime(rdi = ticket issued tv_sec, rsi = now tv_sec)
+;   -> rax = 1 if the ticket may still be resumed, 0 if it is expired or was issued
+; in the future (clock skew). RFC 8446 4.6.1 (tls-7): a resumption ticket past its
+; advertised lifetime must be refused, or a captured ticket resumes for the whole
+; process lifetime since the sealing key never rotates. Mirrors the TCP try_resume
+; check; used by the QUIC handshake and exercised by linnea-replaytest.
+linnea_quic_ticket_within_lifetime:
+    mov rax, rsi
+    sub rax, rdi                     ; age = now - issued
+    js .twl_reject                   ; negative: issued in the future
+    cmp rax, LINNEA_QUIC_TICKET_LIFETIME
+    ja .twl_reject                   ; older than the advertised lifetime
+    mov eax, 1
+    ret
+.twl_reject:
+    xor eax, eax
+    ret
+
 linnea_quic_ticket_resume:
     mov rax, [rsp + 8]               ; out psk (caller's 7th arg)
     push rbx

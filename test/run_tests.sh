@@ -279,7 +279,7 @@ fi
 if [ -x ./bin/linnea-replaytest ]; then
     out=$(./bin/linnea-replaytest)
     rc=$?
-    check "quic 0-RTT anti-replay selftest ($out)" $rc
+    check "quic 0-RTT anti-replay + ticket-lifetime selftest ($out)" $rc
 else
     check "quic 0-RTT anti-replay selftest (skipped: binary unavailable)" 0
 fi
