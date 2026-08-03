@@ -7,12 +7,27 @@ OBJS = $(SRCS:.asm=.o)
 INCS = $(wildcard include/*.inc)
 BIN  = bin/linnea
 
+# Shared P-256 signer objects (build_cert_verify reaches into linnea_p256_ecdsa);
+# used by linnea-probe and several QUIC message binaries. Defined up here so the
+# product variables below can reference it before its former mid-file location.
+QUICP256 = src/linnea_p256_ecdsa.o src/linnea_p256_mont.o src/linnea_p256_fe.o \
+           src/linnea_p256_scalar.o src/linnea_p256_point.o
+
+# linnea-probe: a standalone HTTP/1.1+HTTP/2+HTTP/3 compliance prober. A shipped
+# product in its own right (installed alongside the server), NOT test code — it
+# has its own _start and links only the subset of server objects it reuses.
+PROBE_BIN  = bin/linnea-probe
+PROBE_OBJS = probe/linnea_probe.o src/linnea_print.o src/linnea_string.o \
+             src/linnea_tls_kdf.o src/linnea_tls_record.o src/linnea_aesgcm.o \
+             src/linnea_sha256.o src/linnea_x25519.o src/linnea_fe25519.o \
+             src/linnea_quic.o src/linnea_quic_crypto.o $(QUICP256)
+
 # No dependencies: the binary is nasm + ld over src/, statically linked, with no
 # libc and no third-party code. The io_uring rings are driven straight from
 # src/linnea_ring.asm (io_uring_setup/io_uring_enter), which is what liburing
 # used to provide.
 
-all: $(BIN)
+all: $(BIN) $(PROBE_BIN)
 
 $(BIN): $(OBJS)
 	$(LD) -o $@ $(OBJS)
@@ -60,12 +75,6 @@ $(TLSTEST_BIN): $(TLSTEST_OBJS)
 	$(LD) -o $@ $^
 
 tlstest: $(TLSTEST_BIN)
-
-# The P-256 signer objects several QUIC message binaries need (build_cert_verify
-# reaches into linnea_p256_ecdsa). Defined before first use so prerequisite
-# expansion picks it up.
-QUICP256 = src/linnea_p256_ecdsa.o src/linnea_p256_mont.o src/linnea_p256_fe.o \
-           src/linnea_p256_scalar.o src/linnea_p256_point.o
 
 # --- QUIC crypto known-answer tests (own _start; RFC 9001 vectors) ---
 QUICTEST_BIN  = bin/linnea-quictest
@@ -281,14 +290,8 @@ $(H3RESP_BIN): $(H3RESP_OBJS)
 
 h3resp: $(H3RESP_BIN)
 
-# --- HTTP compliance prober (own _start; a client, not part of the server) ---
-PROBE_BIN  = bin/linnea-probe
-PROBE_OBJS = test/probe/linnea_probe.o src/linnea_print.o src/linnea_string.o \
-             src/linnea_tls_kdf.o src/linnea_tls_record.o src/linnea_aesgcm.o \
-             src/linnea_sha256.o src/linnea_x25519.o src/linnea_fe25519.o \
-             src/linnea_quic.o src/linnea_quic_crypto.o $(QUICP256)
-
-test/probe/linnea_probe.o: test/probe/linnea_probe.asm $(INCS)
+# --- linnea-probe build rules (product; PROBE_BIN/PROBE_OBJS defined up top) ---
+probe/linnea_probe.o: probe/linnea_probe.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
 
 $(PROBE_BIN): $(PROBE_OBJS)
@@ -298,7 +301,7 @@ probe: $(PROBE_BIN)
 
 clean:
 	rm -f $(OBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
-	      test/probe/*.o $(PROBE_BIN) \
+	      probe/*.o $(PROBE_BIN) \
 	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
 
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
@@ -307,14 +310,17 @@ test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN) $(RTXTEST_BIN) $(REPLAYTEST_BIN)
 	./test/run_tests.sh
 
-# Install the binary to /usr/local/bin: bin_t under SELinux, so systemd
-# may exec it, and the fresh inode picks up the standard label — no
+# Install both products to /usr/local/bin: bin_t under SELinux, so systemd
+# may exec the server, and the fresh inode picks up the standard label — no
 # setcap or restorecon after rebuilds. Run as root (`sudo make install`);
 # deliberately not dependent on the build, so root never compiles into
 # the tree. Routine deploy:
 #   make && sudo make install && sudo systemctl restart linnea
-# The systemd unit is a one-time install; see config/linnea.service.
+# `make` builds both bin/linnea and bin/linnea-probe. The systemd unit is a
+# one-time install; see config/linnea.service. linnea-probe is a plain CLI
+# client — no unit, just a binary on the PATH.
 install:
 	install -m 0755 $(BIN) /usr/local/bin/linnea
+	install -m 0755 $(PROBE_BIN) /usr/local/bin/linnea-probe
 
-.PHONY: all clean test selftest tlstest install
+.PHONY: all clean test selftest tlstest probe install
