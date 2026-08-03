@@ -24,6 +24,11 @@ linnea-probe --version
 - `--host <name>` — override the `Host:` header (h1/h2) or `:authority` (h2/h3)
   independently of the connection target. Useful for exercising virtual-host
   routing and cross-certificate misdirection.
+- `--big <path>` — a large resource (default `/`) for the HTTP/3 **urgency**
+  probe, which needs two sizeable concurrent responses to observe scheduling
+  order. Point it at a big asset the server actually has (e.g. a JS bundle or
+  image); if the resource is small or absent, that probe reports `[info]`
+  (inconclusive — it cannot schedule tiny responses) rather than a deviation.
 - `--version` — print the version and exit 0.
 
 The **exit code is the number of deviations** found (capped at 255), so the tool

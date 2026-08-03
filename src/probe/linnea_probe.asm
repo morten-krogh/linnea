@@ -71,6 +71,7 @@ usage_msg:  db "usage: linnea-probe <url> <protocol> [--host <name>]", 10
             db "  <url>       http[s]://<host-or-ipv4>[:port][/path]", 10
             db "  <protocol>  h1 | h2 | h3   (h2 and h3 require https://)", 10
             db "  --host      override the Host / :authority (vhost routing)", 10
+            db "  --big <p>   a large resource for the h3 urgency probe (default /)", 10
 usage_len   equ $ - usage_msg
 
 ; Bump on any change to observable behaviour (probe set, verdicts, output).
@@ -340,8 +341,10 @@ n_h3_qpbase:  db "HTTP/3 negative QPACK Base -> connection closed"
 n_h3_qpbase_len equ $ - n_h3_qpbase
 n_h3_ctrllen: db "HTTP/3 control frame with a bad length -> connection closed"
 n_h3_ctrllen_len equ $ - n_h3_ctrllen
-big_path:     db "/h3big.bin"
-big_path_len  equ $ - big_path
+dflt_big:     db "/"                     ; default urgency-probe path (override --big)
+dflt_big_len  equ $ - dflt_big
+opt_big:      db "--big"
+opt_big_len   equ $ - opt_big
 hdr_priority: db "priority"
 prio_a:       db "u=07"                  ; RFC 8941 number 7 (low); pre-fix read as 0
 prio_a_len    equ $ - prio_a
@@ -474,6 +477,8 @@ h3buf:      resb 4096                   ; response stream-0 data, reassembled
 h3buf_len:  resq 1
 h3_bytes_s0: resq 1                     ; urgency probe: bytes seen on stream 0
 h3_bytes_s4: resq 1                     ; urgency probe: bytes seen on stream 4
+big_ptr:    resq 1                      ; urgency probe: path to fetch (a large file)
+big_len:    resq 1
 
 section .text
 
@@ -528,8 +533,11 @@ _start:
     mov qword [alpn_len], alpn_h11_len
 .proto_set:
 
-    ; --- optional --host override (scan argv[3..]) ---
+    ; --- optional --host / --big overrides (scan argv[3..]) ---
     mov qword [host_ptr], 0
+    lea rax, [dflt_big]                   ; the urgency probe fetches "/" by default
+    mov [big_ptr], rax
+    mov qword [big_len], dflt_big_len
     mov rbx, 3                           ; arg index
 .scan_opts:
     cmp rbx, r15
@@ -539,7 +547,15 @@ _start:
     mov edx, opt_host_len
     call streq_z                         ; rax=1 if argv[rbx] == "--host"
     test rax, rax
-    jz .scan_next
+    jnz .opt_host
+    mov rdi, [rsp + 8 + rbx*8]
+    lea rsi, [opt_big]
+    mov edx, opt_big_len
+    call streq_z                         ; rax=1 if argv[rbx] == "--big"
+    test rax, rax
+    jnz .opt_big
+    jmp .scan_next
+.opt_host:
     lea rcx, [rbx + 1]
     cmp rcx, r15
     jae .opts_done                       ; --host with no value: ignore
@@ -548,6 +564,17 @@ _start:
     mov rsi, rdi
     call cstrlen
     mov [host_len], rax
+    add rbx, 2
+    jmp .scan_opts
+.opt_big:
+    lea rcx, [rbx + 1]
+    cmp rcx, r15
+    jae .opts_done                       ; --big with no value: ignore
+    mov rdi, [rsp + 8 + rcx*8]           ; the path value
+    mov [big_ptr], rdi
+    mov rsi, rdi
+    call cstrlen
+    mov [big_len], rax
     add rbx, 2
     jmp .scan_opts
 .scan_next:
@@ -6220,10 +6247,11 @@ qpack_get_prio:
     mov byte [rdi + 3], 0xd7             ; :scheme https
     add rdi, 4
     mov byte [rdi], 0x51                 ; :path literal, name ref static 1
-    mov byte [rdi + 1], big_path_len
+    mov rax, [big_len]
+    mov [rdi + 1], al                    ; value length (keep the path short, < 60)
     add rdi, 2
-    lea rsi, [big_path]
-    mov ecx, big_path_len
+    mov rsi, [big_ptr]
+    mov rcx, [big_len]
     rep movsb
     mov byte [rdi], 0x50                 ; :authority literal, name ref static 0
     mov rax, [host_len]
