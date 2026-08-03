@@ -257,6 +257,17 @@ h2_preface: db "PRI * HTTP/2.0", 13, 10, 13, 10, "SM", 13, 10, 13, 10
 h2_preface_len equ $ - h2_preface
 h2_settings: db 0,0,0, 0x04, 0x00, 0,0,0,0          ; empty SETTINGS
 h2_settings_len equ $ - h2_settings
+; WINDOW_UPDATE on stream 0 with a 5-byte payload (length != 4) -> FRAME_SIZE_ERROR
+h2_wu_badlen: db 0,0,5, 0x08, 0x00, 0,0,0,0, 0,0,0,1,0
+h2_wu_badlen_len equ $ - h2_wu_badlen
+; WINDOW_UPDATE on stream 1 with a zero increment -> stream error, RST_STREAM
+h2_wu_zero: db 0,0,4, 0x08, 0x00, 0,0,0,1, 0,0,0,0
+h2_wu_zero_len equ $ - h2_wu_zero
+
+n_h2_errcode: db "h2 wrong-length WINDOW_UPDATE -> FRAME_SIZE_ERROR"
+n_h2_errcode_len equ $ - n_h2_errcode
+n_h2_wuzero:  db "h2 zero WINDOW_UPDATE -> stream reset, connection survives"
+n_h2_wuzero_len equ $ - n_h2_wuzero
 h2_hdr_line: db "== HTTP/2 compliance probes -> "
 h2_hdr_line_len equ $ - h2_hdr_line
 ; h2 probe names
@@ -342,6 +353,8 @@ h2_block:   resb 4096                   ; HPACK header block being built
 h2_block_len: resq 1                    ; its length
 h2_sid:     resq 1                      ; next client stream id (odd)
 h2_prefaced: resq 1                     ; 1 once the preface+SETTINGS have gone out
+h2_goaway_seen: resq 1                   ; GOAWAY error code from the response, or -1
+h2_rst_seen: resq 1                      ; first RST_STREAM error code, or -1
 
 ; --- TLS 1.3 client state (one connection at a time, so globals suffice) ---
 use_tls:    resq 1                      ; 1 when the URL scheme is https
@@ -3374,6 +3387,8 @@ h2_battery:
     call probe_h2_dyn
     call probe_h2_nopath
     call probe_h2_badhpack
+    call probe_h2_errcode
+    call probe_h2_wu_zero
     ret
 
 ; probe_h2_valid: a well-formed GET over h2 — OK if any :status came back.
@@ -3546,6 +3561,182 @@ probe_h2_badhpack:
     mov rcx, -1
     mov r9d, -1
     call report
+    pop rbx
+    ret
+
+; h2_send_prefaced(edi=fd, rsi=frame, edx=frame len) -> rax = send result.
+; Sends the connection preface + empty SETTINGS, then the given raw frame.
+h2_send_prefaced:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12, rsi
+    mov r13d, edx
+    lea rdi, [reqbuf]
+    lea rsi, [h2_preface]
+    mov rcx, h2_preface_len
+    rep movsb
+    lea rsi, [h2_settings]
+    mov rcx, h2_settings_len
+    rep movsb
+    mov rsi, r12
+    mov rcx, r13
+    rep movsb
+    lea rax, [reqbuf]
+    mov rdx, rdi
+    sub rdx, rax
+    mov edi, ebx
+    lea rsi, [reqbuf]
+    call send_bytes
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; h2_scan_errors(): walk respbuf frames, recording the GOAWAY error code into
+; h2_goaway_seen and the first RST_STREAM error code into h2_rst_seen (-1 = none).
+h2_scan_errors:
+    push rbx
+    push r12
+    push r13
+    mov qword [h2_goaway_seen], -1
+    mov qword [h2_rst_seen], -1
+    lea r12, [respbuf]
+    mov r13, [resp_total]
+    add r13, r12
+.frame:
+    lea rax, [r12 + 9]
+    cmp rax, r13
+    ja .done
+    movzx eax, byte [r12]
+    shl eax, 8
+    movzx ecx, byte [r12 + 1]
+    or eax, ecx
+    shl eax, 8
+    movzx ecx, byte [r12 + 2]
+    or eax, ecx
+    mov rbx, rax                          ; frame length
+    movzx ecx, byte [r12 + 3]             ; type
+    lea rax, [r12 + 9 + rbx]
+    cmp rax, r13
+    ja .done
+    cmp ecx, 0x07
+    je .goaway
+    cmp ecx, 0x03
+    je .rst
+.skip:
+    lea r12, [r12 + rbx + 9]
+    jmp .frame
+.goaway:
+    cmp rbx, 8
+    jb .skip
+    movzx eax, byte [r12 + 13]            ; error code = payload offset 4 (BE32)
+    shl eax, 8
+    movzx ecx, byte [r12 + 14]
+    or eax, ecx
+    shl eax, 8
+    movzx ecx, byte [r12 + 15]
+    or eax, ecx
+    shl eax, 8
+    movzx ecx, byte [r12 + 16]
+    or eax, ecx
+    mov [h2_goaway_seen], rax
+    jmp .skip
+.rst:
+    cmp rbx, 4
+    jb .skip
+    cmp qword [h2_rst_seen], -1
+    jne .skip                            ; keep the first RST only
+    movzx eax, byte [r12 + 9]            ; error code = payload (BE32)
+    shl eax, 8
+    movzx ecx, byte [r12 + 10]
+    or eax, ecx
+    shl eax, 8
+    movzx ecx, byte [r12 + 11]
+    or eax, ecx
+    shl eax, 8
+    movzx ecx, byte [r12 + 12]
+    or eax, ecx
+    mov [h2_rst_seen], rax
+    jmp .skip
+.done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; probe_h2_errcode (h2-2): a connection error must carry the RFC's code, not a
+; blanket PROTOCOL_ERROR. A WINDOW_UPDATE whose length is not 4 is a
+; FRAME_SIZE_ERROR (0x6). OK iff the GOAWAY names 0x6.
+probe_h2_errcode:
+    push rbx
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov edi, ebx
+    lea rsi, [h2_wu_badlen]
+    mov edx, h2_wu_badlen_len
+    call h2_send_prefaced
+    mov edi, ebx
+    call read_response
+    call h2_scan_errors
+    mov edi, ebx
+    call close_fd
+    mov dil, K_OK
+    cmp qword [h2_goaway_seen], 0x6       ; FRAME_SIZE_ERROR
+    je .report
+    mov dil, K_DEV
+.report:
+    lea rsi, [n_h2_errcode]
+    mov edx, n_h2_errcode_len
+    call report_plain
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h2_errcode]
+    mov edx, n_h2_errcode_len
+    call report_plain
+    pop rbx
+    ret
+
+; probe_h2_wu_zero (h2-3): a zero WINDOW_UPDATE increment on a non-zero stream is
+; a STREAM error, not a connection error. OK iff an RST_STREAM(PROTOCOL_ERROR)
+; comes back AND no GOAWAY (the connection survives).
+probe_h2_wu_zero:
+    push rbx
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov edi, ebx
+    lea rsi, [h2_wu_zero]
+    mov edx, h2_wu_zero_len
+    call h2_send_prefaced
+    mov edi, ebx
+    call read_response
+    call h2_scan_errors
+    mov edi, ebx
+    call close_fd
+    mov dil, K_DEV
+    cmp qword [h2_goaway_seen], -1
+    jne .report                          ; a GOAWAY = old connection-error behaviour
+    cmp qword [h2_rst_seen], 1           ; PROTOCOL_ERROR
+    jne .report
+    mov dil, K_OK
+.report:
+    lea rsi, [n_h2_wuzero]
+    mov edx, n_h2_wuzero_len
+    call report_plain
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h2_wuzero]
+    mov edx, n_h2_wuzero_len
+    call report_plain
     pop rbx
     ret
 
