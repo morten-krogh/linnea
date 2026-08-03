@@ -295,6 +295,8 @@ n_h3_nopath:  db "HTTP/3 request with no :path -> rejected"
 n_h3_nopath_len equ $ - n_h3_nopath
 n_h3_badqp:   db "HTTP/3 undecodable QPACK -> connection closed"
 n_h3_badqp_len equ $ - n_h3_badqp
+n_h3_nosig:   db "QUIC ClientHello without signature_algorithms -> aborted"
+n_h3_nosig_len equ $ - n_h3_nosig
 
 ; QPACK static index -> :status, mirroring the server's encoder table.
 qpack_idx2status:
@@ -376,6 +378,7 @@ q_scid:     resb 8                      ; our source connection id
 alignb 16
 qi_ckeys:   resb linnea_quic_keys_size  ; client Initial keys (we protect with these)
 qi_skeys:   resb linnea_quic_keys_size  ; server Initial keys (we open with these)
+omit_sigalgs: resq 1                     ; tls-5 probe: drop signature_algorithms
 qch:        resb 2048                   ; the QUIC ClientHello handshake message
 qch_len:    resq 1
 qtp:        resb 512                    ; encoded client transport parameters
@@ -3740,7 +3743,9 @@ quic_build_ch:
     mov byte [rdi + 6], 0x00
     mov byte [rdi + 7], 0x1d
     add rdi, 8
-    ; signature_algorithms (ecdsa_secp256r1_sha256)
+    ; signature_algorithms (ecdsa_secp256r1_sha256) — the tls-5 probe drops it
+    cmp qword [omit_sigalgs], 0
+    jne .no_sigalgs
     mov byte [rdi], 0x00
     mov byte [rdi + 1], 0x0d
     mov byte [rdi + 2], 0x00
@@ -3750,6 +3755,7 @@ quic_build_ch:
     mov byte [rdi + 6], 0x04
     mov byte [rdi + 7], 0x03
     add rdi, 8
+.no_sigalgs:
     ; key_share (x25519)
     mov byte [rdi], 0x00
     mov byte [rdi + 1], 0x33
@@ -5221,11 +5227,200 @@ probe_h3_badqpack:
     call report_plain
     ret
 
+; quic_fresh_ids(): a fresh x25519 keypair, client random, session id, DCID, SCID.
+quic_fresh_ids:
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_priv]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    and byte [tls_priv], 248
+    and byte [tls_priv + 31], 127
+    or byte [tls_priv + 31], 64
+    lea rdi, [tls_pub]
+    lea rsi, [tls_priv]
+    lea rdx, [x25519_base]
+    call linnea_x25519
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_random]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [tls_sessid]
+    mov esi, 32
+    xor edx, edx
+    syscall
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [q_dcid]
+    mov esi, 8
+    xor edx, edx
+    syscall
+    mov eax, LINNEA_SYS_GETRANDOM
+    lea rdi, [q_scid]
+    mov esi, 8
+    xor edx, edx
+    syscall
+    ret
+
+; quic_recv_initial_verdict(edi=fd) -> rax: 1 = the server's Initial carried a
+; CONNECTION_CLOSE (an explicit abort), 2 = it carried CRYPTO (a ServerHello: the
+; handshake is proceeding), 0 = nothing decryptable arrived. Walks coalesced
+; long-header packets, unprotects each Initial with qi_skeys and scans its frames.
+quic_recv_initial_verdict:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    and rsp, -16
+    mov ebx, edi
+    mov r12d, 4                           ; datagram budget
+.loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 2000
+    syscall
+    test rax, rax
+    jle .none
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle .none
+    lea r13, [qrx]
+    lea r14, [qrx + rax]                  ; datagram end
+.pkt:
+    cmp r13, r14
+    jae .next
+    movzx eax, byte [r13]
+    test al, 0x80
+    jz .next                             ; short header: unexpected here
+    mov rdi, r13
+    mov rsi, r14
+    call quic_pkt_parse                   ; rax = this packet's total length
+    test rax, rax
+    jz .next
+    mov r15, rax
+    movzx eax, byte [r13]
+    and al, 0xf0
+    cmp al, 0xc0                          ; Initial (long, type bits 00)?
+    jne .adv
+    mov rdi, r13
+    mov rsi, r15
+    lea rdx, [qi_skeys]
+    lea rcx, [qplain]
+    call linnea_quic_unprotect            ; rax = frame bytes (or < 0)
+    test rax, rax
+    js .adv
+    lea rdi, [qplain]
+    lea rsi, [qplain + rax]
+.fr:
+    cmp rdi, rsi
+    jae .adv
+    movzx eax, byte [rdi]
+    cmp al, 0x1c
+    je .close
+    cmp al, 0x1d
+    je .close
+    cmp al, 0x06
+    je .crypto
+    call linnea_quic_frame_skip           ; rax = frame length, rdi preserved
+    test rax, rax
+    jle .adv
+    add rdi, rax
+    jmp .fr
+.adv:
+    add r13, r15
+    jmp .pkt
+.next:
+    dec r12d
+    jnz .loop
+.none:
+    xor eax, eax
+    jmp .done
+.close:
+    mov eax, 1
+    jmp .done
+.crypto:
+    mov eax, 2
+.done:
+    lea rsp, [rbp - 40]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; probe_h3_no_sigalgs (tls-5): a QUIC ClientHello with no signature_algorithms,
+; while the server authenticates with a certificate, MUST be aborted with
+; missing_extension (RFC 8446 9.2). OK iff the server's Initial says so; DEV if it
+; proceeds to a ServerHello; info on silence.
+probe_h3_no_sigalgs:
+    push rbx
+    push r12
+    call quic_fresh_ids
+    mov qword [omit_sigalgs], 1
+    call udp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov edi, ebx
+    call quic_send_initial
+    test rax, rax
+    js .closefail
+    mov edi, ebx
+    call quic_recv_initial_verdict        ; rax: 1 close / 2 proceeded / 0 none
+    mov r12, rax
+    mov qword [omit_sigalgs], 0
+    mov edi, ebx
+    call close_fd
+    mov dil, K_OK
+    cmp r12, 1
+    je .rep
+    mov dil, K_DEV
+    cmp r12, 2
+    je .rep
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_nosig]
+    mov edx, n_h3_nosig_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+.closefail:
+    mov edi, ebx
+    call close_fd
+.fail:
+    mov qword [omit_sigalgs], 0
+    mov dil, K_DEV
+    lea rsi, [n_h3_nosig]
+    mov edx, n_h3_nosig_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+
 ; h3_battery(): the HTTP/3 probe set.
 h3_battery:
     call probe_h3_handshake
     call probe_h3_nopath
     call probe_h3_badqpack
+    call probe_h3_no_sigalgs
     ret
 
 ; probe_h3_initial: send a QUIC Initial and confirm a ServerHello comes back.

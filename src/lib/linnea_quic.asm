@@ -2638,9 +2638,14 @@ linnea_quic_ch_parse:
     je .chp_psk                      ; pre_shared_key (0x0029)
     cmp eax, 0x2a
     je .chp_early                    ; early_data (0x002a)
+    cmp eax, 0x0d
+    je .chp_sigalg                   ; signature_algorithms (0x000d)
 .chp_next:
     mov r13, r15
     jmp .chp_ext
+.chp_sigalg:
+    mov qword [rbx + linnea_quic_ch.sigalg_seen], 1
+    jmp .chp_next
 .chp_ks:
     ; client_shares length(2), then entries: group(2), len(2), key_exchange.
     ; find the x25519 share (group 0x001d) and record its 32-byte key.

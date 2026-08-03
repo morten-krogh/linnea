@@ -936,6 +936,21 @@ linnea_quic_server_datagram:
     call linnea_quic_conn_free
     jmp .done
 .ks_ok:
+    ; RFC 8446 9.2: a server authenticating with a certificate — which we always
+    ; do — MUST abort a ClientHello that omits signature_algorithms, because it
+    ; cannot know which schemes the client will accept for CertificateVerify. The
+    ; TCP path enforces this; the QUIC ClientHello parse never read the extension
+    ; (tls-5), so such a hello was served a certificate the client never said it
+    ; could verify. The missing_extension alert (RFC 8446 6) rides an Initial
+    ; CONNECTION_CLOSE exactly as the key_share/ALPN refusals do.
+    cmp qword [ch_out + linnea_quic_ch.sigalg_seen], 0
+    jne .sigalg_ok
+    mov edi, 0x0100 + 109            ; missing_extension
+    call .initial_close
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
+.sigalg_ok:
     ; The client must actually have offered h3. linnea_quic_build_ee wrote "h3"
     ; into EncryptedExtensions unconditionally, without ever looking at the
     ; list — so a client offering only hq-interop or doq was told h3 had been
