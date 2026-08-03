@@ -278,6 +278,10 @@ n_h2_pingsid: db "h2 PING with a non-zero stream id -> PROTOCOL_ERROR"
 n_h2_pingsid_len equ $ - n_h2_pingsid
 n_h2_rstlen:  db "h2 wrong-length RST_STREAM -> FRAME_SIZE_ERROR"
 n_h2_rstlen_len equ $ - n_h2_rstlen
+m_connect:    db "CONNECT"
+m_connect_len equ $ - m_connect
+n_h2_connect: db "h2 CONNECT (unsupported method) -> 405, not a reset"
+n_h2_connect_len equ $ - n_h2_connect
 h2_hdr_line: db "== HTTP/2 compliance probes -> "
 h2_hdr_line_len equ $ - h2_hdr_line
 ; h2 probe names
@@ -3060,6 +3064,23 @@ h2_build_nopath:
     pop rbx
     ret
 
+; h2_build_connect(): a CONNECT request — :method CONNECT + :authority, and by
+; design (RFC 9113 8.5) NO :scheme and NO :path.
+h2_build_connect:
+    lea rdi, [h2_block]
+    mov rax, 2                            ; :method (name index 2) = CONNECT
+    lea rsi, [m_connect]
+    mov rdx, m_connect_len
+    call h2_enc_nameref
+    mov rax, 1                            ; :authority = host
+    mov rsi, [host_ptr]
+    mov rdx, [host_len]
+    call h2_enc_nameref
+    lea rax, [h2_block]
+    sub rdi, rax
+    mov [h2_block_len], rdi
+    ret
+
 ; h2_build_dyn1(): a GET whose :authority is added to the dynamic table
 ; (literal with incremental indexing) — becomes dynamic index 62.
 h2_build_dyn1:
@@ -3407,6 +3428,7 @@ h2_battery:
     call probe_h2_wu_zero
     call probe_h2_ping_stream
     call probe_h2_rst_badlen
+    call probe_h2_connect
     ret
 
 ; probe_h2_valid: a well-formed GET over h2 — OK if any :status came back.
@@ -3827,6 +3849,62 @@ probe_h2_rst_badlen:
     lea rsi, [n_h2_rstlen]
     mov edx, n_h2_rstlen_len
     call report_plain
+    pop rbx
+    ret
+
+; probe_h2_connect (h2-15): CONNECT is a registered method a static server does
+; not implement; the conformant answer is 405 (like any other known-but-declined
+; method), not a stream reset that tells the client its request was broken. OK iff
+; 405; DEV if RST_STREAM (the "reset not answered" bug) or a served 2xx/3xx.
+probe_h2_connect:
+    push rbx
+    push r12
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    call h2_build_connect
+    mov edi, ebx
+    mov esi, 1
+    mov edx, 1
+    call h2_exchange                      ; status | -2 RST | -3 GOAWAY | -1
+    mov r12, rax
+    mov edi, ebx
+    call close_fd
+    cmp r12, 405
+    je .ok
+    cmp r12, -2
+    je .dev                               ; RST_STREAM: the pre-fix behaviour
+    cmp r12, 200
+    jl .info                              ; GOAWAY / no response: terse
+    cmp r12, 400
+    jl .dev                               ; 2xx/3xx: served CONNECT
+    jmp .info                             ; other 4xx/5xx: a status, just not 405
+.ok:
+    mov dil, K_OK
+    jmp .report
+.dev:
+    mov dil, K_DEV
+    jmp .report
+.info:
+    mov dil, K_INFO
+.report:
+    lea rsi, [n_h2_connect]
+    mov edx, n_h2_connect_len
+    mov rcx, r12
+    mov r9d, 405
+    call report
+    pop r12
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h2_connect]
+    mov edx, n_h2_connect_len
+    mov rcx, -1
+    mov r9d, 405
+    call report
+    pop r12
     pop rbx
     ret
 

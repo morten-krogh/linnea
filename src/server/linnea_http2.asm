@@ -1016,6 +1016,21 @@ h2_build_request:
     js .decode_err
     cmp qword [h2_req_trail], 0
     jne .trailer_block
+    ; CONNECT is a method we do not implement. Hand it straight to h2_serve, which
+    ; declines it with 405 (h2-15); do NOT run req_check first, which would reject
+    ; a CONNECT as malformed for omitting :scheme/:path (which it omits by design,
+    ; RFC 9113 8.5) and reset the stream. h2-only — the shared req_check and the
+    ; h3 path are untouched.
+    mov rdi, [rsp + REQ + linnea_h2_req.method_ptr]
+    test rdi, rdi
+    jz .req_validate
+    mov rsi, [rsp + REQ + linnea_h2_req.method_len]
+    lea rdx, [method_connect_h2]
+    mov ecx, 7
+    call linnea_string_equal
+    test rax, rax
+    jnz .serve
+.req_validate:
     ; the rules the field-by-field pass cannot see: an authority from one
     ; source or the other, agreeing and plausible
     lea rdi, [rsp + REQ]
@@ -1026,7 +1041,7 @@ h2_build_request:
     je .malformed_stream
     cmp qword [rsp + REQ + linnea_h2_req.path_ptr], 0
     je .malformed_stream
-
+.serve:
     ; --- serve the request: write the response at the out cursor --------
     mov rdi, rbx                     ; conn
     lea rsi, [rsp + REQ]             ; decoded request
@@ -1240,6 +1255,15 @@ h2_serve:
     ; draining: GOAWAY already went out, refuse this new stream
     cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_DRAINING
     je .drain_refuse
+    ; CONNECT: a registered method we do not implement (no tunnels). Decline with
+    ; 405 before any :path handling — a CONNECT carries no :path. h2-15.
+    mov rdi, [r12 + linnea_h2_req.method_ptr]
+    mov rsi, [r12 + linnea_h2_req.method_len]
+    lea rdx, [method_connect_h2]
+    mov ecx, 7
+    call linnea_string_equal
+    test rax, rax
+    jnz .connect_405
     ; is_head = method == "HEAD". The GET/HEAD gate applies to static files
     ; alone and moves past the location match: a proxy location forwards any
     ; method to its upstream.
@@ -2019,6 +2043,14 @@ h2_serve:
     mov r8b, LINNEA_H2_FLAG_END_HEADERS | LINNEA_H2_FLAG_END_STREAM
     jmp .flags
 
+.connect_405:
+    ; a 405 is built from a vhost; use this connection's own (the cert we
+    ; presented), since CONNECT carries no :authority routing we honour.
+    mov rdi, rbx
+    call h2_conn_vhost
+    mov [h2_cur_srv], rax
+    mov qword [rsp + S_HEAD], 0      ; emit the small body (CONNECT is not HEAD)
+    ; fall through to .resp_405
 .resp_405:
     lea rax, [status_405_h2]
     lea r14, [body_405]
@@ -4889,6 +4921,7 @@ h2_apply_init_window:
 section .rodata
 method_get_h2:   db "GET"
 method_head_h2:  db "HEAD"
+method_connect_h2: db "CONNECT"
 index_html_h2:   db "index.html"
 status_200_h2:   db "200"
 status_206_h2:   db "206"
