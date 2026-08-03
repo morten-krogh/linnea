@@ -340,6 +340,15 @@ n_h3_qpbase:  db "HTTP/3 negative QPACK Base -> connection closed"
 n_h3_qpbase_len equ $ - n_h3_qpbase
 n_h3_ctrllen: db "HTTP/3 control frame with a bad length -> connection closed"
 n_h3_ctrllen_len equ $ - n_h3_ctrllen
+big_path:     db "/h3big.bin"
+big_path_len  equ $ - big_path
+hdr_priority: db "priority"
+prio_a:       db "u=07"                  ; RFC 8941 number 7 (low); pre-fix read as 0
+prio_a_len    equ $ - prio_a
+prio_b:       db "u=1"                   ; urgency 1 (high) both pre- and post-fix
+prio_b_len    equ $ - prio_b
+n_h3_urgency: db "HTTP/3 urgency: u=07 is low priority, not high"
+n_h3_urgency_len equ $ - n_h3_urgency
 
 ; QPACK static index -> :status, mirroring the server's encoder table.
 qpack_idx2status:
@@ -458,8 +467,11 @@ q_cli_hs_pn: resq 1                     ; our next client Handshake packet numbe
 q_acked:    resq 1                      ; 1 once we have sent a Handshake ACK
 q_cli_ap_pn: resq 1                     ; our next client 1-RTT packet number
 fs_scratch: resb 768                    ; the request QPACK field section
+fs_scratch2: resb 768                   ; a second field section (urgency probe)
 h3buf:      resb 4096                   ; response stream-0 data, reassembled
 h3buf_len:  resq 1
+h3_bytes_s0: resq 1                     ; urgency probe: bytes seen on stream 0
+h3_bytes_s4: resq 1                     ; urgency probe: bytes seen on stream 4
 
 section .text
 
@@ -6164,6 +6176,247 @@ probe_h3_ctrl_framelen:
     pop rbx
     ret
 
+; qpack_get_prio(rdi=out, rsi=priority value, rdx=value len) -> rax = end.
+; Field section for GET /h3big.bin with a "priority" request header.
+qpack_get_prio:
+    push r12
+    push r13
+    mov r12, rsi
+    mov r13, rdx
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x00
+    mov byte [rdi + 2], 0xd1              ; :method GET
+    mov byte [rdi + 3], 0xd7             ; :scheme https
+    add rdi, 4
+    mov byte [rdi], 0x51                 ; :path literal, name ref static 1
+    mov byte [rdi + 1], big_path_len
+    add rdi, 2
+    lea rsi, [big_path]
+    mov ecx, big_path_len
+    rep movsb
+    mov byte [rdi], 0x50                 ; :authority literal, name ref static 0
+    mov rax, [host_len]
+    mov [rdi + 1], al
+    add rdi, 2
+    mov rsi, [host_ptr]
+    mov rcx, [host_len]
+    rep movsb
+    mov byte [rdi], 0x27                 ; priority: literal with a literal name
+    mov byte [rdi + 1], 0x01            ; name length 8 (7 + 1)
+    add rdi, 2
+    lea rsi, [hdr_priority]
+    mov ecx, 8
+    rep movsb
+    mov [rdi], r13b                      ; value length (< 127, H=0)
+    inc rdi
+    mov rsi, r12
+    mov rcx, r13
+    rep movsb
+    mov rax, rdi
+    pop r13
+    pop r12
+    ret
+
+; quic_h3_tally(edi=fd): read the server's early 1-RTT burst and sum the STREAM
+; data bytes seen on stream 0 (h3_bytes_s0) and stream 4 (h3_bytes_s4). We do not
+; ACK, so this captures the initial congestion-limited burst — which a priority
+; scheduler fills from the higher-priority stream first.
+quic_h3_tally:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    and rsp, -16
+    mov ebx, edi
+    mov qword [h3_bytes_s0], 0
+    mov qword [h3_bytes_s4], 0
+    xor r15d, r15d                        ; expected pn for reconstruction
+    mov r12d, 40                          ; datagram budget
+.loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 2000
+    syscall
+    test rax, rax
+    jle .done
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle .done
+    mov rsi, rax
+    call quic_find_1rtt                   ; rax = 1-RTT ptr, rdx = len
+    test rax, rax
+    jz .next
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [q_ap_skeys]
+    lea rcx, [qplain]
+    mov r8d, 8
+    mov r9, r15
+    call linnea_quic_unprotect_short      ; rax = frames, rdx = pn
+    test rax, rax
+    js .next
+    mov r15, rdx                          ; track the largest pn as the next expected
+    push rax                              ; frames length
+    ; ACK what we have so the server keeps streaming — otherwise it sends only the
+    ; initial congestion window and tx_pump's priority scheduling never shows.
+    lea rdi, [qpay]
+    mov rsi, r15
+    call quic_ack_frame
+    lea rdx, [qpay]
+    sub rax, rdx
+    mov rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    pop rax                               ; frames length
+    lea r13, [qplain]
+    lea r14, [qplain]
+    add r14, rax
+.frames:
+    mov rdi, r13
+    mov rsi, r14
+    sub rsi, r13
+    jle .next
+    call linnea_quic_stream_frame         ; rax=data, rdx=len, r8=id, r9=next
+    test rax, rax
+    jz .next
+    mov r13, r9
+    cmp r8, 0
+    je .add0
+    cmp r8, 4
+    je .add4
+    jmp .frames
+.add0:
+    add [h3_bytes_s0], rdx
+    jmp .frames
+.add4:
+    add [h3_bytes_s4], rdx
+    jmp .frames
+.next:
+    dec r12d
+    jnz .loop
+.done:
+    lea rsp, [rbp - 40]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; probe_h3_urgency (h3-13): urgency is an RFC 8941 number, not one digit. Two
+; concurrent GETs of a large file — stream 0 with "u=07" (the number 7, LOW
+; priority; a pre-fix parser read only '0' = HIGHEST) and stream 4 with "u=1"
+; (HIGH). A correct scheduler fills the early burst from stream 4; the pre-fix bug
+; makes stream 0 win. OK iff stream 4 leads; DEV if stream 0 leads.
+probe_h3_urgency:
+    push rbx
+    push r12
+    push r13
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    lea rdi, [fs_scratch]                 ; stream 0: u=07
+    lea rsi, [prio_a]
+    mov edx, prio_a_len
+    call qpack_get_prio
+    lea rcx, [fs_scratch]
+    sub rax, rcx
+    mov r12, rax                          ; lenA
+    lea rdi, [fs_scratch2]                ; stream 4: u=1
+    lea rsi, [prio_b]
+    mov edx, prio_b_len
+    call qpack_get_prio
+    lea rcx, [fs_scratch2]
+    sub rax, rcx
+    mov r13, rax                          ; lenB
+    lea rdi, [qpay]
+    mov byte [rdi], 0x0a                 ; control STREAM(2, SETTINGS)
+    mov byte [rdi + 1], 0x02
+    mov byte [rdi + 2], 0x03
+    mov byte [rdi + 3], 0x00
+    mov byte [rdi + 4], 0x04
+    mov byte [rdi + 5], 0x00
+    add rdi, 6
+    mov byte [rdi], 0x0b                 ; request STREAM(0, FIN)
+    mov byte [rdi + 1], 0x00
+    lea rax, [r12 + 2]
+    mov [rdi + 2], al
+    mov byte [rdi + 3], 0x01
+    mov [rdi + 4], r12b
+    add rdi, 5
+    lea rsi, [fs_scratch]
+    mov rcx, r12
+    rep movsb
+    mov byte [rdi], 0x0b                 ; request STREAM(4, FIN)
+    mov byte [rdi + 1], 0x04
+    lea rax, [r13 + 2]
+    mov [rdi + 2], al
+    mov byte [rdi + 3], 0x01
+    mov [rdi + 4], r13b
+    add rdi, 5
+    lea rsi, [fs_scratch2]
+    mov rcx, r13
+    rep movsb
+    lea rax, [qpay]
+    mov rdx, rdi
+    sub rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_tally
+    mov edi, ebx
+    call close_fd
+    mov rax, [h3_bytes_s4]
+    mov rdx, [h3_bytes_s0]
+    cmp rax, rdx
+    ja .ok                                ; stream 4 (u=1, high) led -> correct
+    cmp rdx, rax
+    ja .dev                               ; stream 0 (u=07 read as 0) led -> pre-fix
+    jmp .info                             ; equal / no data -> inconclusive
+.ok:
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_urgency]
+    mov edx, n_h3_urgency_len
+    call report_plain
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h3_urgency]
+    mov edx, n_h3_urgency_len
+    call report_plain
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; h3_battery(): the HTTP/3 probe set.
 h3_battery:
     call probe_h3_handshake
@@ -6172,6 +6425,7 @@ h3_battery:
     call probe_h3_trailer
     call probe_h3_qpack_base
     call probe_h3_ctrl_framelen
+    call probe_h3_urgency
     call probe_h3_no_sigalgs
     ret
 
