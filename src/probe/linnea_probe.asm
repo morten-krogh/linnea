@@ -308,6 +308,8 @@ n_h3_badqp:   db "HTTP/3 undecodable QPACK -> connection closed"
 n_h3_badqp_len equ $ - n_h3_badqp
 n_h3_nosig:   db "QUIC ClientHello without signature_algorithms -> aborted"
 n_h3_nosig_len equ $ - n_h3_nosig
+n_h3_trailer: db "HTTP/3 frame after the trailer section -> connection error"
+n_h3_trailer_len equ $ - n_h3_trailer
 
 ; QPACK static index -> :status, mirroring the server's encoder table.
 qpack_idx2status:
@@ -5606,11 +5608,114 @@ probe_h3_no_sigalgs:
     pop rbx
     ret
 
+; probe_h3_trailer (h3-2): a request stream is HEADERS, DATA, then AT MOST ONE
+; trailer section and nothing after. A frame following the trailers is a
+; connection error (H3_FRAME_UNEXPECTED, RFC 9114 4.1). OK iff the server aborts
+; the connection; DEV if it serves the request (the pre-fix behaviour absorbed
+; the stray frame into the body).
+probe_h3_trailer:
+    push rbx
+    push r14
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    ; QPACK field section for a valid GET, into fs_scratch
+    lea rdi, [fs_scratch]
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x00
+    mov byte [rdi + 2], 0xd1              ; :method GET
+    mov byte [rdi + 3], 0xd7             ; :scheme https
+    mov byte [rdi + 4], 0xc1             ; :path /
+    mov byte [rdi + 5], 0x50             ; :authority literal, name ref static 0
+    add rdi, 6
+    mov rax, [host_len]
+    mov [rdi], al
+    inc rdi
+    mov rsi, [host_ptr]
+    mov rcx, [host_len]
+    rep movsb
+    lea rax, [fs_scratch]
+    mov r14, rdi
+    sub r14, rax                         ; field-section length
+    ; payload: control STREAM(2, SETTINGS) + request STREAM(0, FIN) carrying
+    ; HEADERS(req) + HEADERS(empty trailer) + DATA(1) — the DATA is the violation.
+    lea rdi, [qpay]
+    mov byte [rdi], 0x0a                 ; control STREAM, LEN, no FIN
+    mov byte [rdi + 1], 0x02             ; stream id 2
+    mov byte [rdi + 2], 0x03
+    mov byte [rdi + 3], 0x00             ; control stream type
+    mov byte [rdi + 4], 0x04             ; SETTINGS
+    mov byte [rdi + 5], 0x00
+    add rdi, 6
+    mov byte [rdi], 0x0b                 ; request STREAM, LEN, FIN
+    mov byte [rdi + 1], 0x00             ; stream id 0
+    lea rax, [r14 + 9]                   ; stream data length (< 63)
+    mov [rdi + 2], al
+    add rdi, 3
+    mov byte [rdi], 0x01                 ; HEADERS (request)
+    mov [rdi + 1], r14b
+    add rdi, 2
+    lea rsi, [fs_scratch]
+    mov rcx, r14
+    rep movsb
+    mov byte [rdi], 0x01                 ; HEADERS (trailer, empty field section)
+    mov byte [rdi + 1], 0x02
+    mov byte [rdi + 2], 0x00
+    mov byte [rdi + 3], 0x00
+    add rdi, 4
+    mov byte [rdi], 0x00                 ; DATA after the trailers -> illegal
+    mov byte [rdi + 1], 0x01
+    mov byte [rdi + 2], 0x41
+    add rdi, 3
+    lea rax, [qpay]
+    mov rdx, rdi
+    sub rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify                ; -3 close / -2 reset / status / -1
+    mov r14, rax
+    mov edi, ebx
+    call close_fd
+    cmp r14, -3                          ; CONNECTION_CLOSE = correct rejection
+    je .ok
+    cmp r14, 200
+    jl .info                             ; -2 reset / -1 silence: terse rejection
+    cmp r14, 400
+    jl .dev                              ; 2xx/3xx: served, stray frame absorbed
+    jmp .info                            ; 4xx/5xx: a rejection, just not a close
+.ok:
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_trailer]
+    mov edx, n_h3_trailer_len
+    call report_plain
+    pop r14
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h3_trailer]
+    mov edx, n_h3_trailer_len
+    call report_plain
+    pop r14
+    pop rbx
+    ret
+
 ; h3_battery(): the HTTP/3 probe set.
 h3_battery:
     call probe_h3_handshake
     call probe_h3_nopath
     call probe_h3_badqpack
+    call probe_h3_trailer
     call probe_h3_no_sigalgs
     ret
 
