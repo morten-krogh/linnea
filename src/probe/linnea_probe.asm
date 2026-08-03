@@ -5401,6 +5401,39 @@ quic_h3_get:
 ; A fresh connection (new keys, DCID, SCID) for a negative probe. Duplicates the
 ; setup in probe_h3_handshake deliberately, so a bug here cannot touch the proven
 ; valid-request path.
+; quic_h3_handshake_retry(edi=fd) -> rax = q_fin_seen. Sends the Initial and reads
+; the flight; if no ServerHello comes back it retries with a fresh connection id,
+; the way a real client retransmits a lost Initial. Without this a single dropped
+; Initial (a WAN loss, a server reload window) reads as a failed handshake.
+quic_h3_handshake_retry:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov r12d, 3
+.attempt:
+    mov edi, ebx
+    call quic_send_initial
+    test rax, rax
+    js .fail
+    mov edi, ebx
+    call quic_recv_flight                 ; sets q_hs_ready / q_fin_seen
+    cmp qword [q_hs_ready], 0
+    jne .done                             ; the handshake got going
+    dec r12d
+    jz .done
+    call quic_fresh_ids                    ; a brand-new connection id and keys
+    jmp .attempt
+.done:
+    mov rax, [q_fin_seen]
+    pop r12
+    pop rbx
+    ret
+.fail:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
 quic_h3_open:
     push rbx
     mov eax, LINNEA_SYS_GETRANDOM
@@ -5440,13 +5473,9 @@ quic_h3_open:
     js .fail
     mov ebx, eax
     mov edi, ebx
-    call quic_send_initial
+    call quic_h3_handshake_retry
     test rax, rax
-    js .closefail
-    mov edi, ebx
-    call quic_recv_flight
-    test rax, rax
-    jz .closefail                         ; no server Finished
+    jz .closefail                         ; no server Finished after retries
     mov edi, ebx
     call quic_finish
     test rax, rax
@@ -6644,13 +6673,9 @@ probe_h3_handshake:
     test rax, rax
     js .fail
     mov ebx, eax
+    ; part 1: the Initial exchange (ServerHello), retried on a lost Initial
     mov edi, ebx
-    call quic_send_initial
-    test rax, rax
-    js .closefail
-    ; part 1: the Initial exchange (ServerHello)
-    mov edi, ebx
-    call quic_recv_flight                 ; also derives Handshake keys en route
+    call quic_h3_handshake_retry          ; also derives Handshake keys en route
     push rax                              ; 1 if the server Finished decrypted
     lea rsi, [n_h3_initial]
     mov edx, n_h3_initial_len
