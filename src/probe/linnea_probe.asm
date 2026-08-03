@@ -67,9 +67,17 @@ DNSBUF_CAP      equ 1024
 section .rodata
 
 usage_msg:  db "usage: linnea-probe <url> <protocol> [--host <name>]", 10
-            db "  <url>       http://<ipv4-or-localhost>[:port][/path]", 10
-            db "  <protocol>  h1 (h2/h3 not yet implemented)", 10
+            db "       linnea-probe --version", 10
+            db "  <url>       http[s]://<host-or-ipv4>[:port][/path]", 10
+            db "  <protocol>  h1 | h2 | h3   (h2 and h3 require https://)", 10
+            db "  --host      override the Host / :authority (vhost routing)", 10
 usage_len   equ $ - usage_msg
+
+; Bump on any change to observable behaviour (probe set, verdicts, output).
+probe_version:     db "linnea-probe 1.0.0", 10
+probe_version_len  equ $ - probe_version
+opt_version:       db "--version"
+opt_version_len    equ $ - opt_version
 
 sch_http:   db "http://"
 sch_http_len equ $ - sch_http
@@ -395,6 +403,15 @@ section .text
 ; =======================================================================
 _start:
     mov r15, [rsp]                      ; argc
+    ; --- --version: report and exit 0 before requiring url/protocol ---
+    cmp r15, 2
+    jl .usage
+    mov rdi, [rsp + 16]                 ; argv[1]
+    lea rsi, [opt_version]
+    mov edx, opt_version_len
+    call streq_z
+    test rax, rax
+    jnz .show_version
     cmp r15, 3
     jl .usage
 
@@ -549,6 +566,12 @@ _start:
 .exit_n:
     jmp exit
 
+.show_version:
+    lea rsi, [probe_version]
+    mov edx, probe_version_len
+    call puts
+    xor edi, edi
+    jmp exit
 .usage:
     lea rsi, [usage_msg]
     mov edx, usage_len
