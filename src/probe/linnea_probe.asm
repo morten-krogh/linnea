@@ -260,6 +260,10 @@ alpn_h11_len equ $ - alpn_h11
 ; variable content). cipher_suites len 2 = {0x1301}, compression len 1 = {0x00}.
 ch_suites:  db 0x00, 0x02, 0x13, 0x01, 0x01, 0x00
 ch_suites_len equ $ - ch_suites
+; the tls-5 probe offers only TLS_AES_256_GCM_SHA384 (0x1302), which we do not
+; implement, so a conformant server must refuse rather than pick 0x1301 unoffered.
+ch_suites_bad: db 0x00, 0x02, 0x13, 0x02, 0x01, 0x00
+ch_suites_bad_len equ $ - ch_suites_bad
 err_tls:    db "error: TLS handshake failed", 10
 err_tls_len equ $ - err_tls
 
@@ -335,6 +339,10 @@ n_h3_badqp:   db "HTTP/3 undecodable QPACK -> connection closed"
 n_h3_badqp_len equ $ - n_h3_badqp
 n_h3_nosig:   db "QUIC ClientHello without signature_algorithms -> aborted"
 n_h3_nosig_len equ $ - n_h3_nosig
+n_h3_notls13: db "QUIC ClientHello not offering TLS 1.3 -> aborted"
+n_h3_notls13_len equ $ - n_h3_notls13
+n_h3_badciph: db "QUIC ClientHello with no supported cipher -> aborted"
+n_h3_badciph_len equ $ - n_h3_badciph
 n_h3_trailer: db "HTTP/3 frame after the trailer section -> connection error"
 n_h3_trailer_len equ $ - n_h3_trailer
 n_h3_qpbase:  db "HTTP/3 negative QPACK Base -> connection closed"
@@ -440,6 +448,8 @@ alignb 16
 qi_ckeys:   resb linnea_quic_keys_size  ; client Initial keys (we protect with these)
 qi_skeys:   resb linnea_quic_keys_size  ; server Initial keys (we open with these)
 omit_sigalgs: resq 1                     ; tls-5 probe: drop signature_algorithms
+bad_version: resq 1                      ; tls-5 probe: offer only TLS 1.2
+bad_cipher:  resq 1                      ; tls-5 probe: offer a suite we lack
 qch:        resb 2048                   ; the QUIC ClientHello handshake message
 qch_len:    resq 1
 qtp:        resb 512                    ; encoded client transport parameters
@@ -4214,8 +4224,13 @@ quic_build_ch:
     lea rsi, [tls_sessid]
     mov ecx, 32
     rep movsb
-    lea rsi, [ch_suites]
+    lea rsi, [ch_suites]                  ; cipher_suites (TLS_AES_128_GCM_SHA256)
     mov ecx, ch_suites_len
+    cmp qword [bad_cipher], 0
+    je .cs_ok
+    lea rsi, [ch_suites_bad]              ; tls-5 probe: offer a suite we lack
+    mov ecx, ch_suites_bad_len
+.cs_ok:
     rep movsb
     mov rbx, rdi                          ; ext-length-16 slot
     add rdi, 2
@@ -4244,7 +4259,11 @@ quic_build_ch:
     mov byte [rdi + 3], 0x03
     mov byte [rdi + 4], 0x02
     mov byte [rdi + 5], 0x03
-    mov byte [rdi + 6], 0x04
+    mov byte [rdi + 6], 0x04              ; TLS 1.3
+    cmp qword [bad_version], 0
+    je .sv_ok
+    mov byte [rdi + 6], 0x03              ; tls-5 probe: offer only TLS 1.2
+.sv_ok:
     add rdi, 7
     ; supported_groups (x25519)
     mov byte [rdi], 0x00
@@ -5911,6 +5930,77 @@ quic_recv_initial_verdict:
     pop rbp
     ret
 
+; quic_h3_abort_verdict() -> rax: a fresh QUIC connection whose (already-mangled)
+; ClientHello should be refused. 1 = the server aborted with a CONNECTION_CLOSE in
+; its Initial; 2 = it proceeded to a ServerHello; 0 = silence.
+quic_h3_abort_verdict:
+    push rbx
+    call quic_fresh_ids
+    call udp_connect
+    test rax, rax
+    js .av_fail
+    mov ebx, eax
+    mov edi, ebx
+    call quic_send_initial
+    test rax, rax
+    js .av_close
+    mov edi, ebx
+    call quic_recv_initial_verdict        ; 1 close / 2 proceeded / 0 none
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rax
+    pop rbx
+    ret
+.av_close:
+    mov edi, ebx
+    call close_fd
+.av_fail:
+    xor eax, eax
+    pop rbx
+    ret
+
+; report_abort_verdict(rdi=verdict, rsi=name, edx=len): OK iff aborted (1), DEV if
+; the handshake proceeded (2), info on silence (0).
+report_abort_verdict:
+    mov cl, K_INFO
+    cmp rdi, 1
+    jne .rav_notok
+    mov cl, K_OK
+    jmp .rav_set
+.rav_notok:
+    cmp rdi, 2
+    jne .rav_set
+    mov cl, K_DEV
+.rav_set:
+    mov dil, cl
+    call report_plain
+    ret
+
+; probe_h3_no_tls13 (tls-5): QUIC mandates TLS 1.3. A hello offering only TLS 1.2
+; in supported_versions must be refused, not served TLS 1.3 unoffered.
+probe_h3_no_tls13:
+    mov qword [bad_version], 1
+    call quic_h3_abort_verdict
+    mov qword [bad_version], 0
+    mov rdi, rax
+    lea rsi, [n_h3_notls13]
+    mov edx, n_h3_notls13_len
+    call report_abort_verdict
+    ret
+
+; probe_h3_bad_cipher (tls-5): a hello offering only a cipher suite we do not
+; implement must be refused, not served TLS_AES_128_GCM_SHA256 unoffered.
+probe_h3_bad_cipher:
+    mov qword [bad_cipher], 1
+    call quic_h3_abort_verdict
+    mov qword [bad_cipher], 0
+    mov rdi, rax
+    lea rsi, [n_h3_badciph]
+    mov edx, n_h3_badciph_len
+    call report_abort_verdict
+    ret
+
 ; probe_h3_no_sigalgs (tls-5): a QUIC ClientHello with no signature_algorithms,
 ; while the server authenticates with a certificate, MUST be aborted with
 ; missing_extension (RFC 8446 9.2). OK iff the server's Initial says so; DEV if it
@@ -6815,6 +6905,8 @@ h3_battery:
     call probe_h3_maxdata
     call probe_h3_newcid
     call probe_h3_no_sigalgs
+    call probe_h3_no_tls13
+    call probe_h3_bad_cipher
     ret
 
 ; probe_h3_initial: send a QUIC Initial and confirm a ServerHello comes back.

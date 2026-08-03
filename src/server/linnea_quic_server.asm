@@ -952,6 +952,27 @@ linnea_quic_server_datagram:
     call linnea_quic_conn_free
     jmp .done
 .sigalg_ok:
+    ; QUIC mandates TLS 1.3 (RFC 9001 4.2), and we implement only
+    ; TLS_AES_128_GCM_SHA256. A hello that offers neither must be refused with the
+    ; matching alert (tls-5) rather than served a version/cipher it never offered —
+    ; which a strict client would reject with illegal_parameter anyway. The QUIC
+    ; ClientHello parse now records both.
+    cmp qword [ch_out + linnea_quic_ch.tls13_seen], 0
+    jne .tls13_ok
+    mov edi, 0x0100 + 70             ; protocol_version
+    call .initial_close
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
+.tls13_ok:
+    cmp qword [ch_out + linnea_quic_ch.aes128_seen], 0
+    jne .cipher_ok
+    mov edi, 0x0100 + 40             ; handshake_failure
+    call .initial_close
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
+.cipher_ok:
     ; The client must actually have offered h3. linnea_quic_build_ee wrote "h3"
     ; into EncryptedExtensions unconditionally, without ever looking at the
     ; list — so a client offering only hq-interop or doq was told h3 had been

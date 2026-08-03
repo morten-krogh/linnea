@@ -2599,6 +2599,23 @@ linnea_quic_ch_parse:
     shl eax, 8
     movzx ecx, byte [r13 + 1]
     or eax, ecx                      ; cipher_suites length
+    ; scan for TLS_AES_128_GCM_SHA256 (0x1301) — the only suite we implement
+    lea rdi, [r13 + 2]               ; first cipher suite
+    lea rsi, [rdi + rax]             ; end of the list
+.chp_cs:
+    lea rdx, [rdi + 2]
+    cmp rdx, rsi
+    ja .chp_cs_done
+    cmp byte [rdi], 0x13
+    jne .chp_cs_next
+    cmp byte [rdi + 1], 0x01
+    jne .chp_cs_next
+    mov qword [rbx + linnea_quic_ch.aes128_seen], 1
+    jmp .chp_cs_done
+.chp_cs_next:
+    add rdi, 2
+    jmp .chp_cs
+.chp_cs_done:
     lea r13, [r13 + 2 + rax]         ; -> compression length
     cmp r13, r12
     jae .chp_done
@@ -2640,12 +2657,34 @@ linnea_quic_ch_parse:
     je .chp_early                    ; early_data (0x002a)
     cmp eax, 0x0d
     je .chp_sigalg                   ; signature_algorithms (0x000d)
+    cmp eax, 0x2b
+    je .chp_supver                   ; supported_versions (0x002b)
 .chp_next:
     mov r13, r15
     jmp .chp_ext
 .chp_sigalg:
     mov qword [rbx + linnea_quic_ch.sigalg_seen], 1
     jmp .chp_next
+.chp_supver:
+    ; a 1-byte list length then 2-byte versions; look for TLS 1.3 (0x0304)
+    cmp r14, r15
+    jae .chp_next
+    movzx ecx, byte [r14]            ; list length
+    lea rax, [r14 + 1]              ; first version
+    lea rcx, [rax + rcx]           ; end of the version list
+.chp_sv:
+    lea rdx, [rax + 2]
+    cmp rdx, rcx
+    ja .chp_next
+    cmp byte [rax], 0x03
+    jne .chp_sv_next
+    cmp byte [rax + 1], 0x04
+    jne .chp_sv_next
+    mov qword [rbx + linnea_quic_ch.tls13_seen], 1
+    jmp .chp_next
+.chp_sv_next:
+    add rax, 2
+    jmp .chp_sv
 .chp_ks:
     ; client_shares length(2), then entries: group(2), len(2), key_exchange.
     ; find the x25519 share (group 0x001d) and record its 32-byte key.

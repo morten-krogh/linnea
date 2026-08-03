@@ -39,4 +39,6 @@ struc linnea_quic_ch
     .psk_dhe_ke:    resq 1 ; 1 if the client offered psk_dhe_ke (the only mode we do)
     .early_data:    resq 1 ; 1 if the client offered early_data (0x2a) for 0-RTT
     .sigalg_seen:   resq 1 ; 1 if signature_algorithms (0x000d) was offered
+    .tls13_seen:    resq 1 ; 1 if supported_versions (0x2b) offers TLS 1.3 (0x0304)
+    .aes128_seen:   resq 1 ; 1 if cipher_suites offers TLS_AES_128_GCM_SHA256 (0x1301)
 endstruc
