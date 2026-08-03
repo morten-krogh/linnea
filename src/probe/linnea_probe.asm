@@ -219,6 +219,18 @@ n_fieldtoken: db "field name with a delimiter -> rejected"
 n_fieldtoken_len equ $ - n_fieldtoken
 n_errdate:    db "error response carries Date"
 n_errdate_len equ $ - n_errdate
+f_post_sp:  db "POST "
+f_post_sp_len equ $ - f_post_sp
+f_clen5:    db "Content-Length: 5", 13, 10
+f_clen5_len equ $ - f_clen5
+f_expect:   db "Expect: 100-continue", 13, 10
+f_expect_len equ $ - f_expect
+f_conn_kac: db "Connection: keep-alive, close", 13, 10
+f_conn_kac_len equ $ - f_conn_kac
+n_expect:   db "Expect: 100-continue answered with 100 Continue"
+n_expect_len equ $ - n_expect
+n_connclose: db "Connection: keep-alive, close closes the socket"
+n_connclose_len equ $ - n_connclose
 f_get_lf:   db "GET "                   ; bare-LF variant reuses the target
 f_get_lf_len equ $ - f_get_lf
 f_sp_h11_lf: db " HTTP/1.1", 10
@@ -586,6 +598,8 @@ _start:
     call probe_known_method
     call probe_field_token
     call probe_err_date
+    call probe_h1_expect
+    call probe_h1_close
     call probe_http10
     call probe_badver
     call probe_long_target
@@ -993,6 +1007,100 @@ probe_err_date:
     mov rcx, rbx
     mov r9d, -1
     call report
+    pop rbx
+    ret
+
+; h1-2: a request carrying Expect: 100-continue must be answered with an interim
+; 100 Continue before the body (RFC 9110 10.1.1). We send the head with a
+; Content-Length but no body; a conforming server replies 100 at once, a pre-fix
+; one waits silently for the body. OK iff the first response is 100.
+probe_h1_expect:
+    call req_begin
+    lea rsi, [f_post_sp]
+    mov edx, f_post_sp_len
+    call req_add
+    call add_target_only
+    lea rsi, [f_sp_h11_crlf]
+    mov edx, f_sp_h11_crlf_len
+    call req_add
+    call add_host
+    lea rsi, [f_clen5]
+    mov edx, f_clen5_len
+    call req_add
+    lea rsi, [f_expect]
+    mov edx, f_expect_len
+    call req_add
+    call add_end                          ; end of head; the body is withheld
+    call run_and_read                     ; rax = first status line (100 if honoured)
+    mov r8, rax
+    mov dil, K_OK
+    cmp rax, 100
+    je .rep
+    mov dil, K_DEV                        ; no 100 -> Expect was ignored
+.rep:
+    lea rsi, [n_expect]
+    mov edx, n_expect_len
+    mov rcx, r8
+    mov r9d, 100
+    call report
+    ret
+
+; h1-3: "close" anywhere in the Connection field's comma list must close the
+; connection, not just a value that is entirely "close" (RFC 9110 7.6.1). We
+; send "keep-alive, close" and check the server hangs up after the response
+; rather than holding the socket open. OK iff the server initiates the close.
+probe_h1_close:
+    push rbx
+    push r12
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    call req_begin
+    call add_get_target_h11
+    call add_host
+    lea rsi, [f_conn_kac]
+    mov edx, f_conn_kac_len
+    call req_add
+    call add_end
+    mov edi, ebx
+    call send_req
+    mov edi, ebx
+    call read_response
+    call parse_status
+    mov r12, rax                          ; the response status (or -1)
+    mov edi, ebx
+    mov esi, 1500
+    call wait_readable_or_closed          ; 1 closing data / 2 FIN / 0 kept alive
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rax
+    test r12, r12
+    js .info                              ; never got a response: cannot judge
+    test rax, rax
+    js .info                              ; poll error
+    jz .dev                               ; timed out with the socket still open
+    mov dil, K_OK                         ; the server closed (FIN or close_notify)
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_connclose]
+    mov edx, n_connclose_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_connclose]
+    mov edx, n_connclose_len
+    call report_plain
+    pop r12
     pop rbx
     ret
 
