@@ -268,6 +268,16 @@ n_h2_errcode: db "h2 wrong-length WINDOW_UPDATE -> FRAME_SIZE_ERROR"
 n_h2_errcode_len equ $ - n_h2_errcode
 n_h2_wuzero:  db "h2 zero WINDOW_UPDATE -> stream reset, connection survives"
 n_h2_wuzero_len equ $ - n_h2_wuzero
+; PING (type 0x06) with a non-zero stream id and a correct 8-byte payload
+h2_ping_sid: db 0,0,8, 0x06, 0x00, 0,0,0,1, 0,0,0,0,0,0,0,0
+h2_ping_sid_len equ $ - h2_ping_sid
+; RST_STREAM (type 0x03) with a 3-byte payload (length != 4) on stream 1
+h2_rst_badlen: db 0,0,3, 0x03, 0x00, 0,0,0,1, 0,0,0
+h2_rst_badlen_len equ $ - h2_rst_badlen
+n_h2_pingsid: db "h2 PING with a non-zero stream id -> PROTOCOL_ERROR"
+n_h2_pingsid_len equ $ - n_h2_pingsid
+n_h2_rstlen:  db "h2 wrong-length RST_STREAM -> FRAME_SIZE_ERROR"
+n_h2_rstlen_len equ $ - n_h2_rstlen
 h2_hdr_line: db "== HTTP/2 compliance probes -> "
 h2_hdr_line_len equ $ - h2_hdr_line
 ; h2 probe names
@@ -3391,6 +3401,8 @@ h2_battery:
     call probe_h2_badhpack
     call probe_h2_errcode
     call probe_h2_wu_zero
+    call probe_h2_ping_stream
+    call probe_h2_rst_badlen
     ret
 
 ; probe_h2_valid: a well-formed GET over h2 — OK if any :status came back.
@@ -3738,6 +3750,78 @@ probe_h2_wu_zero:
     mov dil, K_DEV
     lea rsi, [n_h2_wuzero]
     mov edx, n_h2_wuzero_len
+    call report_plain
+    pop rbx
+    ret
+
+; probe_h2_ping_stream (h2-10): a PING carries no stream, so a non-zero stream id
+; is a connection error PROTOCOL_ERROR (RFC 7540 6.7). Pre-fix the id was ignored
+; and the PING was ACKed. OK iff a GOAWAY(PROTOCOL_ERROR) comes back.
+probe_h2_ping_stream:
+    push rbx
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov edi, ebx
+    lea rsi, [h2_ping_sid]
+    mov edx, h2_ping_sid_len
+    call h2_send_prefaced
+    mov edi, ebx
+    call read_response
+    call h2_scan_errors
+    mov edi, ebx
+    call close_fd
+    mov dil, K_OK
+    cmp qword [h2_goaway_seen], 1         ; PROTOCOL_ERROR
+    je .report
+    mov dil, K_DEV
+.report:
+    lea rsi, [n_h2_pingsid]
+    mov edx, n_h2_pingsid_len
+    call report_plain
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h2_pingsid]
+    mov edx, n_h2_pingsid_len
+    call report_plain
+    pop rbx
+    ret
+
+; probe_h2_rst_badlen (h2-11): RST_STREAM is exactly 4 octets; any other length is
+; a connection error FRAME_SIZE_ERROR (RFC 7540 6.4). Pre-fix the length was
+; unchecked. OK iff a GOAWAY(FRAME_SIZE_ERROR) comes back.
+probe_h2_rst_badlen:
+    push rbx
+    call tcp_connect
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov edi, ebx
+    lea rsi, [h2_rst_badlen]
+    mov edx, h2_rst_badlen_len
+    call h2_send_prefaced
+    mov edi, ebx
+    call read_response
+    call h2_scan_errors
+    mov edi, ebx
+    call close_fd
+    mov dil, K_OK
+    cmp qword [h2_goaway_seen], 0x6       ; FRAME_SIZE_ERROR
+    je .report
+    mov dil, K_DEV
+.report:
+    lea rsi, [n_h2_rstlen]
+    mov edx, n_h2_rstlen_len
+    call report_plain
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h2_rstlen]
+    mov edx, n_h2_rstlen_len
     call report_plain
     pop rbx
     ret
