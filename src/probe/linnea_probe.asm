@@ -202,6 +202,23 @@ f_nocolon_hdr: db "ThisHeaderHasNoColon", 13, 10
 f_nocolon_hdr_len equ $ - f_nocolon_hdr
 f_frob_sp:  db "FROBNICATE "
 f_frob_sp_len equ $ - f_frob_sp
+f_delete_sp: db "DELETE "                ; a real method a static server declines
+f_delete_sp_len equ $ - f_delete_sp
+f_badname_hdr: db "X-Probe(bad): 1", 13, 10   ; '(' is a delimiter, not a token char
+f_badname_hdr_len equ $ - f_badname_hdr
+
+; header-name needles (CRLF + lowercase name), for case-insensitive presence checks
+nd_allow:   db 13, 10, "allow:"
+nd_allow_len equ $ - nd_allow
+nd_date:    db 13, 10, "date:"
+nd_date_len equ $ - nd_date
+
+n_knownmeth:  db "known method (DELETE) -> 405 with Allow"
+n_knownmeth_len equ $ - n_knownmeth
+n_fieldtoken: db "field name with a delimiter -> rejected"
+n_fieldtoken_len equ $ - n_fieldtoken
+n_errdate:    db "error response carries Date"
+n_errdate_len equ $ - n_errdate
 f_get_lf:   db "GET "                   ; bare-LF variant reuses the target
 f_get_lf_len equ $ - f_get_lf
 f_sp_h11_lf: db " HTTP/1.1", 10
@@ -530,6 +547,9 @@ _start:
     call probe_nocolon
     call probe_badreqline
     call probe_unknown_method
+    call probe_known_method
+    call probe_field_token
+    call probe_err_date
     call probe_http10
     call probe_badver
     call probe_long_target
@@ -803,6 +823,141 @@ probe_unknown_method:
     mov edx, n_unknownmeth_len
     mov r9d, 501
     call classify_reject
+    ret
+
+; resp_ci_contains(rsi=needle, edx=needle len) -> rax = 1 if respbuf[0..resp_total)
+; contains the needle (ASCII case-insensitive), else 0. Used to assert a header is
+; present in the raw response (needles carry a leading CRLF so they anchor at a
+; header line, not inside a value).
+resp_ci_contains:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rsi                          ; needle
+    mov r13, rdx                          ; needle length
+    mov r14, [resp_total]
+    sub r14, r13                          ; last viable start offset
+    js .no                                ; needle longer than the response
+    xor ebx, ebx                          ; start offset
+.scan:
+    cmp rbx, r14
+    ja .no
+    xor ecx, ecx
+.cmp:
+    cmp rcx, r13
+    jae .hit
+    mov al, [respbuf + rbx + rcx]
+    cmp al, 'A'
+    jb .a_ok
+    cmp al, 'Z'
+    ja .a_ok
+    add al, 32
+.a_ok:
+    mov dl, [r12 + rcx]
+    cmp dl, 'A'
+    jb .b_ok
+    cmp dl, 'Z'
+    ja .b_ok
+    add dl, 32
+.b_ok:
+    cmp al, dl
+    jne .next
+    inc rcx
+    jmp .cmp
+.next:
+    inc rbx
+    jmp .scan
+.hit:
+    mov eax, 1
+    jmp .done
+.no:
+    xor eax, eax
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; h1-12: a real method a static server declines draws 405 WITH Allow, not 501.
+probe_known_method:
+    push rbx
+    call req_begin
+    lea rsi, [f_delete_sp]
+    mov edx, f_delete_sp_len
+    call req_add
+    call add_target_only
+    lea rsi, [f_sp_h11_crlf]
+    mov edx, f_sp_h11_crlf_len
+    call req_add
+    call add_host
+    call add_close
+    call add_end
+    call run_and_read                     ; rax = status
+    mov rbx, rax
+    mov dil, K_DEV
+    cmp rbx, 405
+    jne .emit                             ; 501 (old behaviour) or worse -> deviation
+    lea rsi, [nd_allow]
+    mov edx, nd_allow_len
+    call resp_ci_contains
+    test rax, rax
+    jz .emit                              ; 405 without Allow is still non-conformant
+    mov dil, K_OK
+.emit:
+    lea rsi, [n_knownmeth]
+    mov edx, n_knownmeth_len
+    mov rcx, rbx
+    mov r9d, 405
+    call report
+    pop rbx
+    ret
+
+; h1-13: a delimiter in a field NAME is not a token -> 400 (parser-differential
+; when proxying if accepted).
+probe_field_token:
+    call req_begin
+    call add_get_target_h11
+    call add_host
+    lea rsi, [f_badname_hdr]
+    mov edx, f_badname_hdr_len
+    call req_add
+    call add_close
+    call add_end
+    call run_and_read
+    mov rcx, rax
+    lea rsi, [n_fieldtoken]
+    mov edx, n_fieldtoken_len
+    mov r9d, 400
+    call classify_reject
+    ret
+
+; h1-6: an error response must carry Date (canned 4xx blobs included).
+probe_err_date:
+    push rbx
+    call req_begin
+    call add_get_target_h11
+    call add_close
+    call add_end                          ; no Host -> a 400 error blob
+    call run_and_read
+    mov rbx, rax
+    mov dil, K_DEV
+    test rbx, rbx
+    js .emit                              ; no response at all
+    lea rsi, [nd_date]
+    mov edx, nd_date_len
+    call resp_ci_contains
+    test rax, rax
+    jz .emit
+    mov dil, K_OK
+.emit:
+    lea rsi, [n_errdate]
+    mov edx, n_errdate_len
+    mov rcx, rbx
+    mov r9d, -1
+    call report
+    pop rbx
     ret
 
 ; an HTTP/1.0 request line — informational (behaviour varies by server)
