@@ -221,7 +221,7 @@ linnea_quic_rxbuf: resb LINNEA_QUIC_RXBUF_SIZE
 plaintext:   resb 2048
 cur_conn:    resq 1                   ; connection this datagram belongs to
 expfin:      resb 64                  ; expected client Finished message
-onertt_pay:  resb 256                 ; ACK + HANDSHAKE_DONE + uni streams + NST CRYPTO
+onertt_pay:  resb 512                 ; ACK + HANDSHAKE_DONE + NEW_CONNECTION_ID + uni + NST
 onertt_pkt:  resb 4096                ; the protected 1-RTT packet
 strm_pay:    resb 4096                ; STREAM frame carrying the h3 response
 fc_grant_pay: resb 4096               ; MAX_DATA prepended to an outgoing payload (quic-9)
@@ -1501,6 +1501,24 @@ linnea_quic_server_datagram:
     mov rcx, rax
     mov byte [onertt_pay + rcx], 0x1e   ; HANDSHAKE_DONE
     inc rcx
+    ; NEW_CONNECTION_ID (quic-7): hand the peer a spare routable CID and its reset
+    ; token, so it can rotate its DCID without losing the connection.
+    push rcx
+    mov rbx, [cur_conn]
+    lea rdi, [onertt_pay + rcx]
+    mov byte [rdi], 0x18                 ; NEW_CONNECTION_ID
+    mov byte [rdi + 1], 0x01            ; sequence number 1
+    mov byte [rdi + 2], 0x00            ; retire prior to 0
+    mov byte [rdi + 3], LINNEA_QUIC_SCID_LEN
+    add rdi, 4
+    lea rsi, [rbx + linnea_quic_conn.cid1]
+    mov ecx, LINNEA_QUIC_SCID_LEN
+    rep movsb                            ; the connection id
+    mov rsi, rdi                         ; the 16-byte reset token follows
+    lea rdi, [rbx + linnea_quic_conn.cid1]
+    call linnea_quic_reset_token
+    pop rcx
+    add rcx, 4 + LINNEA_QUIC_SCID_LEN + 16   ; NEW_CONNECTION_ID frame length
     lea rdi, [onertt_pay + rcx]
     lea rsi, [h3_uni_setup]
     push rcx

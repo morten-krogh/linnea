@@ -352,6 +352,11 @@ struc linnea_quic_conn
     .rx_largest: resq 1
     .rx_mask:    resq 1
     .scid:       resb LINNEA_QUIC_SCID_LEN   ; ours (index || random)
+    ; an alternate connection id we issue via NEW_CONNECTION_ID (quic-7): same
+    ; worker/pool bytes so it routes to this slot, fresh random tail. Lets the peer
+    ; rotate its DCID (migration, unlinkability) without losing the connection.
+    .cid1:       resb LINNEA_QUIC_SCID_LEN
+    .cid1_active: resq 1                      ; 1 once cid1 is routable
     .dcid:       resb LINNEA_QUIC_MAX_CID    ; the peer's, our DCID when sending
     .peer:       resb 28                     ; sockaddr_in6 of the client (IPv4 as ::ffff:x)
     .hs_sec:     resb 96             ; c_hs || s_hs || handshake_secret

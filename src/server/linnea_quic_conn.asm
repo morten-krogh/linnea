@@ -49,10 +49,16 @@ linnea_quic_conn_lookup:
     lea rax, [conn_pool + rax]
     cmp qword [rax + linnea_quic_conn.in_use], 0
     je .miss
-    ; the full ID must match — the random tail authenticates the slot
+    ; the full ID must match — the random tail authenticates the slot. Either the
+    ; primary scid or an issued alternate (quic-7) routes here.
     mov rcx, [rdi]
     cmp rcx, [rax + linnea_quic_conn.scid]
+    je .match
+    cmp qword [rax + linnea_quic_conn.cid1_active], 0
+    je .miss
+    cmp rcx, [rax + linnea_quic_conn.cid1]
     jne .miss
+.match:
     ; a packet arrived for it, so it is not idle
     push rax
     call conn_now
@@ -162,6 +168,19 @@ linnea_quic_conn_alloc:
     syscall
     cmp rax, LINNEA_QUIC_SCID_LEN - 2
     jne .arand_fail
+    ; alternate connection id (quic-7): copy the worker/pool bytes so it routes to
+    ; this same slot, then a fresh random tail. Announced later via
+    ; NEW_CONNECTION_ID; conn_lookup matches it once cid1_active is set.
+    mov ax, [rbx + linnea_quic_conn.scid]             ; worker || pool bytes
+    mov [rbx + linnea_quic_conn.cid1], ax
+    lea rdi, [rbx + linnea_quic_conn.cid1 + 2]
+    mov esi, LINNEA_QUIC_SCID_LEN - 2
+    xor edx, edx
+    mov eax, LINNEA_SYS_GETRANDOM
+    syscall
+    cmp rax, LINNEA_QUIC_SCID_LEN - 2
+    jne .arand_fail
+    mov qword [rbx + linnea_quic_conn.cid1_active], 1
     ; record the peer address (sockaddr_in6; IPv4 arrives as ::ffff:x)
     mov rcx, r14
     cmp rcx, 28

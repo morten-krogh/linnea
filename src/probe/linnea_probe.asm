@@ -354,6 +354,8 @@ n_h3_urgency: db "HTTP/3 urgency: u=07 is low priority, not high"
 n_h3_urgency_len equ $ - n_h3_urgency
 n_h3_maxdata: db "HTTP/3 server grants connection credit (MAX_DATA)"
 n_h3_maxdata_len equ $ - n_h3_maxdata
+n_h3_newcid:  db "HTTP/3 NEW_CONNECTION_ID issued and the CID routes"
+n_h3_newcid_len equ $ - n_h3_newcid
 
 ; QPACK static index -> :status, mirroring the server's encoder table.
 qpack_idx2status:
@@ -468,6 +470,9 @@ q_sh_len:   resq 1
 qhsc_fin_end: resq 1                    ; offset in qhsc just past the server Finished
 q_srv_scid: resb 20                     ; the server's chosen connection id (our DCID)
 q_srv_scid_len: resq 1
+q_alt_cid:  resb 20                     ; a CID the server issued via NEW_CONNECTION_ID
+q_alt_cid_len: resq 1
+q_alt_cid_valid: resq 1                 ; 1 once we captured a NEW_CONNECTION_ID
 q_cli_hs_pn: resq 1                     ; our next client Handshake packet number
 q_acked:    resq 1                      ; 1 once we have sent a Handshake ACK
 q_cli_ap_pn: resq 1                     ; our next client 1-RTT packet number
@@ -4977,7 +4982,11 @@ quic_recv_1rtt:
     xor r9d, r9d                          ; expected pn = 0
     call linnea_quic_unprotect_short      ; rax = frames (or -1)
     test rax, rax
-    jns .yes
+    js .next
+    lea rdi, [qplain]                     ; capture a NEW_CONNECTION_ID if present
+    mov rsi, rax
+    call quic_scan_ncid
+    jmp .yes
 .next:
     dec r12d
     jnz .loop
@@ -6647,6 +6656,153 @@ probe_h3_maxdata:
     pop rbx
     ret
 
+; quic_scan_ncid(rdi=frames, rsi=len): if the frames carry a NEW_CONNECTION_ID
+; (0x18), copy its connection id into q_alt_cid and set q_alt_cid_valid.
+quic_scan_ncid:
+    push rbx
+    push r12
+    mov rbx, rdi
+    lea r12, [rdi + rsi]                  ; end
+.sc_fr:
+    cmp rbx, r12
+    jae .sc_done
+    cmp byte [rbx], 0x18                  ; NEW_CONNECTION_ID
+    je .sc_ncid
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .sc_done
+    add rbx, rax
+    jmp .sc_fr
+.sc_ncid:
+    inc rbx                              ; past the type
+    mov rdi, rbx                         ; sequence number
+    mov rsi, r12
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .sc_done
+    add rbx, rdx
+    mov rdi, rbx                         ; retire prior to
+    mov rsi, r12
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .sc_done
+    add rbx, rdx
+    cmp rbx, r12
+    jae .sc_done
+    movzx eax, byte [rbx]                ; connection id length
+    inc rbx
+    cmp eax, 20
+    ja .sc_done
+    lea rcx, [rbx + rax]                 ; end of the CID
+    cmp rcx, r12
+    ja .sc_done
+    mov [q_alt_cid_len], rax
+    lea rdi, [q_alt_cid]
+    mov rsi, rbx
+    mov rcx, rax
+    rep movsb
+    mov qword [q_alt_cid_valid], 1
+.sc_done:
+    pop r12
+    pop rbx
+    ret
+
+; probe_h3_newcid (quic-7): the server should issue a NEW_CONNECTION_ID so the peer
+; can rotate its DCID, and must route packets sent to that CID. Capture the issued
+; CID during the handshake, switch our DCID to it, and GET /. OK iff a CID was
+; issued AND the server answers 200 on it.
+probe_h3_newcid:
+    push rbx
+    push r14
+    mov qword [q_alt_cid_valid], 0
+    call quic_h3_open                     ; quic_recv_1rtt captures the NCID
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    cmp qword [q_alt_cid_valid], 0
+    je .dev                              ; no NEW_CONNECTION_ID was issued
+    ; rotate: use the issued CID as our destination connection id
+    lea rdi, [q_srv_scid]
+    lea rsi, [q_alt_cid]
+    mov rcx, [q_alt_cid_len]
+    mov [q_srv_scid_len], rcx
+    rep movsb
+    ; GET / on the new CID; the server must still route us
+    lea rdi, [fs_scratch]
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x00
+    mov byte [rdi + 2], 0xd1
+    mov byte [rdi + 3], 0xd7
+    mov byte [rdi + 4], 0xc1
+    mov byte [rdi + 5], 0x50
+    add rdi, 6
+    mov rax, [host_len]
+    mov [rdi], al
+    inc rdi
+    mov rsi, [host_ptr]
+    mov rcx, [host_len]
+    rep movsb
+    lea rax, [fs_scratch]
+    mov r14, rdi
+    sub r14, rax
+    lea rdi, [qpay]
+    mov byte [rdi], 0x0a
+    mov byte [rdi + 1], 0x02
+    mov byte [rdi + 2], 0x03
+    mov byte [rdi + 3], 0x00
+    mov byte [rdi + 4], 0x04
+    mov byte [rdi + 5], 0x00
+    add rdi, 6
+    mov byte [rdi], 0x0b
+    mov byte [rdi + 1], 0x00
+    lea rax, [r14 + 2]
+    mov [rdi + 2], al
+    mov byte [rdi + 3], 0x01
+    mov [rdi + 4], r14b
+    add rdi, 5
+    lea rsi, [fs_scratch]
+    mov rcx, r14
+    rep movsb
+    lea rax, [qpay]
+    mov rdx, rdi
+    sub rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify                 ; status on the rotated CID
+    mov r14, rax
+    mov edi, ebx
+    call close_fd
+    cmp r14, 200
+    je .ok                               ; server routed the new CID and answered
+    mov dil, K_INFO                      ; issued but no clean answer on it
+    jmp .rep
+.ok:
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov edi, ebx
+    call close_fd
+    mov dil, K_DEV                        ; no NEW_CONNECTION_ID at all
+.rep:
+    lea rsi, [n_h3_newcid]
+    mov edx, n_h3_newcid_len
+    call report_plain
+    pop r14
+    pop rbx
+    ret
+.fail:
+    mov dil, K_DEV
+    lea rsi, [n_h3_newcid]
+    mov edx, n_h3_newcid_len
+    call report_plain
+    pop r14
+    pop rbx
+    ret
+
 ; h3_battery(): the HTTP/3 probe set.
 h3_battery:
     call probe_h3_handshake
@@ -6657,6 +6813,7 @@ h3_battery:
     call probe_h3_ctrl_framelen
     call probe_h3_urgency
     call probe_h3_maxdata
+    call probe_h3_newcid
     call probe_h3_no_sigalgs
     ret
 
