@@ -16,6 +16,7 @@ global _start
 
 extern linnea_quic_replay_check
 extern linnea_quic_ticket_within_lifetime
+extern linnea_quic_ack_delay_ms
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 
@@ -116,6 +117,48 @@ _start:
     mov rsi, 1000000
     call linnea_quic_ticket_within_lifetime
     EXPECT rax, 0
+
+    ; --- ACK Delay scaling (quic-12 / RFC 9000 19.3): the field counts
+    ; 2^ack_delay_exponent microseconds, and the exponent belongs to whoever SENT
+    ; the ACK. The old code shifted by a hardcoded 7 (~ /128), i.e. it assumed the
+    ; peer used the default 3; a peer advertising anything else was mis-scaled.
+    ; 125 units at the default exponent 3 = 1000us = 1ms
+    mov rdi, 125
+    mov rsi, 3
+    call linnea_quic_ack_delay_ms
+    EXPECT rax, 1
+    ; 1000 units at exponent 3 = 8000us = 8ms
+    mov rdi, 1000
+    mov rsi, 3
+    call linnea_quic_ack_delay_ms
+    EXPECT rax, 8
+    ; the case the hardcoded shift got wrong: exponent 0 means 1us units, so the
+    ; same raw value is 1ms, not the 7ms the old raw>>7 produced
+    mov rdi, 1000
+    mov rsi, 0
+    call linnea_quic_ack_delay_ms
+    EXPECT rax, 1
+    ; and a large exponent scales up: 1000 << 10 = 1024000us = 1024ms
+    mov rdi, 1000
+    mov rsi, 10
+    call linnea_quic_ack_delay_ms
+    EXPECT rax, 1024
+    ; zero delay stays zero
+    mov rdi, 0
+    mov rsi, 3
+    call linnea_quic_ack_delay_ms
+    EXPECT rax, 0
+    ; 18.2: an exponent above 20 is invalid — clamp rather than shift wild
+    mov rdi, 1
+    mov rsi, 25
+    call linnea_quic_ack_delay_ms
+    EXPECT rax, 1048                 ; as if the exponent were 20
+    ; a peer may claim a delay of 2^62 units: saturate instead of wrapping, and
+    ; let the caller's max_ack_delay cap turn it into something sane
+    mov rdi, 0x4000000000000000
+    mov rsi, 20
+    call linnea_quic_ack_delay_ms
+    EXPECT rax, -1
 
     ; print "quic-replay <pass>/<total>\n"
     lea rdi, [msg_head]

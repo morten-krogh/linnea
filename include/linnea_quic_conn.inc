@@ -455,6 +455,11 @@ struc linnea_quic_conn
     ; and decoder — and RFC 9000 4.6 forbids opening more than the peer allows,
     ; so a client that grants fewer gets none of them rather than a violation.
     .ms_uni_peer:   resq 1
+    ; The peer's ack_delay_exponent and max_ack_delay. Both describe the ACKs it
+    ; SENDS us (RFC 9000 19.3 / RFC 9002 5.3), so both belong to the connection
+    ; rather than being assumed from our own defaults.
+    .ack_exp_peer:  resq 1
+    .max_ack_peer:  resq 1
     .fc_conn_max:   resq 1          ; max total data the client will accept
     .fc_conn_sent:  resq 1          ; response-stream bytes sent against fc_conn_max
     ; receive side (quic-9): the peer is flow-controlled by initial_max_data, which

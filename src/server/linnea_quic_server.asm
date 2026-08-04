@@ -118,6 +118,9 @@ extern linnea_quic_frames_ack_eliciting
 extern linnea_quic_rtt_sample
 extern linnea_quic_pto_ms
 extern linnea_quic_ack_delay
+extern linnea_quic_ack_delay_ms
+extern linnea_quic_tp_ack_exp
+extern linnea_quic_tp_max_ack
 extern linnea_quic_rtx_sent_ms
 extern linnea_quic_build_ack
 extern linnea_quic_ack_ranges
@@ -1025,6 +1028,8 @@ linnea_quic_server_datagram:
     ; Absent parameters mean zero (RFC 9000 18.2).
     mov qword [rbx + linnea_quic_conn.fc_stream_init], 0
     mov qword [rbx + linnea_quic_conn.ms_uni_peer], 0
+    mov qword [rbx + linnea_quic_conn.ack_exp_peer], 3    ; RFC 9000 18.2 defaults
+    mov qword [rbx + linnea_quic_conn.max_ack_peer], 25
     mov qword [rbx + linnea_quic_conn.fc_conn_max], 0
     mov qword [rbx + linnea_quic_conn.fc_conn_sent], 0
     ; receive-side flow control (quic-9): we advertised initial_max_data as the
@@ -1043,6 +1048,10 @@ linnea_quic_server_datagram:
     mov [rbx + linnea_quic_conn.fc_conn_max], rax
     mov [rbx + linnea_quic_conn.fc_stream_init], rdx   ; each new slot starts here
     mov [rbx + linnea_quic_conn.ms_uni_peer], r8
+    mov rax, [linnea_quic_tp_ack_exp]      ; the peer's ACK-delay encoding, which
+    mov [rbx + linnea_quic_conn.ack_exp_peer], rax   ; is what decodes its ACKs
+    mov rax, [linnea_quic_tp_max_ack]
+    mov [rbx + linnea_quic_conn.max_ack_peer], rax
 .tp_recorded:
     ; --- session resumption: accept the client's PSK offer if it is well-formed
     ; (psk_dhe_ke, our ticket, matching SNI, verifying binder). linnea_quic_hs_psk
@@ -1778,14 +1787,25 @@ linnea_quic_server_datagram:
     sub rax, rbx                      ; latest_rtt
     js .rtt_done                      ; a clock that went backwards: no sample
     ; The peer's Ack Delay is in units of 2^ack_delay_exponent microseconds, and
-    ; we advertise no exponent so the default 3 stands: raw * 8 / 1000 ms, i.e.
-    ; raw / 125. Subtract it only while that leaves the sample at or above the
-    ; minimum seen, per 5.3 — a delay big enough to push it below is not credible.
-    mov rcx, [linnea_quic_ack_delay]
-    shr rcx, 7                        ; ~ raw / 128, a hair under raw / 125
-    cmp rcx, LINNEA_QUIC_MAX_ACK_DELAY
+    ; RFC 9000 19.3 takes that exponent from whoever SENT the ACK — the client's
+    ; advertised value, not ours (ours describes the ACKs we send). Assuming our
+    ; own default 3 was right only when the client happened to default too.
+    ; Subtract it only while that leaves the sample at or above the minimum seen,
+    ; per RFC 9002 5.3 — a delay big enough to push it below is not credible.
+    push rax                          ; latest_rtt, across the scaling call
+    push rax
+    mov rdi, [linnea_quic_ack_delay]
+    mov rbx, [cur_conn]
+    mov rsi, [rbx + linnea_quic_conn.ack_exp_peer]
+    call linnea_quic_ack_delay_ms     ; rax = the peer's delay in ms
+    mov rcx, rax
+    pop rax
+    pop rax
+    mov rbx, [cur_conn]
+    mov rdx, [rbx + linnea_quic_conn.max_ack_peer]
+    cmp rcx, rdx
     jbe .rtt_delay_ok
-    mov ecx, LINNEA_QUIC_MAX_ACK_DELAY ; 5.3: never more than the peer may delay
+    mov rcx, rdx                      ; 5.3: never more than the peer said it may delay
 .rtt_delay_ok:
     mov rdi, [cur_conn]
     mov rdx, rax

@@ -221,6 +221,7 @@ rtxtest: $(RTXTEST_BIN)
 # --- 0-RTT anti-replay strike-register unit test ---
 REPLAYTEST_BIN  = bin/linnea-replaytest
 REPLAYTEST_OBJS = test/quic/linnea_replaytest.o src/lib/linnea_quic_crypto.o \
+                  src/lib/linnea_quic.o \
                   src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o src/lib/linnea_tls_kdf.o \
                   src/lib/linnea_x25519.o src/lib/linnea_fe25519.o src/lib/linnea_print.o \
                   src/lib/linnea_string.o $(QUICP256)

@@ -25,6 +25,9 @@ global linnea_quic_ack_seen
 global linnea_quic_rtt_sample
 global linnea_quic_pto_ms
 global linnea_quic_ack_delay
+global linnea_quic_tp_ack_exp
+global linnea_quic_tp_max_ack
+global linnea_quic_ack_delay_ms
 global linnea_quic_build_ack
 global linnea_quic_ack_ranges
 global linnea_quic_recv_initial
@@ -1864,6 +1867,34 @@ linnea_quic_build_transport_params:
     pop rbx
     ret
 
+; linnea_quic_ack_delay_ms(rdi=raw Ack Delay, rsi=exponent) -> rax = milliseconds.
+; RFC 9000 19.3: the ACK Delay field counts 2^ack_delay_exponent microseconds,
+; and the exponent that applies is the one advertised by the endpoint that SENT
+; the ACK. Ours describes the ACKs we send, so decoding a peer's ACK with it is
+; only right by accident when the peer also defaults to 3.
+; Saturates rather than wrapping: the field is a varint, so a peer can claim
+; 2^62 units, and shifting that left by up to 20 would overflow. The caller
+; clamps the result to the peer's max_ack_delay either way.
+linnea_quic_ack_delay_ms:
+    cmp rsi, 20
+    jbe .adm_exp_ok
+    mov esi, 20                      ; 18.2 caps the exponent; never shift wild
+.adm_exp_ok:
+    mov rcx, rsi
+    mov rdx, -1
+    shr rdx, cl                      ; the largest raw that still fits when shifted
+    cmp rdi, rdx
+    ja .adm_saturate
+    mov rax, rdi
+    shl rax, cl                      ; microseconds
+    xor edx, edx
+    mov rcx, 1000
+    div rcx                          ; -> milliseconds
+    ret
+.adm_saturate:
+    mov rax, -1                      ; the caller's cap turns this into max_ack_delay
+    ret
+
 ; linnea_quic_tp_parse(rdi=params, rsi=len) -> rax = initial_max_data (0x04),
 ; rdx = initial_max_stream_data_bidi_local (0x05), r8 = initial_max_streams_uni
 ; (0x09 — how many unidirectional streams the client lets us open at all, which
@@ -1887,6 +1918,8 @@ linnea_quic_tp_parse:
     xor r13d, r13d                   ; initial_max_data
     xor r14d, r14d                   ; initial_max_stream_data_bidi_local
     xor r9d, r9d                     ; initial_max_streams_uni
+    mov qword [linnea_quic_tp_ack_exp], 3    ; RFC 9000 18.2 defaults, in case the
+    mov qword [linnea_quic_tp_max_ack], 25   ; peer omits either parameter
 .tp_next:
     cmp rbx, r12
     jae .tp_done
@@ -1914,6 +1947,10 @@ linnea_quic_tp_parse:
     je .tp_value
     cmp r15, 0x09
     je .tp_value
+    cmp r15, 0x0a
+    je .tp_value
+    cmp r15, 0x0b
+    je .tp_value
     add rbx, rbp                     ; not one we read: skip its payload
     jmp .tp_next
 .tp_value:
@@ -1932,7 +1969,19 @@ linnea_quic_tp_parse:
     mov r14, rax
     jmp .tp_skip
 .tp_val09:
+    cmp r15, 0x09
+    jne .tp_val0a
     mov r9, rax
+    jmp .tp_skip
+.tp_val0a:
+    cmp r15, 0x0a
+    jne .tp_val0b
+    cmp rax, 20                      ; 18.2: values above 20 are invalid; keep the
+    ja .tp_skip                      ; default rather than shift by a wild amount
+    mov [linnea_quic_tp_ack_exp], rax
+    jmp .tp_skip
+.tp_val0b:
+    mov [linnea_quic_tp_max_ack], rax
 .tp_skip:
     add rbx, rbp
     jmp .tp_next
@@ -3431,9 +3480,14 @@ linnea_quic_retry_scid_len: resq 1
 ; the 8 challenge bytes and a flag, so the receive path can echo them back in a
 ; PATH_RESPONSE (RFC 9000 8.2). Reset at the start of each scan.
 ; The Ack Delay of the last ACK frame walked, as the raw varint. Scaling is the
-; caller's: the units are 2^ack_delay_exponent microseconds, and since we never
-; send an ack_delay_exponent transport parameter the default of 3 applies.
+; caller's, via linnea_quic_ack_delay_ms: the units are 2^ack_delay_exponent
+; microseconds, and RFC 9000 19.3 takes that exponent from the endpoint that SENT
+; the ACK — the peer's advertised value, not ours. (Ours describes the ACKs we
+; send.) The two parameters the peer advertised for this are parked here by
+; linnea_quic_tp_parse and copied onto the connection by the caller.
 linnea_quic_ack_delay:  resq 1
+linnea_quic_tp_ack_exp: resq 1     ; peer's ack_delay_exponent (default 3)
+linnea_quic_tp_max_ack: resq 1     ; peer's max_ack_delay in ms (default 25)
 linnea_quic_path_seen:  resq 1
 linnea_quic_path_data:  resb 8
 tp_srt:                 resb 16    ; stateless_reset_token scratch for the tp build
