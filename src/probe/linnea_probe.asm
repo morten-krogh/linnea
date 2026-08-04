@@ -4681,7 +4681,7 @@ quic_walk_datagram:
     js .adv
     mov r14, rax                          ; frame bytes
     cmp rdx, [q_init_largest]
-    jbe .init_pn_done
+    jle .init_pn_done                     ; signed: the -1 "none yet" sentinel is < any pn
     mov [q_init_largest], rdx
 .init_pn_done:
     cmp qword [q_hs_ready], 0
@@ -4729,7 +4729,7 @@ quic_walk_datagram:
     test rax, rax
     js .adv
     cmp rdx, [q_hs_largest]
-    jbe .hs_pn_done
+    jle .hs_pn_done                       ; signed: the -1 "none yet" sentinel is < any pn
     mov [q_hs_largest], rdx
 .hs_pn_done:
     mov r14, rax                          ; frame bytes
@@ -7054,10 +7054,10 @@ probe_h3_handshake:
     test r12, r12
     jnz .rep3
     ; Initial + flight already succeeded, so the server clearly speaks QUIC; a
-    ; failure to drive the client side to 1-RTT from here is far likelier a prober
-    ; limitation (e.g. reassembling a large real Handshake flight) than a server
-    ; deviation, so report [info], not [DEV!]. (Cloudflare exercises this: it ACKs
-    ; our client Finished but withholds 1-RTT, while aioquic completes.)
+    ; failure to drive the client side to 1-RTT from here is likelier a prober
+    ; limitation than a server deviation, so report [info], not [DEV!]. (This path
+    ; is exercised by servers the prober cannot yet fully complete against; the
+    ; reference servers Linnea and Cloudflare both reach [OK] here.)
     mov dil, K_INFO
 .rep3:
     lea rsi, [n_h3_1rtt]
