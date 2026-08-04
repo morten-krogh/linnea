@@ -25,6 +25,8 @@ default rel
 
 global linnea_tls_setup
 global linnea_ktls_enable
+global linnea_ktls_fail_step
+global linnea_ktls_fail_errno
 global linnea_ktls_close_notify
 
 extern linnea_file_map_readonly
@@ -62,6 +64,13 @@ section .bss
 alignb 8
 cert_pool:  resb LINNEA_MAX_SERVERS * MAX_CERT_LIST
 key_pool:  resb LINNEA_MAX_SERVERS * 32
+; Why the last handoff failed. linnea_ktls_enable used to collapse every
+; failure to -1, so a connection closed with "tls kernel handoff failed" and
+; nothing said which of the three setsockopts refused it or why — the one
+; question worth answering when it happens in production. Kept as globals
+; rather than returned so the caller's contract (0 / -1) is unchanged.
+linnea_ktls_fail_step:  resq 1     ; 1 = TCP_ULP, 2 = TLS_TX, 3 = TLS_RX
+linnea_ktls_fail_errno: resq 1     ; the negative errno the syscall returned
 
 section .text
 
@@ -234,6 +243,7 @@ linnea_ktls_enable:
     mov [rsp + K_RXSEQ], r8
 
     ; setsockopt(fd, SOL_TCP, TCP_ULP, "tls", 4) — attach the kernel ULP
+    mov qword [linnea_ktls_fail_step], 1
     mov eax, LINNEA_SYS_SETSOCKOPT
     mov edi, [rsp + K_FD]
     mov esi, LINNEA_SOL_TCP
@@ -245,6 +255,7 @@ linnea_ktls_enable:
     js .fail
 
     ; TX: the server application traffic secret, seq = tx_seq
+    mov qword [linnea_ktls_fail_step], 2
     mov rdi, [rsp + K_SAP]
     mov rsi, [rsp + K_TXSEQ]
     mov edx, LINNEA_TLS_TX
@@ -256,6 +267,7 @@ linnea_ktls_enable:
     js .fail
 
     ; RX: the client application traffic secret, seq = rx_seq
+    mov qword [linnea_ktls_fail_step], 3
     mov rdi, [rsp + K_CAP]
     mov rsi, [rsp + K_RXSEQ]
     mov edx, LINNEA_TLS_RX
@@ -267,8 +279,10 @@ linnea_ktls_enable:
     js .fail
 
     xor eax, eax
+    mov qword [linnea_ktls_fail_step], 0
     jmp .ret
 .fail:
+    mov [linnea_ktls_fail_errno], rax   ; keep the errno: the caller logs it
     mov rax, -1
 .ret:
     add rsp, K_FRAME

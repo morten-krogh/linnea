@@ -76,6 +76,8 @@ extern linnea_log_write
 extern linnea_log_u64
 extern linnea_log_stamp
 extern linnea_log_reopen
+extern linnea_ktls_fail_step
+extern linnea_ktls_fail_errno
 extern linnea_tls_hs_init
 extern linnea_tls_hs_input
 extern linnea_tls_drain_early
@@ -202,6 +204,12 @@ reason_tls_split:   db "tls pipelined record too large to buffer"
 reason_tls_split_len equ $ - reason_tls_split
 reason_tls_ktls:    db "tls kernel handoff failed"
 reason_tls_ktls_len equ $ - reason_tls_ktls
+; The close reason alone never said WHICH setsockopt refused the handoff or
+; why, which is the only thing worth knowing when it happens in production.
+dbgktls:            db "ktls handoff failed: step "
+dbgktls_len         equ $ - dbgktls
+dbgktls_errno:      db " errno "
+dbgktls_errno_len   equ $ - dbgktls_errno
 
 section .data
 
@@ -1542,6 +1550,25 @@ linnea_uring_run:
     mov r15d, reason_tls_split_len
     jmp .conn_close
 .tls_ktls_fail:
+    ; record which of the three setsockopts refused it, and the errno, before
+    ; the connection goes: "handoff failed" on its own is undiagnosable
+    push r12
+    call linnea_log_stamp
+    lea rdi, [dbgktls]
+    mov esi, dbgktls_len
+    call linnea_log_write
+    mov rdi, [linnea_ktls_fail_step]
+    call linnea_log_u64
+    lea rdi, [dbgktls_errno]
+    mov esi, dbgktls_errno_len
+    call linnea_log_write
+    xor rdi, rdi
+    sub rdi, [linnea_ktls_fail_errno]    ; -errno -> errno
+    call linnea_log_u64
+    lea rdi, [log_nl]
+    mov esi, 1
+    call linnea_log_write
+    pop r12
     lea r14, [reason_tls_ktls]
     mov r15d, reason_tls_ktls_len
     jmp .conn_close
