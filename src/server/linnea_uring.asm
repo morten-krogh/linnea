@@ -1550,6 +1550,22 @@ linnea_uring_run:
     mov r15d, reason_tls_split_len
     jmp .conn_close
 .tls_ktls_fail:
+    ; A peer that hangs up during the handshake takes the socket out of
+    ; ESTABLISHED, and attaching the TLS ULP to it then fails with ENOTCONN
+    ; (confirmed against the kernel: alive -> OK, after FIN or RST -> ENOTCONN).
+    ; That is the client leaving, not a handoff we got wrong — there is nothing
+    ; left to serve either way, but calling it a failure buried the real thing
+    ; this log line is for under hundreds of routine disconnects. Report it as
+    ; the peer closing, and keep the loud reason for a handoff the kernel
+    ; actually refused (bad keys, no ULP, resource pressure).
+    cmp qword [linnea_ktls_fail_step], 1
+    jne .tls_ktls_real
+    cmp qword [linnea_ktls_fail_errno], -107      ; -ENOTCONN
+    jne .tls_ktls_real
+    lea r14, [reason_peer]
+    mov r15d, reason_peer_len
+    jmp .conn_close
+.tls_ktls_real:
     ; record which of the three setsockopts refused it, and the errno, before
     ; the connection goes: "handoff failed" on its own is undiagnosable
     push r12
