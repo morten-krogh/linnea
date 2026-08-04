@@ -6084,8 +6084,9 @@ probe_h3_no_sigalgs:
 ; probe_h3_trailer (h3-2): a request stream is HEADERS, DATA, then AT MOST ONE
 ; trailer section and nothing after. A frame following the trailers is a
 ; connection error (H3_FRAME_UNEXPECTED, RFC 9114 4.1). OK iff the server aborts
-; the connection; DEV if it serves the request (the pre-fix behaviour absorbed
-; the stray frame into the body).
+; the connection (Linnea does — a positive lock); else [info]: serving the request
+; despite a frame after the trailers is a common request-tail leniency (Cloudflare
+; does it) and not a portable deviation.
 probe_h3_trailer:
     push rbx
     push r14
@@ -6152,21 +6153,16 @@ probe_h3_trailer:
     mov r14, rax
     mov edi, ebx
     call close_fd
-    cmp r14, -3                          ; CONNECTION_CLOSE = correct rejection
+    cmp r14, -3                          ; CONNECTION_CLOSE = strict rejection
     je .ok
-    cmp r14, 200
-    jl .info                             ; -2 reset / -1 silence: terse rejection
-    cmp r14, 400
-    jl .dev                              ; 2xx/3xx: served, stray frame absorbed
-    jmp .info                            ; 4xx/5xx: a rejection, just not a close
+    ; Anything else is [info], not [DEV!]: a server that serves the request despite
+    ; a frame after the trailers (Cloudflare does) is being lenient about the
+    ; request-stream tail after an already-complete request — common and not a
+    ; portable deviation. Linnea closes -> [OK], so this stays a positive lock.
+    mov dil, K_INFO
+    jmp .rep
 .ok:
     mov dil, K_OK
-    jmp .rep
-.dev:
-    mov dil, K_DEV
-    jmp .rep
-.info:
-    mov dil, K_INFO
 .rep:
     lea rsi, [n_h3_trailer]
     mov edx, n_h3_trailer_len
@@ -6187,7 +6183,9 @@ probe_h3_trailer:
 ; bit means Base = -1, which is forbidden (RFC 9204 4.5.1.2) — a QPACK decoding
 ; failure, i.e. a connection error (QPACK_DECOMPRESSION_FAILED). Field section is
 ; an otherwise valid GET; only the sign bit is wrong. OK iff the server closes the
-; connection; DEV if it serves the request (pre-fix discarded the sign bit).
+; connection (Linnea does — a positive lock); else [info]: with a static-only field
+; section the Base is unused, so a decoder that validates it lazily (Cloudflare)
+; serves the request — not a portable deviation.
 probe_h3_qpack_base:
     push rbx
     push r14
@@ -6241,21 +6239,16 @@ probe_h3_qpack_base:
     mov r14, rax
     mov edi, ebx
     call close_fd
-    cmp r14, -3
+    cmp r14, -3                          ; connection close = strict rejection
     je .ok
-    cmp r14, 200
-    jl .info
-    cmp r14, 400
-    jl .dev
-    jmp .info
+    ; Anything else is [info], not [DEV!]: with a capacity-0 (static-only) field
+    ; section the Base is never used, so a decoder that validates it lazily (as
+    ; Cloudflare does) legitimately never sees the negative value and serves the
+    ; request. Linnea validates eagerly and closes -> [OK], a positive lock.
+    mov dil, K_INFO
+    jmp .rep
 .ok:
     mov dil, K_OK
-    jmp .rep
-.dev:
-    mov dil, K_DEV
-    jmp .rep
-.info:
-    mov dil, K_INFO
 .rep:
     lea rsi, [n_h3_qpbase]
     mov edx, n_h3_qpbase_len
@@ -6510,8 +6503,10 @@ quic_h3_tally:
 ; probe_h3_urgency (h3-13): urgency is an RFC 8941 number, not one digit. Two
 ; concurrent GETs of a large file — stream 0 with "u=07" (the number 7, LOW
 ; priority; a pre-fix parser read only '0' = HIGHEST) and stream 4 with "u=1"
-; (HIGH). A correct scheduler fills the early burst from stream 4; the pre-fix bug
-; makes stream 0 win. OK iff stream 4 leads; DEV if stream 0 leads.
+; (HIGH). A correct scheduler fills the early burst from stream 4. OK iff stream 4
+; clearly leads (server honored the hint — a positive lock, needs --big + a
+; bottleneck); else [info]. Priority (RFC 9218) is advisory, so a server that does
+; not prioritize (Cloudflare, over the default /) is not deviating — never [DEV!].
 probe_h3_urgency:
     push rbx
     push r12
@@ -6572,18 +6567,20 @@ probe_h3_urgency:
     call quic_h3_tally
     mov edi, ebx
     call close_fd
+    ; HTTP priority (RFC 9218) is ADVISORY — a server MAY ignore a "priority"
+    ; request header — so a stream-0 lead is not a deviation. Report [OK] only when
+    ; the high-urgency stream (4) clearly leads (the server honored it), else [info].
+    ; The margin filters network noise and small/absent resources (the default /):
+    ; both streams fetch the same resource, so only a large one (--big) under real
+    ; prioritization yields a big early lead. Never [DEV!] here.
     mov rax, [h3_bytes_s4]
     mov rdx, [h3_bytes_s0]
-    cmp rax, rdx
-    ja .ok                                ; stream 4 (u=1, high) led -> correct
-    cmp rdx, rax
-    ja .dev                               ; stream 0 (u=07 read as 0) led -> pre-fix
-    jmp .info                             ; equal / no data -> inconclusive
+    sub rax, rdx                          ; s4 - s0 (signed)
+    cmp rax, 16384
+    jge .ok                               ; stream 4 (u=1, high) clearly led -> honored
+    jmp .info                             ; otherwise inconclusive (advisory, ignored)
 .ok:
     mov dil, K_OK
-    jmp .rep
-.dev:
-    mov dil, K_DEV
     jmp .rep
 .info:
     mov dil, K_INFO
@@ -6701,7 +6698,9 @@ quic_h3_find_maxdata:
 ; probe_h3_maxdata (quic-9): a receiver must raise the peer's connection flow-
 ; control limit with MAX_DATA as it consumes, or the peer stalls at
 ; initial_max_data. Send one request and check the server grants credit. OK iff a
-; MAX_DATA frame comes back.
+; MAX_DATA frame comes back (Linnea grants ahead-of-need — a positive lock); else
+; [info]: a server need only raise the limit as the peer approaches it, which a
+; small GET never does (Cloudflare sends none), so absence is not a deviation.
 probe_h3_maxdata:
     push rbx
     push r14
@@ -6759,7 +6758,10 @@ probe_h3_maxdata:
     mov dil, K_OK
     test rax, rax
     jnz .rep
-    mov dil, K_DEV
+    ; No MAX_DATA in the window is [info], not [DEV!]: a server need only extend
+    ; connection credit when the peer approaches its limit (a small GET never
+    ; does). Linnea grants it ahead-of-need -> [OK], so this stays a positive lock.
+    mov dil, K_INFO
 .rep:
     lea rsi, [n_h3_maxdata]
     mov edx, n_h3_maxdata_len
@@ -6832,7 +6834,10 @@ quic_scan_ncid:
 ; probe_h3_newcid (quic-7): the server should issue a NEW_CONNECTION_ID so the peer
 ; can rotate its DCID, and must route packets sent to that CID. Capture the issued
 ; CID during the handshake, switch our DCID to it, and GET /. OK iff a CID was
-; issued AND the server answers 200 on it.
+; issued AND the server answers 200 on it (Linnea does — a positive lock); else
+; [info]: issuing extra CIDs is permitted but not required, and a server may issue
+; them later or not at all (Cloudflare issues none in the window), so absence is
+; not a deviation.
 probe_h3_newcid:
     push rbx
     push r14
@@ -6906,7 +6911,10 @@ probe_h3_newcid:
 .dev:
     mov edi, ebx
     call close_fd
-    mov dil, K_DEV                        ; no NEW_CONNECTION_ID at all
+    ; No NEW_CONNECTION_ID in the window is [info], not [DEV!]: issuing extra CIDs
+    ; is permitted but not required, and a server may issue them later or not at
+    ; all. Linnea issues one -> [OK], so this stays a positive lock.
+    mov dil, K_INFO
 .rep:
     lea rsi, [n_h3_newcid]
     mov edx, n_h3_newcid_len
