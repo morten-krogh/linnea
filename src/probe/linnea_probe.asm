@@ -478,6 +478,7 @@ qhsc_len:   resq 1                      ; contiguous bytes from offset 0
 q_hs_ready: resq 1                      ; 1 once Handshake keys are derived
 q_init_largest: resq 1                  ; largest Initial pn the server sent
 q_hs_largest:   resq 1                  ; largest Handshake pn the server sent
+q_hs_smallest:  resq 1                  ; smallest Handshake pn seen (-1 = none yet)
 q_fin_seen: resq 1                      ; 1 once the server Finished is reassembled
 q_pkt_type: resq 1                      ; the long-header type of the packet being walked
 q_sh_ptr:   resq 1                      ; ServerHello handshake message ptr/len
@@ -4732,6 +4733,12 @@ quic_walk_datagram:
     jle .hs_pn_done                       ; signed: the -1 "none yet" sentinel is < any pn
     mov [q_hs_largest], rdx
 .hs_pn_done:
+    ; track the smallest Handshake pn seen so ACKs cover the real range, not 0..
+    ; largest — a server may start the space's pns above 0 (Google starts at 2)
+    cmp qword [q_hs_smallest], -1
+    jne .hs_min_done
+    mov [q_hs_smallest], rdx
+.hs_min_done:
     mov r14, rax                          ; frame bytes
     lea rdi, [qplain]
     mov rsi, r14
@@ -4764,8 +4771,10 @@ quic_walk_datagram:
 quic_ack_frame:
     push rbx
     push r12
+    push r13
     mov rbx, rdi
-    mov r12, rsi
+    mov r12, rsi                          ; largest acknowledged
+    mov r13, rdx                          ; smallest acknowledged (contiguous)
     mov byte [rbx], 0x02
     inc rbx
     mov rdi, rbx
@@ -4782,9 +4791,11 @@ quic_ack_frame:
     add rbx, rax
     mov rdi, rbx
     mov rsi, r12
-    call linnea_quic_varint_encode        ; first ack range = largest
-    add rbx, rax
-    mov rax, rbx
+    sub rsi, r13                          ; first ack range = largest - smallest, so
+    call linnea_quic_varint_encode        ; we never claim packets below the smallest
+    add rbx, rax                          ; one actually received (some servers, e.g.
+    mov rax, rbx                          ; Google, start a space's pns above 0)
+    pop r13
     pop r12
     pop rbx
     ret
@@ -4876,6 +4887,7 @@ quic_send_hs_ack:
     mov ebx, edi
     lea rdi, [qpay]
     mov rsi, [q_hs_largest]
+    mov rdx, [q_hs_smallest]
     call quic_ack_frame                   ; rax = end
     lea rdx, [qpay]
     sub rax, rdx                          ; ACK length
@@ -4897,6 +4909,7 @@ quic_recv_flight:
     mov qword [q_fin_seen], 0
     mov qword [q_init_largest], -1
     mov qword [q_hs_largest], -1
+    mov qword [q_hs_smallest], -1
     mov qword [q_cli_hs_pn], 0
     mov qword [q_acked], 0
 .loop:
@@ -4923,8 +4936,21 @@ quic_recv_flight:
     mov rsi, rax
     call quic_walk_datagram
     cmp qword [q_fin_seen], 0
+    jne .done
+    ; ACK promptly as flight packets arrive. A large server flight (Google's ~5 KB
+    ; certificate) is paced on the client acknowledging what it received; only ACKing
+    ; on a 1500ms stall is too slow and the server's window never reopens. Capped,
+    ; once we have Handshake keys and a Handshake packet to acknowledge.
+    cmp qword [q_hs_ready], 0
     je .loop
-    jmp .done
+    cmp qword [q_hs_largest], 0
+    jl .loop                              ; signed: no Handshake packet received yet
+    cmp qword [q_acked], 16
+    jae .loop
+    inc qword [q_acked]
+    mov edi, ebx
+    call quic_send_hs_ack
+    jmp .loop
 .stall:
     ; The flight stalled. If we have Handshake keys but not the Finished yet, the
     ; server is holding back on the 3x anti-amplification limit — send a Handshake
@@ -4933,9 +4959,9 @@ quic_recv_flight:
     jne .done
     cmp qword [q_hs_ready], 0
     je .done
-    cmp qword [q_acked], 0
-    jne .done
-    mov qword [q_acked], 1
+    cmp qword [q_acked], 16              ; shared cap with the prompt-ACK path
+    jae .done
+    inc qword [q_acked]
     mov edi, ebx
     call quic_send_hs_ack
     jmp .loop
@@ -5083,6 +5109,7 @@ quic_finish:
     ; payload = ACK + CRYPTO(client Finished)
     lea rdi, [qpay]
     mov rsi, [q_hs_largest]
+    mov rdx, [q_hs_smallest]
     call quic_ack_frame                   ; rax = cursor after the ACK
     mov r12, rax                          ; CRYPTO frame start
     mov byte [r12], 0x06                  ; CRYPTO
@@ -6456,6 +6483,7 @@ quic_h3_tally:
     ; initial congestion window and tx_pump's priority scheduling never shows.
     lea rdi, [qpay]
     mov rsi, r15
+    xor edx, edx                          ; 1-RTT: ack 0..largest (our servers start at 0)
     call quic_ack_frame
     lea rdx, [qpay]
     sub rax, rdx
@@ -6654,6 +6682,7 @@ quic_h3_find_maxdata:
     push rax
     lea rdi, [qpay]
     mov rsi, r15
+    xor edx, edx                          ; 1-RTT: ack 0..largest (our servers start at 0)
     call quic_ack_frame
     lea rdx, [qpay]
     sub rax, rdx
