@@ -76,7 +76,7 @@ increment (→ `RST_STREAM`, the connection surviving); a `PING` bearing a strea
 (→ `PROTOCOL_ERROR`); a wrong-length `RST_STREAM` (→ `FRAME_SIZE_ERROR`); and a
 `CONNECT` (→ 405, not a reset).
 
-**HTTP/3 (15 probes)** — the full QUIC/TLS 1.3 handshake in three verified stages
+**HTTP/3 (16 probes)** — the full QUIC/TLS 1.3 handshake in three verified stages
 (Initial + Handshake keys; server flight / server Finished decrypted; client
 Finished → 1-RTT keys), then a real GET over 1-RTT with a QPACK-encoded request
 (→ `:status 200`). Request-stream compliance: no `:path` (→ `RESET_STREAM`); an
@@ -92,6 +92,9 @@ and the probe **rotates its connection id onto it** and confirms the server stil
 routes it; and the QUIC `ClientHello` is refused when it omits
 `signature_algorithms`, doesn't offer TLS 1.3, or offers no cipher the server
 implements — each verified by an explicit `CONNECTION_CLOSE`, not a silent drop.
+It also sends a non-empty `legacy_session_id` and confirms the server echoes an
+**empty** one in its `ServerHello` (RFC 9001 §8.4 forbids TLS compatibility mode
+over QUIC).
 
 ## Building
 

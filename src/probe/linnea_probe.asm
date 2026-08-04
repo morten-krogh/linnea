@@ -339,6 +339,8 @@ n_h3_badqp:   db "HTTP/3 undecodable QPACK -> connection closed"
 n_h3_badqp_len equ $ - n_h3_badqp
 n_h3_nosig:   db "QUIC ClientHello without signature_algorithms -> aborted"
 n_h3_nosig_len equ $ - n_h3_nosig
+n_h3_sessid:  db "QUIC ServerHello echoes an empty legacy_session_id"
+n_h3_sessid_len equ $ - n_h3_sessid
 n_h3_notls13: db "QUIC ClientHello not offering TLS 1.3 -> aborted"
 n_h3_notls13_len equ $ - n_h3_notls13
 n_h3_badciph: db "QUIC ClientHello with no supported cipher -> aborted"
@@ -450,6 +452,7 @@ qi_skeys:   resb linnea_quic_keys_size  ; server Initial keys (we open with thes
 omit_sigalgs: resq 1                     ; tls-5 probe: drop signature_algorithms
 bad_version: resq 1                      ; tls-5 probe: offer only TLS 1.2
 bad_cipher:  resq 1                      ; tls-5 probe: offer a suite we lack
+bad_sessid:  resq 1                      ; §8.4 probe: send a non-empty legacy_session_id
 qch:        resb 2048                   ; the QUIC ClientHello handshake message
 qch_len:    resq 1
 qtp:        resb 512                    ; encoded client transport parameters
@@ -477,6 +480,7 @@ q_fin_seen: resq 1                      ; 1 once the server Finished is reassemb
 q_pkt_type: resq 1                      ; the long-header type of the packet being walked
 q_sh_ptr:   resq 1                      ; ServerHello handshake message ptr/len
 q_sh_len:   resq 1
+q_sh_sessid_len: resq 1                  ; the ServerHello's echoed legacy_session_id length
 qhsc_fin_end: resq 1                    ; offset in qhsc just past the server Finished
 q_srv_scid: resb 20                     ; the server's chosen connection id (our DCID)
 q_srv_scid_len: resq 1
@@ -4219,11 +4223,21 @@ quic_build_ch:
     lea rsi, [tls_random]
     mov ecx, 32
     rep movsb
+    ; legacy_session_id: empty per RFC 9001 8.4 — QUIC forbids TLS compatibility
+    ; mode. The §8.4 probe sets bad_sessid to send a non-empty one on purpose, to
+    ; check the server still echoes an empty session_id in its ServerHello.
+    cmp qword [bad_sessid], 0
+    jne .bad_sessid
+    mov byte [rdi], 0
+    inc rdi
+    jmp .sessid_done
+.bad_sessid:
     mov byte [rdi], 32
     inc rdi
     lea rsi, [tls_sessid]
     mov ecx, 32
     rep movsb
+.sessid_done:
     lea rsi, [ch_suites]                  ; cipher_suites (TLS_AES_128_GCM_SHA256)
     mov ecx, ch_suites_len
     cmp qword [bad_cipher], 0
@@ -4686,6 +4700,10 @@ quic_walk_datagram:
     jz .adv
     mov [q_sh_ptr], rax
     mov [q_sh_len], rdx
+    ; capture the echoed legacy_session_id length (byte 38 of the ServerHello)
+    ; now, while qplain still holds it — later packets overwrite the buffer
+    movzx ecx, byte [rax + 38]
+    mov [q_sh_sessid_len], rcx
     mov rsi, rax
     call parse_serverhello                ; rsi=ptr, rdx=len -> tls_srvpub
     mov qword [qtr_len], 0                ; transcript = CH || SH
@@ -5742,7 +5760,7 @@ quic_h3_bad:
     pop rbp
     ret
 .fail:
-    mov rax, -1
+    mov rax, -4                              ; handshake not established (distinct from -1)
     lea rsp, [rbp - 32]
     pop r14
     pop r13
@@ -5754,7 +5772,9 @@ quic_h3_bad:
 ; probe_h3_nopath: a request missing :path must be rejected, never answered 2xx.
 probe_h3_nopath:
     mov esi, 1
-    call quic_h3_bad                      ; rax = status | -2 | -3 | -1
+    call quic_h3_bad                      ; rax = status | -2 | -3 | -1 | -4
+    cmp rax, -4
+    je .skip                             ; handshake never came up: not a deviation
     mov dil, K_OK
     ; DEVIATION only if the server ANSWERED 2xx/3xx to a malformed request
     cmp rax, 200
@@ -5766,6 +5786,9 @@ probe_h3_nopath:
     jmp .rep
 .dev:
     mov dil, K_DEV
+    jmp .rep
+.skip:
+    mov dil, K_INFO
 .rep:
     lea rsi, [n_h3_nopath]
     mov edx, n_h3_nopath_len
@@ -5776,6 +5799,8 @@ probe_h3_nopath:
 probe_h3_badqpack:
     mov esi, 2
     call quic_h3_bad
+    cmp rax, -4
+    je .skip                             ; handshake never came up: not a deviation
     mov dil, K_OK
     cmp rax, 200                          ; answered 2xx/3xx = accepted bad input
     jl .ok
@@ -5786,6 +5811,9 @@ probe_h3_badqpack:
     jmp .rep
 .dev:
     mov dil, K_DEV
+    jmp .rep
+.skip:
+    mov dil, K_INFO
 .rep:
     lea rsi, [n_h3_badqp]
     mov edx, n_h3_badqp_len
@@ -6145,7 +6173,7 @@ probe_h3_trailer:
     pop rbx
     ret
 .fail:
-    mov dil, K_DEV
+    mov dil, K_INFO                          ; handshake never came up: not a deviation
     lea rsi, [n_h3_trailer]
     mov edx, n_h3_trailer_len
     call report_plain
@@ -6234,7 +6262,7 @@ probe_h3_qpack_base:
     pop rbx
     ret
 .fail:
-    mov dil, K_DEV
+    mov dil, K_INFO                          ; handshake never came up: not a deviation
     lea rsi, [n_h3_qpbase]
     mov edx, n_h3_qpbase_len
     call report_plain
@@ -6325,7 +6353,7 @@ probe_h3_ctrl_framelen:
     pop rbx
     ret
 .fail:
-    mov dil, K_DEV
+    mov dil, K_INFO                          ; handshake never came up: not a deviation
     lea rsi, [n_h3_ctrllen]
     mov edx, n_h3_ctrllen_len
     call report_plain
@@ -6566,7 +6594,7 @@ probe_h3_urgency:
     pop rbx
     ret
 .fail:
-    mov dil, K_DEV
+    mov dil, K_INFO                          ; handshake never came up: not a deviation
     lea rsi, [n_h3_urgency]
     mov edx, n_h3_urgency_len
     call report_plain
@@ -6738,7 +6766,7 @@ probe_h3_maxdata:
     pop rbx
     ret
 .fail:
-    mov dil, K_DEV
+    mov dil, K_INFO                          ; handshake never came up: not a deviation
     lea rsi, [n_h3_maxdata]
     mov edx, n_h3_maxdata_len
     call report_plain
@@ -6885,11 +6913,52 @@ probe_h3_newcid:
     pop rbx
     ret
 .fail:
-    mov dil, K_DEV
+    mov dil, K_INFO                          ; handshake never came up: not a deviation
     lea rsi, [n_h3_newcid]
     mov edx, n_h3_newcid_len
     call report_plain
     pop r14
+    pop rbx
+    ret
+
+; probe_h3_sessid_echo (RFC 9001 8.4): a client MUST send an empty
+; legacy_session_id; a server MAY accept any value but MUST NOT echo anything
+; other than an empty one in its ServerHello. Send a ClientHello WITH a 32-byte
+; session_id and confirm the ServerHello's echoed session_id is empty. OK iff
+; empty; DEV if the server echoed a non-empty value; info if no ServerHello came
+; back (e.g. a stricter server refused the non-empty id — as Cloudflare does).
+; The echoed length is captured in quic_walk_datagram before parse_serverhello,
+; so a violating server is caught even if the shifted ServerHello then misparses;
+; the -1 sentinel distinguishes "no ServerHello seen" from a genuine empty echo.
+probe_h3_sessid_echo:
+    push rbx
+    call quic_fresh_ids
+    mov qword [bad_sessid], 1
+    mov qword [q_sh_sessid_len], -1       ; sentinel: no ServerHello seen yet
+    call udp_connect
+    test rax, rax
+    js .info
+    mov ebx, eax
+    mov edi, ebx
+    call quic_h3_handshake_retry          ; Initial (non-empty sessid) + flight
+    mov edi, ebx
+    call close_fd
+    cmp qword [q_sh_sessid_len], -1
+    je .info                              ; no ServerHello parsed: can't check the echo
+    cmp qword [q_sh_sessid_len], 0
+    jne .dev                              ; server echoed a non-empty session id
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov dil, K_INFO
+.rep:
+    mov qword [bad_sessid], 0
+    lea rsi, [n_h3_sessid]
+    mov edx, n_h3_sessid_len
+    call report_plain
     pop rbx
     ret
 
@@ -6904,6 +6973,7 @@ h3_battery:
     call probe_h3_urgency
     call probe_h3_maxdata
     call probe_h3_newcid
+    call probe_h3_sessid_echo
     call probe_h3_no_sigalgs
     call probe_h3_no_tls13
     call probe_h3_bad_cipher
