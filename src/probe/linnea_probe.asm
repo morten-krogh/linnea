@@ -260,6 +260,22 @@ alpn_h11:    db "http/1.1"
 alpn_h11_len equ $ - alpn_h11
 ; fixed middle of the ClientHello: cipher suites, compression (the parts with no
 ; variable content). cipher_suites len 2 = {0x1301}, compression len 1 = {0x00}.
+; signature_algorithms, as the whole extension (type, length, list length, list).
+; The prober never verifies a certificate or a CertificateVerify signature, so
+; this list is not a claim about what we can check — it is only what the server
+; is allowed to sign with, and a server can only pick from it. Offering just
+; ecdsa_secp256r1_sha256 (which is all linnea itself signs with) meant every
+; server holding an RSA certificate — most of the web — had nothing it could use
+; and refused the handshake outright with alert 40, handshake_failure. http3.is
+; did exactly that, on h1 and h3 alike, until this list grew.
+ch_sigalgs: db 0x00, 0x0d, 0x00, 0x0e, 0x00, 0x0c
+            db 0x04, 0x03            ; ecdsa_secp256r1_sha256 (linnea's own)
+            db 0x05, 0x03            ; ecdsa_secp384r1_sha384
+            db 0x08, 0x04            ; rsa_pss_rsae_sha256  — TLS 1.3 RSA certs
+            db 0x08, 0x05            ; rsa_pss_rsae_sha384
+            db 0x08, 0x06            ; rsa_pss_rsae_sha512
+            db 0x04, 0x01            ; rsa_pkcs1_sha256 (certificate signatures)
+ch_sigalgs_len equ $ - ch_sigalgs
 ch_suites:  db 0x00, 0x02, 0x13, 0x01, 0x01, 0x00
 ch_suites_len equ $ - ch_suites
 ; the tls-5 probe offers only a GREASE cipher (0x5a5a, RFC 8701) that no server
@@ -2958,16 +2974,13 @@ build_clienthello:
     mov byte [rdi + 6], 0x00
     mov byte [rdi + 7], 0x1d
     add rdi, 8
-    ; -- signature_algorithms (ecdsa_secp256r1_sha256) --
-    mov byte [rdi], 0x00
-    mov byte [rdi + 1], 0x0d
-    mov byte [rdi + 2], 0x00
-    mov byte [rdi + 3], 0x04
-    mov byte [rdi + 4], 0x00
-    mov byte [rdi + 5], 0x02
-    mov byte [rdi + 6], 0x04
-    mov byte [rdi + 7], 0x03
-    add rdi, 8
+    ; -- signature_algorithms (see ch_sigalgs: ECDSA and RSA, so an RSA server
+    ; has something it can sign CertificateVerify with) --
+    push rsi
+    lea rsi, [ch_sigalgs]
+    mov ecx, ch_sigalgs_len
+    rep movsb
+    pop rsi
     ; -- key_share --
     mov byte [rdi], 0x00
     mov byte [rdi + 1], 0x33
@@ -4321,18 +4334,14 @@ quic_build_ch:
     mov byte [rdi + 6], 0x00
     mov byte [rdi + 7], 0x1d
     add rdi, 8
-    ; signature_algorithms (ecdsa_secp256r1_sha256) — the tls-5 probe drops it
+    ; signature_algorithms (see ch_sigalgs) — the tls-5 probe drops it entirely
     cmp qword [omit_sigalgs], 0
     jne .no_sigalgs
-    mov byte [rdi], 0x00
-    mov byte [rdi + 1], 0x0d
-    mov byte [rdi + 2], 0x00
-    mov byte [rdi + 3], 0x04
-    mov byte [rdi + 4], 0x00
-    mov byte [rdi + 5], 0x02
-    mov byte [rdi + 6], 0x04
-    mov byte [rdi + 7], 0x03
-    add rdi, 8
+    push rsi
+    lea rsi, [ch_sigalgs]
+    mov ecx, ch_sigalgs_len
+    rep movsb
+    pop rsi
 .no_sigalgs:
     ; key_share (x25519)
     mov byte [rdi], 0x00
