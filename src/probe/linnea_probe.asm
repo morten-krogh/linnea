@@ -110,6 +110,8 @@ s_rst:      db "RST_STREAM (stream rejected)", 10
 s_rst_len   equ $ - s_rst
 s_goaway:   db "GOAWAY (connection error)", 10
 s_goaway_len equ $ - s_goaway
+s_qdyn:     db "responded (:status not decodable — QPACK dynamic table / Huffman)", 10
+s_qdyn_len  equ $ - s_qdyn
 s_want:     db "  (want "
 s_want_len  equ $ - s_want
 s_rparen_nl: db ")", 10
@@ -1831,13 +1833,20 @@ report:
     call puts
     jmp .ret
 .noresp:
-    ; distinguish the h2 sentinels: -2 RST_STREAM, -3 GOAWAY, else no response
+    ; distinguish the sentinels: -2 RST_STREAM, -3 GOAWAY, -5 QPACK-dynamic, else none
     cmp r14, -2
     je .rst
     cmp r14, -3
     je .goaway
+    cmp r14, -5
+    je .qdyn
     lea rsi, [s_noresp]
     mov edx, s_noresp_len
+    call puts
+    jmp .ret
+.qdyn:
+    lea rsi, [s_qdyn]
+    mov edx, s_qdyn_len
     call puts
     jmp .ret
 .rst:
@@ -5223,6 +5232,10 @@ qpack_find_status:
     push rbx
     push r12
     push r13
+    cmp byte [rdi], 0                     ; non-zero Required Insert Count means the
+    jne .dyntable                        ; field section references the QPACK dynamic
+                                         ; table (Google does); capacity-0, we can't
+                                         ; resolve it -> report it honestly, not garbage
     lea r13, [rdi + rsi]                  ; end
     lea rbx, [rdi + 2]                    ; cursor, past Insert-Count + Base
 .walk:
@@ -5282,6 +5295,9 @@ qpack_find_status:
     jae .found_adv
     movzx edx, byte [rbx + rcx]
     sub edx, '0'
+    cmp edx, 9
+    ja .dyntable                         ; non-digit: a Huffman-coded or otherwise
+                                         ; undecodable value, not a plain-ASCII status
     imul eax, eax, 10
     add eax, edx
     inc rcx
@@ -5315,6 +5331,12 @@ qpack_find_status:
     ret
 .none:
     mov rax, -1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.dyntable:
+    mov rax, -5                          ; QPACK dynamic table in use, not decodable
     pop r13
     pop r12
     pop rbx
@@ -7111,10 +7133,17 @@ probe_h3_handshake:
     mov edi, ebx
     call quic_h3_get                      ; rax = :status or -1
     mov r12, rax
+    ; 2xx = served OK (a positive lock). Any other served or undecodable status is
+    ; [info], not [DEV!]: a 3xx redirect is a valid response (google.com/ answers
+    ; 301), and "exactly 200" is Linnea-specific. Not every server's headers are
+    ; decodable capacity-0 either — Google encodes them with the QPACK dynamic table.
     mov dil, K_OK
     cmp rax, 200
-    je .rep4
-    mov dil, K_DEV
+    jl .get_info
+    cmp rax, 299
+    jle .rep4
+.get_info:
+    mov dil, K_INFO
 .rep4:
     lea rsi, [n_h3_get]
     mov edx, n_h3_get_len
