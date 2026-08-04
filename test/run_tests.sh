@@ -3087,6 +3087,26 @@ PYEOF
     grep -qE '"GET /api/simple HTTP/2" 200 ' "$LOG"
     check "http2 proxied request access-logged" $?
 
+    # h2-16 receive-window accounting: a request body costs the client both its
+    # stream and its connection flow-control window, and neither refills on its
+    # own. A body larger than the 65535-byte initial window therefore only
+    # completes if we credit the bytes back as WINDOW_UPDATE on the stream AND on
+    # stream 0 as they go upstream (h2p rq_credit). 300000 bytes needs the credit
+    # to keep coming ~5 times over, so a client that stops after one window — or a
+    # server that only credits the connection — hangs here rather than mismatching.
+    # The h1 upload case above covers the same relay over HTTP/1.1, which has no
+    # flow control, so this is the only place the h2 windows are exercised.
+    python3 -c "
+import random
+random.seed(12)
+open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in range(300000)))"
+    want=$(md5sum < test/www/h2upload.bin | cut -d' ' -f1)
+    curl -s --http2 --max-time 30 --cacert $CA --data-binary @test/www/h2upload.bin \
+        $U/api/echo > /tmp/h2upload_echo.bin
+    [ "$(md5sum < /tmp/h2upload_echo.bin | cut -d' ' -f1)" = "$want" ]
+    check "http2 streams a 300000-byte request body past the flow-control window" $?
+    rm -f /tmp/h2upload_echo.bin test/www/h2upload.bin
+
     # Body-phase slowloris (Q119): head_timeout used to stop at the request
     # head, so a client trickling a proxied request body — or sitting silent
     # on an h2 upload, dodging the idle timeout — held its upstream slot
