@@ -1024,6 +1024,7 @@ linnea_quic_server_datagram:
     ; it consumes, so a response larger than the initial window streams within it.
     ; Absent parameters mean zero (RFC 9000 18.2).
     mov qword [rbx + linnea_quic_conn.fc_stream_init], 0
+    mov qword [rbx + linnea_quic_conn.ms_uni_peer], 0
     mov qword [rbx + linnea_quic_conn.fc_conn_max], 0
     mov qword [rbx + linnea_quic_conn.fc_conn_sent], 0
     ; receive-side flow control (quic-9): we advertised initial_max_data as the
@@ -1036,10 +1037,12 @@ linnea_quic_server_datagram:
     test rdi, rdi
     jz .tp_recorded
     mov rsi, [ch_out + linnea_quic_ch.tp_len]
-    call linnea_quic_tp_parse        ; rax = max_data, rdx = max_stream_data
+    call linnea_quic_tp_parse        ; rax = max_data, rdx = max_stream_data,
+                                     ; r8 = initial_max_streams_uni
     mov rbx, [cur_conn]
     mov [rbx + linnea_quic_conn.fc_conn_max], rax
     mov [rbx + linnea_quic_conn.fc_stream_init], rdx   ; each new slot starts here
+    mov [rbx + linnea_quic_conn.ms_uni_peer], r8
 .tp_recorded:
     ; --- session resumption: accept the client's PSK offer if it is well-formed
     ; (psk_dhe_ke, our ticket, matching SNI, verifying binder). linnea_quic_hs_psk
@@ -1554,6 +1557,17 @@ linnea_quic_server_datagram:
     call linnea_quic_reset_token
     pop rcx
     add rcx, 4 + LINNEA_QUIC_SCID_LEN + 16   ; NEW_CONNECTION_ID frame length
+    ; The control and QPACK streams are three unidirectional streams, and RFC
+    ; 9000 4.6 is unconditional: "An endpoint MUST NOT open more streams than
+    ; allowed by the current stream limit set by its peer". This blob used to go
+    ; out for every connection without reading the client's
+    ; initial_max_streams_uni at all (quic-12), so a client granting fewer than
+    ; three got them anyway. A real HTTP/3 client grants far more, so this only
+    ; bites a peer that has asked us not to — and such a peer cannot do HTTP/3 as
+    ; RFC 9114 6.2.1 specifies either way; not opening them is the half that is
+    ; ours to get right.
+    cmp qword [rbx + linnea_quic_conn.ms_uni_peer], 3
+    jb .no_h3_uni
     lea rdi, [onertt_pay + rcx]
     lea rsi, [h3_uni_setup]
     push rcx
@@ -1561,6 +1575,7 @@ linnea_quic_server_datagram:
     rep movsb                        ; append the fixed control/QPACK stream setup
     pop rcx
     add rcx, h3_uni_setup_len
+.no_h3_uni:
     ; append a NewSessionTicket (post-handshake CRYPTO frame, RFC 9001 4.1.3) so
     ; the client can resume and, once 0-RTT lands, send early data next time.
     mov [s_pay_len], rcx

@@ -1865,7 +1865,9 @@ linnea_quic_build_transport_params:
     ret
 
 ; linnea_quic_tp_parse(rdi=params, rsi=len) -> rax = initial_max_data (0x04),
-; rdx = initial_max_stream_data_bidi_local (0x05); zero when absent — which is
+; rdx = initial_max_stream_data_bidi_local (0x05), r8 = initial_max_streams_uni
+; (0x09 — how many unidirectional streams the client lets us open at all, which
+; bounds the HTTP/3 control and QPACK streams); zero when absent — which is
 ; also what RFC 9000 18.2 says an omitted parameter means. These two bound what
 ; we may send on a client-initiated bidirectional stream (its response), so the
 ; server reads them from the client's transport parameters before it commits to
@@ -1884,6 +1886,7 @@ linnea_quic_tp_parse:
     lea r12, [rdi + rsi]             ; end
     xor r13d, r13d                   ; initial_max_data
     xor r14d, r14d                   ; initial_max_stream_data_bidi_local
+    xor r9d, r9d                     ; initial_max_streams_uni
 .tp_next:
     cmp rbx, r12
     jae .tp_done
@@ -1909,6 +1912,8 @@ linnea_quic_tp_parse:
     je .tp_value
     cmp r15, 0x05
     je .tp_value
+    cmp r15, 0x09
+    je .tp_value
     add rbx, rbp                     ; not one we read: skip its payload
     jmp .tp_next
 .tp_value:
@@ -1922,13 +1927,19 @@ linnea_quic_tp_parse:
     mov r13, rax
     jmp .tp_skip
 .tp_val05:
+    cmp r15, 0x05
+    jne .tp_val09
     mov r14, rax
+    jmp .tp_skip
+.tp_val09:
+    mov r9, rax
 .tp_skip:
     add rbx, rbp
     jmp .tp_next
 .tp_done:
     mov rax, r13
     mov rdx, r14
+    mov r8, r9                       ; initial_max_streams_uni
     add rsp, 8
     pop rbp
     pop r15

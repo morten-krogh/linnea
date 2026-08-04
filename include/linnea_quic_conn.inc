@@ -450,6 +450,11 @@ struc linnea_quic_conn
     ; within it rather than being refused. fc_stream_init is the per-stream initial
     ; applied to each new slot; fc_conn_sent is the running total sent conn-wide.
     .fc_stream_init: resq 1         ; the initial per-stream window (new slots start here)
+    ; How many unidirectional streams the client's transport parameters let us
+    ; open (initial_max_streams_uni). HTTP/3 wants three — control, QPACK encoder
+    ; and decoder — and RFC 9000 4.6 forbids opening more than the peer allows,
+    ; so a client that grants fewer gets none of them rather than a violation.
+    .ms_uni_peer:   resq 1
     .fc_conn_max:   resq 1          ; max total data the client will accept
     .fc_conn_sent:  resq 1          ; response-stream bytes sent against fc_conn_max
     ; receive side (quic-9): the peer is flow-controlled by initial_max_data, which

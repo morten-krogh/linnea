@@ -345,6 +345,10 @@ n_h3_nosig:   db "QUIC ClientHello without signature_algorithms -> aborted"
 n_h3_nosig_len equ $ - n_h3_nosig
 n_h3_sessid:  db "QUIC ServerHello echoes an empty legacy_session_id"
 n_h3_sessid_len equ $ - n_h3_sessid
+n_h3_uni0:    db "QUIC max_streams_uni=0 is honoured (no server uni stream)"
+n_h3_uni0_len equ $ - n_h3_uni0
+n_h3_mups:    db "QUIC max_udp_payload_size=1200 bounds the server's datagrams"
+n_h3_mups_len equ $ - n_h3_mups
 n_h3_notls13: db "QUIC ClientHello not offering TLS 1.3 -> aborted"
 n_h3_notls13_len equ $ - n_h3_notls13
 n_h3_badciph: db "QUIC ClientHello with no supported cipher -> aborted"
@@ -457,6 +461,8 @@ omit_sigalgs: resq 1                     ; tls-5 probe: drop signature_algorithm
 bad_version: resq 1                      ; tls-5 probe: offer only TLS 1.2
 bad_cipher:  resq 1                      ; tls-5 probe: offer a suite we lack
 bad_sessid:  resq 1                      ; §8.4 probe: send a non-empty legacy_session_id
+tp_variant:  resq 1                      ; quic-12 probes: 1 = max_streams_uni 0,
+                                         ; 2 = max_udp_payload_size 1200
 qch:        resb 2048                   ; the QUIC ClientHello handshake message
 qch_len:    resq 1
 qtp:        resb 512                    ; encoded client transport parameters
@@ -494,6 +500,7 @@ q_sh_sessid_len: resq 1                  ; the ServerHello's echoed legacy_sessi
 qhsc_fin_end: resq 1                    ; offset in qhsc just past the server Finished
 q_srv_scid: resb 20                     ; the server's chosen connection id (our DCID)
 q_srv_scid_len: resq 1
+q_srv_uni:   resq 1                      ; first server-initiated uni stream id seen (-1 = none)
 q_alt_cid:  resb 20                     ; a CID the server issued via NEW_CONNECTION_ID
 q_alt_cid_len: resq 1
 q_alt_cid_valid: resq 1                 ; 1 once we captured a NEW_CONNECTION_ID
@@ -4183,6 +4190,10 @@ quic_build_tp:
     mov rdi, rax
     mov esi, 0x03
     mov edx, 1472
+    cmp qword [tp_variant], 2             ; quic-12: smallest datagram the RFC allows
+    jne .tp_mups
+    mov edx, 1200
+.tp_mups:
     call tp_int                           ; max_udp_payload_size
     mov rdi, rax
     mov esi, 0x04
@@ -4207,6 +4218,10 @@ quic_build_tp:
     mov rdi, rax
     mov esi, 0x09
     mov edx, 100
+    cmp qword [tp_variant], 1             ; quic-12: forbid server uni streams
+    jne .tp_uni
+    xor edx, edx
+.tp_uni:
     call tp_int                           ; max_streams_uni
     mov rdi, rax
     mov esi, 0x0e
@@ -5062,9 +5077,16 @@ quic_recv_1rtt:
     call linnea_quic_unprotect_short      ; rax = frames (or -1)
     test rax, rax
     js .next
+    push rax                              ; frame length; the scanners clobber rax
+    push rax                              ; (twice: keep rsp 16-aligned)
     lea rdi, [qplain]                     ; capture a NEW_CONNECTION_ID if present
     mov rsi, rax
     call quic_scan_ncid
+    pop rax
+    pop rax
+    lea rdi, [qplain]                     ; the server's control / QPACK streams
+    mov rsi, rax                          ; ride this same packet
+    call quic_scan_srv_uni
     jmp .yes
 .next:
     dec r12d
@@ -6905,6 +6927,106 @@ quic_h3_find_maxdata:
     pop rbp
     ret
 
+; quic_h3_find_srv_uni(edi=fd) -> rax = the id of the first server-initiated
+; unidirectional stream the server opens, or -1 if it opens none. Server-uni ids
+; are those with (id & 3) == 3 (RFC 9000 2.1). Reads a few 1-RTT datagrams,
+; ACKing as it goes so the server keeps sending.
+quic_h3_find_srv_uni:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    and rsp, -16
+    mov ebx, edi
+    xor r15d, r15d                        ; expected pn for reconstruction
+    mov r12d, 10                          ; datagram budget
+.su_loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 2000
+    syscall
+    test rax, rax
+    jle .su_none
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle .su_none
+    mov rsi, rax
+    call quic_find_1rtt
+    test rax, rax
+    jz .su_next
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [q_ap_skeys]
+    lea rcx, [qplain]
+    mov r8d, 8
+    mov r9, r15
+    call linnea_quic_unprotect_short
+    test rax, rax
+    js .su_next
+    mov r15, rdx
+    push rax
+    lea rdi, [qpay]                       ; keep the server sending
+    mov rsi, r15
+    xor edx, edx
+    call quic_ack_frame
+    lea rdx, [qpay]
+    sub rax, rdx
+    mov rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    pop rax
+    lea r13, [qplain]
+    lea r14, [qplain]
+    add r14, rax
+.su_fr:
+    mov rdi, r13
+    mov rsi, r14
+    sub rsi, r13
+    jle .su_next
+    call linnea_quic_stream_frame         ; rax=data rdx=len r8=id r9=next
+    test rax, rax
+    jz .su_next
+    mov r13, r9
+    mov rax, r8
+    and rax, 3
+    cmp rax, 3                            ; server-initiated unidirectional?
+    jne .su_fr
+    cmp qword [q_srv_uni], -1
+    jne .su_have
+    mov [q_srv_uni], r8
+.su_have:
+    mov rax, r8                           ; found one: report its id
+    jmp .su_done
+.su_next:
+    dec r12d
+    jnz .su_loop
+.su_none:
+    mov rax, -1
+.su_done:
+    lea rsp, [rbp - 40]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
 ; probe_h3_maxdata (quic-9): a receiver must raise the peer's connection flow-
 ; control limit with MAX_DATA as it consumes, or the peer stalls at
 ; initial_max_data. Send one request and check the server grants credit. OK iff a
@@ -6985,6 +7107,40 @@ probe_h3_maxdata:
     mov edx, n_h3_maxdata_len
     call report_plain
     pop r14
+    pop rbx
+    ret
+
+; quic_scan_srv_uni(rdi=frames, rsi=len): record the first server-initiated
+; unidirectional stream ((id & 3) == 3, RFC 9000 2.1) these frames open, in
+; q_srv_uni. Called wherever 1-RTT frames are walked, because HTTP/3 servers
+; open their control / QPACK streams in the very packet that carries
+; HANDSHAKE_DONE — a scan that only starts afterwards never sees them.
+quic_scan_srv_uni:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    lea r13, [rdi + rsi]
+.su_scan:
+    mov rdi, r12
+    mov rsi, r13
+    sub rsi, r12
+    jle .su_scan_done
+    call linnea_quic_stream_frame         ; rax=data rdx=len r8=id r9=next
+    test rax, rax
+    jz .su_scan_done
+    mov r12, r9
+    mov rax, r8
+    and rax, 3
+    cmp rax, 3
+    jne .su_scan
+    cmp qword [q_srv_uni], -1             ; keep the first one seen
+    jne .su_scan
+    mov [q_srv_uni], r8
+    jmp .su_scan
+.su_scan_done:
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -7182,6 +7338,88 @@ probe_h3_sessid_echo:
     pop rbx
     ret
 
+; probe_h3_streams_uni (quic-12): a client that advertises
+; initial_max_streams_uni = 0 permits the server no unidirectional streams at
+; all, and RFC 9000 4.6 is unconditional — "An endpoint MUST NOT open more
+; streams than allowed by the current stream limit set by its peer". HTTP/3
+; wants a control stream, but the transport limit comes first: the server must
+; wait for credit (it may say STREAMS_BLOCKED) rather than open one anyway.
+; This is the client-observable half of quic-12 "almost no client transport
+; parameter honoured": the prober advertises the limit and watches the wire.
+; OK iff no server-initiated uni stream appears; DEV if one does.
+probe_h3_streams_uni:
+    push rbx
+    mov qword [q_srv_uni], -1             ; watch from the handshake onward: the
+                                          ; control / QPACK streams ride the same
+                                          ; packet as HANDSHAKE_DONE
+    mov qword [tp_variant], 1
+    call quic_h3_open                     ; full handshake under the tight limit
+    mov qword [tp_variant], 0             ; restore before any later probe builds a CH
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    ; ask for something, so a server that opens its control stream lazily still does
+    lea rdi, [fs_scratch]
+    mov byte [rdi], 0x00
+    mov byte [rdi + 1], 0x00
+    mov byte [rdi + 2], 0xd1              ; :method GET
+    mov byte [rdi + 3], 0xd7              ; :scheme https
+    mov byte [rdi + 4], 0xc1              ; :path /
+    mov byte [rdi + 5], 0x50              ; :authority literal, name ref static 0
+    add rdi, 6
+    mov rax, [host_len]
+    mov [rdi], al
+    inc rdi
+    mov rsi, [host_ptr]
+    mov rcx, [host_len]
+    rep movsb
+    lea rax, [fs_scratch]
+    mov r9, rdi
+    sub r9, rax                           ; field-section length
+    lea rdi, [qpay]
+    mov byte [rdi], 0x0b                  ; request STREAM(0), LEN, FIN
+    mov byte [rdi + 1], 0x00
+    lea rax, [r9 + 2]
+    mov [rdi + 2], al
+    mov byte [rdi + 3], 0x01              ; HEADERS
+    mov [rdi + 4], r9b
+    add rdi, 5
+    lea rsi, [fs_scratch]
+    mov rcx, r9
+    rep movsb
+    lea rax, [qpay]
+    mov rdx, rdi
+    sub rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_find_srv_uni             ; also records into q_srv_uni
+    mov edi, ebx
+    call close_fd
+    mov rax, [q_srv_uni]
+    cmp rax, -1
+    je .ok                                ; the limit was respected
+    mov dil, K_DEV
+    jmp .rep
+.ok:
+    mov dil, K_OK
+.rep:
+    lea rsi, [n_h3_uni0]
+    mov edx, n_h3_uni0_len
+    call report_plain
+    pop rbx
+    ret
+.fail:
+    ; refusing the connection outright is a legitimate answer to a limit we
+    ; cannot serve HTTP/3 under, and is not a deviation
+    mov dil, K_INFO
+    lea rsi, [n_h3_uni0]
+    mov edx, n_h3_uni0_len
+    call report_plain
+    pop rbx
+    ret
+
 ; h3_battery(): the HTTP/3 probe set.
 h3_battery:
     call probe_h3_handshake
@@ -7194,6 +7432,7 @@ h3_battery:
     call probe_h3_maxdata
     call probe_h3_newcid
     call probe_h3_sessid_echo
+    call probe_h3_streams_uni
     call probe_h3_no_sigalgs
     call probe_h3_no_tls13
     call probe_h3_bad_cipher
