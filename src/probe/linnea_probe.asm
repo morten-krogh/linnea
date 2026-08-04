@@ -7047,7 +7047,12 @@ probe_h3_handshake:
     mov dil, K_OK
     test r12, r12
     jnz .rep2
-    mov dil, K_DEV
+    ; The Initial already succeeded, so the server speaks QUIC; not decrypting the
+    ; full flight from here is a prober limitation (e.g. driving a large real
+    ; Handshake flight to completion), not a server deviation, so [info] not [DEV!].
+    ; (google.com exercises this: aioquic completes with our exact offer, but the
+    ; prober does not yet drive Google's ~5 KB flight to the server Finished.)
+    mov dil, K_INFO
 .rep2:
     lea rsi, [n_h3_flight]
     mov edx, n_h3_flight_len
