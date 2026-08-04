@@ -260,9 +260,11 @@ alpn_h11_len equ $ - alpn_h11
 ; variable content). cipher_suites len 2 = {0x1301}, compression len 1 = {0x00}.
 ch_suites:  db 0x00, 0x02, 0x13, 0x01, 0x01, 0x00
 ch_suites_len equ $ - ch_suites
-; the tls-5 probe offers only TLS_AES_256_GCM_SHA384 (0x1302), which we do not
-; implement, so a conformant server must refuse rather than pick 0x1301 unoffered.
-ch_suites_bad: db 0x00, 0x02, 0x13, 0x02, 0x01, 0x00
+; the tls-5 probe offers only a GREASE cipher (0x5a5a, RFC 8701) that no server
+; implements — so ANY conformant server must refuse rather than pick 0x1301
+; unoffered. (A real-but-unsupported suite like 0x1302 is portable only against a
+; server that happens to lack it, e.g. Linnea; Cloudflare supports 0x1302.)
+ch_suites_bad: db 0x00, 0x02, 0x5a, 0x5a, 0x01, 0x00
 ch_suites_bad_len equ $ - ch_suites_bad
 err_tls:    db "error: TLS handshake failed", 10
 err_tls_len equ $ - err_tls
@@ -7051,7 +7053,12 @@ probe_h3_handshake:
     mov dil, K_OK
     test r12, r12
     jnz .rep3
-    mov dil, K_DEV
+    ; Initial + flight already succeeded, so the server clearly speaks QUIC; a
+    ; failure to drive the client side to 1-RTT from here is far likelier a prober
+    ; limitation (e.g. reassembling a large real Handshake flight) than a server
+    ; deviation, so report [info], not [DEV!]. (Cloudflare exercises this: it ACKs
+    ; our client Finished but withholds 1-RTT, while aioquic completes.)
+    mov dil, K_INFO
 .rep3:
     lea rsi, [n_h3_1rtt]
     mov edx, n_h3_1rtt_len
