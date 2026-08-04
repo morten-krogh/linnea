@@ -427,7 +427,8 @@ linnea_qpack_encode_response:
 .no_allow:
     ; --- validators, when the serve path computed them for this response ---
     cmp qword [linnea_qpack_send_validators], 0
-    je .no_validators
+    je .vary_only                    ; no validators: an error response, but a
+                                     ; 404 still has to carry Vary (see below)
     cmp r12d, 304
     je .no_aranges                   ; a 304 restates no accept-ranges
     mov rdi, rbx
@@ -487,6 +488,20 @@ linnea_qpack_encode_response:
     call qenc_str
     mov rbx, rdi
 .no_ccontrol:
+.vary_only:
+    ; A static path is content-negotiated even when it misses: a ".br" with no
+    ; plain file beside it is served to whoever takes the encoding and 404s
+    ; everyone else, so without Vary a shared cache stores this 404 under the
+    ; bare URL and then hands it to the very clients the variant was for
+    ; (h1-15's sibling on h3). Only the 404 needs it — 400/405/421/431/503 do
+    ; not depend on Accept-Encoding, and saying they do would split their cache
+    ; entries for nothing.
+    cmp r12d, 404
+    jne .no_validators
+    mov rdi, rbx
+    mov byte [rdi], 0xc0 | 59        ; vary: accept-encoding — indexed, static
+    inc rdi
+    mov rbx, rdi
 .no_validators:
     ; --- the vhost's security headers, on every response ---
     cmp qword [linnea_qpack_nosniff], 0

@@ -133,6 +133,18 @@ resp_404:       db "HTTP/1.1 404 Not Found", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_404_len    equ $ - resp_404
+; The same 404 for a static path, which is content-negotiated even when it
+; misses: a ".br" with no plain file beside it is served to whoever takes the
+; encoding and 404s everyone else, so without Vary a shared cache stores this
+; 404 under the bare URL and then hands it to the very clients the variant was
+; for (h1-15). The negotiated 200 already carries the header; the miss has to
+; agree with it or the two responses are not interchangeable to a cache.
+resp_404_vary:  db "HTTP/1.1 404 Not Found", 13, 10
+                db "Server: linnea", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Vary: Accept-Encoding", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_404_vary_len equ $ - resp_404_vary
 ; "OPTIONS *": what this server supports, as a whole. Bodiless, like every
 ; other canned response.
 ;
@@ -1783,7 +1795,7 @@ linnea_http_handle:
     mov rdi, r13
     call .open_regular
     test eax, eax
-    js .resp_404
+    js .resp_404_vary          ; a negotiated miss: the 404 carries Vary (h1-15)
 .have_file:
     mov [rsp + 56], rax        ; fd; statbuf describes the file we opened
     mov rax, [statbuf + LINNEA_STAT_ST_SIZE]
@@ -2493,6 +2505,12 @@ linnea_http_handle:
     mov rdi, [rsp + 56]
     mov eax, LINNEA_SYS_CLOSE
     syscall
+.resp_404_vary:
+    ; a static path that missed: negotiated, so it must carry Vary (h1-15)
+    lea rax, [resp_404_vary]
+    mov ecx, resp_404_vary_len
+    mov qword [rsp + 112], 404
+    jmp .resp_static
 .resp_404:
     lea rax, [resp_404]
     mov ecx, resp_404_len

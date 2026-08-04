@@ -1254,6 +1254,19 @@ resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:47080/enc
 check_http "type ignores the suffix" "Content-Type: text/plain" "$resp"
 check_http "variant length"          "Content-Length: 10" "$resp"
 check_http "variant vary"            "Vary: Accept-Encoding" "$resp"
+# h1-15: a variant with no plain file beside it is served to whoever takes the
+# encoding and 404s everyone else, so the miss is content-negotiated too. If
+# that 404 omits Vary, a shared cache stores it under the bare URL and then
+# hands it to the very clients the variant was for — the 200 becomes
+# unreachable through the cache. Both answers must agree on Vary.
+printf 'br only payload' > test/www/varonly.txt.br
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:47080/varonly.txt)
+check_http "variant-only file served to a br client" "HTTP/1.1 200" "$resp"
+check_http "variant-only 200 varies"                 "Vary: Accept-Encoding" "$resp"
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: identity' http://127.0.0.1:47080/varonly.txt)
+check_http "variant-only 404s a client that cannot take it" "HTTP/1.1 404" "$resp"
+check_http "that 404 varies too (h1-15)"                    "Vary: Accept-Encoding" "$resp"
+rm -f test/www/varonly.txt.br
 # curl decoding the real gzip end to end
 [ "$(curl -s --max-time 2 --compressed -H 'Accept-Encoding: gzip' http://127.0.0.1:47080/enc.txt)" = "gzip payload" ]
 check "gzip variant decodes" $?

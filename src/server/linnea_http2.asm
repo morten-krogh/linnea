@@ -2125,6 +2125,18 @@ h2_serve:
     mov ecx, allow_val_h2_len
     call h2_enc_hdr
 .no_allow_h2:
+    ; a static path is content-negotiated even when it misses: a ".br" with no
+    ; plain file beside it is served to whoever takes the encoding and 404s
+    ; everyone else, so without Vary a shared cache stores this 404 under the
+    ; bare URL and hands it to the very clients the variant was for (h1-15's
+    ; sibling on h2). The negotiated 200 emits the same header at index 59.
+    cmp qword [rsp + S_LSTAT], 404
+    jne .no_vary_h2
+    mov esi, 59                      ; vary: accept-encoding
+    lea rdx, [h2_ae_name]
+    mov ecx, h2_ae_name_len
+    call h2_enc_hdr
+.no_vary_h2:
     call h2_enc_date_server
     mov rbp, rdi
     sub rbp, r13                     ; payload length
