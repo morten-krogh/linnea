@@ -481,6 +481,11 @@ q_hs_ready: resq 1                      ; 1 once Handshake keys are derived
 q_init_largest: resq 1                  ; largest Initial pn the server sent
 q_hs_largest:   resq 1                  ; largest Handshake pn the server sent
 q_hs_smallest:  resq 1                  ; smallest Handshake pn seen (-1 = none yet)
+q_ap_largest:   resq 1                  ; largest 1-RTT pn the server sent
+q_ap_smallest:  resq 1                  ; smallest 1-RTT pn seen (-1 = none yet)
+h3req:      resb 256                    ; the request packet payload, kept for retransmit
+h3req_len:  resq 1
+h3req_tries: resq 1                     ; remaining request retransmissions
 q_fin_seen: resq 1                      ; 1 once the server Finished is reassembled
 q_pkt_type: resq 1                      ; the long-header type of the packet being walked
 q_sh_ptr:   resq 1                      ; ServerHello handshake message ptr/len
@@ -5225,6 +5230,93 @@ qpack_status_lookup:
     mov rax, -1
     ret
 
+; huff_status_decode(rdi=huffman bytes, rsi=len) -> rax = 3-digit status, or -1.
+; A :status value is three ASCII digits, so only the digit codes of the HPACK /
+; QPACK Huffman alphabet are needed (RFC 7541 Appendix B). They are NOT uniform:
+; '0','1','2' are five bits (0b00000..0b00010) while '3'..'9' are six
+; (0b011001..0b011111). Read MSB-first, trying a 5-bit code before a 6-bit one;
+; anything else — including the all-ones padding tail — ends the value.
+; Google Huffman-codes its status ("301" is the two bytes 0x64 0x01).
+huff_status_decode:
+    push rbx
+    push r12
+    push r13
+    lea r13, [rdi + rsi]                  ; end of the value
+    mov r12, rdi                          ; byte cursor
+    xor r10d, r10d                        ; bit accumulator
+    xor r11d, r11d                        ; bits currently held
+    xor eax, eax                          ; status being accumulated
+    xor ebx, ebx                          ; digits decoded
+.hsd_fill:
+    cmp r11d, 6                           ; keep 6 bits buffered: the longest code
+    jae .hsd_have
+    cmp r12, r13
+    jae .hsd_tail                         ; no bytes left; a short tail may still hold
+    movzx edx, byte [r12]                 ; one last 5-bit code
+    inc r12
+    shl r10d, 8
+    or r10d, edx
+    add r11d, 8
+    jmp .hsd_fill
+.hsd_have:
+    mov ecx, r11d                         ; peek the top 5 bits
+    sub ecx, 5
+    mov edx, r10d
+    shr edx, cl
+    and edx, 0x1f
+    cmp edx, 2                            ; 0b00000..0b00010 = '0','1','2'
+    jbe .hsd_five
+    mov ecx, r11d                         ; not a 5-bit digit: peek 6 bits
+    sub ecx, 6
+    mov edx, r10d
+    shr edx, cl
+    and edx, 0x3f
+    cmp edx, 0x19                         ; 0b011001 = '3'
+    jb .hsd_done
+    cmp edx, 0x1f                         ; 0b011111 = '9'
+    ja .hsd_done
+    sub edx, 0x19 - 3                     ; code 0x19..0x1f -> digit 3..9
+    sub r11d, 6
+    jmp .hsd_acc
+.hsd_five:
+    sub r11d, 5
+.hsd_acc:
+    imul eax, eax, 10
+    add eax, edx
+    inc ebx
+    cmp ebx, 3                            ; a status is exactly three digits
+    jb .hsd_fill
+    jmp .hsd_done
+.hsd_tail:
+    cmp r11d, 5                           ; fewer than 6 bits buffered and no more
+    jb .hsd_done                          ; bytes: only a 5-bit code can still fit
+    mov ecx, r11d
+    sub ecx, 5
+    mov edx, r10d
+    shr edx, cl
+    and edx, 0x1f
+    cmp edx, 2
+    ja .hsd_done                          ; padding (all ones) or a longer code
+    sub r11d, 5
+    imul eax, eax, 10
+    add eax, edx
+    inc ebx
+    cmp ebx, 3
+    jb .hsd_tail
+.hsd_done:
+    cmp ebx, 3
+    jne .hsd_fail
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.hsd_fail:
+    mov rax, -1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; qpack_find_status(rdi=field section, rsi=len) -> rax = :status, or -1.
 ; A capacity-0 QPACK decoder: skips the 2-byte prefix, then walks field lines
 ; (indexed / literal-with-name-ref / literal-with-literal-name) for :status.
@@ -5281,13 +5373,19 @@ qpack_find_status:
     mov r8, rax                          ; name index
     cmp rbx, r13
     jae .none
-    movzx r9d, byte [rbx]                 ; value length (H=0 assumed)
+    movzx r9d, byte [rbx]                 ; value: H (Huffman) bit + 7-bit length
+    mov r10d, r9d
+    and r10d, 0x80
     and r9d, 0x7f
     inc rbx
     test r12d, r12d
     jz .skipval
-    cmp r8, 24                            ; :status name reference?
-    jne .skipval
+    cmp r8, 24                            ; static entries 24..28 (":status 103",
+    jb .skipval                          ; 200, 304, 404, 503) all carry the
+    cmp r8, 28                           ; ":status" name
+    ja .skipval
+    test r10d, r10d
+    jnz .huffval                         ; Huffman-coded value (Google sends one)
     xor eax, eax
     xor ecx, ecx
 .digit:
@@ -5303,6 +5401,14 @@ qpack_find_status:
     inc rcx
     jmp .digit
 .found_adv:
+    add rbx, r9
+    jmp .found
+.huffval:
+    mov rdi, rbx
+    mov rsi, r9
+    call huff_status_decode              ; rax = status | -1
+    cmp rax, -1
+    je .dyntable                         ; not three digits: report it undecodable
     add rbx, r9
     jmp .found
 .skipval:
@@ -5439,11 +5545,26 @@ quic_h3_get:
     lea rax, [qpay]
     mov rdx, rdi
     sub rdx, rax                         ; payload length
+    ; keep the request payload so it can be retransmitted: qpay is reused for the
+    ; ACKs we send while reading, and QUIC gives us no retransmission for free
+    mov [h3req_len], rdx
+    push rdx
+    lea rdi, [h3req]
+    lea rsi, [qpay]
+    mov rcx, rdx
+    rep movsb
+    pop rdx
     mov edi, ebx
     lea rsi, [qpay]
     call quic_send_1rtt
     ; --- read 1-RTT packets, reassemble stream 0, decode :status ---
-    mov r12d, 6                          ; datagram budget
+    ; A large response (Google's HEADERS block is ~371 bytes) is paced across
+    ; several 1-RTT packets on the client's acknowledgements, so ACK each round
+    ; rather than reading passively — otherwise only the first packet ever arrives.
+    mov r12d, 15                         ; datagram budget
+    mov qword [q_ap_largest], -1
+    mov qword [q_ap_smallest], -1
+    mov qword [h3req_tries], 3           ; request retransmissions before giving up
 .loop:
     mov [pollfd], ebx
     mov word [pollfd + 4], LINNEA_POLLIN
@@ -5454,7 +5575,7 @@ quic_h3_get:
     mov edx, 2000
     syscall
     test rax, rax
-    jle .fail
+    jle .stall
     mov eax, LINNEA_SYS_RECVFROM
     mov edi, ebx
     lea rsi, [qrx]
@@ -5474,10 +5595,19 @@ quic_h3_get:
     lea rdx, [q_ap_skeys]
     lea rcx, [qplain]
     mov r8d, 8
-    mov r9, [q_cli_ap_pn]                 ; a nearby expected pn for reconstruction
-    call linnea_quic_unprotect_short      ; rax = frame bytes
+    mov r9, [q_ap_largest]                ; expected pn = largest server pn seen + 1
+    inc r9                                ; (-1 "none yet" becomes 0)
+    call linnea_quic_unprotect_short      ; rax = frame bytes, rdx = pn
     test rax, rax
     js .next
+    cmp rdx, [q_ap_largest]               ; track the server's 1-RTT pn range so the
+    jle .ap_max_done                      ; ACK covers exactly what we received
+    mov [q_ap_largest], rdx
+.ap_max_done:
+    cmp qword [q_ap_smallest], -1
+    jne .ap_min_done
+    mov [q_ap_smallest], rdx
+.ap_min_done:
     ; walk STREAM frames; accumulate stream-0 data into h3buf
     lea r13, [qplain]                     ; frame cursor
     mov r14, rax                          ; frames length
@@ -5502,12 +5632,41 @@ quic_h3_get:
     rep movsb
     jmp .frames
 .decode:
+    ; acknowledge what arrived so the server releases the rest of the response
+    cmp qword [q_ap_largest], 0
+    jl .decode_parse                      ; nothing decrypted yet
+    lea rdi, [qpay]
+    mov rsi, [q_ap_largest]
+    mov rdx, [q_ap_smallest]
+    call quic_ack_frame
+    lea rdx, [qpay]
+    sub rax, rdx
+    mov rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+.decode_parse:
     lea rdi, [h3buf]
     mov rsi, [h3buf_len]
     call parse_h3_headers                 ; rax = status or -1
     cmp rax, -1
     jne .done
 .next:
+    dec r12d
+    jnz .loop
+    jmp .fail
+.stall:
+    ; Nothing arrived in the poll window. QUIC gives no retransmission for free, so
+    ; resend the request: it may have been lost, or discarded because we sent it
+    ; before the server had finished its side of the handshake (a 1-RTT packet that
+    ; early is dropped). Servers that answer promptly never reach here.
+    cmp qword [h3req_tries], 0
+    jle .fail
+    dec qword [h3req_tries]
+    mov edi, ebx
+    lea rsi, [h3req]
+    mov rdx, [h3req_len]
+    call quic_send_1rtt
     dec r12d
     jnz .loop
 .fail:
