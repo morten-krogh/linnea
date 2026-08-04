@@ -1249,6 +1249,22 @@ check "q=0 falls back to gzip" $?
 check "a small q still accepts" $?
 [ -z "$(enc_of 'br;q=0.000')" ]
 check "q=0.000 refuses too" $?
+# h1-14: RFC 9110 5.3 makes repeated field lines equivalent to the comma-joined
+# value, so a client may split its codings over several Accept-Encoding lines.
+# Taking only the first dropped every coding after it — "identity" then "br"
+# served the plain file. Each line is now its own span and a coding is taken if
+# any of them accepts it, which is the answer joining them would have given.
+enc_of2() {
+    curl -si --max-time 2 -H "Accept-Encoding: $1" -H "Accept-Encoding: $2" \
+        http://127.0.0.1:47080/enc.txt \
+        | grep -ai '^content-encoding' | tr -d '\r' | sed 's/.*: //'
+}
+[ "$(enc_of2 'identity' 'br')" = "br" ]
+check "split accept-encoding: the second line is honoured" $?
+[ "$(enc_of2 'identity' 'gzip')" = "gzip" ]
+check "split accept-encoding: gzip on the second line" $?
+[ "$(enc_of2 'gzip' 'br')" = "br" ]
+check "split accept-encoding: br still preferred over gzip" $?
 # the type comes from the name before the suffix, not from ".br"
 resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:47080/enc.txt)
 check_http "type ignores the suffix" "Content-Type: text/plain" "$resp"
@@ -3099,6 +3115,12 @@ PYEOF
     check "http2 static request access-logged" $?
     grep -qE '"GET /api/simple HTTP/2" 200 ' "$LOG"
     check "http2 proxied request access-logged" $?
+
+    # h2-14: a GOAWAY from the client announces it will open no NEW streams; the
+    # ones already running still have to be finished (RFC 9113 6.8). Closing on
+    # receipt threw away a response that was already in flight.
+    timeout 30 python3 test/tls/h2_goaway_inflight.py $CA 47443 >/dev/null 2>&1
+    check "http2 client GOAWAY still finishes the in-flight response" $?
 
     # h2-16 receive-window accounting: a request body costs the client both its
     # stream and its connection flow-control window, and neither refills on its

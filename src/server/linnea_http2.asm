@@ -678,8 +678,17 @@ linnea_h2_handle:
     add r12, r11
     jmp .frames
 .f_goaway:
+    ; RFC 9113 6.8: GOAWAY says the peer will open no NEW streams — it does not
+    ; abandon the ones already running, and "allows an endpoint to gracefully
+    ; stop accepting new streams while still finishing processing of previously
+    ; established streams". Closing the connection here threw away a response
+    ; that was already in flight (h2-14). Put the connection in the same
+    ; DRAINING state the worker-drain path uses: new streams are refused there
+    ; already, and linnea_h2_after_send closes once the stream pool empties.
+    ; Keep walking the buffer — frames for the open streams may follow this one.
     add r12, r11
-    jmp .close                       ; peer is going away
+    mov qword [rbx + linnea_connection.h2_state], LINNEA_H2_DRAINING
+    jmp .frames
 ; Typed entries to the GOAWAY below. RFC 9113 names a specific code for most of
 ; these faults, and every one of them used to arrive here as PROTOCOL_ERROR
 ; because the reason was not threaded through. It matters on the wire: a peer
@@ -4816,6 +4825,14 @@ linnea_h2_after_send:
     jnz .send
     cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_CLOSING
     je .close
+    ; A peer that sent us GOAWAY is draining without the worker being: finish
+    ; what is open, then close, rather than waiting for the idle timeout (h2-14).
+    cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_DRAINING
+    jne .more
+    mov rdi, rbx
+    call h2_pool_active
+    test rax, rax
+    jz .close                        ; nothing left in flight: done
 .more:
     mov eax, LINNEA_H2_MORE
     jmp .aret

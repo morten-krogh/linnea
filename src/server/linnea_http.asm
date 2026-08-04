@@ -726,7 +726,9 @@ linnea_http_handle:
     push r13
     push r14
     push r15
-    sub rsp, 352               ; +32 for the two precondition fields
+    sub rsp, 416               ; +32 for the two precondition fields, +64 for the
+                               ; Accept-Encoding span array (h1-14): [352] holds
+                               ; three (ptr,len) pairs, [400] the scan index
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -743,7 +745,7 @@ linnea_http_handle:
     mov qword [rsp + 144], 0   ; no raw target yet
     mov qword [rsp + 176], 0   ; no If-None-Match yet
     mov qword [rsp + 192], 0   ; no If-Modified-Since yet
-    mov qword [rsp + 208], 0   ; no Accept-Encoding yet
+    mov qword [rsp + 208], 0   ; no Accept-Encoding lines yet (a count, h1-14)
     mov qword [rsp + 224], 0   ; nothing negotiated
     mov qword [rsp + 232], 0   ; no upgrade asked
     mov qword [rbx + linnea_connection.conn_opts], 0      ; no Connection field yet
@@ -1267,12 +1269,25 @@ linnea_http_handle:
     mov [rsp + 200], rax
     jmp .header_next
 .ae_header:
-    cmp qword [rsp + 208], 0
-    jne .header_next
-    mov rax, [rsp + 72]
-    mov [rsp + 208], rax
-    mov rax, [rsp + 80]
-    mov [rsp + 216], rax
+    ; RFC 9110 5.3: repeated field lines of a list-based field are equivalent to
+    ; the comma-joined value, so a client may split its codings over several
+    ; Accept-Encoding lines. Keeping only the first one (h1-14) silently dropped
+    ; every coding after it — "Accept-Encoding: identity" then ".. : br" served
+    ; the plain file. Record each line as its own (ptr,len) span instead; the
+    ; negotiation below tries them all, which is the same answer as joining them
+    ; without having to copy the values anywhere. Three spans is far more than a
+    ; real client sends; further lines are ignored rather than growing the frame.
+    mov rcx, [rsp + 208]       ; spans recorded so far
+    cmp rcx, 3
+    jae .header_next
+    shl rcx, 4                 ; -> byte offset of this span in the array
+    lea rax, [rsp + 352]
+    add rax, rcx
+    mov rdx, [rsp + 72]        ; value ptr
+    mov [rax], rdx
+    mov rdx, [rsp + 80]        ; value len
+    mov [rax + 8], rdx
+    inc qword [rsp + 208]
     jmp .header_next
 .range_header:                 ; first occurrence wins, as for Host
     cmp qword [rsp + 240], 0
@@ -1760,13 +1775,24 @@ linnea_http_handle:
     ; at r15, so the name before it stays intact for the MIME lookup.
     cmp qword [rsp + 208], 0
     je .open_plain             ; no Accept-Encoding: nothing to negotiate
-    mov rdi, [rsp + 208]
-    mov rsi, [rsp + 216]
+    ; each Accept-Encoding line is its own span (h1-14): the coding is taken if
+    ; ANY of them accepts it, which is what joining the lines would have said.
+    mov qword [rsp + 400], 0
+.br_span:
+    mov rcx, [rsp + 400]
+    cmp rcx, [rsp + 208]
+    jae .try_gzip              ; no line accepts br
+    shl rcx, 4
+    lea rax, [rsp + 352]
+    add rax, rcx
+    mov rdi, [rax]
+    mov rsi, [rax + 8]
     lea rdx, [enc_br]
     mov ecx, enc_br_len
     call linnea_http_ae_accepts
+    inc qword [rsp + 400]
     test eax, eax
-    jz .try_gzip
+    jz .br_span
     mov dword [r15], '.br'     ; three bytes and the NUL
     mov rdi, r13
     call .open_regular
@@ -1775,13 +1801,22 @@ linnea_http_handle:
     mov qword [rsp + 224], 2
     jmp .have_file
 .try_gzip:
-    mov rdi, [rsp + 208]
-    mov rsi, [rsp + 216]
+    mov qword [rsp + 400], 0
+.gz_span:
+    mov rcx, [rsp + 400]
+    cmp rcx, [rsp + 208]
+    jae .open_plain            ; no line accepts gzip
+    shl rcx, 4
+    lea rax, [rsp + 352]
+    add rax, rcx
+    mov rdi, [rax]
+    mov rsi, [rax + 8]
     lea rdx, [enc_gzip]
     mov ecx, enc_gzip_len
     call linnea_http_ae_accepts
+    inc qword [rsp + 400]
     test eax, eax
-    jz .open_plain
+    jz .gz_span
     mov dword [r15], '.gz'
     mov rdi, r13
     call .open_regular
@@ -2642,7 +2677,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 352
+    add rsp, 416
     pop r15
     pop r14
     pop r13
