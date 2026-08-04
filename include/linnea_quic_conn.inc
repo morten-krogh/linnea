@@ -460,6 +460,14 @@ struc linnea_quic_conn
     ; rather than being assumed from our own defaults.
     .ack_exp_peer:  resq 1
     .max_ack_peer:  resq 1
+    ; The effective idle window for THIS connection, in seconds. RFC 9000 10.1:
+    ; "the effective value ... is computed as the minimum of the two advertised
+    ; values", so a client that says it will forget us sooner than our own
+    ; LINNEA_QUIC_IDLE_SECS gets its slot reclaimed at its number, not ours. Set
+    ; to our default at allocation and narrowed once the client's transport
+    ; parameters are read; a peer that omits the parameter (or sends 0) imposes
+    ; no limit of its own and leaves ours standing.
+    .idle_secs:     resq 1
     .fc_conn_max:   resq 1          ; max total data the client will accept
     .fc_conn_sent:  resq 1          ; response-stream bytes sent against fc_conn_max
     ; receive side (quic-9): the peer is flow-controlled by initial_max_data, which

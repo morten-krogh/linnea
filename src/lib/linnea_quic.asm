@@ -27,6 +27,7 @@ global linnea_quic_pto_ms
 global linnea_quic_ack_delay
 global linnea_quic_tp_ack_exp
 global linnea_quic_tp_max_ack
+global linnea_quic_tp_idle_ms
 global linnea_quic_ack_delay_ms
 global linnea_quic_build_ack
 global linnea_quic_ack_ranges
@@ -1920,6 +1921,7 @@ linnea_quic_tp_parse:
     xor r9d, r9d                     ; initial_max_streams_uni
     mov qword [linnea_quic_tp_ack_exp], 3    ; RFC 9000 18.2 defaults, in case the
     mov qword [linnea_quic_tp_max_ack], 25   ; peer omits either parameter
+    mov qword [linnea_quic_tp_idle_ms], 0    ; absent == no limit from the peer
 .tp_next:
     cmp rbx, r12
     jae .tp_done
@@ -1951,6 +1953,8 @@ linnea_quic_tp_parse:
     je .tp_value
     cmp r15, 0x0b
     je .tp_value
+    cmp r15, 0x01
+    je .tp_value
     add rbx, rbp                     ; not one we read: skip its payload
     jmp .tp_next
 .tp_value:
@@ -1970,8 +1974,13 @@ linnea_quic_tp_parse:
     jmp .tp_skip
 .tp_val09:
     cmp r15, 0x09
-    jne .tp_val0a
+    jne .tp_val01
     mov r9, rax
+    jmp .tp_skip
+.tp_val01:
+    cmp r15, 0x01
+    jne .tp_val0a
+    mov [linnea_quic_tp_idle_ms], rax
     jmp .tp_skip
 .tp_val0a:
     cmp r15, 0x0a
@@ -3488,6 +3497,9 @@ linnea_quic_retry_scid_len: resq 1
 linnea_quic_ack_delay:  resq 1
 linnea_quic_tp_ack_exp: resq 1     ; peer's ack_delay_exponent (default 3)
 linnea_quic_tp_max_ack: resq 1     ; peer's max_ack_delay in ms (default 25)
+linnea_quic_tp_idle_ms: resq 1     ; peer's max_idle_timeout in ms (0 = absent,
+                                   ; which RFC 9000 10.1 reads as "no limit from
+                                   ; that side" rather than "expire immediately")
 linnea_quic_path_seen:  resq 1
 linnea_quic_path_data:  resb 8
 tp_srt:                 resb 16    ; stateless_reset_token scratch for the tp build

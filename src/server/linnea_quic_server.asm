@@ -121,6 +121,7 @@ extern linnea_quic_ack_delay
 extern linnea_quic_ack_delay_ms
 extern linnea_quic_tp_ack_exp
 extern linnea_quic_tp_max_ack
+extern linnea_quic_tp_idle_ms
 extern linnea_quic_rtx_sent_ms
 extern linnea_quic_build_ack
 extern linnea_quic_ack_ranges
@@ -1052,6 +1053,28 @@ linnea_quic_server_datagram:
     mov [rbx + linnea_quic_conn.ack_exp_peer], rax   ; is what decodes its ACKs
     mov rax, [linnea_quic_tp_max_ack]
     mov [rbx + linnea_quic_conn.max_ack_peer], rax
+    ; RFC 9000 10.1: the effective idle timeout is the minimum of the two
+    ; advertised values, and a peer that omits it (or sends 0) imposes none. We
+    ; advertise LINNEA_QUIC_IDLE_SECS; a client that will forget us sooner gets
+    ; its slot reclaimed at its number instead of ours. Round the peer's
+    ; milliseconds up to whole seconds — the sweep's granularity — and never
+    ; below one, so a tiny value cannot reclaim a connection the instant it is
+    ; made.
+    mov rax, [linnea_quic_tp_idle_ms]
+    test rax, rax
+    jz .idle_done                    ; absent or 0: ours stands
+    add rax, 999
+    xor edx, edx
+    mov rcx, 1000
+    div rcx                          ; -> seconds, rounded up
+    test rax, rax
+    jnz .idle_floor
+    mov eax, 1
+.idle_floor:
+    cmp rax, LINNEA_QUIC_IDLE_SECS
+    jae .idle_done                   ; longer than ours: the minimum is ours
+    mov [rbx + linnea_quic_conn.idle_secs], rax
+.idle_done:
 .tp_recorded:
     ; --- session resumption: accept the client's PSK offer if it is well-formed
     ; (psk_dhe_ke, our ticket, matching SNI, verifying binder). linnea_quic_hs_psk

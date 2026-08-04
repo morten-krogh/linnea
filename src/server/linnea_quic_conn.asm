@@ -154,6 +154,7 @@ linnea_quic_conn_alloc:
     mov ecx, linnea_quic_conn_size
     rep stosb
     mov qword [rbx + linnea_quic_conn.in_use], 1
+    mov qword [rbx + linnea_quic_conn.idle_secs], LINNEA_QUIC_IDLE_SECS
     mov qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_NEW
     ; connection id = steering index || pool index || 6 random bytes. The
     ; steering index routes the connection back to this worker (BPF reuseport);
@@ -224,7 +225,16 @@ linnea_quic_conn_sweep:
                                      ; reclaim a live connection
     ; an established connection gets the full idle window; one still handshaking
     ; gets a much shorter one (see LINNEA_QUIC_HS_IDLE_SECS)
+    ; the caller's window is the ceiling; this connection may have agreed a
+    ; shorter one with its peer (RFC 9000 10.1, .idle_secs)
     mov rdx, rsi
+    mov r8, [rbx + linnea_quic_conn.idle_secs]
+    test r8, r8
+    jz .sw_have_window               ; unset (an older slot): keep the ceiling
+    cmp r8, rdx
+    jae .sw_have_window
+    mov rdx, r8
+.sw_have_window:
     cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
     je .sw_window
     cmp rdx, LINNEA_QUIC_HS_IDLE_SECS

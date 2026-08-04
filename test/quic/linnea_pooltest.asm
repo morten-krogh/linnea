@@ -131,6 +131,49 @@ _start:
     call linnea_quic_conn_active
     EXPECT rax, 1
 
+    ; --- the peer's max_idle_timeout shortens the window (quic-12) ---
+    ; RFC 9000 10.1 makes the effective idle timeout the minimum of the two
+    ; advertised values. A slot carries the agreed window in .idle_secs; the
+    ; sweep used to ignore it and apply our LINNEA_QUIC_IDLE_SECS to everyone,
+    ; so a client that had told us it would forget the connection in a few
+    ; seconds still held a slot for the full thirty.
+    ; The live slot from above is our subject: give it a 5-second window and a
+    ; last_active of 0, then sweep at "now" values either side of it.
+    ; clear the pool, then take a slot of our own so the pointer is in hand
+    mov rdi, 1 << 30
+    mov esi, LINNEA_QUIC_IDLE_SECS
+    call linnea_quic_conn_sweep
+    lea rdi, [peer]
+    mov esi, 16
+    call linnea_quic_conn_alloc
+    mov rbx, rax
+    mov qword [rbx + linnea_quic_conn.idle_secs], 5
+    mov qword [rbx + linnea_quic_conn.last_active], 0
+    mov qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
+    mov rdi, 4                       ; inside the agreed 5s: survives
+    mov esi, LINNEA_QUIC_IDLE_SECS
+    call linnea_quic_conn_sweep
+    EXPECT rax, 0
+    mov rdi, 9                       ; past 5s but well inside our own 30s:
+    mov esi, LINNEA_QUIC_IDLE_SECS   ; the peer's number is the one that binds
+    call linnea_quic_conn_sweep
+    EXPECT rax, 1
+    call linnea_quic_conn_active
+    EXPECT rax, 0
+
+    ; --- and a peer window LONGER than ours does not extend ours ---
+    lea rdi, [peer]
+    mov esi, 16
+    call linnea_quic_conn_alloc
+    mov rbx, rax
+    mov qword [rbx + linnea_quic_conn.idle_secs], 300   ; the min() is still ours
+    mov qword [rbx + linnea_quic_conn.last_active], 0
+    mov qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
+    mov rdi, LINNEA_QUIC_IDLE_SECS + 1
+    mov esi, LINNEA_QUIC_IDLE_SECS
+    call linnea_quic_conn_sweep
+    EXPECT rax, 1
+
     ; print "quic-pool <pass>/<total>\n"
     lea rdi, [msg_head]
     mov esi, msg_head_len
