@@ -48,6 +48,73 @@ check() {
 # so an attack test compares this before and after: any change is a crash.
 workers_of() { pgrep -P "$1" 2>/dev/null | sort | tr '\n' ' '; }
 
+# Every long-running server this run starts, so none is left behind. A server
+# that outlives its run holds its port, the NEXT run's server then cannot bind
+# and exits at once, and that run's tests quietly exercise the stale server
+# instead -- passing, while any check that inspects the process measures a pid
+# that is already gone. The condition sustains itself once it starts, so the
+# cure is not leaving them in the first place.
+SERVERS=""
+cleanup_servers() {
+    local p
+    for p in $SERVERS; do kill $p 2>/dev/null; done
+}
+trap cleanup_servers EXIT
+
+# start_server <config> — start a long-running test server and PROVE it is ours.
+# Sets SRV_PID, which callers assign to their own variable.
+#
+# A server that cannot bind exits immediately, and everything downstream then
+# runs against whoever already holds the port. The requests succeed, so the block
+# looks healthy, while workers_of returns empty, worker-count comparisons compare
+# nothing, and a signal to "the master" goes to a dead pid. A silent wrong answer
+# is worse than a failure, so this stops the run and says why.
+start_server() {
+    local cfg=$1 err i
+    err=$(mktemp)
+    $BIN --config "$cfg" >"$err" 2>&1 &
+    SRV_PID=$!
+    SERVERS="$SERVERS $SRV_PID"
+    for i in $(seq 1 60); do
+        kill -0 "$SRV_PID" 2>/dev/null || break        # it exited: report below
+        if [ -n "$(pgrep -P "$SRV_PID" 2>/dev/null)" ]; then
+            rm -f "$err"                               # master up, workers forked
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo >&2
+    echo "FATAL: the server for $cfg never came up." >&2
+    if [ -s "$err" ]; then
+        echo "  it said:" >&2
+        sed 's/^/    /' "$err" >&2
+    fi
+    echo "  The usual cause is a server an earlier run left behind still holding" >&2
+    echo "  the port. Such a server would go on answering these tests, so the run" >&2
+    echo "  stops here rather than report on the wrong process. Find them with:" >&2
+    echo "    ps -eo pid,ppid,comm,args | awk '\$3==\"linnea\" && \$0 ~ /test\\/configs/'" >&2
+    echo "  and kill the ones whose parent is 1." >&2
+    echo >&2
+    rm -f "$err"
+    exit 1
+}
+
+# ...and refuse to start at all if such a server is already running: every port
+# this suite uses would be answered by it.
+stray_servers() {
+    ps -eo pid,ppid,comm,args --no-headers 2>/dev/null \
+        | awk '$3 == "linnea" && $0 ~ /test\/configs/ && $2 == 1 { print $1 }'
+}
+strays=$(stray_servers)
+if [ -n "$strays" ]; then
+    echo "FATAL: test servers from an earlier run are still running:" >&2
+    ps -o pid,args -p $(echo $strays | tr ' ' ',') >&2
+    echo "  They hold this suite's ports, so its own servers cannot bind and its" >&2
+    echo "  results would describe the old ones. Kill them and re-run:" >&2
+    echo "    kill $(echo $strays | tr '\n' ' ')" >&2
+    exit 1
+fi
+
 # --- config parsing and validation ---
 run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test locations=3" \
     timeout 0.5 $BIN --config test/configs/listen.json
@@ -391,8 +458,8 @@ fi
 # so this also covers SO_REUSEPORT steering.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/mk_test_image.py test/www/linnea.png >/dev/null    # served over h3
-    $BIN --config test/configs/tls-h3.json >/dev/null 2>&1 &
-    h3_pid=$!
+    start_server test/configs/tls-h3.json
+    h3_pid=$SRV_PID
     sleep 0.5
     python3 test/quic/h3_e2e_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): real server serves static files over QUIC" $?
@@ -825,8 +892,8 @@ fi
 # 28-byte sockaddr_in6 handling on the receive, conn.peer and sendto-reply paths.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN --config test/configs/tls-h3-v6.json >/dev/null 2>&1 &
-    v6_pid=$!
+    start_server test/configs/tls-h3-v6.json
+    v6_pid=$SRV_PID
     sleep 0.5
     python3 test/quic/h3_ipv6_test.py 47455 >/dev/null 2>&1
     check "h3 (io_uring): dual-stack — served over native IPv6 (::1) and IPv4" $?
@@ -848,8 +915,8 @@ fi
 # whole-file GET into a 206.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN --config test/configs/tls-h3-drain.json >/dev/null 2>&1 &
-    tr_master=$!
+    start_server test/configs/tls-h3-drain.json
+    tr_master=$SRV_PID
     sleep 0.5
     timeout 60 python3 test/quic/h3_trailer_test.py 47453 >/dev/null 2>&1
     check "h3 (io_uring): trailers do not influence the response" $?
@@ -869,8 +936,8 @@ fi
 # keeps the signalling deterministic; the test kills the master itself.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN --config test/configs/tls-h3-drain.json >/dev/null 2>&1 &
-    ga_master=$!
+    start_server test/configs/tls-h3-drain.json
+    ga_master=$SRV_PID
     sleep 0.5
     python3 test/quic/h3_goaway_test.py 47453 $ga_master >/dev/null 2>&1
     check "h3 (io_uring): drain sends GOAWAY on the control stream" $?
@@ -892,8 +959,8 @@ fi
 # (H3_NO_ERROR), and only then exits.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN --config test/configs/tls-h3-drain.json >/dev/null 2>&1 &
-    di_master=$!
+    start_server test/configs/tls-h3-drain.json
+    di_master=$SRV_PID
     sleep 0.5
     timeout 40 python3 test/quic/h3_drain_inflight_test.py 47453 $di_master >/dev/null 2>&1
     check "h3 (io_uring): drain finishes the in-flight response, then closes" $?
@@ -915,8 +982,8 @@ fi
 # stream is rejected AND the in-flight response still completes.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN --config test/configs/tls-h3-drain.json >/dev/null 2>&1 &
-    gr_master=$!
+    start_server test/configs/tls-h3-drain.json
+    gr_master=$SRV_PID
     sleep 0.5
     timeout 60 python3 test/quic/h3_goaway_reject_test.py 47453 $gr_master >/dev/null 2>&1
     check "h3 (io_uring): drain rejects disowned streams (0x10b), serves owned" $?
@@ -952,8 +1019,8 @@ fi
 # peer closes) delivers every byte.
 rm -f test/linnea.log
 python3 -c "open('test/www/h2drain.bin','wb').write(bytes(3000000))"
-$BIN --config test/configs/tls-h3-drain.json >/dev/null 2>&1 &
-h2d_master=$!
+start_server test/configs/tls-h3-drain.json
+h2d_master=$SRV_PID
 sleep 0.5
 timeout 60 python3 test/tls/h2_drain_slow.py test/tls/server.crt 47453 $h2d_master >/dev/null 2>&1
 check "http2 drain delivers the whole in-flight body to a slow reader" $?
@@ -970,8 +1037,8 @@ rm -f test/linnea.log test/www/h2drain.bin
 # exercises the raised cap; the curl check confirms the same chain over h2/TCP.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
-    $BIN --config test/configs/tls-h3-bigcert.json >/dev/null 2>&1 &
-    bc_pid=$!
+    start_server test/configs/tls-h3-bigcert.json
+    bc_pid=$SRV_PID
     sleep 0.6
     python3 test/quic/h3_bigcert_test.py 47454 >/dev/null 2>&1
     check "h3 (io_uring): large flight segmented + held to the 3x amp budget" $?
@@ -1062,8 +1129,8 @@ backend_ready() {
 python3 test/proxy_backend.py >/dev/null 2>&1 &
 backend_pid=$!
 backend_ready
-$BIN --config test/configs/listen.json >/dev/null 2>&1 &
-server_pid=$!
+start_server test/configs/listen.json
+server_pid=$SRV_PID
 sleep 0.3
 
 # check_http <name> <grep-pattern> <response-text>
@@ -1880,8 +1947,8 @@ rm -f "$LOG" test/www/big.txt test/www/upload.bin test/www/upload2.bin test/www/
 # it: every byte rearms it, so a trickled request head keeps its slot forever.
 # limits.json sets a long idle timeout on purpose, so only the head deadline can
 # be what closes the trickling connection.
-$BIN --config test/configs/limits.json >/dev/null 2>&1 &
-limits_pid=$!
+start_server test/configs/limits.json
+limits_pid=$SRV_PID
 sleep 0.5
 python3 test/limits_test.py 47470 >/dev/null 2>&1
 check "connection limits: slow head cut off, per-address cap holds" $?
@@ -1892,8 +1959,8 @@ wait $limits_pid 2>/dev/null
 # A client dribbling ClientHello bytes rearms only the per-op idle timeout; the
 # head deadline (stamped at accept) must cut it, while a real handshake serves.
 if python3 -c 'import ssl' 2>/dev/null; then
-    $BIN --config test/configs/tls-slowhead.json >/dev/null 2>&1 &
-    slowhs_pid=$!
+    start_server test/configs/tls-slowhead.json
+    slowhs_pid=$SRV_PID
     sleep 0.5
     timeout 40 python3 test/tls/tls_slow_handshake.py test/tls/server.crt 47455 3 \
         >/dev/null 2>&1
@@ -1907,8 +1974,8 @@ fi
 # must complete it, refuse new connections meanwhile, and exit after.
 python3 -c "open('test/www/drain.bin','w').write('D' * 3000000)"
 rm -f "$LOG"
-$BIN --config test/configs/listen.json >/dev/null 2>&1 &
-drain_master=$!
+start_server test/configs/listen.json
+drain_master=$SRV_PID
 sleep 0.3
 curl -s --max-time 30 --limit-rate 500k http://127.0.0.1:47080/drain.bin -o /tmp/drain_out &
 drain_curl=$!
@@ -1947,8 +2014,8 @@ rm -f /tmp/drain_out test/www/drain.bin "$LOG"
 # Before, every accept landed on one worker's ring and multi-core TCP
 # scaling was theoretical. 24 held connections must reach BOTH workers.
 rm -f "$LOG"
-$BIN --config test/configs/listen.json >/dev/null 2>&1 &
-spread_master=$!
+start_server test/configs/listen.json
+spread_master=$SRV_PID
 sleep 0.3
 spread_workers=$(pgrep -P $spread_master | sort | tr '\n' ' ')
 python3 - <<'PYEOF2' &
@@ -2022,8 +2089,8 @@ check "cli: --config starts the server" $?
 # is the patient drain used for the hot upgrade, where the new generation
 # is already serving; it leaves those connections alone.
 rm -f "$LOG"
-$BIN --config test/configs/listen.json >/dev/null 2>&1 &
-stop_master=$!
+start_server test/configs/listen.json
+stop_master=$SRV_PID
 sleep 0.3
 stop_workers=$(pgrep -P $stop_master | tr '\n' ' ')
 # hold an idle keep-alive connection open across the stop
@@ -2051,8 +2118,8 @@ wait $stop_master 2>/dev/null
 # they must be told to reopen it: without that they keep filling the renamed
 # inode and the fresh file stays empty.
 rm -f "$LOG" "$LOG.rot"
-$BIN --config test/configs/listen.json >/dev/null 2>&1 &
-rot_master=$!
+start_server test/configs/listen.json
+rot_master=$SRV_PID
 sleep 0.3
 curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null
 sleep 0.2
@@ -2082,8 +2149,8 @@ rm -f "$LOG.rot"
 # the signal lands must finish, and no new request may be refused.
 rm -f "$LOG"
 python3 -c "open('test/www/up.bin','w').write('U' * 3000000)"
-$BIN --config test/configs/listen.json >/dev/null 2>&1 &
-up_master=$!
+start_server test/configs/listen.json
+up_master=$SRV_PID
 sleep 0.3
 old_workers=$(pgrep -P $up_master | tr '\n' ' ')
 # a slow download in flight across the upgrade
@@ -2148,8 +2215,8 @@ for _ in $(seq 1 40); do
     (echo > /dev/tcp/127.0.0.1/47080) >/dev/null 2>&1 || break
     sleep 0.25
 done
-$BIN --config test/configs/listen.json >/dev/null 2>&1 &
-burst_master=$!
+start_server test/configs/listen.json
+burst_master=$SRV_PID
 for _ in $(seq 1 40); do
     curl -s --max-time 1 http://127.0.0.1:47080/hello.txt -o /dev/null && break
     sleep 0.25
@@ -2170,8 +2237,8 @@ if [ $burst_rc -ne 0 ]; then
         (echo > /dev/tcp/127.0.0.1/47080) >/dev/null 2>&1 || break
         sleep 0.25
     done
-    $BIN --config test/configs/listen.json >/dev/null 2>&1 &
-    burst_master=$!
+    start_server test/configs/listen.json
+    burst_master=$SRV_PID
     for _ in $(seq 1 40); do
         curl -s --max-time 1 http://127.0.0.1:47080/hello.txt -o /dev/null && break
         sleep 0.25
@@ -2356,8 +2423,8 @@ else
     python3 test/proxy_backend.py >/dev/null 2>&1 &
     tls_backend_pid=$!
     backend_ready
-    $BIN --config test/configs/tls.json >/dev/null 2>&1 &
-    tls_server_pid=$!
+    start_server test/configs/tls.json
+    tls_server_pid=$SRV_PID
     sleep 0.3
     CA=test/tls/server.crt
     U=https://localhost:47443
@@ -2650,8 +2717,8 @@ rm -f /tmp/upload3_echo.bin
 
     # HTTP/2 connection bring-up: a separate http2:1 server. ALPN selects
     # h2; preface + SETTINGS + PING exchange; a request draws GOAWAY.
-    $BIN --config test/configs/tls-h2.json >/dev/null 2>&1 &
-    h2_pid=$!
+    start_server test/configs/tls-h2.json
+    h2_pid=$SRV_PID
     sleep 0.3
     timeout 10 python3 test/tls/h2_bringup.py $CA 47446 >/dev/null 2>&1
     check "http2 connection bring-up (preface, settings, ping, goaway)" $?
@@ -3212,8 +3279,8 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     # a trickler about head_timeout after its last honest burst: h1 closes,
     # h2 fails the stream 408 and the connection and slot live on. A
     # full-speed upload must be untouched. Own server: head_timeout=3.
-    $BIN --config test/configs/tls-slowbody.json >/dev/null 2>&1 &
-    slowbody_pid=$!
+    start_server test/configs/tls-slowbody.json
+    slowbody_pid=$SRV_PID
     sleep 0.3
     timeout 60 python3 test/tls/slow_body.py $CA 47457 >/dev/null 2>&1
     check "request-body slowloris cut on h1 and h2; honest uploads untouched" $?
@@ -3226,8 +3293,8 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     rm -f "$LOG" test/www/big.txt
 
     # --- SNI: two TLS vhosts share 127.0.0.1:47444, each with its own cert
-    $BIN --config test/configs/tls-sni.json >/dev/null 2>&1 &
-    sni_server_pid=$!
+    start_server test/configs/tls-sni.json
+    sni_server_pid=$SRV_PID
     sleep 0.3
     subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 \
         -servername sni.test 2>/dev/null | openssl x509 -noout -subject)
@@ -3281,8 +3348,8 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     # worker-PID check is not ceremony: the first version of this crashed the
     # worker (the 421 path skipped the vhost the response builder reads), and
     # a crash looks exactly like a closed connection from the client side.
-    $BIN --config test/configs/tls-coalesce.json >/dev/null 2>&1 &
-    coal_h2_pid=$!
+    start_server test/configs/tls-coalesce.json
+    coal_h2_pid=$SRV_PID
     sleep 0.4
     md_before=$(workers_of $sni_server_pid)
     timeout 60 python3 test/tls/h2_misdirected.py $CA 47444 47459 >/dev/null 2>&1
@@ -3308,8 +3375,8 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     # h3 connection serves both (what a browser coalesces). Own server: the
     # two vhosts differ from the SNI pair in using the same cert.
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
-        $BIN --config test/configs/tls-coalesce.json >/dev/null 2>&1 &
-        coal_pid=$!
+        start_server test/configs/tls-coalesce.json
+        coal_pid=$SRV_PID
         sleep 0.4
         timeout 60 python3 test/quic/h3_coalesce_test.py 47459 >/dev/null 2>&1
         check "h3 coalescing: one cert, two vhosts, one connection" $?
