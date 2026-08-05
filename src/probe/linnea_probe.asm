@@ -400,6 +400,8 @@ n_h3_initpad: db "QUIC Initial datagram expansion (RFC 9000 14.1)"
 n_h3_initpad_len equ $ - n_h3_initpad
 n_h3_keyupd:  db "QUIC key update (Key Phase flip) is followed"
 n_h3_keyupd_len equ $ - n_h3_keyupd
+n_h3_kuold:   db "QUIC packet delayed across a key update (old keys retained?)"
+n_h3_kuold_len equ $ - n_h3_kuold
 n_h3_iscid:   db "QUIC initial_source_connection_id mismatch -> refused"
 n_h3_iscid_len equ $ - n_h3_iscid
 n_h3_noiscid: db "QUIC initial_source_connection_id absent -> refused"
@@ -569,6 +571,10 @@ q_ku_armed:  resq 1                      ; BESIDE the current one. After we flip
                                          ; server's own ku_try does for us. Assuming
                                          ; it had rotated worked on loopback and
                                          ; failed over a real RTT.
+q_hold:      resq 1                      ; 1 = build the next 1-RTT packet but do NOT
+                                         ; send it; keep it in q_held instead
+q_held:      resb 1500                   ; a protected packet withheld from the wire,
+q_held_len:  resq 1                      ; to be released after a key update
 q_pkt_ptr:   resq 1                      ; the 1-RTT packet being opened, kept so a
 q_pkt_len:   resq 1                      ; retry does not re-derive a clobbered length
                                          ; (RFC 9001 6: that bit IS a QUIC key
@@ -5119,6 +5125,25 @@ quic_send_hs_ack:
     pop rbx
     ret
 
+; quic_send_held(edi = fd) — put a withheld packet on the wire, unchanged. It was
+; protected with the keys and the key phase in force when it was BUILT, which is
+; the whole point: it arrives after a key update carrying the older phase, exactly
+; as a packet delayed by the network would.
+quic_send_held:
+    cmp qword [q_held_len], 0
+    je .sh_none
+    mov eax, LINNEA_SYS_SENDTO
+    mov esi, edi
+    mov edi, esi
+    lea rsi, [q_held]
+    mov rdx, [q_held_len]
+    mov r10d, LINNEA_MSG_NOSIGNAL
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+.sh_none:
+    ret
+
 ; quic_send_1rtt_ack(edi = fd) — acknowledge the server's 1-RTT packets.
 ;
 ; The prober acknowledged the handshake and then nothing. On loopback that is
@@ -5492,7 +5517,18 @@ quic_send_1rtt:
     call linnea_quic_protect
     add rsp, 16
     mov r12, rax
-    inc qword [q_cli_ap_pn]
+    inc qword [q_cli_ap_pn]               ; the number is consumed either way, so a
+                                          ; withheld packet keeps the one it was
+                                          ; built with and the next packet moves on
+    cmp qword [q_hold], 0
+    je .send_it
+    mov [q_held_len], r12                 ; keep it for later instead of sending
+    lea rdi, [q_held]
+    lea rsi, [qpkt]
+    mov rcx, r12
+    rep movsb
+    jmp .sent
+.send_it:
     mov eax, LINNEA_SYS_SENDTO
     mov edi, ebx
     lea rsi, [qpkt]
@@ -5501,6 +5537,7 @@ quic_send_1rtt:
     xor r8d, r8d
     xor r9d, r9d
     syscall
+.sent:
     xor eax, eax
     test rax, rax
     lea rsp, [rbp - 32]
@@ -7790,6 +7827,123 @@ probe_h3_keyupdate:
     pop rbx
     ret
 
+; probe_h3_ku_oldkey (RFC 9001 6.5): a packet protected with the OLDER keys can
+; arrive after a key update, for no better reason than the network reordering it.
+; The receiver must still open it: "an endpoint SHOULD retain old read keys for no
+; more than three times the PTO after having received a packet protected using the
+; new keys" -- the point of retaining them at all is to process such a packet.
+;
+; Reordering cannot be scheduled on a real network, so this manufactures it: build
+; a request under the current keys and WITHHOLD it, rekey, send a different request
+; under the new keys so the server rotates, and only then release the held packet.
+; It arrives carrying the older key phase and a LOWER packet number, which is
+; precisely the delayed-packet case.
+;
+; MEASURED 2026-08-05: linnea, cloudflare-quic.com AND www.google.com all drop it.
+; Three independent implementations agreeing is the answer to the question, not a
+; finding against them -- retention here is an OPTIMISATION, not an obligation,
+; and this probe reports rather than accuses.
+;
+; The reason it is optional is worth understanding before anyone "fixes" it:
+; QUIC's loss recovery already covers the case. A real client's delayed packet is
+; dropped, its probe timeout fires, and it is RETRANSMITTED under the new keys --
+; nothing is lost, one PTO is spent. Retaining old keys buys back that PTO and
+; nothing else, which is why RFC 9001 6.5 frames retention as something an
+; endpoint may do and bounds how long it may do it, rather than requiring it.
+; This probe never retransmits, which is precisely why it sees a "loss" that no
+; real client would.
+;
+; The inverted control matters here and was run: withholding and releasing the
+; SAME packet with NO key update is answered normally, which is what proves the
+; mechanism sound and puts the difference on the keys rather than on reordering.
+probe_h3_ku_oldkey:
+    push rbx
+    push r12
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    ; --- build the request that will be delayed, under the CURRENT keys ---
+    xor edi, edi                          ; stream 0
+    mov esi, 1                            ; open the control stream with it
+    call qpay_build_get
+    mov qword [q_hold], 1                 ; built, protected, and kept back
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov qword [q_hold], 0
+    ; --- rotate, and make the server rotate with a request it CAN read ---
+    lea rdi, [q_cli_ap_secret]
+    lea rsi, [q_ku_next]
+    lea rdx, [q_ap_ckeys]
+    call linnea_quic_ku_next
+    lea rdi, [q_cli_ap_secret]
+    lea rsi, [q_ku_next]
+    mov ecx, 32
+    rep movsb
+    lea rdi, [q_ap_skeys_next]
+    lea rsi, [q_ap_skeys]
+    mov ecx, linnea_quic_keys_size
+    rep movsb
+    lea rdi, [q_srv_ap_secret]
+    lea rsi, [q_ku_next]
+    lea rdx, [q_ap_skeys_next]
+    call linnea_quic_ku_next
+    lea rdi, [q_srv_ap_secret]
+    lea rsi, [q_ku_next]
+    mov ecx, 32
+    rep movsb
+    mov qword [q_ku_armed], 1
+    mov qword [q_kphase], 1
+    mov edi, 4                            ; a different stream, new keys
+    xor esi, esi
+    call qpay_build_get
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify                 ; the server rekeys and answers this one
+    cmp rax, 200
+    jne .info                             ; the update itself did not work: that is
+                                          ; probe_h3_keyupdate's business, not ours
+    ; --- now the delayed packet, under the OLD keys and the OLD phase ---
+    mov edi, ebx
+    call quic_send_held
+    mov qword [q_req_sid], 0              ; its response belongs to stream 0
+    mov edi, ebx
+    call quic_h3_classify
+    push rax
+    mov qword [q_kphase], 0
+    mov qword [q_ku_armed], 0
+    mov edi, ebx
+    call close_fd
+    pop rax
+    cmp rax, 200
+    je .ok
+    mov dil, K_INFO                       ; dropped: old keys not retained, which is
+    jmp .rep                              ; allowed -- see the note above
+.ok:
+    mov dil, K_OK
+    jmp .rep
+.info:
+    mov edi, ebx
+    call close_fd
+    mov dil, K_INFO
+    jmp .rep
+.fail:
+    mov dil, K_INFO
+.rep:
+    mov qword [q_kphase], 0
+    mov qword [q_ku_armed], 0
+    mov qword [q_hold], 0
+    mov qword [q_held_len], 0
+    lea rsi, [n_h3_kuold]
+    mov edx, n_h3_kuold_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+
 ; probe_h3_iscid (tls-12): RFC 9000 7.3 makes BOTH of these a connection error
 ; of type TRANSPORT_PARAMETER_ERROR -- a value that does not match the Source
 ; Connection ID of the peer's first Initial, and the parameter being absent. The
@@ -8665,6 +8819,7 @@ h3_battery:
     call probe_h3_sessid_echo
     call probe_h3_streams_uni
     call probe_h3_keyupdate
+    call probe_h3_ku_oldkey
     call probe_h3_iscid
     call probe_h3_noiscid
     call probe_h3_tpudp
