@@ -46,6 +46,7 @@ extern linnea_quic_varint_encode
 extern linnea_quic_varint_decode
 extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
+extern linnea_quic_ku_next
 extern linnea_quic_unprotect_short
 extern linnea_quic_stream_frame
 extern linnea_quic_frame_skip
@@ -397,6 +398,8 @@ n_h3_strmlim: db "QUIC stream id past the advertised limit -> STREAM_LIMIT_ERROR
 n_h3_strmlim_len equ $ - n_h3_strmlim
 n_h3_initpad: db "QUIC Initial datagram expansion (RFC 9000 14.1)"
 n_h3_initpad_len equ $ - n_h3_initpad
+n_h3_keyupd:  db "QUIC key update (Key Phase flip) is followed"
+n_h3_keyupd_len equ $ - n_h3_keyupd
 n_h3_iscid:   db "QUIC initial_source_connection_id mismatch -> refused"
 n_h3_iscid_len equ $ - n_h3_iscid
 n_h3_noiscid: db "QUIC initial_source_connection_id absent -> refused"
@@ -521,6 +524,9 @@ q_hs_ckeys: resb linnea_quic_keys_size  ; client Handshake keys (we protect)
 q_hs_skeys: resb linnea_quic_keys_size  ; server Handshake keys (we open)
 q_ap_ckeys: resb linnea_quic_keys_size  ; client 1-RTT keys
 q_ap_skeys: resb linnea_quic_keys_size  ; server 1-RTT keys
+q_cli_ap_secret: resb 32                ; the 1-RTT traffic secrets, kept because a
+q_srv_ap_secret: resb 32                ; key update derives the next generation
+q_ku_next:  resb 32                     ; from the SECRET, not from the keys
 q_secrets:  resb 96                     ; c_hs || s_hs || handshake_secret
 q_fin_key:  resb 32                     ; client Finished MAC key
 qtr:        resb 8192                   ; TLS transcript (CH || SH || flight)
@@ -553,6 +559,21 @@ q_srv_ms_bidi: resq 1                    ; the server's advertised initial_max_s
 q_init_dgram: resq 1                     ; size of the first datagram carrying a server Initial
 q_req_sid:   resq 1                      ; the stream the current request went out on, so the
                                          ; classifier collects the right response
+q_kphase:    resq 1                      ; 1 = flip the Key Phase bit on what we send
+q_ap_skeys_next: resb linnea_quic_keys_size ; the server's NEXT generation, held
+q_ku_armed:  resq 1                      ; BESIDE the current one. After we flip the
+                                         ; phase the server answers under whichever
+                                         ; it has reached -- the old one until it
+                                         ; processes the flip, the new one after --
+                                         ; so both must be tried, exactly as the
+                                         ; server's own ku_try does for us. Assuming
+                                         ; it had rotated worked on loopback and
+                                         ; failed over a real RTT.
+q_pkt_ptr:   resq 1                      ; the 1-RTT packet being opened, kept so a
+q_pkt_len:   resq 1                      ; retry does not re-derive a clobbered length
+                                         ; (RFC 9001 6: that bit IS a QUIC key
+                                         ; update; the TLS KeyUpdate message is
+                                         ; forbidden here and is a connection error)
 q_alt_cid:  resb 20                     ; a CID the server issued via NEW_CONNECTION_ID
 q_alt_cid_len: resq 1
 q_alt_cid_valid: resq 1                 ; 1 once we captured a NEW_CONNECTION_ID
@@ -5098,6 +5119,49 @@ quic_send_hs_ack:
     pop rbx
     ret
 
+; quic_send_1rtt_ack(edi = fd) — acknowledge the server's 1-RTT packets.
+;
+; The prober acknowledged the handshake and then nothing. On loopback that is
+; invisible; against a real server the unacknowledged response fills its
+; congestion window and it STOPS SENDING, which looks exactly like it ignoring
+; the request. That is not a hypothetical: it is what made a key-update probe
+; appear to fail against Cloudflare while an independent client showed Cloudflare
+; handling it perfectly.
+;
+; The ack is deliberately PLAIN. It must not inherit whatever malformation the
+; probe in progress has armed -- q_rsvd would put the reserved bits on every ack,
+; which is a different experiment from "one request carried them" and silently
+; changes what the peer does. The key phase is the exception and is kept: after a
+; rotation every packet we send belongs to the new phase.
+quic_send_1rtt_ack:
+    push rbx
+    push r12
+    mov ebx, edi
+    mov r12, [q_rsvd]
+    mov qword [q_rsvd], 0
+    cmp qword [q_ap_largest], 0
+    jl .a1_done                           ; signed: nothing received yet
+    ; Acknowledge ONLY the largest packet, not the span [smallest..largest]: a
+    ; range claims every number in it, and this prober does not track which
+    ; arrived, so a gap would have it vouching for packets it never saw -- and a
+    ; peer that has not even SENT one of them is entitled to close the connection
+    ; (RFC 9000 13.1). A single-packet range is always true.
+    lea rdi, [qpay]
+    mov rsi, [q_ap_largest]
+    mov rdx, [q_ap_largest]
+    call quic_ack_frame                   ; rax = one past the frame
+    lea rdx, [qpay]
+    sub rax, rdx
+    mov rdx, rax
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+.a1_done:
+    mov [q_rsvd], r12
+    pop r12
+    pop rbx
+    ret
+
 ; quic_recv_flight(edi=fd) -> rax = 1 if the server Finished was decrypted.
 ; Reads datagrams, deriving Handshake keys from the ServerHello and reassembling
 ; the Handshake CRYPTO, until the server Finished arrives (or a timeout).
@@ -5326,8 +5390,8 @@ quic_finish:
     lea rsi, [th_buf]
     lea rdx, [q_ap_ckeys]
     lea rcx, [q_ap_skeys]
-    xor r8d, r8d                          ; skip client traffic-secret output
-    xor r9d, r9d                          ; skip server traffic-secret output
+    lea r8, [q_cli_ap_secret]             ; keep both traffic secrets: a key update
+    lea r9, [q_srv_ap_secret]             ; derives from the SECRET, not the keys
     call linnea_quic_app_secrets          ; 1-RTT keys
     ; finished_key = HKDF-Expand-Label(c_hs, "finished", "", 32)
     lea rdi, [q_secrets]
@@ -5398,6 +5462,13 @@ quic_send_1rtt:
     je .no_rsvd
     or byte [rdi], 0x18
 .no_rsvd:
+    ; RFC 9001 6: a QUIC key update is the Key Phase bit (0x04), not a TLS
+    ; KeyUpdate message -- that one is forbidden here and is a connection error.
+    ; Set before linnea_quic_protect masks the byte, as the reserved bits are.
+    cmp qword [q_kphase], 0
+    je .no_kphase
+    or byte [rdi], 0x04
+.no_kphase:
     inc rdi
     mov rcx, [q_srv_scid_len]             ; DCID = the server's connection id
     lea rsi, [q_srv_scid]
@@ -5950,6 +6021,13 @@ quic_h3_open:
     push rbx
     mov qword [q_ncid_count], 0           ; per-connection, like q_req_sid below
     mov qword [q_dgram_max], 0
+    ; The received packet numbers MUST be reset with the connection. They feed the
+    ; acks the classifier now sends, and an ack for a packet the peer never sent is
+    ; a PROTOCOL_VIOLATION (RFC 9000 13.1) -- a stale value from the previous
+    ; probe's connection had this server closing on us, which stalled the battery
+    ; for minutes against prod while lenient peers shrugged it off.
+    mov qword [q_ap_largest], -1
+    mov qword [q_ap_smallest], -1
     mov qword [q_req_sid], 0              ; a fresh connection requests on stream 0
                                           ; unless a probe says otherwise, so a probe
                                           ; that used another id cannot strand the next
@@ -6052,6 +6130,8 @@ quic_h3_classify:
     call quic_find_1rtt
     test rax, rax
     jz .next
+    mov [q_pkt_ptr], rax
+    mov [q_pkt_len], rdx
     mov rdi, rax
     mov rsi, rdx
     lea rdx, [q_ap_skeys]
@@ -6060,7 +6140,42 @@ quic_h3_classify:
     mov r9, [q_cli_ap_pn]
     call linnea_quic_unprotect_short
     test rax, rax
+    jns .opened
+    cmp qword [q_ku_armed], 0
+    je .next                              ; no key update in flight: not ours to read
+    mov rdi, [q_pkt_ptr]                  ; the SAME packet, under the next generation
+    mov rsi, [q_pkt_len]
+    lea rdx, [q_ap_skeys_next]
+    lea rcx, [qplain]
+    mov r8d, 8
+    mov r9, [q_cli_ap_pn]
+    call linnea_quic_unprotect_short
+    test rax, rax
     js .next
+    push rax
+    push rdx                              ; keep the length and the packet number
+    lea rdi, [q_ap_skeys]                 ; it opened: the server has rotated, so
+    lea rsi, [q_ap_skeys_next]            ; adopt the new generation and stop trying
+    mov ecx, linnea_quic_keys_size
+    rep movsb
+    mov qword [q_ku_armed], 0
+    pop rdx
+    pop rax
+.opened:
+    ; track what we have received so the ack actually acknowledges the response --
+    ; without this the ack names a packet from the handshake era and frees no
+    ; congestion window at all.
+    cmp qword [q_ap_largest], 0
+    jl .cl_first_pn
+    cmp rdx, [q_ap_largest]
+    jbe .cl_pn_done
+.cl_first_pn:
+    mov [q_ap_largest], rdx
+.cl_pn_done:
+    cmp qword [q_ap_smallest], 0
+    jge .cl_have_small
+    mov [q_ap_smallest], rdx
+.cl_have_small:
     lea r13, [qplain]                     ; frame cursor
     lea r14, [qplain]
     add r14, rax                          ; frames end
@@ -6137,6 +6252,10 @@ quic_h3_classify:
     mov rax, -3
     jmp .out
 .next:
+    mov edi, ebx                          ; ack what we have read so far: placed
+    call quic_send_1rtt_ack               ; HERE, where the datagram is done with,
+                                          ; because doing it before quic_find_1rtt
+                                          ; would clobber the length it needs
     dec r15d
     jnz .loop
 .none:
@@ -7455,7 +7574,10 @@ quic_drain:
     xor r9d, r9d
     syscall
     test rax, rax
-    jg .d_loop
+    jle .d_done
+    mov edi, ebx                          ; keep the sender's window open while we
+    call quic_send_1rtt_ack               ; swallow what it is sending
+    jmp .d_loop
 .d_done:
     pop rbx
     ret
@@ -7544,6 +7666,126 @@ quic_wait_close:
 .wc_ret:
     pop r14
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; probe_h3_keyupdate (RFC 9001 6): QUIC has no TLS KeyUpdate message -- that one
+; is forbidden and is a connection error here. An endpoint rotates by flipping the
+; Key Phase bit and protecting the packet with
+; secret_next = HKDF-Expand-Label(secret, "quic ku", "", 32). A peer that cannot
+; follow does not fail loudly; it goes deaf, losing every packet from then on.
+;
+; Both directions move: 6.1 has the receiver update its receive keys AND its own
+; send keys. But NOT necessarily before it answers -- until it processes the flip
+; it is still on the old phase -- so the classifier is armed to try both
+; generations rather than assuming. Assuming worked on loopback and failed over a
+; real RTT, which is the difference between a probe and a probe that is right.
+;
+; A normal GET runs first: 6 forbids initiating an update before the handshake is
+; confirmed, and it makes the connection known-good so a failure afterwards means
+; the update and nothing else.
+probe_h3_keyupdate:
+    push rbx
+    push r12
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    xor edi, edi                          ; control: an ordinary request
+    mov esi, 1
+    call qpay_build_get
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify
+    cmp rax, 200
+    jne .info                             ; never worked: nothing to conclude
+    mov edi, ebx
+    call quic_drain                       ; finish the response before rotating
+    ; --- our sending keys move to the next generation ---
+    lea rdi, [q_cli_ap_secret]
+    lea rsi, [q_ku_next]
+    lea rdx, [q_ap_ckeys]                 ; key+iv re-derived in place; the header
+    call linnea_quic_ku_next              ; protection key deliberately does not move
+    lea rdi, [q_cli_ap_secret]
+    lea rsi, [q_ku_next]
+    mov ecx, 32
+    rep movsb
+    ; --- and the server's next generation is PREPARED, not assumed ---
+    lea rdi, [q_ap_skeys_next]
+    lea rsi, [q_ap_skeys]
+    mov ecx, linnea_quic_keys_size
+    rep movsb
+    lea rdi, [q_srv_ap_secret]
+    lea rsi, [q_ku_next]
+    lea rdx, [q_ap_skeys_next]
+    call linnea_quic_ku_next
+    lea rdi, [q_srv_ap_secret]
+    lea rsi, [q_ku_next]
+    mov ecx, 32
+    rep movsb
+    mov qword [q_ku_armed], 1             ; the classifier may now fall back to it
+    mov qword [q_kphase], 1               ; and everything we send is phase 1
+    mov edi, 4                            ; the next client bidirectional stream
+    xor esi, esi                          ; the control stream is already open
+    call qpay_build_get
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify
+    push rax
+    mov qword [q_kphase], 0
+    mov edi, ebx
+    call close_fd
+    pop rax
+    ; What counts as "followed" is not the 200 -- it is that a packet arrived
+    ; under the NEXT generation, which only the server's own rotation can
+    ; produce. q_ku_armed is cleared by the classifier when it opens one, so
+    ; that flag IS the evidence; the status merely says the request survived.
+    cmp qword [q_ku_armed], 0
+    jne .no_evidence
+    cmp rax, 200
+    je .ok
+.no_evidence:
+    cmp rax, 200
+    je .info_noclose                      ; answered, but under the OLD keys. That
+                                          ; is not obviously wrong: 6.2's timing for
+                                          ; when a responder must start SENDING in
+                                          ; the new phase is a nuance not worth
+                                          ; adjudicating from a probe, and the peer
+                                          ; plainly read our phase-1 packet to
+                                          ; answer it at all. Reported, not accused.
+    cmp rax, -3
+    je .dev                               ; closed on us: definitely not followed
+    cmp rax, -2
+    je .dev
+    mov dil, K_INFO                       ; silence: it may simply not have answered
+    jmp .rep                              ; in the window. The suite's
+                                          ; h3_key_update_test.py is the red-green;
+                                          ; this probe is live positive proof.
+.ok:
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov edi, ebx
+    call close_fd
+.info_noclose:
+    mov dil, K_INFO
+    jmp .rep
+.fail:
+    mov dil, K_INFO
+.rep:
+    mov qword [q_kphase], 0               ; never leave either armed for a later probe
+    mov qword [q_ku_armed], 0
+    lea rsi, [n_h3_keyupd]
+    mov edx, n_h3_keyupd_len
+    call report_plain
     pop r12
     pop rbx
     ret
@@ -8422,6 +8664,7 @@ h3_battery:
     call probe_h3_newcid
     call probe_h3_sessid_echo
     call probe_h3_streams_uni
+    call probe_h3_keyupdate
     call probe_h3_iscid
     call probe_h3_noiscid
     call probe_h3_tpudp
