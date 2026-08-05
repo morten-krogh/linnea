@@ -40,6 +40,9 @@ global linnea_quic_build_transport_params
 global linnea_quic_retry_scid
 global linnea_quic_retry_scid_len
 global linnea_quic_tp_parse
+global linnea_quic_tp_max_udp
+global linnea_quic_tp_cid_lim
+global linnea_quic_tp_error
 global linnea_quic_flow_scan
 global linnea_quic_parse_priority
 global linnea_quic_reset_scan
@@ -1944,6 +1947,9 @@ linnea_quic_tp_parse:
     mov qword [linnea_quic_tp_ack_exp], 3    ; RFC 9000 18.2 defaults, in case the
     mov qword [linnea_quic_tp_max_ack], 25   ; peer omits either parameter
     mov qword [linnea_quic_tp_idle_ms], 0    ; absent == no limit from the peer
+    mov qword [linnea_quic_tp_max_udp], 65527 ; 18.2 defaults: the largest UDP
+    mov qword [linnea_quic_tp_cid_lim], 2     ; payload, and the smallest legal
+    mov qword [linnea_quic_tp_error], 0       ; connection-id limit
 .tp_next:
     cmp rbx, r12
     jae .tp_done
@@ -1977,6 +1983,10 @@ linnea_quic_tp_parse:
     je .tp_value
     cmp r15, 0x01
     je .tp_value
+    cmp r15, 0x03
+    je .tp_value
+    cmp r15, 0x0e
+    je .tp_value
     add rbx, rbp                     ; not one we read: skip its payload
     jmp .tp_next
 .tp_value:
@@ -2006,12 +2016,40 @@ linnea_quic_tp_parse:
     jmp .tp_skip
 .tp_val0a:
     cmp r15, 0x0a
-    jne .tp_val0b
+    jne .tp_val03
     cmp rax, 20                      ; 18.2: values above 20 are invalid; keep the
     ja .tp_skip                      ; default rather than shift by a wild amount
     mov [linnea_quic_tp_ack_exp], rax
     jmp .tp_skip
-.tp_val0b:
+.tp_val03:
+    cmp r15, 0x03
+    jne .tp_val0e
+    ; RFC 9000 18.2: "Values below 1200 are invalid", and 7.4 makes a parameter
+    ; with an invalid value a connection error of type TRANSPORT_PARAMETER_ERROR.
+    ; This is not a limit we have to shrink to — every datagram we send is at most
+    ; the padded Initial's 1200 bytes, and 1200 is the floor this parameter may
+    ; carry, so any legal advertisement already admits everything we send. What
+    ; was missing was refusing an illegal one.
+    cmp rax, 1200
+    jb .tp_bad
+    mov [linnea_quic_tp_max_udp], rax
+    jmp .tp_skip
+.tp_val0e:
+    cmp r15, 0x0e
+    jne .tp_val0b_do
+    ; RFC 9000 18.2: "The value of the active_connection_id_limit parameter MUST
+    ; be at least 2. An endpoint that receives a value less than 2 MUST close the
+    ; connection with an error of type TRANSPORT_PARAMETER_ERROR." Two is also all
+    ; we need: the id the handshake settled on plus the one NEW_CONNECTION_ID we
+    ; issue, so a conforming peer's limit never binds us.
+    cmp rax, 2
+    jb .tp_bad
+    mov [linnea_quic_tp_cid_lim], rax
+    jmp .tp_skip
+.tp_bad:
+    mov qword [linnea_quic_tp_error], 1
+    jmp .tp_done
+.tp_val0b_do:
     mov [linnea_quic_tp_max_ack], rax
 .tp_skip:
     add rbx, rbp
@@ -3614,6 +3652,14 @@ linnea_quic_tp_max_ack: resq 1     ; peer's max_ack_delay in ms (default 25)
 linnea_quic_tp_idle_ms: resq 1     ; peer's max_idle_timeout in ms (0 = absent,
                                    ; which RFC 9000 10.1 reads as "no limit from
                                    ; that side" rather than "expire immediately")
+linnea_quic_tp_max_udp: resq 1     ; peer's max_udp_payload_size (default 65527)
+linnea_quic_tp_cid_lim: resq 1     ; peer's active_connection_id_limit (default 2)
+linnea_quic_tp_error:   resq 1     ; 1 when a parameter carried a value RFC 9000
+                                   ; 18.2 declares invalid, which 7.4 makes a
+                                   ; connection error of type
+                                   ; TRANSPORT_PARAMETER_ERROR. A flag rather
+                                   ; than a return value because the caller reads
+                                   ; three results out of registers already.
 linnea_quic_path_seen:  resq 1
 linnea_quic_path_data:  resb 8
 tp_srt:                 resb 16    ; stateless_reset_token scratch for the tp build

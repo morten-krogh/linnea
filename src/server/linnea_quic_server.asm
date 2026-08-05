@@ -133,6 +133,7 @@ extern linnea_quic_txchunk_record
 extern linnea_quic_txchunk_ack
 extern linnea_quic_txchunk_clear
 extern linnea_quic_tp_parse
+extern linnea_quic_tp_error
 extern linnea_quic_flow_scan
 extern linnea_quic_parse_priority
 extern linnea_quic_reset_scan
@@ -965,6 +966,20 @@ linnea_quic_server_datagram:
     mov rdi, [cur_conn]
     call linnea_quic_conn_free
     jmp .done
+.tp_invalid:
+    ; RFC 9000 7.4 MUST: a transport parameter carrying a value 18.2 declares
+    ; invalid is a connection error of type TRANSPORT_PARAMETER_ERROR. Two are
+    ; judged (linnea_quic_tp_parse): max_udp_payload_size below 1200, and
+    ; active_connection_id_limit below 2. Both were read past in silence, so a
+    ; peer could contradict itself — advertise a receive size no QUIC endpoint may
+    ; use, or refuse to hold the second connection id we are about to issue it —
+    ; and be served anyway. Refused in the Initial space, like the key_share and
+    ; ALPN refusals, since that is where the ClientHello carrying them arrived.
+    mov edi, 0x08                    ; TRANSPORT_PARAMETER_ERROR
+    call .initial_close
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
 .ini_rsvd:
     ; RFC 9000 17.2 MUST: a long header's two reserved bits (mask 0x0c) set on a
     ; packet that authenticated is a connection error of type PROTOCOL_VIOLATION.
@@ -1083,6 +1098,8 @@ linnea_quic_server_datagram:
     mov rsi, [ch_out + linnea_quic_ch.tp_len]
     call linnea_quic_tp_parse        ; rax = max_data, rdx = max_stream_data,
                                      ; r8 = initial_max_streams_uni
+    cmp qword [linnea_quic_tp_error], 0
+    jne .tp_invalid                  ; a value RFC 9000 18.2 declares invalid
     mov rbx, [cur_conn]
     mov [rbx + linnea_quic_conn.fc_conn_max], rax
     mov [rbx + linnea_quic_conn.fc_stream_init], rdx   ; each new slot starts here

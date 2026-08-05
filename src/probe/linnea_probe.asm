@@ -104,9 +104,9 @@ pfx_info_len equ $ - pfx_info
 s_arrow:    db " -> "
 s_arrow_len equ $ - s_arrow
 s_status:   db "HTTP "
+s_status_len equ $ - s_status
 s_bytes:    db " bytes"
 s_bytes_len equ $ - s_bytes
-s_status_len equ $ - s_status
 s_noresp:   db "(no response / connection closed)", 10
 s_noresp_len equ $ - s_noresp
 s_rst:      db "RST_STREAM (stream rejected)", 10
@@ -397,6 +397,14 @@ n_h3_strmlim: db "QUIC stream id past the advertised limit -> STREAM_LIMIT_ERROR
 n_h3_strmlim_len equ $ - n_h3_strmlim
 n_h3_initpad: db "QUIC Initial datagram expansion (RFC 9000 14.1)"
 n_h3_initpad_len equ $ - n_h3_initpad
+n_h3_tpudp:   db "QUIC max_udp_payload_size below 1200 -> refused"
+n_h3_tpudp_len equ $ - n_h3_tpudp
+n_h3_tpcid:   db "QUIC active_connection_id_limit below 2 -> refused"
+n_h3_tpcid_len equ $ - n_h3_tpcid
+n_h3_dgmax:   db "QUIC datagrams stay within the peer's max_udp_payload_size"
+n_h3_dgmax_len equ $ - n_h3_dgmax
+n_h3_cidcnt:  db "QUIC connection ids issued stay within the peer's limit"
+n_h3_cidcnt_len equ $ - n_h3_cidcnt
 n_h3_runt:    db "QUIC runt datagrams leave a live connection undisturbed"
 n_h3_runt_len equ $ - n_h3_runt
 n_h3_newcid:  db "HTTP/3 NEW_CONNECTION_ID issued and the CID routes"
@@ -488,8 +496,13 @@ omit_sigalgs: resq 1                     ; tls-5 probe: drop signature_algorithm
 bad_version: resq 1                      ; tls-5 probe: offer only TLS 1.2
 bad_cipher:  resq 1                      ; tls-5 probe: offer a suite we lack
 bad_sessid:  resq 1                      ; §8.4 probe: send a non-empty legacy_session_id
+q_ncid_count: resq 1                     ; NEW_CONNECTION_ID frames the server sent
+q_dgram_max: resq 1                      ; largest datagram the server sent us
 tp_variant:  resq 1                      ; quic-12 probes: 1 = max_streams_uni 0,
-                                         ; 2 = max_udp_payload_size 1200
+                                         ; 2 = max_udp_payload_size 1200 (the
+                                         ; floor), 3 = 1199 (below it, invalid),
+                                         ; 4 = active_connection_id_limit 1
+                                         ; (below the 2 RFC 9000 18.2 requires)
 qch:        resb 2048                   ; the QUIC ClientHello handshake message
 qch_len:    resq 1
 qtp:        resb 512                    ; encoded client transport parameters
@@ -4223,8 +4236,12 @@ quic_build_tp:
     mov esi, 0x03
     mov edx, 1472
     cmp qword [tp_variant], 2             ; quic-12: smallest datagram the RFC allows
-    jne .tp_mups
+    jne .tp_mups2
     mov edx, 1200
+.tp_mups2:
+    cmp qword [tp_variant], 3             ; quic-12: one below the floor — invalid
+    jne .tp_mups
+    mov edx, 1199
 .tp_mups:
     call tp_int                           ; max_udp_payload_size
     mov rdi, rax
@@ -4258,6 +4275,10 @@ quic_build_tp:
     mov rdi, rax
     mov esi, 0x0e
     mov edx, 2
+    cmp qword [tp_variant], 4             ; quic-12: below the 2 that 18.2 requires
+    jne .tp_cidlim
+    mov edx, 1
+.tp_cidlim:
     call tp_int                           ; active_connection_id_limit
     ; 0x0f initial_source_connection_id = our SCID (raw)
     mov byte [rax], 0x0f
@@ -5106,6 +5127,10 @@ quic_recv_flight:
     ; 1200 bytes, and the server's ServerHello flight is exactly that. Measured
     ; on the datagram, not the packet, because coalescing is what usually
     ; satisfies the rule.
+    cmp rsi, [q_dgram_max]                ; the largest datagram of the flight, for
+    jbe .no_max                           ; the max_udp_payload_size lock
+    mov [q_dgram_max], rsi
+.no_max:
     cmp qword [q_init_dgram], 0
     jne .no_measure
     movzx eax, byte [qrx]
@@ -5910,6 +5935,8 @@ quic_h3_handshake_retry:
 
 quic_h3_open:
     push rbx
+    mov qword [q_ncid_count], 0           ; per-connection, like q_req_sid below
+    mov qword [q_dgram_max], 0
     mov qword [q_req_sid], 0              ; a fresh connection requests on stream 0
                                           ; unless a probe says otherwise, so a probe
                                           ; that used another id cannot strand the next
@@ -6005,6 +6032,10 @@ quic_h3_classify:
     test rax, rax
     jle .none
     mov rsi, rax
+    cmp rsi, [q_dgram_max]                ; keep the largest datagram of the whole
+    jbe .no_max_1rtt                      ; connection, not just of the flight
+    mov [q_dgram_max], rsi
+.no_max_1rtt:
     call quic_find_1rtt
     test rax, rax
     jz .next
@@ -6371,6 +6402,16 @@ quic_recv_initial_verdict:
     xor eax, eax
     jmp .done
 .close:
+    ; record WHICH error the abort names, so a probe for a specific MUST can tell
+    ; it from a server that refused the handshake for an unrelated reason. rdi
+    ; still points at the CONNECTION_CLOSE; rsi is the end of its packet.
+    mov qword [q_close_code], -1
+    inc rdi
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .close_out
+    mov [q_close_code], rax
+.close_out:
     mov eax, 1
     jmp .done
 .crypto:
@@ -7494,6 +7535,183 @@ quic_wait_close:
     pop rbx
     ret
 
+; probe_h3_tpudp (quic-12): RFC 9000 18.2 says of max_udp_payload_size that
+; "values below 1200 are invalid", and 7.4 makes any parameter with an invalid
+; value a connection error of type TRANSPORT_PARAMETER_ERROR. A peer advertising
+; one is contradicting the protocol -- no QUIC endpoint may send a datagram that
+; small a receiver could not take -- so being served anyway means the parameter
+; was read past in silence.
+probe_h3_tpudp:
+    push rbx
+    push r12
+    mov qword [tp_variant], 3
+    call quic_tp_refused_verdict          ; rax: 1 close / 2 proceeded / 0 none
+    mov r12, rax
+    mov qword [tp_variant], 0             ; restore before any later probe builds a CH
+    mov dil, K_DEV
+    cmp r12, 2
+    je .rep                               ; the handshake proceeded: value ignored
+    cmp r12, 1
+    jne .info                             ; nothing came back: no verdict
+    mov dil, K_OK
+    cmp qword [q_close_code], 0x08        ; TRANSPORT_PARAMETER_ERROR
+    je .rep
+    mov dil, K_INFO                       ; refused, but named another fault
+    jmp .rep
+.info:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_tpudp]
+    mov edx, n_h3_tpudp_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+
+; probe_h3_tpcid (quic-12): "The value of the active_connection_id_limit
+; parameter MUST be at least 2. An endpoint that receives a value less than 2
+; MUST close the connection with an error of type TRANSPORT_PARAMETER_ERROR"
+; (RFC 9000 18.2). A peer saying 1 cannot hold the second id the server is about
+; to issue, so serving it sets up a connection that breaks on the first rotation.
+probe_h3_tpcid:
+    push rbx
+    push r12
+    mov qword [tp_variant], 4
+    call quic_tp_refused_verdict
+    mov r12, rax
+    mov qword [tp_variant], 0
+    mov dil, K_DEV
+    cmp r12, 2
+    je .rep
+    cmp r12, 1
+    jne .info
+    mov dil, K_OK
+    cmp qword [q_close_code], 0x08
+    je .rep
+    mov dil, K_INFO
+    jmp .rep
+.info:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_tpcid]
+    mov edx, n_h3_tpcid_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+
+; quic_tp_refused_verdict() -> rax: 1 = the server aborted in the Initial space
+; (code in q_close_code), 2 = it sent a ServerHello and carried on, 0 = silence.
+; Shared by the two transport-parameter probes above; tp_variant selects which
+; invalid value the ClientHello carries.
+quic_tp_refused_verdict:
+    push rbx
+    call quic_fresh_ids
+    call udp_connect
+    test rax, rax
+    js .tv_fail
+    mov ebx, eax
+    mov edi, ebx
+    call quic_send_initial
+    test rax, rax
+    js .tv_close
+    mov edi, ebx
+    call quic_recv_initial_verdict
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rax
+    pop rbx
+    ret
+.tv_close:
+    mov edi, ebx
+    call close_fd
+.tv_fail:
+    xor eax, eax
+    pop rbx
+    ret
+
+; probe_h3_dgmax (quic-12): an endpoint MUST NOT send a datagram larger than the
+; peer's max_udp_payload_size (RFC 9000 18.2 / 14). Advertise the smallest legal
+; value, 1200, and hold the whole connection to it -- handshake flight and
+; response alike. A POSITIVE LOCK: linnea's largest datagram is the Initial one
+; padded to exactly 1200, which is the floor this parameter can carry, so no
+; legal advertisement can bind it. What this would catch is that ceasing to be
+; true -- a chunk size raised past the point where the padded Initial still fits.
+probe_h3_dgmax:
+    push rbx
+    push r12
+    mov qword [tp_variant], 2             ; advertise exactly 1200
+    call quic_h3_open
+    mov qword [tp_variant], 0
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    xor edi, edi
+    mov esi, 1
+    call qpay_build_get                   ; a real response, so the 1-RTT path is
+    mov edi, ebx                          ; measured too, not just the flight
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify
+    mov r12, [q_dgram_max]
+    mov edi, ebx
+    call close_fd
+    test r12, r12
+    jz .info                              ; nothing measured: no verdict
+    mov dil, K_OK
+    cmp r12, 1200
+    jbe .rep
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov dil, K_INFO
+    jmp .rep
+.fail:
+    mov dil, K_INFO
+    mov r12, -1
+.rep:
+    lea rsi, [n_h3_dgmax]
+    mov edx, n_h3_dgmax_len
+    mov rcx, r12
+    mov r9d, 1200
+    call report_size
+    pop r12
+    pop rbx
+    ret
+
+; probe_h3_cidcnt (quic-12): an endpoint MUST NOT provide its peer with more
+; connection ids than the peer's active_connection_id_limit (RFC 9000 5.1.1). We
+; advertise 2 -- the smallest legal value -- which permits the id the handshake
+; settled on plus one more, so at most ONE NEW_CONNECTION_ID may arrive. Another
+; positive lock: linnea issues exactly one (quic-7).
+probe_h3_cidcnt:
+    push rbx
+    push r12
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov r12, [q_ncid_count]
+    mov edi, ebx
+    call close_fd
+    mov dil, K_OK
+    cmp r12, 1
+    jbe .rep
+    mov dil, K_DEV
+    jmp .rep
+.fail:
+    mov dil, K_INFO
+    mov r12, -1
+.rep:
+    lea rsi, [n_h3_cidcnt]
+    mov edx, n_h3_cidcnt_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+
 ; probe_h3_rsvd (quic-14): the two reserved bits of a short header (0x18) MUST be
 ; zero, and a receiver that sees them set MUST close with PROTOCOL_VIOLATION
 ; (RFC 9000 17.3.1). Header protection hides them until it is removed, so this is
@@ -7855,6 +8073,8 @@ quic_scan_ncid:
     add rbx, rax
     jmp .sc_fr
 .sc_ncid:
+    inc qword [q_ncid_count]             ; how many ids the server has issued, so a
+                                         ; probe can hold it to the limit we granted
     inc rbx                              ; past the type
     mov rdi, rbx                         ; sequence number
     mov rsi, r12
@@ -8124,6 +8344,10 @@ h3_battery:
     call probe_h3_newcid
     call probe_h3_sessid_echo
     call probe_h3_streams_uni
+    call probe_h3_tpudp
+    call probe_h3_tpcid
+    call probe_h3_dgmax
+    call probe_h3_cidcnt
     call probe_h3_rsvd
     call probe_h3_strmlim
     call probe_h3_initpad
