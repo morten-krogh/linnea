@@ -59,9 +59,16 @@ LINNEA_QUIC_CH_BUF    equ 4096       ; largest ClientHello we reassemble
 ; MTU must be split: the CRYPTO byte stream is chopped into chunks, each carried
 ; by its own Handshake packet (increasing packet number, increasing CRYPTO
 ; offset) in its own datagram. This chunk size keeps a datagram — even the first,
-; which coalesces the Initial ahead of the Handshake packet — under the 1200-byte
-; floor every QUIC endpoint must accept (RFC 9000 s14.1).
+; which coalesces the Initial ahead of the Handshake packet — WITHIN the
+; 1200-byte size every QUIC endpoint must accept (RFC 9000 s14.1), so no
+; datagram of ours depends on a path that carries more.
+; 14.1 also runs the other way, which this once had backwards: a datagram
+; carrying an ack-eliciting Initial must be EXPANDED to 1200. That is how the
+; path is shown to carry the size QUIC requires before the handshake commits to
+; it, and it bounds what an unvalidated address can reflect. .send_flight pads
+; the datagram that coalesces the Initial up to this.
 LINNEA_QUIC_CRYPTO_CHUNK equ 960    ; max CRYPTO payload per Handshake packet
+LINNEA_QUIC_MIN_INITIAL_DGRAM equ 1200 ; RFC 9000 14.1 floor for an Initial datagram
 LINNEA_QUIC_HS_FLIGHT_MAX equ 8192  ; largest flight the shared hsmsg scratch assembles
 LINNEA_QUIC_FLIGHT_TAIL   equ 320   ; per-conn EE || CertVerify || Finished kept for resume
 
@@ -181,6 +188,12 @@ LINNEA_QUIC_RST_SEEN    equ 32      ; cancelled stream ids remembered per connec
 ; times exhausts the limit, can open no more request streams (images stop loading),
 ; and falls back to h2 after ~30 s. Grant a fresh window once within THRESH of it.
 LINNEA_QUIC_MS_INIT     equ 100     ; initial_max_streams_bidi we advertise
+; initial_max_streams_uni we advertise. Unlike the bidirectional limit this one
+; is never raised — a client needs three uni streams for HTTP/3 (control and the
+; two QPACK streams) and opens no more — so the value the transport parameter
+; carries is also the value linnea_quic_stream_limit enforces. Both now read
+; this constant, so the granted limit and the enforced one cannot drift apart.
+LINNEA_QUIC_MSU_INIT    equ 100
 LINNEA_QUIC_MS_WINDOW   equ 128     ; streams granted ahead of the peer's highest
 LINNEA_QUIC_MS_THRESH   equ 64      ; regrant when the peer is within this of the limit
 

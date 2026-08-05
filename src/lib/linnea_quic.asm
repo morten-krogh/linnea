@@ -19,6 +19,7 @@ global linnea_quic_stream_frame
 global linnea_quic_close_frame
 global linnea_quic_frame_skip
 global linnea_quic_frames_check
+global linnea_quic_stream_limit
 global linnea_quic_frames_ack_eliciting
 global linnea_quic_ack_record
 global linnea_quic_ack_seen
@@ -254,11 +255,24 @@ unprotect_body:
     add rsp, 16
     test rax, rax
     js .err
+    ; RFC 9000 17.2: the two reserved bits of a long header (mask 0x0c) MUST be
+    ; zero, and a packet carrying them set is a connection error of type
+    ; PROTOCOL_VIOLATION. Judged HERE, after the AEAD opens, because 17.2 says
+    ; "after removing both packet and header protection" — the bits are
+    ; unreadable before, and acting on a packet that never authenticated would
+    ; hand anyone who can spoof a datagram the power to end a connection.
+    ; The unprotected first byte is read back from the AAD scratch: r8 held it,
+    ; but has since become the ciphertext pointer.
+    test byte [rsp + U_AAD], 0x0c
+    jnz .rsvd
     mov rax, r15
     sub rax, [rsp + U_PNLEN]
     sub rax, 16                      ; plaintext length = ctlen - tag
     mov rdx, [rsp + U_PN]            ; and the packet number, for acknowledging
     jmp .done
+.rsvd:
+    mov rax, -2                      ; distinct from -1: the packet is authentic,
+    jmp .done                        ; so the caller must close, not just drop
 .err:
     mov rax, -1
 .done:
@@ -421,10 +435,18 @@ linnea_quic_unprotect_short:
     add rsp, 16
     test rax, rax
     js .serr
+    ; RFC 9000 17.3.1: a short header's reserved bits are the pair masked by 0x18
+    ; (a short header spends 0x04 on the key phase, which is why the mask differs
+    ; from the long header's 0x0c). Same rule, same timing as above.
+    test byte [rsp + S_AAD], 0x18
+    jnz .srsvd
     mov rax, rbp
     sub rax, [rsp + S_HLEN]
     sub rax, 16                      ; plaintext length = ctlen - tag
     mov rdx, [rsp + S_PN]            ; and the packet number, for acknowledging
+    jmp .sdone
+.srsvd:
+    mov rax, -2
     jmp .sdone
 .serr:
     mov rax, -1
@@ -1850,12 +1872,12 @@ linnea_quic_build_transport_params:
     mov r12, rax
     mov rdi, r12                     ; initial_max_streams_bidi (0x08)
     mov esi, 0x08
-    mov edx, 100
+    mov edx, LINNEA_QUIC_MS_INIT     ; what linnea_quic_stream_limit enforces
     call tp_int
     mov r12, rax
     mov rdi, r12                     ; initial_max_streams_uni (0x09)
     mov esi, 0x09
-    mov edx, 100
+    mov edx, LINNEA_QUIC_MSU_INIT
     call tp_int
     mov r12, rax
     mov rax, r12
@@ -3441,6 +3463,98 @@ linnea_quic_frames_check:
     ret
 .fc_bad:
     mov rax, -1
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_stream_limit(rdi = frames, rsi = length, rdx = the bidirectional
+;   stream limit we have granted, rcx = the unidirectional one)
+;   -> rax = 0 when every peer-initiated stream these frames name is within them,
+;      or -1 with rdx = the type of the frame that broke one.
+;
+; RFC 9000 4.6 MUST: "An endpoint that receives a frame with a stream ID
+; exceeding the limit it has sent MUST treat this as a connection error of type
+; STREAM_LIMIT_ERROR." Nothing checked a stream id against what we advertised at
+; all: a peer could open stream 4 000 000 and we would either serve it or, once
+; the response slots ran out, drop it in silence — leaving the peer waiting on a
+; request we had neither answered nor refused.
+;
+; Only PEER-initiated streams count against what WE granted. RFC 9000 2.1 puts
+; the initiator in bit 0 (0 = client) and the directionality in bit 1 (0 = bidi),
+; so a frame naming one of our own streams is not limited by our advertisement
+; and is stepped over. The ordinal of a stream is (id >> 2) + 1, which is what a
+; limit of N bounds.
+linnea_quic_stream_limit:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                       ; keep the calls 16-aligned
+    mov rbx, rdi                     ; cursor
+    lea r12, [rdi + rsi]             ; end
+    mov r13, rdx                     ; bidirectional limit
+    mov r14, rcx                     ; unidirectional limit
+.sl_loop:
+    cmp rbx, r12
+    jae .sl_ok
+    movzx eax, byte [rbx]
+    mov r15d, eax                    ; the type, to name in the CONNECTION_CLOSE
+    cmp eax, 0x04                    ; RESET_STREAM
+    je .sl_id
+    cmp eax, 0x05                    ; STOP_SENDING
+    je .sl_id
+    cmp eax, 0x11                    ; MAX_STREAM_DATA
+    je .sl_id
+    cmp eax, 0x15                    ; STREAM_DATA_BLOCKED
+    je .sl_id
+    mov ecx, eax
+    and ecx, 0xf8
+    cmp ecx, 0x08                    ; STREAM, in all eight flag combinations
+    je .sl_id
+.sl_next:
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .sl_ok                       ; unknown or truncated: frames_check judges it
+    add rbx, rax
+    jmp .sl_loop
+.sl_id:
+    lea rdi, [rbx + 1]               ; every one of these frames opens with the id
+    mov rsi, r12
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .sl_ok                        ; unreadable: not ours to judge
+    mov rcx, rax
+    and rcx, 3
+    jz .sl_bidi                      ; 0b00: client-initiated bidirectional
+    cmp rcx, 2
+    je .sl_uni                       ; 0b10: client-initiated unidirectional
+    jmp .sl_next                     ; 0b01 / 0b11: server-initiated, ours
+.sl_bidi:
+    shr rax, 2
+    inc rax                          ; this stream's ordinal
+    cmp rax, r13
+    ja .sl_bad
+    jmp .sl_next
+.sl_uni:
+    shr rax, 2
+    inc rax
+    cmp rax, r14
+    ja .sl_bad
+    jmp .sl_next
+.sl_bad:
+    mov rdx, r15
+    mov rax, -1
+    jmp .sl_ret
+.sl_ok:
+    xor eax, eax
+.sl_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret

@@ -59,22 +59,28 @@ def handshake(session_ticket=None):
         pass
     resumed = conn.tls.session_resumed
     confirmed = conn._handshake_confirmed
+    got_cert = conn.tls._peer_certificate is not None
     s.close()
     assert confirmed, "handshake not confirmed"
-    return (tickets[0] if tickets else None), server_bytes, resumed
+    return (tickets[0] if tickets else None), server_bytes, resumed, got_cert
 
 
 # First connection: full handshake, obtain a ticket.
-ticket, full_bytes, resumed1 = handshake()
+ticket, full_bytes, resumed1, cert1 = handshake()
 assert ticket is not None, "no ticket from the first handshake"
 assert not resumed1, "first handshake should not be a resumption"
+assert cert1, "the full handshake sent no certificate"
 
 # Second connection: resume with that ticket.
-ticket2, resume_bytes, resumed2 = handshake(session_ticket=ticket)
+ticket2, resume_bytes, resumed2, cert2 = handshake(session_ticket=ticket)
 assert resumed2, "second handshake was not resumed"
-# the resumed flight carries no certificate, so the server sent far fewer bytes
-assert resume_bytes < full_bytes, \
-    f"resumed handshake not smaller: {resume_bytes} vs {full_bytes}"
+# The point of resumption is that the certificate is NOT re-sent, and that is
+# what to assert. This used to compare total bytes received, which stopped
+# discriminating once the server began expanding the datagram carrying its
+# Initial to the 1200 bytes RFC 9000 14.1 requires: with a small test
+# certificate both handshakes then sit on that floor and the totals are equal.
+# Padding is not the absence of a certificate, so measure the certificate.
+assert not cert2, "the resumed handshake re-sent the certificate"
 # resumption also issues a fresh ticket (rotation)
 assert ticket2 is not None, "no ticket issued on the resumed handshake"
-print(f"ok (full={full_bytes}B resumed={resume_bytes}B)")
+print(f"ok (full={full_bytes}B resumed={resume_bytes}B, cert only on the full one)")

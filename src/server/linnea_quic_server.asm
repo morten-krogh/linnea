@@ -113,6 +113,7 @@ extern linnea_quic_close_frame
 extern linnea_quic_ack_record
 extern linnea_quic_ack_seen
 extern linnea_quic_frames_check
+extern linnea_quic_stream_limit
 extern linnea_quic_alpn_has
 extern linnea_quic_frames_ack_eliciting
 extern linnea_quic_rtt_sample
@@ -611,9 +612,25 @@ linnea_quic_server_datagram:
     ; confirmed; long-header packets are the handshake flights.
     test byte [linnea_quic_rxbuf], 0x80
     jz .demux_short
+    ; A datagram must actually contain the header fields we are about to read.
+    ; There was no length floor here at all, and rxbuf is reused between
+    ; datagrams: a runt was demultiplexed on whatever the PREVIOUS datagram left
+    ; behind, so it could be routed to an unrelated live connection and credit
+    ; that connection's amplification budget with bytes received from somewhere
+    ; else entirely. Nothing could be reflected by it — every reply path (Version
+    ; Negotiation, the closing re-send, the stateless reset) carries its own
+    ; length gate — but routing a packet on bytes that never arrived is not
+    ; something to leave standing. A long header needs the first byte, the
+    ; version, both connection-id length bytes and the DCID itself.
+    cmp r13, 7
+    jb .done
     movzx eax, byte [linnea_quic_rxbuf + 5]      ; long header: explicit DCID length
     cmp eax, LINNEA_QUIC_MAX_CID
     ja .done
+    lea rax, [rax + 7]                           ; b0 + version(4) + len byte + DCID
+    cmp r13, rax                                 ; + the SCID length byte
+    jb .done
+    movzx eax, byte [linnea_quic_rxbuf + 5]
     lea rdi, [linnea_quic_rxbuf + 6]
     mov esi, eax
     call linnea_quic_conn_lookup
@@ -762,6 +779,11 @@ linnea_quic_server_datagram:
     rep movsb
     jmp .long_in
 .demux_short:
+    ; the same floor for a short header: the id we look up is a fixed 8 bytes
+    ; after the first, and reading it out of a shorter datagram means reading the
+    ; previous one (see the long-header note above)
+    cmp r13, 1 + LINNEA_QUIC_SCID_LEN
+    jb .done
     lea rdi, [linnea_quic_rxbuf + 1]             ; short header: our ID, fixed length
     mov esi, LINNEA_QUIC_SCID_LEN
     call linnea_quic_conn_lookup
@@ -865,6 +887,8 @@ linnea_quic_server_datagram:
     CONNLEA rdx, ini_client
     lea rcx, [plaintext]
     call linnea_quic_unprotect       ; rax = plaintext length, rdx = pn
+    cmp rax, -2
+    je .ini_rsvd                     ; authentic, but its reserved bits are set
     test rax, rax
     js .try_handshake                ; not decryptable — maybe the client Finished
     mov [s_ini_pn], rdx
@@ -937,6 +961,20 @@ linnea_quic_server_datagram:
     cmp qword [ch_out + linnea_quic_ch.ks_ptr], 0
     jne .ks_ok
     mov edi, 0x0100 + 40             ; handshake_failure
+    call .initial_close
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
+.ini_rsvd:
+    ; RFC 9000 17.2 MUST: a long header's two reserved bits (mask 0x0c) set on a
+    ; packet that authenticated is a connection error of type PROTOCOL_VIOLATION.
+    ; The close goes in the Initial space — the one whose keys both ends certainly
+    ; hold at this point — exactly as the key_share and ALPN refusals do, and the
+    ; slot is released with it. A client that has already moved to the Handshake
+    ; space has discarded its Initial keys (RFC 9001 4.9.1) and would not read
+    ; this, so a Handshake packet carrying the bits is still only dropped; that
+    ; space has no close builder of its own yet.
+    mov edi, 0x0a                    ; PROTOCOL_VIOLATION
     call .initial_close
     mov rdi, [cur_conn]
     call linnea_quic_conn_free
@@ -1666,6 +1704,11 @@ linnea_quic_server_datagram:
     lea rcx, [plaintext]
     mov r8d, LINNEA_QUIC_SCID_LEN    ; the connection ID length we issue
     call linnea_quic_unprotect_short  ; rax = frame bytes, rdx = pn, r8 = key phase
+    cmp rax, -2                       ; reserved bits set on an authentic packet:
+    je .oi_rsvd                       ; a connection error, not a decrypt failure —
+                                      ; and it must be caught BEFORE the key-update
+                                      ; retry below, or a violating packet would
+                                      ; provoke a pointless trial rekey instead
     test rax, rax
     jns .oi_ok
     ; Failed to open with the current keys. A peer-initiated key update (RFC 9001 6)
@@ -1689,8 +1732,19 @@ linnea_quic_server_datagram:
     inc r8
 .oi_ku_call:
     call ku_try                      ; rax = frame bytes (or -1), rdx = pn
+    cmp rax, -2
+    je .oi_rsvd                      ; opened under the next key phase, bits still set
     test rax, rax
     js .done
+    jmp .oi_ok
+.oi_rsvd:
+    ; RFC 9000 17.3.1 MUST: reserved bits set on a packet that authenticated is a
+    ; connection error of type PROTOCOL_VIOLATION. No frame triggered it — the
+    ; fault is in the header — and 19.19 defines the frame type 0 as exactly that
+    ; case, "the value 0 is used when the frame type is unknown".
+    mov edi, 0x0a                    ; PROTOCOL_VIOLATION
+    xor esi, esi                     ; no frame type
+    jmp .transport_close
 .oi_ok:
     mov r10, rax                     ; hold the frame-byte count across the calls
     mov r11, rdx                     ; and the packet number
@@ -1757,6 +1811,24 @@ linnea_quic_server_datagram:
     mov esi, edx                     ; the type we could not parse
     jmp .transport_close
 .frames_ok:
+    ; RFC 9000 4.6 MUST: a stream id past the limit we granted is a connection
+    ; error of type STREAM_LIMIT_ERROR. Judged next to the frame walk above and
+    ; for the same reason — once, on the whole packet, rather than by each of the
+    ; scanners that go on to act on these frames. The bidirectional limit is the
+    ; one this connection has been granted (it rises as streams open, see the
+    ; MAX_STREAMS regrant), not the initial advertisement.
+    lea rdi, [plaintext]
+    mov rsi, r14
+    mov rax, [cur_conn]
+    mov rdx, [rax + linnea_quic_conn.ms_bidi_max]
+    mov ecx, LINNEA_QUIC_MSU_INIT
+    call linnea_quic_stream_limit
+    test rax, rax
+    jz .limits_ok
+    mov edi, 0x04                    ; STREAM_LIMIT_ERROR
+    mov esi, edx                     ; the frame that named the stream
+    jmp .transport_close
+.limits_ok:
     ; RFC 9000 13.2.1 MUST: an ack-eliciting packet has to be acknowledged. Note
     ; both whether this one is, and our packet number before any of it is acted
     ; on — comparing that number at the exit is how we tell whether anything we
@@ -3707,6 +3779,33 @@ linnea_quic_server_datagram:
     lea rsi, [hsmsg + r14]           ; chunk source: the recomposed flight in hsmsg
     mov rcx, [s_hs_chunk]
     rep movsb                        ; copy the chunk into hspay
+    ; RFC 9000 14.1 MUST: a UDP datagram carrying an ack-eliciting Initial is
+    ; expanded to 1200 bytes. That is this datagram — the Initial staged in
+    ; outpkt coalesced with the first Handshake chunk — and ours ran short
+    ; whenever the flight was small (a resumption flight is EE || Finished, a
+    ; few hundred bytes). The padding goes in the LAST packet of the datagram as
+    ; PADDING frames (type 0x00) inside the Handshake payload, so it is covered
+    ; by that packet's Length and its AEAD; trailing bytes after the final packet
+    ; would instead be read as a packet with the fixed bit clear and discarded.
+    ; The header is built twice on purpose: its Length varint describes the
+    ; payload, so the padded size has to be known before the header is final.
+    test r14, r14
+    jnz .sf_hdr                      ; only the first chunk shares the Initial's datagram
+    call .build_hs_header
+    mov rax, [s_ini_len]
+    add rax, rcx                     ; + this packet's header
+    add rax, r15                     ; + its payload
+    add rax, 16                      ; + its AEAD tag
+    cmp rax, LINNEA_QUIC_MIN_INITIAL_DGRAM
+    jae .sf_hdr
+    mov rdx, LINNEA_QUIC_MIN_INITIAL_DGRAM
+    sub rdx, rax                     ; PADDING bytes wanted
+    lea rdi, [hspay + r15]
+    xor eax, eax
+    mov rcx, rdx
+    rep stosb
+    add r15, rdx
+.sf_hdr:
     call .build_hs_header            ; rcx = header length; uses r15, conn.flight_pn
     sub rsp, 16
     CONNLEA rax, hs_skeys
@@ -4316,7 +4415,11 @@ ku_try:
     mov rcx, r15
     mov r8d, LINNEA_QUIC_SCID_LEN
     mov r9, [ku_exp]
-    call linnea_quic_unprotect_short  ; rax = len (or -1), rdx = pn
+    call linnea_quic_unprotect_short  ; rax = len (or -1/-2), rdx = pn
+    cmp rax, -2
+    je .kt_done                       ; opened, but its reserved bits are set: pass
+                                      ; that verdict up rather than committing a key
+                                      ; update off a packet the caller must close on
     test rax, rax
     js .kt_fail
     ; it opened: this IS a key update. Commit it. Keep len+pn across the copies.

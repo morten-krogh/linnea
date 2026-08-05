@@ -19,6 +19,7 @@ default rel
 %include "linnea_syscall.inc"
 %include "linnea_tls.inc"
 %include "linnea_quic.inc"
+%include "linnea_quic_conn.inc"
 
 global _start
 
@@ -103,6 +104,8 @@ pfx_info_len equ $ - pfx_info
 s_arrow:    db " -> "
 s_arrow_len equ $ - s_arrow
 s_status:   db "HTTP "
+s_bytes:    db " bytes"
+s_bytes_len equ $ - s_bytes
 s_status_len equ $ - s_status
 s_noresp:   db "(no response / connection closed)", 10
 s_noresp_len equ $ - s_noresp
@@ -388,6 +391,14 @@ n_h3_urgency: db "HTTP/3 urgency: u=07 is low priority, not high"
 n_h3_urgency_len equ $ - n_h3_urgency
 n_h3_maxdata: db "HTTP/3 server grants connection credit (MAX_DATA)"
 n_h3_maxdata_len equ $ - n_h3_maxdata
+n_h3_rsvd:    db "QUIC reserved header bits set -> PROTOCOL_VIOLATION"
+n_h3_rsvd_len equ $ - n_h3_rsvd
+n_h3_strmlim: db "QUIC stream id past the advertised limit -> STREAM_LIMIT_ERROR"
+n_h3_strmlim_len equ $ - n_h3_strmlim
+n_h3_initpad: db "QUIC Initial datagram expansion (RFC 9000 14.1)"
+n_h3_initpad_len equ $ - n_h3_initpad
+n_h3_runt:    db "QUIC runt datagrams leave a live connection undisturbed"
+n_h3_runt_len equ $ - n_h3_runt
 n_h3_newcid:  db "HTTP/3 NEW_CONNECTION_ID issued and the CID routes"
 n_h3_newcid_len equ $ - n_h3_newcid
 
@@ -517,6 +528,14 @@ qhsc_fin_end: resq 1                    ; offset in qhsc just past the server Fi
 q_srv_scid: resb 20                     ; the server's chosen connection id (our DCID)
 q_srv_scid_len: resq 1
 q_srv_uni:   resq 1                      ; first server-initiated uni stream id seen (-1 = none)
+q_close_code: resq 1                     ; error code of the last CONNECTION_CLOSE (-1 = none)
+q_rsvd:      resq 1                      ; 1 = set the short header's reserved bits (quic-14)
+q_srv_ms_bidi: resq 1                    ; the server's advertised initial_max_streams_bidi
+                                         ; (-1 = it sent none, so no limit can be exceeded
+                                         ; on purpose)
+q_init_dgram: resq 1                     ; size of the first datagram carrying a server Initial
+q_req_sid:   resq 1                      ; the stream the current request went out on, so the
+                                         ; classifier collects the right response
 q_alt_cid:  resb 20                     ; a CID the server issued via NEW_CONNECTION_ID
 q_alt_cid_len: resq 1
 q_alt_cid_valid: resq 1                 ; 1 once we captured a NEW_CONNECTION_ID
@@ -4681,6 +4700,115 @@ quic_check_finished:
 .ret:
     ret
 
+; quic_srv_tp_scan(): read the server's initial_max_streams_bidi out of the QUIC
+; transport parameters it sent in EncryptedExtensions, so the stream-limit probe
+; can build an id the SERVER ITSELF declared out of bounds instead of guessing a
+; number and hoping it is over the limit. Left at -1 when the parameter is absent
+; (RFC 9000 18.2 lets a server omit it; a server that never stated a limit is not
+; one we can accuse of ignoring it), which the probe reports as [info].
+quic_srv_tp_scan:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov qword [q_srv_ms_bidi], -1
+    xor ecx, ecx                          ; handshake-message cursor
+.m:
+    lea rax, [rcx + 4]
+    cmp rax, [qhsc_len]
+    ja .ret
+    movzx eax, byte [qhsc + rcx]          ; message type
+    movzx edx, byte [qhsc + rcx + 1]
+    shl edx, 8
+    movzx r8d, byte [qhsc + rcx + 2]
+    or edx, r8d
+    shl edx, 8
+    movzx r8d, byte [qhsc + rcx + 3]
+    or edx, r8d                           ; message body length
+    lea r9, [rcx + 4]
+    add r9, rdx                           ; end of this message
+    cmp r9, [qhsc_len]
+    ja .ret                               ; incomplete
+    cmp al, 0x08                          ; EncryptedExtensions
+    jne .next
+    lea rbx, [qhsc + rcx + 4]             ; -> 2-byte extensions length
+    lea r12, [qhsc + r9]                  ; message end
+    lea rax, [rbx + 2]
+    cmp rax, r12
+    ja .ret
+    movzx r13d, byte [rbx]
+    shl r13d, 8
+    movzx eax, byte [rbx + 1]
+    or r13d, eax
+    add rbx, 2
+    lea rax, [rbx + r13]
+    cmp rax, r12
+    ja .ret
+    mov r12, rax                          ; extensions end
+.ext:
+    lea rax, [rbx + 4]
+    cmp rax, r12
+    ja .ret
+    movzx r13d, byte [rbx]                ; extension type
+    shl r13d, 8
+    movzx eax, byte [rbx + 1]
+    or r13d, eax
+    movzx r14d, byte [rbx + 2]            ; extension length
+    shl r14d, 8
+    movzx eax, byte [rbx + 3]
+    or r14d, eax
+    add rbx, 4
+    lea rax, [rbx + r14]
+    cmp rax, r12
+    ja .ret
+    cmp r13d, 0x0039                      ; quic_transport_parameters (RFC 9001 8.2)
+    je .tp
+    add rbx, r14
+    jmp .ext
+.tp:
+    lea r12, [rbx + r14]                  ; the parameter list's end
+.tpl:
+    cmp rbx, r12
+    jae .ret
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_varint_decode        ; parameter id
+    test rdx, rdx
+    jz .ret
+    mov r13, rax
+    add rbx, rdx
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_varint_decode        ; parameter length
+    test rdx, rdx
+    jz .ret
+    add rbx, rdx
+    mov r14, rax
+    lea rax, [rbx + r14]
+    cmp rax, r12
+    ja .ret
+    cmp r13, 0x08                         ; initial_max_streams_bidi
+    jne .tpnext
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ret
+    mov [q_srv_ms_bidi], rax
+    jmp .ret
+.tpnext:
+    add rbx, r14
+    jmp .tpl
+.next:
+    mov rcx, r9
+    jmp .m
+.ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; quic_walk_datagram(rsi=datagram length): walk the coalesced packets in qrx,
 ; decrypting the Initial (ServerHello -> derive Handshake keys) and Handshake
 ; packets (CRYPTO -> reassemble into qhsc). Force-aligns rsp for the SSE crypto.
@@ -4950,6 +5078,7 @@ quic_recv_flight:
     mov qword [q_hs_smallest], -1
     mov qword [q_cli_hs_pn], 0
     mov qword [q_acked], 0
+    mov qword [q_init_dgram], 0
 .loop:
     mov [pollfd], ebx
     mov word [pollfd + 4], LINNEA_POLLIN
@@ -4972,6 +5101,20 @@ quic_recv_flight:
     test rax, rax
     jle .stall
     mov rsi, rax
+    ; measure the first datagram that carries a server Initial: RFC 9000 14.1
+    ; requires a datagram carrying an ack-eliciting Initial to be expanded to
+    ; 1200 bytes, and the server's ServerHello flight is exactly that. Measured
+    ; on the datagram, not the packet, because coalescing is what usually
+    ; satisfies the rule.
+    cmp qword [q_init_dgram], 0
+    jne .no_measure
+    movzx eax, byte [qrx]
+    test al, 0x80                         ; long header
+    jz .no_measure
+    and al, 0x30                          ; v1 long-header type: 00 = Initial
+    jnz .no_measure
+    mov [q_init_dgram], rsi
+.no_measure:
     call quic_walk_datagram
     cmp qword [q_fin_seen], 0
     jne .done
@@ -5004,6 +5147,7 @@ quic_recv_flight:
     call quic_send_hs_ack
     jmp .loop
 .done:
+    call quic_srv_tp_scan                 ; the flight is in qhsc now: read its limits
     mov rax, [q_fin_seen]
     pop rbx
     ret
@@ -5091,6 +5235,13 @@ quic_recv_1rtt:
     lea rdi, [qplain]                     ; capture a NEW_CONNECTION_ID if present
     mov rsi, rax
     call quic_scan_ncid
+    pop rax
+    pop rax
+    push rax
+    push rax
+    lea rdi, [qplain]                     ; a raised bidi stream limit, if the server
+    mov rsi, rax                          ; grants one before we test the old limit
+    call quic_scan_maxstreams
     pop rax
     pop rax
     lea rdi, [qplain]                     ; the server's control / QPACK streams
@@ -5200,6 +5351,15 @@ quic_send_1rtt:
     mov r13, rdx
     lea rdi, [qhdr]
     mov byte [rdi], 0x40                  ; short header: fixed bit, pnlen-1 = 0
+    ; quic-14 probe: the two reserved bits (0x18) MUST be zero on the wire, and a
+    ; peer that receives them set MUST close with PROTOCOL_VIOLATION (RFC 9000
+    ; 17.3.1). They are set HERE, before linnea_quic_protect masks the byte, so
+    ; they travel exactly as a real violator's would — header protection is what
+    ; makes them invisible until the receiver has removed it.
+    cmp qword [q_rsvd], 0
+    je .no_rsvd
+    or byte [rdi], 0x18
+.no_rsvd:
     inc rdi
     mov rcx, [q_srv_scid_len]             ; DCID = the server's connection id
     lea rsi, [q_srv_scid]
@@ -5750,6 +5910,9 @@ quic_h3_handshake_retry:
 
 quic_h3_open:
     push rbx
+    mov qword [q_req_sid], 0              ; a fresh connection requests on stream 0
+                                          ; unless a probe says otherwise, so a probe
+                                          ; that used another id cannot strand the next
     mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [tls_priv]
     mov esi, 32
@@ -5886,9 +6049,20 @@ quic_h3_classify:
     test rax, rax
     jz .next
     mov r13, r9
-    test r8, r8
-    jnz .frame                           ; not our request stream
+    cmp r8, [q_req_sid]
+    jne .frame                           ; not the stream we requested on
+    ; clamp to h3buf: a real page is far larger than this buffer and the copy had
+    ; no bound, so a third-party server's response walked off the end of .bss and
+    ; killed the prober. Only the head of the stream is ever needed — the field
+    ; section carrying :status sits at its start.
     mov rcx, [h3buf_len]
+    mov r8, 4096
+    sub r8, rcx                          ; room left
+    jbe .frame                           ; full: keep walking, copy nothing
+    cmp rdx, r8
+    jbe .fits
+    mov rdx, r8
+.fits:
     lea rdi, [h3buf + rcx]
     mov rsi, rax
     mov rcx, rdx
@@ -5904,6 +6078,18 @@ quic_h3_classify:
     mov rax, -2
     jmp .out
 .closed:
+    ; record WHICH violation the server reported, not merely that it closed: a
+    ; probe for a specific MUST has to tell the right error code from a server
+    ; that closed for some unrelated reason. RFC 9000 19.19: the frame type byte
+    ; is followed by the error code as a varint.
+    mov qword [q_close_code], -1
+    lea rdi, [r13 + 1]
+    mov rsi, r14
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .closed_out
+    mov [q_close_code], rax
+.closed_out:
     mov rax, -3
     jmp .out
 .next:
@@ -7119,6 +7305,461 @@ probe_h3_maxdata:
     pop rbx
     ret
 
+; qpay_build_get(rdi = request stream id, rsi = 1 to open the control stream)
+;   -> rdx = payload length, built in qpay.
+; A GET on the given bidirectional stream, optionally preceded by the client
+; control stream (an empty SETTINGS). The id is varint-encoded, so a probe can
+; put an ordinary, perfectly well-formed request on a stream the server never
+; permitted (quic-14) exactly as easily as on stream 0 — the stream id is then
+; the only variable. The control stream is optional because it may be opened
+; ONCE: a second SETTINGS on it is itself an HTTP/3 connection error (RFC 9114
+; 7.2.4), so a probe sending a second request must not repeat it.
+; Records the id in q_req_sid so the classifier collects the right response.
+qpay_build_get:
+    push rbx
+    push r13
+    push r14
+    push r15
+    mov r13, rdi                          ; request stream id
+    mov r15, rsi                          ; open the control stream?
+    mov [q_req_sid], rdi
+    lea rdi, [fs_scratch]
+    mov byte [rdi], 0x00                  ; QPACK: Required Insert Count 0
+    mov byte [rdi + 1], 0x00             ;        Delta Base 0
+    mov byte [rdi + 2], 0xd1             ; :method GET   (static 17)
+    mov byte [rdi + 3], 0xd7             ; :scheme https (static 23)
+    mov byte [rdi + 4], 0xc1             ; :path /       (static 1)
+    mov byte [rdi + 5], 0x50             ; :authority, literal with static name 0
+    add rdi, 6
+    mov rax, [host_len]
+    mov [rdi], al
+    inc rdi
+    mov rsi, [host_ptr]
+    mov rcx, [host_len]
+    rep movsb
+    lea rax, [fs_scratch]
+    mov r14, rdi
+    sub r14, rax                          ; field-section length
+    lea rdi, [qpay]
+    test r15, r15
+    jz .no_control
+    mov byte [rdi], 0x0a                  ; STREAM | LEN
+    mov byte [rdi + 1], 0x02             ; stream 2: the client's control stream
+    mov byte [rdi + 2], 0x03             ; STREAM data length
+    mov byte [rdi + 3], 0x00             ; stream type 0x00 = control
+    mov byte [rdi + 4], 0x04             ; SETTINGS
+    mov byte [rdi + 5], 0x00             ; no settings
+    add rdi, 6
+.no_control:
+    mov byte [rdi], 0x0b                  ; STREAM | LEN | FIN
+    inc rdi
+    mov rsi, r13
+    call linnea_quic_varint_encode        ; the request stream id
+    add rdi, rax
+    lea rax, [r14 + 2]
+    mov [rdi], al                         ; STREAM data length
+    mov byte [rdi + 1], 0x01             ; HEADERS frame
+    mov [rdi + 2], r14b                  ; HEADERS length
+    add rdi, 3
+    lea rsi, [fs_scratch]
+    mov rcx, r14
+    rep movsb
+    lea rax, [qpay]
+    mov rdx, rdi
+    sub rdx, rax
+    pop r15
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+; quic_drain(edi = fd): read and discard whatever is still arriving, until a poll
+; goes quiet. A probe that asks a question AFTER a full response has to get the
+; rest of that response out of the way first — a real page is many datagrams, and
+; the classifier's per-call datagram budget would otherwise be spent on the tail
+; of the previous answer and report the next one as missing.
+quic_drain:
+    push rbx
+    mov ebx, edi
+.d_loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 300
+    syscall
+    test rax, rax
+    jle .d_done
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jg .d_loop
+.d_done:
+    pop rbx
+    ret
+
+; quic_wait_close(edi = fd) -> rax = 1 if a CONNECTION_CLOSE arrives within a
+; short window, with its error code in q_close_code. Needed because "the server
+; answered" is not the same as "the server let it pass": an endpoint may detect a
+; header-level violation after the response is already on its way, and closing
+; late still satisfies "treat this as a connection error". Without this the probe
+; would accuse every implementation that orders the two that way.
+quic_wait_close:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov r12d, 4                           ; datagrams to look through
+    mov qword [q_close_code], -1
+.wc_loop:
+    mov [pollfd], ebx
+    mov word [pollfd + 4], LINNEA_POLLIN
+    mov word [pollfd + 6], 0
+    mov eax, LINNEA_SYS_POLL
+    lea rdi, [pollfd]
+    mov esi, 1
+    mov edx, 400
+    syscall
+    test rax, rax
+    jle .wc_no
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, ebx
+    lea rsi, [qrx]
+    mov edx, 2048
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    test rax, rax
+    jle .wc_no
+    mov rsi, rax
+    call quic_find_1rtt
+    test rax, rax
+    jz .wc_next
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [q_ap_skeys]
+    lea rcx, [qplain]
+    mov r8d, 8
+    mov r9, [q_cli_ap_pn]
+    call linnea_quic_unprotect_short
+    test rax, rax
+    js .wc_next
+    lea r13, [qplain]
+    lea r14, [qplain]
+    add r14, rax
+.wc_frame:
+    cmp r13, r14
+    jae .wc_next
+    movzx eax, byte [r13]
+    cmp al, 0x1c
+    je .wc_found
+    cmp al, 0x1d
+    je .wc_found
+    mov rdi, r13
+    mov rsi, r14
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .wc_next
+    add r13, rax
+    jmp .wc_frame
+.wc_next:
+    dec r12d
+    jnz .wc_loop
+.wc_no:
+    xor eax, eax
+    jmp .wc_ret
+.wc_found:
+    lea rdi, [r13 + 1]
+    mov rsi, r14
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .wc_yes
+    mov [q_close_code], rax
+.wc_yes:
+    mov eax, 1
+.wc_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; probe_h3_rsvd (quic-14): the two reserved bits of a short header (0x18) MUST be
+; zero, and a receiver that sees them set MUST close with PROTOCOL_VIOLATION
+; (RFC 9000 17.3.1). Header protection hides them until it is removed, so this is
+; precisely a check a receiver can only make after unmasking — and one it is easy
+; never to write. An otherwise perfect GET carries them here, so a :status back
+; means the packet was processed with the bits set.
+probe_h3_rsvd:
+    push rbx
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov qword [q_rsvd], 1
+    xor edi, edi                          ; request stream 0
+    mov esi, 1                            ; ...opening the control stream
+    call qpay_build_get
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov qword [q_rsvd], 0                 ; never leave it set for a later probe
+    mov edi, ebx
+    call quic_h3_classify
+    cmp rax, 100
+    jl .rs_noanswer
+    ; It answered. That is only a deviation if the connection then STAYS up —
+    ; an endpoint that detects the violation after the response is already on
+    ; its way still ends the connection, which is what 17.3.1 asks for. Both
+    ; reference stacks probed here (Cloudflare, Google) answer first, so
+    ; returning on the status alone would have accused them wrongly.
+    mov edi, ebx
+    call quic_wait_close
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rax
+    test rax, rax
+    jz .dev                               ; answered and stayed up: bits ignored
+    cmp qword [q_close_code], 0x0a        ; PROTOCOL_VIOLATION
+    jne .info                             ; closed, but named another fault
+    mov dil, K_OK
+    jmp .rep
+.rs_noanswer:
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rax
+    cmp rax, -3                           ; CONNECTION_CLOSE, no response at all
+    jne .info                             ; dropped in silence: refused, but not the
+                                          ; connection error 17.3.1 asks for
+    cmp qword [q_close_code], 0x0a        ; PROTOCOL_VIOLATION
+    jne .info                             ; closed for some other reason
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov dil, K_INFO
+    jmp .rep
+.fail:
+    mov dil, K_INFO                       ; handshake never came up: not a deviation
+.rep:
+    lea rsi, [n_h3_rsvd]
+    mov edx, n_h3_rsvd_len
+    call report_plain
+    pop rbx
+    ret
+
+; probe_h3_strmlim (quic-14): a peer MUST NOT open more streams than the limit
+; the receiver advertised, and a receiver that is sent a stream id past its own
+; initial_max_streams_bidi MUST close with STREAM_LIMIT_ERROR (RFC 9000 4.6).
+; The id comes from the server's OWN transport parameters (quic_srv_tp_scan), so
+; this accuses nobody of exceeding a limit they never set: client-initiated
+; bidirectional ids are 4n, so a limit of N permits 0..4(N-1) and 4N is the first
+; one past it.
+probe_h3_strmlim:
+    push rbx
+    push r12
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov r12, [q_srv_ms_bidi]
+    cmp r12, 0
+    jl .unknown                           ; no limit advertised: nothing to exceed
+    cmp r12, 0x10000000
+    jae .unknown                          ; effectively unlimited: no id can pass it
+    shl r12, 2                            ; the first id past the limit
+    mov rdi, r12
+    mov esi, 1
+    call qpay_build_get
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rax
+    cmp rax, 100
+    jge .dev                              ; served a stream it had forbidden
+    cmp rax, -3
+    jne .dev                              ; silence is a deviation too: 4.6 says the
+                                          ; receiver MUST make this a CONNECTION
+                                          ; error, and a peer told nothing keeps the
+                                          ; request outstanding forever
+    cmp qword [q_close_code], 0x04        ; STREAM_LIMIT_ERROR
+    jne .info                             ; closed, but named another fault
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.unknown:
+    mov edi, ebx
+    call close_fd
+.info:
+    mov dil, K_INFO
+    jmp .rep
+.fail:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_strmlim]
+    mov edx, n_h3_strmlim_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+
+; probe_h3_initpad (quic-13): a datagram carrying an ack-eliciting Initial MUST
+; be expanded to 1200 bytes (RFC 9000 14.1) — that is how the path is shown to
+; carry the size QUIC requires before the handshake commits to it. The server's
+; ServerHello flight is such a datagram. Measured on the DATAGRAM, since
+; coalescing an Initial with a Handshake packet is the usual way to satisfy it.
+probe_h3_initpad:
+    push rbx
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    mov edi, ebx
+    call close_fd
+    mov rax, [q_init_dgram]
+    test rax, rax
+    jz .info                              ; never saw one (a Retry, or v2): no verdict
+    cmp rax, LINNEA_QUIC_MIN_INITIAL_DGRAM
+    jb .dev
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov dil, K_INFO
+    jmp .rep
+.fail:
+    mov dil, K_INFO
+    mov qword [q_init_dgram], -1
+.rep:
+    ; report the measured size: "expanded or not" is not actionable on its own,
+    ; and the number says at once whether a server is near the floor or nowhere
+    ; close to it.
+    lea rsi, [n_h3_initpad]
+    mov edx, n_h3_initpad_len
+    mov rcx, [q_init_dgram]
+    mov r9d, LINNEA_QUIC_MIN_INITIAL_DGRAM
+    call report_size
+    pop rbx
+    ret
+
+; probe_h3_runt (quic-13): a datagram too short to hold the fields a receiver
+; parses to route it must be dropped, never demultiplexed on whatever the
+; PREVIOUS datagram left in the receive buffer. That mis-routing has no reply
+; path — every one is already length-gated — so this is a POSITIVE LOCK, not a
+; red-green: it passes before the fix and after, and what it would catch is a
+; floor drawn too high, which would break ordinary traffic. The runts go out
+; between two requests on a live connection, so anything they disturb shows up
+; as the second request failing.
+probe_h3_runt:
+    push rbx
+    push r12
+    call quic_h3_open
+    test rax, rax
+    js .fail
+    mov ebx, eax
+    xor edi, edi
+    mov esi, 1
+    call qpay_build_get
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify
+    cmp rax, 200
+    jne .info                             ; the baseline request did not work: no verdict
+    mov edi, ebx
+    call quic_drain                       ; let the first response finish arriving
+    ; eight runts, 1..8 bytes, short-header shaped so they take the 1-RTT route
+    mov r12d, 1
+.runt:
+    mov byte [qpay], 0x40
+    mov byte [qpay + 1], 0x00
+    mov byte [qpay + 2], 0x00
+    mov byte [qpay + 3], 0x00
+    mov byte [qpay + 4], 0x00
+    mov byte [qpay + 5], 0x00
+    mov byte [qpay + 6], 0x00
+    mov byte [qpay + 7], 0x00
+    mov eax, LINNEA_SYS_SENDTO
+    mov edi, ebx
+    lea rsi, [qpay]
+    mov rdx, r12
+    mov r10d, LINNEA_MSG_NOSIGNAL
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    inc r12d
+    cmp r12d, 8
+    jbe .runt
+    ; the connection must be untouched: a second request is still served
+    mov edi, 4                            ; the next client bidirectional stream
+    xor esi, esi                          ; control stream already open: do not repeat it
+    call qpay_build_get
+    mov edi, ebx
+    lea rsi, [qpay]
+    call quic_send_1rtt
+    mov edi, ebx
+    call quic_h3_classify
+    push rax
+    mov edi, ebx
+    call close_fd
+    pop rax
+    cmp rax, 200
+    je .ok
+    ; A close or a stream reset means the runts DISTURBED the connection, which is
+    ; what this probe exists to catch. No answer at all is not evidence of that —
+    ; a server may simply not answer a second request inside the classifier's
+    ; window — so that is [info], not an accusation.
+    cmp rax, -3                           ; CONNECTION_CLOSE
+    je .dev
+    cmp rax, -2                           ; RESET_STREAM
+    je .dev
+    jmp .info_noclose
+.ok:
+    mov dil, K_OK
+    jmp .rep
+.dev:
+    mov dil, K_DEV
+    jmp .rep
+.info:
+    mov edi, ebx
+    call close_fd
+.info_noclose:
+    mov dil, K_INFO
+    jmp .rep
+.fail:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_runt]
+    mov edx, n_h3_runt_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+
 ; quic_scan_srv_uni(rdi=frames, rsi=len): record the first server-initiated
 ; unidirectional stream ((id & 3) == 3, RFC 9000 2.1) these frames open, in
 ; q_srv_uni. Called wherever 1-RTT frames are walked, because HTTP/3 servers
@@ -7149,6 +7790,47 @@ quic_scan_srv_uni:
     jmp .su_scan
 .su_scan_done:
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; quic_scan_maxstreams(rdi=frames, rsi=len): adopt a MAX_STREAMS (bidirectional,
+; type 0x12) into q_srv_ms_bidi. Without this the stream-limit probe would test
+; against the limit the server advertised at the handshake and accuse a server
+; that had since granted more — linnea itself grants ahead of need, so this is
+; not hypothetical. The limit only ever rises (RFC 9000 19.11: a MAX_STREAMS
+; below the current one is ignored).
+quic_scan_maxstreams:
+    push rbx
+    push r12
+    mov rbx, rdi
+    lea r12, [rdi + rsi]
+.ms_scan:
+    cmp rbx, r12
+    jae .ms_done
+    cmp byte [rbx], 0x12                  ; MAX_STREAMS (bidirectional)
+    jne .ms_skip
+    lea rdi, [rbx + 1]
+    mov rsi, r12
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ms_done
+    mov rcx, [q_srv_ms_bidi]
+    cmp rcx, 0
+    jl .ms_take                           ; nothing recorded yet (signed -1)
+    cmp rax, rcx
+    jbe .ms_skip                          ; never lower the limit
+.ms_take:
+    mov [q_srv_ms_bidi], rax
+.ms_skip:
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .ms_done                          ; unknown or truncated: stop walking
+    add rbx, rax
+    jmp .ms_scan
+.ms_done:
     pop r12
     pop rbx
     ret
@@ -7442,6 +8124,10 @@ h3_battery:
     call probe_h3_newcid
     call probe_h3_sessid_echo
     call probe_h3_streams_uni
+    call probe_h3_rsvd
+    call probe_h3_strmlim
+    call probe_h3_initpad
+    call probe_h3_runt
     call probe_h3_no_sigalgs
     call probe_h3_no_tls13
     call probe_h3_bad_cipher
@@ -7576,6 +8262,81 @@ probe_h3_handshake:
     ret
 
 ; report_plain(dil=kind, rsi=name, edx=namelen): a report line with no status.
+; report_size(dil=kind, rsi=name, edx=namelen, rcx=observed, r9d=expected)
+; Like report, but the number is a byte count rather than a status code —
+; "-> 827 bytes  (want 1200)". A size printed as "HTTP 827" reads as nonsense,
+; and for a size deviation the number IS the finding.
+report_size:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+    movzx ebx, dil
+    mov r12, rsi
+    mov r13d, edx
+    mov r14, rcx
+    mov r15d, r9d
+    inc dword [n_total]
+    cmp ebx, K_DEV
+    jne .rs_prefix
+    inc dword [n_dev]
+.rs_prefix:
+    cmp ebx, K_OK
+    je .rs_ok
+    cmp ebx, K_DEV
+    je .rs_dev
+    lea rsi, [pfx_info]
+    mov edx, pfx_info_len
+    jmp .rs_put
+.rs_ok:
+    lea rsi, [pfx_ok]
+    mov edx, pfx_ok_len
+    jmp .rs_put
+.rs_dev:
+    lea rsi, [pfx_dev]
+    mov edx, pfx_dev_len
+.rs_put:
+    call puts
+    mov rsi, r12
+    mov edx, r13d
+    call puts
+    test r14, r14
+    js .rs_none                           ; nothing measured: just end the line
+    lea rsi, [s_arrow]
+    mov edx, s_arrow_len
+    call puts
+    mov edi, r14d
+    call print_u32
+    lea rsi, [s_bytes]
+    mov edx, s_bytes_len
+    call puts
+    cmp r15d, -1
+    je .rs_nl
+    lea rsi, [s_want]
+    mov edx, s_want_len
+    call puts
+    mov edi, r15d
+    call print_u32
+    lea rsi, [s_rparen_nl]
+    mov edx, s_rparen_nl_len
+    call puts
+    jmp .rs_ret
+.rs_none:
+.rs_nl:
+    lea rsi, [s_nl]
+    mov edx, 1
+    call puts
+.rs_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 report_plain:
     push rbx
     push r12
