@@ -6,7 +6,14 @@
 # empty early_data extension), and serves the buffered request once the 1-RTT
 # keys are up. We assert aioquic reports early data as accepted and the response
 # (200 with the file body) arrives.
-# Usage: h3_0rtt_test.py <port>
+#
+# The version matters here and is a parameter (quic-6b). RFC 9369 shifts every
+# long-header packet type up by one for QUIC v2, so a 0-RTT packet is type 0x10
+# in v1 and 0x20 in v2 -- and the walk that hunts for the coalesced 0-RTT packet
+# has to know that, or it looks for a type the client never sent and the early
+# data is silently ignored. Same code, same assertions, one byte different on
+# the wire.
+# Usage: h3_0rtt_test.py <port> [1|2]     (QUIC version, default 1)
 import socket
 import ssl
 import sys
@@ -15,8 +22,11 @@ import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
+from aioquic.quic.packet import QuicProtocolVersion
 
 port = int(sys.argv[1])
+VERSION = (QuicProtocolVersion.VERSION_2 if len(sys.argv) > 2 and sys.argv[2] == "2"
+           else QuicProtocolVersion.VERSION_1)
 ADDR = ("127.0.0.1", port)
 
 
@@ -49,7 +59,8 @@ def h3_get(path):
 def full_handshake():
     """Complete a full handshake and return the ticket the server issues."""
     tickets = []
-    cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
+    cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"],
+                            supported_versions=[VERSION])
     cfg.verify_mode = ssl.CERT_NONE
     cfg.server_name = "localhost"
     conn = QuicConnection(configuration=cfg, session_ticket_handler=tickets.append)
@@ -77,7 +88,8 @@ def full_handshake():
 ticket = full_handshake()
 
 # Second connection: resume and send the GET as 0-RTT (before the handshake).
-cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
+cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"],
+                        supported_versions=[VERSION])
 cfg.verify_mode = ssl.CERT_NONE
 cfg.server_name = "localhost"
 cfg.session_ticket = ticket
@@ -138,4 +150,4 @@ while i < len(resp):
         body += payload
 assert status == b"200", f"status {status!r}, want 200"
 assert body, "empty body"
-print(f"ok (0-RTT accepted, {len(body)}B body)")
+print(f"ok (0-RTT accepted over QUIC v{2 if VERSION == QuicProtocolVersion.VERSION_2 else 1}, {len(body)}B body)")

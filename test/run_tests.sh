@@ -101,9 +101,23 @@ start_server() {
 
 # ...and refuse to start at all if such a server is already running: every port
 # this suite uses would be answered by it.
+# Any test server already running, whoever started it. This deliberately does NOT
+# filter on ppid == 1: a server started from a shell that is still alive has that
+# shell as its parent, and looking only for orphans misses exactly the case that
+# bites -- a server left behind by hand a moment ago. Workers are excluded by
+# taking only processes whose parent is not itself a linnea.
 stray_servers() {
-    ps -eo pid,ppid,comm,args --no-headers 2>/dev/null \
-        | awk '$3 == "linnea" && $0 ~ /test\/configs/ && $2 == 1 { print $1 }'
+    local pids
+    pids=$(ps -eo pid,comm,args --no-headers 2>/dev/null \
+        | awk '$2 == "linnea" && $0 ~ /test\/configs/ { print $1 }' | tr '\n' ' ')
+    local p ppid
+    for p in $pids; do
+        ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+        case " $pids " in
+            *" $ppid "*) ;;              # a worker: its master is in the list
+            *) echo "$p" ;;
+        esac
+    done
 }
 strays=$(stray_servers)
 if [ -n "$strays" ]; then
@@ -818,6 +832,14 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_0rtt_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): serves a 0-RTT request (early data)" $?
 
+    # quic-6b: the same over QUIC v2. RFC 9369 shifts every long-header type up
+    # by one, so the 0-RTT packet is 0x20 rather than 0x10 -- the walk that hunts
+    # for it used to look for the v1 type only, so a v2 client's early data was
+    # silently ignored and its request went unanswered until it resent it at
+    # 1-RTT. One byte different on the wire, same assertions.
+    python3 test/quic/h3_0rtt_test.py 47452 2 >/dev/null 2>&1
+    check "h3 (io_uring): serves a 0-RTT request over QUIC v2 (RFC 9369 types)" $?
+
     # quic-6: the 0-RTT packet shares the Application pn space with 1-RTT and MUST
     # be acknowledged (RFC 9000 13.2.1); the server used to discard its number, so
     # the early request was never acked. The qlog must show the server ack cover
@@ -1117,13 +1139,23 @@ PY
 # output goes to /dev/null, so a failed bind is invisible until every proxied
 # request in the rest of the run answers 502. Seen once: 23 failures, all
 # proxy, none reproducible. Wait for it to actually accept.
+# It used to WARN and carry on. That is how ten proxy tests come to fail at once
+# with 502s that say nothing about the cause: every proxied request in the block
+# is answered by a server with no backend behind it. Same rule as start_server --
+# a fixture that did not come up makes every result after it meaningless, so stop.
 backend_ready() {
     for _ in $(seq 1 60); do
         (echo > /dev/tcp/127.0.0.1/47100) >/dev/null 2>&1 && return 0
         sleep 0.1
     done
-    echo "WARNING: the proxy backend never came up on 47100" >&2
-    return 1
+    echo >&2
+    echo "FATAL: the proxy backend never came up on 47100." >&2
+    echo "  Every proxied request in this block would answer 502 and the failures" >&2
+    echo "  would point everywhere except here, so the run stops instead. Check for" >&2
+    echo "  a backend an earlier run left behind:" >&2
+    echo "    ps -eo pid,args | grep [p]roxy_backend" >&2
+    echo >&2
+    exit 1
 }
 
 python3 test/proxy_backend.py >/dev/null 2>&1 &

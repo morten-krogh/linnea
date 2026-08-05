@@ -270,6 +270,8 @@ s_ack_elicit: resq 1                  ; 1 when the 1-RTT packet in hand must be 
 s_pn_before:  resq 1                  ; conn.pn_1rtt before we processed it, so the
                                       ; exit can tell whether anything was sent
 s_hs_type:   resq 1                   ; long-header Handshake type bits for this version
+s_zrtt_type: resq 1                   ; ...and the 0-RTT and Initial ones, likewise
+s_ini_type:  resq 1                   ; per-version (RFC 9369 shifts them all by one)
 s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK freed
 fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow scan
 LINNEA_QUIC_RESET_MAX equ 16
@@ -1462,8 +1464,25 @@ linnea_quic_server_datagram:
     mov rbx, [cur_conn]
     lea rdx, [rbx + linnea_quic_conn.zrtt_ckeys]
     call linnea_quic_early_keys
-    ; walk the datagram for the coalesced 0-RTT packet (long header, type 0x10)
+    ; walk the datagram for the coalesced 0-RTT packet.
+    ;
+    ; RFC 9369 shifts every long-header packet type up by one for QUIC v2, so
+    ; 0-RTT is 0x10 in v1 and 0x20 in v2, and Initial is 0x00 and 0x10. BOTH
+    ; matter to this walk: the first is what it is hunting for, and the second is
+    ; how it decides whether the packet it is stepping over carries a token to
+    ; skip. Hardcoding the v1 values meant a v2 client's early data was looked
+    ; for under a type it never sends -- the 0-RTT packet was silently ignored,
+    ; the request went unanswered until the client resent it at 1-RTT, and the
+    ; whole point of 0-RTT was lost. The Handshake walk below has computed its
+    ; type per version all along (s_hs_type); this now does the same.
     mov r13, [s_dgram_len]           ; r13 may have been clobbered building the flight
+    mov qword [s_zrtt_type], 0x10
+    mov qword [s_ini_type], 0x00
+    cmp byte [quic_v2_active], 0
+    je .ew_types_set
+    mov qword [s_zrtt_type], 0x20
+    mov qword [s_ini_type], 0x10
+.ew_types_set:
     lea r15, [linnea_quic_rxbuf]
 .ew_loop:
     lea rax, [linnea_quic_rxbuf + r13]
@@ -1473,8 +1492,8 @@ linnea_quic_server_datagram:
     jz .early_done                   ; short header — stop
     movzx eax, byte [r15]
     and al, 0x30
-    mov r10d, eax                    ; 0x00 Initial, 0x10 0-RTT
-    cmp r10d, 0x10
+    mov r10d, eax                    ; this packet's type bits
+    cmp r10, [s_zrtt_type]
     je .ew_zrtt
     ; skip this long-header packet (an Initial ahead of the 0-RTT one)
     movzx eax, byte [r15 + 5]        ; DCID length
@@ -1482,8 +1501,8 @@ linnea_quic_server_datagram:
     movzx eax, byte [rdi]            ; SCID length
     lea rdi, [rdi + 1 + rax]         ; -> token length (Initial) / length
     lea rsi, [linnea_quic_rxbuf + r13]
-    test r10d, r10d
-    jnz .ew_len                      ; only an Initial carries a token
+    cmp r10, [s_ini_type]
+    jne .ew_len                      ; only an Initial carries a token
     call linnea_quic_varint_decode
     add rdi, rdx
     add rdi, rax                     ; skip the token
