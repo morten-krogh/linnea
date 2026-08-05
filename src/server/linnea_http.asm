@@ -293,6 +293,8 @@ version_11_sp:  db "HTTP/1.1 "
 version_11_sp_len equ $ - version_11_sp
 
 version_11:     db "HTTP/1.1"          ; 8 bytes, compared as one qword
+version_1x:     db "HTTP/1."           ; the 7-byte prefix, minor digit free
+                db 0                   ; (padding: the compare masks it off)
 version_10:     db "HTTP/1.0"          ; accepted from an upstream, rewritten
 crlf:           db 13, 10
 crlfcrlf:       db 13, 10, 13, 10
@@ -373,6 +375,7 @@ hop_by_hop_names:
     db 19, "proxy-authorization"
     db  0
 hv_close:       db "close"
+hv_keepalive:   db "keep-alive"
 hv_chunked:     db "chunked"
 slash_ch:       db "/"
 zero_ch:        db "0"
@@ -932,14 +935,45 @@ linnea_http_handle:
     mov [rsp + 96], r8
 .target_form_done:
 
-    ; --- version: exactly "HTTP/1.1" CRLF -------------------------
+    ; --- version: HTTP/1.x CRLF -----------------------------------
+    ; 1.1 is the common case and stays a single qword compare. Anything else
+    ; with major version 1 is handled per RFC 9112 2.5 rather than refused:
+    ;   1.0 -> served in 1.0 mode (see the four differences below)
+    ;   1.2+ -> "process the message as if it were in the highest minor version
+    ;           within that major version", i.e. exactly as 1.1
+    ; Only a major version we do not implement is 505, which is what RFC 9110
+    ; 15.6.6 actually defines that code for -- it was being answered to 1.0 and
+    ; 1.2 as well, neither of which is a major-version problem.
     lea rax, [r15 + 8]
     cmp rax, r13
     ja .resp_400
     mov rax, [r14 + r15]
     mov rcx, [version_11]
     cmp rax, rcx
+    je .version_done
+    ; not 1.1: is it "HTTP/1." with some other minor digit?
+    mov rdx, rax
+    mov rcx, 0x00ffffffffffffff       ; the low 7 bytes, "HTTP/1."
+    and rdx, rcx
+    mov rcx, [version_1x]
+    and rcx, 0x00ffffffffffffff
+    cmp rdx, rcx
     jne .version_other
+    mov rcx, rax
+    shr rcx, 56                       ; the minor digit
+    cmp cl, '0'
+    je .version_10
+    cmp cl, '1'
+    jb .resp_400                      ; "HTTP/1.-" and the like: malformed
+    cmp cl, '9'
+    ja .resp_400
+    jmp .version_done                 ; 1.2..1.9 -> treat as 1.1 (2.5)
+.version_10:
+    or qword [rsp + 136], 8           ; this request is HTTP/1.0
+    ; 1.0 has no persistent connections unless the client asks for one, so the
+    ; default flips: close, and the "keep-alive" token below turns it back on.
+    mov qword [rsp + 24], 0
+.version_done:
     add r15, 8
     cmp word [r14 + r15], 0x0A0D         ; CRLF
     jne .resp_400
@@ -1117,8 +1151,30 @@ linnea_http_handle:
     mov ecx, 5
     call linnea_string_iequal
     test eax, eax
-    jz .conn_tok_start
+    jz .conn_tok_ka
     mov qword [rsp + 24], 0    ; the client asked to close
+    or qword [rsp + 136], 16   ; ...and that is final, see below
+    jmp .conn_tok_start
+.conn_tok_ka:
+    ; "keep-alive" is how an HTTP/1.0 client asks for the persistence 1.1 gives
+    ; by default (RFC 9112 9.3). For a 1.1 request it changes nothing, since the
+    ; default is already on.
+    ;
+    ; "close" wins wherever it sits in the list, which is NOT what applying the
+    ; tokens in order gives you: `Connection: close, keep-alive` would end on
+    ; keep-alive and hold a socket the client said it was done with. 9.1 makes
+    ; close an instruction about the connection, not a vote, so it is sticky.
+    test qword [rsp + 136], 16
+    jnz .conn_tok_start
+    mov rdi, [rsp + 344]
+    mov rsi, [rsp + 56]
+    sub rsi, rdi               ; token length
+    lea rdx, [hv_keepalive]
+    mov ecx, 10
+    call linnea_string_iequal
+    test eax, eax
+    jz .conn_tok_start
+    mov qword [rsp + 24], 1
     jmp .conn_tok_start
 .conn_tok_skip:
     inc qword [rsp + 56]
@@ -1234,6 +1290,12 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jz .header_next
+    ; RFC 9110 10.1.1: a server "MUST NOT send a 100 (Continue) response to an
+    ; HTTP/1.0 client", which has no way to understand it -- the interim status
+    ; would be read as the final one and the response as garbage. A 1.0 client
+    ; sending Expect is already confused; answering it would make things worse.
+    test qword [rsp + 136], 8
+    jnz .header_next
     or qword [rsp + 232], 4    ; the client is waiting for permission
     jmp .header_next
 .ifm_header:                   ; first occurrence wins, as for Host
@@ -1366,15 +1428,23 @@ linnea_http_handle:
     ; --- serve the file ---------------------------------------------
 .parsed:
     ; Host (RFC 9112 3.2): exactly one field line, and a value that could be
-    ; an authority. Every request we accept is HTTP/1.1 (the version check
-    ; above admits nothing else), so the header is mandatory — and a missing
-    ; or repeated one is how a request gets routed one way here and another
-    ; way at an intermediary. This runs before the asterisk-form branch below:
-    ; "OPTIONS *" carries no authority of its own, so it is exactly the request
-    ; whose Host an intermediary would read differently, and the rule is not
-    ; waived for it.
+    ; an authority. For HTTP/1.1 the header is mandatory — a missing or repeated
+    ; one is how a request gets routed one way here and another way at an
+    ; intermediary. This runs before the asterisk-form branch below: "OPTIONS *"
+    ; carries no authority of its own, so it is exactly the request whose Host an
+    ; intermediary would read differently, and the rule is not waived for it.
+    ;
+    ; HTTP/1.0 predates Host and 9112 3.2 does not require it there, so an absent
+    ; one is served by the accepting server's default vhost — the same fallback an
+    ; unrecognised name gets. MORE THAN ONE is still 400 whatever the version:
+    ; the ambiguity that rule exists to prevent does not depend on the version.
     cmp qword [rsp + 296], 1
-    jne .resp_400
+    ja .resp_400               ; two or more: ambiguous, always
+    je .host_present
+    test qword [rsp + 136], 8
+    jz .resp_400               ; 1.1 with no Host
+    jmp .host_done             ; 1.0 without one: the default vhost serves it
+.host_present:
     mov rcx, [rsp + 96]
     test rcx, rcx
     jz .resp_400               ; "Host:" with no authority at all
@@ -1388,6 +1458,7 @@ linnea_http_handle:
     inc rdx
     dec rcx
     jnz .host_char
+.host_done:
     test qword [rsp + 136], 2
     jnz .resp_501                      ; a coding we do not implement
     ; Transfer-Encoding and Content-Length together is the classic smuggling

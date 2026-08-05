@@ -1540,7 +1540,43 @@ check_http "body too large 413" "413 Content Too Large" "$(raw_http 'GET / HTTP/
 
 # --- protocol errors and traversal (raw, curl normalizes paths) ---
 check_http "http 400" "400 Bad Request" "$(raw_http 'GARBAGE\r\n\r\n')"
-check_http "http 505" "505 HTTP Version Not Supported" "$(raw_http 'GET / HTTP/1.0\r\nConnection: close\r\n\r\n')"
+# h1-11: HTTP/1.0 is SERVED, not refused. 505 is defined for a MAJOR version the
+# server does not support (RFC 9110 15.6.6) and 1.0 shares major version 1 with
+# 1.1, so refusing it was both a misuse of the code and an operational trap --
+# health checkers and `curl -0` speak 1.0, and a 505 reads like a protocol fault
+# rather than a version default. Only a major version we do not implement is 505
+# now; a higher MINOR version is processed as 1.1, which is what RFC 9112 2.5
+# asks for.
+check_http "http/1.0 served" "200 OK" "$(raw_http 'GET /hello.txt HTTP/1.0\r\nHost: one.test\r\n\r\n')"
+check_http "http/1.0 without Host served" "200 OK" "$(raw_http 'GET /hello.txt HTTP/1.0\r\n\r\n')"
+check_http "http/1.1 without Host still 400" "400 Bad Request" "$(raw_http 'GET /hello.txt HTTP/1.1\r\n\r\n')"
+check_http "http/1.2 processed as 1.1" "200 OK" "$(raw_http 'GET /hello.txt HTTP/1.2\r\nHost: one.test\r\n\r\n')"
+check_http "http 505" "505 HTTP Version Not Supported" "$(raw_http 'GET / HTTP/2.0\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
+
+# 1.0 has no persistent connections unless the client asks for one, and "close"
+# wins wherever it appears in the list (9.1) -- applying the tokens in order
+# would let `close, keep-alive` reopen a connection the client had finished with.
+check_http "http/1.0 defaults to close" "Connection: close" "$(raw_http 'GET /hello.txt HTTP/1.0\r\nHost: one.test\r\n\r\n')"
+check_http "http/1.0 keep-alive honoured" "Connection: keep-alive" "$(raw_http 'GET /hello.txt HTTP/1.0\r\nHost: one.test\r\nConnection: keep-alive\r\n\r\n')"
+check_http "http/1.0 close beats keep-alive whatever the order" "Connection: close" "$(raw_http 'GET /hello.txt HTTP/1.0\r\nHost: one.test\r\nConnection: close, keep-alive\r\n\r\n')"
+check_http "http/1.1 close beats keep-alive whatever the order" "Connection: close" "$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test\r\nConnection: close, keep-alive\r\n\r\n')"
+
+# two requests on one 1.0 connection, which only works if keep-alive was real
+ka10=$(raw_http 'GET /hello.txt HTTP/1.0\r\nHost: one.test\r\nConnection: keep-alive\r\n\r\nGET /hello.txt HTTP/1.0\r\nHost: one.test\r\nConnection: close\r\n\r\n')
+[ "$(printf '%s' "$ka10" | grep -c '^HTTP/1.1 200')" = "2" ]
+check "http/1.0 keep-alive serves a second request on the same connection" $?
+
+# RFC 9110 10.1.1: a 100 (Continue) MUST NOT be sent to a 1.0 client, which would
+# read the interim status as the final one. 1.1 must still get it.
+exp11=$(raw_http 'POST /hello.txt HTTP/1.1\r\nHost: one.test\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n')
+printf '%s' "$exp11" | grep -q '100 Continue'
+check "http/1.1 Expect still draws 100 Continue" $?
+# `grep -qv` would be the wrong test here: it asks "is there a line that does not
+# match", which is FALSE for the empty response that passing actually produces --
+# a 1.0 client gets nothing at all and the server waits for the body.
+exp10=$(raw_http 'POST /hello.txt HTTP/1.0\r\nHost: one.test\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n')
+! printf '%s' "$exp10" | grep -q '100 Continue'
+check "http/1.0 Expect draws no 100 Continue" $?
 check_http "traversal blocked" "400 Bad Request" "$(raw_http 'GET /../secret HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
 
 # --- video MIME types (Q129): a .mp4 served as application/octet-stream is
