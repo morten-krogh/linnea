@@ -82,6 +82,7 @@ extern linnea_tls_hs_init
 extern linnea_tls_hs_input
 extern linnea_tls_drain_early
 extern linnea_ktls_enable
+extern linnea_ktls_rekey_rx
 extern linnea_ktls_close_notify
 extern linnea_h2_init
 extern linnea_h2_busy
@@ -898,6 +899,12 @@ linnea_uring_run:
     jne .stale_completion      ; belonged to is gone, and the slot may now
                                ; be serving someone else               ; connection*
     mov qword [r12 + linnea_connection.h2_rx_busy], 0
+    call ktls_rx_record_type   ; a kTLS read names the record it delivered; a
+                               ; record that is not application data becomes the
+                               ; EOF the -EIO path used to report, EXCEPT a
+                               ; KeyUpdate, which is answered by rekeying
+    test eax, eax
+    jnz .ktls_rekeyed
     cmp qword [r12 + linnea_connection.h2_closing], 0
     jne .h2_closing_check      ; a straggler of a torn-down h2 connection
     cmp qword [r12 + linnea_connection.linger], 0
@@ -921,6 +928,17 @@ linnea_uring_run:
     lea r14, [reason_recv_err]
     mov r15d, reason_recv_err_len
     jmp .conn_close
+.ktls_rekeyed:
+    ; The receive keys have moved on. Re-arm the very read the KeyUpdate
+    ; consumed -- same buffer, same length -- rather than assuming it was the
+    ; ordinary in_buf one: it may have been a request-body relay into up_buf,
+    ; and a KeyUpdate can arrive at any moment, including mid-upload.
+    mov rdi, r12
+    mov rsi, [r12 + linnea_connection.rx_iov + LINNEA_IOVEC_BASE]
+    mov rdx, [r12 + linnea_connection.rx_iov + LINNEA_IOVEC_LEN]
+    call linnea_uring_arm_recv_buf
+    call linnea_uring_submit_now
+    jmp .wait
 .recv_eof:
     lea r14, [reason_peer]
     mov r15d, reason_peer_len
@@ -1499,6 +1517,18 @@ linnea_uring_run:
     call linnea_ktls_enable
     test rax, rax
     js .tls_ktls_fail
+    ; Keep both application traffic secrets before the handshake state they live
+    ; in is lost: it is overlaid on up_buf, which is a buffer again from here on.
+    ; A KeyUpdate derives the next generation from the current secret, so without
+    ; this copy the connection could never follow one.
+    lea rdi, [r12 + linnea_connection.s_ap_secret]
+    lea rsi, [r12 + linnea_connection.up_buf + linnea_tls_hs.s_ap]
+    mov ecx, 32
+    rep movsb
+    lea rdi, [r12 + linnea_connection.c_ap_secret]
+    lea rsi, [r12 + linnea_connection.up_buf + linnea_tls_hs.c_ap]
+    mov ecx, 32
+    rep movsb
     mov qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_KTLS
     cmp dword [r12 + linnea_connection.up_buf + linnea_tls_hs.alpn_is_h2], 0
     jne .h2_handoff                ; ALPN chose h2: speak frames, not HTTP/1
@@ -2417,6 +2447,114 @@ linnea_uring_arm_accept:
     pop rbx
     ret
 
+; ktls_rx_record_type(r12 = connection*, r15d = the read's result)
+;   -> r15d may be forced to 0 (EOF)
+; A kTLS read carries the type of the record it delivered. Application data is
+; the only type the rest of the server can do anything with; anything else --
+; today a close_notify alert, or a KeyUpdate -- is turned into the EOF that a
+; plain recv used to report by failing with -EIO. Behaviour is unchanged by this
+; alone: the SAME connections close, for the same reasons. What changes is that
+; the type is now KNOWN, which is what a KeyUpdate needs.
+; Clobbers rax, rcx.
+ktls_rx_record_type:
+    cmp qword [r12 + linnea_connection.rx_msg_armed], 0
+    je .krt_ret                       ; a plain recv: nothing was asked for
+    mov qword [r12 + linnea_connection.rx_msg_armed], 0
+    mov qword [r12 + linnea_connection.rx_rectype], 0
+    test r15d, r15d
+    jle .krt_ret                      ; an error or EOF delivers no record
+    cmp qword [r12 + linnea_connection.rx_msg + LINNEA_MSGHDR_CONTROLLEN], 16
+    jb .krt_ret                       ; no cmsg came back: application data, the
+                                      ; same assumption a plain recv makes
+    lea rcx, [r12 + linnea_connection.rx_cmsg]
+    cmp dword [rcx + 8], LINNEA_SOL_TLS          ; struct cmsghdr: len, level, type
+    jne .krt_ret
+    cmp dword [rcx + 12], LINNEA_TLS_GET_RECORD_TYPE
+    jne .krt_ret
+    movzx eax, byte [rcx + 16]
+    mov [r12 + linnea_connection.rx_rectype], rax
+    cmp eax, LINNEA_TLS_REC_APPDATA
+    je .krt_ret
+    cmp eax, LINNEA_TLS_REC_HANDSHAKE
+    je .krt_handshake
+.krt_eof:
+    xor r15d, r15d                    ; not application data: EOF, as before
+.krt_ret:
+    xor eax, eax
+    ret
+.krt_handshake:
+    ; A post-handshake handshake message. The only one a client sends that we
+    ; can act on is KeyUpdate (RFC 8446 4.6.3): 0x18, a 3-byte length of 1, then
+    ; the request_update byte. Anything else -- post-handshake authentication,
+    ; a message split across records -- is closed on, as every non-application
+    ; record was before this.
+    cmp r15d, 5
+    jne .krt_eof
+    lea rcx, [r12 + linnea_connection.rx_iov]
+    mov rcx, [rcx + LINNEA_IOVEC_BASE]        ; where the record landed
+    cmp byte [rcx], 0x18                      ; key_update
+    jne .krt_eof
+    cmp dword [rcx + 1], 0x00010000           ; length 1, little-endian read of
+    jne .krt_eof                              ; the 3 length bytes + the payload
+                                              ; byte 0 == update_not_requested
+    ; Lingering or tearing down: there is nothing left to receive, so the old
+    ; answer (close) is still the right one and is cheaper than a rekey.
+    cmp qword [r12 + linnea_connection.linger], 0
+    jne .krt_eof
+    cmp qword [r12 + linnea_connection.h2_closing], 0
+    jne .krt_eof
+    mov edi, [r12 + linnea_connection.fd]
+    lea rsi, [r12 + linnea_connection.c_ap_secret]
+    call linnea_ktls_rekey_rx
+    test rax, rax
+    js .krt_eof                       ; the kernel refused: close, as before
+    mov eax, 1                        ; handled: the caller re-arms the read
+    ret
+
+; ktls_prep_rx(rdi = connection*, rsi = buffer, edx = length) -> rax = msghdr*
+; Fill this connection's msghdr for a kTLS read: one iovec over the caller's
+; buffer, plus control space for the record type the kernel attaches to every
+; record it delivers. A plain recv has nowhere to put that cmsg, so the kernel
+; fails such a read with -EIO -- AND CONSUMES THE RECORD, after which the socket
+; yields nothing further. There is therefore no way to notice a KeyUpdate after
+; the fact; the type has to be asked for on every read. Sets rx_msg_armed so the
+; completion knows rx_cmsg holds something.
+ktls_prep_rx:
+    mov [rdi + linnea_connection.rx_iov + LINNEA_IOVEC_BASE], rsi
+    mov ecx, edx                      ; zero-extends: the length is a u32
+    mov [rdi + linnea_connection.rx_iov + LINNEA_IOVEC_LEN], rcx
+    lea rax, [rdi + linnea_connection.rx_msg]
+    mov qword [rax + LINNEA_MSGHDR_NAME], 0
+    mov dword [rax + LINNEA_MSGHDR_NAMELEN], 0
+    lea rcx, [rdi + linnea_connection.rx_iov]
+    mov [rax + LINNEA_MSGHDR_IOV], rcx
+    mov qword [rax + LINNEA_MSGHDR_IOVLEN], 1
+    lea rcx, [rdi + linnea_connection.rx_cmsg]
+    mov [rax + LINNEA_MSGHDR_CONTROL], rcx
+    mov qword [rax + LINNEA_MSGHDR_CONTROLLEN], LINNEA_KTLS_CMSG_SIZE
+    mov dword [rax + LINNEA_MSGHDR_FLAGS], 0
+    mov qword [rdi + linnea_connection.rx_msg_armed], 1
+    ret
+
+; ktls_sqe_to_recvmsg(rbx = connection*, rax = sqe*) — turn a prepared RECV sqe
+; into the RECVMSG this connection needs, reusing the buffer and length already
+; written into it. Called only when the connection is past the kTLS handoff.
+; Preserves rax (the sqe), which every caller goes on to use.
+ktls_sqe_to_recvmsg:
+    push rax
+    push rax                          ; twice: keep rsp 16-byte aligned
+    mov rdi, rbx
+    mov rsi, [rax + LINNEA_SQE_ADDR]  ; the buffer the caller chose
+    mov edx, [rax + LINNEA_SQE_LEN]   ; and how much of it
+    call ktls_prep_rx                 ; rax = msghdr*
+    mov rcx, rax
+    pop rax
+    pop rax
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECVMSG
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1   ; one msghdr, not a byte count
+    ret
+
 ; linnea_uring_arm_recv(rdi=connection*)
 ; Queue a recv into the free tail of the connection's input buffer, with
 ; a linked idle timeout: if the peer stays silent the recv completes with
@@ -2460,6 +2598,12 @@ linnea_uring_arm_recv:
     sub edx, ecx
 .ar_len:
     mov [rax + LINNEA_SQE_LEN], edx
+    mov qword [rbx + linnea_connection.rx_msg_armed], 0
+    cmp qword [rbx + linnea_connection.tls_phase], LINNEA_TLS_PHASE_KTLS
+    jne .ar_ud
+    call ktls_sqe_to_recvmsg          ; the kernel owns the decryption now, so
+                                      ; the record type has to come with the data
+.ar_ud:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_RECV
@@ -2487,6 +2631,12 @@ arm_linger_recv:
     lea rcx, [rbx + linnea_connection.in_buf]
     mov [rax + LINNEA_SQE_ADDR], rcx
     mov dword [rax + LINNEA_SQE_LEN], LINNEA_CONN_IN_BUF
+    mov qword [rbx + linnea_connection.rx_msg_armed], 0
+    cmp qword [rbx + linnea_connection.tls_phase], LINNEA_TLS_PHASE_KTLS
+    jne .lr_ud
+    call ktls_sqe_to_recvmsg          ; these bytes are dropped, but the read
+                                      ; still has to carry control space
+.lr_ud:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_RECV
@@ -2543,6 +2693,11 @@ linnea_uring_arm_recv_buf:
     mov [rax + LINNEA_SQE_FD], ecx
     mov [rax + LINNEA_SQE_ADDR], r12
     mov [rax + LINNEA_SQE_LEN], r13d
+    mov qword [rbx + linnea_connection.rx_msg_armed], 0
+    cmp qword [rbx + linnea_connection.tls_phase], LINNEA_TLS_PHASE_KTLS
+    jne .arb_ud
+    call ktls_sqe_to_recvmsg
+.arb_ud:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_RECV

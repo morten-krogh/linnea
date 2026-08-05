@@ -2660,6 +2660,33 @@ rm -f /tmp/upload3_echo.bin
     # Huffman + the static table) has its HEADERS decoded and the named
     # static file served back over h2. Serving the right file end to end is
     # the proof the :path decoded correctly.
+    # tls-4: a mid-connection KeyUpdate (RFC 8446 4.6.3). The peer derives the
+    # next generation of its traffic secret and switches to it; a receiver that
+    # cannot follow loses the connection. kTLS reports the KeyUpdate record by
+    # attaching a control message, which a plain recv cannot carry -- such a read
+    # fails with -EIO AND CONSUMES THE RECORD -- so this is also what proves the
+    # receive path is reading with RECVMSG.
+    #
+    # openssl s_client's 'k' sends one. TWO TRAPS, both of which make a broken
+    # server look healthy:
+    #   -ign_eof DISABLES the interactive commands, so 'k' is sent as request
+    #     data and no KeyUpdate ever reaches the wire;
+    #   one KeyUpdate does not prove the secret was ADVANCED -- deriving the same
+    #     generation twice would still serve the second request. Hence two.
+    ku_req() { printf 'GET /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n'; }
+    ku_n=$({ ku_req; sleep 0.6; sleep 0.6; ku_req; sleep 1; } | timeout 15 \
+        openssl s_client -connect 127.0.0.1:47446 -alpn http/1.1 2>/dev/null \
+        | grep -c '^HTTP/1.1')
+    [ "$ku_n" = "2" ]
+    check "tls control: two requests on one kTLS connection" $?
+
+    ku_n=$({ ku_req; sleep 0.6; echo k; sleep 0.6; ku_req; sleep 0.6; echo k; \
+             sleep 0.6; ku_req; sleep 1; } | timeout 20 \
+        openssl s_client -connect 127.0.0.1:47446 -alpn http/1.1 2>/dev/null \
+        | grep -c '^HTTP/1.1')
+    [ "$ku_n" = "3" ]
+    check "tls survives two mid-connection KeyUpdates (kTLS rekey)" $?
+
     rl="--resolve localhost:47446:127.0.0.1"
     u="https://localhost:47446"
     body=$(curl -s --http2 --cacert $CA $rl "$u/hello.txt")

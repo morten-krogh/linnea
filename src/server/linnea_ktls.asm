@@ -25,6 +25,7 @@ default rel
 
 global linnea_tls_setup
 global linnea_ktls_enable
+global linnea_ktls_rekey_rx
 global linnea_ktls_fail_step
 global linnea_ktls_fail_errno
 global linnea_ktls_close_notify
@@ -44,6 +45,8 @@ section .rodata
 ulp_tls:    db "tls", 0
 lbl_key:    db "key"
 lbl_iv:     db "iv"
+lbl_traffic_upd: db "traffic upd"     ; RFC 8446 7.2, the KeyUpdate derivation
+lbl_traffic_upd_len equ $ - lbl_traffic_upd
 
 msg_no_aesni: db "TLS requires a CPU with AES-NI, PCLMULQDQ and SSSE3"
 msg_no_aesni_len equ $ - msg_no_aesni
@@ -367,6 +370,63 @@ install_direction:
     pop rbx
     ret
 
+
+; linnea_ktls_rekey_rx(rdi = fd, rsi = the client application traffic secret)
+;   -> rax = 0 installed, -1 setsockopt refused. The secret is ADVANCED IN PLACE
+;   on success, so the next KeyUpdate derives from the right generation.
+;
+; RFC 8446 7.2: after a KeyUpdate the peer's next traffic secret is
+;   application_traffic_secret_N+1 = HKDF-Expand-Label(secret_N, "traffic upd", "", 32)
+; and 5.3 restarts that direction's record sequence number at 0 with it.
+;
+; Installing a second RX key on a socket that already has one is precisely what
+; mainline kTLS used to refuse with -EBUSY. Measured on this box (kernel 7.0.8):
+; the second setsockopt returns 0 and the kernel decrypts the following records
+; under the new key. That measurement is what unblocked this; if a kernel ever
+; refuses, the caller closes the connection, which is exactly what it did before.
+linnea_ktls_rekey_rx:
+    push rbx
+    push r12
+    sub rsp, 112                      ; 32 next secret | 40 crypto_info | 28 key||iv
+                                      ; (112 keeps rsp 16-aligned through the calls)
+    mov r12d, edi                     ; fd
+    mov rbx, rsi                      ; the caller's secret, advanced at the end
+    ; next = HKDF-Expand-Label(secret, "traffic upd", "", 32)
+    mov rdi, rbx
+    lea rsi, [lbl_traffic_upd]
+    mov edx, lbl_traffic_upd_len
+    xor ecx, ecx
+    xor r8d, r8d
+    lea r9, [rsp]
+    sub rsp, 16
+    mov qword [rsp], 32
+    call linnea_tls_hkdf_expand_label
+    add rsp, 16
+    ; install it for the receive direction, sequence number back to 0
+    lea rdi, [rsp]                    ; the next secret
+    xor esi, esi                      ; seq 0 (RFC 8446 5.3)
+    mov edx, LINNEA_TLS_RX
+    mov ecx, r12d
+    lea r8, [rsp + 32]                ; crypto_info scratch
+    lea r9, [rsp + 72]                ; key||iv scratch
+    call install_direction
+    test rax, rax
+    js .rk_fail
+    ; only now adopt it: a refused install leaves the connection on the old
+    ; secret, which is still the one the kernel is using
+    mov rdi, rbx
+    lea rsi, [rsp]
+    mov ecx, 32
+    rep movsb
+    xor eax, eax
+    jmp .rk_ret
+.rk_fail:
+    mov rax, -1
+.rk_ret:
+    add rsp, 112
+    pop r12
+    pop rbx
+    ret
 
 ; linnea_ktls_close_notify(edi = fd) — send a TLS close_notify alert.
 ;

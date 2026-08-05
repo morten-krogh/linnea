@@ -105,6 +105,12 @@ LINNEA_TLS_CIPHER_AES_GCM_128 equ 51
 ; produce application data. A record of another type — an alert — is asked
 ; for with a control message carrying the type alongside the payload.
 LINNEA_TLS_SET_RECORD_TYPE equ 1
+LINNEA_TLS_GET_RECORD_TYPE equ 2   ; cmsg the kernel attaches to each record it
+                                   ; delivers, naming that record's type
+; TLS record content types (RFC 8446 5.1), as they arrive in that cmsg
+LINNEA_TLS_REC_ALERT       equ 21
+LINNEA_TLS_REC_HANDSHAKE   equ 22
+LINNEA_TLS_REC_APPDATA     equ 23
 ; struct tls12_crypto_info_aes_gcm_128 = version(2) cipher(2) iv(8) key(16)
 ; salt(4) rec_seq(8) = 40 bytes.
 LINNEA_TLS_CRYPTO_INFO_SIZE equ 40

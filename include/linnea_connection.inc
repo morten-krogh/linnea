@@ -1,6 +1,16 @@
 ; Connection pool limits and per-connection state layout.
 ; The pool size comes from the config (max_connections).
 
+; Sizes for the per-connection kTLS receive state below. Kernel ABI: struct
+; msghdr is 56 bytes on x86-64 and struct iovec 16; the control buffer holds one
+; cmsghdr (16) plus the single record-type byte, rounded up. Defined HERE rather
+; than in linnea_uring.inc because several modules include this file WITHOUT
+; that one, and the .inc files carry no include guards -- one definition, so the
+; struct and the code that fills it cannot drift apart.
+LINNEA_KTLS_MSGHDR_SIZE equ 56
+LINNEA_KTLS_IOVEC_SIZE  equ 16
+LINNEA_KTLS_CMSG_SIZE   equ 32
+
 ; Request head+body buffer (431/413 if exceeded). It must also be able to
 ; hold one maximum-size TLS record: during the userspace handshake we read a
 ; record at a time, and a record the client pipelines behind its Finished has
@@ -165,6 +175,29 @@ struc linnea_connection
     ; vhost with a DIFFERENT certificate is answered 421, exactly as HTTP/3
     ; does since Q124.
     .sni_vhost:      resq 1
+    ; The two application traffic secrets, kept for the life of the connection.
+    ; A TLS 1.3 KeyUpdate (RFC 8446 4.6.3) means the peer has derived the next
+    ; generation of its secret and switched to it, so the receiver must derive
+    ; the same one -- which needs the current secret. They are computed in the
+    ; handshake state, and that state is OVERLAID ON up_buf, which is reused as
+    ; a buffer the moment the kernel takes the connection over; so they have to
+    ; be copied somewhere that outlives the handoff. 64 bytes against buffers
+    ; measured in kilobytes.
+    .c_ap_secret:    resb 32
+    .s_ap_secret:    resb 32
+    ; kTLS receive: a msghdr, its iovec and room for the control message the
+    ; kernel attaches to every record it delivers (TLS_GET_RECORD_TYPE). A plain
+    ; recv cannot carry that cmsg, and a record that is not application data then
+    ; fails the read with -EIO AND IS CONSUMED -- the connection cannot be
+    ; recovered from that point -- so a kTLS connection reads with RECVMSG and
+    ; asks for the type up front. The kernel reads these asynchronously, so they
+    ; live per connection rather than in shared scratch.
+    .rx_msg:         resb LINNEA_KTLS_MSGHDR_SIZE
+    .rx_iov:         resb LINNEA_KTLS_IOVEC_SIZE
+    .rx_cmsg:        resb LINNEA_KTLS_CMSG_SIZE
+    .rx_msg_armed:   resq 1     ; 1 when the outstanding read is a RECVMSG, so a
+                                ; completion knows whether rx_cmsg holds anything
+    .rx_rectype:     resq 1     ; TLS record type of the last completed read
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF
