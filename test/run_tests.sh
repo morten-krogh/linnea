@@ -412,6 +412,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     check "h3 (io_uring): several requests on one connection" $?
     python3 test/quic/h3_conns_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): two interleaved connections" $?
+    # the idle timeout is the MINIMUM of the two advertised max_idle_timeouts
+    # (RFC 9000 10.1), so a client that will forget us in a second must not hold
+    # a pool slot for our 30; the paired control keeps that from being any
+    # connection simply going idle
+    timeout 60 python3 test/quic/h3_idle_tp_test.py 47452 >/dev/null 2>&1
+    check "h3 (io_uring): the client's max_idle_timeout is honoured (and only it)" $?
     # several workers each bind the QUIC port with SO_REUSEPORT; the kernel
     # steers by 4-tuple so a connection always reaches the worker holding it
     python3 test/quic/h3_workers_test.py 47452 8 >/dev/null 2>&1
