@@ -92,6 +92,8 @@ linnea_connection_alloc:
     mov qword [rdx + linnea_connection.h2_state], 0
     mov qword [rdx + linnea_connection.h2_tx_busy], 0
     mov qword [rdx + linnea_connection.h2_rx_busy], 0
+    mov qword [rdx + linnea_connection.tx_inflight], 0
+    mov qword [rdx + linnea_connection.ku_pending], 0
     inc qword [rdx + linnea_connection.gen]      ; this slot's new incarnation
     inc qword [linnea_connection_active]
     mov rax, rdx

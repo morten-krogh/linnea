@@ -83,6 +83,8 @@ extern linnea_tls_hs_input
 extern linnea_tls_drain_early
 extern linnea_ktls_enable
 extern linnea_ktls_rekey_rx
+extern linnea_ktls_rekey_tx
+extern linnea_ktls_key_update
 extern linnea_ktls_close_notify
 extern linnea_h2_init
 extern linnea_h2_busy
@@ -1164,6 +1166,14 @@ linnea_uring_run:
     cmp ecx, [r12 + linnea_connection.gen]   ; this slot: the connection it
     jne .stale_completion      ; belonged to is gone, and the slot may now
                                ; be serving someone else
+    cmp qword [r12 + linnea_connection.tx_inflight], 0
+    je .tx_counted             ; never below zero, whatever the completion is
+    dec qword [r12 + linnea_connection.tx_inflight]
+.tx_counted:
+    call ktls_flush_key_update ; a KeyUpdate the peer asked for waits here for
+                               ; the socket to go quiet: nothing of ours is
+                               ; outstanding at this instant, which is the whole
+                               ; requirement for switching the transmit key
     cmp qword [r12 + linnea_connection.h2_closing], 0
     jne .h2_closing_send       ; a straggler of a torn-down h2 connection
     cmp qword [r12 + linnea_connection.linger], 0
@@ -2447,6 +2457,52 @@ linnea_uring_arm_accept:
     pop rbx
     ret
 
+; ktls_flush_key_update(r12 = connection*)
+; Answer a KeyUpdate the peer asked us to reciprocate (RFC 8446 4.6.3: when
+; request_update is update_requested, the receiver MUST send a KeyUpdate of its
+; own before its next Application Data record).
+;
+; Ordering is the whole difficulty. Our KeyUpdate goes out under the CURRENT
+; transmit key and everything after it under the next one, so nothing of ours may
+; be in flight across that boundary: a send the kernel is still framing would be
+; encrypted under whichever key won the race, and the peer would fail to decrypt
+; a record it had no reason to doubt. So this runs only with tx_inflight == 0 --
+; either straight away, when the KeyUpdate arrived on an idle connection, or from
+; the send completion, where the socket has just gone quiet.
+;
+; Failure is not fatal and not silent-by-accident: if the send or the rekey is
+; refused, the flag stays set and the next quiet moment tries again. The peer
+; keeps decrypting our records with the key it already has, because a peer only
+; switches its receive key when our KeyUpdate actually arrives.
+; Clobbers rax, rcx, rdx, rdi, rsi, r8, r9, r10, r11.
+ktls_flush_key_update:
+    cmp qword [r12 + linnea_connection.ku_pending], 0
+    je .fku_ret
+    cmp qword [r12 + linnea_connection.tx_inflight], 0
+    jne .fku_ret                      ; still busy: the next completion retries
+    cmp qword [r12 + linnea_connection.tls_phase], LINNEA_TLS_PHASE_KTLS
+    jne .fku_clear                    ; not ours to send any more
+    push r12
+    push r13
+    mov edi, [r12 + linnea_connection.fd]
+    call linnea_ktls_key_update
+    test rax, rax
+    js .fku_done                      ; the write failed: try again when quiet
+    mov edi, [r12 + linnea_connection.fd]
+    lea rsi, [r12 + linnea_connection.s_ap_secret]
+    call linnea_ktls_rekey_tx         ; only after the record is on the wire
+    test rax, rax
+    js .fku_done
+    mov qword [r12 + linnea_connection.ku_pending], 0
+.fku_done:
+    pop r13
+    pop r12
+    ret
+.fku_clear:
+    mov qword [r12 + linnea_connection.ku_pending], 0
+.fku_ret:
+    ret
+
 ; ktls_rx_record_type(r12 = connection*, r15d = the read's result)
 ;   -> r15d may be forced to 0 (EOF)
 ; A kTLS read carries the type of the record it delivered. Application data is
@@ -2494,9 +2550,12 @@ ktls_rx_record_type:
     mov rcx, [rcx + LINNEA_IOVEC_BASE]        ; where the record landed
     cmp byte [rcx], 0x18                      ; key_update
     jne .krt_eof
-    cmp dword [rcx + 1], 0x00010000           ; length 1, little-endian read of
-    jne .krt_eof                              ; the 3 length bytes + the payload
-                                              ; byte 0 == update_not_requested
+    cmp dword [rcx + 1], 0x00010000           ; length 1, over the 3 length bytes;
+    je .krt_ku                                ; payload 0 = update_not_requested
+    cmp dword [rcx + 1], 0x01010000           ; payload 1 = update_requested: the
+    jne .krt_eof                              ; peer wants one of ours back
+    mov qword [r12 + linnea_connection.ku_pending], 1
+.krt_ku:
     ; Lingering or tearing down: there is nothing left to receive, so the old
     ; answer (close) is still the right one and is cheaper than a rekey.
     cmp qword [r12 + linnea_connection.linger], 0
@@ -2508,6 +2567,8 @@ ktls_rx_record_type:
     call linnea_ktls_rekey_rx
     test rax, rax
     js .krt_eof                       ; the kernel refused: close, as before
+    call ktls_flush_key_update        ; if one was asked for, and the socket is
+                                      ; quiet, answer it now
     mov eax, 1                        ; handled: the caller re-arms the read
     ret
 
@@ -2729,6 +2790,9 @@ linnea_uring_arm_send_buf:
     push r12
     push r13
     mov rbx, rdi
+    inc qword [rbx + linnea_connection.tx_inflight]   ; see .tx_inflight: this is
+                                                      ; the one funnel every client
+                                                      ; send passes through
     mov r12, rsi
     mov r13, rdx
     call linnea_uring_get_sqe_zeroed

@@ -198,6 +198,18 @@ struc linnea_connection
     .rx_msg_armed:   resq 1     ; 1 when the outstanding read is a RECVMSG, so a
                                 ; completion knows whether rx_cmsg holds anything
     .rx_rectype:     resq 1     ; TLS record type of the last completed read
+    ; Client sends this connection has queued and not yet had completed. A COUNT
+    ; rather than a flag: a flag cleared by the first of two overlapping sends
+    ; would claim the socket was idle while one was still in flight. It exists
+    ; for one decision -- when it is safe to send our own KeyUpdate and switch
+    ; the transmit key underneath it. Interleaving that with a send the kernel is
+    ; still framing would encrypt application data under a key the peer has not
+    ; been told to expect. If this ever sticks above zero the KeyUpdate is simply
+    ; never sent, which is what the server did before it could send one at all.
+    .tx_inflight:    resq 1
+    ; A peer asked for a KeyUpdate of our own (RFC 8446 4.6.3 update_requested)
+    ; and a send was in flight, so it waits for that send to complete.
+    .ku_pending:     resq 1
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

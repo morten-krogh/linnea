@@ -26,6 +26,8 @@ default rel
 global linnea_tls_setup
 global linnea_ktls_enable
 global linnea_ktls_rekey_rx
+global linnea_ktls_rekey_tx
+global linnea_ktls_key_update
 global linnea_ktls_fail_step
 global linnea_ktls_fail_errno
 global linnea_ktls_close_notify
@@ -372,6 +374,7 @@ install_direction:
 
 
 ; linnea_ktls_rekey_rx(rdi = fd, rsi = the client application traffic secret)
+; linnea_ktls_rekey_tx(rdi = fd, rsi = the server application traffic secret)
 ;   -> rax = 0 installed, -1 setsockopt refused. The secret is ADVANCED IN PLACE
 ;   on success, so the next KeyUpdate derives from the right generation.
 ;
@@ -384,9 +387,18 @@ install_direction:
 ; the second setsockopt returns 0 and the kernel decrypts the following records
 ; under the new key. That measurement is what unblocked this; if a kernel ever
 ; refuses, the caller closes the connection, which is exactly what it did before.
+linnea_ktls_rekey_tx:
+    mov r10d, LINNEA_TLS_TX
+    jmp rekey_body
 linnea_ktls_rekey_rx:
+    mov r10d, LINNEA_TLS_RX
+rekey_body:
     push rbx
     push r12
+    push r13
+    push r14                          ; an even number of pushes: the frame below
+                                      ; keeps rsp 16-aligned for the calls
+    mov r13d, r10d                    ; the direction to install
     sub rsp, 112                      ; 32 next secret | 40 crypto_info | 28 key||iv
                                       ; (112 keeps rsp 16-aligned through the calls)
     mov r12d, edi                     ; fd
@@ -405,7 +417,7 @@ linnea_ktls_rekey_rx:
     ; install it for the receive direction, sequence number back to 0
     lea rdi, [rsp]                    ; the next secret
     xor esi, esi                      ; seq 0 (RFC 8446 5.3)
-    mov edx, LINNEA_TLS_RX
+    mov edx, r13d
     mov ecx, r12d
     lea r8, [rsp + 32]                ; crypto_info scratch
     lea r9, [rsp + 72]                ; key||iv scratch
@@ -424,7 +436,61 @@ linnea_ktls_rekey_rx:
     mov rax, -1
 .rk_ret:
     add rsp, 112
+    pop r14
+    pop r13
     pop r12
+    pop rbx
+    ret
+
+; linnea_ktls_key_update(edi = fd) -> rax = sendmsg result.
+; Send a KeyUpdate with request_update = update_not_requested (RFC 8446 4.6.3):
+; handshake message 0x18, 3-byte length 1, one payload byte 0. It rides a
+; HANDSHAKE record, which with kTLS means naming the type in a control message
+; exactly as close_notify names the alert type.
+;
+; SAME CALLER CONTRACT AS close_notify, and for a sharper reason: this record
+; says "everything after this comes under my next key", so it must not be
+; interleaved with a send the kernel is still framing, and the transmit key must
+; not turn over until it is out. The caller proves the socket is quiet
+; (tx_inflight == 0) before calling.
+;
+; Layout: msghdr(56) | iovec(16) | cmsghdr+data(24) | payload(5).
+linnea_ktls_key_update:
+    push rbx
+    mov ebx, edi                      ; fd
+    sub rsp, 112
+    mov byte [rsp + 96], 0x18         ; key_update
+    mov byte [rsp + 97], 0x00         ; length, 3 bytes big-endian
+    mov byte [rsp + 98], 0x00
+    mov byte [rsp + 99], 0x01
+    mov byte [rsp + 100], 0x00        ; update_not_requested: answering a request
+                                      ; with another request would loop forever
+    lea rax, [rsp + 96]
+    mov [rsp + 56], rax               ; iov_base
+    mov qword [rsp + 64], 5           ; iov_len
+    mov qword [rsp + 72], 17          ; cmsg_len = CMSG_LEN(1)
+    mov dword [rsp + 80], LINNEA_SOL_TLS
+    mov dword [rsp + 84], LINNEA_TLS_SET_RECORD_TYPE
+    mov byte [rsp + 88], LINNEA_TLS_REC_HANDSHAKE
+    mov qword [rsp + 0], 0            ; msg_name
+    mov dword [rsp + 8], 0            ; msg_namelen
+    lea rax, [rsp + 56]
+    mov [rsp + 16], rax               ; msg_iov
+    mov qword [rsp + 24], 1           ; msg_iovlen
+    lea rax, [rsp + 72]
+    mov [rsp + 32], rax               ; msg_control
+    mov qword [rsp + 40], 24          ; msg_controllen = CMSG_SPACE(1)
+    mov dword [rsp + 48], 0           ; msg_flags
+    mov eax, LINNEA_SYS_SENDMSG
+    mov edi, ebx
+    lea rsi, [rsp]
+    mov edx, LINNEA_MSG_NOSIGNAL      ; NOT MSG_DONTWAIT: a short write here would
+                                      ; leave the peer expecting a key change that
+                                      ; never fully arrived. Five bytes, and the
+                                      ; caller only reaches here with the socket
+                                      ; quiet, so blocking is not a real risk.
+    syscall
+    add rsp, 112
     pop rbx
     ret
 

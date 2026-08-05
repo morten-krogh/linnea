@@ -2687,6 +2687,36 @@ rm -f /tmp/upload3_echo.bin
     [ "$ku_n" = "3" ]
     check "tls survives two mid-connection KeyUpdates (kTLS rekey)" $?
 
+    # ...and the other half of 4.6.3: update_requested obliges US to send a
+    # KeyUpdate of our own before our next application record, which means
+    # switching the transmit key underneath it. 'K' asks for that; two of them
+    # prove our sending secret advances as well as our receiving one.
+    ku_n=$({ ku_req; sleep 0.6; echo K; sleep 0.6; ku_req; sleep 0.6; echo K; \
+             sleep 0.6; ku_req; sleep 1; } | timeout 25 \
+        openssl s_client -connect 127.0.0.1:47446 -alpn http/1.1 2>/dev/null \
+        | grep -c '^HTTP/1.1')
+    [ "$ku_n" = "3" ]
+    check "tls answers an update_requested KeyUpdate (both directions rekey)" $?
+
+    # the KeyUpdate must be OURS, on the wire, not merely survived: -msg prints
+    # both directions, so two lines mean the peer's and the answer to it
+    ku_m=$({ ku_req; sleep 0.6; echo K; sleep 0.6; ku_req; sleep 1; } | timeout 20 \
+        openssl s_client -connect 127.0.0.1:47446 -alpn http/1.1 -msg 2>&1 \
+        | grep -ac 'KeyUpdate')
+    [ "$ku_m" = "2" ]
+    check "tls sends its own KeyUpdate in answer ($ku_m records)" $?
+
+    # the deferred path: a KeyUpdate landing while a large response is still
+    # streaming cannot rekey immediately -- switching the transmit key with a
+    # send in flight would encrypt data under a key the peer is not expecting --
+    # so it waits for the socket to go quiet. Both responses must still arrive.
+    ku_out=$({ printf 'GET /h3s11.bin HTTP/1.1\r\nHost: localhost\r\n\r\n'; \
+               sleep 0.03; echo K; sleep 3; ku_req; sleep 2; } | timeout 30 \
+        openssl s_client -connect 127.0.0.1:47446 -alpn http/1.1 2>/dev/null \
+        | grep -ac -e 'Content-Length: 690000' -e 'hello from linnea')
+    [ "$ku_out" = "2" ]
+    check "tls KeyUpdate mid-stream: the response and the next request survive" $?
+
     rl="--resolve localhost:47446:127.0.0.1"
     u="https://localhost:47446"
     body=$(curl -s --http2 --cacert $CA $rl "$u/hello.txt")
