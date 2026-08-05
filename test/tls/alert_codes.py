@@ -27,10 +27,12 @@ HOST = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
 ADDR = (HOST, PORT)
 
 CLOSE_NOTIFY, UNEXPECTED_MESSAGE, BAD_RECORD_MAC = 0, 10, 20
+RECORD_OVERFLOW = 22
 HANDSHAKE_FAILURE, DECODE_ERROR, DECRYPT_ERROR = 40, 50, 51
 PROTOCOL_VERSION, MISSING_EXTENSION = 70, 109
 
 NAMES = {0: "close_notify", 10: "unexpected_message", 20: "bad_record_mac",
+         22: "record_overflow",
          40: "handshake_failure", 47: "illegal_parameter", 50: "decode_error",
          51: "decrypt_error", 70: "protocol_version", 80: "internal_error",
          109: "missing_extension", 120: "no_application_protocol"}
@@ -206,7 +208,15 @@ s.sendall(rec(20, b"\x02"))                           # CCS with the wrong byte
 case("ChangeCipherSpec with a bad value", UNEXPECTED_MESSAGE, alert_from(s))
 s.close()
 
-# 6. a record that does not open (tls-8). The alert is sealed under the server's
+# 6. an unencrypted handshake record longer than a TLSPlaintext may be (tls-10).
+#    2^14 is the plaintext bound (5.1); 2^14+256 is the CIPHERTEXT one (5.2) and
+#    was being applied here, so 16385..16640 got in.
+s = connect()
+s.sendall(rec(22, b"\x01" + (16385 - 1).to_bytes(3, "big") + b"\x00" * (16385 - 4)))
+case("handshake record over 2^14", RECORD_OVERFLOW, alert_from(s))
+s.close()
+
+# 7. a record that does not open (tls-8). The alert is sealed under the server's
 #    handshake key, so derive it and read the description out.
 s = connect()
 ch = client_hello(pub=pub)

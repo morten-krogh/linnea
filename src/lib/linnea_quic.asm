@@ -20,6 +20,7 @@ global linnea_quic_close_frame
 global linnea_quic_frame_skip
 global linnea_quic_frames_check
 global linnea_quic_stream_limit
+global linnea_quic_early_fresh
 global linnea_quic_frames_ack_eliciting
 global linnea_quic_ack_record
 global linnea_quic_ack_seen
@@ -41,6 +42,8 @@ global linnea_quic_retry_scid
 global linnea_quic_retry_scid_len
 global linnea_quic_tp_parse
 global linnea_quic_tp_max_udp
+global linnea_quic_tp_iscid
+global linnea_quic_tp_iscid_len
 global linnea_quic_tp_cid_lim
 global linnea_quic_tp_error
 global linnea_quic_flow_scan
@@ -1950,6 +1953,7 @@ linnea_quic_tp_parse:
     mov qword [linnea_quic_tp_max_udp], 65527 ; 18.2 defaults: the largest UDP
     mov qword [linnea_quic_tp_cid_lim], 2     ; payload, and the smallest legal
     mov qword [linnea_quic_tp_error], 0       ; connection-id limit
+    mov qword [linnea_quic_tp_iscid_len], -1  ; absent until seen
 .tp_next:
     cmp rbx, r12
     jae .tp_done
@@ -1987,6 +1991,8 @@ linnea_quic_tp_parse:
     je .tp_value
     cmp r15, 0x0e
     je .tp_value
+    cmp r15, 0x0f
+    je .tp_iscid                     ; a raw connection id, not a varint
     add rbx, rbp                     ; not one we read: skip its payload
     jmp .tp_next
 .tp_value:
@@ -2051,6 +2057,25 @@ linnea_quic_tp_parse:
     jmp .tp_done
 .tp_val0b_do:
     mov [linnea_quic_tp_max_ack], rax
+.tp_iscid:
+    ; initial_source_connection_id (RFC 9000 18.2): the connection id the peer
+    ; put in the Source Connection ID field of its first Initial. Kept whole so
+    ; the caller can hold it against the packet -- 7.3 makes a mismatch, and an
+    ; absent parameter, a connection error.
+    cmp rbp, LINNEA_QUIC_MAX_CID
+    ja .tp_bad                       ; longer than a connection id may be
+    mov [linnea_quic_tp_iscid_len], rbp
+    test rbp, rbp
+    jz .tp_skip                      ; a zero-length id is legal
+    push rdi
+    push rsi
+    lea rdi, [linnea_quic_tp_iscid]
+    mov rsi, rbx
+    mov rcx, rbp
+    rep movsb
+    pop rsi
+    pop rdi
+    jmp .tp_skip
 .tp_skip:
     add rbx, rbp
     jmp .tp_next
@@ -2720,6 +2745,9 @@ linnea_quic_ch_parse:
     cmp r13, r12
     jae .chp_done
     movzx eax, byte [r13]            ; session_id length
+    mov [rbx + linnea_quic_ch.sessid_len], rax   ; 8.4: must be zero over QUIC
+                                                 ; (rbx is the out struct here;
+                                                 ; r15 is the hello itself)
     lea r13, [r13 + 1 + rax]         ; -> cipher_suites length
     lea rax, [r13 + 2]
     cmp rax, r12
@@ -3505,6 +3533,30 @@ linnea_quic_frames_check:
     pop rbx
     ret
 
+; linnea_quic_early_fresh(rdi = the ticket's issued time, rsi = now, both in
+;   seconds) -> rax = 1 when 0-RTT may be accepted against this ticket.
+;
+; This is the check that stands in for RFC 8446 8.3's client-reported ticket age,
+; and it is the stronger of the two: 8.3 exists for servers that cannot tell when
+; they issued a ticket and must therefore trust the client's arithmetic, whereas
+; ours carries its issue time INSIDE the sealed ticket, where the client cannot
+; touch it. Bounding replay is what both are for -- here it also bounds how long
+; the strike register must remember a binder (RFC 9001 9.2).
+;
+; A future-dated ticket underflows the subtraction to a huge number and is
+; refused by the same comparison; that is deliberate, and it is what the unit
+; test pins.
+linnea_quic_early_fresh:
+    mov rax, rsi
+    sub rax, rdi
+    cmp rax, LINNEA_QUIC_REPLAY_WINDOW
+    ja .ef_no
+    mov eax, 1
+    ret
+.ef_no:
+    xor eax, eax
+    ret
+
 ; linnea_quic_stream_limit(rdi = frames, rsi = length, rdx = the bidirectional
 ;   stream limit we have granted, rcx = the unidirectional one)
 ;   -> rax = 0 when every peer-initiated stream these frames name is within them,
@@ -3652,6 +3704,9 @@ linnea_quic_tp_max_ack: resq 1     ; peer's max_ack_delay in ms (default 25)
 linnea_quic_tp_idle_ms: resq 1     ; peer's max_idle_timeout in ms (0 = absent,
                                    ; which RFC 9000 10.1 reads as "no limit from
                                    ; that side" rather than "expire immediately")
+linnea_quic_tp_iscid:   resb 20    ; peer's initial_source_connection_id (0x0f)
+linnea_quic_tp_iscid_len: resq 1   ; its length, or -1 when the peer sent none —
+                                   ; RFC 9000 7.3 makes absence itself an error
 linnea_quic_tp_max_udp: resq 1     ; peer's max_udp_payload_size (default 65527)
 linnea_quic_tp_cid_lim: resq 1     ; peer's active_connection_id_limit (default 2)
 linnea_quic_tp_error:   resq 1     ; 1 when a parameter carried a value RFC 9000

@@ -16,6 +16,7 @@ global _start
 
 extern linnea_quic_replay_check
 extern linnea_quic_ticket_within_lifetime
+extern linnea_quic_early_fresh
 extern linnea_quic_ack_delay_ms
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
@@ -90,6 +91,29 @@ _start:
     ; once those entries expire, the register accepts again
     RCHECK 0x3333, 200000
     EXPECT rax, 1
+
+    ; --- 0-RTT freshness (tls-11): linnea_quic_early_fresh ---
+    ; The gate that stands in for RFC 8446 8.3's client-reported ticket age, and
+    ; is stronger than it: the issue time comes out of the sealed ticket rather
+    ; than off the wire. Four cases, the last of which is the one that would rot
+    ; silently -- a future-dated ticket must underflow into a rejection, not out
+    ; of one.
+    mov edi, 100                     ; issued
+    mov esi, 100                     ; now: no age at all
+    call linnea_quic_early_fresh
+    EXPECT rax, 1
+    mov edi, 100
+    mov esi, 110                     ; exactly the window (10s): still fresh,
+    call linnea_quic_early_fresh     ; the rejection is strict
+    EXPECT rax, 1
+    mov edi, 100
+    mov esi, 111                     ; one second past it
+    call linnea_quic_early_fresh
+    EXPECT rax, 0
+    mov edi, 200                     ; issued in the future
+    mov esi, 100
+    call linnea_quic_early_fresh
+    EXPECT rax, 0                    ; the underflow must reject, not wrap into a pass
 
     ; --- ticket lifetime (tls-7): linnea_quic_ticket_within_lifetime ---
     ; issued == now: fresh

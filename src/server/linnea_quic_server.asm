@@ -134,6 +134,8 @@ extern linnea_quic_txchunk_ack
 extern linnea_quic_txchunk_clear
 extern linnea_quic_tp_parse
 extern linnea_quic_tp_error
+extern linnea_quic_tp_iscid
+extern linnea_quic_tp_iscid_len
 extern linnea_quic_flow_scan
 extern linnea_quic_parse_priority
 extern linnea_quic_reset_scan
@@ -177,6 +179,7 @@ extern linnea_sha256_update
 extern linnea_sha256_final
 extern linnea_quic_resumption_psk
 extern linnea_quic_ticket_seal
+extern linnea_quic_early_fresh
 extern linnea_quic_ticket_resume
 extern linnea_quic_early_keys
 extern linnea_quic_replay_check
@@ -959,6 +962,14 @@ linnea_quic_server_datagram:
     ; Q159 and this one still lacks; QUIC's ClientHello parse does not read
     ; supported_groups, so the two cases are indistinguishable here exactly as
     ; they were on TCP before that fix.
+    ; RFC 9001 8.4 MUST: QUIC forbids the TLS middlebox compatibility mode, so a
+    ; ClientHello whose legacy_session_id is not empty "MUST be treated as a
+    ; connection error of type PROTOCOL_VIOLATION". We always echoed an empty
+    ; session id, which lands on the right outcome by accident -- such a client
+    ; rejects our ServerHello -- but it learns nothing about why, and the refusal
+    ; is properly ours to make.
+    cmp qword [ch_out + linnea_quic_ch.sessid_len], 0
+    jne .ini_rsvd                    ; the PROTOCOL_VIOLATION close
     cmp qword [ch_out + linnea_quic_ch.ks_ptr], 0
     jne .ks_ok
     mov edi, 0x0100 + 40             ; handshake_failure
@@ -1104,6 +1115,34 @@ linnea_quic_server_datagram:
     mov [rbx + linnea_quic_conn.fc_conn_max], rax
     mov [rbx + linnea_quic_conn.fc_stream_init], rdx   ; each new slot starts here
     mov [rbx + linnea_quic_conn.ms_uni_peer], r8
+    ; ...and only NOW judge the connection ids. tp_parse returns three values in
+    ; bare registers (rax, rdx, r8) and they are consumed by the three stores
+    ; above; anything inserted between the call and them silently eats one. This
+    ; check sat there and clobbered rax, so every connection ran with
+    ; initial_max_data set to a connection-id length -- the handshake completed
+    ; and small replies fitted, while any real response stalled on flow control.
+    ;
+    ; RFC 9000 7.3 MUST, both halves: the absence of initial_source_connection_id
+    ; is a TRANSPORT_PARAMETER_ERROR, and so is a value that does not match the
+    ; Source Connection ID of the peer's first Initial. The parameter binds the
+    ; transport parameters to the packets that carried them: unchecked, an
+    ; attacker who can rewrite Initials can swap connection ids on a handshake in
+    ; flight and neither end notices. conn.dcid IS that Source Connection ID --
+    ; it is what we address the peer by.
+    mov rax, [linnea_quic_tp_iscid_len]
+    cmp rax, -1
+    je .tp_invalid                   ; the peer sent none
+    cmp rax, [rbx + linnea_quic_conn.dcid_len]
+    jne .tp_invalid                  ; a different length is already a mismatch
+    test rax, rax
+    jz .iscid_ok                     ; both empty: nothing to compare
+    mov rcx, rax
+    lea rdi, [linnea_quic_tp_iscid]
+    lea rsi, [rbx + linnea_quic_conn.dcid]
+    repe cmpsb
+    jne .tp_invalid
+.iscid_ok:
+    mov rbx, [cur_conn]
     mov rax, [linnea_quic_tp_ack_exp]      ; the peer's ACK-delay encoding, which
     mov [rbx + linnea_quic_conn.ack_exp_peer], rax   ; is what decodes its ACKs
     mov rax, [linnea_quic_tp_max_ack]
@@ -1186,9 +1225,11 @@ linnea_quic_server_datagram:
     syscall
     mov rax, [q_nst_ts]                       ; now (seconds)
     mov [s_now_sec], rax
-    sub rax, [linnea_quic_resume_issued]      ; ticket age
-    cmp rax, LINNEA_QUIC_REPLAY_WINDOW
-    ja .no_resume                             ; too old for 0-RTT (underflow -> huge -> reject)
+    mov rdi, [linnea_quic_resume_issued]      ; from inside the SEALED ticket, so
+    mov rsi, rax                              ; the client cannot move it
+    call linnea_quic_early_fresh
+    test rax, rax
+    jz .no_resume                             ; outside the window: resume at 1-RTT
     mov rdi, [ch_out + linnea_quic_ch.psk_binder_ptr]
     mov esi, [s_now_sec]
     call linnea_quic_replay_check
@@ -1593,11 +1634,21 @@ linnea_quic_server_datagram:
     CONNLEA rsi, hs_sec              ; c_hs traffic secret (offset 0)
     CONNLEA rdx, th_cfin
     call linnea_quic_build_finished  ; rax = 36
+    ; The 4-byte handshake header is framing and compares plainly; the 32-byte
+    ; verify_data is a MAC and gets the same constant-time compare the TCP path
+    ; has always used. The packet carrying it is AEAD-authenticated, so the risk
+    ; here is remote -- but there is no reason for the two paths to differ, and
+    ; "it is protected anyway" is the argument that ages badly.
     lea rsi, [expfin]
     mov rdi, r14
-    mov ecx, 36
+    mov ecx, 4
     repe cmpsb
     jne .done
+    lea rdi, [expfin + 4]
+    lea rsi, [r14 + 4]
+    call quic_ct_eq32
+    test eax, eax
+    jz .done
     ; the client authenticated. Complete the handshake exactly once: a repeated
     ; client Finished (its HANDSHAKE_DONE was lost) is left to the loss-recovery
     ; timer, which resends the packet below rather than rebuilding it here.
@@ -4394,6 +4445,28 @@ emit_1rtt:
     mov rax, [rbx + linnea_quic_conn.pn_1rtt]   ; the number just used
     inc qword [rbx + linnea_quic_conn.pn_1rtt]
     pop rbx
+    ret
+
+; quic_ct_eq32(rdi = a, rsi = b) -> eax = 1 when the 32 bytes match, in constant
+; time: every byte is compared and the verdict falls out at the end, so how long
+; this takes says nothing about WHERE two values first differ.
+;
+; The twin of ct_eq32 in linnea_tls.asm. It lives here rather than being shared
+; because the QUIC test binaries do not link the TLS module, and pulling that in
+; for eight instructions would be the larger sin. If either changes, change both.
+quic_ct_eq32:
+    xor eax, eax                      ; accumulates the difference
+    xor ecx, ecx
+.qct_loop:
+    mov dl, [rdi + rcx]
+    xor dl, [rsi + rcx]
+    or al, dl
+    inc ecx
+    cmp ecx, 32
+    jb .qct_loop
+    test al, al
+    sete al
+    movzx eax, al
     ret
 
 ; ku_try(rdi=conn, rsi=packet, rdx=len, rcx=out plaintext, r8=expected pn)

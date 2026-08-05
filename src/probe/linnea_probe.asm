@@ -362,7 +362,7 @@ n_h3_badqp:   db "HTTP/3 undecodable QPACK -> connection closed"
 n_h3_badqp_len equ $ - n_h3_badqp
 n_h3_nosig:   db "QUIC ClientHello without signature_algorithms -> aborted"
 n_h3_nosig_len equ $ - n_h3_nosig
-n_h3_sessid:  db "QUIC ServerHello echoes an empty legacy_session_id"
+n_h3_sessid:  db "QUIC non-empty legacy_session_id -> refused"
 n_h3_sessid_len equ $ - n_h3_sessid
 n_h3_uni0:    db "QUIC max_streams_uni=0 is honoured (no server uni stream)"
 n_h3_uni0_len equ $ - n_h3_uni0
@@ -397,6 +397,10 @@ n_h3_strmlim: db "QUIC stream id past the advertised limit -> STREAM_LIMIT_ERROR
 n_h3_strmlim_len equ $ - n_h3_strmlim
 n_h3_initpad: db "QUIC Initial datagram expansion (RFC 9000 14.1)"
 n_h3_initpad_len equ $ - n_h3_initpad
+n_h3_iscid:   db "QUIC initial_source_connection_id mismatch -> refused"
+n_h3_iscid_len equ $ - n_h3_iscid
+n_h3_noiscid: db "QUIC initial_source_connection_id absent -> refused"
+n_h3_noiscid_len equ $ - n_h3_noiscid
 n_h3_tpudp:   db "QUIC max_udp_payload_size below 1200 -> refused"
 n_h3_tpudp_len equ $ - n_h3_tpudp
 n_h3_tpcid:   db "QUIC active_connection_id_limit below 2 -> refused"
@@ -4280,14 +4284,23 @@ quic_build_tp:
     mov edx, 1
 .tp_cidlim:
     call tp_int                           ; active_connection_id_limit
-    ; 0x0f initial_source_connection_id = our SCID (raw)
+    ; 0x0f initial_source_connection_id = our SCID (raw). tls-12 probes bend it:
+    ; variant 5 states a DIFFERENT id than the packets carry, variant 6 omits
+    ; the parameter altogether -- RFC 9000 7.3 makes both a connection error.
+    cmp qword [tp_variant], 6
+    je .tp_no_iscid
     mov byte [rax], 0x0f
     mov byte [rax + 1], 8                 ; length
     lea rdi, [rax + 2]
     lea rsi, [q_scid]
     mov ecx, 8
     rep movsb
-    mov rax, rdi
+    cmp qword [tp_variant], 5
+    jne .tp_iscid_done
+    xor byte [rax + 2], 0xff              ; same length, one bit of a different id
+.tp_iscid_done:
+    mov rax, rdi                          ; cursor past the parameter
+.tp_no_iscid:                             ; ...or standing where it was
     sub rax, rbx
     pop rbx
     ret
@@ -7535,6 +7548,67 @@ quic_wait_close:
     pop rbx
     ret
 
+; probe_h3_iscid (tls-12): RFC 9000 7.3 makes BOTH of these a connection error
+; of type TRANSPORT_PARAMETER_ERROR -- a value that does not match the Source
+; Connection ID of the peer's first Initial, and the parameter being absent. The
+; parameter is what binds the transport parameters to the packets that carried
+; them; unchecked, an attacker who can rewrite Initials can swap connection ids
+; on a handshake in flight and neither end is any the wiser.
+probe_h3_iscid:
+    push rbx
+    push r12
+    mov qword [tp_variant], 5             ; a different id than the packets carry
+    call quic_tp_refused_verdict
+    mov r12, rax
+    mov qword [tp_variant], 0
+    mov dil, K_DEV
+    cmp r12, 2
+    je .rep                               ; handshake proceeded: never compared
+    cmp r12, 1
+    jne .info
+    mov dil, K_OK
+    cmp qword [q_close_code], 0x08        ; TRANSPORT_PARAMETER_ERROR
+    je .rep
+    mov dil, K_INFO
+    jmp .rep
+.info:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_iscid]
+    mov edx, n_h3_iscid_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+
+; probe_h3_noiscid (tls-12): the same MUST, absence half.
+probe_h3_noiscid:
+    push rbx
+    push r12
+    mov qword [tp_variant], 6             ; omit the parameter entirely
+    call quic_tp_refused_verdict
+    mov r12, rax
+    mov qword [tp_variant], 0
+    mov dil, K_DEV
+    cmp r12, 2
+    je .rep
+    cmp r12, 1
+    jne .info
+    mov dil, K_OK
+    cmp qword [q_close_code], 0x08
+    je .rep
+    mov dil, K_INFO
+    jmp .rep
+.info:
+    mov dil, K_INFO
+.rep:
+    lea rsi, [n_h3_noiscid]
+    mov edx, n_h3_noiscid_len
+    call report_plain
+    pop r12
+    pop rbx
+    ret
+
 ; probe_h3_tpudp (quic-12): RFC 9000 18.2 says of max_udp_payload_size that
 ; "values below 1200 are invalid", and 7.4 makes any parameter with an invalid
 ; value a connection error of type TRANSPORT_PARAMETER_ERROR. A peer advertising
@@ -8217,35 +8291,39 @@ probe_h3_newcid:
 ; The echoed length is captured in quic_walk_datagram before parse_serverhello,
 ; so a violating server is caught even if the shifted ServerHello then misparses;
 ; the -1 sentinel distinguishes "no ServerHello seen" from a genuine empty echo.
+; tls-12: RFC 9001 8.4 bars the TLS middlebox compatibility mode from QUIC --
+; a ClientHello whose legacy_session_id is not empty "MUST be treated as a
+; connection error of type PROTOCOL_VIOLATION".
+;
+; This probe used to assert something weaker: that the ServerHello echoed an
+; EMPTY session id. That is what linnea did, and it lands on the right outcome by
+; accident -- a client that sent a session id rejects a ServerHello that does not
+; echo it -- but the refusal was the client's, made for a reason it had to guess.
+; Now the server makes it, and says which rule was broken.
 probe_h3_sessid_echo:
     push rbx
-    call quic_fresh_ids
+    push r12
     mov qword [bad_sessid], 1
-    mov qword [q_sh_sessid_len], -1       ; sentinel: no ServerHello seen yet
-    call udp_connect
-    test rax, rax
-    js .info
-    mov ebx, eax
-    mov edi, ebx
-    call quic_h3_handshake_retry          ; Initial (non-empty sessid) + flight
-    mov edi, ebx
-    call close_fd
-    cmp qword [q_sh_sessid_len], -1
-    je .info                              ; no ServerHello parsed: can't check the echo
-    cmp qword [q_sh_sessid_len], 0
-    jne .dev                              ; server echoed a non-empty session id
-    mov dil, K_OK
-    jmp .rep
-.dev:
+    call quic_tp_refused_verdict          ; rax: 1 close / 2 proceeded / 0 none
+    mov r12, rax
+    mov qword [bad_sessid], 0
     mov dil, K_DEV
+    cmp r12, 2
+    je .rep                               ; served a hello 8.4 forbids
+    cmp r12, 1
+    jne .info
+    mov dil, K_OK
+    cmp qword [q_close_code], 0x0a        ; PROTOCOL_VIOLATION
+    je .rep
+    mov dil, K_INFO                       ; refused, but named another fault
     jmp .rep
 .info:
     mov dil, K_INFO
 .rep:
-    mov qword [bad_sessid], 0
     lea rsi, [n_h3_sessid]
     mov edx, n_h3_sessid_len
     call report_plain
+    pop r12
     pop rbx
     ret
 
@@ -8344,6 +8422,8 @@ h3_battery:
     call probe_h3_newcid
     call probe_h3_sessid_echo
     call probe_h3_streams_uni
+    call probe_h3_iscid
+    call probe_h3_noiscid
     call probe_h3_tpudp
     call probe_h3_tpcid
     call probe_h3_dgmax

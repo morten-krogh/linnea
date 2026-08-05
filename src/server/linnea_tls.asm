@@ -285,7 +285,12 @@ linnea_tls_hs_input:
     shl r13d, 8
     mov al, [rbx + 4]
     mov r13b, al
-    cmp r13d, 16640             ; 2^14 + 256, the record-overflow bound
+    ; RFC 8446 5.1 and 5.2 give two different bounds, and this path had the
+    ; wrong one. 2^14 + 256 is the CIPHERTEXT limit -- it allows for the content
+    ; type byte and AEAD expansion. A ClientHello record is TLSPlaintext, whose
+    ; fragment "MUST NOT exceed 2^14" (5.1), so 16385..16640 were being accepted
+    ; here when they should draw record_overflow.
+    cmp r13d, 16384             ; 2^14, the TLSPlaintext bound (5.1)
     ja .ch_overflow
     lea rax, [r13 + 5]
     cmp rax, r12

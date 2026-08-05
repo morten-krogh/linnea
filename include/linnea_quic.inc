@@ -45,4 +45,7 @@ struc linnea_quic_ch
     .sigalg_seen:   resq 1 ; 1 if signature_algorithms (0x000d) was offered
     .tls13_seen:    resq 1 ; 1 if supported_versions (0x2b) offers TLS 1.3 (0x0304)
     .aes128_seen:   resq 1 ; 1 if cipher_suites offers TLS_AES_128_GCM_SHA256 (0x1301)
+    .sessid_len:    resq 1 ; legacy_session_id length. RFC 9001 8.4 forbids the TLS
+                           ; middlebox compatibility mode over QUIC outright, so
+                           ; anything but 0 here is a PROTOCOL_VIOLATION
 endstruc
