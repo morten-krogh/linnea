@@ -2727,6 +2727,15 @@ rm -f /tmp/upload3_echo.bin
     # Huffman + the static table) has its HEADERS decoded and the named
     # static file served back over h2. Serving the right file end to end is
     # the proof the :path decoded correctly.
+    # tls-8 / tls-9: the alert DESCRIPTION the server sends. Refusing correctly
+    # but naming the wrong reason sends a client to fix the wrong thing --
+    # handshake_failure for a version mismatch tells an old client to change its
+    # cipher list. Six cases, one of them a control that must NOT move, and one
+    # (bad_record_mac) read out of a record sealed under the server's handshake
+    # key. 5 of the 6 report the wrong code before the fix.
+    timeout 60 python3 test/tls/alert_codes.py 47446 >/dev/null 2>&1
+    check "tls alert codes name the actual fault (tls-8, tls-9)" $?
+
     # tls-4: a mid-connection KeyUpdate (RFC 8446 4.6.3). The peer derives the
     # next generation of its traffic secret and switches to it; a receiver that
     # cannot follow loses the connection. kTLS reports the KeyUpdate record by

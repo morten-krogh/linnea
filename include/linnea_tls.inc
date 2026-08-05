@@ -131,6 +131,8 @@ LINNEA_TLS_A_ILLEGAL_PARAMETER   equ 47
 LINNEA_TLS_A_DECODE_ERROR        equ 50
 LINNEA_TLS_A_DECRYPT_ERROR       equ 51
 LINNEA_TLS_A_PROTOCOL_VERSION    equ 70
+LINNEA_TLS_A_MISSING_EXTENSION   equ 109   ; RFC 8446 9.2: a MUST-send extension
+                                           ; the client left out
 LINNEA_TLS_A_INTERNAL_ERROR      equ 80
 LINNEA_TLS_A_NO_APP_PROTOCOL     equ 120   ; RFC 7301 3.2
 

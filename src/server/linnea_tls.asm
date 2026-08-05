@@ -267,6 +267,15 @@ linnea_tls_hs_input:
     lea rax, [r13 + 5]
     cmp rax, r12
     ja .ret                     ; wait for the whole record before dropping it
+    ; RFC 8446 5: the compatibility ChangeCipherSpec is one byte, 0x01, and an
+    ; implementation "which receives any other change_cipher_spec value ... MUST
+    ; abort the handshake with an unexpected_message alert". It was dropped
+    ; unread, so any payload of any length passed for one. .ch_not_tls sends
+    ; exactly that alert.
+    cmp r13d, 1
+    jne .ch_not_tls
+    cmp byte [rbx + 5], 1
+    jne .ch_not_tls
     add [rbp + linnea_tls_hs.consumed], rax
     add rbx, rax
     sub r12, rax
@@ -443,7 +452,12 @@ linnea_tls_hs_input:
     jmp .ret
 
 .ch_not_tls:
-    mov edi, LINNEA_TLS_A_DECODE_ERROR
+    ; RFC 8446 5.1: "If a TLS implementation receives an unexpected record type,
+    ; it MUST terminate the connection with an unexpected_message alert."
+    ; decode_error (50) is for a message of the RIGHT type that will not parse;
+    ; this is a record that has no business being here at all -- plain HTTP on
+    ; the TLS port, a stray ChangeCipherSpec before any ClientHello, or noise.
+    mov edi, LINNEA_TLS_A_UNEXPECTED_MESSAGE
     jmp .plain_alert
 .ch_overflow:
     mov edi, LINNEA_TLS_A_RECORD_OVERFLOW
@@ -549,7 +563,7 @@ linnea_tls_hs_input:
     call ct_eq32
     add rsp, 128
     test eax, eax
-    jz .fin_badmac
+    jz .fin_badverify
 
     ; success: absorb the client Finished, switch to application keys
     lea rsi, [rbp + linnea_tls_hs.msg_buf]
@@ -580,7 +594,16 @@ linnea_tls_hs_input:
     mov edi, LINNEA_TLS_A_RECORD_OVERFLOW
     jmp .enc_alert
 .fin_badmac:
-    mov edi, LINNEA_TLS_A_DECRYPT_ERROR
+    ; RFC 8446 5.2: a record whose AEAD does not open is bad_record_mac. This
+    ; label used to serve the verify_data mismatch below as well, and answered
+    ; both with decrypt_error -- right for that one, wrong here. The two say
+    ; different things to the peer: bad_record_mac is "this record is not what
+    ; you encrypted" (a corrupted or forged record, or keys that disagree),
+    ; decrypt_error is "the handshake did not authenticate".
+    mov edi, LINNEA_TLS_A_BAD_RECORD_MAC
+    jmp .enc_alert
+.fin_badverify:
+    mov edi, LINNEA_TLS_A_DECRYPT_ERROR   ; RFC 8446 4.4.4, the Finished MAC
 .enc_alert:
     ; seal a fatal alert under the server handshake keys
     mov [rbp + linnea_tls_hs.alert], edi
@@ -696,8 +719,17 @@ parse_ch:
     sub rcx, 2
     jmp .suite_loop
 .suite_done:
+    ; Do NOT rule on the cipher suite yet. supported_versions is an extension,
+    ; parsed further down, so refusing here answers a TLS 1.2 client -- which
+    ; offers only TLS 1.2 suites and no supported_versions -- with
+    ; handshake_failure, when what is actually wrong is the version. RFC 8446
+    ; 4.1.1 wants protocol_version for that, and an old client deserves to be
+    ; told which of the two it is. The verdict moves to .ext_done, after the
+    ; version is known.
     test r15d, r15d
-    jz .handshake_fail
+    jz .no_suite
+    or r14d, 0x40000            ; an acceptable suite was offered
+.no_suite:
 
     ; legacy_compression_methods <1..2^8-1>: must be exactly { null }
     lea rax, [rbx + 2]
@@ -886,7 +918,7 @@ parse_ch:
     jae .ext_skip
     cmp word [rsi], 0x0304      ; ecdsa_secp256r1_sha256 = 0x0403 big-endian
     jne .sa_next
-    or r14d, 4
+    or r14d, 4                  ; ...and it lists a scheme we can sign with
 .sa_next:
     add rsi, 2
     jmp .sa_loop
@@ -1082,6 +1114,19 @@ parse_ch:
 .ext_done:
     test r14d, 2                ; supported_versions offered TLS 1.3?
     jz .protocol_version
+    test r14d, 0x40000          ; ...and only then, was a suite we speak offered?
+    jz .handshake_fail
+    ; RFC 8446 4.2.9 MUST: "If clients offer pre_shared_key without a
+    ; psk_key_exchange_modes extension, servers MUST abort the handshake." It
+    ; was ignored, and the handshake simply carried on as a full one -- the
+    ; harmless direction, but a client that contradicts itself this way is
+    ; better told than quietly corrected. 4.2 names missing_extension for an
+    ; extension the peer was obliged to send.
+    test r14d, 0x1000           ; pre_shared_key offered...
+    jz .no_psk_modes_needed
+    test r14d, 0x2000           ; ...without psk_key_exchange_modes?
+    jz .missing_extension
+.no_psk_modes_needed:
     test r14d, 1                ; an x25519 key share present?
     jnz .have_share
     ; No usable share. RFC 8446 4.1.4 MUST: when the server picks a group the
@@ -1100,7 +1145,16 @@ parse_ch:
     test dword [rbp + linnea_tls_hs.flags], LINNEA_TLS_FLAG_TRACE
     jnz .alpn_select
     test r14d, 4
-    jz .handshake_fail
+    jnz .alpn_select
+    ; RFC 8446 9.2: a client offering to authenticate the server with a
+    ; certificate MUST send signature_algorithms, and 4.2 answers a MUST-send
+    ; extension that is absent with missing_extension. That is a different
+    ; failure from "sent it, and we sign with none of what it listed", which
+    ; stays handshake_failure (4.1.1) -- one is a malformed hello, the other a
+    ; genuine disagreement, and a client can only act on the second.
+    test r14d, 0x400            ; .ext_sa's own marker: the extension was there
+    jz .missing_extension
+    jmp .handshake_fail
 .alpn_select:
     ; choose the ALPN protocol: h2 when the client offered it and this
     ; server enables it, else http/1.1 if offered, else none
@@ -1147,6 +1201,9 @@ parse_ch:
     jmp .pret
 .protocol_version:
     mov eax, LINNEA_TLS_A_PROTOCOL_VERSION
+    jmp .pret
+.missing_extension:
+    mov eax, LINNEA_TLS_A_MISSING_EXTENSION
     jmp .pret
 .handshake_fail:
     mov eax, LINNEA_TLS_A_HANDSHAKE_FAILURE
