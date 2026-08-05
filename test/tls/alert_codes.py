@@ -11,7 +11,7 @@
 # server_handshake_traffic_secret -- which needs only CH and SH -- and decrypts
 # it. Without that, the one finding whose fix is about ciphertext could only be
 # tested by watching the connection die, which is what it did before too.
-# Usage: alert_codes.py <port>
+# Usage: alert_codes.py <port> [host]   (host defaults to 127.0.0.1)
 import hashlib
 import hmac
 import os
@@ -23,7 +23,8 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 PORT = int(sys.argv[1])
-ADDR = ("127.0.0.1", PORT)
+HOST = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+ADDR = (HOST, PORT)
 
 CLOSE_NOTIFY, UNEXPECTED_MESSAGE, BAD_RECORD_MAC = 0, 10, 20
 HANDSHAKE_FAILURE, DECODE_ERROR, DECRYPT_ERROR = 40, 50, 51
