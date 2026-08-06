@@ -87,6 +87,13 @@ linnea_connection_alloc:
     mov dword [rdx + linnea_connection.up_fd], -1
     mov dword [rdx + linnea_connection.spill_fd], -1
     mov qword [rdx + linnea_connection.spill_len], 0
+    mov qword [rdx + linnea_connection.chunk_state], LINNEA_CHUNK_SIZE
+    mov qword [rdx + linnea_connection.chunk_rem], 0
+    mov qword [rdx + linnea_connection.chunk_digits], 0
+    mov qword [rdx + linnea_connection.chunk_raw], 0
+    mov qword [rdx + linnea_connection.capture_chunked], 0
+    mov qword [rdx + linnea_connection.capture_done], 0
+    mov qword [rdx + linnea_connection.answer_linger], 0
     mov qword [rdx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
     mov qword [rdx + linnea_connection.tls_phase], LINNEA_TLS_PHASE_NONE
     mov qword [rdx + linnea_connection.close_notified], 0

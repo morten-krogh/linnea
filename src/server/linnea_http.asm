@@ -1492,6 +1492,8 @@ linnea_http_handle:
     mov qword [rbx + linnea_connection.req_body_rem], 0
     test qword [rsp + 136], 4
     jz .not_chunked
+    cmp qword [rbx + linnea_connection.capture_done], 0
+    jne .chunked_captured
     ; --- chunked: decode it in place, then carry on as any other body -------
     ; Afterwards the buffer holds the body exactly as though the client had
     ; declared a Content-Length, so nothing downstream needs to know this
@@ -1511,7 +1513,7 @@ linnea_http_handle:
     ; which the chunked path does not do yet.
     mov rcx, [rbx + linnea_connection.in_len]
     cmp rcx, LINNEA_CONN_IN_BUF
-    jae .resp_413
+    jae .chunked_capture
     test qword [rsp + 232], 4        ; waiting on our permission to send it?
     jz .chunked_wait
     mov rdi, rbx
@@ -1543,6 +1545,28 @@ linnea_http_handle:
     mov [rsp + 128], rax             ; the decoded length IS the Content-Length
     and qword [rsp + 136], ~4        ; and it is an ordinary body from here on
     or qword [rsp + 136], 8          ; ...but the proxy still owes it a length
+    jmp .not_chunked                 ; the two capture arms below are not ours
+.chunked_capture:
+    ; The buffer is full and the body is not finished, so it never will fit:
+    ; it is captured — and decoded — as it arrives instead. Whether that is
+    ; allowed is routing's call, exactly as for a counted body: [rsp+288]
+    ; sends every location that cannot consume a body this large to a 413.
+    ; Nothing is queued behind the head; the whole body goes to the capture.
+    mov qword [rsp + 288], 2
+    mov qword [rsp + 128], 0
+    mov rax, [rbx + linnea_connection.head_len]
+    jmp .body_ready
+.chunked_captured:
+    ; The second pass over the same head, once the capture is complete. The
+    ; body is decoded and mapped rather than sitting in in_buf, so nothing is
+    ; queued behind the head and the length the backend is told comes from
+    ; spill_len (below). It is an ordinary counted request from here on — the
+    ; same shape a chunked body small enough to buffer has always been given.
+    mov qword [rsp + 128], 0
+    and qword [rsp + 136], ~4
+    or qword [rsp + 136], 8          ; and the proxy owes it a length
+    mov rax, [rbx + linnea_connection.in_len]
+    jmp .body_ready
 .not_chunked:
     mov rax, [rbx + linnea_connection.head_len]
     add rax, [rsp + 128]
@@ -1564,7 +1588,12 @@ linnea_http_handle:
     lea rax, [linnea_config_instance]
     mov rax, [rax + linnea_config.max_body]
     cmp [rsp + 128], rax
-    ja .resp_413
+    jbe .body_capture_ok
+    ; the client has not been told to hold back (no 100-continue was answered),
+    ; so it is about to send a body nobody will read: linger over the refusal
+    mov qword [rbx + linnea_connection.answer_linger], 1
+    jmp .resp_413
+.body_capture_ok:
     ; keep the head consumed and hand the routing whatever body bytes have
     ; already arrived; the rest is captured as it comes
     mov qword [rsp + 288], 1
@@ -2394,6 +2423,22 @@ linnea_http_handle:
 ; --- proxy location: rewrite the request and open the upstream socket ---
 ; The event loop takes it from here (connect, send, read the head back).
 .proxy_start:
+    ; A chunked body still arriving: capture it before anything is built or
+    ; connected. The head cannot be rewritten yet — its Content-Length is the
+    ; decoded length, which is not known until the last chunk — so the caller
+    ; captures and then calls us again over the same head.
+    cmp qword [rsp + 288], 2
+    jne .proxy_build
+    ; The vhost has to be recorded even though the head is not built yet: a
+    ; capture that fails is answered with a canned response, and both that
+    ; response's security headers and its log line are the vhost's. A pool slot
+    ; carries the last connection's vhost otherwise, which is a stale pointer.
+    mov rcx, [rsp + 120]
+    mov [rbx + linnea_connection.vhost], rcx
+    mov [rbx + linnea_connection.location], rax
+    mov eax, LINNEA_HTTP_CAPTURE
+    jmp .ret
+.proxy_build:
     mov [rbx + linnea_connection.location], rax
     ; the client head is rewritten into up_buf (method + target + our version
     ; and Connection lines + every client header verbatim). up_buf is smaller
@@ -2561,6 +2606,10 @@ linnea_http_handle:
     mov esi, hdr_cl_up_len
     call .append
     mov rdi, [rsp + 128]             ; the decoded length
+    cmp qword [rbx + linnea_connection.capture_done], 0
+    je .proxy_clen_digits
+    mov rdi, [rbx + linnea_connection.spill_len]   ; captured, not buffered
+.proxy_clen_digits:
     lea rsi, [num_buf]
     call linnea_string_from_u64      ; rax = digits written
     lea rdi, [num_buf]
@@ -3197,8 +3246,20 @@ linnea_http_proxy_error:
     mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
     cmp r12, 504
     je .gateway_timeout
+    cmp r12, 400
+    je .bad_request            ; a captured body whose framing did not hold up
+    cmp r12, 413
+    je .too_large              ; ...or which ran past max_body
     lea rax, [resp_502]
     mov ecx, resp_502_len
+    jmp .set
+.bad_request:
+    lea rax, [resp_400]
+    mov ecx, resp_400_len
+    jmp .set
+.too_large:
+    lea rax, [resp_413]
+    mov ecx, resp_413_len
     jmp .set
 .gateway_timeout:
     lea rax, [resp_504]

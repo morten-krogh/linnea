@@ -1942,6 +1942,37 @@ check "abandoned upload reaches the backend not at all" $?
 grep -q ' /api/echo 300000$' "$SEEN"
 check "backend record control (the completed upload IS in it)" $?
 
+# --- chunked uploads too large to buffer: captured and decoded as they
+# arrive, then forwarded as an ordinary counted request. Before this they were
+# a 413 outright, since only the counted path could stream. ---
+for m in big head bad abort cap flood twice; do
+    out=$(python3 test/upload_chunked.py $m)
+    [ "$out" = "OK" ]
+    case $m in
+      big)   check "chunked upload captured byte-exact through ragged framing ($out)" $? ;;
+      head)  check "chunked upload reaches the backend counted, not chunked ($out)" $? ;;
+      bad)   check "chunked upload with a bad chunk size is 400 ($out)" $? ;;
+      abort) check "abandoned chunked upload reaches the backend not at all ($out)" $? ;;
+      cap)   check "chunked upload past max_body is 413, not a reset ($out)" $? ;;
+      flood) check "endless chunked trailers hit max_body too ($out)" $? ;;
+      twice) check "two chunked captures on one kept-alive connection ($out)" $? ;;
+    esac
+done
+
+# The same, counted: two captures on one connection. The bodies must DIFFER —
+# with identical ones a second upload served out of the first one's file looks
+# perfectly correct.
+python3 -c "
+import random
+random.seed(31); open('test/www/up1.bin','wb').write(bytes(random.getrandbits(8) for _ in range(200000)))
+random.seed(41); open('test/www/up2.bin','wb').write(bytes(random.getrandbits(8) for _ in range(250000)))"
+curl -s --max-time 30 -o /tmp/up1_echo.bin --data-binary @test/www/up1.bin http://127.0.0.1:47080/api/echo \
+     --next -s --max-time 30 -o /tmp/up2_echo.bin --data-binary @test/www/up2.bin http://127.0.0.1:47080/api/echo
+[ "$(md5sum < /tmp/up1_echo.bin | cut -d' ' -f1)" = "$(md5sum < test/www/up1.bin | cut -d' ' -f1)" ] &&
+[ "$(md5sum < /tmp/up2_echo.bin | cut -d' ' -f1)" = "$(md5sum < test/www/up2.bin | cut -d' ' -f1)" ]
+check "two counted captures on one kept-alive connection" $?
+rm -f /tmp/up1_echo.bin /tmp/up2_echo.bin test/www/up1.bin test/www/up2.bin
+
 # max_body is what stands between one client and the filesystem, so it is
 # refused on the declared length — before a byte of it is written anywhere.
 resp=$(raw_http "POST /api/toobig HTTP/1.1\r\nHost: one.test\r\nContent-Length: 99999999999\r\n\r\n")

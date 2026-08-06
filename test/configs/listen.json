@@ -2,28 +2,57 @@
   "log": "test/linnea.log",
   "timeout": 2,
   "max_connections": 64,
+  "max_body": 1000000,
   "workers": 2,
   "servers": [
     {
-      "host": "127.0.0.1", "port": 47080, "hostname": "one.test",
+      "host": "127.0.0.1",
+      "port": 47080,
+      "hostname": "one.test",
       "locations": [
-        { "prefix": "/", "root": "test/www", "cache_control": "max-age=60" },
-        { "prefix": "/api", "proxy": "127.0.0.1:47100" },
-        { "prefix": "/down", "proxy": "127.0.0.1:47199" }
+        {
+          "prefix": "/",
+          "root": "test/www",
+          "cache_control": "max-age=60"
+        },
+        {
+          "prefix": "/api",
+          "proxy": "127.0.0.1:47100"
+        },
+        {
+          "prefix": "/down",
+          "proxy": "127.0.0.1:47199"
+        }
       ]
     },
     {
-      "host": "127.0.0.1", "port": 47090, "hostname": "two.test",
+      "host": "127.0.0.1",
+      "port": 47090,
+      "hostname": "two.test",
       "locations": [
-        { "prefix": "/", "root": "test/www/sub" },
-        { "prefix": "/sub", "root": "test/www" },
-        { "prefix": "/old", "redirect": "https://example.com" }
+        {
+          "prefix": "/",
+          "root": "test/www/sub"
+        },
+        {
+          "prefix": "/sub",
+          "root": "test/www"
+        },
+        {
+          "prefix": "/old",
+          "redirect": "https://example.com"
+        }
       ]
     },
     {
-      "host": "127.0.0.1", "port": 47080, "hostname": "three.test",
+      "host": "127.0.0.1",
+      "port": 47080,
+      "hostname": "three.test",
       "locations": [
-        { "prefix": "/", "root": "test/www/sub" }
+        {
+          "prefix": "/",
+          "root": "test/www/sub"
+        }
       ]
     }
   ]

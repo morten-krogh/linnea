@@ -46,6 +46,21 @@ LINNEA_PROXY_CAPTURE    equ 8      ; capturing a request body too large to
                                    ; here leaves the backend untouched rather
                                    ; than holding a truncated request.
 
+; conn.chunk_state — where an incremental chunked decode stopped. The states
+; are per BYTE, not per line: any of these boundaries can fall between two
+; recvs, and a decoder that assumed otherwise would reject valid framing.
+LINNEA_CHUNK_SIZE       equ 0      ; accumulating the hex size
+LINNEA_CHUNK_EXT        equ 1      ; chunk-ext, ignored, runs to the CR
+LINNEA_CHUNK_SIZE_LF    equ 2      ; saw the CR of the size line
+LINNEA_CHUNK_DATA       equ 3      ; copying chunk_rem bytes of data
+LINNEA_CHUNK_DATA_CR    equ 4      ; the CR that must follow the data
+LINNEA_CHUNK_DATA_LF    equ 5
+LINNEA_CHUNK_TRAIL      equ 6      ; at the start of a trailer line
+LINNEA_CHUNK_TRAIL_LINE equ 7      ; inside one, dropping it
+LINNEA_CHUNK_TRAIL_LF   equ 8
+LINNEA_CHUNK_END_LF     equ 9      ; the LF that ends the whole body
+LINNEA_CHUNK_DONE       equ 10
+
 ; conn.tls_phase — a TLS connection is only special until the keys reach the
 ; kernel; after that the ordinary HTTP/proxy/tunnel path runs unchanged.
 LINNEA_TLS_PHASE_NONE   equ 0      ; plaintext listener
@@ -100,6 +115,25 @@ struc linnea_connection
     .spill_fd:      resd 1         ; O_TMPFILE holding the captured request
     .spill_pad:     resd 1         ; body, -1 = none
     .spill_len:     resq 1         ; bytes captured so far
+    ; A chunked body has no declared length, so it is decoded as it arrives —
+    ; the state a decode carries between one recv and the next, since a chunk
+    ; header, its data or even a CRLF can be split across datagrams.
+    .chunk_state:   resq 1         ; LINNEA_CHUNK_*
+    .chunk_rem:     resq 1         ; the size being accumulated, then the data
+                                   ; bytes of that chunk still to come
+    .chunk_digits:  resq 1         ; hex digits in the current size line
+    .chunk_raw:     resq 1         ; encoded bytes consumed, capped like the
+                                   ; decoded ones: endless empty chunks and
+                                   ; trailers must not run forever
+    .capture_chunked: resq 1       ; 1 = the capture is decoding chunked framing
+    .capture_done:  resq 1         ; 1 = the captured body is complete, and the
+                                   ; parser's second pass serves it from the
+                                   ; mapping rather than from in_buf
+    .answer_linger: resq 1         ; 1 = this response was written while the
+                                   ; client was still sending its body, so the
+                                   ; close has to linger: close(2) with unread
+                                   ; inbound answers RST and the client would
+                                   ; never get to read the answer
     .up_status:     resq 1         ; upstream status code, for the log
     .is_head:       resq 1         ; 1 = the client sent HEAD (no body relay)
     ; --- upgrade tunnel (websockets etc.) ----------------------------

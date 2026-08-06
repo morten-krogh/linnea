@@ -66,6 +66,8 @@ extern linnea_connection_free
 extern linnea_spill_release
 extern linnea_spill_write
 extern linnea_spill_finish
+extern linnea_spill_chunked
+extern linnea_spill_reset
 extern linnea_connection_at
 extern linnea_connection_active
 extern linnea_http_handle
@@ -1040,6 +1042,8 @@ linnea_uring_run:
     jz .recv_more
     cmp eax, LINNEA_HTTP_PROXY
     je .proxy_connect
+    cmp eax, LINNEA_HTTP_CAPTURE
+    je .capture_chunked_start
     mov rdi, r12               ; response ready
     call linnea_uring_arm_send
     call linnea_uring_submit_now
@@ -1110,6 +1114,67 @@ linnea_uring_run:
     mov qword [r12 + linnea_connection.file_rem], 0
     test eax, eax
     js .capture_fail
+    jmp .capture_more          ; a counted body: its length says when it ends
+.capture_chunked_start:
+    ; A chunked body has no declared length, so the decoder is what says when
+    ; it ends. Whatever arrived with the head goes through it first; in_buf is
+    ; left holding the head alone, which is what the second parse pass reads.
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CAPTURE
+    mov qword [r12 + linnea_connection.capture_chunked], 1
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.in_buf]
+    add rsi, [r12 + linnea_connection.head_len]
+    mov rdx, [r12 + linnea_connection.in_len]
+    sub rdx, [r12 + linnea_connection.head_len]
+    call linnea_spill_chunked
+    mov rcx, [r12 + linnea_connection.head_len]
+    mov [r12 + linnea_connection.in_len], rcx
+.capture_verdict:
+    cmp eax, 1
+    je .capture_complete
+    test eax, eax
+    jz .capture_more
+    cmp eax, -2
+    je .capture_too_large
+    jmp .capture_malformed
+.capture_complete:
+    ; The body is whole. Parse the same head again: this time it sees a
+    ; complete counted body and rewrites the request head with the length the
+    ; decode counted, which is why the head could not be built up front.
+    mov qword [r12 + linnea_connection.capture_done], 1
+    mov rdi, r12
+    call linnea_http_handle
+    cmp eax, LINNEA_HTTP_PROXY
+    je .capture_upstream
+    test eax, eax
+    jz .capture_fail           ; NEED_MORE is impossible: the body is complete
+    mov rdi, r12               ; the second pass answered the client instead
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.capture_upstream:
+    mov rdi, r12               ; the mapping replaces whatever was queued
+    call linnea_spill_finish
+    test eax, eax
+    js .capture_fail
+    jmp .proxy_connect_now
+.capture_malformed:
+    mov esi, 400
+    jmp .capture_answer
+.capture_too_large:
+    mov esi, 413
+.capture_answer:
+    ; Nothing has been sent to the client and no upstream was ever contacted,
+    ; so the whole exchange can still be answered honestly. The client is
+    ; mid-upload, though, and does not know it is over: the close after this
+    ; has to linger, or the RST discards the answer we just wrote.
+    mov qword [r12 + linnea_connection.answer_linger], 1
+    mov rdi, r12
+    call linnea_http_proxy_error
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
 .capture_more:
     ; The capture window is out_buf. NOT up_buf: that already holds the
     ; rewritten request head, waiting to go out the moment the body is
@@ -1172,6 +1237,14 @@ linnea_uring_run:
     cmp rax, [head_timeout_ns]
     ja .req_body_slow
 .req_body_take:
+    cmp qword [r12 + linnea_connection.capture_chunked], 0
+    je .req_body_counted
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.out_buf]
+    mov edx, r15d
+    call linnea_spill_chunked
+    jmp .capture_verdict
+.req_body_counted:
     mov eax, r15d
     cmp rax, [r12 + linnea_connection.req_body_rem]
     jbe .req_body_have
@@ -1323,7 +1396,9 @@ linnea_uring_run:
     jne .keep_alive_continue
     lea r14, [reason_done]
     mov r15d, reason_done_len
-    jmp .conn_close
+    cmp qword [r12 + linnea_connection.answer_linger], 0
+    jne .drain_linger          ; refused mid-upload: linger or the RST takes
+    jmp .conn_close            ; the answer with it
 .drain_close:
     lea r14, [reason_drain]
     mov r15d, reason_drain_len
@@ -1399,6 +1474,8 @@ linnea_uring_run:
                                                         ; dead-end: reached only by
                                                         ; the explicit jump in .on_send)
 .keep_alive_continue:
+    mov rdi, r12               ; whatever this request captured is finished
+    call linnea_spill_reset    ; with; the next one starts from nothing
     ; keep-alive: drop the consumed head, keep any pipelined bytes. The
     ; subtraction is guarded: an in_len below head_len would wrap into a
     ; gigabyte-scale rep movsb that walks off the end of the pool, and a
