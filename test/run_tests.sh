@@ -1158,6 +1158,8 @@ backend_ready() {
     exit 1
 }
 
+SEEN=/tmp/linnea_backend_seen.log       # what actually reached a backend
+rm -f "$SEEN"
 python3 test/proxy_backend.py >/dev/null 2>&1 &
 backend_pid=$!
 backend_ready
@@ -1914,8 +1916,9 @@ curl -s --max-time 3 http://127.0.0.1:47080/api/truncated >/dev/null 2>&1
 grep -qF ': upstream closed early' "$LOG"
 check "proxy truncated body" $?
 
-# --- large uploads: the body streams to the upstream instead of being
-# buffered whole, so it is bounded by the relay, not by in_buf ---
+# --- large uploads: a body too large to buffer with the head is captured in
+# full (on disk, past what fits in memory) and only then forwarded, so it is
+# bounded by max_body rather than by in_buf ---
 python3 -c "
 import random, sys
 random.seed(11)
@@ -1924,8 +1927,27 @@ want=$(md5sum < test/www/upload.bin | cut -d' ' -f1)
 curl -s --max-time 30 --data-binary @test/www/upload.bin \
     http://127.0.0.1:47080/api/echo > /tmp/upload_echo.bin
 [ "$(md5sum < /tmp/upload_echo.bin | cut -d' ' -f1)" = "$want" ]
-check "proxy streams a 300000-byte request body (byte-exact)" $?
+check "proxy captures a 300000-byte request body (byte-exact)" $?
 rm -f /tmp/upload_echo.bin
+
+# The point of capturing rather than relaying: a client that abandons its
+# upload must leave the backend with NOTHING — not a truncated request it
+# cannot distinguish from a complete one, and may already have acted on.
+# Asserted against the backend's own record of what reached it, and the
+# control below proves that record is being written.
+python3 test/upload_abort.py >/dev/null
+sleep 0.5
+! grep -q ' /api/abandoned ' "$SEEN"
+check "abandoned upload reaches the backend not at all" $?
+grep -q ' /api/echo 300000$' "$SEEN"
+check "backend record control (the completed upload IS in it)" $?
+
+# max_body is what stands between one client and the filesystem, so it is
+# refused on the declared length — before a byte of it is written anywhere.
+resp=$(raw_http "POST /api/toobig HTTP/1.1\r\nHost: one.test\r\nContent-Length: 99999999999\r\n\r\n")
+check_http "upload past max_body is 413" "413 Content Too Large" "$resp"
+! grep -q ' /api/toobig ' "$SEEN"
+check "the refused upload never reached the backend" $?
 
 # --- proxied request log lines: upstream status, relayed byte count ---
 grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /api/simple HTTP/1\.1" 200 12' "$LOG"
@@ -2518,6 +2540,19 @@ else
     resp=$(curl -si --http1.1 --max-time 5 --cacert $CA $U/api/simple)
     check_http "tls proxy body"   "backend body" "$resp"
     check_http "tls proxy status" "200 OK" "$resp"
+
+    # A captured upload over TLS: the capture window is filled by the kTLS
+    # recvmsg path rather than a plain recv, which is a different arm.
+    python3 -c "
+import random
+random.seed(13)
+open('test/www/tlsupload.bin','wb').write(bytes(random.getrandbits(8) for _ in range(300000)))"
+    curl -s --max-time 30 --cacert $CA --data-binary @test/www/tlsupload.bin \
+        $U/api/echo > /tmp/tls_upload_echo.bin
+    [ "$(md5sum < /tmp/tls_upload_echo.bin | cut -d' ' -f1)" = \
+      "$(md5sum < test/www/tlsupload.bin | cut -d' ' -f1)" ]
+    check "tls proxy captures a 300000-byte request body (byte-exact)" $?
+    rm -f /tmp/tls_upload_echo.bin test/www/tlsupload.bin
 
     timeout 8 python3 - "$CA" 47443 <<'PYEOF'
 import ssl, socket, sys

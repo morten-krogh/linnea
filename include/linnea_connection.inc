@@ -39,9 +39,12 @@ LINNEA_PROXY_TUNNEL     equ 6      ; full-duplex byte relay after a 101; the
                                    ; one-op invariant becomes one PER DIRECTION
 LINNEA_PROXY_CLOSING    equ 7      ; tunnel torn down; both sockets are shut
                                    ; down, waiting for in-flight ops to drain
-LINNEA_PROXY_REQ_BODY   equ 8      ; relaying a request body too large to
-                                   ; buffer: client recv -> upstream send,
-                                   ; a chunk at a time, until it is all sent
+LINNEA_PROXY_CAPTURE    equ 8      ; capturing a request body too large to
+                                   ; buffer: client recv -> spill file, until
+                                   ; it is complete. The upstream has not been
+                                   ; contacted yet, so a client that gives up
+                                   ; here leaves the backend untouched rather
+                                   ; than holding a truncated request.
 
 ; conn.tls_phase — a TLS connection is only special until the keys reach the
 ; kernel; after that the ordinary HTTP/proxy/tunnel path runs unchanged.
@@ -90,11 +93,13 @@ struc linnea_connection
     .relayed:       resq 1         ; body bytes relayed to the client
     .up_len:        resq 1         ; bytes buffered in up_buf
     .req_body_rem:  resq 1         ; request-body bytes still to come from the
-                                   ; client and be relayed upstream. Nonzero
-                                   ; only for a body too large to buffer with
-                                   ; the head, which streams through in_buf a
-                                   ; chunk at a time instead of being held
-                                   ; whole (a 413 before Q89).
+                                   ; client. Nonzero only for a body too large
+                                   ; to buffer with the head, which is captured
+                                   ; into the spill file below and forwarded
+                                   ; once complete (a 413 before Q89).
+    .spill_fd:      resd 1         ; O_TMPFILE holding the captured request
+    .spill_pad:     resd 1         ; body, -1 = none
+    .spill_len:     resq 1         ; bytes captured so far
     .up_status:     resq 1         ; upstream status code, for the log
     .is_head:       resq 1         ; 1 = the client sent HEAD (no body relay)
     ; --- upgrade tunnel (websockets etc.) ----------------------------

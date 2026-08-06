@@ -16,6 +16,7 @@ import time
 
 HOST, PORT = "127.0.0.1", 47100
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+SEEN = "/tmp/linnea_backend_seen.log"   # every request that reached a backend
 
 
 def read_request(conn):
@@ -66,6 +67,12 @@ def respond(conn, head, body, extra=b""):
     request_line = head.split(b"\r\n")[0]
     method, target = request_line.split(b" ")[0], request_line.split(b" ")[1]
     path = target.split(b"?")[0]
+
+    # A record of everything that actually reached a backend, so a test can
+    # assert the negative: an upload the client abandoned must appear NOWHERE
+    # in here, not even truncated.
+    with open(SEEN, "a") as f:
+        f.write(f"{method.decode()} {path.decode()} {len(body)}\n")
 
     if path.endswith(b"/ws-echo"):
         # tunnel echo: whatever arrives after the 101 goes straight back,

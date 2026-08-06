@@ -73,9 +73,14 @@ LINNEA_STDERR        equ 2
 
 LINNEA_O_RDONLY      equ 0
 LINNEA_O_WRONLY      equ 1
+LINNEA_O_RDWR        equ 2
 LINNEA_O_CREAT       equ 0x40
 LINNEA_O_APPEND      equ 0x400
 LINNEA_O_CLOEXEC     equ 0x80000
+; O_TMPFILE is __O_TMPFILE | O_DIRECTORY: the path names the filesystem, and
+; the file it creates there has no directory entry at all
+LINNEA_O_TMPFILE     equ 0x410000
+LINNEA_MODE_0600     equ 384  ; rw-------
 LINNEA_MODE_0644     equ 420  ; rw-r--r--
 LINNEA_PROT_READ     equ 1
 LINNEA_PROT_WRITE    equ 2

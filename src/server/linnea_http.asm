@@ -1558,8 +1558,15 @@ linnea_http_handle:
     mov eax, LINNEA_HTTP_NEED_MORE
     jmp .ret
 .body_stream:
+    ; Too large to hold with the head, so it will be captured on disk — but
+    ; only up to max_body. Refused here, on the declared length, rather than
+    ; after writing it: the point of the cap is that the bytes never land.
+    lea rax, [linnea_config_instance]
+    mov rax, [rax + linnea_config.max_body]
+    cmp [rsp + 128], rax
+    ja .resp_413
     ; keep the head consumed and hand the routing whatever body bytes have
-    ; already arrived; the rest follows through the same buffer
+    ; already arrived; the rest is captured as it comes
     mov qword [rsp + 288], 1
     mov rcx, [rbx + linnea_connection.in_len]
     sub rcx, [rbx + linnea_connection.head_len]      ; body bytes in hand

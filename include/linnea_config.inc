@@ -27,6 +27,11 @@ LINNEA_DEFAULT_MAX_PER_IP       equ 64
 ; usually far smaller than the flood that can reach us, and refusing here is
 ; what keeps it alive.
 LINNEA_DEFAULT_MAX_UPSTREAM     equ 256
+; A proxied upload is captured on disk before it is forwarded, so the cap is
+; what stands between one client and the filesystem. 64 MB by default; the
+; ceiling is a sanity bound on the config value, not a promise of disk.
+LINNEA_DEFAULT_MAX_BODY         equ 67108864
+LINNEA_MAX_BODY_CEILING         equ 68719476736
 LINNEA_DEFAULT_MAX_CONNECTIONS  equ 1024
 LINNEA_DEFAULT_WORKERS          equ 0     ; 0 = one worker per online CPU
 LINNEA_MAX_WORKERS              equ 256
@@ -92,6 +97,7 @@ struc linnea_config
     .head_timeout:  resq 1                        ; seconds to complete a request head
     .max_per_ip:    resq 1                        ; connections one address may hold
     .max_upstream:  resq 1                        ; upstream connections in flight
+    .max_body:      resq 1                        ; largest request body accepted
     .workers:       resq 1                        ; worker processes; 0 until the
                                                   ; auto count is resolved at startup
     .http2:         resq 1                        ; 1 = offer HTTP/2 via ALPN

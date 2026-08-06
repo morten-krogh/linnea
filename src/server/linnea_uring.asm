@@ -63,6 +63,9 @@ extern linnea_upstream_closed
 extern linnea_upstream_limit
 extern linnea_connection_alloc
 extern linnea_connection_free
+extern linnea_spill_release
+extern linnea_spill_write
+extern linnea_spill_finish
 extern linnea_connection_at
 extern linnea_connection_active
 extern linnea_http_handle
@@ -165,6 +168,8 @@ reason_slow_head:   db "request head too slow"
 reason_slow_head_len equ $ - reason_slow_head
 reason_slow_body:   db "request body too slow"
 reason_slow_body_len equ $ - reason_slow_body
+reason_spill_err:   db "cannot capture request body"
+reason_spill_err_len equ $ - reason_spill_err
 reason_per_ip:      db "per-address connection limit"
 reason_per_ip_len   equ $ - reason_per_ip
 reason_timeout:     db "idle timeout"
@@ -917,7 +922,7 @@ linnea_uring_run:
     je .tunnel_client_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
     je .closing_c2u
-    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_REQ_BODY
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CAPTURE
     je .req_body_recv
     test r15d, r15d
     jg .recv_data
@@ -1083,21 +1088,56 @@ linnea_uring_run:
     mov r15d, reason_done_len
     jmp .conn_close
 .proxy_connect:
+    ; A body too large to buffer with the head is captured in full before the
+    ; upstream is touched at all — not even connected. The backend therefore
+    ; only ever sees requests that are already complete, and a client that
+    ; abandons its upload costs it nothing.
+    cmp qword [r12 + linnea_connection.req_body_rem], 0
+    jne .capture_start
+.proxy_connect_now:
     mov rdi, r12               ; the request goes to an upstream first
     call linnea_uring_arm_connect
     call linnea_uring_submit_now
     jmp .wait
+.capture_start:
+    ; the body bytes that arrived with the head are queued behind it in
+    ; file_ptr/file_rem; they open the capture file instead
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CAPTURE
+    mov rdi, r12
+    mov rsi, [r12 + linnea_connection.file_ptr]
+    mov rdx, [r12 + linnea_connection.file_rem]
+    call linnea_spill_write
+    mov qword [r12 + linnea_connection.file_rem], 0
+    test eax, eax
+    js .capture_fail
+.capture_more:
+    ; The capture window is out_buf. NOT up_buf: that already holds the
+    ; rewritten request head, waiting to go out the moment the body is
+    ; complete. NOT in_buf either — the parser's head is still there for the
+    ; access log. out_buf is idle until the response head is rewritten into
+    ; it, which cannot happen before the request has even been sent.
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.out_buf]
+    mov edx, LINNEA_CONN_OUT_BUF
+    call linnea_uring_arm_recv_buf
+    call linnea_uring_submit_now
+    jmp .wait
+.capture_fail:
+    lea r14, [reason_spill_err]
+    mov r15d, reason_spill_err_len
+    jmp .conn_close
 .recv_more:
     mov rdi, r12
     call h2_arm_recv_once
     call linnea_uring_submit_now
     jmp .wait
 
-; --- streaming a request body: the client's bytes go straight upstream ---
+; --- capturing a request body: the client's bytes go to the spill file ---
 ; The client stopping early (EOF, error or the idle timeout) means the body
-; will never be complete, so the exchange is over: the upstream sees a short
-; request and the connection is torn down. Nothing has been sent to the
-; client yet, so there is no half-response to worry about.
+; will never be complete, so the exchange is over — and since nothing has been
+; forwarded, it ends with the upstream never having heard of the request at
+; all. Nothing has been sent to the client either, so there is no half of
+; anything to worry about.
 .req_body_recv:
     test r15d, r15d
     jle .req_body_gone
@@ -1138,14 +1178,22 @@ linnea_uring_run:
     mov rax, [r12 + linnea_connection.req_body_rem]   ; ignore anything past
 .req_body_have:                                       ; the declared length
     sub [r12 + linnea_connection.req_body_rem], rax
-    lea rcx, [r12 + linnea_connection.up_buf]     ; the chunk landed here
-    mov [r12 + linnea_connection.out_ptr], rcx
-    mov [r12 + linnea_connection.out_rem], rax
-    mov qword [r12 + linnea_connection.file_rem], 0
     mov rdi, r12
-    call linnea_uring_arm_up_send
-    call linnea_uring_submit_now
-    jmp .wait
+    lea rsi, [r12 + linnea_connection.out_buf]    ; the chunk landed here
+    mov rdx, rax
+    call linnea_spill_write
+    test eax, eax
+    js .capture_fail
+    cmp qword [r12 + linnea_connection.req_body_rem], 0
+    jne .capture_more
+    ; the body is complete. Map it behind file_ptr/file_rem — where the head
+    ; send already knows to find a queued body — and only now open the
+    ; upstream, with the whole request in hand.
+    mov rdi, r12
+    call linnea_spill_finish
+    test eax, eax
+    js .capture_fail
+    jmp .proxy_connect_now
 .req_body_gone:
     lea r14, [reason_peer]
     mov r15d, reason_peer_len
@@ -1705,23 +1753,10 @@ linnea_uring_run:
     mov esi, 504               ; backend accepted but stopped reading
     jmp .proxy_fail
 .up_send_done:
-    ; more request body still to come from the client? Relay it a chunk at a
-    ; time — recv into in_buf, send that upstream, repeat — so an upload is
-    ; bounded by the buffer rather than having to fit in it.
-    cmp qword [r12 + linnea_connection.req_body_rem], 0
-    je .up_send_response
-    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_REQ_BODY
-    ; The rest of the body is relayed through up_buf, which is idle between
-    ; sending the request head and reading the response head. in_buf is left
-    ; exactly as the parser saw it — the head still readable for the access
-    ; log, in_len still consistent with head_len for the keep-alive
-    ; bookkeeping below, and the whole buffer available as a chunk window.
-    mov rdi, r12
-    lea rsi, [r12 + linnea_connection.up_buf]
-    mov edx, LINNEA_CONN_UP_BUF
-    call linnea_uring_arm_recv_buf
-    call linnea_uring_submit_now
-    jmp .wait
+    ; The request is always complete by the time any of it is sent: a body too
+    ; large to buffer was captured before the upstream was even connected, and
+    ; the head send drained it out of file_ptr/file_rem just above. So there is
+    ; never more of it to come here.
 .up_send_response:
     ; the whole request is out; read the response head back into up_buf
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_HEAD
@@ -2195,6 +2230,8 @@ linnea_uring_run:
     mov rdi, r12               ; and any upstream proxy exchange it owned
     call linnea_h2p_conn_close
 .close_file:
+    mov rdi, r12               ; a captured request body's fd; the mapping it
+    call linnea_spill_release  ; may have handed to file_base goes just below
     mov rdi, [r12 + linnea_connection.file_base]
     test rdi, rdi
     jz .close_no_file
