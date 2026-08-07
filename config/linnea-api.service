@@ -1,0 +1,45 @@
+# The HTTP/1.1 backend behind linnea's /api location: the upload checksummer
+# and the random-number endpoint the site's index page calls.
+#
+# One-time install:
+#   make && sudo make install
+#   sudo cp config/linnea-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now linnea-api
+# After a rebuild:
+#   make && sudo make install && sudo systemctl restart linnea-api
+#
+# It listens on 127.0.0.1 only and is reached exclusively through linnea, which
+# proxies /api to it. Nothing outside the box can talk to it directly, and it
+# needs no capabilities: port 7700 is unprivileged.
+#
+# PrivateTmp gives it a /tmp of its own, which is where an upload lives for the
+# few moments between arriving and being hashed. It deletes each one itself; the
+# private /tmp means even a crash mid-upload leaves nothing in the real /tmp.
+
+[Unit]
+Description=Linnea /api backend (upload checksum + random number)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=linnea
+Group=linnea
+WorkingDirectory=/home/linnea/linnea
+ExecStart=/usr/local/bin/linnea-api 7700
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=10
+
+# It binds a loopback port and writes to its own /tmp; it wants nothing else.
+CapabilityBoundingSet=
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

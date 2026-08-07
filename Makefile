@@ -219,6 +219,20 @@ rtxtest: $(RTXTEST_BIN)
 	./$(RTXTEST_BIN)
 
 # --- 0-RTT anti-replay strike-register unit test ---
+# The little HTTP/1.1 backend behind the site's /api location: it takes the
+# uploads the index page sends and answers with their size and checksum.
+API_BIN         = bin/linnea-api
+API_OBJS        = test/api/linnea_api.o src/lib/linnea_sha256.o src/lib/linnea_print.o \
+                  src/lib/linnea_string.o
+
+test/api/linnea_api.o: test/api/linnea_api.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(API_BIN): $(API_OBJS)
+	$(LD) -o $@ $^
+
+api: $(API_BIN)
+
 REPLAYTEST_BIN  = bin/linnea-replaytest
 REPLAYTEST_OBJS = test/quic/linnea_replaytest.o src/lib/linnea_quic_crypto.o \
                   src/lib/linnea_quic.o \
@@ -327,8 +341,9 @@ test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
 # `make` builds both bin/linnea and bin/linnea-probe. The systemd unit is a
 # one-time install; see config/linnea.service. linnea-probe is a plain CLI
 # client — no unit, just a binary on the PATH.
-install:
+install: $(API_BIN)
 	install -m 0755 $(BIN) /usr/local/bin/linnea
 	install -m 0755 $(PROBE_BIN) /usr/local/bin/linnea-probe
+	install -m 0755 $(API_BIN) /usr/local/bin/linnea-api
 
-.PHONY: all clean test selftest tlstest probe install
+.PHONY: all clean test selftest tlstest probe api install

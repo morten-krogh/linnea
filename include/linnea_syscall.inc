@@ -39,6 +39,7 @@ LINNEA_SYS_LISTEN    equ 50
 LINNEA_SYS_GETPEERNAME equ 52
 LINNEA_SYS_SETSOCKOPT equ 54
 LINNEA_SYS_GETPID    equ 39
+LINNEA_SYS_UNLINK    equ 87
 LINNEA_SYS_FORK      equ 57
 LINNEA_SYS_EXIT      equ 60
 LINNEA_SYS_IO_URING_SETUP equ 425
@@ -80,6 +81,7 @@ LINNEA_O_CLOEXEC     equ 0x80000
 ; O_TMPFILE is __O_TMPFILE | O_DIRECTORY: the path names the filesystem, and
 ; the file it creates there has no directory entry at all
 LINNEA_O_TMPFILE     equ 0x410000
+LINNEA_O_TRUNC       equ 0x200
 LINNEA_MODE_0600     equ 384  ; rw-------
 LINNEA_MODE_0644     equ 420  ; rw-r--r--
 LINNEA_PROT_READ     equ 1
