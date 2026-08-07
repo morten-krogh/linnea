@@ -5018,19 +5018,27 @@ h2p_hn_hsts_len  equ $ - h2p_hn_hsts
 ; plus the framing h2 carries itself
 h2p_d_conn:      db "connection"
 h2p_d_ka:        db "keep-alive"
-h2p_d_te:        db "transfer-encoding"
+h2p_d_tenc:      db "transfer-encoding"
 h2p_d_upg:       db "upgrade"
 h2p_d_trailer:   db "trailer"
 h2p_d_pauth:     db "proxy-authenticate"
 h2p_d_pconn:     db "proxy-connection"
+; TE is hop-by-hop like the rest, and on HTTP/2 it is more than that: RFC 9113
+; 8.2.2 makes a message carrying a connection-specific field malformed, TE
+; included unless its value is exactly "trailers". It was missing here while
+; every other name on the list was present, so a backend answering "TE: gzip"
+; had it relayed to the client — us emitting a message the peer is entitled to
+; reject. h1 has always dropped it and h3 does too; this is h2 catching up.
+h2p_d_te:        db "te"
 h2p_dropped_tab:
     dq h2p_d_conn, 10
     dq h2p_d_ka, 10
-    dq h2p_d_te, 17
+    dq h2p_d_tenc, 17
     dq h2p_d_upg, 7
     dq h2p_d_trailer, 7
     dq h2p_d_pauth, 18
     dq h2p_d_pconn, 16
+    dq h2p_d_te, 2
     dq 0, 0
 body_400: db "400 Bad Request", 10
 body_400_len equ $ - body_400

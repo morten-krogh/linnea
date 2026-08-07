@@ -2661,24 +2661,38 @@ PYEOF
     # a close-delimited body, 40000 bytes streamed past a single packet,
     # hop-by-hop fields stopped in both directions, a POST body forwarded, and
     # an unreachable upstream answered 502 rather than left silent.
+    # Its own log file, deliberately: these clients hang up hard (a raw socket
+    # closed the moment the field block is read, a QUIC client that stops
+    # answering), and the close_notify checks further down grep $LOG for the
+    # absence of "recv error". Sharing a log would have this block decide that.
+    rm -f test/linnea-h3p.log
+    start_server test/configs/tls-h3-proxy.json
+    h3p_pid=$SRV_PID
+    sleep 0.5
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
-        start_server test/configs/tls-h3-proxy.json
-        h3p_pid=$SRV_PID
-        sleep 0.5
         out=$(timeout 120 python3 test/quic/h3_proxy_test.py 47462 2>&1)
         [ "$out" = "OK" ]
         check "h3 proxies to an HTTP/1.1 upstream ($out)" $?
-        # the same paths over h2, which has proxied since Q86: the two must agree
-        b2=$(curl -s --http2 --max-time 6 --cacert test/tls/server.crt \
-                  https://localhost:47462/api/simple)
-        [ "$b2" = "backend body" ]
-        check "h3/h2 agree on the proxied body" $?
-        kill $h3p_pid 2>/dev/null
-        wait $h3p_pid 2>/dev/null
     else
         check "h3 proxying (skipped: aioquic/pylsqpack unavailable)" 0
-        check "h3/h2 agree on the proxied body (skipped)" 0
     fi
+    # the same path over h2, which has proxied since Q86: the two must agree
+    b2=$(curl -s --http2 --max-time 6 --cacert test/tls/server.crt \
+              https://localhost:47462/api/simple)
+    [ "$b2" = "backend body" ]
+    check "h3/h2 agree on the proxied body" $?
+
+    # RFC 9110 7.6.1 / RFC 9113 8.2.2: the backend's connection fields describe
+    # its connection to us, and a message carrying one is malformed on h2. Six
+    # names were dropped and TE was not — the one a backend is most likely to
+    # send back for an ordinary reason — so the same answer travelled
+    # differently over h1 (which drops it) and h2. Checked by decoding the
+    # field block: a substring search finds "te" inside "content-length".
+    timeout 60 python3 test/tls/h2_proxy_hop_by_hop.py test/tls/server.crt 47462 \
+        >/dev/null 2>&1
+    check "h2 does not relay hop-by-hop response fields" $?
+    kill $h3p_pid 2>/dev/null
+    wait $h3p_pid 2>/dev/null
 
     # kTLS reports the peer's close_notify as -EIO rather than a 0-length
     # read, so an orderly shutdown must not be logged as a recv error.

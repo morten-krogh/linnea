@@ -1,5 +1,5 @@
 {
-  "log": "test/linnea.log",
+  "log": "test/linnea-h3p.log",
   "timeout": 5,
   "workers": 1,
   "max_body": 200000,
