@@ -368,17 +368,19 @@ linnea_uring_run:
     je .quic_next
     cmp qword [rdx + linnea_config_server.location_count], 0
     je .quic_next
-    ; the owner must be a PURE static vhost, like every h3 vhost (see the
-    ; registration loop below) — otherwise a mixed config could bind a QUIC
-    ; listener that no vhost ever registers on
+    ; The owner must be a vhost that h3 can actually serve, on the same terms as
+    ; the registration loop below — otherwise a mixed config could bind a QUIC
+    ; listener that no vhost ever registers on. h3 routes to locations now, so a
+    ; proxy location no longer disqualifies a vhost; only a redirect does, which
+    ; h3 has no way to express (QPACK emits no Location header).
     lea rcx, [rdx + linnea_config_server.locations]
     mov rax, [rdx + linnea_config_server.location_count]
     xor r9d, r9d
 .quic_owner_kinds:
     cmp r9, rax
     jae .quic_owner_ok
-    cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
-    jne .quic_next             ; proxy/redirect location: not an h3 owner
+    cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
+    je .quic_next              ; a redirect location: not an h3 owner
     add rcx, linnea_config_location_size
     inc r9
     jmp .quic_owner_kinds
@@ -414,23 +416,47 @@ linnea_uring_run:
     je .quic_vhost_next
     cmp word [rax + linnea_config_server.port], r13w
     jne .quic_vhost_next                                ; a vhost on another port
-    ; Only a PURE static vhost is served over h3: h3 has no location routing,
-    ; so a proxy or redirect location would resolve under the static root and
-    ; 404 — and Alt-Svc migration is per-origin, so a browser that switched
-    ; would break those paths with no fallback. Such a vhost keeps h1/h2.
+    ; A vhost with a REDIRECT location is still kept off h3: QPACK has no
+    ; Location header to emit, so a redirect could not be expressed, and
+    ; Alt-Svc migration is per-origin — a browser that switched would break
+    ; those paths with no fallback. Such a vhost keeps h1/h2, as before.
+    ;
+    ; A proxy location no longer disqualifies one. h3 routes to locations now,
+    ; and until it can reach an upstream those paths answer 502 rather than
+    ; resolving under a static root. Leaving such a vhost UNREGISTERED was the
+    ; worse failure by far: its h3 requests fell through to whichever vhost
+    ; owned the listener and were served from that one's document root, under
+    ; that one's certificate.
     lea rcx, [rax + linnea_config_server.locations]
     mov r8, [rax + linnea_config_server.location_count]
     xor r9d, r9d
 .quic_vhost_kinds:
     cmp r9, r8
-    jae .quic_vhost_static                              ; every location is a root
-    cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
-    jne .quic_vhost_next                                ; proxy/redirect: no h3
+    jae .quic_vhost_static
+    cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
+    je .quic_vhost_next                                 ; a redirect: no h3
     add rcx, linnea_config_location_size
     inc r9
     jmp .quic_vhost_kinds
 .quic_vhost_static:
-    lea rcx, [rax + linnea_config_server.locations]     ; the first (root) location
+    ; Register with the first ROOT location as the default. Every request
+    ; routes for itself now, so this only matters when routing is unavailable.
+    lea rcx, [rax + linnea_config_server.locations]
+    mov r8, [rax + linnea_config_server.location_count]
+    xor r9d, r9d
+.quic_vhost_root:
+    cmp r9, r8
+    jae .quic_vhost_add                                 ; none: register the first
+    cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    je .quic_vhost_add
+    add rcx, linnea_config_location_size
+    inc r9
+    jmp .quic_vhost_root
+.quic_vhost_add:
+    cmp r9, r8
+    jb .quic_vhost_have
+    lea rcx, [rax + linnea_config_server.locations]
+.quic_vhost_have:
     mov rdi, rax
     mov rsi, rcx
     call linnea_quic_add_vhost

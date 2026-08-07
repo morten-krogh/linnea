@@ -41,6 +41,9 @@ struc linnea_quic_vhost
     .hsts_ptr: resq 1               ; the server's Strict-Transport-Security
     .hsts_len: resq 1               ; value (len 0 = not sent)
     .nosniff:  resq 1               ; 1 = send X-Content-Type-Options
+    .srv:      resq 1               ; the config server*, so a request can be
+                                    ; routed to a location rather than served
+                                    ; under whichever root was registered
 endstruc
 
 ; Per-connection state lives in the pool slot cur_conn points at. CONNLEA loads
@@ -74,6 +77,7 @@ extern linnea_h3_build_431
 extern linnea_h3_build_421
 extern linnea_h3_read_headers
 extern linnea_h3_serve
+extern linnea_h3_srv
 extern linnea_h3_body_off
 extern linnea_h3_body_len
 extern linnea_qpack_ccontrol_ptr
@@ -406,6 +410,7 @@ linnea_quic_add_vhost:
     mov [rdx + linnea_quic_vhost.hsts_len], r8
     mov r8, [rdi + linnea_config_server.nosniff]
     mov [rdx + linnea_quic_vhost.nosniff], r8
+    mov [rdx + linnea_quic_vhost.srv], rdi
     inc qword [vhost_count]
 .av_full:
     xor eax, eax
@@ -2683,6 +2688,8 @@ linnea_quic_server_datagram:
     mov [linnea_log_acc_host_len], r10
     mov rsi, [rax + linnea_quic_vhost.root_ptr]
     mov rdx, [rax + linnea_quic_vhost.root_len]
+    mov r10, [rax + linnea_quic_vhost.srv]   ; route this request on its own
+    mov [linnea_h3_srv], r10                 ; vhost, not on the registered root
     ; this vhost's Cache-Control for the QPACK encoder (ptr 0 = none)
     mov r10, [rax + linnea_quic_vhost.cc_len]
     mov [linnea_qpack_ccontrol_len], r10

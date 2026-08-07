@@ -83,3 +83,4 @@ LINNEA_H3_INLINE_MAX   equ 1024
 ; this). Must not exceed the per-connection head buffer it is copied into
 ; (LINNEA_QUIC_TX_HDR in linnea_quic_conn.inc).
 LINNEA_H3_HEAD_MAX     equ 512
+LINNEA_H3_PATH_ROOT equ LINNEA_MAX_ROOT + 1   ; room for the root in front of the path

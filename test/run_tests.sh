@@ -908,6 +908,30 @@ else
     check "h3 io_uring tests (skipped: deps unavailable)" 0
 fi
 
+# h3 routes to locations. A vhost with a proxy location used to be barred from
+# h3 altogether, and when another vhost on the same port owned the listener its
+# requests were answered from THAT vhost's document root, under that vhost's
+# certificate — 404s over h3 for paths that served 200 over h2. The fixture is
+# that exact shape, with disjoint roots so the fall-through cannot pass quietly.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    rm -f test/linnea.log
+    start_server test/configs/tls-h3-mixed.json
+    mixed_pid=$SRV_PID
+    sleep 0.5
+    out=$(python3 test/quic/h3_locations_test.py 47461 2>&1)
+    [ "$out" = "OK" ]
+    check "h3 routes to locations: own root, longest prefix, 502 on proxy ($out)" $?
+    # the same paths over h2, which has always routed: the two must agree
+    body=$(curl -s --http2 --max-time 6 --cacert test/tls/server.crt \
+                https://localhost:47461/page.html)
+    case "$body" in *"subdirectory page"*) true ;; *) false ;; esac
+    check "h3/h2 agree on the mixed vhost's own root" $?
+    kill $mixed_pid 2>/dev/null
+    wait $mixed_pid 2>/dev/null
+else
+    check "h3 location routing (skipped: deps unavailable)" 0
+fi
+
 # Dual-stack IPv6: one AF_INET6 listener (host "::", IPV6_V6ONLY off) serves both
 # families. A full h3 GET must complete over native IPv6 (::1) AND over IPv4
 # (127.0.0.1) against that single listener — the native-v6 peer also exercises the

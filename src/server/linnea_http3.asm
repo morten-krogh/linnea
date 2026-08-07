@@ -5,6 +5,7 @@
 default rel
 
 %include "linnea_http3.inc"
+%include "linnea_config.inc"
 %include "linnea_hpack.inc"
 %include "linnea_syscall.inc"
 
@@ -14,6 +15,7 @@ global linnea_h3_build_431
 global linnea_h3_build_421
 global linnea_h3_build_response_head
 global linnea_h3_serve
+global linnea_h3_srv
 global linnea_h3_tx_cap
 
 extern linnea_hpack_req_check
@@ -31,7 +33,10 @@ extern linnea_qpack_send_validators
 extern linnea_qpack_crange_ptr
 extern linnea_qpack_crange_len
 extern linnea_qpack_cenc
+extern linnea_qpack_ccontrol_ptr
+extern linnea_qpack_ccontrol_len
 ; static-file resolution, shared with the HTTP/2 serve path
+extern linnea_config_match_location
 extern linnea_static_normalize
 extern linnea_static_open
 extern linnea_static_open_enc
@@ -58,6 +63,8 @@ body_404:      db "404 Not Found", 10
 body_404_len   equ $ - body_404
 body_400:      db "400 Bad Request", 10
 body_400_len   equ $ - body_400
+body_502:      db "502 Bad Gateway", 10
+body_502_len   equ $ - body_502
 body_405:      db "405 Method Not Allowed", 10
 body_405_len   equ $ - body_405
 proto_h3: db "HTTP/3"
@@ -73,6 +80,11 @@ section .bss
 fs_buf:   resb 768                    ; encoded response field section
 clen_buf: resb 20                     ; content-length as decimal ASCII
 h3_path_buf: resb 4096                ; root ++ decoded path ++ NUL
+h3_join:     resq 1                   ; where the joined root++path starts
+; The vhost's config server*, set by the caller before linnea_h3_serve so the
+; request can be routed to a location. Zero means "no routing": serve the root
+; the caller passed, which is what h3 did before it could route at all.
+linnea_h3_srv: resq 1
 ; The caller's flow-control allowance for one chunked response: the most stream
 ; bytes (head + body) the requesting client can accept, set by the QUIC server
 ; per request before linnea_h3_serve — 0 while another chunked response is in
@@ -503,20 +515,56 @@ linnea_h3_serve:
     cmp dword [rdi], 0x44414548      ; "HEAD", little-endian
     jne .resp_405
 .method_ok:
-    ; path buffer = root ++ (decoded path)
-    lea rdi, [h3_path_buf]
-    mov rcx, rdx                     ; root length (rsi = root ptr)
-    rep movsb
-    mov r13, rdi                     ; where the decoded path starts
+    ; The path is normalized at a fixed offset, leaving room in front of it for
+    ; a root that is not known yet: which root depends on which location the
+    ; path matches, so the join happens after the routing, not before it. Same
+    ; shape as h1 and h2, which have always reserved LINNEA_*_PATH_ROOT here.
     mov rsi, [rbx + linnea_h2_req.path_ptr]
     test rsi, rsi
     jz .bad                          ; no :path in the request
     mov rdx, [rbx + linnea_h2_req.path_len]
-    mov rdi, r13
+    lea rdi, [h3_path_buf + LINNEA_H3_PATH_ROOT]
     call linnea_static_normalize     ; rax = end ptr (0 = reject), r9 = dir flag
     test rax, rax
     jz .bad
     mov r14, rax                     ; end of the resolved path
+    mov r13, r9                      ; the directory flag, across the routing
+    ; --- routing ------------------------------------------------------
+    ; h3 used to be handed a document root and nothing else, so every path
+    ; resolved under one root and a vhost with any other kind of location was
+    ; kept off h3 entirely. It now matches locations by the same longest-prefix
+    ; rule as the other protocols, and the matched kind decides what happens.
+    mov rdi, [linnea_h3_srv]
+    test rdi, rdi
+    jz .join                         ; unrouted: the root the caller passed
+    lea rsi, [h3_path_buf + LINNEA_H3_PATH_ROOT]
+    mov rdx, r14
+    sub rdx, rsi
+    call linnea_config_match_location
+    test rax, rax
+    jz .notfound                     ; no location claims this path
+    cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    jne .not_static
+    ; Cache-Control belongs to the matched location, not to whichever location
+    ; happened to be registered with the vhost.
+    mov r10, [rax + linnea_config_location.cache_control_len]
+    mov [linnea_qpack_ccontrol_len], r10
+    lea r11, [rax + linnea_config_location.cache_control]
+    test r10, r10
+    jnz .cc_set
+    xor r11d, r11d
+.cc_set:
+    mov [linnea_qpack_ccontrol_ptr], r11
+    lea rsi, [rax + linnea_config_location.root]
+    mov rdx, [rax + linnea_config_location.root_len]
+.join:
+    ; the root goes immediately in front of the path, ending where it begins
+    lea rdi, [h3_path_buf + LINNEA_H3_PATH_ROOT]
+    sub rdi, rdx
+    mov [h3_join], rdi
+    mov rcx, rdx
+    rep movsb                        ; rsi = root, rdi lands on the path
+    mov r9, r13                      ; the directory flag again
     test r9, r9
     jz .noindex
     mov rdi, r14                     ; a directory: serve index.html from it
@@ -533,7 +581,7 @@ linnea_h3_serve:
     ; open the file — negotiating a pre-compressed variant when the client's
     ; Accept-Encoding allows one (open_enc writes the suffix and NUL at r14;
     ; the MIME lookup below keeps using the name before it)
-    lea rdi, [h3_path_buf]
+    mov rdi, [h3_join]
     mov rsi, r14
     mov rdx, [rbx + linnea_h2_req.ae_ptr]
     mov rcx, [rbx + linnea_h2_req.ae_len]
@@ -811,6 +859,19 @@ linnea_h3_serve:
     mov ecx, txt_plain_len
     lea r8, [body_503]
     mov r9d, body_503_len
+    call linnea_h3_build_response
+    jmp .sret
+.not_static:
+    ; A proxy location, which h3 cannot serve yet. Answering 502 is the honest
+    ; placeholder: the route exists and is ours, we simply cannot reach the
+    ; upstream over this protocol. Redirect locations never get here — a vhost
+    ; that has one is still kept off h3 by the registration.
+    mov rdi, r12
+    mov esi, 502
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_502]
+    mov r9d, body_502_len
     call linnea_h3_build_response
     jmp .sret
 .notfound:
