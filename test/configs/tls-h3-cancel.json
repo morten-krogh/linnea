@@ -1,0 +1,25 @@
+{
+  "log": "test/linnea-h3c.log",
+  "timeout": 5,
+  "workers": 1,
+  "max_upstream": 1,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 47463,
+      "hostname": "localhost",
+      "cert": "test/tls/server.crt",
+      "key": "test/tls/server.key",
+      "locations": [
+        {
+          "prefix": "/api",
+          "proxy": "127.0.0.1:47100"
+        },
+        {
+          "prefix": "/",
+          "root": "test/www"
+        }
+      ]
+    }
+  ]
+}

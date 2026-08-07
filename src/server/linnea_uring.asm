@@ -80,6 +80,9 @@ extern linnea_h3_proxy_body
 extern linnea_h3_proxy_deliver
 extern linnea_h3_proxy_fail
 extern linnea_h3_proxy_arm_hook
+extern linnea_h3_proxy_cancel
+extern linnea_h3_cancel_hook
+extern linnea_h3_proxy_release
 extern linnea_h3_proxy_hook
 extern linnea_http_proxy_log
 extern linnea_error_exit
@@ -331,6 +334,8 @@ linnea_uring_run:
     mov [linnea_h3_proxy_arm_hook], rax
     lea rax, [linnea_h3_proxy_start]   ; ...and the serve path is told where the
     mov [linnea_h3_proxy_hook], rax    ; upstream machinery lives
+    lea rax, [linnea_h3_proxy_cancel]  ; ...and the QUIC side how to drop a leg
+    mov [linnea_h3_cancel_hook], rax   ; whose stream is gone
 
     mov edi, LINNEA_URING_ENTRIES
     lea rsi, [ring]
@@ -1806,6 +1811,8 @@ linnea_uring_run:
     cmp ecx, [r12 + linnea_connection.gen]   ; this slot: the connection it
     jne .stale_completion      ; belonged to is gone, and the slot may now
                                ; be serving someone else
+    cmp qword [r12 + linnea_connection.h3_cancel], 0
+    jne .h3_leg_reap           ; the stream it answers is gone
     test r15d, r15d
     jz .connect_ok
     cmp r15d, -LINNEA_ECANCELED
@@ -1842,6 +1849,16 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 
+; An upstream leg whose stream was cancelled, or whose whole QUIC connection
+; went away, while this operation was in flight. The kernel has finished with
+; the buffer now — that is the whole reason the free waited for this completion
+; rather than happening at the cancel — so the leg can go. Nothing is sent:
+; there is no longer a stream to send it on.
+.h3_leg_reap:
+    mov rdi, r12
+    call linnea_h3_proxy_release
+    jmp .wait
+
 ; --- upstream send completion: r15d = bytes or -errno ------------------
 .on_up_send:
     mov rdi, r13
@@ -1851,6 +1868,8 @@ linnea_uring_run:
     cmp ecx, [r12 + linnea_connection.gen]   ; this slot: the connection it
     jne .stale_completion      ; belonged to is gone, and the slot may now
                                ; be serving someone else
+    cmp qword [r12 + linnea_connection.h3_cancel], 0
+    jne .h3_leg_reap           ; the stream it answers is gone
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
     je .tunnel_up_send
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
@@ -1906,6 +1925,8 @@ linnea_uring_run:
     cmp ecx, [r12 + linnea_connection.gen]   ; this slot: the connection it
     jne .stale_completion      ; belonged to is gone, and the slot may now
                                ; be serving someone else
+    cmp qword [r12 + linnea_connection.h3_cancel], 0
+    jne .h3_leg_reap           ; the stream it answers is gone
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
     je .tunnel_up_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING

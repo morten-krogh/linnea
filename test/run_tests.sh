@@ -2694,6 +2694,29 @@ PYEOF
     kill $h3p_pid 2>/dev/null
     wait $h3p_pid 2>/dev/null
 
+    # A cancelled h3 request must let its upstream leg go rather than run it to
+    # completion. Dropping the answer at delivery was always correct, but the
+    # leg held a connection slot and an upstream socket for as long as the
+    # backend took — one of each per abandoned request. The fixture sets
+    # max_upstream to 1, so a leg that was not released blocks the next proxied
+    # request with a 503; that is the observable, and it is checked for a reset
+    # STREAM and a closed CONNECTION separately, since they reach the leg by
+    # different paths. The third case keeps the fix honest: a leg nobody
+    # cancelled must STILL hold its slot.
+    if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+        rm -f test/linnea-h3c.log
+        start_server test/configs/tls-h3-cancel.json
+        h3c_pid=$SRV_PID
+        sleep 0.5
+        out=$(timeout 120 python3 test/quic/h3_cancel_test.py 47463 2>&1)
+        [ "$out" = "OK" ]
+        check "h3 cancel releases the upstream leg ($out)" $?
+        kill $h3c_pid 2>/dev/null
+        wait $h3c_pid 2>/dev/null
+    else
+        check "h3 cancel releases the upstream leg (skipped: deps unavailable)" 0
+    fi
+
     # kTLS reports the peer's close_notify as -EIO rather than a 0-length
     # read, so an orderly shutdown must not be logged as a recv error.
     curl -s --max-time 5 --cacert $CA $U/hello.txt >/dev/null

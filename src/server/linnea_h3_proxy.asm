@@ -43,7 +43,9 @@ global linnea_h3_proxy_body
 global linnea_h3_proxy_deliver
 global linnea_h3_proxy_fail
 global linnea_h3_proxy_release
+global linnea_h3_proxy_cancel
 
+extern linnea_connection_at
 extern linnea_connection_alloc
 extern linnea_connection_free
 extern linnea_upstream_open
@@ -126,6 +128,9 @@ body_413:      db "413 Content Too Large", 10
 body_413_len   equ $ - body_413
 
 section .bss
+; Legs in flight. Only so that a QUIC connection closing on a server that
+; proxies nothing over h3 — the usual case — can skip the pool walk entirely.
+h3_legs_live: resq 1
 num_buf:  resb 24
 ; The response head as it goes out: the HTTP/3 HEADERS frame and the DATA frame
 ; header. It lives only for the length of one delivery — the loop is
@@ -174,6 +179,8 @@ linnea_h3_proxy_start:
     ; Claim it as an h3 leg BEFORE anything can fail: every teardown path from
     ; here on tests .h3_owner to know it must not touch a client socket.
     mov qword [r12 + linnea_connection.h3_owner], 1
+    inc qword [h3_legs_live]         ; counted for exactly as long as that is set
+    mov qword [r12 + linnea_connection.h3_cancel], 0
     mov dword [r12 + linnea_connection.fd], -1        ; no client socket at all
     mov [r12 + linnea_connection.h3_qidx], r13
     mov [r12 + linnea_connection.h3_qgen], r14
@@ -380,12 +387,12 @@ linnea_h3_proxy_start:
     pop rbx
     ret
 
-; .st_drop(rdi = leg) — give a leg back before it was ever armed. No socket is
-; open yet on any path that reaches here, so this is only the slot.
+; .st_drop(rdi = leg) — give a leg back before it was ever armed. The ordinary
+; release does exactly the right thing here: no socket is open yet on any path
+; that reaches this, so it closes nothing, and going through it is what keeps
+; the live-leg count in one place rather than two.
 .st_drop:
-    mov qword [rdi + linnea_connection.h3_owner], 0
-    mov qword [rdi + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
-    jmp linnea_connection_free
+    jmp linnea_h3_proxy_release
 
 ; .lg_park(rdi = leg, rsi = text, rdx = its length, ecx = offset in in_buf,
 ;   r8d = the room there) -> rax = the length actually kept.
@@ -1079,6 +1086,80 @@ linnea_h3_proxy_fail:
     pop rbx
     ret
 
+; linnea_h3_proxy_cancel(rdi = QUIC conn index, rsi = its connection ID,
+;   rdx = stream id, or -1 for every stream on that connection)
+; Nobody is waiting for these answers any more — the peer reset the stream, or
+; the whole connection has gone. Without this the leg ran to completion and its
+; answer was dropped at delivery: correct, but it held a connection slot and an
+; upstream socket for as long as the backend took, and a client that cancels a
+; page's worth of requests holds one of each per request.
+;
+; The leg cannot be freed here. It has an io_uring operation in flight and the
+; kernel owns its buffer until that completes, so freeing now would hand the
+; buffer to a new connection while the kernel was still writing into it. Shut
+; the socket down instead — which is what makes the completion arrive at once
+; rather than whenever the backend finishes — and mark the leg; the completion
+; frees it. The same bargain .h2_closing makes on the client side.
+linnea_h3_proxy_cancel:
+    ; Every QUIC connection that closes comes through here, and most servers
+    ; proxy nothing over h3 at all — so the pool walk below is skipped outright
+    ; unless a leg actually exists. Without this a connection close paid for a
+    ; max_connections-long scan to find nothing, on every close.
+    cmp qword [h3_legs_live], 0
+    je .cn_none
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov r13, rdi                     ; quic conn index
+    mov r14, rsi                     ; its connection id
+    mov r15, rdx                     ; stream id, or -1 for all of them
+    xor ebp, ebp                     ; pool index
+    lea rax, [linnea_config_instance]
+    mov rbx, [rax + linnea_config.max_connections]
+.cn_slot:
+    cmp rbp, rbx
+    jae .cn_done
+    mov rdi, rbp
+    call linnea_connection_at
+    mov r12, rax
+    cmp qword [r12 + linnea_connection.in_use], 0
+    je .cn_next
+    cmp qword [r12 + linnea_connection.h3_owner], 0
+    je .cn_next                      ; an ordinary client connection
+    cmp qword [r12 + linnea_connection.h3_cancel], 0
+    jne .cn_next                     ; already on its way out
+    cmp [r12 + linnea_connection.h3_qidx], r13
+    jne .cn_next
+    cmp [r12 + linnea_connection.h3_qgen], r14
+    jne .cn_next                     ; a leg of an earlier incarnation
+    cmp r15, -1
+    je .cn_hit                       ; every stream of this connection
+    cmp [r12 + linnea_connection.h3_sid], r15
+    jne .cn_next
+.cn_hit:
+    mov qword [r12 + linnea_connection.h3_cancel], 1
+    mov edi, [r12 + linnea_connection.up_fd]
+    cmp edi, -1
+    je .cn_next                      ; nothing open yet; the completion still comes
+    mov esi, 2                       ; SHUT_RDWR
+    mov eax, LINNEA_SYS_SHUTDOWN
+    syscall
+.cn_next:
+    inc rbp
+    jmp .cn_slot
+.cn_done:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+.cn_none:
+    ret
+
 ; linnea_h3_proxy_release(rdi = leg) — close the upstream socket, drop the
 ; capture file and give the connection slot back. Nothing here is armed, so
 ; there is no in-flight operation to wait for: every caller reaches this from
@@ -1102,7 +1183,13 @@ linnea_h3_proxy_release:
     mov qword [rbx + linnea_connection.file_size], 0
     mov qword [rbx + linnea_connection.file_rem], 0
     mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    cmp qword [rbx + linnea_connection.h3_owner], 0
+    je .rl_counted                   ; released twice: give the count back once
+    dec qword [h3_legs_live]
+.rl_counted:
     mov qword [rbx + linnea_connection.h3_owner], 0
+    mov qword [rbx + linnea_connection.h3_cancel], 0   ; not a leg awaiting a
+                                                       ; reap any more either
     mov rdi, rbx
     call linnea_connection_free
     pop rbx

@@ -152,6 +152,14 @@ struc linnea_connection
     ; holds it now. Zero .h3_owner means an ordinary client-facing connection,
     ; which is what every path outside the h3 proxy tests for.
     .h3_owner:      resq 1         ; 1 = this leg answers an HTTP/3 stream
+    ; Nobody is waiting for this answer any more: the peer cancelled the stream,
+    ; or its whole connection is gone. The leg cannot simply be freed — an
+    ; io_uring operation is in flight and the kernel owns its buffer until that
+    ; completes, so freeing now would let it write into a recycled connection.
+    ; The socket is shut down instead (which makes the completion prompt) and
+    ; this is set; whichever completion arrives next does the freeing and sends
+    ; nothing. Same shape as .h2_closing on the client side.
+    .h3_cancel:     resq 1
     .h3_qidx:       resq 1         ; the QUIC connection's pool index
     .h3_qgen:       resq 1         ; its generation when the leg was started
     .h3_sid:        resq 1         ; the request stream to answer

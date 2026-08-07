@@ -85,6 +85,7 @@ global linnea_h3d_base
 global linnea_h3d_size
 global linnea_h3d_foff
 global linnea_h3d_flen
+global linnea_h3_cancel_hook
 
 extern linnea_h3_build_431
 extern linnea_h3_build_421
@@ -299,6 +300,12 @@ linnea_h3d_base: resq 1
 linnea_h3d_size: resq 1
 linnea_h3d_foff: resq 1
 linnea_h3d_flen: resq 1
+; Called with (rdi = conn index, rsi = its connection id, rdx = stream id or -1)
+; when nobody is waiting for a proxied answer any more, so the upstream leg can
+; be dropped instead of running to completion. A pointer rather than a direct
+; call, for the same reason the serve path takes one: the QUIC server has to
+; stay linkable without the upstream machinery behind it. 0 = no legs exist.
+linnea_h3_cancel_hook: resq 1
 s_ini_pn:    resq 1                   ; the Initial packet number being reassembled
 s_ack_elicit: resq 1                  ; 1 when the 1-RTT packet in hand must be acked
 s_pn_before:  resq 1                  ; conn.pn_1rtt before we processed it, so the
@@ -5375,6 +5382,18 @@ tx_abort:
     push r13
     push r14
     mov rbx, rdi
+    ; Every proxied request still in flight for this connection is owed to a
+    ; stream that no longer exists. This is the bigger of the two leaks the
+    ; cancel closes: a browser closing a tab takes a page's worth of requests
+    ; with it, and each one held a connection slot and an upstream socket until
+    ; the backend answered. -1 means every stream, not one.
+    cmp qword [linnea_h3_cancel_hook], 0
+    je .ta_no_legs
+    movzx edi, byte [rbx + linnea_quic_conn.scid + 1]
+    mov rsi, [rbx + linnea_quic_conn.scid]
+    mov rdx, -1
+    call [linnea_h3_cancel_hook]
+.ta_no_legs:
     lea r13, [rbx + linnea_quic_conn.tx_streams]
     xor r14d, r14d
 .ta_each:
@@ -5528,6 +5547,17 @@ reset_teardown:
     mov rbx, rdi                      ; conn
     mov r13, rsi                      ; stream id
     mov r15, -1                       ; final size (-1 = no active response to reset)
+    ; A proxied request for this stream has an upstream exchange in flight that
+    ; nobody wants the answer to any more. Dropping it at delivery is correct
+    ; but leaves the leg holding a connection slot and an upstream socket for as
+    ; long as the backend takes; this ends it now.
+    cmp qword [linnea_h3_cancel_hook], 0
+    je .rt_no_leg
+    movzx edi, byte [rbx + linnea_quic_conn.scid + 1]   ; the pool index
+    mov rsi, [rbx + linnea_quic_conn.scid]              ; and the incarnation
+    mov rdx, r13
+    call [linnea_h3_cancel_hook]
+.rt_no_leg:
     ; remember the id: a request whose frames are still arriving must not be
     ; served after its cancel (see .rst_ids)
     mov rax, [rbx + linnea_quic_conn.rst_cursor]
