@@ -12,6 +12,7 @@ extern linnea_qpack_decode
 section .bss
 inbuf:    resb 8192
 scratch:  resb 8192
+hbuf:     resb 8192
 req:      resb linnea_h2_req_size
 
 section .text
@@ -35,6 +36,13 @@ _start:
     mov [req + linnea_h2_req.scratch], rax
     lea rax, [scratch + 8192]
     mov [req + linnea_h2_req.scratch_end], rax
+    ; arm the proxy header rebuild, so the decode also produces the h1 lines an
+    ; upstream would be sent — the same shared path h2 and h3 both rely on
+    lea rax, [hbuf]
+    mov [req + linnea_h2_req.hb_start], rax
+    mov [req + linnea_h2_req.hb_cur], rax
+    lea rax, [hbuf + 8192]
+    mov [req + linnea_h2_req.hb_end], rax
     ; decode
     lea rdi, [inbuf]
     mov rsi, r12
@@ -55,6 +63,17 @@ _start:
     mov rdi, [req + linnea_h2_req.auth_ptr]
     mov rsi, [req + linnea_h2_req.auth_len]
     call .putline
+    ; then the rebuilt forwardable headers, verbatim (they carry their own CRLFs)
+    mov rsi, [req + linnea_h2_req.hb_cur]
+    lea rdi, [hbuf]
+    sub rsi, rdi                     ; bytes the rebuild produced
+    jbe .done                        ; none, or parked past the end on overflow
+    mov rdx, rsi
+    lea rsi, [hbuf]
+    mov eax, LINNEA_SYS_WRITE
+    mov edi, 1
+    syscall
+.done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall

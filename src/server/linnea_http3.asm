@@ -16,6 +16,7 @@ global linnea_h3_build_421
 global linnea_h3_build_response_head
 global linnea_h3_serve
 global linnea_h3_srv
+global h3_hdrs_buf
 global linnea_h3_tx_cap
 
 extern linnea_hpack_req_check
@@ -85,6 +86,10 @@ h3_join:     resq 1                   ; where the joined root++path starts
 ; request can be routed to a location. Zero means "no routing": serve the root
 ; the caller passed, which is what h3 did before it could route at all.
 linnea_h3_srv: resq 1
+; Where emit_field rebuilds the client's forwardable headers as h1 lines, for
+; the request we send upstream. Same size as h2's, and overflow is detectable:
+; the rebuild parks hb_cur past hb_end rather than writing past it.
+h3_hdrs_buf: resb LINNEA_H3_HDRS_BUF
 ; The caller's flow-control allowance for one chunked response: the most stream
 ; bytes (head + body) the requesting client can accept, set by the QUIC server
 ; per request before linnea_h3_serve — 0 while another chunked response is in

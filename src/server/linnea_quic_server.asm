@@ -78,6 +78,7 @@ extern linnea_h3_build_421
 extern linnea_h3_read_headers
 extern linnea_h3_serve
 extern linnea_h3_srv
+extern h3_hdrs_buf
 extern linnea_h3_body_off
 extern linnea_h3_body_len
 extern linnea_qpack_ccontrol_ptr
@@ -2421,6 +2422,16 @@ linnea_quic_server_datagram:
     mov [req + linnea_h2_req.scratch], rax
     lea rax, [h3scratch + LINNEA_HPACK_MAX_LISTSIZE]
     mov [req + linnea_h2_req.scratch_end], rax
+    ; Arm the header rebuild emit_field already performs for h2: with hb_start
+    ; set, every forwardable field is appended as an h1 "name: value" line,
+    ; hop-by-hop and managed names stripped. h3 never set it, which is why a
+    ; proxied h3 request had nowhere to keep a header the request struct has no
+    ; field for -- an X-Filename or an Authorization simply had no way through.
+    lea rax, [h3_hdrs_buf]
+    mov [req + linnea_h2_req.hb_start], rax
+    mov [req + linnea_h2_req.hb_cur], rax
+    lea rax, [h3_hdrs_buf + LINNEA_H3_HDRS_BUF]
+    mov [req + linnea_h2_req.hb_end], rax
     ; parse the HTTP/3 request (HEADERS frame -> QPACK decode)
     mov rdi, [s_sdata]
     mov rsi, [s_slen]
