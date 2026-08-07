@@ -7,6 +7,7 @@
       "cert": "/home/linnea/certs/linnea.amberbio.com/fullchain.pem", "key": "/home/linnea/certs/linnea.amberbio.com/privkey.pem",
       "hsts": "max-age=86400", "nosniff": 1,
       "locations": [
+        { "prefix": "/api", "proxy": "127.0.0.1:7700" },
         { "prefix": "/", "root": "/home/linnea/www/linnea" }
       ]
     },
