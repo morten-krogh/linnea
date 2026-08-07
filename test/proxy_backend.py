@@ -164,6 +164,16 @@ def respond(conn, head, body, extra=b""):
                      b"eof delimited body")
     elif path.endswith(b"/truncated"):
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort")
+    elif path.endswith(b"/linger"):
+        # A backend that takes long enough for the client to give up first, but
+        # not so long that it trips a proxy timeout. What that leaves behind is
+        # an upstream exchange whose answer nobody is waiting for any more,
+        # which the proxy has to notice rather than send to whichever
+        # connection holds that slot by then.
+        time.sleep(1.5)
+        payload = b"linger body"
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
+                     % (len(payload), payload))
     elif path.endswith(b"/big"):
         # A body larger than any single relay buffer, to exercise the loop.
         payload = b"x" * 40000

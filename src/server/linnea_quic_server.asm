@@ -72,12 +72,28 @@ global linnea_h3_altsvc
 global linnea_h3_altsvc_len
 global linnea_h3_server
 global linnea_h3_advert
+; delivering a proxied HTTP/3 response, which completes long after the datagram
+; that carried the request: the parameter block and the entry point that reads
+; it (see linnea_h3_proxy.asm)
+global linnea_quic_h3_deliver
+global linnea_h3d_qidx
+global linnea_h3d_qgen
+global linnea_h3d_sid
+global linnea_h3d_hdr
+global linnea_h3d_hlen
+global linnea_h3d_base
+global linnea_h3d_size
+global linnea_h3d_foff
+global linnea_h3d_flen
 
 extern linnea_h3_build_431
 extern linnea_h3_build_421
 extern linnea_h3_read_headers
 extern linnea_h3_serve
 extern linnea_h3_srv
+extern linnea_h3_owner_idx
+extern linnea_h3_owner_gen
+extern linnea_h3_owner_sid
 extern h3_hdrs_buf
 extern linnea_h3_body_off
 extern linnea_h3_body_len
@@ -270,6 +286,19 @@ s_tp_off:    resq 1                   ; a chunk's stream offset, held across the
 s_tp_len:    resq 1                   ; and its length, for the in-flight record
 s_prio_u:    resq 1                   ; a request's parsed urgency (0-7)
 s_prio_i:    resq 1                   ; and incremental flag (0/1), for the slot fill
+; One proxied response, handed over from the upstream leg's completion (see
+; linnea_quic_h3_deliver). Which connection and stream it answers, then the
+; response itself: a head held here (a canned error), or a mapping whose
+; foff/flen already span head and body together.
+linnea_h3d_qidx: resq 1
+linnea_h3d_qgen: resq 1               ; the connection ID that incarnation issued
+linnea_h3d_sid:  resq 1
+linnea_h3d_hdr:  resq 1
+linnea_h3d_hlen: resq 1
+linnea_h3d_base: resq 1
+linnea_h3d_size: resq 1
+linnea_h3d_foff: resq 1
+linnea_h3d_flen: resq 1
 s_ini_pn:    resq 1                   ; the Initial packet number being reassembled
 s_ack_elicit: resq 1                  ; 1 when the 1-RTT packet in hand must be acked
 s_pn_before:  resq 1                  ; conn.pn_1rtt before we processed it, so the
@@ -2745,8 +2774,21 @@ linnea_quic_server_datagram:
     jnz .tx_cap_scan
 .tx_cap_set:
     mov [linnea_h3_tx_cap], r11
+    ; who the answer is owed to, for a request that turns out to be proxied:
+    ; the connection's slot, the connection ID that authenticates this
+    ; incarnation of it, and the stream
+    mov r10, [cur_conn]
+    mov r11, [r10 + linnea_quic_conn.scid]
+    mov [linnea_h3_owner_gen], r11
+    movzx r11d, byte [r10 + linnea_quic_conn.scid + 1]  ; the id carries the
+    mov [linnea_h3_owner_idx], r11                      ; pool index in byte 1
+    mov r11, [s_sid]
+    mov [linnea_h3_owner_sid], r11
     call linnea_h3_serve             ; rax = h3 response length (or the head's);
-                                     ; r9 != 0: chunked — r8/r9 = file mapping
+                                     ; r9 != 0: chunked — r8/r9 = file mapping;
+                                     ; rax = -1: proxied, and parked
+    cmp rax, -1
+    je .serve_parked
     test r9, r9
     jnz .serve_large
     lea rdx, [rax + rbx]             ; STREAM frame length
@@ -2788,35 +2830,7 @@ linnea_quic_server_datagram:
     pop rbx
     pop rax
 .sl_prio_pending:
-    ; A PRIORITY_UPDATE that overtook this request wins over the header it came
-    ; with: the header is the priority the request was born with, the update is
-    ; the client changing its mind afterwards (RFC 9218 7). Consume the entry —
-    ; it has done its job, and leaving it would re-apply to a later stream that
-    ; happened to reuse the id, which cannot occur but costs nothing to rule out.
-    push rax
-    push rbx
-    mov rbx, [cur_conn]
-    mov rdx, [s_sid]
-    inc rdx                           ; stored as id + 1
-    xor ecx, ecx
-.sl_pp_scan:
-    cmp [rbx + linnea_quic_conn.pu_sid + rcx * 8], rdx
-    je .sl_pp_hit
-    inc ecx
-    cmp ecx, LINNEA_QUIC_PU_PEND
-    jb .sl_pp_scan
-    jmp .sl_pp_done
-.sl_pp_hit:
-    mov qword [rbx + linnea_quic_conn.pu_sid + rcx * 8], 0
-    mov rax, [rbx + linnea_quic_conn.pu_val + rcx * 8]
-    mov rdx, rax
-    and rdx, 0xff
-    mov [s_prio_u], rdx
-    shr rax, 8
-    mov [s_prio_i], rax
-.sl_pp_done:
-    pop rbx
-    pop rax
+    call .pu_take
 .sl_find:
     mov rcx, [cur_conn]
     lea rdx, [rcx + linnea_quic_conn.tx_streams]
@@ -2862,6 +2876,113 @@ linnea_quic_server_datagram:
     xor esi, esi                      ; nothing of the body was sent
     call tx_reset_stream
     jmp .stream_scan
+
+.serve_parked:
+    ; The request went to a proxy upstream and its answer will arrive on an
+    ; io_uring completion. Claim a response-stream slot for it NOW, marked
+    ; pending: it is what a retransmitted request finds instead of being served
+    ; a second time, what a cancel frees, and what the answer fills in when it
+    ; comes. The priority the client signalled is resolved here too, while the
+    ; request is still in hand, so the answer is scheduled against the
+    ; connection's other streams the moment it arrives.
+    mov qword [s_prio_u], 3           ; the RFC 9218 default: urgency 3,
+    mov qword [s_prio_i], 0           ; non-incremental
+    mov rdi, [req + linnea_h2_req.prio_ptr]
+    test rdi, rdi
+    jz .sp_prio_pending
+    mov rsi, [req + linnea_h2_req.prio_len]
+    call linnea_quic_parse_priority   ; rax = urgency, rdx = incremental
+    mov [s_prio_u], rax
+    mov [s_prio_i], rdx
+.sp_prio_pending:
+    call .pu_take
+    mov rcx, [cur_conn]
+    lea rdx, [rcx + linnea_quic_conn.tx_streams]
+    mov r10d, LINNEA_QUIC_TXSTREAMS
+.sp_scan:
+    cmp qword [rdx + linnea_quic_txstream.active], 0
+    je .sp_found
+    add rdx, linnea_quic_txstream_size
+    dec r10d
+    jnz .sp_scan
+    ; No slot, which tx_cap only fails to notice when every one is busy — the
+    ; same condition a large static response answers 503 to. Nothing is parked,
+    ; so the leg's answer will find no slot and be dropped; reset the stream so
+    ; the client learns now rather than waiting for a response we cannot place.
+    mov rdi, [s_sid]
+    xor esi, esi
+    mov edx, LINNEA_H3_ERR_REQ_REJECTED   ; not processed by us: safe to retry
+    call tx_reset_stream_code
+    jmp .stream_scan
+.sp_found:
+    mov qword [rdx + linnea_quic_txstream.base], 0
+    mov qword [rdx + linnea_quic_txstream.size], 0
+    mov qword [rdx + linnea_quic_txstream.foff], 0
+    mov qword [rdx + linnea_quic_txstream.flen], 0
+    mov qword [rdx + linnea_quic_txstream.hlen], 0
+    mov r10, [s_sid]
+    mov [rdx + linnea_quic_txstream.sid], r10
+    mov qword [rdx + linnea_quic_txstream.off], 0
+    mov qword [rdx + linnea_quic_txstream.inflight], 0
+    mov r10, [rcx + linnea_quic_conn.fc_stream_init]
+    mov [rdx + linnea_quic_txstream.fc_max], r10
+    mov r10, [s_prio_u]
+    mov [rdx + linnea_quic_txstream.urgency], r10
+    mov r10, [s_prio_i]
+    mov [rdx + linnea_quic_txstream.incremental], r10
+    mov qword [rdx + linnea_quic_txstream.pending], 1
+    mov qword [rdx + linnea_quic_txstream.active], 1
+    ; Nothing goes out on this stream now, but the request packet still has to
+    ; be acknowledged: the peer would otherwise retransmit it for as long as the
+    ; backend takes to answer.
+    lea rdi, [strm_pay]
+    CONNLEA rsi, rx_have
+    call linnea_quic_build_ack
+    test rax, rax
+    jz .stream_scan
+    lea rsi, [strm_pay]
+    mov [s_pl_ptr], rsi
+    mov [s_pl_len], rax
+    call emit_1rtt
+    jmp .stream_scan
+
+; .pu_take — a PRIORITY_UPDATE that overtook the request on [s_sid] wins over
+; the priority header it came with: the header is what the request was born
+; with, the update is the client changing its mind afterwards (RFC 9218 7).
+; Applies it to s_prio_u / s_prio_i and consumes the entry — it has done its
+; job, and leaving it would re-apply to a later stream that happened to reuse
+; the id, which cannot occur but costs nothing to rule out. Touches no register
+; the two slot-filling paths keep live.
+.pu_take:
+    push rax
+    push rcx
+    push rdx
+    push r10
+    mov r10, [cur_conn]
+    mov rdx, [s_sid]
+    inc rdx                           ; stored as id + 1
+    xor ecx, ecx
+.pt_scan:
+    cmp [r10 + linnea_quic_conn.pu_sid + rcx * 8], rdx
+    je .pt_hit
+    inc ecx
+    cmp ecx, LINNEA_QUIC_PU_PEND
+    jb .pt_scan
+    jmp .pt_done
+.pt_hit:
+    mov qword [r10 + linnea_quic_conn.pu_sid + rcx * 8], 0
+    mov rax, [r10 + linnea_quic_conn.pu_val + rcx * 8]
+    mov rdx, rax
+    and rdx, 0xff
+    mov [s_prio_u], rdx
+    shr rax, 8
+    mov [s_prio_i], rax
+.pt_done:
+    pop r10
+    pop rdx
+    pop rcx
+    pop rax
+    ret
 
 ; --- a client unidirectional stream: control, QPACK encoder/decoder or grease.
 ; A stream's type is the first varint, present only at offset 0, so a later frame
@@ -4995,6 +5116,8 @@ tx_pump:
 .tp_reap_each:
     cmp qword [rbp + linnea_quic_txstream.active], 0
     je .tp_reap_next
+    cmp qword [rbp + linnea_quic_txstream.pending], 0
+    jne .tp_reap_next                 ; claimed, but its response has not arrived
     mov rax, [rbp + linnea_quic_txstream.hlen]
     add rax, [rbp + linnea_quic_txstream.flen]
     cmp qword [rbp + linnea_quic_txstream.off], rax
@@ -5471,6 +5594,118 @@ reset_teardown:
 ; open response stream's mapping through tx_abort first.
 quic_tx_free_hook:
     jmp tx_abort
+
+; linnea_quic_h3_deliver(edi = UDP socket fd) -> rax = 1 the response is on its
+; way, 0 nobody is waiting for it any more (the connection is gone or the peer
+; cancelled the stream), -1 it could not be represented.
+; The answer to a proxied HTTP/3 request arrives long after the datagram that
+; carried the request — on the completion of the upstream exchange — so this is
+; the way in from outside a received packet: identify the connection, fill the
+; response-stream slot the request parked, and drive the pump, exactly as the
+; loss-recovery sweep does on the timer.
+; The parameter block below is the argument list; there are more of them than
+; registers, and they describe one response at a time (the loop is
+; single-threaded, and this runs to completion before anything else does).
+linnea_quic_h3_deliver:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbp, rsp
+    and rsp, -16                      ; The pump reaches emit_1rtt, whose AES-GCM
+                                      ; uses force-aligned SSE frames, and this is
+                                      ; entered from an upstream completion — a
+                                      ; call chain that keeps no alignment of its
+                                      ; own. Every other caller of the pump is a
+                                      ; loop entry point that happens to be
+                                      ; aligned; this one has to make it so.
+    mov r12d, edi                     ; the socket emit_1rtt sends on
+    mov rdi, [linnea_h3d_qidx]
+    call linnea_quic_conn_slot        ; rax = conn* if that slot is in use
+    test rax, rax
+    jz .hd_gone
+    mov rbx, rax
+    ; The slot may have been recycled while the backend was working. Our
+    ; connection ID authenticates the incarnation — its low bytes are the pool
+    ; index and the rest is random per connection — so comparing it is exactly
+    ; the generation check a connection pool would give us.
+    mov rcx, [linnea_h3d_qgen]
+    cmp [rbx + linnea_quic_conn.scid], rcx
+    jne .hd_gone
+    cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CLOSING
+    je .hd_gone                       ; it sends nothing but its retained close
+    ; the slot the request parked. Gone means the peer cancelled the stream
+    ; (reset_teardown freed it), which is an answer nobody wants any more.
+    xor r14d, r14d
+    lea r15, [rbx + linnea_quic_conn.tx_streams]
+    mov r13, [linnea_h3d_sid]
+.hd_find:
+    cmp qword [r15 + linnea_quic_txstream.pending], 0
+    je .hd_find_next
+    cmp qword [r15 + linnea_quic_txstream.sid], r13
+    je .hd_found
+.hd_find_next:
+    add r15, linnea_quic_txstream_size
+    inc r14d
+    cmp r14d, LINNEA_QUIC_TXSTREAMS
+    jb .hd_find
+    jmp .hd_gone
+.hd_found:
+    ; The head is either held in the slot (a canned error, which needs no file)
+    ; or lives at the front of the mapping with the body behind it (a relayed
+    ; response, whose head is too big for the slot's fixed hdr).
+    mov rax, [linnea_h3d_hlen]
+    cmp rax, LINNEA_QUIC_TX_HDR
+    ja .hd_toolong
+    mov [r15 + linnea_quic_txstream.hlen], rax
+    test rax, rax
+    jz .hd_nohdr
+    mov rcx, rax
+    mov rsi, [linnea_h3d_hdr]
+    lea rdi, [r15 + linnea_quic_txstream.hdr]
+    rep movsb
+.hd_nohdr:
+    mov rax, [linnea_h3d_base]
+    mov [r15 + linnea_quic_txstream.base], rax
+    mov rax, [linnea_h3d_size]
+    mov [r15 + linnea_quic_txstream.size], rax
+    mov rax, [linnea_h3d_foff]
+    mov [r15 + linnea_quic_txstream.foff], rax
+    mov rax, [linnea_h3d_flen]
+    mov [r15 + linnea_quic_txstream.flen], rax
+    mov qword [r15 + linnea_quic_txstream.off], 0
+    mov qword [r15 + linnea_quic_txstream.inflight], 0
+    mov rax, [rbx + linnea_quic_conn.fc_stream_init]  ; this stream's own window
+    mov [r15 + linnea_quic_txstream.fc_max], rax
+    mov qword [r15 + linnea_quic_txstream.pending], 0 ; it is a response now
+    mov [cur_conn], rbx
+    call tx_pump
+    mov eax, 1
+    jmp .hd_ret
+.hd_toolong:
+    ; unreachable: the caller bounds the head before it gets here. Free the slot
+    ; and end the stream rather than write past the slot's hdr into the next one.
+    mov qword [r15 + linnea_quic_txstream.pending], 0
+    mov qword [r15 + linnea_quic_txstream.active], 0
+    mov [cur_conn], rbx
+    mov rdi, r13
+    xor esi, esi                      ; nothing of it was ever sent
+    call tx_reset_stream
+    mov eax, -1
+    jmp .hd_ret
+.hd_gone:
+    xor eax, eax
+.hd_ret:
+    mov rsp, rbp
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; linnea_quic_server_rtx_sweep(edi = UDP socket fd) — one probe-timeout pass over
 ; every live connection. Any buffered 1-RTT packet unacknowledged past its probe

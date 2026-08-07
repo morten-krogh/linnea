@@ -239,6 +239,16 @@ endstruc
 ; its mapping is released the moment it is both fully sent and fully acknowledged.
 struc linnea_quic_txstream
     .active:   resq 1
+    ; The slot is claimed but has no response in it yet: the request went to a
+    ; proxy upstream and the answer arrives on a later io_uring completion. It
+    ; is claimed at once for two reasons. A retransmitted request finds it and
+    ; is acknowledged rather than served a second time — otherwise a loss burst
+    ; starts two upstream exchanges and answers one stream twice. And the peer
+    ; cancelling the stream frees it through the ordinary reset path, so the
+    ; response is dropped when it finally turns up. Nothing else may touch it:
+    ; the pump skips it (it has no bytes to send) and, without this flag, the
+    ; reaper would see a fully-sent unacknowledged-free stream and free it.
+    .pending:  resq 1
     .sid:      resq 1               ; the request stream being answered
     .base:     resq 1               ; the response file's mapping (munmap wants
     .size:     resq 1               ; base/size — always the WHOLE mapping)

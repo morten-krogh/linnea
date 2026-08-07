@@ -41,7 +41,6 @@ cert_list: resb 4096
 ; a minimal config server + root location, just enough for the vhost
 ; registration the real config parser would provide
 fake_srv:  resb linnea_config_server_size
-fake_loc:  resb linnea_config_location_size
 
 section .text
 _start:
@@ -70,14 +69,23 @@ _start:
     mov [fake_srv + linnea_config_server.cert_list], rax
     mov [fake_srv + linnea_config_server.cert_list_len], r13
     mov [fake_srv + linnea_config_server.key_priv], r14
-    lea rdi, [fake_loc + linnea_config_location.root]
+    ; The location is the server's own locations[0], not a loose struct beside
+    ; it. Since h3 routes by location (the vhost's config server is what it
+    ; matches against), a server declaring none has nothing for a request to
+    ; match and every path 404s — which is exactly what this harness did when
+    ; the two were kept apart.
+    lea rdi, [fake_srv + linnea_config_server.locations + linnea_config_location.root]
     lea rsi, [docroot]
     mov ecx, docroot_len
     rep movsb
-    mov qword [fake_loc + linnea_config_location.root_len], docroot_len
+    mov qword [fake_srv + linnea_config_server.locations + linnea_config_location.root_len], docroot_len
+    mov byte [fake_srv + linnea_config_server.locations + linnea_config_location.prefix], '/'
+    mov qword [fake_srv + linnea_config_server.locations + linnea_config_location.prefix_len], 1
+    mov qword [fake_srv + linnea_config_server.locations + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    mov qword [fake_srv + linnea_config_server.location_count], 1
     call linnea_quic_server_init
     lea rdi, [fake_srv]
-    lea rsi, [fake_loc]
+    lea rsi, [fake_srv + linnea_config_server.locations]
     call linnea_quic_add_vhost
     call linnea_quic_ticket_setup    ; session-ticket key for the NewSessionTicket
     ; udp socket bound to 127.0.0.1:47501

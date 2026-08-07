@@ -73,6 +73,14 @@ extern linnea_connection_active
 extern linnea_http_handle
 extern linnea_http_proxy_error
 extern linnea_http_proxy_head
+; an upstream leg owned by an HTTP/3 stream: the same completions, diverted
+extern linnea_h3_proxy_start
+extern linnea_h3_proxy_head
+extern linnea_h3_proxy_body
+extern linnea_h3_proxy_deliver
+extern linnea_h3_proxy_fail
+extern linnea_h3_proxy_arm_hook
+extern linnea_h3_proxy_hook
 extern linnea_http_proxy_log
 extern linnea_error_exit
 extern linnea_print_stderr
@@ -316,6 +324,13 @@ linnea_uring_run:
     mov [max_per_ip], rax
     mov rax, [rbx + linnea_config.max_upstream]
     mov [linnea_upstream_limit], rax
+    ; A proxied HTTP/3 request builds its upstream leg in linnea_h3_proxy.asm
+    ; and needs the connect queued; queuing an SQE is ours alone, so the module
+    ; is handed the one entry point it needs rather than the ring.
+    lea rax, [h3p_arm]
+    mov [linnea_h3_proxy_arm_hook], rax
+    lea rax, [linnea_h3_proxy_start]   ; ...and the serve path is told where the
+    mov [linnea_h3_proxy_hook], rax    ; upstream machinery lives
 
     mov edi, LINNEA_URING_ENTRIES
     lea rsi, [ring]
@@ -1809,10 +1824,21 @@ linnea_uring_run:
 
 ; give up on the upstream and answer the client instead; esi = 502 or 504
 .proxy_fail:
+    ; An HTTP/3 leg has no client socket to send on: its answer goes out as a
+    ; QUIC stream, and the leg is freed rather than kept for a keep-alive that
+    ; does not exist.
+    cmp qword [r12 + linnea_connection.h3_owner], 0
+    jne .h3_proxy_fail
     mov rdi, r12
     call linnea_http_proxy_error
     mov rdi, r12
     call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.h3_proxy_fail:
+    mov rdi, r12
+    mov edx, [quic_fd]
+    call linnea_h3_proxy_fail
     call linnea_uring_submit_now
     jmp .wait
 
@@ -1886,6 +1912,8 @@ linnea_uring_run:
     je .closing_u2c
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_RELAY
     je .relay_recv
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_H3BODY
+    je .h3_body_recv
     ; reading the response head
     test r15d, r15d
     jg .head_data
@@ -1904,6 +1932,8 @@ linnea_uring_run:
     mov eax, r15d
     add [r12 + linnea_connection.up_len], rax
     mov rdi, r12
+    cmp qword [r12 + linnea_connection.h3_owner], 0
+    jne .h3_head_parse
     call linnea_http_proxy_head
     cmp eax, LINNEA_HTTP_HEAD_READY
     je .head_ready
@@ -1927,6 +1957,86 @@ linnea_uring_run:
 .head_ready:
     mov rdi, r12               ; the rewritten head goes out to the client
     call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+
+; --- an HTTP/3 leg: the head is kept for the QPACK re-encode and the body is
+; captured whole before any of the response is sent, so there is no relay ---
+.h3_head_parse:
+    call linnea_h3_proxy_head
+    cmp eax, LINNEA_HTTP_HEAD_READY
+    je .h3_head_ready
+    test eax, eax
+    js .head_bad               ; malformed: 502, on the stream
+    mov rax, [r12 + linnea_connection.up_len]   ; incomplete: read more, unless
+    cmp rax, LINNEA_CONN_UP_BUF                 ; the head has filled the buffer
+    jae .head_bad
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.up_buf]
+    add rsi, rax
+    mov edx, LINNEA_CONN_UP_BUF
+    sub edx, eax
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.h3_head_ready:
+    ; Whatever arrived behind the head is the body's first bytes. up_buf stays
+    ; untouched from here — the response head has to survive until it is
+    ; re-encoded — so the capture reads into out_buf, which an h3 leg never
+    ; uses for anything else.
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.up_buf]
+    add rsi, [r12 + linnea_connection.h3_hlen]
+    mov rdx, [r12 + linnea_connection.up_len]
+    sub rdx, [r12 + linnea_connection.h3_hlen]
+    call linnea_h3_proxy_body
+    jmp .h3_body_verdict
+.h3_body_recv:
+    test r15d, r15d
+    jg .h3_body_data
+    jz .h3_body_eof
+    cmp r15d, -LINNEA_ECANCELED
+    je .h3_body_timeout
+    mov esi, 502
+    jmp .proxy_fail
+.h3_body_eof:
+    ; A close-delimited body ends exactly here; a counted one that is still
+    ; short was cut off, and half a response is not one we can send.
+    cmp qword [r12 + linnea_connection.body_rem], -1
+    jne .h3_body_short
+    mov qword [r12 + linnea_connection.body_rem], 0
+    jmp .h3_body_done
+.h3_body_short:
+    cmp qword [r12 + linnea_connection.body_rem], 0
+    je .h3_body_done
+    mov esi, 502
+    jmp .proxy_fail
+.h3_body_timeout:
+    mov esi, 504
+    jmp .proxy_fail
+.h3_body_data:
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.out_buf]
+    mov edx, r15d
+    call linnea_h3_proxy_body
+.h3_body_verdict:
+    cmp eax, 1
+    je .h3_body_done
+    test eax, eax
+    js .h3_body_fail
+    mov rdi, r12               ; more of it to come
+    lea rsi, [r12 + linnea_connection.out_buf]
+    mov edx, LINNEA_CONN_OUT_BUF
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.h3_body_fail:
+    mov esi, 502
+    jmp .proxy_fail
+.h3_body_done:
+    mov rdi, r12
+    mov esi, [quic_fd]
+    call linnea_h3_proxy_deliver
     call linnea_uring_submit_now
     jmp .wait
 
@@ -2954,6 +3064,15 @@ linnea_uring_arm_send_buf:
     pop r12
     pop rbx
     jmp linnea_uring_arm_link_timeout
+
+; h3p_arm(rdi = an upstream leg an HTTP/3 request just built) — the arm hook
+; linnea_h3_proxy.asm calls. Submitting at once matters: the leg was created
+; while a QUIC datagram was being processed, and nothing else on that path
+; publishes the SQ, so the connect would otherwise sit unqueued until some
+; unrelated connection happened to submit.
+h3p_arm:
+    call linnea_uring_arm_connect
+    jmp linnea_uring_submit_now
 
 ; linnea_uring_arm_connect(rdi=connection*)
 ; Queue a connect to the matched proxy location's upstream, with a linked

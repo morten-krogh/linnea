@@ -18,9 +18,12 @@ default rel
 %include "linnea_hpack.inc"
 %include "linnea_qpack_data.inc"
 %include "linnea_time.inc"
+%include "linnea_config.inc"
+%include "linnea_http3.inc"
 
 global linnea_qpack_decode
 global linnea_qpack_encode_response
+global linnea_qpack_encode_proxy
 global linnea_qpack_send_validators
 global linnea_qpack_crange_ptr
 global linnea_qpack_crange_len
@@ -38,6 +41,8 @@ extern linnea_static_etag
 extern linnea_static_etag_len
 extern linnea_static_lastmod
 extern linnea_time_http_now
+extern linnea_string_iequal
+extern linnea_string_from_u64
 
 section .rodata
 ; status -> QPACK static-table index (RFC 9204 Appendix A). Statuses not listed
@@ -60,6 +65,55 @@ allow_name_len  equ $ - allow_name
 allow_value:    db "GET, HEAD"
 allow_value_len equ $ - allow_value
 
+; --- relaying an upstream response head (linnea_qpack_encode_proxy) --------
+; The hop this RESPONSE crossed, so the version it names is the one the
+; upstream answered on, not the one the client asked over (RFC 9110 7.6.3) —
+; the request's own Via says 3, and is added where that head is built. QPACK's
+; static table has no `via` entry, so both halves are literals.
+qp_via_name:    db "via"
+qp_via_name_len equ $ - qp_via_name
+qp_via_val:     db "1.1 linnea"
+qp_via_val_len  equ $ - qp_via_val
+qp_n_cl:        db "content-length"
+; Fields that must never reach the client: hop-by-hop (RFC 9110 7.6.1) and the
+; framing HTTP/3 carries itself. Content-length is judged separately — it is
+; dropped only when we restate it from the body we actually captured.
+qp_d_conn:      db "connection"
+qp_d_ka:        db "keep-alive"
+qp_d_tenc:      db "transfer-encoding"
+qp_d_upg:       db "upgrade"
+qp_d_trailer:   db "trailer"
+qp_d_pauth:     db "proxy-authenticate"
+qp_d_pconn:     db "proxy-connection"
+; TE is hop-by-hop like the rest, and on HTTP/3 it is more than that: RFC 9114
+; 4.2 makes any connection-specific field malformed, TE included unless its
+; value is exactly "trailers". A backend answering "TE: gzip" would otherwise
+; have us emit a message the client is entitled to reject.
+qp_d_te:        db "te"
+qp_drop_tab:
+    dq qp_d_conn, 10
+    dq qp_d_ka, 10
+    dq qp_d_tenc, 17
+    dq qp_d_upg, 7
+    dq qp_d_trailer, 7
+    dq qp_d_pauth, 18
+    dq qp_d_pconn, 16
+    dq qp_d_te, 2
+    dq 0, 0
+; Fields we would otherwise append a second copy of. The upstream's wins: a
+; backend that states its own Date or its own policy is describing its own
+; response, and two of either is a header a cache has to guess about.
+qp_n_date:      db "date"
+qp_n_server:    db "server"
+qp_n_hsts:      db "strict-transport-security"
+qp_n_nosniff:   db "x-content-type-options"
+qp_note_tab:
+    dq qp_n_date, 4, 1
+    dq qp_n_server, 6, 2
+    dq qp_n_hsts, 25, 4
+    dq qp_n_nosniff, 22, 8
+    dq 0, 0, 0
+
 section .bss
 ; set by the h3 serve path once it has computed the opened file's validators
 ; (linnea_static_etag / linnea_static_lastmod); cleared for every response
@@ -81,6 +135,10 @@ linnea_qpack_cenc: resq 1
 linnea_qpack_hsts_ptr: resq 1
 linnea_qpack_hsts_len: resq 1
 linnea_qpack_nosniff:  resq 1
+; scratch for relaying an upstream response head: one field name, lowercased,
+; and the re-derived content-length as digits
+qp_nmbuf:  resb 64
+qp_numbuf: resb 24
 
 section .text
 
@@ -284,6 +342,57 @@ qenc_str:
     rep movsb
     ret
 
+; qenc_status(rdi=out, esi=status) -> rdi advanced. The :status field line:
+; a single indexed byte when the status is one the static table carries, else
+; a literal with the :status name reference (24) and three ASCII digits.
+; Clobbers rax/rcx/rdx/rsi/r8/r9/r10.
+qenc_status:
+    sub rsp, 24
+    mov r10d, esi
+    lea rsi, [qpack_status_tab]
+    lea r9, [qpack_status_end]
+.qs_loop:
+    cmp rsi, r9
+    jae .qs_literal
+    movzx eax, word [rsi]
+    cmp eax, r10d
+    je .qs_found
+    add rsi, 4
+    jmp .qs_loop
+.qs_found:
+    movzx eax, word [rsi + 2]        ; static index
+    mov cl, 6
+    mov dl, 0xc0                     ; indexed field line, static table
+    call qenc_int
+    add rsp, 24
+    ret
+.qs_literal:
+    mov eax, 24                      ; literal w/ name ref :status (static)
+    mov cl, 4
+    mov dl, 0x50
+    push r10
+    call qenc_int
+    pop r10
+    mov eax, r10d                    ; the status as three ASCII digits
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    add al, '0'
+    mov [rsp], al
+    mov eax, edx
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    mov [rsp + 1], al
+    add dl, '0'
+    mov [rsp + 2], dl
+    mov rsi, rsp
+    mov rdx, 3
+    call qenc_str
+    add rsp, 24
+    ret
+
 ; linnea_qpack_encode_response(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
 ;   r8=clen_ptr, r9=clen_len) -> rax = field-section length.
 ; Encodes :status (indexed if a static value, else literal with name ref 24),
@@ -317,50 +426,9 @@ linnea_qpack_encode_response:
     mov word [rbx], 0x0000
     add rbx, 2
     ; --- :status ---
-    lea rsi, [qpack_status_tab]
-    lea r10, [qpack_status_end]
-.st_loop:
-    cmp rsi, r10
-    jae .st_literal
-    movzx eax, word [rsi]
-    cmp eax, r12d
-    je .st_found
-    add rsi, 4
-    jmp .st_loop
-.st_found:
-    movzx eax, word [rsi + 2]        ; static index
     mov rdi, rbx
-    mov cl, 6
-    mov dl, 0xc0                     ; indexed field line, static table
-    call qenc_int
-    mov rbx, rdi
-    jmp .after_status
-.st_literal:
-    mov rdi, rbx
-    mov eax, 24                      ; literal w/ name ref :status (static)
-    mov cl, 4
-    mov dl, 0x50
-    call qenc_int
-    mov rbx, rdi
-    ; format the status as three ASCII digits
-    mov eax, r12d
-    xor edx, edx
-    mov ecx, 100
-    div ecx
-    add al, '0'
-    mov [rsp + 8], al
-    mov eax, edx
-    xor edx, edx
-    mov ecx, 10
-    div ecx
-    add al, '0'
-    mov [rsp + 9], al
-    add dl, '0'
-    mov [rsp + 10], dl
-    mov rdi, rbx
-    lea rsi, [rsp + 8]
-    mov rdx, 3
-    call qenc_str
+    mov esi, r12d
+    call qenc_status
     mov rbx, rdi
 .after_status:
     ; --- content-type: literal with name reference (static index 44) ---
@@ -548,6 +616,344 @@ linnea_qpack_encode_response:
     add rsp, 24
     pop rbp
     pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; qenc_lit(rdi=out, rsi=name, rdx=namelen, rcx=val, r8=vallen) -> rdi advanced.
+; A literal field line with a literal name (001 N H, 3-bit name length), which
+; can carry any field — the static table has no entry for most of what a
+; backend sends, and a name reference would only save a byte on the few it has.
+qenc_lit:
+    push rcx                         ; value
+    push r8                          ; value length
+    push rsi                         ; name
+    push rdx                         ; name length
+    mov rax, rdx
+    mov cl, 3
+    mov dl, 0x20
+    call qenc_int
+    pop rdx
+    pop rsi
+    mov rcx, rdx
+    rep movsb                        ; the name, already lowercased by the caller
+    pop rdx
+    pop rsi
+    jmp qenc_str
+
+; linnea_qpack_encode_proxy(rdi=out, esi=status, rdx=head ptr, rcx=head len,
+;   r8=content-length to state (-1 = state none and forward the upstream's),
+;   r9=vhost server* or 0)
+;   -> rax = field-section length, or -1 when it would not fit the reserve.
+; Translates an upstream HTTP/1.1 response head into an HTTP/3 field section:
+; the status as :status, then every field except the hop-by-hop ones and the
+; framing HTTP/3 carries itself. Names are lowercased, as RFC 9114 4.1.2
+; requires. Our own via, and the vhost's security headers, are appended — the
+; latter only when the backend did not set them, so an application that sends
+; its own policy still wins. Date and server are added only when the upstream
+; sent neither, so a proxied response never carries two of either.
+; Locals: [0] out start, [8] content-length, [16] vhost, [24] seen flags,
+;         [32] name length, [40] colon offset, [48] out limit
+linnea_qpack_encode_proxy:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 72
+    mov rbx, rdi                     ; out cursor
+    mov [rsp], rdi                   ; out start
+    mov [rsp + 8], r8                ; content-length to state
+    mov [rsp + 16], r9               ; vhost
+    mov qword [rsp + 24], 0          ; nothing seen yet
+    lea rax, [rdi + LINNEA_H3_PROXY_RESERVE - 32]
+    mov [rsp + 48], rax              ; the framing added after us needs the slack
+    mov r12, rdx                     ; head
+    mov r13, rcx                     ; head length
+    ; field section prefix: Required Insert Count = 0, Delta Base = 0
+    mov word [rbx], 0x0000
+    add rbx, 2
+    mov rdi, rbx
+    call qenc_status
+    mov rbx, rdi
+    ; --- content-length, when it is ours to state. The captured body's length
+    ; is what the client will actually receive, whatever the upstream framed.
+    mov rax, [rsp + 8]
+    cmp rax, -1
+    je .ep_walk
+    mov rdi, rax
+    lea rsi, [qp_numbuf]
+    call linnea_string_from_u64      ; rax = digits written
+    push rax                         ; keep the digit count across the name
+    mov rdi, rbx
+    mov eax, 4                       ; content-length: name reference (static 4)
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    pop rdx                          ; the digit count is the value's length
+    lea rsi, [qp_numbuf]
+    call qenc_str
+    mov rbx, rdi
+.ep_walk:
+    ; --- the upstream's own fields ---
+    xor r14d, r14d                   ; line cursor
+.ep_status_eol:
+    cmp r14, r13
+    jae .ep_done
+    cmp byte [r12 + r14], 13
+    je .ep_status_done
+    inc r14
+    jmp .ep_status_eol
+.ep_status_done:
+    add r14, 2
+.ep_line:
+    cmp r14, r13
+    jae .ep_done
+    mov r15, r14
+.ep_eol:
+    cmp r15, r13
+    jae .ep_done
+    cmp byte [r12 + r15], 13
+    je .ep_have
+    inc r15
+    jmp .ep_eol
+.ep_have:
+    cmp r15, r14
+    je .ep_done                      ; the empty line ends the head
+    mov rdx, r14                     ; split at the colon
+.ep_colon:
+    cmp rdx, r15
+    jae .ep_next                     ; no colon: not a field line
+    cmp byte [r12 + rdx], ':'
+    je .ep_colon_found
+    inc rdx
+    jmp .ep_colon
+.ep_colon_found:
+    mov [rsp + 40], rdx
+    mov rax, rdx
+    sub rax, r14                     ; name length
+    test rax, rax
+    jz .ep_next
+    cmp rax, 64
+    ja .ep_next                      ; an implausible name: drop it
+    mov [rsp + 32], rax
+    ; lowercase the name into the scratch (HTTP/3 forbids uppercase, 4.1.2)
+    lea rdi, [qp_nmbuf]
+    lea rsi, [r12 + r14]
+    mov rcx, rax
+.ep_lower:
+    movzx edx, byte [rsi]
+    cmp dl, 'A'
+    jb .ep_lower_put
+    cmp dl, 'Z'
+    ja .ep_lower_put
+    or dl, 0x20
+.ep_lower_put:
+    mov [rdi], dl
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .ep_lower
+    ; note the ones we would otherwise duplicate, and drop what must not travel
+    lea rdi, [qp_nmbuf]
+    mov rsi, [rsp + 32]
+    xor edx, edx                     ; is content-length ours to state?
+    cmp qword [rsp + 8], -1
+    setne dl
+    call .ep_classify                ; eax = 1 to drop, rdx = the seen bit
+    or [rsp + 24], rdx
+    test eax, eax
+    jnz .ep_next
+    ; the value, leading spaces trimmed
+    mov rdx, [rsp + 40]
+    inc rdx                          ; past the colon
+.ep_vlead:
+    cmp rdx, r15
+    jae .ep_vdone
+    cmp byte [r12 + rdx], ' '
+    jne .ep_vdone
+    inc rdx
+    jmp .ep_vlead
+.ep_vdone:
+    mov rcx, r15
+    sub rcx, rdx                     ; value length
+    ; room? A head that outgrows the reserve cannot be written in front of the
+    ; body, so the caller answers 502 rather than send a truncated field section
+    mov rax, rbx
+    add rax, [rsp + 32]
+    add rax, rcx
+    cmp rax, [rsp + 48]
+    ja .ep_toolong
+    mov rdi, rbx
+    lea rsi, [qp_nmbuf]
+    mov r8, rcx                      ; value length
+    lea rcx, [r12 + rdx]             ; value pointer
+    mov rdx, [rsp + 32]              ; name length
+    call qenc_lit
+    mov rbx, rdi
+.ep_next:
+    lea r14, [r15 + 2]
+    jmp .ep_line
+.ep_done:
+    ; the hop this response crossed (RFC 9110 7.6.3)
+    mov rdi, rbx
+    lea rsi, [qp_via_name]
+    mov rdx, qp_via_name_len
+    lea rcx, [qp_via_val]
+    mov r8, qp_via_val_len
+    call qenc_lit
+    mov rbx, rdi
+    ; --- the vhost's security headers, when the backend set neither ---
+    mov r14, [rsp + 16]
+    test r14, r14
+    jz .ep_datesrv
+    test qword [rsp + 24], 4         ; the upstream sent its own HSTS
+    jnz .ep_nosniff
+    cmp qword [r14 + linnea_config_server.hsts_len], 0
+    je .ep_nosniff
+    mov rdi, rbx
+    mov eax, 56                      ; strict-transport-security: name ref
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    lea rsi, [r14 + linnea_config_server.hsts]
+    mov rdx, [r14 + linnea_config_server.hsts_len]
+    call qenc_str
+    mov rbx, rdi
+.ep_nosniff:
+    test qword [rsp + 24], 8
+    jnz .ep_datesrv
+    cmp qword [r14 + linnea_config_server.nosniff], 0
+    je .ep_datesrv
+    mov rdi, rbx
+    mov byte [rdi], 0xc0 | 61        ; x-content-type-options: nosniff —
+    inc rdi                          ; name and value both in the static table
+    mov rbx, rdi
+.ep_datesrv:
+    ; --- date and server, each only when the upstream sent none ---
+    test qword [rsp + 24], 1
+    jnz .ep_server
+    call linnea_time_http_now        ; rax = current IMF-fixdate text
+    mov rdi, rbx
+    mov r14, rax
+    mov eax, 6                       ; date: name reference
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    mov rsi, r14
+    mov edx, LINNEA_HTTP_DATE_LEN
+    call qenc_str
+    mov rbx, rdi
+.ep_server:
+    test qword [rsp + 24], 2
+    jnz .ep_fin
+    mov rdi, rbx
+    mov eax, 92                      ; server: name reference
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    lea rsi, [qpack_srv_name]
+    mov edx, qpack_srv_name_len
+    call qenc_str
+    mov rbx, rdi
+.ep_fin:
+    cmp rbx, [rsp + 48]
+    ja .ep_toolong
+    mov rax, rbx
+    sub rax, [rsp]
+    jmp .ep_ret
+.ep_toolong:
+    mov rax, -1
+.ep_ret:
+    add rsp, 72
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; .ep_classify(rdi = lowercased name, rsi = its length, edx = 1 when
+;   content-length is ours to state) -> eax = 1 when the field must not be
+;   forwarded, rdx = the seen bit for a field we would otherwise duplicate.
+; Two tables: one of fields that must never travel to the client (hop-by-hop,
+; RFC 9110 7.6.1, plus the framing HTTP/3 carries itself), and one of fields we
+; add ourselves and so must notice the upstream already sending.
+.ep_classify:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    mov r12, rsi
+    mov r14d, edx                    ; content-length is ours
+    xor r13d, r13d                   ; the seen bit, if any
+    ; content-length, dropped only when we restate it from the captured body
+    cmp r12, 14
+    jne .cl_note_scan
+    test r14d, r14d
+    jz .cl_note_scan
+    mov rdi, rbx
+    mov rsi, r12
+    lea rdx, [qp_n_cl]
+    mov ecx, 14
+    call linnea_string_iequal
+    test eax, eax
+    jnz .cl_yes
+.cl_note_scan:
+    lea r14, [qp_note_tab]
+.cl_note:
+    mov rcx, [r14]
+    test rcx, rcx
+    jz .cl_drop_scan
+    cmp qword [r14 + 8], r12
+    jne .cl_note_next
+    push r14
+    mov rdi, rbx
+    mov rsi, r12
+    mov rdx, rcx
+    mov rcx, r12
+    call linnea_string_iequal
+    pop r14
+    test eax, eax
+    jz .cl_note_next
+    mov r13, [r14 + 16]              ; this field's seen bit
+    jmp .cl_drop_scan
+.cl_note_next:
+    add r14, 24
+    jmp .cl_note
+.cl_drop_scan:
+    lea r14, [qp_drop_tab]
+.cl_drop:
+    mov rcx, [r14]
+    test rcx, rcx
+    jz .cl_keep
+    cmp qword [r14 + 8], r12
+    jne .cl_drop_next
+    push r14
+    mov rdi, rbx
+    mov rsi, r12
+    mov rdx, rcx
+    mov rcx, r12
+    call linnea_string_iequal
+    pop r14
+    test eax, eax
+    jnz .cl_yes
+.cl_drop_next:
+    add r14, 16
+    jmp .cl_drop
+.cl_yes:
+    mov eax, 1
+    xor edx, edx                     ; a dropped field notes nothing
+    jmp .cl_ret
+.cl_keep:
+    xor eax, eax
+    mov rdx, r13
+.cl_ret:
     pop r14
     pop r13
     pop r12

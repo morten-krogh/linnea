@@ -45,6 +45,12 @@ LINNEA_PROXY_CAPTURE    equ 8      ; capturing a request body too large to
                                    ; contacted yet, so a client that gives up
                                    ; here leaves the backend untouched rather
                                    ; than holding a truncated request.
+LINNEA_PROXY_H3BODY     equ 9      ; an HTTP/3-owned leg capturing the upstream
+                                   ; RESPONSE body into the spill file. There is
+                                   ; no client socket to relay to — the answer
+                                   ; goes out as QUIC stream chunks once whole —
+                                   ; so the response is buffered exactly as an
+                                   ; oversized request body is on the way in.
 
 ; conn.chunk_state — where an incremental chunked decode stopped. The states
 ; are per BYTE, not per line: any of these boundaries can fall between two
@@ -136,6 +142,35 @@ struc linnea_connection
                                    ; never get to read the answer
     .up_status:     resq 1         ; upstream status code, for the log
     .is_head:       resq 1         ; 1 = the client sent HEAD (no body relay)
+    ; --- an upstream leg owned by an HTTP/3 request -------------------
+    ; A proxied h3 request has no client socket of its own: the answer is owed
+    ; to one stream of a QUIC connection, which lives in a different pool. So
+    ; the leg borrows an ordinary connection slot for its UPSTREAM half alone
+    ; (.fd stays -1) and names its owner here. The generation is what makes a
+    ; late completion safe: a QUIC connection that died meanwhile has had its
+    ; slot recycled, and the response is dropped rather than sent to whoever
+    ; holds it now. Zero .h3_owner means an ordinary client-facing connection,
+    ; which is what every path outside the h3 proxy tests for.
+    .h3_owner:      resq 1         ; 1 = this leg answers an HTTP/3 stream
+    .h3_qidx:       resq 1         ; the QUIC connection's pool index
+    .h3_qgen:       resq 1         ; its generation when the leg was started
+    .h3_sid:        resq 1         ; the request stream to answer
+    .h3_hlen:       resq 1         ; response-head bytes at the front of up_buf
+    ; The access line's who-and-what, parked when the request is forwarded. It
+    ; is written long afterwards, from an upstream completion, by which time the
+    ; QUIC reassembly buffer those fields pointed into has been reused — and the
+    ; shared log parameter block belongs to whichever request was served most
+    ; recently. Copied into in_buf, which an h3 leg has no other use for:
+    ; method at 0, target at LINNEA_H3_LG_TGT, host at LINNEA_H3_LG_HOST. Each
+    ; is truncated to its slot, as HTTP/2's proxy log fields are.
+    .h3_lg_meth_len: resq 1
+    .h3_lg_tgt_len:  resq 1
+    .h3_lg_host_len: resq 1
+    .h3_nobody:     resq 1         ; 1 = this response carries no body at all
+                                   ; (a HEAD, a 204, a 304, a 1xx), so its
+                                   ; content-length is the upstream's to state
+                                   ; and not ours to re-derive from a capture
+                                   ; that was always going to be empty
     ; --- upgrade tunnel (websockets etc.) ----------------------------
     ; The client's Connection field value, so the proxy rewriter can honour
     ; RFC 9110 7.6.1: every field this names is hop-by-hop and MUST be removed

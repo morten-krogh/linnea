@@ -2642,12 +2642,43 @@ PYEOF
     check_http "hsts on a proxy 502 (h1)"    "Strict-Transport-Security:" "$hdrs"
     check_http "nosniff on a proxy 502 (h1)" "X-Content-Type-Options: nosniff" "$hdrs"
 
-    # a vhost with a proxy location must not advertise h3: Alt-Svc migration
-    # is per-origin, and h3 has no location routing — a browser that switched
-    # would 404 on every proxied path with no fallback
+    # This vhost has a REDIRECT location, which keeps it off h3: QPACK has no
+    # Location header to emit, so a redirect cannot be expressed there. Alt-Svc
+    # migration is per-origin, so advertising h3 anyway would send a browser to
+    # a protocol that cannot answer /old with no way back. (A proxy location no
+    # longer excludes a vhost — h3 routes and proxies since stage 3 — which is
+    # what the block below exercises.)
     hdrs=$(curl -si --max-time 5 --cacert $CA $U/hello.txt)
     ! echo "$hdrs" | grep -qi 'alt-svc'
-    check "h3 not advertised by a proxy vhost (no alt-svc)" $?
+    check "h3 not advertised by a redirect vhost (no alt-svc)" $?
+
+    # HTTP/3 proxying end to end, against the backend already listening on
+    # 47100. A proxied h3 request has no client socket to answer on: the leg
+    # borrows a connection slot for its upstream half, captures the response
+    # whole, and streams it out of a response-stream slot like a file. Every
+    # part of that is checked here — status and body, the target and query, a
+    # client header reaching the backend, chunked de-chunked and re-lengthed,
+    # a close-delimited body, 40000 bytes streamed past a single packet,
+    # hop-by-hop fields stopped in both directions, a POST body forwarded, and
+    # an unreachable upstream answered 502 rather than left silent.
+    if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+        start_server test/configs/tls-h3-proxy.json
+        h3p_pid=$SRV_PID
+        sleep 0.5
+        out=$(timeout 120 python3 test/quic/h3_proxy_test.py 47462 2>&1)
+        [ "$out" = "OK" ]
+        check "h3 proxies to an HTTP/1.1 upstream ($out)" $?
+        # the same paths over h2, which has proxied since Q86: the two must agree
+        b2=$(curl -s --http2 --max-time 6 --cacert test/tls/server.crt \
+                  https://localhost:47462/api/simple)
+        [ "$b2" = "backend body" ]
+        check "h3/h2 agree on the proxied body" $?
+        kill $h3p_pid 2>/dev/null
+        wait $h3p_pid 2>/dev/null
+    else
+        check "h3 proxying (skipped: aioquic/pylsqpack unavailable)" 0
+        check "h3/h2 agree on the proxied body (skipped)" 0
+    fi
 
     # kTLS reports the peer's close_notify as -EIO rather than a 0-length
     # read, so an orderly shutdown must not be logged as a recv error.

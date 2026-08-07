@@ -18,6 +18,12 @@ global linnea_h3_serve
 global linnea_h3_srv
 global h3_hdrs_buf
 global linnea_h3_tx_cap
+global linnea_h3_owner_idx
+global linnea_h3_owner_gen
+global linnea_h3_owner_sid
+global linnea_h3_proxy_hook
+global linnea_h3_proxy_body_ptr
+global linnea_h3_proxy_body_len
 
 extern linnea_hpack_req_check
 extern linnea_quic_varint_decode
@@ -86,6 +92,25 @@ h3_join:     resq 1                   ; where the joined root++path starts
 ; request can be routed to a location. Zero means "no routing": serve the root
 ; the caller passed, which is what h3 did before it could route at all.
 linnea_h3_srv: resq 1
+; Which QUIC connection and stream this request arrived on, so a proxied one
+; can name the owner its answer is owed to. The generation is the connection ID
+; that incarnation issued: a slot recycled meanwhile carries a different one and
+; the response is dropped rather than sent to whoever holds it now. Set by the
+; QUIC server before linnea_h3_serve, alongside linnea_h3_srv.
+linnea_h3_owner_idx: resq 1
+linnea_h3_owner_gen: resq 1
+linnea_h3_owner_sid: resq 1
+; What a proxy location does with a request (0 = nothing can): the server
+; installs linnea_h3_proxy_start here at startup. A pointer rather than a
+; direct call so that the framing and response builders stay linkable on their
+; own — the test binaries that exercise them have no connection pool, no
+; io_uring loop and no upstream to reach.
+linnea_h3_proxy_hook: resq 1
+; The request body the hook forwards, whole and in memory: an h3 request stream
+; is reassembled before it is served, so its DATA frames have already been
+; joined into one run.
+linnea_h3_proxy_body_ptr: resq 1
+linnea_h3_proxy_body_len: resq 1
 ; Where emit_field rebuilds the client's forwardable headers as h1 lines, for
 ; the request we send upstream. Same size as h2's, and overflow is detectable:
 ; the rebuild parks hb_cur past hb_end rather than writing past it.
@@ -465,10 +490,12 @@ linnea_h3_build_response:
 ;   r9=body len) -> rax = response length written to out, and r8/r9 = the
 ; response file's mapping base/size when the body was too large to inline
 ; (r9 = 0 otherwise: out holds the complete response, nothing stays mapped).
-; A POST echoes its request body (200 text/plain). Otherwise resolves the
-; request's :path under root and serves that file with its MIME type, or a
-; 404 / 400 response. The path normalizer, opener and MIME table are the shared
-; ones, so h3 and h2 resolve and reject paths identically.
+; Resolves the request's :path to a location on the vhost (linnea_h3_srv) and,
+; for a static one, serves the file under that location's root with its MIME
+; type, or a 404 / 400 / 405. The path normalizer, opener and MIME table are the
+; shared ones, so h3 and h2 resolve and reject paths identically. A proxy
+; location instead forwards the request upstream and returns -1: the stream is
+; parked, and its answer arrives on a later io_uring completion.
 ; A body over LINNEA_H3_INLINE_MAX is not copied: out receives only the head
 ; (HEADERS frame + DATA frame header), the file stays mapped, and the caller
 ; streams the body as chunks — unless head + body exceeds the caller's
@@ -482,44 +509,21 @@ linnea_h3_serve:
     push r14
     push r15
     push rbp
-    sub rsp, 40                      ; [0/8] mime ptr/len, [16/24] range
-    ;                                ; offset/length, [32] ranged flag
+    sub rsp, 72                      ; [0/8] mime ptr/len, [16/24] range
+    ;                                ; offset/length, [32] ranged flag,
+    ;                                ; [40/48] the request body a proxy forwards,
+    ;                                ; [56/64] the root the caller passed
     mov rbx, rdi                     ; req
     mov r12, rcx                     ; out
+    mov [rsp + 40], r8               ; the body the reader joined for us (0/0
+    mov [rsp + 48], r9               ; when the request carried none)
+    mov [rsp + 56], rsi              ; the caller's root, for a request that
+    mov [rsp + 64], rdx              ; routes to no location of its own
     ; no validators or content-range until a file is opened and the request's
     ; conditionals and range are evaluated
     mov qword [linnea_qpack_send_validators], 0
     mov qword [linnea_qpack_crange_ptr], 0
     mov qword [linnea_qpack_cenc], 0
-    ; POST is not something a static file does. h1 and h2 have always answered
-    ; it 405; h3 used to echo the request body back instead, which existed as
-    ; the observable that DATA frames are captured rather than as a feature —
-    ; and meant a POST over h3 reflected the caller's own bytes with a 200. The
-    ; body is still parsed and joined by linnea_h3_read_headers, so a future
-    ; consumer has it; nothing serves from it now, and the method gate below
-    ; answers POST like every other method a file does not take.
-.not_post:
-    ; Static files answer GET and HEAD, exactly as the h1 and h2 static paths
-    ; do. Only POST (above) and those two ever meant anything here, but nothing
-    ; said so: every other method fell through and was served as if it were a
-    ; GET, so a PROPFIND, PUT or DELETE against a static file came back 200 with
-    ; the file's body while h1 and h2 both answered 405. The method is matched
-    ; exactly, not case-insensitively — RFC 9110 9.1 makes it case-sensitive,
-    ; and the POST and HEAD tests around it already compare exactly.
-    mov rdi, [rbx + linnea_h2_req.method_ptr]
-    cmp qword [rbx + linnea_h2_req.method_len], 3
-    jne .method_head
-    cmp word [rdi], 'GE'
-    jne .resp_405
-    cmp byte [rdi + 2], 'T'
-    jne .resp_405
-    jmp .method_ok
-.method_head:
-    cmp qword [rbx + linnea_h2_req.method_len], 4
-    jne .resp_405
-    cmp dword [rdi], 0x44414548      ; "HEAD", little-endian
-    jne .resp_405
-.method_ok:
     ; The path is normalized at a fixed offset, leaving room in front of it for
     ; a root that is not known yet: which root depends on which location the
     ; path matches, so the join happens after the routing, not before it. Same
@@ -541,7 +545,7 @@ linnea_h3_serve:
     ; rule as the other protocols, and the matched kind decides what happens.
     mov rdi, [linnea_h3_srv]
     test rdi, rdi
-    jz .join                         ; unrouted: the root the caller passed
+    jz .unrouted                     ; the root the caller passed
     lea rsi, [h3_path_buf + LINNEA_H3_PATH_ROOT]
     mov rdx, r14
     sub rdx, rsi
@@ -562,6 +566,36 @@ linnea_h3_serve:
     mov [linnea_qpack_ccontrol_ptr], r11
     lea rsi, [rax + linnea_config_location.root]
     mov rdx, [rax + linnea_config_location.root_len]
+    jmp .method_gate
+.unrouted:
+    ; No config server to route on (a driver that hands the serve a bare root).
+    ; The root is the caller's, saved at entry: the normalize above reused rsi
+    ; and rdx for the path, so they no longer hold it.
+    mov rsi, [rsp + 56]
+    mov rdx, [rsp + 64]
+.method_gate:
+    ; A STATIC location answers GET and HEAD and nothing else, exactly as the h1
+    ; and h2 static paths do — a PROPFIND, PUT or DELETE against a file used to
+    ; fall through here and be served as if it were a GET. The method is matched
+    ; exactly, not case-insensitively: RFC 9110 9.1 makes it case-sensitive.
+    ;
+    ; The gate belongs HERE, after the routing, not before it: a proxy location
+    ; forwards whatever method it is given, and while it sat in front of the
+    ; match a POST to a proxied path was answered 405 by us instead of reaching
+    ; the backend at all. h1 and h2 both place it the same way.
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    cmp qword [rbx + linnea_h2_req.method_len], 3
+    jne .method_head
+    cmp word [rdi], 'GE'
+    jne .resp_405
+    cmp byte [rdi + 2], 'T'
+    jne .resp_405
+    jmp .join
+.method_head:
+    cmp qword [rbx + linnea_h2_req.method_len], 4
+    jne .resp_405
+    cmp dword [rdi], 0x44414548      ; "HEAD", little-endian
+    jne .resp_405
 .join:
     ; the root goes immediately in front of the path, ending where it begins
     lea rdi, [h3_path_buf + LINNEA_H3_PATH_ROOT]
@@ -867,10 +901,68 @@ linnea_h3_serve:
     call linnea_h3_build_response
     jmp .sret
 .not_static:
-    ; A proxy location, which h3 cannot serve yet. Answering 502 is the honest
-    ; placeholder: the route exists and is ours, we simply cannot reach the
-    ; upstream over this protocol. Redirect locations never get here — a vhost
-    ; that has one is still kept off h3 by the registration.
+    ; A proxy location. The request goes to the location's upstream on a leg of
+    ; its own and this stream is PARKED: the answer arrives on an io_uring
+    ; completion, long after this datagram has been dealt with. Redirect
+    ; locations never get here — a vhost that has one is still kept off h3 by
+    ; the registration, QPACK having no Location header to emit.
+    ; Is there a response-stream slot to park this request in? The caller
+    ; already scanned for one (linnea_h3_tx_cap). Asking now rather than at the
+    ; park matters: the upstream is contacted before the stream is parked, so
+    ; without this the backend would serve a request we then had nowhere to put
+    ; the answer to. 503 says the same thing a large static response says when
+    ; every slot is busy — refused, try again.
+    cmp qword [linnea_h3_tx_cap], 0
+    je .proxy_busy
+    mov r10, [linnea_h3_proxy_hook]
+    test r10, r10
+    jz .no_proxy                     ; a build without the upstream machinery
+    mov rdi, [rsp + 40]              ; the request body, joined by the reader
+    mov [linnea_h3_proxy_body_ptr], rdi
+    mov rdi, [rsp + 48]
+    mov [linnea_h3_proxy_body_len], rdi
+    mov rdi, rbx                     ; req
+    mov rsi, rax                     ; the matched location
+    mov rdx, [linnea_h3_srv]         ; its vhost, for the response's own headers
+    mov rcx, [linnea_h3_owner_idx]
+    mov r8, [linnea_h3_owner_gen]
+    mov r9, [linnea_h3_owner_sid]
+    call r10                         ; rax = 0 parked, else a status to answer
+    test eax, eax
+    jnz .proxy_status
+    mov rax, -1                      ; nothing to send on this stream yet
+    jmp .sret                        ; (and no mapping: .sret zeroes r8/r9)
+.proxy_busy:
+    mov eax, 503
+.proxy_status:
+    ; The upstream was never reached — no socket, no slot, a head we would not
+    ; forward — so the client gets a status of ours instead. These describe no
+    ; representation, so they carry no validators.
+    mov qword [linnea_qpack_send_validators], 0
+    mov r13d, eax                    ; the status, across the body selection
+    lea r8, [body_502]
+    mov r9d, body_502_len
+    cmp r13d, 503
+    jne .ps_431
+    lea r8, [body_503]
+    mov r9d, body_503_len
+    jmp .ps_emit
+.ps_431:
+    cmp r13d, 431
+    jne .ps_emit
+    lea r8, [body_431]
+    mov r9d, body_431_len
+.ps_emit:
+    mov rdi, r12
+    mov esi, r13d
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    call linnea_h3_build_response
+    jmp .sret
+.no_proxy:
+    ; The route is ours and the request is well-formed; this build simply has
+    ; no way to reach an upstream. 502 is what h3 answered for every proxy
+    ; location before it could proxy at all.
     mov rdi, r12
     mov esi, 502
     lea rdx, [txt_plain]
@@ -909,7 +1001,7 @@ linnea_h3_serve:
     xor r8d, r8d                     ; complete response in out, nothing mapped
     xor r9d, r9d
 .sret_large:
-    add rsp, 40
+    add rsp, 72
     pop rbp
     pop r15
     pop r14

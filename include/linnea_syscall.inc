@@ -8,6 +8,10 @@ LINNEA_SYS_WRITE     equ 1
 LINNEA_SYS_OPEN      equ 2
 LINNEA_SYS_CLOSE     equ 3
 LINNEA_SYS_FSTAT     equ 5
+LINNEA_SYS_LSEEK     equ 8
+LINNEA_SEEK_SET      equ 0
+LINNEA_SYS_PWRITE64  equ 18      ; write at an explicit offset, without moving
+                                 ; the file position a sequential write uses
 LINNEA_SYS_MMAP      equ 9
 LINNEA_SYS_MUNMAP    equ 11
 LINNEA_SYS_RT_SIGACTION equ 13

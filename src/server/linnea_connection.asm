@@ -95,6 +95,8 @@ linnea_connection_alloc:
     mov qword [rdx + linnea_connection.capture_done], 0
     mov qword [rdx + linnea_connection.answer_linger], 0
     mov qword [rdx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    mov qword [rdx + linnea_connection.h3_owner], 0   ; a client-facing slot
+                                                      ; until an h3 leg claims it
     mov qword [rdx + linnea_connection.tls_phase], LINNEA_TLS_PHASE_NONE
     mov qword [rdx + linnea_connection.close_notified], 0
     mov qword [rdx + linnea_connection.is_h2], 0

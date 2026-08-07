@@ -1,0 +1,29 @@
+{
+  "log": "test/linnea.log",
+  "timeout": 5,
+  "workers": 1,
+  "max_body": 200000,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 47462,
+      "hostname": "localhost",
+      "cert": "test/tls/server.crt",
+      "key": "test/tls/server.key",
+      "locations": [
+        {
+          "prefix": "/api",
+          "proxy": "127.0.0.1:47100"
+        },
+        {
+          "prefix": "/down",
+          "proxy": "127.0.0.1:47109"
+        },
+        {
+          "prefix": "/",
+          "root": "test/www"
+        }
+      ]
+    }
+  ]
+}

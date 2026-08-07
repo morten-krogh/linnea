@@ -85,3 +85,27 @@ LINNEA_H3_INLINE_MAX   equ 1024
 LINNEA_H3_HEAD_MAX     equ 512
 LINNEA_H3_PATH_ROOT equ LINNEA_MAX_ROOT + 1   ; room for the root in front of the path
 LINNEA_H3_HDRS_BUF equ 8192      ; proxy header rebuild for an h3 request
+
+; --- proxying to an HTTP/1.1 upstream (linnea_h3_proxy.asm) ---------------
+; The upstream response head we will re-encode, capped exactly where HTTP/2
+; caps it (LINNEA_H2P_RHEAD_MAX): the same backend answer must not be relayed
+; over one protocol and refused over the other.
+LINNEA_H3_PROXY_RHEAD_MAX equ 6144
+; The response's own head (HEADERS frame + DATA frame header) does NOT fit the
+; fixed hdr of a response-stream slot once a backend's fields are in it, and
+; growing that hdr costs LINNEA_QUIC_TXSTREAMS x LINNEA_QUIC_MAX_CONNS times
+; whatever it grows by. So the head is written into the capture file IN FRONT
+; of the body instead: the capture starts this far into the file, leaving a
+; hole the head is written back into once its length is known, and the slot
+; streams head and body as one run out of the mapping (its hdr goes unused).
+; The reserve therefore bounds the encoded head, and comfortably exceeds what
+; a 6144-byte upstream head can encode to.
+LINNEA_H3_PROXY_RESERVE   equ 8192
+; Where a parked request's access-line text sits in the leg's in_buf, and how
+; much of each is kept. Long enough for any real method, target or host; a
+; longer one is truncated, since this is a log line and not a decision.
+LINNEA_H3_LG_METH_MAX     equ 32
+LINNEA_H3_LG_TGT          equ 32
+LINNEA_H3_LG_TGT_MAX      equ 1024
+LINNEA_H3_LG_HOST         equ 1056
+LINNEA_H3_LG_HOST_MAX     equ 256
