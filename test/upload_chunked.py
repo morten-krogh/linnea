@@ -54,12 +54,21 @@ def send_ragged(s, data, rng):
 def read_response(s):
     s.settimeout(20)
     resp = b""
-    while b"\r\n\r\n" not in resp:
-        d = s.recv(65536)
-        if not d:
-            return None, b""
-        resp += d
-    head, rest = resp.split(b"\r\n\r\n", 1)
+    while True:
+        while b"\r\n\r\n" not in resp:
+            d = s.recv(65536)
+            if not d:
+                return None, b""
+            resp += d
+        head, rest = resp.split(b"\r\n\r\n", 1)
+        # An interim response is not the answer (RFC 9110 15.2): mode_head
+        # sends Expect: 100-continue, and whether the 100 arrives in the same
+        # recv as the final status is a matter of timing. Reading it as the
+        # response failed the run about one time in three.
+        if head.split(b" ")[1:2] and head.split(b" ")[1].startswith(b"1"):
+            resp = rest
+            continue
+        break
     clen = 0
     for h in head.split(b"\r\n")[1:]:
         if h.lower().startswith(b"content-length:"):
