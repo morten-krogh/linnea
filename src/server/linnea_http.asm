@@ -97,6 +97,7 @@ LINNEA_HTTP_PATH_ROOT   equ LINNEA_MAX_ROOT + 1
 LINNEA_HTTP_PATH_BUF    equ 2560
 
 extern linnea_config_instance
+extern linnea_config_match_location
 extern linnea_string_from_u64
 extern linnea_string_from_hex_u64
 extern linnea_string_equal
@@ -1801,44 +1802,12 @@ linnea_http_handle:
     mov r15, rdi               ; path end
     mov r8, rdi
     sub r8, r13                ; path len
-    mov [rsp + 168], r9        ; the compares below clobber r9
-    mov qword [rsp + 152], 0   ; best location*
-    mov qword [rsp + 160], 0   ; best prefix len
-    mov r10, [r12 + linnea_config_server.location_count]
-    xor r11d, r11d             ; location index
-.loc_loop:
-    cmp r11, r10
-    jae .loc_done
-    imul rax, r11, linnea_config_location_size
-    lea rax, [r12 + rax + linnea_config_server.locations]
-    mov rcx, [rax + linnea_config_location.prefix_len]
-    cmp rcx, r8
-    ja .loc_next               ; prefix longer than the path
-    cmp rcx, [rsp + 160]
-    jbe .loc_next              ; not longer than the best match so far
-    ; compare the first prefix_len bytes of the path
-    mov [rsp + 56], rax        ; candidate location*
-    mov [rsp + 64], r8
-    mov [rsp + 72], r10
-    mov [rsp + 80], r11
-    mov rdi, r13
-    mov rsi, rcx
-    lea rdx, [rax + linnea_config_location.prefix]
-    call linnea_string_equal
-    mov r11, [rsp + 80]
-    mov r10, [rsp + 72]
-    mov r8, [rsp + 64]
-    test eax, eax
-    jz .loc_next
-    mov rax, [rsp + 56]
-    mov [rsp + 152], rax
-    mov rcx, [rax + linnea_config_location.prefix_len]
-    mov [rsp + 160], rcx
-.loc_next:
-    inc r11
-    jmp .loc_loop
-.loc_done:
-    mov rax, [rsp + 152]
+    mov [rsp + 168], r9        ; the matcher clobbers r9
+    mov rdi, r12               ; server*
+    mov rsi, r13               ; path
+    mov rdx, r8                ; path length
+    call linnea_config_match_location
+    mov [rsp + 152], rax       ; five places downstream re-read the match here
     test rax, rax
     jz .resp_404               ; no location claims this path
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY

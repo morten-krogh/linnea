@@ -8,7 +8,9 @@ default rel
 global linnea_config_instance
 global linnea_config_validate
 global linnea_config_dump
+global linnea_config_match_location
 
+extern linnea_string_equal
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 extern linnea_error_exit
@@ -448,6 +450,61 @@ linnea_config_dump:
     inc r12
     jmp .loop
 .done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+
+; linnea_config_match_location(rdi=server*, rsi=path, rdx=path len)
+;   -> rax = location*, or 0 if none claims the path
+;
+; Longest prefix wins, and a prefix is compared byte for byte and never
+; stripped: the whole path is what gets appended to the root or sent upstream.
+; Lifted out of the HTTP/1.1 parser so that HTTP/3, which used to be handed a
+; document root and no locations at all, can route by exactly the same rule
+; rather than by a second implementation of it.
+linnea_config_match_location:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov r12, rdi                     ; server*
+    mov r13, rsi                     ; path
+    mov r14, rdx                     ; path length
+    xor ebx, ebx                     ; best location so far
+    xor r15d, r15d                   ; its prefix length
+    xor ebp, ebp                     ; index
+.loop:
+    cmp rbp, [r12 + linnea_config_server.location_count]
+    jae .done
+    imul rax, rbp, linnea_config_location_size
+    lea rax, [r12 + rax + linnea_config_server.locations]
+    mov rcx, [rax + linnea_config_location.prefix_len]
+    cmp rcx, r14
+    ja .next                         ; prefix longer than the path
+    cmp rcx, r15
+    jbe .next                        ; no longer than the best already found
+    push rax                         ; the candidate, across the compare
+    mov rdi, r13
+    mov rsi, rcx
+    lea rdx, [rax + linnea_config_location.prefix]
+    call linnea_string_equal
+    pop rcx
+    test eax, eax
+    jz .next
+    mov rbx, rcx
+    mov r15, [rcx + linnea_config_location.prefix_len]
+.next:
+    inc rbp
+    jmp .loop
+.done:
+    mov rax, rbx
+    pop rbp
     pop r15
     pop r14
     pop r13
