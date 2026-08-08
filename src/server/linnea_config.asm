@@ -36,6 +36,8 @@ dump_perip:             db " max_per_ip="
 dump_perip_len          equ $ - dump_perip
 dump_maxup:             db " max_upstream="
 dump_maxup_len          equ $ - dump_maxup
+dump_maxbody:           db " max_body="
+dump_maxbody_len        equ $ - dump_maxbody
 dump_server:            db "server "
 dump_server_len         equ $ - dump_server
 dump_host:              db ": host="
@@ -350,6 +352,14 @@ linnea_config_dump:
     mov esi, dump_maxup_len
     call linnea_print_stdout
     mov rdi, [rbx + linnea_config.max_upstream]
+    call linnea_print_u64_stdout
+    ; max_body was the one limit the dump did not name, which is awkward for
+    ; the limit that stands between one client and the disk: setting it left
+    ; nothing to check it by.
+    lea rdi, [dump_maxbody]
+    mov esi, dump_maxbody_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.max_body]
     call linnea_print_u64_stdout
     lea rdi, [newline]
     mov esi, 1

@@ -136,6 +136,11 @@ run_test "config dump"     124 stdout "config: 3 servers timeout=2 max_connectio
     timeout 0.5 $BIN --config test/configs/listen.json
 run_test "location dump"   124 stdout "location 1: prefix=/sub root=test/www" \
     timeout 0.5 $BIN --config test/configs/listen.json
+# max_body was the one limit the dump did not name — awkward for the limit
+# that stands between one client and the disk, since setting it left nothing
+# to check it by
+run_test "max_body dumped"  124 stdout "max_body=1000000" \
+    timeout 0.5 $BIN --config test/configs/listen.json
 run_test "bad timeout"     1 stderr "timeout must be between 1 and 3600" \
     $BIN --config test/configs/bad-timeout.json
 run_test "workers dump"    124 stdout "workers=2" \
@@ -2691,6 +2696,26 @@ PYEOF
     timeout 60 python3 test/tls/h2_proxy_hop_by_hop.py test/tls/server.crt 47462 \
         >/dev/null 2>&1
     check "h2 does not relay hop-by-hop response fields" $?
+
+    # max_body bounds an upload on h1, and did nothing at all on h2: a body
+    # with a Content-Length streams through the slot FIFO to the backend, and
+    # nothing compared the declared length against the cap. Lowering max_body
+    # to bound uploads therefore left the one protocol browsers use uncapped.
+    # The fixture's max_body is 200000.
+    rm -f "$SEEN"
+    code=$(head -c 199000 /dev/zero | tr '\0' 'a' | curl -s -o /dev/null \
+           -w '%{http_code}' --http2 --max-time 20 --cacert test/tls/server.crt \
+           -X POST --data-binary @- https://localhost:47462/api/echo)
+    [ "$code" = "200" ]
+    check "h2 upload under max_body is served ($code)" $?
+    code=$(head -c 400000 /dev/zero | tr '\0' 'b' | curl -s -o /dev/null \
+           -w '%{http_code}' --http2 --max-time 20 --cacert test/tls/server.crt \
+           -X POST --data-binary @- https://localhost:47462/api/echo)
+    [ "$code" = "413" ]
+    check "h2 upload past max_body is 413 ($code)" $?
+    # and the point of a cap: the bytes never land
+    ! grep -q ' 400000$' "$SEEN"
+    check "the refused h2 upload never reached the backend" $?
     kill $h3p_pid 2>/dev/null
     wait $h3p_pid 2>/dev/null
 

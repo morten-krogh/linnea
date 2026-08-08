@@ -523,6 +523,15 @@ linnea_h2_handle:
     lea r9, [r8 + rax]
     cmp r9, LINNEA_H2P_BODY_MAX
     ja .fd_toobig
+    ; ...and max_body too, which can be configured below this buffer. A body
+    ; with no Content-Length is collected and measured here, so this is the
+    ; only place its size is ever judged.
+    push rcx
+    lea rcx, [linnea_config_instance]
+    mov rcx, [rcx + linnea_config.max_body]
+    cmp r9, rcx
+    pop rcx
+    ja .fd_toobig
     ; append at buf[BODY_OFF + len)
     mov rsi, rcx
     lea rdx, [rdi + linnea_h2p.buf + LINNEA_H2P_BODY_OFF]
@@ -1891,6 +1900,19 @@ h2_serve:
     cmp rax, -1
     je .proxy_done                   ; unparseable: collect and re-derive
     mov [r13 + linnea_h2p.rq_declared], rax   ; judged at END_STREAM (8.1.1)
+    ; ...and refused here if it is larger than we accept. max_body bounds a
+    ; request body on h1, which refuses on the DECLARED length for the same
+    ; reason: the point of the cap is that the bytes never land. h2 never
+    ; consulted it at all — the collect path below is bounded by its own buffer,
+    ; but a body with a Content-Length streams straight through to the backend,
+    ; so whatever the client declared is what the backend got. Lowering
+    ; max_body to bound uploads did nothing on the one protocol browsers use.
+    push rax
+    lea rcx, [linnea_config_instance]
+    mov rcx, [rcx + linnea_config.max_body]
+    cmp rax, rcx
+    pop rax
+    ja .proxy_toolarge
     test rax, rax
     jz .proxy_nobody
     ; claim the connection's upload buffer; without it (a second concurrent
@@ -1918,6 +1940,17 @@ h2_serve:
 .proxy_done:
     xor eax, eax                     ; no response bytes at the out cursor
     jmp .out
+.proxy_toolarge:
+    ; NB: below .proxy_done's jmp, not above it — .proxy_nobody falls THROUGH
+    ; into .proxy_done, so a label placed between them marks every bodiless
+    ; proxied request (which is every GET) as failed.
+    ; The slot never opens a socket, so the backend hears nothing of this. The
+    ; body still arrives — the client was told nothing to make it hold back —
+    ; and is dropped: h2p_find_collect skips a FAILED slot, so the DATA frames
+    ; are credited and discarded, exactly as they are for .fd_toobig.
+    mov qword [r13 + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [r13 + linnea_h2p.status], 413
+    jmp .proxy_done
 .proxy_toobig:
     mov qword [r13 + linnea_h2p.state], LINNEA_H2P_FREE
     mov rdi, rbx                     ; free the stream slot allocated above
