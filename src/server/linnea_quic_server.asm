@@ -306,6 +306,21 @@ s_tp_len:    resq 1                   ; and its length, for the in-flight record
 ; stream arrived in one frame and was walked from the packet. It says which of
 ; the two the serve path is looking at.
 s_ra_ctx:    resq 1
+; The context whose CAPTURE FILE the serve path is still holding, or 0. A
+; completed stream gives its slot back at .ra_complete but deliberately keeps
+; its file open, because those bytes ARE the request body and the serve is about
+; to be handed them; the close comes after. That hand-off has to end somewhere on
+; every path out of .serve_bidi, not only the one that serves — a duplicate
+; request, a cancelled stream, a 421 and a late decode failure all leave through
+; other doors, and each one used to take a descriptor (and, under PrivateTmp, the
+; tmpfs pages behind it) with it for the life of the worker. Cleared by whoever
+; releases; anything still set when the frame loop comes round is released there.
+s_ra_hold:   resq 1
+; CLOCK_MONOTONIC ms for the datagram being read, or 0 before anything has asked
+; for it. A bulk upload arrives as a run of STREAM frames in one packet and they
+; are all exactly as recent as each other, so the clock is read once per datagram
+; that touches a request stream rather than once per frame.
+s_rx_ms:     resq 1
 s_prio_u:    resq 1                   ; a request's parsed urgency (0-7)
 s_prio_i:    resq 1                   ; and incremental flag (0/1), for the slot fill
 ; One proxied response, handed over from the upstream leg's completion (see
@@ -2253,9 +2268,22 @@ linnea_quic_server_datagram:
     jb .fa_each
     call tx_pump
 .no_pump:
+    ; Nothing is held across datagrams: a hold names a context of the connection
+    ; whose packet is being read, and a connection torn down mid-serve had every
+    ; context of its own released by the pool's free hook. Starting each scan at
+    ; zero is what keeps the pointer below from ever outliving what it points at.
+    mov qword [s_ra_hold], 0
+    mov qword [s_rx_ms], 0           ; read on demand, once, below
     lea r15, [plaintext + r14]       ; end of the frames
     lea r14, [plaintext]             ; scan cursor
 .stream_scan:
+    ; A capture file the last stream's serve was handed, if its exit did not
+    ; already close it. One choke point rather than a release at each of the
+    ; four doors out of .serve_bidi, because the list of doors is the thing that
+    ; kept growing. r14/r15 are callee-saved and survive the call.
+    cmp qword [s_ra_hold], 0
+    jne .ra_hold_drop
+.ra_hold_done:
     cmp r14, r15
     jae .rtt_finish
     mov rdi, r14
@@ -2334,7 +2362,7 @@ linnea_quic_server_datagram:
     add rax, linnea_quic_ra_size
     dec rdx
     jnz .ra_alloc_find
-    jmp .stream_scan                 ; every context busy (a very deep burst): drop
+    jmp .ra_reclaim                  ; all busy: one of them may be abandoned
 .ra_start:
     mov qword [rax + linnea_quic_ra.active], 1
     mov rdx, [s_sid]
@@ -2375,6 +2403,20 @@ linnea_quic_server_datagram:
     mov [rcx + linnea_quic_ra.walk + linnea_h3_walk.sink], rax
     pop rax
 .ra_have:
+    ; when this stream last showed a sign of life, which is what tells an
+    ; abandoned context from a slow one at .ra_reclaim
+    mov r9, [s_rx_ms]
+    test r9, r9
+    jnz .ra_stamp
+    push rax
+    push rax                                   ; a second qword: rsp stays aligned
+    call now_ms
+    mov [s_rx_ms], rax
+    pop rax
+    pop rax
+    mov r9, [s_rx_ms]
+.ra_stamp:
+    mov [rax + linnea_quic_ra.act_ms], r9
     ; place the frame at its offset (out-of-order frames are buffered, not
     ; dropped) and record the bytes as seen; the contiguous prefix advances below.
     ; rax is this stream's reassembly context throughout.
@@ -2446,7 +2488,20 @@ linnea_quic_server_datagram:
     ; request to this buffer. The FIN rides the feed that reaches the final size.
     mov r10, [rax + linnea_quic_ra.len]
     cmp r10, [rax + linnea_quic_ra.fed]
+    jne .ra_feed
+    ; No new bytes -- but the FIN may have arrived on a frame that carried none:
+    ; a bare empty STREAM frame, or one lying entirely below the window's base.
+    ; The walk still has to be TOLD the stream ended, because completion is only
+    ; ever reached through a feed, and .fed tracks .len which ra_slide resets to
+    ; zero. Skipping the feed here left such a request buffered for ever: no
+    ; response, no reset, and the context never given back.
+    cmp qword [rax + linnea_quic_ra.fin], 0
     je .ra_fed_none
+    mov r9, [rax + linnea_quic_ra.base]
+    add r9, r10
+    cmp r9, [rax + linnea_quic_ra.final]
+    jne .ra_fed_none                           ; a gap remains before the end
+.ra_feed:
     mov [s_ra_ctx], rax                        ; the walk may fail; the handlers
                                                ; below need to find its context
     push rax
@@ -2507,9 +2562,12 @@ linnea_quic_server_datagram:
     jmp .ra_more                               ; more of the stream to come
 .ra_complete:
     ; the capture file is NOT closed here: its contents are the request body,
-    ; and the serve is about to be handed it. The close comes after.
+    ; and the serve is about to be handed it. The close comes after — and
+    ; s_ra_hold is what makes sure "after" arrives down every exit and not just
+    ; the one that serves.
     mov rax, [s_ra_ctx]
     mov qword [rax + linnea_quic_ra.active], 0
+    mov [s_ra_hold], rax
     jmp .serve_bidi
 .ra_walk_failed:
     ; the same verdicts the one-pass walk gives, and the same handlers: the
@@ -2554,6 +2612,65 @@ linnea_quic_server_datagram:
     mov [s_pl_len], rax
     call emit_1rtt
     jmp .stream_scan                           ; waiting for more frames
+.ra_reclaim:
+    ; Every context is busy — but "busy" only ever meant "claimed". A context is
+    ; held until its stream completes or faults, and a client that opens a
+    ; request stream and then walks away does neither, so RA_CTXS abandoned
+    ; streams stopped every later MULTI-FRAME request on the connection: their
+    ; frames were dropped here, silently and for good, while single-frame GETs
+    ; sailed past on the copy-free path and hid it.
+    ;
+    ; So take the least recently active context back, once it has been silent
+    ; long enough to be abandoned rather than merely slow, and reset its stream:
+    ; that client is owed an answer either way, and H3_REQUEST_REJECTED is the
+    ; true one — nothing of the request was processed and it may be retried. A
+    ; genuine burst keeps every context fed, none is stale, and this falls
+    ; through to dropping the frame exactly as before.
+    ; The candidate and its stream id live on the STACK, not in callee-saved
+    ; registers: r12d is the UDP socket emit_1rtt sends on and this calls into
+    ; it, so borrowing r12 here would have sent the reset on the low half of a
+    ; pointer. Sixteen bytes, so the call parity is unchanged either way.
+    sub rsp, 16                      ; [rsp] = the context, [rsp + 8] = its id
+    mov rax, [cur_conn]
+    lea rax, [rax + linnea_quic_conn.ra_ctx]
+    lea rcx, [rax + linnea_quic_ra_size]
+    mov edx, LINNEA_QUIC_RA_CTXS - 1
+.ra_rc_scan:
+    mov rsi, [rcx + linnea_quic_ra.act_ms]
+    cmp rsi, [rax + linnea_quic_ra.act_ms]
+    jae .ra_rc_next
+    mov rax, rcx                     ; older: the candidate so far
+.ra_rc_next:
+    add rcx, linnea_quic_ra_size
+    dec edx
+    jnz .ra_rc_scan
+    mov [rsp], rax
+    call now_ms
+    mov rcx, [rsp]
+    sub rax, [rcx + linnea_quic_ra.act_ms]
+    cmp rax, LINNEA_QUIC_RA_STALE_MS
+    jb .ra_rc_busy
+    mov rax, [rcx + linnea_quic_ra.sid]
+    mov [rsp + 8], rax
+    mov rdi, rcx
+    call ra_release                  ; the slot and its capture file, both back
+    mov rdi, [rsp + 8]
+    xor esi, esi                     ; nothing was sent in the direction we reset
+    mov edx, LINNEA_H3_ERR_REQ_REJECTED
+    call tx_reset_stream_code
+    mov rax, [rsp]                   ; ...and the new stream takes the slot
+    add rsp, 16
+    jmp .ra_start
+.ra_rc_busy:
+    add rsp, 16
+    jmp .stream_scan                 ; every context genuinely live: drop, as before
+.ra_hold_drop:
+    ; out of line, and reached only from the head of the frame loop
+    mov rdi, [s_ra_hold]
+    call ra_release
+    mov qword [s_ra_hold], 0
+    mov qword [linnea_h3_body_fd], -1
+    jmp .ra_hold_done
 .serve_bidi:
     ; Already answering this stream? Then this is a RETRANSMITTED request: the peer
     ; resent it because our ack of the original was lost (which happens exactly
@@ -2999,6 +3116,7 @@ linnea_quic_server_datagram:
     jz .no_body_fd
     call ra_release
 .no_body_fd:
+    mov qword [s_ra_hold], 0         ; released here: the frame loop need not
     mov qword [linnea_h3_body_fd], -1
     pop r9
     pop r8
@@ -5624,6 +5742,23 @@ tx_abort:
     jb .ta_each
     mov rdi, rbx
     call linnea_quic_txchunk_clear    ; drop the shared in-flight table
+    ; ...and every request stream still reassembling, which this walked past for
+    ; as long as a request body could not outlive the datagram it arrived in. It
+    ; can now: the body is captured to an O_TMPFILE, and closing that descriptor
+    ; is the only thing that gives the space back. An upload abandoned midway --
+    ; a tab closed, a phone off a train -- held one descriptor and up to max_body
+    ; of tmpfs until the worker exited. Unconditional rather than active-only: a
+    ; context whose stream COMPLETED has already given its slot back and still
+    ; holds the file, and ra_release does nothing to one with no file to close.
+    lea r13, [rbx + linnea_quic_conn.ra_ctx]
+    xor r14d, r14d
+.ta_ra:
+    mov rdi, r13
+    call ra_release
+    add r13, linnea_quic_ra_size
+    inc r14d
+    cmp r14d, LINNEA_QUIC_RA_CTXS
+    jb .ta_ra
     pop r14
     pop r13
     pop rbx

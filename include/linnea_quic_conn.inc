@@ -162,6 +162,12 @@ LINNEA_QUIC_RA_WALK     equ 8288    ; room for one linnea_h3_walk (asserted)
 ; buffer: grant sooner and it is a packet per datagram, later and the client
 ; stalls waiting on credit it has already earned.
 LINNEA_QUIC_RA_GRANT    equ LINNEA_QUIC_RA_BUF / 2
+; How long a request stream may go without a single frame before its context is
+; considered abandoned and may be taken from it (see linnea_quic_ra.act_ms). An
+; upload in progress is ack-clocked, so frames arrive every round trip; five
+; seconds of silence is a client that has gone away, not a slow one — even a
+; path bad enough to have doubled its PTO several times is well inside it.
+LINNEA_QUIC_RA_STALE_MS equ 5000
 
 ; 0-RTT (early data): a resuming client can send its request in a 0-RTT packet
 ; coalesced with the ClientHello, before the handshake completes. The decrypted
@@ -306,6 +312,13 @@ struc linnea_quic_ra
     ; the client stops at the window it was told about at the handshake.
     .base:      resq 1
     .fc_adv:    resq 1
+    ; CLOCK_MONOTONIC ms when a frame last arrived for this stream. A context is
+    ; held until its stream completes or faults, and a client that opens a
+    ; request stream and walks away completes neither — so without this the slot
+    ; is gone for the life of the connection, and RA_CTXS abandoned streams stop
+    ; every later multi-frame request on it dead. The allocator reclaims the
+    ; least recently active context once it has been silent for RA_STALE_MS.
+    .act_ms:    resq 1
     .len:      resq 1               ; contiguous bytes received from offset 0
     .hi:       resq 1               ; highest offset+len seen (extent of the seen set)
     .fin:      resq 1               ; the FIN has been seen

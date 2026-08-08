@@ -2733,8 +2733,41 @@ PYEOF
         out=$(timeout 120 python3 test/quic/h3_proxy_test.py 47462 2>&1)
         [ "$out" = "OK" ]
         check "h3 proxies to an HTTP/1.1 upstream ($out)" $?
+
+        # How a request stream ends, and what becomes of one that never does:
+        # a FIN on a frame carrying no bytes, and contexts left claimed by
+        # clients that walked away. Both are consequences of consuming a stream
+        # as it arrives, and both were silent — the client simply waited.
+        out=$(timeout 150 python3 test/quic/h3_stream_end_test.py 47462 2>&1)
+        [ "$out" = "OK" ]
+        check "h3 request streams end and are reclaimed ($out)" $?
+
+        # An upload abandoned midway leaves a capture file behind. Closing that
+        # descriptor is the only thing that returns the space, and PrivateTmp
+        # makes the space RAM — so the count has to come back DOWN once the
+        # connections are reaped, not merely stop climbing. Counted on the
+        # worker, since the master opens none of them.
+        # Not the peak, which races the idle sweep — whether the count comes
+        # back DOWN. Eight of them, so a server that keeps them is unmistakable:
+        # before the fix all eight were still open minutes later, and it is the
+        # count settling at the baseline that says the descriptor and its tmpfs
+        # pages went back.
+        h3p_worker=$(pgrep -P "$h3p_pid" | head -1)
+        fd_deleted() { ls -l /proc/"$1"/fd 2>/dev/null | grep -c '(deleted)'; }
+        before=$(fd_deleted "$h3p_worker")
+        timeout 120 python3 test/quic/h3_abandon_upload.py 47462 8 >/dev/null 2>&1
+        after=$(fd_deleted "$h3p_worker")
+        for _ in $(seq 1 75); do          # the reap runs ~30 s in; leave room
+            [ "$after" -le "$before" ] && break
+            sleep 1
+            after=$(fd_deleted "$h3p_worker")
+        done
+        [ "$after" -le "$before" ]
+        check "h3 abandoned uploads release their capture file (${before} -> ${after} after 8)" $?
     else
         check "h3 proxying (skipped: aioquic/pylsqpack unavailable)" 0
+        check "h3 request streams end and are reclaimed (skipped)" 0
+        check "h3 abandoned uploads release their capture file (skipped)" 0
     fi
     # the same path over h2, which has proxied since Q86: the two must agree
     b2=$(curl -s --http2 --max-time 6 --cacert test/tls/server.crt \
