@@ -84,6 +84,22 @@ for label, stream, want in CASES:
             print(f"FAIL {label} fragmented by {n}: rc={r.returncode} got={got}",
                   file=sys.stderr)
 
+# ...and again with the body going to a SINK rather than being joined in place.
+# That is the path a spilled upload takes, and it must recover the same body:
+# the sink is handed one run per piece of DATA payload, in order, and appending
+# them has to reconstruct exactly what the in-place join produces. Combined
+# with fragmentation because that is the combination the real thing runs — a
+# payload split across STREAM frames becomes two runs to the sink.
+for label, stream, want in CASES:
+    for n in (0, 1, 2, 5, 13, 1000):
+        r = subprocess.run(["./bin/linnea-h3test", str(n or 1000000), "sink"],
+                           input=stream, capture_output=True)
+        got = r.stdout.decode().splitlines()
+        if r.returncode != 0 or got != want:
+            fails += 1
+            print(f"FAIL {label} sink fragmented by {n}: rc={r.returncode} "
+                  f"got={got}", file=sys.stderr)
+
 if fails:
     sys.exit(1)
 print("ok")

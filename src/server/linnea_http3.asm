@@ -146,13 +146,13 @@ section .text
 ; the same verdict. Everything that can be split at any byte — a frame header,
 ; a field section, a payload — is carried in the state rather than the stack.
 ;
-; The body is joined IN PLACE, as the one-pass walk always did: each run of
-; DATA payload is moved down onto the end of the body so the whole body reads
-; as one run without a copy elsewhere. The destination is at or below the
-; source, so the overlap is safe. It does mean the caller must feed successive
-; slices of ONE buffer; feeding disjoint buffers would move bytes between them.
-; That constraint is why this is only half the job — the sink becomes the spill
-; file next, and then it goes away.
+; Runs of DATA payload go to .sink when one is set — the spill file, for a
+; stream being consumed as it arrives, so the body never has to be held whole.
+; Without a sink they are joined IN PLACE instead, as the one-pass walk always
+; did: each run is moved down onto the end of the body so the whole body reads
+; as one run without a copy elsewhere (the destination is at or below the
+; source, so the overlap is safe). That path needs the caller to be feeding
+; successive slices of ONE buffer, which is what a whole stream in one call is.
 linnea_h3_walk_feed:
     push rbx
     push r12
@@ -334,18 +334,34 @@ linnea_h3_walk_feed:
     jbe .w_d_take
     mov rax, rcx
 .w_d_take:
+    ; Where this run of body goes. A sink takes it somewhere that outlives the
+    ; bytes in hand — the spill file — which is what lets the stream be
+    ; consumed as it arrives instead of held whole. Without one the run is
+    ; joined in place, as the one-pass walk always did.
+    cmp qword [rbx + linnea_h3_walk.sink], 0
+    je .w_d_join
+    mov [rsp], rax                   ; the run's length, across the sink's call
+    mov rdi, rbx
+    mov rsi, r12
+    mov rdx, rax
+    call [rbx + linnea_h3_walk.sink]
+    test eax, eax
+    js .w_sink_failed
+    mov rax, [rsp]
+    jmp .w_d_extend
+.w_d_join:
     mov rdx, [rbx + linnea_h3_walk.body_ptr]
     test rdx, rdx
     jz .w_d_first
     add rdx, [rbx + linnea_h3_walk.body_len]   ; where the body ends now
     cmp rdx, r12
     je .w_d_extend                   ; already contiguous: nothing to move
-    push rax                         ; squeeze this run down onto that end
+    mov [rsp], rax                   ; squeeze this run down onto that end
     mov rdi, rdx
     mov rsi, r12
     mov rcx, rax
     rep movsb
-    pop rax
+    mov rax, [rsp]
     jmp .w_d_extend
 .w_d_first:
     mov [rbx + linnea_h3_walk.body_ptr], r12
@@ -413,6 +429,11 @@ linnea_h3_walk_feed:
     jmp .w_fail
 .w_qpack_bad:
     mov rax, -LINNEA_H3_ERR_QPACK
+    jmp .w_fail
+.w_sink_failed:
+    ; the body could not be put where it was going (the capture file). Ours,
+    ; not the peer's, so it is not a protocol error at all
+    mov rax, -LINNEA_H3_ERR_SINK
     jmp .w_fail
 .w_err:
     mov rax, -LINNEA_H3_ERR

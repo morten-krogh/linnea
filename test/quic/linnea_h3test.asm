@@ -22,6 +22,10 @@ walk:     resb linnea_h3_walk_size
 nl:       resb 1
 frag:     resq 1                     ; argv[1]: feed the walk this many bytes at
                                      ; a time (0 = one call with the lot)
+usesink:  resq 1                     ; argv[2]: send the body to a sink instead
+                                     ; of joining it in place
+sinkbuf:  resb 8192                  ; what the sink was handed, in order
+sinklen:  resq 1
 
 section .text
 _start:
@@ -49,6 +53,10 @@ _start:
     jmp .fd_digit
 .fd_done:
     mov [frag], rax
+    mov rax, [rsp]
+    cmp rax, 3
+    jb .no_frag
+    mov qword [usesink], 1
 .no_frag:
     xor eax, eax                     ; read stdin
     xor edi, edi
@@ -83,6 +91,11 @@ _start:
     xor eax, eax
     mov ecx, LINNEA_H3_WALK_RESET
     rep stosb
+    cmp qword [usesink], 0
+    je .no_sink
+    lea rax, [mem_sink]
+    mov [walk + linnea_h3_walk.sink], rax
+.no_sink:
     xor r13d, r13d                   ; bytes fed so far
 .frag_loop:
     mov r14, r12
@@ -114,6 +127,10 @@ _start:
 .frag_ok:
     mov r8, [walk + linnea_h3_walk.body_ptr]
     mov r9, [walk + linnea_h3_walk.body_len]
+    cmp qword [usesink], 0
+    je .parsed
+    lea r8, [sinkbuf]                ; the sink's copy is the body here
+    mov r9, [sinklen]
 .parsed:
     mov r13, r8                      ; the request body, printed last
     mov r14, r9
@@ -159,3 +176,27 @@ _start:
     mov edi, 1
     mov eax, LINNEA_SYS_EXIT
     syscall
+
+; mem_sink(rdi = walk state, rsi = bytes, rdx = length) -> rax = 0.
+; Appends each run to sinkbuf in the order the walk hands them over, which is
+; the order the body has. Touches no callee-saved register: the walk keeps its
+; whole position in them.
+mem_sink:
+    mov rax, [sinklen]
+    lea rcx, [rax + rdx]
+    cmp rcx, 8192
+    ja .ms_full
+    push rdi
+    push rsi
+    lea rdi, [sinkbuf]
+    add rdi, rax
+    mov rcx, rdx
+    rep movsb
+    pop rsi
+    pop rdi
+    add [sinklen], rdx
+    xor eax, eax
+    ret
+.ms_full:
+    mov rax, -1
+    ret

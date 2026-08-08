@@ -71,6 +71,10 @@ LINNEA_H3_ERR_UNEXPECTED equ 5
 ; truncated, that is a CONNECTION error of type H3_FRAME_ERROR. Kept apart from
 ; the malformed-request sentinel above because that one fails only the stream.
 LINNEA_H3_ERR_TRUNCATED equ 6
+; The body could not be written where it was going — the capture file. Ours to
+; own, not the peer's: nothing about the request was wrong, so it earns a 500
+; rather than a stream reset that would tell the client to blame itself.
+LINNEA_H3_ERR_SINK equ 7
 
 ; --- the request-stream frame walk -----------------------------------------
 ; A request stream is a sequence of frames, and until now it was walked in one
@@ -96,6 +100,12 @@ LINNEA_H3_W_DONE    equ 4    ; finished, or failed and not to be resumed
 LINNEA_H3_WALK_FS   equ LINNEA_HPACK_MAX_LISTSIZE
 
 struc linnea_h3_walk
+    ; Where runs of body go: sink(rdi = this state, rsi = bytes, rdx = length)
+    ; -> rax = 0 or -1. Zero means join them in place instead, which needs the
+    ; caller to be feeding slices of one buffer and is how a whole stream that
+    ; arrived at once is still handled. .sink_ctx is the sink's to use.
+    .sink:      resq 1
+    .sink_ctx:  resq 1
     .phase:     resq 1
     .frame_rem: resq 1       ; payload bytes still to consume in this frame
     ; Where the walk is in the frame SEQUENCE (RFC 9114 4.1): 0 = nothing yet,
