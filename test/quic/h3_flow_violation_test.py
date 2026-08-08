@@ -39,10 +39,22 @@ while not conn._handshake_confirmed and time.time() < dl:
     flush()
 assert conn._handshake_confirmed, "handshake failed"
 
-# Send ~16 KB on one client-initiated bidi stream — well past the server's 8 KB
-# request-stream window — with the send-side limits overridden so aioquic emits it.
+# Write PAST the end of the server's request-stream window rather than merely
+# filling it: a single frame whose data lands at offset 20000, when the window
+# advertised was 8 KB and nothing has been granted since. Volume alone no longer
+# says anything -- the server consumes a request stream as it arrives and slides
+# the window forward, so 16 KB of a WELL-FORMED stream is something it will
+# happily take. An offset beyond the credit is a violation either way.
+#
+# (16 KB of 0x00 used to serve here, but those bytes are also a valid HTTP/3
+# DATA frame arriving before any HEADERS, and the frame walk now says so first
+# -- an earlier and more specific fault, but not this one.)
 sid = conn.get_next_available_stream_id()
-conn.send_stream_data(sid, b"\x00" * 16000, end_stream=False)
+conn.send_stream_data(sid, b"", end_stream=False)
+conn._streams[sid].sender._buffer_start = 20000
+conn._streams[sid].sender._buffer_stop = 20000
+conn._streams[sid].sender._next_offset = 20000
+conn.send_stream_data(sid, b"\x01" * 64, end_stream=False)
 conn._remote_max_data = 100_000_000
 conn._remote_max_data_used = 0
 conn._streams[sid].max_stream_data_remote = 100_000_000

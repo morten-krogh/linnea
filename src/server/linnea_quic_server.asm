@@ -60,6 +60,14 @@ endstruc
 
 %define SYS_SENDTO   44
 
+; The reassembly context reserves room for a frame walk by SIZE, because the
+; header it lives in is included by files with no business knowing about
+; HTTP/3. This is the one place that sees both, so this is where they are held
+; to each other.
+%if LINNEA_QUIC_RA_WALK < linnea_h3_walk_size
+  %error "LINNEA_QUIC_RA_WALK is smaller than the walk it has to hold"
+%endif
+
 global linnea_quic_server_init
 global linnea_quic_add_vhost
 global linnea_quic_server_datagram
@@ -90,6 +98,8 @@ global linnea_h3_cancel_hook
 extern linnea_h3_build_431
 extern linnea_h3_build_421
 extern linnea_h3_read_headers
+extern linnea_h3_walk_feed
+extern linnea_h3_walk_decode
 extern linnea_h3_serve
 extern linnea_h3_srv
 extern linnea_h3_owner_idx
@@ -285,6 +295,10 @@ ku_ssecret:  resb 32
 ku_exp:      resq 1                   ; expected packet number, held across the calls
 s_tp_off:    resq 1                   ; a chunk's stream offset, held across the emit call
 s_tp_len:    resq 1                   ; and its length, for the in-flight record
+; The reassembly context a request was consumed through, or 0 when the whole
+; stream arrived in one frame and was walked from the packet. It says which of
+; the two the serve path is looking at.
+s_ra_ctx:    resq 1
 s_prio_u:    resq 1                   ; a request's parsed urgency (0-7)
 s_prio_i:    resq 1                   ; and incremental flag (0/1), for the slot fill
 ; One proxied response, handed over from the upstream leg's completion (see
@@ -2297,6 +2311,7 @@ linnea_quic_server_datagram:
     jne .ra_alloc                    ; not at offset 0: earlier bytes came elsewhere
     cmp qword [s_sfin], 0
     je .ra_alloc                     ; no FIN: more frames follow
+    mov qword [s_ra_ctx], 0          ; parsed in one pass, from the packet
     jmp .serve_bidi                  ; the whole request is here: serve it directly
 
 ; reassemble the request stream into a context's buffer, at each frame's offset.
@@ -2328,6 +2343,17 @@ linnea_quic_server_datagram:
     rep stosb
     pop rax
     mov qword [rax + linnea_quic_ra.hi], 0
+    ; the frame walk over this stream starts clean, holding its field section
+    ; rather than decoding it (the decoder's output is shared, so it cannot be
+    ; produced until the moment the request is served)
+    mov qword [rax + linnea_quic_ra.fed], 0
+    push rax
+    lea rdi, [rax + linnea_quic_ra.walk]
+    xor eax, eax
+    mov ecx, LINNEA_H3_WALK_RESET
+    rep stosb
+    pop rax
+    mov qword [rax + linnea_quic_ra.walk + linnea_h3_walk.defer], 1
 .ra_have:
     ; place the frame at its offset (out-of-order frames are buffered, not
     ; dropped) and record the bytes as seen; the contiguous prefix advances below.
@@ -2379,18 +2405,49 @@ linnea_quic_server_datagram:
     add r10, [s_slen]
     mov [rax + linnea_quic_ra.final], r10
 .ra_donecheck:
+    ; Hand the walk whatever the contiguous prefix has gained. It parses as far
+    ; as those bytes go and keeps its place, so the stream is consumed as it
+    ; arrives instead of being held until it is whole -- which is what bounded a
+    ; request to this buffer. The FIN rides the feed that reaches the final size.
+    mov r10, [rax + linnea_quic_ra.len]
+    cmp r10, [rax + linnea_quic_ra.fed]
+    je .ra_fed_none
+    mov [s_ra_ctx], rax                        ; the walk may fail; the handlers
+                                               ; below need to find its context
+    push rax
+    lea rdi, [rax + linnea_quic_ra.walk]
+    lea rsi, [rax + linnea_quic_ra.buf]
+    add rsi, [rax + linnea_quic_ra.fed]
+    mov rdx, r10
+    sub rdx, [rax + linnea_quic_ra.fed]
+    lea rcx, [req]
+    xor r8d, r8d
     cmp qword [rax + linnea_quic_ra.fin], 0
-    je .ra_more
-    mov r10, [rax + linnea_quic_ra.len]
-    cmp r10, [rax + linnea_quic_ra.final]
-    jb .ra_more                                ; a gap remains before the end
-    ; complete: serve the reassembled request from the context's buffer
-    lea r10, [rax + linnea_quic_ra.buf]
-    mov [s_sdata], r10
-    mov r10, [rax + linnea_quic_ra.len]
-    mov [s_slen], r10
+    je .ra_feed_nofin
+    mov r9, [rax + linnea_quic_ra.final]
+    cmp r10, r9
+    jne .ra_feed_nofin
+    mov r8d, 1                                 ; this feed ends the stream
+.ra_feed_nofin:
+    call linnea_h3_walk_feed
+    pop rcx
+    mov [rcx + linnea_quic_ra.fed], r10
+    test rax, rax
+    js .ra_walk_failed
+    cmp rax, 1
+    je .ra_complete
+.ra_fed_none:
+    jmp .ra_more                               ; more of the stream to come
+.ra_complete:
+    mov rax, [s_ra_ctx]
     mov qword [rax + linnea_quic_ra.active], 0
     jmp .serve_bidi
+.ra_walk_failed:
+    ; the same verdicts the one-pass walk gives, and the same handlers: the
+    ; context is done with either way
+    mov rcx, [s_ra_ctx]
+    mov qword [rcx + linnea_quic_ra.active], 0
+    jmp .req_err
 .ra_drop:
     mov qword [rax + linnea_quic_ra.active], 0  ; abandon the over-long stream
     ; the peer sent more stream data than the window we advertised
@@ -2468,13 +2525,30 @@ linnea_quic_server_datagram:
     mov [req + linnea_h2_req.hb_cur], rax
     lea rax, [h3_hdrs_buf + LINNEA_H3_HDRS_BUF]
     mov [req + linnea_h2_req.hb_end], rax
-    ; parse the HTTP/3 request (HEADERS frame -> QPACK decode)
+    ; Parse the request. A stream that arrived in one piece is walked here and
+    ; now; one that was consumed as it arrived has already been walked, and only
+    ; its field section is still to decode -- which waited for exactly this
+    ; moment, because the decoder's output is shared and cannot be produced
+    ; while other streams are still arriving.
+    cmp qword [s_ra_ctx], 0
+    jne .parse_walked
     mov rdi, [s_sdata]
     mov rsi, [s_slen]
     lea rdx, [req]
     call linnea_h3_read_headers      ; r8 = body ptr, r9 = body len on success
+    jmp .parse_done
+.parse_walked:
+    mov rdi, [s_ra_ctx]
+    add rdi, linnea_quic_ra.walk
+    lea rsi, [req]
+    call linnea_h3_walk_decode
+    mov rcx, [s_ra_ctx]              ; after the call: the decode clobbers both
+    mov r8, [rcx + linnea_quic_ra.walk + linnea_h3_walk.body_ptr]
+    mov r9, [rcx + linnea_quic_ra.walk + linnea_h3_walk.body_len]
+.parse_done:
     test rax, rax
     jz .req_ok
+.req_err:
     ; An undecodable field section is a CONNECTION error (RFC 9204 2.2.1):
     ; the encoder's table state and ours have diverged, so every later
     ; request on this connection would fail too — say so instead of leaving

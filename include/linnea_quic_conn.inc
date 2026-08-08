@@ -157,6 +157,7 @@ LINNEA_QUIC_FC_WINDOW        equ 0x400000   ; 4 MiB ahead of received
 LINNEA_QUIC_FC_GRANT_MIN     equ 0x40000    ; 256 KiB minimum grant step
 LINNEA_QUIC_CTRL_RO     equ 512     ; reordered control-stream bytes held (h3-6)
 LINNEA_QUIC_RA_CTXS     equ 6       ; requests that can reassemble concurrently
+LINNEA_QUIC_RA_WALK     equ 8288    ; room for one linnea_h3_walk (asserted)
 
 ; 0-RTT (early data): a resuming client can send its request in a 0-RTT packet
 ; coalesced with the ClientHello, before the handshake completes. The decrypted
@@ -273,6 +274,19 @@ endstruc
 struc linnea_quic_ra
     .active:   resq 1               ; 1 while this context is buffering a stream
     .sid:      resq 1               ; the stream id it is reassembling
+    ; The frame walk over this stream, carried across datagrams. The stream is
+    ; parsed as it arrives rather than once it is whole, which is what lets the
+    ; bytes stop having to all be here at the same time. It holds its field
+    ; section rather than decoding it (linnea_h3_walk.defer), so the decoder's
+    ; output stays shared instead of costing every stream its own copy.
+    ;
+    ; Reserved by size rather than by struct: this header is included by files
+    ; that have no reason to know about HTTP/3 at all, and the .inc files carry
+    ; no include guards. linnea_quic_server.asm sees both and asserts the two
+    ; agree, so the number cannot drift away from the thing it holds.
+    .walk:     resb LINNEA_QUIC_RA_WALK
+    .fed:      resq 1               ; bytes of the contiguous prefix already
+                                    ; handed to the walk
     .len:      resq 1               ; contiguous bytes received from offset 0
     .hi:       resq 1               ; highest offset+len seen (extent of the seen set)
     .fin:      resq 1               ; the FIN has been seen
