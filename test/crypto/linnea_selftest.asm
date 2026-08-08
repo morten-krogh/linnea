@@ -24,6 +24,8 @@ global _start
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 extern linnea_sha256
+extern linnea_sha1
+extern linnea_base64_encode
 extern linnea_hmac_sha256
 extern linnea_hkdf_extract
 extern linnea_hkdf_expand
@@ -56,6 +58,7 @@ extern linnea_tls_hs_input
 section .rodata
 
 mode_stdin:  db "sha256-stdin", 0
+mode_s1stdin: db "sha1-stdin", 0
 mode_xstdin: db "x25519-stdin", 0
 mode_xiter:  db "x25519-iter", 0
 mode_gseal:  db "aesgcm-stdin", 0
@@ -65,6 +68,12 @@ mode_p256sc: db "p256-scalar-stdin", 0
 mode_p256ec: db "p256-ecdsa-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
+lbl_sha1:    db "sha1 "
+lbl_sha1_len equ $ - lbl_sha1
+lbl_b64:     db "base64 "
+lbl_b64_len  equ $ - lbl_b64
+lbl_wsa:     db "ws-accept "
+lbl_wsa_len  equ $ - lbl_wsa
 lbl_hmac:    db "hmac "
 lbl_hmac_len equ $ - lbl_hmac
 lbl_ext:     db "hkdf-extract "
@@ -100,6 +109,67 @@ dummy_cert:  db 0x30, 0x82, 0x01, 0x00   ; a small opaque blob; the trace
 sep_slash:   db "/"
 nl:          db 10
 
+; SHA-1 and base64 known answers. Both exist only for the WebSocket opening
+; handshake, and both are fixed by specification, so the vectors are written
+; out here rather than generated: FIPS 180-1's own three, an exact-block-
+; multiple input (whose tail block is nothing but padding), a multi-block
+; input, and RFC 4648 4's base64 progression through every padding case.
+s1_in0:  db ""
+s1_in1:  db "abc"
+s1_in2:  db "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+s1_in3:  times 64 db "a"
+s1_in4:  times 1000 db "a"
+s1_out0: db 0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55
+         db 0xbf, 0xef, 0x95, 0x60, 0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09
+s1_out1: db 0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e
+         db 0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
+s1_out2: db 0x84, 0x98, 0x3e, 0x44, 0x1c, 0x3b, 0xd2, 0x6e, 0xba, 0xae
+         db 0x4a, 0xa1, 0xf9, 0x51, 0x29, 0xe5, 0xe5, 0x46, 0x70, 0xf1
+s1_out3: db 0x00, 0x98, 0xba, 0x82, 0x4b, 0x5c, 0x16, 0x42, 0x7b, 0xd7
+         db 0xa1, 0x12, 0x2a, 0x5a, 0x44, 0x2a, 0x25, 0xec, 0x64, 0x4d
+s1_out4: db 0x29, 0x1e, 0x9a, 0x6c, 0x66, 0x99, 0x49, 0x49, 0xb5, 0x7b
+         db 0xa5, 0xe6, 0x50, 0x36, 0x1e, 0x98, 0xfc, 0x36, 0xb1, 0xba
+
+align 8
+sha1_tests:                     ; { data, length, expected 20 bytes }
+    dq s1_in0, 0,    s1_out0
+    dq s1_in1, 3,    s1_out1
+    dq s1_in2, 56,   s1_out2
+    dq s1_in3, 64,   s1_out3
+    dq s1_in4, 1000, s1_out4
+sha1_test_count equ 5
+
+b64_in0: db "f"
+b64_in1: db "fo"
+b64_in2: db "foo"
+b64_in3: db "foob"
+b64_in4: db "fooba"
+b64_in5: db "foobar"
+b64_out0: db "Zg=="
+b64_out1: db "Zm8="
+b64_out2: db "Zm9v"
+b64_out3: db "Zm9vYg=="
+b64_out4: db "Zm9vYmE="
+b64_out5: db "Zm9vYmFy"
+
+align 8
+b64_tests:                      ; { input, length, expected, expected length }
+    dq b64_in0, 1, b64_out0, 4
+    dq b64_in1, 2, b64_out1, 4
+    dq b64_in2, 3, b64_out2, 4
+    dq b64_in3, 4, b64_out3, 8
+    dq b64_in4, 5, b64_out4, 8
+    dq b64_in5, 6, b64_out5, 8
+b64_test_count equ 6
+
+; The two composed, on RFC 6455 1.3's own example — the exact computation the
+; handshake performs, checked against the value the RFC prints.
+ws_key:  db "dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+ws_key_len equ $ - ws_key
+ws_acc:  db "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+ws_acc_len equ $ - ws_acc
+
+
 section .bss
 
 outbuf:      resb 1 << 20       ; digest / OKM / AEAD output scratch
@@ -128,6 +198,11 @@ _start:
     call streq
     test eax, eax
     jnz .stdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_s1stdin]
+    call streq
+    test eax, eax
+    jnz .s1stdin
     mov rdi, [rsp + 16]
     lea rsi, [mode_xstdin]
     call streq
@@ -197,6 +272,94 @@ _start:
     add r15, sha256_test_count
     sub r15, r13               ; += (total - pass); the count is a constant,
                                ; rcx was clobbered by report's print calls
+
+    ; SHA-1
+    lea rbx, [sha1_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.sha1_loop:
+    cmp r12, sha1_test_count
+    jae .sha1_done
+    imul rax, r12, 24
+    lea r14, [rbx + rax]
+    mov rdi, [r14 + 0]
+    mov rsi, [r14 + 8]
+    lea rdx, [outbuf]
+    call linnea_sha1
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 16]
+    mov rcx, 20
+    call memeq
+    add r13, rax
+    inc r12
+    jmp .sha1_loop
+.sha1_done:
+    lea rdi, [lbl_sha1]
+    mov rsi, lbl_sha1_len
+    mov rdx, r13
+    mov rcx, sha1_test_count
+    call report
+    add r15, sha1_test_count
+    sub r15, r13
+
+    ; base64 encoding. Both the bytes and the returned length are checked; a
+    ; wrong length would otherwise pass unnoticed on a matching prefix.
+    lea rbx, [b64_tests]
+    xor r12d, r12d
+    xor r13d, r13d
+.b64_loop:
+    cmp r12, b64_test_count
+    jae .b64_done
+    imul rax, r12, 32
+    lea r14, [rbx + rax]
+    mov rdi, [r14 + 0]
+    mov rsi, [r14 + 8]
+    lea rdx, [outbuf]
+    call linnea_base64_encode
+    cmp rax, [r14 + 24]
+    jne .b64_next
+    lea rdi, [outbuf]
+    mov rsi, [r14 + 16]
+    mov rcx, [r14 + 24]
+    call memeq
+    add r13, rax
+.b64_next:
+    inc r12
+    jmp .b64_loop
+.b64_done:
+    lea rdi, [lbl_b64]
+    mov rsi, lbl_b64_len
+    mov rdx, r13
+    mov rcx, b64_test_count
+    call report
+    add r15, b64_test_count
+    sub r15, r13
+
+    ; Sec-WebSocket-Accept, end to end
+    xor r13d, r13d
+    lea rdi, [ws_key]
+    mov rsi, ws_key_len
+    lea rdx, [outbuf]
+    call linnea_sha1
+    lea rdi, [outbuf]
+    mov rsi, 20
+    lea rdx, [outbuf + 64]
+    call linnea_base64_encode
+    cmp rax, ws_acc_len
+    jne .wsa_done
+    lea rdi, [outbuf + 64]
+    lea rsi, [ws_acc]
+    mov rcx, ws_acc_len
+    call memeq
+    mov r13, rax
+.wsa_done:
+    lea rdi, [lbl_wsa]
+    mov rsi, lbl_wsa_len
+    mov rdx, r13
+    mov rcx, 1
+    call report
+    add r15, 1
+    sub r15, r13
 
     ; HMAC
     lea rbx, [hmac_tests]
@@ -1079,6 +1242,24 @@ _start:
     mov rsi, 32
     call linnea_print_stdout
     jmp .stdin
+.s1stdin:
+    lea rdi, [lenbuf]
+    mov rsi, 4
+    call read_full
+    cmp eax, 4
+    jne .stdin_done
+    mov ecx, [lenbuf]
+    lea rdi, [inbuf]
+    mov rsi, rcx
+    call read_full
+    lea rdi, [inbuf]
+    mov esi, [lenbuf]
+    lea rdx, [outbuf]
+    call linnea_sha1
+    lea rdi, [outbuf]
+    mov rsi, 20
+    call linnea_print_stdout
+    jmp .s1stdin
 .stdin_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT

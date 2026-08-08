@@ -45,6 +45,7 @@ src/%.o: src/%.asm $(INCS)
 # --- crypto self-test binary (own _start; links only what it needs) ---
 SELFTEST_BIN  = bin/linnea-selftest
 SELFTEST_OBJS = test/crypto/linnea_selftest.o src/lib/linnea_sha256.o \
+                src/lib/linnea_sha1.o src/lib/linnea_base64.o \
                 src/lib/linnea_fe25519.o src/lib/linnea_x25519.o \
                 src/lib/linnea_p256_mont.o src/lib/linnea_p256_fe.o \
                 src/lib/linnea_p256_scalar.o src/lib/linnea_p256_point.o \
