@@ -13,6 +13,7 @@
 global _start
 extern linnea_h3_read_headers
 extern linnea_h3_walk_feed
+extern linnea_h3_walk_decode
 
 section .bss
 inbuf:    resb 8192
@@ -23,9 +24,19 @@ nl:       resb 1
 frag:     resq 1                     ; argv[1]: feed the walk this many bytes at
                                      ; a time (0 = one call with the lot)
 usesink:  resq 1                     ; argv[2]: send the body to a sink instead
-                                     ; of joining it in place
+                                     ; of joining it in place. "defer" also
+                                     ; holds the field section and decodes it
+                                     ; at the end, as a consumed-as-it-arrives
+                                     ; stream does.
+usedefer: resq 1
 sinkbuf:  resb 8192                  ; what the sink was handed, in order
 sinklen:  resq 1
+hb:       resb 8192                  ; the forwardable fields, rebuilt as h1
+                                     ; lines. Printed so the test covers the
+                                     ; ordinary headers too: checking only the
+                                     ; pseudo-headers left the LAST field of a
+                                     ; block unexamined, and truncating it is
+                                     ; exactly what a length bug does.
 
 section .text
 _start:
@@ -57,6 +68,11 @@ _start:
     cmp rax, 3
     jb .no_frag
     mov qword [usesink], 1
+    mov rsi, [rsp + 24]              ; argv[2]
+    cmp byte [rsi], 'd'              ; "defer" rather than "sink"
+    jne .no_frag
+    mov qword [usedefer], 1
+    mov qword [usesink], 0
 .no_frag:
     xor eax, eax                     ; read stdin
     xor edi, edi
@@ -74,6 +90,11 @@ _start:
     mov [req + linnea_h2_req.scratch], rax
     lea rax, [scratch + 8192]
     mov [req + linnea_h2_req.scratch_end], rax
+    lea rax, [hb]
+    mov [req + linnea_h2_req.hb_start], rax
+    mov [req + linnea_h2_req.hb_cur], rax
+    lea rax, [hb + 8192]
+    mov [req + linnea_h2_req.hb_end], rax
     cmp qword [frag], 0
     jne .fragmented
     lea rdi, [inbuf]
@@ -96,6 +117,8 @@ _start:
     lea rax, [mem_sink]
     mov [walk + linnea_h3_walk.sink], rax
 .no_sink:
+    mov rax, [usedefer]
+    mov [walk + linnea_h3_walk.defer], rax
     xor r13d, r13d                   ; bytes fed so far
 .frag_loop:
     mov r14, r12
@@ -125,6 +148,14 @@ _start:
     jb .frag_loop
     jmp .fail                        ; ran out of input without a verdict
 .frag_ok:
+    cmp qword [usedefer], 0
+    je .frag_body
+    lea rdi, [walk]                  ; the held field section, decoded now
+    lea rsi, [req]
+    call linnea_h3_walk_decode
+    test rax, rax
+    jnz .fail
+.frag_body:
     mov r8, [walk + linnea_h3_walk.body_ptr]
     mov r9, [walk + linnea_h3_walk.body_len]
     cmp qword [usesink], 0
@@ -149,9 +180,40 @@ _start:
     mov rdi, r13                     ; body bytes as one line (empty if none)
     mov rsi, r14
     call .putline
+    mov rdi, [req + linnea_h2_req.hb_cur]   ; the rebuilt field lines, CRs out
+    lea rsi, [hb]
+    sub rdi, rsi
+    call .put_hb
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall
+; .put_hb(rdi = length) — the rebuilt lines, with the CRs dropped so each
+; field reads as its own line. An empty rebuild prints nothing at all.
+.put_hb:
+    lea rsi, [hb]
+    xor rcx, rcx
+.ph_next:
+    cmp rcx, rdi
+    jae .ph_done
+    cmp byte [rsi + rcx], 13
+    je .ph_skip
+    push rdi
+    push rsi
+    push rcx
+    lea rsi, [rsi + rcx]
+    mov edx, 1
+    mov eax, LINNEA_SYS_WRITE
+    mov edi, 1
+    syscall
+    pop rcx
+    pop rsi
+    pop rdi
+.ph_skip:
+    inc rcx
+    jmp .ph_next
+.ph_done:
+    ret
+
 .putline:
     push rdi
     push rsi

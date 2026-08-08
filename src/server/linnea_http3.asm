@@ -11,6 +11,7 @@ default rel
 
 global linnea_h3_read_headers
 global linnea_h3_walk_feed
+global linnea_h3_walk_decode
 global linnea_h3_build_response
 global linnea_h3_build_431
 global linnea_h3_build_421
@@ -259,6 +260,8 @@ linnea_h3_walk_feed:
     mov rcx, [rbx + linnea_h3_walk.frame_rem]
     cmp qword [rbx + linnea_h3_walk.fs_have], 0
     jne .w_fields_accum              ; already accumulating: keep to one place
+    cmp qword [rbx + linnea_h3_walk.defer], 0
+    jne .w_fields_accum              ; held for later: it has to be copied out
     cmp rcx, rax
     ja .w_fields_accum
     mov rdi, r12                     ; the whole section is contiguous
@@ -288,6 +291,8 @@ linnea_h3_walk_feed:
     add r12, rax
     sub [rbx + linnea_h3_walk.frame_rem], rax
     jnz .w_step                      ; more of the section still to come
+    cmp qword [rbx + linnea_h3_walk.defer], 0
+    jne .w_fields_held
     lea rdi, [rbx + linnea_h3_walk.fs]
     mov rsi, [rbx + linnea_h3_walk.fs_have]
 .w_decode:
@@ -311,6 +316,11 @@ linnea_h3_walk_feed:
     call linnea_hpack_req_check
     test rax, rax
     js .w_err
+    mov qword [rbx + linnea_h3_walk.seq], 1
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_HEADER
+    jmp .w_step
+.w_fields_held:
+    ; the section is whole in .fs; the caller decodes it when it serves
     mov qword [rbx + linnea_h3_walk.seq], 1
     mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_HEADER
     jmp .w_step
@@ -444,6 +454,48 @@ linnea_h3_walk_feed:
     pop rbp
     pop r15
     pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_h3_walk_decode(rdi = walk state, rsi = req) -> rax = 0 | -err.
+; Decode the field section a deferred walk held, at the point the request is
+; finally served. Same verdicts as decoding it inline: the bytes are the same
+; bytes, only later, and the caller has just armed the req the decoder fills.
+linnea_h3_walk_decode:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    lea rdi, [rbx + linnea_h3_walk.fs]
+    mov rsi, [rbx + linnea_h3_walk.fs_have]
+    mov rdx, r12
+    call linnea_qpack_decode
+    test rax, rax
+    jns .wd_ok
+    ; the same mapping the inline decode makes: a semantic breach fails the
+    ; stream, a bound fails the request, anything else fails the connection
+    cmp qword [r12 + linnea_h2_req.malformed], 0
+    jne .wd_err
+    cmp rax, -LINNEA_HPACK_ERR_LIMIT
+    jne .wd_qpack
+    mov rax, -LINNEA_H3_ERR_TOOLARGE
+    jmp .wd_ret
+.wd_ok:
+    mov rdi, r12
+    call linnea_hpack_req_check
+    test rax, rax
+    js .wd_err
+    xor eax, eax
+    jmp .wd_ret
+.wd_qpack:
+    mov rax, -LINNEA_H3_ERR_QPACK
+    jmp .wd_ret
+.wd_err:
+    mov rax, -LINNEA_H3_ERR
+.wd_ret:
     pop r13
     pop r12
     pop rbx

@@ -31,7 +31,12 @@ def data_frame(body):
 
 REQ = [(b":method", b"GET"), (b":path", b"/hello.txt"), (b":scheme", b"https"),
        (b":authority", b"linnea.amberbio.com"), (b"accept", b"*/*")]
+# The pseudo-headers, then the body, then the fields rebuilt as h1 lines. The
+# rebuild is what a proxied request forwards, and printing it is what makes the
+# LAST field of a block covered — checking pseudo-headers alone left it unseen,
+# so a decode one byte short went unnoticed.
 WANT = ["GET", "/hello.txt", "https", "linnea.amberbio.com"]
+REBUILT = ["accept: */*"]
 
 hf = headers_frame(REQ)
 # The body is the concatenation of every DATA frame's payload (RFC 9114 4.1),
@@ -39,22 +44,22 @@ hf = headers_frame(REQ)
 # is the body linnea recovered.
 big = bytes((i * 7 + 3) % 26 + 97 for i in range(900))
 CASES = [
-    ("plain", hf, WANT + [""]),
+    ("plain", hf, WANT + [""] + REBUILT),
     # an unknown (grease) frame type before HEADERS must be skipped
-    ("skip-unknown", vlq(0x21) + vlq(3) + b"\x00\x00\x00" + hf, WANT + [""]),
-    ("one-data", hf + data_frame(b"ABCDEFGH"), WANT + ["ABCDEFGH"]),
+    ("skip-unknown", vlq(0x21) + vlq(3) + b"\x00\x00\x00" + hf, WANT + [""] + REBUILT),
+    ("one-data", hf + data_frame(b"ABCDEFGH"), WANT + ["ABCDEFGH"] + REBUILT),
     ("split-data", hf + data_frame(b"ABCD") + data_frame(b"EFGH"),
-     WANT + ["ABCDEFGH"]),
+     WANT + ["ABCDEFGH"] + REBUILT),
     # three frames, the middle one empty, and a trailing grease frame between two
     # of them: the payloads still join in order and nothing else leaks in
     ("split-data-gaps",
      hf + data_frame(b"AB") + data_frame(b"") + vlq(0x21) + vlq(2) + b"xx"
         + data_frame(b"CD") + data_frame(b"EF"),
-     WANT + ["ABCDEF"]),
+     WANT + ["ABCDEF"] + REBUILT),
     # a split whose pieces are long enough that the moves overlap heavily
     ("split-data-big",
      hf + b"".join(data_frame(big[i:i + 100]) for i in range(0, len(big), 100)),
-     WANT + [big.decode()]),
+     WANT + [big.decode()] + REBUILT),
 ]
 
 fails = 0
@@ -98,6 +103,21 @@ for label, stream, want in CASES:
         if r.returncode != 0 or got != want:
             fails += 1
             print(f"FAIL {label} sink fragmented by {n}: rc={r.returncode} "
+                  f"got={got}", file=sys.stderr)
+
+# ...and with the field section HELD and decoded at the end, which is how a
+# stream consumed as it arrives has to do it: decoding when the headers land
+# would mean carrying the decoder's output -- the request, the arena its
+# pointers reach into, the rebuilt header lines -- per stream until it is
+# served. Deferring must reach the same request as decoding inline.
+for label, stream, want in CASES:
+    for n in (0, 1, 2, 5, 13, 1000):
+        r = subprocess.run(["./bin/linnea-h3test", str(n or 1000000), "defer"],
+                           input=stream, capture_output=True)
+        got = r.stdout.decode().splitlines()
+        if r.returncode != 0 or got != want:
+            fails += 1
+            print(f"FAIL {label} deferred fragmented by {n}: rc={r.returncode} "
                   f"got={got}", file=sys.stderr)
 
 if fails:
