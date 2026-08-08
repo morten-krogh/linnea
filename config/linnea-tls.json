@@ -1,6 +1,7 @@
 {
   "log": "linnea.log",
   "timeout": 60,
+  "max_body": 8388608,
   "servers": [
     {
       "host": "0.0.0.0", "port": 443, "hostname": "linnea.amberbio.com",
