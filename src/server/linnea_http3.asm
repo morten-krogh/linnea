@@ -10,6 +10,7 @@ default rel
 %include "linnea_syscall.inc"
 
 global linnea_h3_read_headers
+global linnea_h3_walk_feed
 global linnea_h3_build_response
 global linnea_h3_build_431
 global linnea_h3_build_421
@@ -129,8 +130,303 @@ linnea_h3_tx_cap: resq 1
 linnea_h3_body_off: resq 1
 linnea_h3_body_len: resq 1
 h3_crange_buf: resb 80                ; "bytes first-last/size" / "bytes */size"
+; The one request-stream walk. One at a time is enough while the caller feeds a
+; whole stream in a single call; driving it incrementally moves this into the
+; per-stream context, which is what lets several uploads run at once.
+h3_walk: resb linnea_h3_walk_size
 
 section .text
+
+; linnea_h3_walk_feed(rdi = walk state, rsi = bytes, rdx = length, rcx = req,
+;   r8 = 1 when these bytes end the stream) -> rax = 0 more of the stream is
+;   needed, 1 the request is complete, or -LINNEA_H3_ERR_* .
+;
+; The request-stream frame walk, resumable: it may be called once with a whole
+; stream or many times with successive pieces of one, and the two must reach
+; the same verdict. Everything that can be split at any byte — a frame header,
+; a field section, a payload — is carried in the state rather than the stack.
+;
+; The body is joined IN PLACE, as the one-pass walk always did: each run of
+; DATA payload is moved down onto the end of the body so the whole body reads
+; as one run without a copy elsewhere. The destination is at or below the
+; source, so the overlap is safe. It does mean the caller must feed successive
+; slices of ONE buffer; feeding disjoint buffers would move bytes between them.
+; That constraint is why this is only half the job — the sink becomes the spill
+; file next, and then it goes away.
+linnea_h3_walk_feed:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 8                       ; [rsp] = the frame type across two decodes
+    mov rbx, rdi                     ; walk state
+    mov r12, rsi                     ; cursor
+    lea r13, [rsi + rdx]             ; end of what arrived
+    mov r14, rcx                     ; req
+    mov r15, r8                      ; does the stream end here?
+    cmp qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_DONE
+    je .w_spent
+.w_step:
+    mov rax, [rbx + linnea_h3_walk.phase]
+    cmp rax, LINNEA_H3_W_HEADER
+    je .w_header
+    cmp rax, LINNEA_H3_W_FIELDS
+    je .w_fields
+    cmp rax, LINNEA_H3_W_DATA
+    je .w_data
+    jmp .w_skip
+
+; --- a frame header: two varints, taken a byte at a time so a header split
+; across STREAM frames resumes exactly where it stopped ---------------------
+.w_header:
+    cmp r12, r13
+    jae .w_input_end
+    mov rcx, [rbx + linnea_h3_walk.hdr_len]
+    cmp rcx, 16
+    jae .w_truncated                 ; unreachable: two varints are 16 bytes at
+                                     ; most, so a header cannot outgrow .hdr —
+                                     ; and a frame we cannot read the header of
+                                     ; is a frame error, as 7.1 has it
+    movzx eax, byte [r12]
+    mov [rbx + linnea_h3_walk.hdr + rcx], al
+    inc rcx
+    mov [rbx + linnea_h3_walk.hdr_len], rcx
+    inc r12
+    lea rdi, [rbx + linnea_h3_walk.hdr]
+    lea rsi, [rdi + rcx]
+    call linnea_quic_varint_decode   ; the type
+    test rdx, rdx
+    jz .w_header                     ; incomplete: another byte
+    mov [rsp], rax                   ; hold it across the length's decode
+    lea rdi, [rbx + linnea_h3_walk.hdr]
+    add rdi, rdx
+    lea rsi, [rbx + linnea_h3_walk.hdr]
+    add rsi, [rbx + linnea_h3_walk.hdr_len]
+    call linnea_quic_varint_decode   ; the payload length
+    test rdx, rdx
+    jz .w_header
+    mov qword [rbx + linnea_h3_walk.hdr_len], 0
+    mov [rbx + linnea_h3_walk.frame_rem], rax
+    mov rcx, [rsp]
+    cmp rcx, LINNEA_H3_FRAME_HEADERS
+    je .w_headers_frame
+    cmp rcx, LINNEA_H3_FRAME_DATA
+    je .w_data_frame
+    ; Neither. A request stream carries only those two; the reserved HTTP/2
+    ; types (0x02..0x09, RFC 9114 7.2.8), the control/push frames and
+    ; MAX_PUSH_ID are a connection error here, as is PRIORITY_UPDATE (RFC 9218
+    ; 7.2) which belongs on the control stream. GREASE and any other unknown
+    ; type MUST be ignored (7.2, 9).
+    cmp rcx, LINNEA_H3_FRAME_MAX_PUSH_ID
+    je .w_unexpected
+    mov rdx, rcx
+    sub rdx, 2
+    cmp rdx, 7                       ; original type in 0x02..0x09
+    jbe .w_unexpected
+    cmp rcx, LINNEA_H3_FRAME_PRIORITY_UPDATE
+    je .w_unexpected
+    cmp rcx, LINNEA_H3_FRAME_PRIORITY_UPDATE_PUSH
+    je .w_unexpected
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_SKIP
+    jmp .w_step
+.w_headers_frame:
+    ; A HEADERS after the first is a trailer section, which must NOT merge into
+    ; the request: a trailing range or if-none-match would change the response
+    ; the client never asked to change. A third is an invalid sequence (4.1).
+    mov rcx, [rbx + linnea_h3_walk.seq]
+    cmp rcx, 2
+    jae .w_unexpected
+    test rcx, rcx
+    jnz .w_trailer
+    mov qword [rbx + linnea_h3_walk.fs_have], 0
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_FIELDS
+    jmp .w_step
+.w_trailer:
+    mov qword [rbx + linnea_h3_walk.seq], 2
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_SKIP
+    jmp .w_step
+.w_data_frame:
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_DATA
+    jmp .w_step
+
+; --- a HEADERS payload: decoded where it lies when it all arrived together,
+; which is every request that fits one packet; accumulated only when split ---
+.w_fields:
+    mov rax, r13
+    sub rax, r12                     ; bytes in hand
+    mov rcx, [rbx + linnea_h3_walk.frame_rem]
+    cmp qword [rbx + linnea_h3_walk.fs_have], 0
+    jne .w_fields_accum              ; already accumulating: keep to one place
+    cmp rcx, rax
+    ja .w_fields_accum
+    mov rdi, r12                     ; the whole section is contiguous
+    mov rsi, rcx
+    add r12, rcx
+    mov qword [rbx + linnea_h3_walk.frame_rem], 0
+    jmp .w_decode
+.w_fields_accum:
+    test rax, rax
+    jz .w_input_end
+    cmp rax, rcx
+    jbe .w_fa_take
+    mov rax, rcx
+.w_fa_take:
+    mov rdx, [rbx + linnea_h3_walk.fs_have]
+    lea rcx, [rdx + rax]
+    cmp rcx, LINNEA_H3_WALK_FS
+    ja .w_toolarge
+    push rax
+    lea rdi, [rbx + linnea_h3_walk.fs]
+    add rdi, rdx
+    mov rsi, r12
+    mov rcx, rax
+    rep movsb
+    pop rax
+    add [rbx + linnea_h3_walk.fs_have], rax
+    add r12, rax
+    sub [rbx + linnea_h3_walk.frame_rem], rax
+    jnz .w_step                      ; more of the section still to come
+    lea rdi, [rbx + linnea_h3_walk.fs]
+    mov rsi, [rbx + linnea_h3_walk.fs_have]
+.w_decode:
+    mov rdx, r14
+    call linnea_qpack_decode         ; 0 | -err
+    test rax, rax
+    jns .w_decoded
+    ; A request that broke a semantic rule decoded fine — the QPACK state is
+    ; intact, so RFC 9114 4.1.2 fails the STREAM, which -LINNEA_H3_ERR does.
+    cmp qword [r14 + linnea_h2_req.malformed], 0
+    jne .w_err
+    ; a header list past our bound is a resource limit, answerable on the
+    ; stream; only a genuine decode failure is a connection error
+    cmp rax, -LINNEA_HPACK_ERR_LIMIT
+    jne .w_qpack_bad
+    jmp .w_toolarge
+.w_decoded:
+    ; the whole-request rules (an agreeing, plausible authority from one source
+    ; or the other) — shared with HTTP/2
+    mov rdi, r14
+    call linnea_hpack_req_check
+    test rax, rax
+    js .w_err
+    mov qword [rbx + linnea_h3_walk.seq], 1
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_HEADER
+    jmp .w_step
+
+; --- a DATA payload: the body is the concatenation of every DATA frame's
+; payload (4.1), which an encoder may split any way it likes ----------------
+.w_data:
+    mov rcx, [rbx + linnea_h3_walk.seq]
+    test rcx, rcx
+    jz .w_unexpected                 ; DATA before HEADERS
+    cmp rcx, 2
+    jae .w_unexpected                ; ...and DATA after the trailer section
+    cmp qword [rbx + linnea_h3_walk.frame_rem], 0
+    je .w_frame_end
+    mov rax, r13
+    sub rax, r12
+    test rax, rax
+    jz .w_input_end
+    mov rcx, [rbx + linnea_h3_walk.frame_rem]
+    cmp rax, rcx
+    jbe .w_d_take
+    mov rax, rcx
+.w_d_take:
+    mov rdx, [rbx + linnea_h3_walk.body_ptr]
+    test rdx, rdx
+    jz .w_d_first
+    add rdx, [rbx + linnea_h3_walk.body_len]   ; where the body ends now
+    cmp rdx, r12
+    je .w_d_extend                   ; already contiguous: nothing to move
+    push rax                         ; squeeze this run down onto that end
+    mov rdi, rdx
+    mov rsi, r12
+    mov rcx, rax
+    rep movsb
+    pop rax
+    jmp .w_d_extend
+.w_d_first:
+    mov [rbx + linnea_h3_walk.body_ptr], r12
+.w_d_extend:
+    add [rbx + linnea_h3_walk.body_len], rax
+    add r12, rax
+    sub [rbx + linnea_h3_walk.frame_rem], rax
+    jnz .w_step
+    jmp .w_frame_end
+
+; --- a payload we do not read: grease, an unknown type, or a trailer section
+.w_skip:
+    cmp qword [rbx + linnea_h3_walk.frame_rem], 0
+    je .w_frame_end
+    mov rax, r13
+    sub rax, r12
+    test rax, rax
+    jz .w_input_end
+    mov rcx, [rbx + linnea_h3_walk.frame_rem]
+    cmp rax, rcx
+    jbe .w_s_take
+    mov rax, rcx
+.w_s_take:
+    add r12, rax
+    sub [rbx + linnea_h3_walk.frame_rem], rax
+    jnz .w_step
+.w_frame_end:
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_HEADER
+    jmp .w_step
+
+; --- the bytes in hand ran out ---------------------------------------------
+.w_input_end:
+    test r15, r15
+    jz .w_more                       ; more of the stream is still to come
+    ; The stream has ended here. Both entries to the serve require the FIN, so
+    ; a walk stopped inside a frame means its last frame was cut short — RFC
+    ; 9114 7.1 makes that a connection error, not a stream one.
+    cmp qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_HEADER
+    jne .w_truncated
+    cmp qword [rbx + linnea_h3_walk.hdr_len], 0
+    jne .w_truncated
+    cmp qword [rbx + linnea_h3_walk.seq], 0
+    je .w_noheaders
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_DONE
+    mov eax, 1
+    jmp .w_ret
+.w_more:
+    xor eax, eax
+    jmp .w_ret
+.w_spent:
+    ; bytes after the walk finished, which the caller should not have fed
+    mov rax, -LINNEA_H3_ERR_UNEXPECTED
+    jmp .w_ret
+.w_unexpected:
+    mov rax, -LINNEA_H3_ERR_UNEXPECTED
+    jmp .w_fail
+.w_truncated:
+    mov rax, -LINNEA_H3_ERR_TRUNCATED
+    jmp .w_fail
+.w_noheaders:
+    mov rax, -LINNEA_H3_ERR_NOHEADERS
+    jmp .w_fail
+.w_toolarge:
+    mov rax, -LINNEA_H3_ERR_TOOLARGE
+    jmp .w_fail
+.w_qpack_bad:
+    mov rax, -LINNEA_H3_ERR_QPACK
+    jmp .w_fail
+.w_err:
+    mov rax, -LINNEA_H3_ERR
+.w_fail:
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_DONE
+.w_ret:
+    add rsp, 8
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; linnea_h3_read_headers(rdi=stream, rsi=len, rdx=req)
 ;   -> rax = 0 | -err, and on success r8 = request-body ptr, r9 = body length
@@ -144,175 +440,40 @@ section .text
 ;   hold the entire request.
 ; Body ptr/len live in stack locals [rsp]/[rsp+8] during the walk (all callee-
 ; saved registers are already in use) and move to r8/r9 at return.
+; linnea_h3_read_headers(rdi=stream, rsi=len, rdx=req)
+;   -> rax = 0 | -err, and on success r8 = request-body ptr, r9 = body length
+;   (0 if none).
+; A request whose stream arrived whole, which is every request until the walk
+; above is driven incrementally: reset the walk and feed it the lot WITH the
+; FIN, so it must reach a verdict rather than ask for more.
 linnea_h3_read_headers:
     push rbx
     push r12
-    push r13
-    push r14
-    push r15
-    push rbp
-    sub rsp, 24                      ; [rsp]=body ptr, [rsp+8]=body len (16-aligned)
-    mov r14, rdx                     ; req
-    mov r12, rdi                     ; cursor
-    lea r13, [rdi + rsi]             ; end
-    xor r15d, r15d                   ; HEADERS seen yet?
-    mov qword [rsp], 0               ; body ptr
-    mov qword [rsp + 8], 0           ; body len
-.frame:
-    cmp r12, r13
-    jae .done
-    ; frame type (varint_decode takes rdi=cursor, rsi=end)
-    mov rdi, r12
-    mov rsi, r13
-    call linnea_quic_varint_decode
-    test rdx, rdx
-    jz .truncated
-    mov rbx, rax                     ; frame type
-    add r12, rdx
-    ; frame length
-    mov rdi, r12
-    mov rsi, r13
-    call linnea_quic_varint_decode
-    test rdx, rdx
-    jz .truncated
-    add r12, rdx                     ; -> payload
-    ; the payload must fit in the remaining stream bytes
+    push r13                         ; three pushes: the calls stay 16-aligned
+    mov rbx, rdi                     ; stream
+    mov r12, rsi                     ; length
+    mov r13, rdx                     ; req
+    lea rdi, [h3_walk]
+    xor eax, eax
+    mov ecx, LINNEA_H3_WALK_RESET
+    rep stosb
+    lea rdi, [h3_walk]
+    mov rsi, rbx
+    mov rdx, r12
     mov rcx, r13
-    sub rcx, r12
-    cmp rax, rcx
-    ja .truncated
-    cmp rbx, LINNEA_H3_FRAME_HEADERS
-    je .headers
-    cmp rbx, LINNEA_H3_FRAME_DATA
-    je .data
-    ; Neither HEADERS nor DATA. A request stream carries only those two; the
-    ; reserved HTTP/2 types (0x02/0x06/0x08/0x09, RFC 9114 7.2.8) and the
-    ; control/push frames — CANCEL_PUSH/SETTINGS/PUSH_PROMISE/GOAWAY (0x03..0x07)
-    ; and MAX_PUSH_ID (0x0d) — are a connection error H3_FRAME_UNEXPECTED here.
-    ; GREASE (0x1f*N+0x21) and any other unknown type MUST be ignored (7.2, 9).
-    cmp rbx, 0x0d
-    je .frame_unexpected
-    mov rcx, rbx
-    sub rcx, 2
-    cmp rcx, 7                        ; original type in 0x02..0x09
-    jbe .frame_unexpected
-    ; PRIORITY_UPDATE belongs on the control stream, and RFC 9218 7.2 makes it
-    ; H3_FRAME_UNEXPECTED anywhere else — including here
-    cmp rbx, LINNEA_H3_FRAME_PRIORITY_UPDATE
-    je .frame_unexpected
-    cmp rbx, LINNEA_H3_FRAME_PRIORITY_UPDATE_PUSH
-    je .frame_unexpected
-    add r12, rax                     ; grease / unknown: skip its payload
-    jmp .frame
-.headers:
-    ; A HEADERS after the first is a trailer section (RFC 9114 4.1). We serve
-    ; from the request headers, not trailers, and must NOT let a trailer merge
-    ; into the request struct: a trailing `range`/`if-none-match`/etc. would
-    ; otherwise change the response the client never asked to change. Skip it
-    ; unread; the request was already parsed from the first HEADERS.
-    ;
-    ; r15d is the position in that sequence: 0 = nothing yet, 1 = the request
-    ; headers are in, 2 = the trailers have been and gone. A request stream is
-    ; HEADERS, then DATA, then AT MOST ONE trailer section and nothing after it
-    ; — so a third HEADERS is an invalid sequence, which 4.1 makes a connection
-    ; error of type H3_FRAME_UNEXPECTED. Both of those used to be accepted: the
-    ; second HEADERS was skipped as a trailer and every one after it was skipped
-    ; again, so a stream could carry any number of them.
-    cmp r15d, 2
-    jae .frame_unexpected            ; a frame after the trailer section
-    test r15d, r15d
-    jnz .trailer_seen
-    mov rdi, r12                     ; QPACK field section
-    mov rsi, rax
-    mov rdx, r14
-    mov rbp, rax                     ; keep the field-section length
-    call linnea_qpack_decode         ; returns 0 | -err
+    mov r8d, 1
+    call linnea_h3_walk_feed
+    cmp rax, 1
+    je .rh_ok
     test rax, rax
-    jns .decoded
-    ; a request that broke a semantic rule decoded fine — the QPACK state is
-    ; intact, so RFC 9114 4.1.2 fails the STREAM, which -LINNEA_H3_ERR does
-    cmp qword [r14 + linnea_h2_req.malformed], 0
-    jne .err
-    ; a header list past our bound is a resource limit, answerable on the
-    ; stream; only a genuine decode failure is a connection error
-    cmp rax, -LINNEA_HPACK_ERR_LIMIT
-    jne .qpack_broken
-    mov rax, -LINNEA_H3_ERR_TOOLARGE
-    jmp .ret
-.qpack_broken:
-    mov rax, -LINNEA_H3_ERR_QPACK    ; the caller ends the connection with it
-    jmp .ret
-.decoded:
-    ; the whole-request rules (an agreeing, plausible authority from one
-    ; source or the other) — shared with HTTP/2
-    mov rdi, r14
-    call linnea_hpack_req_check
-    test rax, rax
-    js .err
-    mov r15d, 1                      ; HEADERS decoded
-    add r12, rbp                     ; past the field section
-    jmp .frame
-.data:
-    ; the DATA frames after HEADERS carry the request body, which is the
-    ; concatenation of their payloads (RFC 9114 4.1) — an encoder may split one
-    ; body across any number of them
-    test r15d, r15d
-    jz .frame_unexpected             ; DATA before HEADERS (RFC 9114 4.1)
-    cmp r15d, 2
-    jae .frame_unexpected            ; ...and DATA after the trailer section
-    cmp qword [rsp], 0
-    jne .data_join                   ; a body is already started: append to it
-    mov [rsp], r12                   ; body ptr
-    mov [rsp + 8], rax               ; body len
-    add r12, rax
-    jmp .frame
-.data_join:
-    ; The payloads are already contiguous but for the frame headers between them,
-    ; so squeeze this one down onto the end of the body in place rather than
-    ; copying the body elsewhere. The destination is the body's end, which is
-    ; below this payload by at least the two bytes of its own frame header, so a
-    ; forward copy is safe on the overlap. It also stays within this frame: the
-    ; last byte written is at most the payload's own last byte, so the frames
-    ; still to be walked are untouched.
-    mov rdi, [rsp]
-    add rdi, [rsp + 8]               ; dst = end of the body so far
-    mov rsi, r12                     ; src = this payload
-    mov rcx, rax
-    add [rsp + 8], rax               ; the body grows by this payload
-    add r12, rax                     ; cursor past it, in the original layout
-    rep movsb
-    jmp .frame
-.trailer_seen:                       ; a dead-end reached only by the jump in
-    mov r15d, 2                      ; .headers: the trailer section closes the
-    add r12, rax                     ; stream's frame sequence, so advance past
-    jmp .frame                       ; its field section without decoding it
-.frame_unexpected:                   ; a dead-end reached only by explicit jumps
-    mov rax, -LINNEA_H3_ERR_UNEXPECTED
-    jmp .ret
-.done:
-    test r15d, r15d
-    jz .noheaders
-    xor eax, eax                     ; a complete request
-    jmp .ret
-.noheaders:
-    mov rax, -LINNEA_H3_ERR_NOHEADERS
-    jmp .ret
-.truncated:
-    ; a frame header running off the end, or a declared payload longer than what
-    ; arrived. Both entries here require the FIN, so the stream has terminated
-    ; cleanly and its last frame is cut short — RFC 9114 7.1 makes that a
-    ; connection error, not a stream one.
-    mov rax, -LINNEA_H3_ERR_TRUNCATED
-    jmp .ret
-.err:
-    mov rax, -LINNEA_H3_ERR
-.ret:
-    mov r8, [rsp]                    ; body ptr / len out (0 if none)
-    mov r9, [rsp + 8]
-    add rsp, 24
-    pop rbp
-    pop r15
-    pop r14
+    js .rh_ret                       ; the walk's own error code
+    mov rax, -LINNEA_H3_ERR_TRUNCATED   ; unreachable: it was given the FIN
+    jmp .rh_ret
+.rh_ok:
+    xor eax, eax
+.rh_ret:
+    mov r8, [h3_walk + linnea_h3_walk.body_ptr]
+    mov r9, [h3_walk + linnea_h3_walk.body_len]
     pop r13
     pop r12
     pop rbx

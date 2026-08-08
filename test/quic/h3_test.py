@@ -65,6 +65,25 @@ for label, stream, want in CASES:
         fails += 1
         print(f"FAIL {label}: rc={r.returncode} got={got}", file=sys.stderr)
 
+# The same streams, fed to the walk a few bytes at a time. Every fragmentation
+# must reach the same verdict and the same body as one call with the lot: a
+# frame header, a field section and a payload can each be split at any byte,
+# and a walk that carries its position wrongly across one of those boundaries
+# is exactly the failure the incremental upload path would rest on. A size of 1
+# is the brutal case — every varint arrives a byte at a time.
+#
+# The network cannot be made to split where a test wants, so this is driven
+# through the walk directly rather than over QUIC.
+for label, stream, want in CASES:
+    for n in (1, 2, 3, 5, 7, 13, 64, 1000):
+        r = subprocess.run(["./bin/linnea-h3test", str(n)],
+                           input=stream, capture_output=True)
+        got = r.stdout.decode().splitlines()
+        if r.returncode != 0 or got != want:
+            fails += 1
+            print(f"FAIL {label} fragmented by {n}: rc={r.returncode} got={got}",
+                  file=sys.stderr)
+
 if fails:
     sys.exit(1)
 print("ok")

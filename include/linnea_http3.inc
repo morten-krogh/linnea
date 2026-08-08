@@ -72,6 +72,46 @@ LINNEA_H3_ERR_UNEXPECTED equ 5
 ; the malformed-request sentinel above because that one fails only the stream.
 LINNEA_H3_ERR_TRUNCATED equ 6
 
+; --- the request-stream frame walk -----------------------------------------
+; A request stream is a sequence of frames, and until now it was walked in one
+; pass over a stream that had been reassembled whole. That is what bounds an
+; HTTP/3 request to the reassembly buffer, and so bounds an upload to 8 KB: the
+; window advertised for a client's request stream cannot exceed what we can
+; hold, or a body between the two overflows reassembly, is dropped WITHOUT an
+; ack, and the client retransmits it forever.
+;
+; This walk carries its position across STREAM frames instead, so the stream
+; can be consumed as it arrives. Same shape as the control stream's walk
+; (linnea_quic_server.asm), including the buffer for a frame header split
+; across a boundary — a type and a length varint, so 16 bytes covers it.
+LINNEA_H3_W_HEADER  equ 0    ; accumulating a frame header
+LINNEA_H3_W_FIELDS  equ 1    ; inside a HEADERS payload
+LINNEA_H3_W_DATA    equ 2    ; inside a DATA payload
+LINNEA_H3_W_SKIP    equ 3    ; inside a payload we do not read
+LINNEA_H3_W_DONE    equ 4    ; finished, or failed and not to be resumed
+; The field section must be decoded whole, so a section split across STREAM
+; frames is accumulated here first. Bounded by the decoded-list limit QPACK
+; already enforces: an encoding cannot be larger than the list it decodes to,
+; since RFC 7541 4.1 charges 32 bytes per field on top of its bytes.
+LINNEA_H3_WALK_FS   equ LINNEA_HPACK_MAX_LISTSIZE
+
+struc linnea_h3_walk
+    .phase:     resq 1
+    .frame_rem: resq 1       ; payload bytes still to consume in this frame
+    ; Where the walk is in the frame SEQUENCE (RFC 9114 4.1): 0 = nothing yet,
+    ; 1 = the request headers are in, 2 = the trailer section has been and gone.
+    .seq:       resq 1
+    .hdr_len:   resq 1       ; bytes of a split frame header held in .hdr
+    .fs_have:   resq 1       ; field-section bytes accumulated in .fs
+    .body_ptr:  resq 1       ; the request body, joined as one run
+    .body_len:  resq 1
+    .hdr:       resb 16
+    .fs:        resb LINNEA_H3_WALK_FS
+endstruc
+; Everything before the accumulator is reset per request; .fs needs no clearing
+; because .fs_have says how much of it is live.
+LINNEA_H3_WALK_RESET equ linnea_h3_walk.fs
+
 ; A response body up to this size is written into the response packet directly
 ; (one packet, as ever). A larger body is not copied at all: linnea_h3_serve
 ; hands back the file mapping and writes only the stream's head — the HEADERS

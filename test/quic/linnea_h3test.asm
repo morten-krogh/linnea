@@ -7,18 +7,49 @@
 
 %include "linnea_syscall.inc"
 %include "linnea_hpack.inc"
+%include "linnea_config.inc"   ; LINNEA_MAX_ROOT, which linnea_http3.inc builds on
+%include "linnea_http3.inc"
 
 global _start
 extern linnea_h3_read_headers
+extern linnea_h3_walk_feed
 
 section .bss
 inbuf:    resb 8192
 scratch:  resb 8192
 req:      resb linnea_h2_req_size
+walk:     resb linnea_h3_walk_size
 nl:       resb 1
+frag:     resq 1                     ; argv[1]: feed the walk this many bytes at
+                                     ; a time (0 = one call with the lot)
 
 section .text
 _start:
+    ; argv[1], when given, is a fragment size: the same stream is fed to the
+    ; walk that many bytes at a time. Every fragmentation must reach the same
+    ; verdict and the same body as one call with the lot -- that is the whole
+    ; property the incremental path will rest on, and it cannot be tested
+    ; through a socket because nothing makes the network split where you want.
+    mov qword [frag], 0
+    mov rax, [rsp]                   ; argc
+    cmp rax, 2
+    jb .no_frag
+    mov rsi, [rsp + 16]              ; argv[1]
+    xor eax, eax
+.fd_digit:
+    movzx ecx, byte [rsi]
+    test cl, cl
+    jz .fd_done
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .fd_done
+    imul rax, rax, 10
+    add rax, rcx
+    inc rsi
+    jmp .fd_digit
+.fd_done:
+    mov [frag], rax
+.no_frag:
     xor eax, eax                     ; read stdin
     xor edi, edi
     lea rsi, [inbuf]
@@ -35,12 +66,55 @@ _start:
     mov [req + linnea_h2_req.scratch], rax
     lea rax, [scratch + 8192]
     mov [req + linnea_h2_req.scratch_end], rax
+    cmp qword [frag], 0
+    jne .fragmented
     lea rdi, [inbuf]
     mov rsi, r12
     lea rdx, [req]
     call linnea_h3_read_headers
     test rax, rax
     jnz .fail
+    jmp .parsed
+.fragmented:
+    ; drive the walk by hand, in slices of ONE buffer (the body join is in
+    ; place, so the slices have to be of the same buffer -- which is exactly
+    ; how the QUIC layer will feed it)
+    lea rdi, [walk]
+    xor eax, eax
+    mov ecx, LINNEA_H3_WALK_RESET
+    rep stosb
+    xor r13d, r13d                   ; bytes fed so far
+.frag_loop:
+    mov r14, r12
+    sub r14, r13                     ; bytes left
+    cmp r14, [frag]
+    jbe .frag_last
+    mov r14, [frag]
+.frag_last:
+    lea rdi, [walk]
+    lea rsi, [inbuf + r13]
+    mov rdx, r14
+    lea rcx, [req]
+    xor r8d, r8d                     ; the FIN rides the last slice only
+    mov rbp, r13
+    add rbp, r14
+    cmp rbp, r12
+    jne .frag_call
+    mov r8d, 1
+.frag_call:
+    call linnea_h3_walk_feed
+    test rax, rax
+    js .fail
+    mov r13, rbp
+    cmp rax, 1
+    je .frag_ok
+    cmp r13, r12
+    jb .frag_loop
+    jmp .fail                        ; ran out of input without a verdict
+.frag_ok:
+    mov r8, [walk + linnea_h3_walk.body_ptr]
+    mov r9, [walk + linnea_h3_walk.body_len]
+.parsed:
     mov r13, r8                      ; the request body, printed last
     mov r14, r9
     mov rdi, [req + linnea_h2_req.method_ptr]
