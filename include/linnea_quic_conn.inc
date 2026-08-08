@@ -147,7 +147,7 @@ LINNEA_QUIC_PU_PEND equ 8
 ; would drop all but one (the packet is already acknowledged, so the dropped
 ; request is never retransmitted — it is lost, and the page stalls). Requests
 ; larger than the buffer, or a burst deeper than the contexts, are still dropped.
-LINNEA_QUIC_RA_BUF      equ 8192    ; reassembly capacity for one request stream
+LINNEA_QUIC_RA_BUF      equ 32768   ; reassembly capacity for one request stream
 ; Receive-side connection flow control (quic-9). We advertise INITIAL_MAX_DATA and
 ; keep the ceiling FC_WINDOW ahead of what the peer has sent, re-granting via
 ; MAX_DATA whenever a fresh grant would advance the ceiling by >= FC_GRANT_MIN.
@@ -287,6 +287,13 @@ struc linnea_quic_ra
     .walk:     resb LINNEA_QUIC_RA_WALK
     .fed:      resq 1               ; bytes of the contiguous prefix already
                                     ; handed to the walk
+    ; The request body, captured as it arrives. It cannot stay in .buf: the
+    ; buffer is reused the moment this datagram is done with, and an upstream
+    ; leg does not send until its connect completes. O_TMPFILE, so it has no
+    ; name, nothing else can see it, and the kernel reclaims it when the fd
+    ; closes -- including if we are killed mid-upload.
+    .spill_fd:  resq 1              ; -1 = none opened
+    .spill_len: resq 1
     .len:      resq 1               ; contiguous bytes received from offset 0
     .hi:       resq 1               ; highest offset+len seen (extent of the seen set)
     .fin:      resq 1               ; the FIN has been seen

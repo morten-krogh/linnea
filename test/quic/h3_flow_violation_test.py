@@ -40,20 +40,24 @@ while not conn._handshake_confirmed and time.time() < dl:
 assert conn._handshake_confirmed, "handshake failed"
 
 # Write PAST the end of the server's request-stream window rather than merely
-# filling it: a single frame whose data lands at offset 20000, when the window
-# advertised was 8 KB and nothing has been granted since. Volume alone no longer
-# says anything -- the server consumes a request stream as it arrives and slides
-# the window forward, so 16 KB of a WELL-FORMED stream is something it will
-# happily take. An offset beyond the credit is a violation either way.
+# filling it, and take the window from the server rather than from a constant
+# here: it is a size that changes as the receive path changes, and a test that
+# guessed it would quietly stop testing anything the moment it grew.
 #
-# (16 KB of 0x00 used to serve here, but those bytes are also a valid HTTP/3
-# DATA frame arriving before any HEADERS, and the frame walk now says so first
-# -- an earlier and more specific fault, but not this one.)
+# Volume says nothing on its own any more. The server consumes a request stream
+# as it arrives, so a large WELL-FORMED stream is something it will take; only
+# an offset beyond the credit is a violation, and that is true whatever the
+# window is. (16 KB of 0x00 used to serve here, but those bytes are also a valid
+# HTTP/3 DATA frame arriving before any HEADERS, and the frame walk now says so
+# first -- an earlier and more specific fault, but not this one.)
+window = conn._remote_max_stream_data_bidi_remote
+assert window > 0, "no request-stream window was advertised"
+beyond = window + 4096
 sid = conn.get_next_available_stream_id()
 conn.send_stream_data(sid, b"", end_stream=False)
-conn._streams[sid].sender._buffer_start = 20000
-conn._streams[sid].sender._buffer_stop = 20000
-conn._streams[sid].sender._next_offset = 20000
+conn._streams[sid].sender._buffer_start = beyond
+conn._streams[sid].sender._buffer_stop = beyond
+conn._streams[sid].sender._next_offset = beyond
 conn.send_stream_data(sid, b"\x01" * 64, end_stream=False)
 conn._remote_max_data = 100_000_000
 conn._remote_max_data_used = 0

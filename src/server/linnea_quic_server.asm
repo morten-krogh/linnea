@@ -21,6 +21,7 @@ default rel
 %include "linnea_hpack.inc"
 %include "linnea_http3.inc"
 %include "linnea_config.inc"
+%include "linnea_uring.inc"      ; errno names, for the body capture below
 
 ; A TLS virtual host reachable over HTTP/3: the ClientHello's SNI selects one, and
 ; the handshake serves its certificate, signs CertVerify with its key, and answers
@@ -100,6 +101,8 @@ extern linnea_h3_build_421
 extern linnea_h3_read_headers
 extern linnea_h3_walk_feed
 extern linnea_h3_walk_decode
+extern linnea_config_instance
+extern linnea_h3_body_fd
 extern linnea_h3_serve
 extern linnea_h3_srv
 extern linnea_h3_owner_idx
@@ -220,6 +223,9 @@ extern linnea_quic_early_ok
 extern linnea_quic_resume_issued
 extern linnea_quic_ticket_within_lifetime
 section .rodata
+; The directory only supplies the filesystem — O_TMPFILE creates no entry in
+; it. The unit runs with PrivateTmp, so this is a namespace of our own.
+ra_spill_dir: db "/tmp", 0
 quic_alpn_h3:   db "h3"        ; the one application protocol this server offers
 ; Retry integrity tag key and nonce, fixed by the RFC per QUIC version:
 ; v1 RFC 9001 5.8, v2 RFC 9369 3.3. They authenticate a Retry to any client
@@ -2312,6 +2318,7 @@ linnea_quic_server_datagram:
     cmp qword [s_sfin], 0
     je .ra_alloc                     ; no FIN: more frames follow
     mov qword [s_ra_ctx], 0          ; parsed in one pass, from the packet
+    mov qword [linnea_h3_body_fd], -1   ; ...and its body is in the packet too
     jmp .serve_bidi                  ; the whole request is here: serve it directly
 
 ; reassemble the request stream into a context's buffer, at each frame's offset.
@@ -2354,6 +2361,15 @@ linnea_quic_server_datagram:
     rep stosb
     pop rax
     mov qword [rax + linnea_quic_ra.walk + linnea_h3_walk.defer], 1
+    ; the body goes to a file of this context's own, not into .buf
+    mov qword [rax + linnea_quic_ra.spill_fd], -1
+    mov qword [rax + linnea_quic_ra.spill_len], 0
+    mov [rax + linnea_quic_ra.walk + linnea_h3_walk.sink_ctx], rax
+    push rax
+    lea rax, [ra_body_sink]
+    mov rcx, [rsp]
+    mov [rcx + linnea_quic_ra.walk + linnea_h3_walk.sink], rax
+    pop rax
 .ra_have:
     ; place the frame at its offset (out-of-order frames are buffered, not
     ; dropped) and record the bytes as seen; the contiguous prefix advances below.
@@ -2439,17 +2455,22 @@ linnea_quic_server_datagram:
 .ra_fed_none:
     jmp .ra_more                               ; more of the stream to come
 .ra_complete:
+    ; the capture file is NOT closed here: its contents are the request body,
+    ; and the serve is about to be handed it. The close comes after.
     mov rax, [s_ra_ctx]
     mov qword [rax + linnea_quic_ra.active], 0
     jmp .serve_bidi
 .ra_walk_failed:
     ; the same verdicts the one-pass walk gives, and the same handlers: the
     ; context is done with either way
-    mov rcx, [s_ra_ctx]
-    mov qword [rcx + linnea_quic_ra.active], 0
+    mov rdi, [s_ra_ctx]
+    call ra_release
     jmp .req_err
 .ra_drop:
-    mov qword [rax + linnea_quic_ra.active], 0  ; abandon the over-long stream
+    push rax
+    mov rdi, rax
+    call ra_release                             ; abandon the over-long stream
+    pop rax
     ; the peer sent more stream data than the window we advertised
     ; (initial_max_stream_data_bidi_remote == the reassembly buffer): a flow-control
     ; violation, so close the connection (RFC 9000 4.1: FLOW_CONTROL_ERROR = 0x03).
@@ -2543,8 +2564,13 @@ linnea_quic_server_datagram:
     lea rsi, [req]
     call linnea_h3_walk_decode
     mov rcx, [s_ra_ctx]              ; after the call: the decode clobbers both
-    mov r8, [rcx + linnea_quic_ra.walk + linnea_h3_walk.body_ptr]
-    mov r9, [rcx + linnea_quic_ra.walk + linnea_h3_walk.body_len]
+    ; The body is in the context's capture file, not in memory. Hand over the
+    ; descriptor: whoever wants the bytes maps it, and a mapping outlives the
+    ; close below, so nothing has to agree about who owns the fd.
+    mov r10, [rcx + linnea_quic_ra.spill_fd]
+    mov [linnea_h3_body_fd], r10
+    xor r8d, r8d
+    mov r9, [rcx + linnea_quic_ra.spill_len]
 .parse_done:
     test rax, rax
     jz .req_ok
@@ -2866,6 +2892,20 @@ linnea_quic_server_datagram:
     mov r11, [s_sid]
     mov [linnea_h3_owner_sid], r11
     call linnea_h3_serve             ; rax = h3 response length (or the head's);
+    push rax                         ; the capture file has been mapped by now
+    push rdx                         ; if anyone wanted it; the mapping outlives
+    push r8                          ; the close, so this is simply the last
+    push r9                          ; reference going away
+    mov rdi, [s_ra_ctx]
+    test rdi, rdi
+    jz .no_body_fd
+    call ra_release
+.no_body_fd:
+    mov qword [linnea_h3_body_fd], -1
+    pop r9
+    pop r8
+    pop rdx
+    pop rax
                                      ; r9 != 0: chunked — r8/r9 = file mapping;
                                      ; rax = -1: proxied, and parked
     cmp rax, -1
@@ -5679,7 +5719,8 @@ reset_teardown:
     je .rt_ra_next
     cmp qword [rax + linnea_quic_ra.sid], r13
     jne .rt_ra_next
-    mov qword [rax + linnea_quic_ra.active], 0
+    mov rdi, rax
+    call ra_release
     jmp .rt_done
 .rt_ra_next:
     inc r14d
@@ -6160,4 +6201,89 @@ linnea_quic_server_drain_sweep:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ra_body_sink(rdi = the walk, rsi = bytes, rdx = length) -> rax = 0 | -1.
+; Where a request body goes while its stream is still arriving. The walk hands
+; over one run per piece of DATA payload; they are appended to a file of the
+; context's own, because .buf is reused the moment this datagram is finished
+; with and an upstream leg does not send until its connect completes.
+; The walk keeps its position in callee-saved registers, so this touches none.
+ra_body_sink:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, [rdi + linnea_h3_walk.sink_ctx]     ; the context this walk is in
+    mov r12, rsi
+    mov r13, rdx
+    cmp qword [rbx + linnea_quic_ra.spill_fd], -1
+    jne .bs_have_fd
+    lea rdi, [ra_spill_dir]
+    mov esi, LINNEA_O_TMPFILE | LINNEA_O_RDWR | LINNEA_O_CLOEXEC
+    mov edx, LINNEA_MODE_0600
+    mov eax, LINNEA_SYS_OPEN
+    syscall
+    cmp rax, -4095
+    jae .bs_fail
+    mov [rbx + linnea_quic_ra.spill_fd], rax
+.bs_have_fd:
+    ; the cap is max_body, the same one an h1 upload is held to
+    mov rax, [rbx + linnea_quic_ra.spill_len]
+    add rax, r13
+    mov r14, rax
+    lea rax, [linnea_config_instance]
+    mov rax, [rax + linnea_config.max_body]
+    cmp r14, rax
+    ja .bs_fail
+.bs_write:
+    test r13, r13
+    jz .bs_done
+    mov edi, [rbx + linnea_quic_ra.spill_fd]
+    mov rsi, r12
+    mov rdx, r13
+    mov eax, LINNEA_SYS_WRITE
+    syscall
+    cmp rax, -4095
+    jae .bs_retry
+    test rax, rax
+    jz .bs_fail                                  ; no progress: a full filesystem
+    add [rbx + linnea_quic_ra.spill_len], rax
+    add r12, rax
+    sub r13, rax
+    jmp .bs_write
+.bs_retry:
+    cmp rax, -LINNEA_EINTR
+    je .bs_write
+    cmp rax, -LINNEA_EAGAIN
+    je .bs_write
+.bs_fail:
+    mov rax, -1
+    jmp .bs_ret
+.bs_done:
+    xor eax, eax
+.bs_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ra_release(rdi = context) — give up a context, closing any capture file with
+; it. Closing is what returns the disk space: an O_TMPFILE has no link, so the
+; kernel reclaims it here. A mapping taken from it outlives the close, which is
+; how a body reaches an upstream leg.
+ra_release:
+    mov qword [rdi + linnea_quic_ra.active], 0
+    mov rax, [rdi + linnea_quic_ra.spill_fd]
+    cmp rax, -1
+    je .rr_none
+    push rdi
+    mov edi, eax
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    pop rdi
+    mov qword [rdi + linnea_quic_ra.spill_fd], -1
+.rr_none:
+    mov qword [rdi + linnea_quic_ra.spill_len], 0
     ret

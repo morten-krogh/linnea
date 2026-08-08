@@ -148,6 +148,20 @@ for name in ("keep-alive", "te", "trailer", "proxy-connection", "proxy-authentic
 st, hd, body = request("/api/echo", body=b"hello over h3", method=b"POST")
 want("post echoed", body == "hello over h3", repr(body))
 
+# ...including one far past a single packet. An h3 request used to be bounded
+# by the buffer it was reassembled in, so an upload could not exceed 8 KB and a
+# larger one simply stalled -- the client was flow-controlled to a window that
+# never moved. The stream is consumed as it arrives now and its body captured to
+# a file, so what bounds it is the window, not the buffer a request is held in.
+# (printable bytes, so the helper's lossy decode round-trips and a difference
+# is a difference rather than an artefact of comparing through it)
+for n in (20000, 30000):
+    payload = bytes((i * 37 + 11) % 26 + 97 for i in range(n))
+    st, hd, body = request("/api/echo", body=payload, method=b"POST")
+    want(f"upload of {n} bytes", st == "200", str(st))
+    want(f"upload of {n} bytes intact", body == payload.decode(),
+         f"{len(body)} of {n} bytes back")
+
 # HEAD is deliberately not checked here. A HEAD response states the content
 # length the GET would have had and carries no body (RFC 9110 9.3.2), and this
 # client cannot accept that: aioquic's H3Connection does not track the request

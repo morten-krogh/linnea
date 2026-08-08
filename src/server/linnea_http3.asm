@@ -26,6 +26,7 @@ global linnea_h3_owner_sid
 global linnea_h3_proxy_hook
 global linnea_h3_proxy_body_ptr
 global linnea_h3_proxy_body_len
+global linnea_h3_body_fd
 
 extern linnea_hpack_req_check
 extern linnea_quic_varint_decode
@@ -113,6 +114,11 @@ linnea_h3_proxy_hook: resq 1
 ; joined into one run.
 linnea_h3_proxy_body_ptr: resq 1
 linnea_h3_proxy_body_len: resq 1
+; ...or, when the stream was consumed as it arrived, the file it was captured
+; into (-1 = none). The bytes are too many and too long-lived to sit in the
+; reassembly buffer: that is reused as soon as the datagram is done with, and a
+; proxied request does not go upstream until its connect completes.
+linnea_h3_body_fd: resq 1
 ; Where emit_field rebuilds the client's forwardable headers as h1 lines, for
 ; the request we send upstream. Same size as h2's, and overflow is detectable:
 ; the rebuild parks hb_cur past hb_end rather than writing past it.

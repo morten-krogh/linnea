@@ -70,6 +70,7 @@ extern linnea_h3_build_response
 ; builders stay linkable without any of the upstream machinery)
 extern linnea_h3_proxy_body_ptr
 extern linnea_h3_proxy_body_len
+extern linnea_h3_body_fd
 ; the delivery parameter block and the entry point that consumes it, both in
 ; the QUIC server: the response stream slots are its to hand out
 extern linnea_quic_h3_deliver
@@ -264,7 +265,6 @@ linnea_h3_proxy_start:
     mov rax, [rbx + linnea_h2_req.hb_cur]
     sub rax, [rbx + linnea_h2_req.hb_start]
     add rcx, rax
-    add rcx, [linnea_h3_proxy_body_len]               ; the body rides behind it
     add rcx, http11_host_len + hdr_clen_len + hdr_via_len + hdr_close_len + 32
     cmp rcx, LINNEA_CONN_UP_BUF
     ja .st_toobig
@@ -319,19 +319,50 @@ linnea_h3_proxy_start:
     lea rdi, [hdr_close]             ; one request per upstream connection,
     mov esi, hdr_close_len           ; then the empty line that ends the head
     call .up_append
-    ; the body goes straight behind the head, so head and body are one send
-    test r13, r13
-    jz .st_sendwin
-    mov rdi, [linnea_h3_proxy_body_ptr]
-    mov rsi, r13
-    call .up_append
 .st_sendwin:
     lea rax, [r12 + linnea_connection.up_buf]
     mov [r12 + linnea_connection.out_ptr], rax
     mov rcx, rbp
     sub rcx, rax
     mov [r12 + linnea_connection.out_rem], rcx
-    mov qword [r12 + linnea_connection.file_rem], 0   ; nothing queued behind it
+    ; The body is QUEUED behind the head rather than copied in with it: the
+    ; head send drains file_ptr/file_rem next, which is how h1 has always sent
+    ; a captured upload. Copying was fine while a body could not outgrow the
+    ; buffer; now that a request stream is consumed as it arrives, it can.
+    mov qword [r12 + linnea_connection.file_rem], 0
+    test r13, r13
+    jz .st_socket
+    mov rax, [linnea_h3_body_fd]
+    cmp rax, -1
+    jne .st_body_file
+    ; still in memory (a request that arrived in one frame): it fits, and the
+    ; bytes live only as long as this datagram, so take a copy behind the head
+    mov rdi, [linnea_h3_proxy_body_ptr]
+    mov rsi, r13
+    call .up_append
+    mov rcx, rbp
+    lea rax, [r12 + linnea_connection.up_buf]
+    sub rcx, rax
+    mov [r12 + linnea_connection.out_rem], rcx
+    jmp .st_socket
+.st_body_file:
+    ; captured on the way in: map it, and let the leg own the mapping. The
+    ; descriptor is the caller's to close — a mapping outlives it.
+    xor edi, edi
+    mov rsi, r13
+    mov edx, LINNEA_PROT_READ
+    mov r10d, LINNEA_MAP_PRIVATE
+    mov r8d, eax
+    xor r9d, r9d
+    mov eax, LINNEA_SYS_MMAP
+    syscall
+    cmp rax, -4095
+    jae .st_nomap
+    mov [r12 + linnea_connection.file_base], rax
+    mov [r12 + linnea_connection.file_ptr], rax
+    mov [r12 + linnea_connection.file_size], r13
+    mov [r12 + linnea_connection.file_rem], r13
+.st_socket:
     ; --- the socket, which the loop then connects --------------------
     mov eax, LINNEA_SYS_SOCKET
     mov edi, LINNEA_AF_INET
@@ -359,6 +390,11 @@ linnea_h3_proxy_start:
     mov rdi, r12
     call linnea_h3_proxy_release
     mov eax, 502
+    jmp .st_ret
+.st_nomap:
+    mov rdi, r12
+    call .st_drop
+    mov eax, 500                     ; the body is on disk and we cannot read it
     jmp .st_ret
 .st_nosock:
     mov rdi, r12
@@ -1177,8 +1213,18 @@ linnea_h3_proxy_release:
 .rl_nofd:
     mov rdi, rbx
     call linnea_spill_release
-    ; a mapping still owned here (a path that failed after spill_finish) is the
-    ; caller's to release: it may have handed ownership to a response slot
+    ; the REQUEST body's mapping, if this leg took one. The response's mapping
+    ; is not here: that one is handed to a response-stream slot, which unmaps it
+    ; when the stream is done, and the deliver path clears these first.
+    mov rdi, [rbx + linnea_connection.file_base]
+    test rdi, rdi
+    jz .rl_nomap
+    push rbx
+    mov rsi, [rbx + linnea_connection.file_size]
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+    pop rbx
+.rl_nomap:
     mov qword [rbx + linnea_connection.file_base], 0
     mov qword [rbx + linnea_connection.file_size], 0
     mov qword [rbx + linnea_connection.file_rem], 0

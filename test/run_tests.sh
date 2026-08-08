@@ -129,6 +129,21 @@ if [ -n "$strays" ]; then
     exit 1
 fi
 
+# ...and a backend from an earlier run, which is worse than it sounds. The
+# suite starts its own on 47100 at the point it needs one, and until then
+# nothing should answer there: several tests turn on a proxied path being
+# UNREACHABLE. A leftover backend makes /api/anything a 404 from the backend
+# rather than a 502 from a dead upstream, and the failure names the wrong
+# thing entirely. Cheap to detect, and it has caught real confusion twice.
+if (echo > /dev/tcp/127.0.0.1/47100) >/dev/null 2>&1; then
+    echo "FATAL: something is already listening on 127.0.0.1:47100." >&2
+    echo "  That is this suite's proxy backend port, and it starts its own" >&2
+    echo "  later — tests that need an UNREACHABLE upstream would pass or" >&2
+    echo "  fail for the wrong reason. Probably a leftover:" >&2
+    ps -eo pid,args | grep "[p]roxy_backend" >&2
+    exit 1
+fi
+
 # --- config parsing and validation ---
 run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test locations=3" \
     timeout 0.5 $BIN --config test/configs/listen.json
