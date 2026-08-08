@@ -158,6 +158,10 @@ LINNEA_QUIC_FC_GRANT_MIN     equ 0x40000    ; 256 KiB minimum grant step
 LINNEA_QUIC_CTRL_RO     equ 512     ; reordered control-stream bytes held (h3-6)
 LINNEA_QUIC_RA_CTXS     equ 6       ; requests that can reassemble concurrently
 LINNEA_QUIC_RA_WALK     equ 8288    ; room for one linnea_h3_walk (asserted)
+; How far the request-stream window may slide before the peer is told. Half the
+; buffer: grant sooner and it is a packet per datagram, later and the client
+; stalls waiting on credit it has already earned.
+LINNEA_QUIC_RA_GRANT    equ LINNEA_QUIC_RA_BUF / 2
 
 ; 0-RTT (early data): a resuming client can send its request in a 0-RTT packet
 ; coalesced with the ClientHello, before the handshake completes. The decrypted
@@ -294,6 +298,14 @@ struc linnea_quic_ra
     ; closes -- including if we are killed mid-upload.
     .spill_fd:  resq 1              ; -1 = none opened
     .spill_len: resq 1
+    ; The window slides. .base is the stream offset buf[0] holds, so .len and
+    ; .hi are measured from there rather than from the start of the stream, and
+    ; a request is bounded by how much of it is UNCONSUMED at once rather than
+    ; by how long it is. .fc_adv is the ceiling last granted to the peer
+    ; (base + the buffer); a fresh MAX_STREAM_DATA goes out as it advances, or
+    ; the client stops at the window it was told about at the handshake.
+    .base:      resq 1
+    .fc_adv:    resq 1
     .len:      resq 1               ; contiguous bytes received from offset 0
     .hi:       resq 1               ; highest offset+len seen (extent of the seen set)
     .fin:      resq 1               ; the FIN has been seen

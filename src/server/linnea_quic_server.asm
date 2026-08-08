@@ -97,6 +97,7 @@ global linnea_h3d_flen
 global linnea_h3_cancel_hook
 
 extern linnea_h3_build_431
+extern linnea_h3_build_413
 extern linnea_h3_build_421
 extern linnea_h3_read_headers
 extern linnea_h3_walk_feed
@@ -350,6 +351,7 @@ acc_peer_buf: resb 64                  ; the peer's address text, for the access
 ; does not link). A draining worker opens no new connections.
 linnea_quic_draining: resd 1
 goaway_pay:  resb 24                  ; a GOAWAY STREAM frame on the control stream
+msd_pay:     resb 24                  ; one MAX_STREAM_DATA frame
 maxstreams_pay: resb 16               ; a MAX_STREAMS frame raising the peer's limit
 ch_out:      resb linnea_quic_ch_size
 ; Per-connection ephemeral X25519 private key and ServerHello random, refilled
@@ -2364,6 +2366,8 @@ linnea_quic_server_datagram:
     ; the body goes to a file of this context's own, not into .buf
     mov qword [rax + linnea_quic_ra.spill_fd], -1
     mov qword [rax + linnea_quic_ra.spill_len], 0
+    mov qword [rax + linnea_quic_ra.base], 0
+    mov qword [rax + linnea_quic_ra.fc_adv], LINNEA_QUIC_RA_BUF
     mov [rax + linnea_quic_ra.walk + linnea_h3_walk.sink_ctx], rax
     push rax
     lea rax, [ra_body_sink]
@@ -2374,17 +2378,32 @@ linnea_quic_server_datagram:
     ; place the frame at its offset (out-of-order frames are buffered, not
     ; dropped) and record the bytes as seen; the contiguous prefix advances below.
     ; rax is this stream's reassembly context throughout.
-    mov r9, [s_soff]                           ; offset
-    mov r10, [s_slen]                          ; length
+    mov r9, [s_soff]                           ; the frame's stream offset
+    mov r10, [s_slen]                          ; and length
+    mov rsi, [s_sdata]
+    ; The window has a base: everything below it has been consumed already, so
+    ; a retransmit of those bytes says nothing new. Trim them rather than
+    ; treating the frame as out of range.
+    mov r11, [rax + linnea_quic_ra.base]
+    cmp r9, r11
+    jae .ra_rel
+    mov rcx, r11
+    sub rcx, r9                                ; bytes below the base
+    cmp rcx, r10
+    jae .ra_below                              ; all of it: nothing to place
+    add rsi, rcx
+    sub r10, rcx
+    mov r9, r11
+.ra_rel:
+    sub r9, r11                                ; offset within the window
     mov r11, r9
-    add r11, r10                               ; frame end = offset + len
+    add r11, r10                               ; where the frame ends in it
     cmp r11, LINNEA_QUIC_RA_BUF
-    ja .ra_drop                                ; past the buffer: request too large
+    ja .ra_drop                                ; past the window we advertised
     test r10, r10
     jz .ra_hi_upd                              ; empty frame (e.g. a lone FIN)
     lea rdi, [rax + linnea_quic_ra.buf]
-    add rdi, r9                                ; dest = buf + offset
-    mov rsi, [s_sdata]
+    add rdi, r9                                ; dest = buf + the relative offset
     mov rcx, r10
     rep movsb                                  ; copy the frame's bytes (rax intact)
     lea rdi, [rax + linnea_quic_ra.seen]       ; mark those bytes seen. bts takes
@@ -2419,7 +2438,7 @@ linnea_quic_server_datagram:
     mov qword [rax + linnea_quic_ra.fin], 1
     mov r10, [s_soff]
     add r10, [s_slen]
-    mov [rax + linnea_quic_ra.final], r10
+    mov [rax + linnea_quic_ra.final], r10      ; an absolute stream offset
 .ra_donecheck:
     ; Hand the walk whatever the contiguous prefix has gained. It parses as far
     ; as those bytes go and keeps its place, so the stream is consumed as it
@@ -2440,8 +2459,9 @@ linnea_quic_server_datagram:
     xor r8d, r8d
     cmp qword [rax + linnea_quic_ra.fin], 0
     je .ra_feed_nofin
-    mov r9, [rax + linnea_quic_ra.final]
-    cmp r10, r9
+    mov r9, [rax + linnea_quic_ra.base]        ; the contiguous end, absolutely
+    add r9, r10
+    cmp r9, [rax + linnea_quic_ra.final]
     jne .ra_feed_nofin
     mov r8d, 1                                 ; this feed ends the stream
 .ra_feed_nofin:
@@ -2452,6 +2472,37 @@ linnea_quic_server_datagram:
     js .ra_walk_failed
     cmp rax, 1
     je .ra_complete
+    ; Consumed: slide the window over it, so what bounds a request is how much
+    ; of it is unread at once rather than how long it is. Then tell the peer,
+    ; or it stops at the window it was given during the handshake and the
+    ; upload stalls at exactly the size this was meant to stop mattering.
+    mov rdi, [s_ra_ctx]
+    mov rsi, [rdi + linnea_quic_ra.len]
+    call ra_slide
+    mov rdi, [s_ra_ctx]
+    mov rax, [rdi + linnea_quic_ra.base]
+    add rax, LINNEA_QUIC_RA_BUF                ; the ceiling it may now reach
+    mov rcx, rax
+    sub rcx, [rdi + linnea_quic_ra.fc_adv]
+    cmp rcx, LINNEA_QUIC_RA_GRANT
+    jb .ra_fed_none
+    mov [rdi + linnea_quic_ra.fc_adv], rax
+    mov byte [msd_pay], 0x11                   ; MAX_STREAM_DATA
+    push rax
+    lea rdi, [msd_pay + 1]
+    mov rsi, [s_sid]
+    call linnea_quic_varint_encode             ; rax = the id's varint length
+    lea rdi, [msd_pay + 1]
+    add rdi, rax
+    mov r8, rax
+    pop rsi                                    ; the new ceiling
+    push r8
+    call linnea_quic_varint_encode
+    pop r8
+    lea rdx, [rax + r8 + 1]                    ; type byte + both varints
+    lea rsi, [msd_pay]
+    call .send_1rtt                            ; buffered for loss recovery: a
+                                               ; lost grant is a stalled upload
 .ra_fed_none:
     jmp .ra_more                               ; more of the stream to come
 .ra_complete:
@@ -2462,10 +2513,22 @@ linnea_quic_server_datagram:
     jmp .serve_bidi
 .ra_walk_failed:
     ; the same verdicts the one-pass walk gives, and the same handlers: the
-    ; context is done with either way
+    ; context is done with either way. The verdict has to survive the release,
+    ; which closes a file and so clobbers rax -- without this every walk error
+    ; arrived at the handlers as whatever close(2) returned, and they all
+    ; fell through to the same generic stream reset.
+    push rax
     mov rdi, [s_ra_ctx]
     call ra_release
+    pop rax
     jmp .req_err
+.ra_below:
+    ; a retransmit of bytes already consumed and slid past: nothing of it is
+    ; new, but the frame may still carry the FIN, so it goes on rather than
+    ; being dropped. NB out of line -- .ra_mark falls through to .ra_hi_upd.
+    xor r10d, r10d
+    xor r11d, r11d
+    jmp .ra_hi_upd
 .ra_drop:
     push rax
     mov rdi, rax
@@ -2581,6 +2644,8 @@ linnea_quic_server_datagram:
     ; the client waiting on a stream we silently dropped.
     cmp rax, -LINNEA_H3_ERR_TOOLARGE
     je .req_toolarge
+    cmp rax, -LINNEA_H3_ERR_SINK
+    je .req_body_toolarge
     cmp rax, -LINNEA_H3_ERR_QPACK
     je .req_qpack_bad
     cmp rax, -LINNEA_H3_ERR_UNEXPECTED
@@ -2665,6 +2730,39 @@ linnea_quic_server_datagram:
     call .send_1rtt
     jmp .stream_scan
 
+.req_body_toolarge:
+    ; The body outgrew max_body (or its capture file could not be written).
+    ; Ours, not the peer's: the request was well formed and we will not hold
+    ; it, which is a 413 on the stream and not a reset -- h1 and h2 both answer
+    ; an oversized upload that way, and a reset would leave the client to guess.
+    CONNLEA rdi, peer
+    lea rsi, [acc_peer_buf]
+    call linnea_network_addr_format
+    mov [linnea_log_acc_peer_len], rax
+    lea rax, [acc_peer_buf]
+    mov [linnea_log_acc_peer], rax
+    xor eax, eax
+    mov [linnea_log_acc_meth], rax
+    mov [linnea_log_acc_tgt], rax
+    mov [linnea_log_acc_host], rax
+    lea rdi, [strm_pay]
+    CONNLEA rsi, rx_have
+    call linnea_quic_build_ack
+    mov [s_acklen], rax
+    mov rcx, rax
+    mov byte [strm_pay + rcx], 0x09  ; STREAM | FIN
+    lea rdi, [strm_pay + rcx + 1]
+    mov rsi, [s_sid]
+    call linnea_quic_varint_encode
+    mov rbx, [s_acklen]
+    add rbx, rax
+    inc rbx
+    lea rdi, [strm_pay + rbx]
+    call linnea_h3_build_413         ; rax = response length
+    lea rdx, [rax + rbx]
+    lea rsi, [strm_pay]
+    call .send_1rtt
+    jmp .stream_scan
 .req_toolarge:
     ; The header section decoded but is bigger than we hold. That is our limit,
     ; not a protocol violation, so it is answered on this stream (RFC 9114
@@ -6286,4 +6384,82 @@ ra_release:
     mov qword [rdi + linnea_quic_ra.spill_fd], -1
 .rr_none:
     mov qword [rdi + linnea_quic_ra.spill_len], 0
+    ret
+
+; ra_slide(rdi = context, rsi = bytes the walk has consumed) — move the window
+; forward over them. buf[0] becomes the first byte the walk has not read, and
+; anything buffered beyond that comes down with it, arrived-bytes map and all.
+;
+; This is what makes a request stream unbounded: the buffer stops having to
+; hold the whole request and only has to hold what is unread at once. The
+; awkward half is the map -- its bits are per stream byte, so sliding the bytes
+; means shifting the bits by the same amount, and getting that wrong loses or
+; invents an arrival rather than raising anything. The usual case is that the
+; contiguous prefix reached the high-water and nothing is left, which just
+; clears it.
+ra_slide:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    mov r12, rsi                      ; consumed
+    add [rbx + linnea_quic_ra.base], r12
+    mov qword [rbx + linnea_quic_ra.len], 0
+    mov qword [rbx + linnea_quic_ra.fed], 0
+    mov r13, [rbx + linnea_quic_ra.hi]
+    lea rdi, [rbx + linnea_quic_ra.seen]
+    cmp r13, r12
+    jbe .sl_clear                     ; nothing was buffered past what was read
+    mov r14, r13
+    sub r14, r12                      ; bytes that survive the slide
+    push rdi
+    lea rdi, [rbx + linnea_quic_ra.buf]
+    lea rsi, [rdi + r12]
+    mov rcx, r14
+    rep movsb                         ; forward copy: the destination is below
+    pop rdi
+    xor rsi, rsi
+.sl_bit:
+    cmp rsi, r14
+    jae .sl_bit_tail
+    mov rdx, rsi
+    add rdx, r12
+    bt [rdi], rdx
+    jc .sl_bit_set
+    btr [rdi], rsi
+    jmp .sl_bit_next
+.sl_bit_set:
+    bts [rdi], rsi
+.sl_bit_next:
+    inc rsi
+    jmp .sl_bit
+.sl_bit_tail:
+    ; and clear what is now past the high-water, or a later advance would walk
+    ; over bits belonging to bytes that have already been read
+    mov rsi, r14
+.sl_tail:
+    cmp rsi, r13
+    jae .sl_done
+    btr [rdi], rsi
+    inc rsi
+    jmp .sl_tail
+.sl_done:
+    mov [rbx + linnea_quic_ra.hi], r14
+    jmp .sl_ret
+.sl_clear:
+    xor rsi, rsi
+.sl_clr:
+    cmp rsi, r13
+    jae .sl_clr_done
+    btr [rdi], rsi
+    inc rsi
+    jmp .sl_clr
+.sl_clr_done:
+    mov qword [rbx + linnea_quic_ra.hi], 0
+.sl_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret

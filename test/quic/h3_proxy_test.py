@@ -155,12 +155,19 @@ want("post echoed", body == "hello over h3", repr(body))
 # a file, so what bounds it is the window, not the buffer a request is held in.
 # (printable bytes, so the helper's lossy decode round-trips and a difference
 # is a difference rather than an artefact of comparing through it)
-for n in (20000, 30000):
+for n in (20000, 30000, 100000, 199000):
     payload = bytes((i * 37 + 11) % 26 + 97 for i in range(n))
     st, hd, body = request("/api/echo", body=payload, method=b"POST")
     want(f"upload of {n} bytes", st == "200", str(st))
     want(f"upload of {n} bytes intact", body == payload.decode(),
          f"{len(body)} of {n} bytes back")
+
+# ...and max_body still bounds it. The window slides, so size alone no longer
+# stops anything; what stops this is the cap, answered on the stream as a 413
+# rather than as a reset the client would have to interpret.
+st, hd, body = request("/api/echo", method=b"POST",
+                       body=b"z" * 250000)      # the fixture's max_body is 200000
+want("upload past max_body is 413", st == "413", f"{st} {body[:30]!r}")
 
 # HEAD is deliberately not checked here. A HEAD response states the content
 # length the GET would have had and carries no body (RFC 9110 9.3.2), and this

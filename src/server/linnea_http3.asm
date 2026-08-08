@@ -14,6 +14,7 @@ global linnea_h3_walk_feed
 global linnea_h3_walk_decode
 global linnea_h3_build_response
 global linnea_h3_build_431
+global linnea_h3_build_413
 global linnea_h3_build_421
 global linnea_h3_build_response_head
 global linnea_h3_serve
@@ -83,6 +84,8 @@ body_421: db "421 Misdirected Request", 10
 body_421_len equ $ - body_421
 body_431:      db "431 Request Header Fields Too Large", 10
 body_431_len   equ $ - body_431
+body_413:      db "413 Content Too Large", 10
+body_413_len   equ $ - body_413
 body_503:      db "503 Service Unavailable", 10
 body_503_len   equ $ - body_503
 
@@ -688,6 +691,19 @@ linnea_h3_build_421:
     mov ecx, txt_plain_len
     lea r8, [body_421]
     mov r9d, body_421_len
+    jmp linnea_h3_build_response
+
+; linnea_h3_build_413(rdi=out) -> rax = length written.
+; The whole response for a request body larger than max_body. The request never
+; finished parsing, so there is no path or vhost to serve from — only the status
+; that says which side the limit is on, which beats resetting the stream and
+; leaving the client to guess whether to retry.
+linnea_h3_build_413:
+    mov esi, 413
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_413]
+    mov r9d, body_413_len
     jmp linnea_h3_build_response
 
 ; linnea_h3_build_431(rdi=out) -> rax = length written.
