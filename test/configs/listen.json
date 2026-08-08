@@ -11,6 +11,10 @@
       "hostname": "one.test",
       "locations": [
         {
+          "prefix": "/ws",
+          "proxy": "127.0.0.1:47702"
+        },
+        {
           "prefix": "/",
           "root": "test/www",
           "cache_control": "max-age=60"

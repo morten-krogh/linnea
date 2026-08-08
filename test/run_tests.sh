@@ -144,6 +144,19 @@ if (echo > /dev/tcp/127.0.0.1/47100) >/dev/null 2>&1; then
     exit 1
 fi
 
+# Same reasoning for the websocket backend's two ports: a leftover linnea-ws
+# holding one of them would answer with a counter at some arbitrary value, and
+# the checks that read the count would fail with numbers that look like a
+# framing bug.
+for wsport in 47701 47702; do
+    if (echo > /dev/tcp/127.0.0.1/$wsport) >/dev/null 2>&1; then
+        echo "FATAL: something is already listening on 127.0.0.1:$wsport." >&2
+        echo "  That is this suite's websocket backend port. Probably a leftover:" >&2
+        ps -eo pid,args | grep "[l]innea-ws" >&2
+        exit 1
+    fi
+done
+
 # --- config parsing and validation ---
 run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test locations=3" \
     timeout 0.5 $BIN --config test/configs/listen.json
@@ -1207,6 +1220,18 @@ rm -f "$SEEN"
 python3 test/proxy_backend.py >/dev/null 2>&1 &
 backend_pid=$!
 backend_ready
+# The websocket backend, twice: 47701 is spoken to directly, 47702 sits behind
+# linnea's /ws location. Two instances rather than one, so the counter each
+# battery sees is its own and the two runs cannot perturb each other.
+./bin/linnea-ws 47701 >/dev/null 2>&1 &
+ws_direct_pid=$!
+./bin/linnea-ws 47702 >/dev/null 2>&1 &
+ws_proxy_pid=$!
+for _ in $(seq 1 60); do
+    (echo > /dev/tcp/127.0.0.1/47701) >/dev/null 2>&1 && \
+    (echo > /dev/tcp/127.0.0.1/47702) >/dev/null 2>&1 && break
+    sleep 0.1
+done
 start_server test/configs/listen.json
 server_pid=$SRV_PID
 sleep 0.3
@@ -2060,6 +2085,20 @@ check "ws upgrade refusal passes through ($out)" $?
 # a 101 the client never asked for must not start a tunnel
 resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/101)
 check_http "unrequested 101 becomes 502" "502 Bad Gateway" "$resp"
+
+# --- the assembly websocket backend, direct and through the tunnel ---
+# The same battery both ways: RFC 6455 handshake, framing, unmasking, the
+# broadcast, and the protocol errors. Passing directly but failing proxied
+# would put the fault in linnea's tunnel rather than in the backend.
+ws_direct_out=$(python3 test/api/ws_backend_test.py 47701 2>&1)
+[ $? -eq 0 ]
+check "websocket backend, spoken to directly" $?
+ws_proxy_out=$(python3 test/api/ws_backend_test.py 47080 /ws 2>&1)
+[ $? -eq 0 ]
+check "websocket backend, through linnea's tunnel" $?
+for out in "$ws_direct_out" "$ws_proxy_out"; do
+    printf '%s\n' "$out" | grep -q "^FAIL" && printf '%s\n' "$out" | sed -n 's/^FAIL /  ws: /p'
+done
 # an upgrade wish on a static location changes nothing
 resp=$(curl -si --max-time 3 -H 'Connection: upgrade' -H 'Upgrade: websocket' \
     http://127.0.0.1:47080/hello.txt)
@@ -2097,7 +2136,7 @@ check "termination peer closed" $?
 grep -qF ': idle timeout' "$LOG"
 check "termination idle timeout" $?
 
-kill $server_pid $backend_pid 2>/dev/null
+kill $server_pid $backend_pid $ws_direct_pid $ws_proxy_pid 2>/dev/null
 # the next block binds 47100 again, so let this one's listener go first
 for _ in $(seq 1 60); do
     (echo > /dev/tcp/127.0.0.1/47100) >/dev/null 2>&1 || break
@@ -2105,6 +2144,7 @@ for _ in $(seq 1 60); do
 done
 wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
+wait $ws_direct_pid $ws_proxy_pid 2>/dev/null
 rm -f "$LOG" test/www/big.txt test/www/upload.bin test/www/upload2.bin test/www/h2range.bin test/www/huge.bin test/www/enc.txt test/www/enc.txt.gz test/www/enc.txt.br
 
 # --- connection limits: slow-head deadline and the per-address cap ---

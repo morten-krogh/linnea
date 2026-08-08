@@ -234,6 +234,21 @@ $(API_BIN): $(API_OBJS)
 
 api: $(API_BIN)
 
+# The WebSocket backend behind linnea2.amberbio.com's /ws location. linnea
+# relays an accepted upgrade as an opaque tunnel, so all of RFC 6455 lives
+# here — including the SHA-1 and base64 the accept token is made of.
+WS_BIN          = bin/linnea-ws
+WS_OBJS         = test/api/linnea_ws.o src/lib/linnea_sha1.o \
+                  src/lib/linnea_base64.o src/lib/linnea_print.o src/lib/linnea_string.o
+
+test/api/linnea_ws.o: test/api/linnea_ws.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(WS_BIN): $(WS_OBJS)
+	$(LD) -o $@ $^
+
+ws: $(WS_BIN)
+
 REPLAYTEST_BIN  = bin/linnea-replaytest
 REPLAYTEST_OBJS = test/quic/linnea_replaytest.o src/lib/linnea_quic_crypto.o \
                   src/lib/linnea_quic.o \
@@ -330,7 +345,8 @@ clean:
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
       bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs $(QPACKTEST_BIN) \
-      $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN) $(RTXTEST_BIN) $(REPLAYTEST_BIN)
+      $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN) $(RTXTEST_BIN) $(REPLAYTEST_BIN) \
+      $(WS_BIN)
 	./test/run_tests.sh
 
 # Install both products to /usr/local/bin: bin_t under SELinux, so systemd
@@ -342,9 +358,10 @@ test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
 # `make` builds both bin/linnea and bin/linnea-probe. The systemd unit is a
 # one-time install; see config/linnea.service. linnea-probe is a plain CLI
 # client — no unit, just a binary on the PATH.
-install: $(API_BIN)
+install: $(API_BIN) $(WS_BIN)
 	install -m 0755 $(BIN) /usr/local/bin/linnea
 	install -m 0755 $(PROBE_BIN) /usr/local/bin/linnea-probe
 	install -m 0755 $(API_BIN) /usr/local/bin/linnea-api
+	install -m 0755 $(WS_BIN) /usr/local/bin/linnea-ws
 
-.PHONY: all clean test selftest tlstest probe api install
+.PHONY: all clean test selftest tlstest probe api ws install

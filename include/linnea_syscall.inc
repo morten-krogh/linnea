@@ -30,6 +30,9 @@ LINNEA_SYS_CONNECT   equ 42      ; client-side: reach out to a server (linnea-pr
 LINNEA_SYS_POLL      equ 7       ; readability wait with a timeout (linnea-probe)
 LINNEA_SYS_NANOSLEEP equ 35      ; deliberate pauses for slow-drip probes
 LINNEA_POLLIN        equ 1
+LINNEA_POLLOUT       equ 4       ; ...and writability, for linnea-ws's loop
+LINNEA_POLLERR       equ 8
+LINNEA_POLLHUP       equ 16
 LINNEA_SYS_SENDTO    equ 44
 LINNEA_SYS_SENDMSG   equ 46
 LINNEA_MSG_DONTWAIT  equ 0x40
