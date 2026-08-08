@@ -2697,6 +2697,19 @@ PYEOF
         >/dev/null 2>&1
     check "h2 does not relay hop-by-hop response fields" $?
 
+    # A request BODY spanning packets, delivered out of order and duplicated,
+    # echoed back and compared by checksum. h3_reorder_test.py covers a field
+    # SECTION the same way; this covers the bytes a body is made of, where a
+    # misplacement is silent rather than a parse failure. Both matter more once
+    # the buffer starts sliding out from under a stream as it is consumed.
+    if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+        out=$(timeout 180 python3 test/quic/h3_reorder_body_test.py 47462 2>&1)
+        [ "$out" = "OK" ]
+        check "h3 request body reassembled out of order and duplicated ($out)" $?
+    else
+        check "h3 body reassembly (skipped: deps unavailable)" 0
+    fi
+
     # max_body bounds an upload on h1, and did nothing at all on h2: a body
     # with a Content-Length streams through the slot FIFO to the backend, and
     # nothing compared the declared length against the cap. Lowering max_body
