@@ -2353,6 +2353,18 @@ linnea_quic_server_datagram:
 
 ; reassemble the request stream into a context's buffer, at each frame's offset.
 .ra_alloc:
+    ; A stream we have already finished with — cancelled by the peer, or refused
+    ; below for want of a context — gets no buffer. The rest of a request is
+    ; often still in flight when either happens, and without this each of its
+    ; datagrams claims a context that the serve path then discards at
+    ; .rst_seen_scan, or earns a second RESET_STREAM for a stream already reset.
+    ; .stream_scan is the same exit .rst_seen_scan takes, and .rtt_finish still
+    ; acknowledges the packet, so the peer stops retransmitting.
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    call rst_known
+    test eax, eax
+    jnz .stream_scan
     mov rax, [cur_conn]
     lea rax, [rax + linnea_quic_conn.ra_ctx]
     mov rdx, LINNEA_QUIC_RA_CTXS
@@ -2662,8 +2674,24 @@ linnea_quic_server_datagram:
     add rsp, 16
     jmp .ra_start
 .ra_rc_busy:
+    ; Every context is genuinely live — a burst deeper than RA_CTXS, not an
+    ; abandoned stream. There is nowhere to put this request, and there was
+    ; nothing to be done about that before either; what WAS wrong is that its
+    ; frames were then dropped in silence, leaving the client holding a stream
+    ; that would never be answered until it gave up on its own. Say so. Nothing
+    ; of it was processed, which is exactly what H3_REQUEST_REJECTED means and
+    ; tells the client it may retry — on this connection a moment later, or on
+    ; another. Remembered, so the rest of a request already in flight is
+    ; recognised at .ra_alloc rather than refused once per datagram.
     add rsp, 16
-    jmp .stream_scan                 ; every context genuinely live: drop, as before
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    call rst_remember
+    mov rdi, [s_sid]
+    xor esi, esi                     ; nothing was sent in the direction we reset
+    mov edx, LINNEA_H3_ERR_REQ_REJECTED
+    call tx_reset_stream_code
+    jmp .stream_scan
 .ra_hold_drop:
     ; out of line, and reached only from the head of the frame loop
     mov rdi, [s_ra_hold]
@@ -5873,6 +5901,39 @@ tx_reset_stream_code:
     pop rbx
     ret
 
+; rst_remember(rdi = conn, rsi = stream id) — note that this stream is finished
+; with. Frames for it may still be arriving, and must not be served, buffered,
+; or refused a second time. A ring of LINNEA_QUIC_RST_SEEN; ids are stored as
+; id + 1, since a zeroed slot means empty and 0 is a valid stream id. Oldest
+; falls out, which only costs a repeat of whatever the id was remembered for.
+rst_remember:
+    mov rax, [rdi + linnea_quic_conn.rst_cursor]
+    lea rcx, [rsi + 1]
+    mov [rdi + linnea_quic_conn.rst_ids + rax * 8], rcx
+    inc rax
+    cmp rax, LINNEA_QUIC_RST_SEEN
+    jb .rr_wrapped
+    xor eax, eax
+.rr_wrapped:
+    mov [rdi + linnea_quic_conn.rst_cursor], rax
+    ret
+
+; rst_known(rdi = conn, rsi = stream id) -> eax = 1 if it is in that ring.
+rst_known:
+    xor ecx, ecx
+    lea rdx, [rsi + 1]
+.rk_scan:
+    cmp [rdi + linnea_quic_conn.rst_ids + rcx * 8], rdx
+    je .rk_yes
+    inc ecx
+    cmp ecx, LINNEA_QUIC_RST_SEEN
+    jb .rk_scan
+    xor eax, eax
+    ret
+.rk_yes:
+    mov eax, 1
+    ret
+
 ; reset_teardown(rdi=conn, rsi=stream id) — the peer cancelled this stream
 ; (STOP_SENDING / RESET_STREAM). Abort its open response (free the slot, unmap, and
 ; drop its in-flight chunks so they stop holding the shared congestion window) and
@@ -5906,17 +5967,10 @@ reset_teardown:
     call [linnea_h3_cancel_hook]
 .rt_no_leg:
     ; remember the id: a request whose frames are still arriving must not be
-    ; served after its cancel (see .rst_ids)
-    mov rax, [rbx + linnea_quic_conn.rst_cursor]
-    lea rcx, [r13 + 1]                ; stored as id + 1: a zeroed slot means
-    mov [rbx + linnea_quic_conn.rst_ids + rax * 8], rcx   ; empty, and 0 is a
-                                      ; perfectly valid stream id
-    inc rax
-    cmp rax, LINNEA_QUIC_RST_SEEN
-    jb .rt_cur_ok
-    xor eax, eax
-.rt_cur_ok:
-    mov [rbx + linnea_quic_conn.rst_cursor], rax
+    ; served after its cancel (see rst_remember)
+    mov rdi, rbx
+    mov rsi, r13
+    call rst_remember
     xor r14d, r14d                    ; slot index
 .rt_tx:
     mov rax, r14

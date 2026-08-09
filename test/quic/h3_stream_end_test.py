@@ -31,6 +31,7 @@ ADDR = ("127.0.0.1", PORT)
 # must exceed the server's LINNEA_QUIC_RA_STALE_MS
 STALE_WAIT = 7.0
 CONTEXTS = 6                      # LINNEA_QUIC_RA_CTXS
+H3_REQUEST_REJECTED = 0x10b
 HDRS = [(b":method", b"GET"), (b":scheme", b"https"),
         (b":authority", b"localhost"), (b":path", b"/hello.txt")]
 
@@ -56,7 +57,9 @@ class Peer:
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.s.settimeout(0.1)
         self.status = {}
-        self.reset = set()
+        self.reset = {}                # stream id -> the code it was reset with
+        self.reset_n = {}              # ...and how many times, which is the
+                                       # question for a stream refused once
         self.h3 = None                # nothing to hand events to until ALPN
         self.pump()
         dl = time.time() + 10
@@ -89,7 +92,8 @@ class Peer:
             if ev is None:
                 return
             if type(ev).__name__ == "StreamReset":
-                self.reset.add(ev.stream_id)
+                self.reset[ev.stream_id] = ev.error_code
+                self.reset_n[ev.stream_id] = self.reset_n.get(ev.stream_id, 0) + 1
                 continue
             if self.h3 is None:
                 continue
@@ -137,14 +141,14 @@ for _ in range(CONTEXTS):
     p.turn(2)
 
 
-def multi_frame_request():
+def multi_frame_request(fin=True):
     """A request that needs a reassembly context: two STREAM frames, so it
     cannot take the whole-request-in-one-frame path."""
     sid = p.conn.get_next_available_stream_id()
     p.h3.send_headers(sid, HDRS, end_stream=False)
     p.pump()
     p.turn(3)
-    p.h3.send_data(sid, b"", end_stream=True)
+    p.h3.send_data(sid, b"" if fin else b"body", end_stream=fin)
     p.pump()
     return sid
 
@@ -156,6 +160,29 @@ p.h3.send_headers(sid, HDRS, end_stream=True)
 p.pump()
 want("a single-frame GET is served while every context is held",
      p.await_status(sid) == "200", str(p.status.get(sid)))
+
+# Every context is claimed and NONE is stale yet, so there is genuinely nowhere
+# to put this request -- as there was before. What must not happen is the thing
+# that used to: its frames dropped in silence, leaving the client on a stream
+# that would never be answered. H3_REQUEST_REJECTED says nothing of it was
+# processed and it may be retried, which is the truth and is actionable.
+busy = multi_frame_request(fin=False)          # no FIN: more can follow it
+end = time.time() + 6
+while time.time() < end and busy not in p.reset and busy not in p.status:
+    p.turn(4)
+want("a request with every context busy is refused, not dropped",
+     p.reset.get(busy) == H3_REQUEST_REJECTED,
+     f"reset={p.reset.get(busy)} status={p.status.get(busy)}")
+# ...once. The rest of a request is usually still in flight when it is refused,
+# and each of its datagrams must not earn another RESET_STREAM. Counted for THIS
+# stream rather than over all of them: an abandoned context going stale during
+# these few seconds resets a different stream, and that is not this question.
+for _ in range(5):
+    p.conn.send_stream_data(busy, b"more", end_stream=False)
+    p.pump()
+    p.turn(3)
+want("a refused stream is not refused again per datagram",
+     p.reset_n.get(busy, 0) == 1, f"reset {p.reset_n.get(busy, 0)} times")
 
 # ...and now let the abandoned ones go stale, with the connection kept alive.
 end = time.time() + STALE_WAIT
@@ -171,8 +198,9 @@ want("a multi-frame request once the abandoned contexts are stale",
      p.await_status(sid) == "200", str(p.status.get(sid)))
 # ...and the client of the one that was taken back is told, rather than left
 # holding a stream that will never be answered
-want("the reclaimed stream is reset", len(p.reset & set(stalled)) >= 1,
-     f"{len(p.reset & set(stalled))} of {CONTEXTS} reset")
+reclaimed = set(p.reset) & set(stalled)
+want("the reclaimed stream is reset", len(reclaimed) >= 1,
+     f"{len(reclaimed)} of {CONTEXTS} reset")
 p.close()
 
 print("OK" if not bad else "; ".join(bad))
