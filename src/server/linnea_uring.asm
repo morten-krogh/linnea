@@ -1170,8 +1170,18 @@ linnea_uring_run:
     mov rdi, r12
     lea rsi, [r12 + linnea_connection.in_buf]
     add rsi, [r12 + linnea_connection.head_len]
+    ; Guarded like the one at .keep_alive_continue, and for the same reason: an
+    ; in_len below head_len would wrap into a length no buffer has, and hand it
+    ; to a decoder that walks it. It cannot be below here — this path is only
+    ; entered with in_buf full, so in_len is LINNEA_CONN_IN_BUF and head_len is
+    ; a prefix of it — but that argument lives in linnea_http.asm, three
+    ; functions away, and is the sort that stops being true without anyone
+    ; editing this line. Zero is the honest reading of "no body bytes in hand".
     mov rdx, [r12 + linnea_connection.in_len]
     sub rdx, [r12 + linnea_connection.head_len]
+    jae .cap_ch_have
+    xor edx, edx
+.cap_ch_have:
     call linnea_spill_chunked
     mov rcx, [r12 + linnea_connection.head_len]
     mov [r12 + linnea_connection.in_len], rcx
