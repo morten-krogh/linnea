@@ -157,6 +157,15 @@ for wsport in 47701 47702; do
     fi
 done
 
+# ...and the /api backend's, for the same reason: a leftover would answer, and
+# the checks below would be reporting on a binary nobody built.
+if (echo > /dev/tcp/127.0.0.1/47703) >/dev/null 2>&1; then
+    echo "FATAL: something is already listening on 127.0.0.1:47703." >&2
+    echo "  That is this suite's /api backend port. Probably a leftover:" >&2
+    ps -eo pid,args | grep "[l]innea-api" >&2
+    exit 1
+fi
+
 # --- config parsing and validation ---
 run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test locations=3" \
     timeout 0.5 $BIN --config test/configs/listen.json
@@ -2090,6 +2099,21 @@ check_http "unrequested 101 becomes 502" "502 Bad Gateway" "$resp"
 # The same battery both ways: RFC 6455 handshake, framing, unmasking, the
 # broadcast, and the protocol errors. Passing directly but failing proxied
 # would put the fault in linnea's tunnel rather than in the backend.
+# The /api backend, which had no coverage at all until a read of it turned up
+# five faults — including one that stopped the whole server indefinitely. It is
+# spoken to directly: linnea's side of /api is exercised by the proxy tests.
+./bin/linnea-api 47703 >/dev/null 2>&1 &
+api_pid=$!
+for _ in $(seq 1 60); do
+    (echo > /dev/tcp/127.0.0.1/47703) >/dev/null 2>&1 && break
+    sleep 0.1
+done
+api_out=$(python3 test/api/api_backend_test.py 47703 2>&1)
+[ $? -eq 0 ]
+check "the /api backend" $?
+printf '%s\n' "$api_out" | grep -q "^FAIL" && printf '%s\n' "$api_out" | sed -n 's/^FAIL /  api: /p'
+kill $api_pid 2>/dev/null
+
 ws_direct_out=$(python3 test/api/ws_backend_test.py 47701 2>&1)
 [ $? -eq 0 ]
 check "websocket backend, spoken to directly" $?

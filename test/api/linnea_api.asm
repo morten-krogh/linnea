@@ -2,21 +2,23 @@
 ;
 ; Two endpoints, both answering JSON:
 ;
-;   POST /api/upload   the request body IS the file. It is written to a
-;                      temporary file and SHA-256'd in the same pass, the file
-;                      is deleted as soon as the answer is composed, and the
-;                      reply is {"name":..,"size":..,"checksum":..}. The name
-;                      comes from the client's X-Filename header, which the
-;                      browser percent-encodes because a header may not carry
-;                      arbitrary bytes; it is decoded for the answer and NEVER
-;                      used to build a path — the temporary file is named by
-;                      this process, so a client cannot steer where it lands.
+;   POST /api/upload   the request body IS the file. It is written to an
+;                      O_TMPFILE and SHA-256'd in the same pass, the descriptor
+;                      is closed as soon as the answer is composed — which is
+;                      what deletes it — and the reply is
+;                      {"name":..,"size":..,"checksum":..}. The name comes from
+;                      the client's X-Filename header, which the browser
+;                      percent-encodes because a header may not carry arbitrary
+;                      bytes; it is decoded for the answer and NEVER used to
+;                      build a path. There is no path: the file has no name.
 ;
 ;   GET  /api/random   {"value":N}, 1 <= N <= 1000, from getrandom(2).
 ;
 ; One request per connection: linnea proxies with Connection: close, so there
 ; is nothing to gain from keeping it. Blocking syscalls and one connection at a
-; time — this is a test backend for the site's upload demo, not a server.
+; time — this is a test backend for the site's upload demo, not a server. That
+; is why both socket deadlines are set: with no concurrency, one peer that says
+; nothing is the whole service, and a blocking read has no other way back.
 ;
 ; Usage: linnea-api [port]        (default 7700, bound to 127.0.0.1)
 
@@ -33,11 +35,30 @@ extern linnea_sha256_final
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
 
+LINNEA_EINTR    equ 4
+LINNEA_EAGAIN   equ 11
+
 DEFAULT_PORT    equ 7700
 HEAD_BUF        equ 8192          ; request head, plus whatever body rode with it
 IO_BUF          equ 65536
+RESP_BUF        equ 1024          ; the composed JSON answer
 NAME_MAX        equ 255           ; decoded filename bytes we will repeat back
-MAX_UPLOAD      equ 67108864      ; 64 MB, matching linnea's own max_body default
+; A ceiling of our own, well above anything linnea will pass on: it enforces its
+; own max_body first (8 MiB in the live config, 64 MB by default), so this is
+; the backstop for a request that somehow arrives without having gone through
+; it, not a limit that tracks linnea's.
+MAX_UPLOAD      equ 67108864
+; This server handles one connection at a time and blocks while it does, so a
+; peer that connects and then says nothing stops every other request until it
+; goes away — measured at exactly that, indefinitely, before this existed.
+;
+; The deadline does not make the server concurrent; it bounds the damage. One
+; stuck peer costs everyone behind it this long instead of for ever, so the
+; number wants to be as small as it can be without ever firing in anger. Only
+; linnea reaches this port, over loopback, having already buffered the whole
+; request before it opens the leg — a read that takes ten seconds is not a slow
+; client, it is a linnea that is no longer there.
+IO_TIMEOUT_SEC  equ 10
 
 section .rodata
 
@@ -57,9 +78,9 @@ path_upload_len equ $ - path_upload
 path_random:    db "/api/random"
 path_random_len equ $ - path_random
 
-; The temporary file's name is built here, so the client has no say in it.
-tmp_prefix:     db "/tmp/linnea-api-"
-tmp_prefix_len  equ $ - tmp_prefix
+; The directory only supplies the filesystem — O_TMPFILE creates no entry in it,
+; so there is no name for a client to have a say in.
+tmp_dir:        db "/tmp", 0
 
 ; Status lines and bodies are kept apart so that no Content-Length is ever
 ; written by hand: send_status counts the body. Three of these four were
@@ -74,6 +95,8 @@ st_411:         db "HTTP/1.1 411 Length Required", 13, 10
 st_411_len      equ $ - st_411
 st_413:         db "HTTP/1.1 413 Content Too Large", 13, 10
 st_413_len      equ $ - st_413
+st_500:         db "HTTP/1.1 500 Internal Server Error", 13, 10
+st_500_len      equ $ - st_500
 
 resp_fixed:     db "Content-Type: application/json", 13, 10
                 db "Connection: close", 13, 10
@@ -102,6 +125,11 @@ body_413:       db '{"error":"upload too big"}'
 body_413_len    equ $ - body_413
 body_400:       db '{"error":"bad request"}'
 body_400_len    equ $ - body_400
+body_500:       db '{"error":"server error"}'
+body_500_len    equ $ - body_500
+; struct timeval for the socket deadlines
+align 8
+io_timeout:     dq IO_TIMEOUT_SEC, 0
 
 hexdigits:      db "0123456789abcdef"
 default_name:   db "upload"
@@ -119,15 +147,11 @@ in_len:         resq 1            ; everything read so far (head + body prefix)
 iobuf:          resb IO_BUF
 namebuf:        resb NAME_MAX + 8
 name_len:       resq 1
-pathbuf:        resb 64
-path_len:       resq 1
-respbuf:        resb 1024
+respbuf:        resb RESP_BUF
 numbuf:         resb 24
 ctx:            resb linnea_sha256_ctx_size
 digest:         resb LINNEA_SHA256_DIGEST
 hexsum:         resb 64
-body_len:       resq 1
-tmp_seq:        resq 1
 
 section .text
 
@@ -167,11 +191,31 @@ _start:
     test rax, rax
     js .accept_loop                ; EINTR and friends: just go round again
     mov [conn_fd], rax
+    ; Deadlines, before a single byte is read. Both directions: a peer that
+    ; never speaks and a peer that never reads wedge this server identically,
+    ; since it serves one connection at a time and blocks in both.
+    mov edx, LINNEA_SO_RCVTIMEO
+    call set_timeout
+    mov edx, LINNEA_SO_SNDTIMEO
+    call set_timeout
     call handle_conn
     mov eax, LINNEA_SYS_CLOSE
     mov rdi, [conn_fd]
     syscall
     jmp .accept_loop
+
+
+; set_timeout(edx = SO_RCVTIMEO or SO_SNDTIMEO) — arm one deadline on conn_fd.
+; A failure is not worth refusing the connection over: the result is the old
+; behaviour, which served this backend for a while.
+set_timeout:
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, [conn_fd]
+    mov esi, LINNEA_SOL_SOCKET
+    lea r10, [io_timeout]
+    mov r8d, 16                    ; sizeof(struct timeval)
+    syscall
+    ret
 
 
 ; handle_conn() — read one request head, dispatch on method and path.
@@ -228,11 +272,20 @@ handle_conn:
 ; do_random() — {"value":N}, 1..1000.
 do_random:
     push rbx
+.draw:
     mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [numbuf]
     mov esi, 8
     xor edx, edx
     syscall
+    cmp rax, -LINNEA_EINTR
+    je .draw
+    ; Unchecked, this read whatever numbuf happened to hold — zeroed .bss on the
+    ; first call, so a failure would have answered a confident {"value":1}. It
+    ; effectively cannot fail for eight bytes with no flags, which is the reason
+    ; to say so out loud rather than to leave it out.
+    cmp rax, 8
+    jne .no_random
     mov rax, [numbuf]
     xor edx, edx
     mov rcx, 1000
@@ -258,6 +311,14 @@ do_random:
     call send_status
     pop rbx
     ret
+.no_random:
+    lea rdi, [st_500]
+    mov esi, st_500_len
+    lea rdx, [body_500]
+    mov ecx, body_500_len
+    call send_status
+    pop rbx
+    ret
 
 
 ; do_upload() — stream the body to a temporary file, hashing as it goes, then
@@ -279,8 +340,10 @@ do_upload:
     mov rdi, rax
     mov rsi, rdx
     call parse_u64
+    test rdx, rdx
+    jz .fail400                    ; present but not a number: not 411, and not
+                                   ; a zero-length upload either
     mov r12, rax                   ; declared length
-    mov [body_len], rax
     cmp r12, MAX_UPLOAD
     ja .too_big
     call temp_open                 ; rax = fd
@@ -321,8 +384,11 @@ do_upload:
     lea rsi, [iobuf]
     mov rdx, r15
     syscall
+    cmp rax, -LINNEA_EINTR
+    je .take                       ; a signal, not the end of anything
     cmp rax, 0
-    jle .fail_file                 ; EOF mid-body: the upload never completed
+    jle .fail_file                 ; EOF, error, or the deadline: either way the
+                                   ; upload never completed
     mov rbx, rax
     lea rsi, [iobuf]
     mov rdx, rbx
@@ -333,10 +399,9 @@ do_upload:
     add r14, rbx
     jmp .stream
 .complete:
-    mov eax, LINNEA_SYS_CLOSE
-    mov rdi, r13
+    mov eax, LINNEA_SYS_CLOSE      ; the close IS the delete: O_TMPFILE has no
+    mov rdi, r13                   ; link, so this is what returns the space
     syscall
-    call temp_unlink               ; answered from memory from here on
     lea rdi, [ctx]
     lea rsi, [digest]
     call linnea_sha256_final
@@ -353,6 +418,9 @@ do_upload:
     lea rdi, [namebuf]
     mov rsi, [name_len]
     mov rdx, rax
+    ; the tail after the name is fixed-shape: ","size": + digits + ,"checksum":"
+    ; + 64 hex + "}. Keep exactly that much back.
+    lea rcx, [respbuf + RESP_BUF - (json_size_len + 20 + json_sum_len + 64 + json_end_len)]
     call append_escaped
     lea rdi, [json_size]
     mov esi, json_size_len
@@ -381,10 +449,9 @@ do_upload:
     call send_status
     jmp .out
 .fail_file:
-    mov eax, LINNEA_SYS_CLOSE
+    mov eax, LINNEA_SYS_CLOSE      ; a half-written upload leaves nothing behind
     mov rdi, r13
     syscall
-    call temp_unlink               ; a half-written upload leaves nothing behind
     jmp .out                       ; and no answer: the request was never whole
 .no_length:
     lea rdi, [st_411]
@@ -437,6 +504,8 @@ absorb:
     mov eax, LINNEA_SYS_WRITE
     mov rdi, rbx
     syscall
+    cmp rax, -LINNEA_EINTR
+    je .wloop
     cmp rax, 0
     jle .fail
     add rsi, rax
@@ -456,49 +525,27 @@ absorb:
     ret
 
 
-; temp_open() -> rax = fd (or negative). The name is ours: "/tmp/linnea-api-"
-; plus the pid and a per-process counter, so two uploads cannot collide and a
-; client cannot influence the path.
+; temp_open() -> rax = fd (or negative).
+;
+; O_TMPFILE: the directory supplies the filesystem and no entry is made in it.
+; The file has no name, so nothing else on the box can open it, two uploads
+; cannot collide over one, and the kernel reclaims it when the descriptor closes
+; — INCLUDING if this process is killed mid-upload, which a named file would
+; have survived. It was a named file until this: "/tmp/linnea-api-<pid>-<n>",
+; built here so a client could not steer it, and removed by hand afterwards.
+; That hand was the only thing keeping /tmp clean, and a kill took it away.
+; linnea's own two capture paths (linnea_spill.asm, and the h3 one in
+; linnea_quic_server.asm) had both already reached this conclusion.
+;
+; Nothing ever reads the file back: the checksum comes from the SHA-256 running
+; over the same bytes in the same pass, and the answer is composed from memory.
+; It is written because receiving an upload onto disk is what this endpoint
+; exists to demonstrate.
 temp_open:
-    push rbx
-    lea rdi, [pathbuf]
-    lea rsi, [tmp_prefix]
-    mov ecx, tmp_prefix_len
-    push rdi
-    rep movsb
-    pop rdi
-    mov rbx, rdi
-    add rbx, tmp_prefix_len
-    mov eax, LINNEA_SYS_GETPID
-    syscall
-    mov rdi, rax
-    mov rsi, rbx
-    call u64_to_dec
-    add rbx, rax
-    mov byte [rbx], '-'
-    inc rbx
-    mov rdi, [tmp_seq]
-    inc qword [tmp_seq]
-    mov rsi, rbx
-    call u64_to_dec
-    add rbx, rax
-    mov byte [rbx], 0
-    lea rax, [pathbuf]
-    sub rbx, rax
-    mov [path_len], rbx
-    mov eax, LINNEA_SYS_OPEN
-    lea rdi, [pathbuf]
-    mov esi, LINNEA_O_WRONLY | LINNEA_O_CREAT | LINNEA_O_TRUNC | LINNEA_O_CLOEXEC
+    lea rdi, [tmp_dir]
+    mov esi, LINNEA_O_TMPFILE | LINNEA_O_WRONLY | LINNEA_O_CLOEXEC
     mov edx, LINNEA_MODE_0600
-    syscall
-    pop rbx
-    ret
-
-; temp_unlink() — the upload is not kept: it exists only for as long as it
-; takes to write and hash it.
-temp_unlink:
-    mov eax, LINNEA_SYS_UNLINK
-    lea rdi, [pathbuf]
+    mov eax, LINNEA_SYS_OPEN
     syscall
     ret
 
@@ -632,15 +679,24 @@ append:
     pop rcx
     ret
 
-; append_escaped(rdi=src, rsi=len, rdx=dst) -> rax = dst end
+; append_escaped(rdi=src, rsi=len, rdx=dst, rcx=dst limit) -> rax = dst end
 ; The name is the client's, so it goes into the JSON escaped: a quote or a
 ; backslash in a filename would otherwise end the string early and let the
 ; client write the rest of the object.
+;
+; The limit is the only thing in this function that bounds it. It was safe
+; without one — 255 name bytes escape to at most 510, and the rest of the object
+; leaves room for that in respbuf — but every term of that argument lives
+; somewhere else, and NAME_MAX moving would have broken it silently and at a
+; distance. Two bytes are needed for an escape, so the check is for two.
 append_escaped:
     xor r8, r8
 .loop:
     cmp r8, rsi
     jae .done
+    lea rax, [rdx + 2]
+    cmp rax, rcx
+    ja .done                       ; no room even for an escaped byte
     movzx eax, byte [rdi + r8]
     cmp al, '"'
     je .escape
@@ -720,8 +776,10 @@ send_buf:
     syscall
     pop rdx
     pop rsi
+    cmp rax, -LINNEA_EINTR
+    je .loop                       ; a signal must not truncate the response
     cmp rax, 0
-    jle .done
+    jle .done                      ; error or the send deadline: give up on it
     add rsi, rax
     sub rdx, rax
     jmp .loop
@@ -747,8 +805,10 @@ read_head:
     add rsi, [in_len]
     mov rdx, rbx
     syscall
+    cmp rax, -LINNEA_EINTR
+    je .more
     cmp rax, 0
-    jle .fail
+    jle .fail                      ; EOF, error, or the read deadline
     add [in_len], rax
     call find_head_end             ; rax = head length, or 0 while incomplete
     test rax, rax
@@ -960,20 +1020,30 @@ hdr_find:
     ret
 
 
-; parse_u64(rdi=ptr, rsi=len) -> rax = value (0 on anything unparseable).
+; parse_u64(rdi=ptr, rsi=len) -> rax = value, rdx = 1 if the whole field was
+; digits and there was at least one, 0 otherwise.
+;
+; The validity flag is not decoration. Returning 0 for "abc" is
+; indistinguishable from returning 0 for "0", and Content-Length took the first
+; as the second: a malformed length was answered 200 with an empty upload
+; rather than refused. RFC 9110 8.6 is 1*DIGIT and nothing else — no sign, no
+; hex, no trailing rubbish (hdr_find has already trimmed the spaces).
+;
 ; Saturates rather than wrapping: a length that cannot be represented must not
 ; come out small enough to look acceptable.
 parse_u64:
     xor rax, rax
     xor rcx, rcx
+    test rsi, rsi
+    jz .invalid                    ; no digits at all
 .loop:
     cmp rcx, rsi
-    jae .done
+    jae .valid
     movzx edx, byte [rdi + rcx]
     cmp dl, '0'
-    jb .done
+    jb .invalid
     cmp dl, '9'
-    ja .done
+    ja .invalid
     mov r8, 0x1999999999999999
     cmp rax, r8
     ja .saturate
@@ -984,8 +1054,26 @@ parse_u64:
     inc rcx
     jmp .loop
 .saturate:
+    ; Still a number, just not one we will serve — but the REST of it has to be
+    ; checked too, or "999...9zz" would come back valid because the overflow
+    ; happened before the rubbish did.
     mov rax, -1
-.done:
+.sat_scan:
+    inc rcx
+    cmp rcx, rsi
+    jae .valid
+    movzx edx, byte [rdi + rcx]
+    cmp dl, '0'
+    jb .invalid
+    cmp dl, '9'
+    ja .invalid
+    jmp .sat_scan
+.valid:
+    mov edx, 1
+    ret
+.invalid:
+    xor eax, eax
+    xor edx, edx
     ret
 
 ; u64_to_dec(rdi=value, rsi=out) -> rax = digits written

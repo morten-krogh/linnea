@@ -114,6 +114,12 @@ LINNEA_SO_REUSEADDR  equ 2
 LINNEA_SO_REUSEPORT  equ 15
 LINNEA_SO_RCVBUF     equ 8
 LINNEA_SO_RXQ_OVFL   equ 40    ; ask for the per-socket drop count as a cmsg
+; Deadlines for a blocking socket, which is the only thing standing between a
+; serial server and one peer that says nothing (linnea-api). Both take a struct
+; timeval, and a expiry surfaces as EAGAIN — distinguishable from EINTR, which
+; is the one worth retrying.
+LINNEA_SO_RCVTIMEO   equ 20
+LINNEA_SO_SNDTIMEO   equ 21
 LINNEA_IPPROTO_IPV6  equ 41
 LINNEA_IPV6_V6ONLY   equ 26
 LINNEA_SOCKADDR_IN_SIZE equ 16  ; struct sockaddr_in: family u16, port u16 (BE), addr u32 (BE), zero[8]
