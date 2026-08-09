@@ -36,6 +36,13 @@
 # Server log files
 *.log
 *.log.rot
+
+# Fixtures the suite writes into its document root. Only a handful of files
+# under test/www are real (hello.txt, index.html, style.css, favicon.ico,
+# "a b.txt", sub/) — the rest are made and usually removed by run_tests.sh.
+# Some live only for the length of one check, so whether they are on disk
+# depends on where the suite has got to, and `git add -A` DURING a run will
+# otherwise sweep them into a commit.
 test/www/big.txt
 test/www/big2.txt
 test/www/med.txt
@@ -57,4 +64,14 @@ test/www/linnea.png
 test/www/h3s*.bin
 test/www/h3p*.bin
 test/www/m*.bin
+# The mime battery writes test/www/probe.<ext> for one extension after another,
+# so this is a pattern rather than a list of the types it happens to try today.
+test/www/probe.*
+test/www/clip.mp4
+test/www/varonly.txt.br
+test/www/drain.bin
+test/www/up1.bin
+test/www/up2.bin
+test/www/h2upload.bin
+test/www/tlsupload.bin
 linnea-qdbg
