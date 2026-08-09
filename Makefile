@@ -33,7 +33,19 @@ PROBE_OBJS = src/probe/linnea_probe.o src/lib/linnea_print.o src/lib/linnea_stri
 # src/server/linnea_ring.asm (io_uring_setup/io_uring_enter), which is what liburing
 # used to provide.
 
-all: $(BIN) $(PROBE_BIN)
+# The two backends linnea proxies to, named here rather than beside their rules
+# further down for the same reason QUICP256 is: a prerequisite list is expanded
+# where it is WRITTEN, so a variable defined after `all` expands to nothing
+# there and silently drops the target. Their objects and link rules stay below.
+API_BIN = bin/linnea-api
+WS_BIN  = bin/linnea-ws
+
+# Everything `install` copies, so that `make` alone leaves nothing behind it.
+# The two backends used to be built only as a side effect of `install`, which
+# meant a plain `make` after editing one of them silently kept the old binary
+# and `sudo make install` then compiled it as root. They are small; building
+# them always costs two links.
+all: $(BIN) $(PROBE_BIN) $(API_BIN) $(WS_BIN)
 
 $(BIN): $(LIBOBJS) $(SRVOBJS)
 	$(LD) -o $@ $^
@@ -222,7 +234,7 @@ rtxtest: $(RTXTEST_BIN)
 # --- 0-RTT anti-replay strike-register unit test ---
 # The little HTTP/1.1 backend behind the site's /api location: it takes the
 # uploads the index page sends and answers with their size and checksum.
-API_BIN         = bin/linnea-api
+# API_BIN is defined up beside `all`, which needs it before this point.
 API_OBJS        = test/api/linnea_api.o src/lib/linnea_sha256.o src/lib/linnea_print.o \
                   src/lib/linnea_string.o
 
@@ -237,7 +249,7 @@ api: $(API_BIN)
 # The WebSocket backend behind linnea2.amberbio.com's /ws location. linnea
 # relays an accepted upgrade as an opaque tunnel, so all of RFC 6455 lives
 # here — including the SHA-1 and base64 the accept token is made of.
-WS_BIN          = bin/linnea-ws
+# WS_BIN, likewise, is defined up beside `all`.
 WS_OBJS         = test/api/linnea_ws.o src/lib/linnea_sha1.o \
                   src/lib/linnea_base64.o src/lib/linnea_print.o src/lib/linnea_string.o
 
@@ -339,8 +351,8 @@ probe: $(PROBE_BIN)
 
 clean:
 	rm -f $(LIBOBJS) $(SRVOBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
-	      src/probe/*.o $(PROBE_BIN) \
-	      test/crypto/*.o test/tls/*.o test/quic/*.o $(CRYPTO_VECS)
+	      src/probe/*.o $(PROBE_BIN) $(API_BIN) $(WS_BIN) \
+	      test/crypto/*.o test/tls/*.o test/quic/*.o test/api/*.o $(CRYPTO_VECS)
 
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
@@ -349,16 +361,28 @@ test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(WS_BIN)
 	./test/run_tests.sh
 
-# Install both products to /usr/local/bin: bin_t under SELinux, so systemd
+# Install all four products to /usr/local/bin: bin_t under SELinux, so systemd
 # may exec the server, and the fresh inode picks up the standard label — no
-# setcap or restorecon after rebuilds. Run as root (`sudo make install`);
-# deliberately not dependent on the build, so root never compiles into
-# the tree. Routine deploy:
+# setcap or restorecon after rebuilds. Run as root (`sudo make install`).
+# Routine deploy:
 #   make && sudo make install && sudo systemctl restart linnea
-# `make` builds both bin/linnea and bin/linnea-probe. The systemd unit is a
-# one-time install; see config/linnea.service. linnea-probe is a plain CLI
-# client — no unit, just a binary on the PATH.
-install: $(API_BIN) $(WS_BIN)
+#
+# It COPIES and does not build, so that root never compiles into the tree —
+# root-owned .o files and binaries make the next ordinary `make` fail or, worse,
+# quietly not rebuild. That was the stated intent before, but a prerequisite on
+# the two backends undid it, which is exactly how they came to be root-owned.
+#
+# Copying without building can install something stale instead, so the guard
+# asks make whether the tree is already built (-q builds nothing, it only
+# answers) and stops with the command to run rather than deploying yesterday's
+# binary. The systemd units are a one-time install; see config/*.service.
+# linnea-probe is a plain CLI client — no unit, just a binary on the PATH.
+install:
+	@$(MAKE) -q all || { \
+	    echo "linnea: the tree is not built, or is built from older sources."; \
+	    echo "        run 'make' first, AS YOURSELF — this target only copies,"; \
+	    echo "        so that root never leaves objects it owns in the tree."; \
+	    exit 1; }
 	install -m 0755 $(BIN) /usr/local/bin/linnea
 	install -m 0755 $(PROBE_BIN) /usr/local/bin/linnea-probe
 	install -m 0755 $(API_BIN) /usr/local/bin/linnea-api
