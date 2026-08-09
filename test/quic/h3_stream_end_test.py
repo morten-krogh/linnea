@@ -60,6 +60,8 @@ class Peer:
         self.reset = {}                # stream id -> the code it was reset with
         self.reset_n = {}              # ...and how many times, which is the
                                        # question for a stream refused once
+        self.stop = {}                 # stream id -> the STOP_SENDING code, for
+                                       # the direction WE are giving up reading
         self.h3 = None                # nothing to hand events to until ALPN
         self.pump()
         dl = time.time() + 10
@@ -94,6 +96,9 @@ class Peer:
             if type(ev).__name__ == "StreamReset":
                 self.reset[ev.stream_id] = ev.error_code
                 self.reset_n[ev.stream_id] = self.reset_n.get(ev.stream_id, 0) + 1
+                continue
+            if type(ev).__name__ == "StopSendingReceived":
+                self.stop[ev.stream_id] = ev.error_code
                 continue
             if self.h3 is None:
                 continue
@@ -173,6 +178,11 @@ while time.time() < end and busy not in p.reset and busy not in p.status:
 want("a request with every context busy is refused, not dropped",
      p.reset.get(busy) == H3_REQUEST_REJECTED,
      f"reset={p.reset.get(busy)} status={p.status.get(busy)}")
+# RESET_STREAM ends only the direction the server sends in. This request's FIN
+# never came, so the client believes it is still uploading a body nobody will
+# read; RFC 9000 3.5 asks for one frame each way to end both directions.
+want("a refused request is also told to stop sending",
+     p.stop.get(busy) == H3_REQUEST_REJECTED, f"stop={p.stop.get(busy)}")
 # ...once. The rest of a request is usually still in flight when it is refused,
 # and each of its datagrams must not earn another RESET_STREAM. Counted for THIS
 # stream rather than over all of them: an abandoned context going stale during
@@ -201,6 +211,10 @@ want("a multi-frame request once the abandoned contexts are stale",
 reclaimed = set(p.reset) & set(stalled)
 want("the reclaimed stream is reset", len(reclaimed) >= 1,
      f"{len(reclaimed)} of {CONTEXTS} reset")
+# ...in both directions, for the same reason: its FIN never came either
+want("the reclaimed stream is also told to stop sending",
+     reclaimed and reclaimed <= set(p.stop),
+     f"reset {sorted(reclaimed)}, stopped {sorted(p.stop)}")
 p.close()
 
 print("OK" if not bad else "; ".join(bad))

@@ -353,7 +353,15 @@ s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK f
 fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow scan
 LINNEA_QUIC_RESET_MAX equ 16
 reset_ids:   resq LINNEA_QUIC_RESET_MAX  ; stream ids the peer cancelled this packet
-reset_pay:   resb 32                  ; a RESET_STREAM frame we send back on cancel
+; A RESET_STREAM we send back on cancel, and — when the receive side is being
+; abandoned too — a STOP_SENDING for the same stream in the same packet. Sized
+; for the worst case rather than the usual one: three varints and a type byte is
+; 25, plus two varints and a type byte is 17. Today's ids and codes are small
+; enough that both fit eleven bytes, but a long-lived connection reaches
+; eight-byte stream ids and this must not be the thing that discovers it.
+reset_pay:   resb 64
+; whether that STOP_SENDING is wanted, held across the frame build
+s_rst_stop:  resq 1
 path_resp_pay: resb 16                ; a PATH_RESPONSE frame (0x1b + 8 echoed bytes)
 LINNEA_QUIC_SRST_MAX equ 64           ; largest stateless reset we send
 srst_buf:    resb LINNEA_QUIC_SRST_MAX ; the stateless-reset packet we build
@@ -2669,7 +2677,8 @@ linnea_quic_server_datagram:
     mov rdi, [rsp + 8]
     xor esi, esi                     ; nothing was sent in the direction we reset
     mov edx, LINNEA_H3_ERR_REQ_REJECTED
-    call tx_reset_stream_code
+    call tx_reset_and_stop           ; both directions: its FIN never came, so
+                                     ; the peer may still believe it is uploading
     mov rax, [rsp]                   ; ...and the new stream takes the slot
     add rsp, 16
     jmp .ra_start
@@ -2690,7 +2699,11 @@ linnea_quic_server_datagram:
     mov rdi, [s_sid]
     xor esi, esi                     ; nothing was sent in the direction we reset
     mov edx, LINNEA_H3_ERR_REQ_REJECTED
-    call tx_reset_stream_code
+    call tx_reset_and_stop           ; ...and stop the body we will not read.
+                                     ; Only here and at the reclaim above: the
+                                     ; other two rejections are past .serve_bidi,
+                                     ; which the FIN is a precondition of, so
+                                     ; there is nothing left to ask them to stop.
     jmp .stream_scan
 .ra_hold_drop:
     ; out of line, and reached only from the head of the frame loop
@@ -5852,6 +5865,23 @@ tx_reset_stream:
 ; — the same, for a caller that is rejecting the request rather than cancelling
 ; a response it had already begun.
 tx_reset_stream_code:
+    mov qword [s_rst_stop], 0
+    jmp tx_rs_common
+
+; tx_reset_and_stop(rdi = stream id, rsi = final size, edx = app error code) —
+; the same, plus a STOP_SENDING for the same stream in the SAME packet.
+;
+; RESET_STREAM ends only the direction we send in. A request we are refusing has
+; the other direction live and a client happily uploading a body into it, and
+; nothing we had said asked it to stop: the bytes arrived, were dropped, and
+; cost the client its bandwidth for as long as it took to finish. RFC 9000 3.5
+; is explicit that terminating both directions means one frame each way.
+;
+; One packet for the pair, so they cannot be separated by loss and they share a
+; single retransmission record.
+tx_reset_and_stop:
+    mov qword [s_rst_stop], 1
+tx_rs_common:
     push rbx
     push r13
     push r14
@@ -5876,6 +5906,22 @@ tx_reset_stream_code:
     mov rsi, r13                      ; final size
     call linnea_quic_varint_encode
     add r14, rax
+    ; STOP_SENDING = type 0x05, stream id, app error code (RFC 9000 19.5). No
+    ; final size: it speaks about the direction the PEER sends in, whose extent
+    ; is the peer's to state, not ours.
+    cmp qword [s_rst_stop], 0
+    je .rs_no_stop
+    mov byte [r14], 0x05
+    inc r14
+    mov rdi, r14
+    mov rsi, rbx                      ; the same stream
+    call linnea_quic_varint_encode
+    add r14, rax
+    mov rdi, r14
+    mov rsi, [s_rst_code]             ; and the same reason
+    call linnea_quic_varint_encode
+    add r14, rax
+.rs_no_stop:
     lea rax, [reset_pay]
     sub r14, rax                      ; frame length
     lea rsi, [reset_pay]
