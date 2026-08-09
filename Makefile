@@ -349,10 +349,21 @@ $(PROBE_BIN): $(PROBE_OBJS)
 
 probe: $(PROBE_BIN)
 
+# Globs, not a list of the variables above. The list was one, and it had drifted
+# to cover six of the twenty binaries this file can produce: `make clean` left
+# linnea-h3test, linnea-pooltest, linnea-quiccv and a dozen others sitting in
+# bin/ looking current, while removing the objects they were linked from. A
+# stale binary that survives a clean is worse than no clean at all, and a list
+# that has to be extended by hand every time a target is added will drift again.
+#
+# bin/ holds nothing else — its own .gitignore ignores the whole directory and
+# excepts only itself — and every product is bin/linnea or bin/linnea-something,
+# so naming those two patterns cannot reach .gitignore whatever the shell does
+# with dotfiles. Objects are every .o under the two source trees; the generated
+# crypto vectors are named because they are an .inc and not a .o.
 clean:
-	rm -f $(LIBOBJS) $(SRVOBJS) $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) \
-	      src/probe/*.o $(PROBE_BIN) $(API_BIN) $(WS_BIN) \
-	      test/crypto/*.o test/tls/*.o test/quic/*.o test/api/*.o $(CRYPTO_VECS)
+	rm -f bin/linnea bin/linnea-*
+	rm -f src/*/*.o test/*/*.o $(CRYPTO_VECS)
 
 test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
