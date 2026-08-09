@@ -2037,6 +2037,16 @@ for m in big head bad abort cap flood twice; do
     esac
 done
 
+# The rewritten upstream head goes into up_buf behind ONE up-front bound, and
+# .append is an unchecked rep movsb — so a head that clears the bound but whose
+# rewrite outgrows it runs off the end of the slot into the next connection.
+# The bound has ~24 bytes of margin over everything the rewrite adds (Via, the
+# Connection line, a Content-Length when a chunked one was dropped); this walks
+# a head across the boundary in both framings and expects only 200 or 431.
+out=$(python3 test/h1_upbuf_test.py 47080 2>&1 | tail -1)
+[ "$out" = "OK" ]
+check "a proxied head at the up_buf boundary is served or refused ($out)" $?
+
 # The same, counted: two captures on one connection. The bodies must DIFFER —
 # with identical ones a second upload served out of the first one's file looks
 # perfectly correct.

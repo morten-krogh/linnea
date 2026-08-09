@@ -2409,14 +2409,38 @@ linnea_http_handle:
     jmp .ret
 .proxy_build:
     mov [rbx + linnea_connection.location], rax
-    ; the client head is rewritten into up_buf (method + target + our version
-    ; and Connection lines + every client header verbatim). up_buf is smaller
-    ; than in_buf, and .append is an unchecked rep movsb, so bound the head
-    ; first: a head that fits in_buf but not up_buf would otherwise overrun the
-    ; slot into the next connection. head_len here spans the buffered body too
-    ; (set at .body_ready), so subtract it — the pure head is what gets copied,
-    ; exactly as the copy loop computes its limit. Upper bound = pure head + the
-    ; longest Connection line we add + the request-line rewrite slack.
+    ; The client head is rewritten into up_buf. up_buf is smaller than in_buf
+    ; and .append is an unchecked rep movsb, so this one bound guards the whole
+    ; rewrite: a head that fits in_buf but not up_buf would otherwise overrun
+    ; the slot into the next connection. head_len here spans the buffered body
+    ; too (set at .body_ready), so subtract it — the pure head is what gets
+    ; copied, exactly as the copy loop computes its limit.
+    ;
+    ; What the rewrite writes, measured against that pure head, because the
+    ; budget below has to cover ALL of it and named only some of it:
+    ;
+    ;   request line   a wash. "method SP target" + req_version (" HTTP/1.1"
+    ;                  CRLF, 11) is exactly as long as the "method SP target SP
+    ;                  HTTP/1.x CRLF" it replaces — an HTTP-version token is
+    ;                  always eight characters. req_version_len below is
+    ;                  therefore pure surplus, not payment for this.
+    ;   headers        never more than the pure head's: Connection, Expect and
+    ;                  Transfer-Encoding are skipped by name, then the
+    ;                  hop-by-hop list and everything Connection itself names.
+    ;   Via            +17, ALWAYS, and nothing in the budget was named for it.
+    ;   Content-Length +16 plus digits plus CRLF, but ONLY when bit 8 is set,
+    ;                  which means the body arrived chunked — so the pure head
+    ;                  carried a Transfer-Encoding line (>= 27) that the copy
+    ;                  loop dropped. Longest we can emit is 11 digits, since
+    ;                  the captured length is bounded by max_body's 64 GiB
+    ;                  ceiling, giving 29. Net over the dropped line: +2.
+    ;   Connection     +23 at most (upgrade; close is 21).
+    ;
+    ; Worst case is therefore 17 + 2 + 23 = 42 over the pure head, against a
+    ; budget of 23 + 11 + 32 = 66. The 24 bytes between them are the margin any
+    ; new line added here spends — lengthening Via is enough to start eating
+    ; it. h1_upbuf_test.py walks a proxied head across this boundary in both
+    ; framings and expects every size to be forwarded or refused 431.
     mov rcx, [rbx + linnea_connection.head_len]
     sub rcx, [rsp + 128]             ; buffered body bytes queued behind the head
     add rcx, hdr_up_upgrade_len
