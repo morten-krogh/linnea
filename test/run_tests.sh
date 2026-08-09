@@ -3122,6 +3122,16 @@ rm -f /tmp/upload3_echo.bin
     timeout 60 python3 test/tls/alert_codes.py 47446 >/dev/null 2>&1
     check "tls alert codes name the actual fault (tls-8, tls-9)" $?
 
+    # RFC 8446 7.4.2 MUST: a low-order X25519 key share drives the ECDHE
+    # product to all-zero whatever the server's private key is, and the
+    # handshake must be abandoned rather than keyed from a secret both sides
+    # could name in advance. All eight of Curve25519's low-order points, plus
+    # the non-canonical encodings p, p+1 and p-1 — which is why the check is on
+    # the computed secret and not a blocklist of inputs. Every one of them was
+    # accepted before the check existed.
+    timeout 60 python3 test/tls/low_order_share.py 127.0.0.1 47446 >/dev/null 2>&1
+    check "a low-order x25519 share is refused, not keyed from (RFC 8446 7.4.2)" $?
+
     # tls-4: a mid-connection KeyUpdate (RFC 8446 4.6.3). The peer derives the
     # next generation of its traffic secret and switches to it; a receiver that
     # cannot follow loses the connection. kTLS reports the KeyUpdate record by

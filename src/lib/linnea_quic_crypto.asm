@@ -330,6 +330,18 @@ linnea_quic_hs_secrets:
     mov rsi, r12
     mov rdx, rbx
     call linnea_x25519
+    ; RFC 8446 7.4.2, the same MUST the TCP handshake honours in
+    ; linnea_tls.asm: a client share of small order drives this to all-zero
+    ; whatever server_priv is, and the handshake must be abandoned rather than
+    ; keyed from a secret both sides know. ORed and tested once; the caller
+    ; turns a non-zero return into a handshake_failure and frees the
+    ; connection, since QUIC has no half-built flight to unwind.
+    mov rax, [rsp]
+    or rax, [rsp + 8]
+    or rax, [rsp + 16]
+    or rax, [rsp + 24]
+    test rax, rax
+    jz .hs_degenerate
     ; early = HKDF-Extract("", PSK-or-zeros). A resumption handshake seeds the IKM
     ; with the ticket's PSK (set in linnea_quic_hs_psk); a fresh one uses zeros.
     ; Everything downstream (derived, the hs secret from the ECDHE share) is
@@ -389,6 +401,17 @@ linnea_quic_hs_secrets:
     lea rdi, [rsp + 160]
     mov rsi, r15
     call quic_pp_keys
+    xor eax, eax                     ; 0 = keys derived
+    add rsp, 232
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.hs_degenerate:
+    mov eax, -1                      ; the only way this function fails
     add rsp, 232
     pop rbp
     pop r15

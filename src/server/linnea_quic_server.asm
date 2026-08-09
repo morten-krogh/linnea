@@ -1066,6 +1066,18 @@ linnea_quic_server_datagram:
     mov rdi, [cur_conn]
     call linnea_quic_conn_free
     jmp .done
+.hs_degenerate_share:
+    ; RFC 8446 7.4.2: the ECDHE product is all-zero, so the client's share was
+    ; of small order and the secret is one both sides could have named in
+    ; advance. illegal_parameter (47) is what names a share we will not key
+    ; from — handshake_failure above is for a client offering no x25519 at all,
+    ; which is a different complaint. Same refusal the TCP path makes in
+    ; build_flight; nothing has been sent, so the connection simply ends.
+    mov edi, 0x0100 + 47             ; illegal_parameter
+    call .initial_close
+    mov rdi, [cur_conn]
+    call linnea_quic_conn_free
+    jmp .done
 .tp_invalid:
     ; RFC 9000 7.4 MUST: a transport parameter carrying a value 18.2 declares
     ; invalid is a connection error of type TRANSPORT_PARAMETER_ERROR. Two are
@@ -1385,7 +1397,9 @@ linnea_quic_server_datagram:
     CONNLEA rcx, hs_ckeys
     CONNLEA r8, hs_skeys
     CONNLEA r9, hs_sec
-    call linnea_quic_hs_secrets
+    call linnea_quic_hs_secrets      ; 0, or -1 for an all-zero ECDHE secret
+    test eax, eax
+    jnz .hs_degenerate_share
     ; EE || Cert || CertVerify || Finished into hsmsg
     ; retry_source_connection_id (RFC 9000 7.3): after a Retry the client checks
     ; that the id it has been talking to is the one our Retry chose. Empty length

@@ -382,7 +382,9 @@ linnea_tls_hs_input:
     mov rdi, rbp                ; SH + CCS + encrypted flight into outbuf
     mov rsi, [rsp + IN_OUT]
     mov rdx, [rsp + IN_OCAP]
-    call build_flight
+    call build_flight           ; 0, or the alert a degenerate share earns
+    test eax, eax
+    jnz .ch_alert
     mov dword [rbp + linnea_tls_hs.state], LINNEA_TLS_WAIT_FIN
     jmp .ret
 
@@ -1540,6 +1542,28 @@ build_flight:
     lea rsi, [rbp + linnea_tls_hs.priv]
     lea rdx, [rbp + linnea_tls_hs.client_pub]
     call linnea_x25519
+    ; RFC 8446 7.4.2, a MUST: "implementations MUST check whether the computed
+    ; Diffie-Hellman shared secret is the all-zero value and abort if so".
+    ;
+    ; A client share of small order drives the product to zero whatever our
+    ; private key is, and all eight of Curve25519's low-order points did — as
+    ; did the non-canonical encodings p, p+1 and p-1, which is why this checks
+    ; the OUTPUT rather than blocklisting inputs. Nothing here was exploitable:
+    ; the server authenticates with ECDSA so no one can impersonate it, the
+    ; client already knows its own session keys, clamping clears the low three
+    ; bits so the cofactor subgroup leaks no scalar, and the ephemeral key is
+    ; fresh per handshake. What is lost without it is contributory behaviour,
+    ; and conformance with a MUST.
+    ;
+    ; ORed and tested once. The value is not secret, but a byte-at-a-time
+    ; compare that exits early is the wrong habit to leave in a file whose
+    ; every other comparison is constant-time on purpose.
+    mov rax, [rsp + BF_SHARED]
+    or rax, [rsp + BF_SHARED + 8]
+    or rax, [rsp + BF_SHARED + 16]
+    or rax, [rsp + BF_SHARED + 24]
+    test rax, rax
+    jz .bf_degenerate
 
     ; 2. schedule up to the handshake secret (no transcript needed yet).
     ; early = HKDF-Extract(0, PSK-or-0): resumption seeds the IKM with the
@@ -1771,6 +1795,19 @@ build_flight:
     sub r15, rax
     mov [rbp + linnea_tls_hs.out_len], r15
 
+    xor eax, eax                ; 0 = the flight is built; see .bf_degenerate
+    add rsp, BF_FRAME
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.bf_degenerate:
+    ; The only way this function fails. Nothing has been written to outbuf yet,
+    ; so the caller is free to put an alert there instead; out_len is set by
+    ; that path and not by this one.
+    mov eax, LINNEA_TLS_A_ILLEGAL_PARAMETER
     add rsp, BF_FRAME
     pop r15
     pop r14
