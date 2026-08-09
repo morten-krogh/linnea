@@ -25,7 +25,12 @@ sha1_block:
     push rbx
     push rbp
     push r12
-    sub rsp, 328                     ; w[80] dwords, and keep rsp 16-aligned
+    sub rsp, 328                     ; w[80] dwords, plus 8. NOT a 16-alignment
+                                     ; claim: this frame preserves whatever
+                                     ; parity the caller had rather than fixing
+                                     ; it, which is only safe because nothing
+                                     ; below here touches SSE. Anything added
+                                     ; that does must align rsp itself.
     mov rbp, rsp
     ; w[0..15]: the block's dwords, big-endian as SHA-1 reads them
     xor ecx, ecx

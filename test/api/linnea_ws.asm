@@ -139,6 +139,18 @@ resp_403:       db "HTTP/1.1 403 Forbidden", 13, 10
                 db "origin not allowed", 13, 10
 resp_403_len    equ $ - resp_403
 
+; A request head that will not fit IN_BUF. Every other refusal here answers in
+; HTTP and this one used to hang up mid-request instead, which reads to the
+; client as a network fault rather than as a decision. A browser's upgrade runs
+; a few hundred bytes, so this is headroom rather than a live limit — but the
+; way it failed was the wrong way to fail.
+resp_431:       db "HTTP/1.1 431 Request Header Fields Too Large", 13, 10
+                db "Content-Type: text/plain", 13, 10
+                db "Connection: close", 13, 10
+                db "Content-Length: 24", 13, 10, 13, 10
+                db "request head too large", 13, 10
+resp_431_len    equ $ - resp_431
+
 json_count:     db '{"count":'
 json_count_len  equ $ - json_count
 json_clients:   db ',"clients":'
@@ -147,6 +159,10 @@ json_end:       db '}'
 
 cmd_inc:        db "inc"
 cmd_inc_len     equ $ - cmd_inc
+
+; struct timespec { 0 s, 100 ms }, for the one place that has to back off.
+align 8
+pause_100ms:    dq 0, 100000000
 
 section .bss
 
@@ -202,7 +218,7 @@ _start:
     mov edx, -1                    ; block: there is no timer work to do
     syscall
     test rax, rax
-    js .loop                       ; EINTR: rebuild and wait again
+    js .poll_err
     ; the listener first, so a burst of connections is taken in one pass
     movzx eax, word [pollfds + 6]
     test eax, LINNEA_POLLIN
@@ -236,6 +252,19 @@ _start:
 .next:
     inc rbx
     jmp .each
+.poll_err:
+    ; EINTR is the ordinary one and comes straight back round. Anything else —
+    ; ENOMEM is the realistic candidate — would spin this loop at the speed of
+    ; the syscall, burning a core for as long as it lasted, since the wait that
+    ; paces the loop is the very thing that failed. Pause first, so a transient
+    ; fault costs a tenth of a second and a permanent one is merely idle.
+    cmp rax, -4                    ; EINTR
+    je .loop
+    lea rdi, [pause_100ms]
+    xor esi, esi
+    mov eax, LINNEA_SYS_NANOSLEEP
+    syscall
+    jmp .loop
 
 
 ; clients_init() — every slot free.
@@ -307,17 +336,27 @@ build_pollfds:
     ret
 
 
-; accept_client() — take one connection, park it in a free slot.
+; accept_client() — take everything waiting, parking each in a free slot.
+;
+; The whole queue, not one: poll is level-triggered so a burst would eventually
+; be taken either way, but a connection refused for want of a slot has to be
+; closed and the next one looked at, or a full table turns every poll into an
+; accept-and-close of the same backlog. The listener is non-blocking (see
+; setup_listener), so EAGAIN is what ends this loop and is the ordinary exit.
 accept_client:
     push rbx
     push r12
+.again:
     mov eax, LINNEA_SYS_ACCEPT
     mov rdi, [listen_fd]
     xor esi, esi
     xor edx, edx
     syscall
     test rax, rax
-    js .done                       ; EAGAIN, or the peer left before we looked
+    js .done                       ; EAGAIN: the queue is empty, which is the
+                                   ; end of the burst. ECONNABORTED (the peer
+                                   ; left before we looked) ends it too — poll
+                                   ; will say so again if there is more.
     mov rbx, rax
     ; a free slot, or turn it away
     xor r12, r12
@@ -334,7 +373,8 @@ accept_client:
     mov eax, LINNEA_SYS_CLOSE
     mov rdi, rbx
     syscall
-    jmp .done
+    jmp .again                     ; and look at the next one, or the backlog
+                                   ; is re-offered on every poll for ever
 .have:
     mov r12, rax                   ; the slot
     mov eax, LINNEA_SYS_FCNTL
@@ -347,6 +387,7 @@ accept_client:
     mov qword [r12 + ws_client.in_len], 0
     mov qword [r12 + ws_client.out_len], 0
     mov qword [r12 + ws_client.out_off], 0
+    jmp .again
 .done:
     pop r12
     pop rbx
@@ -414,6 +455,17 @@ client_read:
     pop rbx
     ret
 .overflow:
+    ; Before the upgrade this is a request head too long to hold, and it is
+    ; answered in HTTP like every other refusal. After it, it is a frame larger
+    ; than the buffer, which is 1009 on the WebSocket connection.
+    cmp qword [rbx + ws_client.state], ST_HANDSHAKE
+    jne .overflow_frame
+    mov rdi, rbx
+    lea rsi, [resp_431]
+    mov rdx, resp_431_len
+    call refuse
+    jmp .done
+.overflow_frame:
     mov rdi, rbx
     mov esi, WS_TOO_BIG
     call fail_close
@@ -913,7 +965,51 @@ dispatch_frame:
     call send_frame
     jmp .done
 .close:
-    ; RFC 6455 5.5.1: answer a close with a close, then stop.
+    ; RFC 6455 5.5.1: answer a close with a close, then stop — and answer it
+    ; with the code the peer sent rather than 1000 regardless, which is what
+    ; "echoed" is supposed to mean and told a client that closed with 1001
+    ; Going Away that we had understood something else.
+    ;
+    ; An empty payload is a close with no code, answered with none of ours
+    ; either (1000 is what the peer is entitled to read into it). A payload of
+    ; exactly ONE byte cannot hold a code and is a protocol error, as is a code
+    ; outside the ranges 7.4.1 allows a peer to send: 1004 was never assigned,
+    ; 1005 and 1006 mean "no code" and "abnormal" and exist only inside an
+    ; implementation, and the registered range stops at 1011 until the private
+    ; 3000-4999.
+    test r13, r13
+    jz .close_normal
+    cmp r13, 2
+    jb .protocol_close             ; one byte: half a code
+    movzx eax, byte [r12]
+    shl eax, 8
+    movzx edx, byte [r12 + 1]
+    or eax, edx                    ; the code, big-endian on the wire
+    cmp eax, 3000
+    jae .close_private
+    cmp eax, 1000
+    jb .protocol_close
+    cmp eax, 1003
+    jbe .close_echo
+    cmp eax, 1007
+    jb .protocol_close             ; 1004, 1005, 1006
+    cmp eax, 1011
+    ja .protocol_close
+.close_echo:
+    mov rdi, rbx
+    mov esi, eax
+    call fail_close
+    jmp .done
+.close_private:
+    cmp eax, 4999
+    ja .protocol_close
+    jmp .close_echo
+.protocol_close:
+    mov rdi, rbx
+    mov esi, WS_PROTOCOL
+    call fail_close
+    jmp .done
+.close_normal:
     mov rdi, rbx
     mov esi, WS_NORMAL
     call fail_close
@@ -1383,6 +1479,16 @@ setup_listener:
     syscall
     test rax, rax
     js .fail
+    ; ...and non-blocking, which accept_client's loop has always assumed and
+    ; this never actually set. Readiness from poll(2) is not a promise that a
+    ; connection is still there to take — the peer may have reset it in between,
+    ; and on a blocking listener that is a single-threaded server asleep in
+    ; accept(2) with a poll set it is no longer watching.
+    mov eax, LINNEA_SYS_FCNTL
+    mov rdi, rbx
+    mov esi, LINNEA_F_SETFL
+    mov edx, LINNEA_O_NONBLOCK
+    syscall
     pop rbx
     ret
 .fail:

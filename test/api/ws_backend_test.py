@@ -199,6 +199,35 @@ check("the close carries a status code", len(payload) >= 2 and
       struct.unpack(">H", payload[:2])[0] == 1000, repr(payload))
 s2.close()
 
+
+def close_with(payload):
+    """Close a fresh connection with this payload; return the code we get back."""
+    c, _, _, _, rr = open_client()
+    rr.read_frame()                               # its greeting
+    c.sendall(frame(payload, opcode=0x8))
+    op, body, _, _ = rr.read_frame()
+    c.close()
+    if op != 0x8 or len(body) < 2:
+        return None
+    return struct.unpack(">H", body[:2])[0]
+
+
+# The code that comes back must be the one that was SENT: answering 1000 to
+# everything told a client that closed with 1001 Going Away that we had
+# understood something else. 3000-4999 is the private range, which a peer is
+# entitled to use and we have no business judging.
+check("a close with 1001 is echoed as 1001", close_with(struct.pack(">H", 1001)) == 1001)
+check("a close in the private range is echoed",
+      close_with(struct.pack(">H", 4321)) == 4321)
+check("a close with no payload is answered 1000", close_with(b"") == 1000)
+# ...and the ones RFC 6455 7.4.1 does not let a peer send. A single byte cannot
+# hold a code at all; 1005 and 1006 exist only inside an implementation.
+check("a one-byte close payload is a protocol error", close_with(b"\x03") == 1002)
+check("a close with 1005 is a protocol error", close_with(struct.pack(">H", 1005)) == 1002)
+check("a close with 1006 is a protocol error", close_with(struct.pack(">H", 1006)) == 1002)
+check("a close with an unassigned code is a protocol error",
+      close_with(struct.pack(">H", 2000)) == 1002)
+
 # ---- 6: protocol errors ----------------------------------------------
 s3, _, _, _, r3 = open_client()
 r3.read_frame()                                   # its greeting
@@ -260,6 +289,23 @@ check("the page's own Origin is allowed", status.startswith(b"HTTP/1.1 101"),
       status.decode(errors="replace"))
 c.close()
 
+# A head too long to hold. Every other refusal here answers in HTTP; this one
+# used to hang up mid-request, which reads to the client as a network fault
+# rather than as a decision. Sent as one blob, since the point is the buffer
+# filling before the blank line arrives.
+c = connect()
+c.sendall(b"GET " + PATH + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+          b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+          b"Sec-WebSocket-Version: 13\r\n"
+          b"X-Padding: " + b"p" * 4000 + b"\r\n\r\n")
+try:
+    answer = c.recv(200)
+except (ConnectionResetError, socket.timeout):
+    answer = b""
+check("an oversized request head is refused with 431, not a bare close",
+      answer.startswith(b"HTTP/1.1 431"), repr(answer[:60]))
+c.close()
+
 # ---- 8: the count survives, and departures are noticed ----------------
 s7, _, _, _, r7 = open_client()
 st = json.loads(r7.read_frame()[1])
@@ -271,6 +317,49 @@ check("clients that left are no longer counted", st.get("clients") == 2,
       repr(st))   # this one and the very first, which is still open
 s.close()
 s7.close()
+
+# ---- 9: a burst of connections ---------------------------------------
+# All of them opened before any is read, so they arrive together and the
+# listener's backlog is what holds them. accept_client drains the queue rather
+# than taking one per poll; either way every one of these must end up with a
+# socket, and a broadcast must reach all of them.
+burst = []
+for _ in range(20):
+    b = connect()
+    b.sendall(b"GET " + PATH + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+              b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+              b"Sec-WebSocket-Key: " + base64.b64encode(os.urandom(16)) + b"\r\n"
+              b"Sec-WebSocket-Version: 13\r\n\r\n")
+    burst.append(b)
+opened, readers = 0, []
+for b in burst:
+    try:
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = b.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        if buf.startswith(b"HTTP/1.1 101"):
+            opened += 1
+            rd = Reader(b, buf.partition(b"\r\n\r\n")[2])
+            rd.read_frame()                       # its greeting
+            readers.append(rd)
+    except (socket.timeout, ConnectionResetError, EOFError):
+        pass
+check("a burst of 20 connections is all accepted", opened == 20, "%d of 20" % opened)
+burst[0].sendall(frame(b"inc"))
+reached = 0
+for rd in readers:
+    try:
+        if rd.read_frame()[0] == 0x1:
+            reached += 1
+    except (socket.timeout, EOFError):
+        pass
+check("the broadcast reaches every one of them", reached == opened,
+      "%d of %d" % (reached, opened))
+for b in burst:
+    b.close()
 
 print()
 if failures:
