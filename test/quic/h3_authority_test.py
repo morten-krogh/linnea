@@ -101,7 +101,7 @@ assert b"sub index" not in body, "cross-vhost request leaked the other vhost's p
 
 # a name we do not host at all (an IP literal, an alias) keeps being served by
 # the connection's own vhost — this is how address-based access still works
-body = request("sni.test", [M, S, (b":authority", b"127.0.0.1:47444"), P])
+body = request("sni.test", [M, S, (b":authority", b"127.0.0.1:61444"), P])
 assert b"sub index" in body, f"unknown authority was not served locally: {body[:60]}"
 
 # and the malformed rules apply here too (shared with HTTP/2): a request with

@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""A stop must not wait for a WebSocket tunnel.
+"""A stop is immediate, whatever is open.
 
 This test owns its own server, because it stops it — the shared fixture on
-47080 is serving the rest of the suite.
+61080 is serving the rest of the suite.
 
-A tunnel has no request left to finish, so the fast drain closes it. The case
-that matters is the BUSY one: a client sending frames pushes last_activity
-forward on every one, so the idle reaper never fires and, before this was
-fixed, the worker survived until systemd's TimeoutStopSec and was SIGKILLed.
-The quiet case is measured too, to show the drain is what closes it and not
-the 2-second idle timeout this fixture configures.
+SIGTERM means the unit is going down, and nothing open outlives that however
+politely we treat it, so a worker exits at once rather than draining. What
+made the old behaviour worth changing was the WebSocket tunnel: it is never
+idle and never finishes on its own, so a busy one was never reaped and the
+worker survived to systemd's TimeoutStopSec and was SIGKILLed. Every restart
+with a page open took the full ten seconds.
 
-Prints OK, or a description of what took too long.
+The three cases below are the three things that used to hold a stop up: a
+quiet tunnel (held for the idle timeout), a busy tunnel (held for ever), and
+a response still streaming (finished first, by design, until it did not need
+to be). All three must now be immediate.
+
+Prints OK, or what took too long.
 """
 import base64
 import os
@@ -22,10 +27,14 @@ import sys
 import threading
 import time
 
-PORT = 47471                 # test/configs/ws-drain.json
+PORT = 61471                 # test/configs/ws-drain.json
 CONFIG = "test/configs/ws-drain.json"
-LIMIT = 1.5                  # must beat the fixture's 2s idle timeout, so a
-                             # pass cannot be the reaper doing the work
+# NOT ws_*: the fixture routes the /ws prefix to the WebSocket
+# backend, and "/ws_big.bin" would match it
+BIG = "test/www/drain_big.bin"
+BIG_SIZE = 6 << 20
+LIMIT = 1.5                  # under the fixture's own 2s idle timeout, so a
+                             # pass cannot be the idle reaper doing the work
 
 
 def wait_port_free():
@@ -65,20 +74,44 @@ def open_tunnel():
         buf += chunk
     if not buf.startswith(b"HTTP/1.1 101"):
         raise SystemExit("no 101: %r" % buf[:60])
-    return s
+    return s, None
 
 
-def keep_busy(s, stop):
-    """Frames every 250ms — each one resets the tunnel's idle timer."""
-    while not stop.is_set():
-        try:
-            k = os.urandom(4)
-            pay = b"get"
-            s.sendall(bytes([0x81, 0x80 | len(pay)]) + k
-                      + bytes(b ^ k[i % 4] for i, b in enumerate(pay)))
-        except OSError:
-            return
-        stop.wait(0.25)
+def open_busy_tunnel():
+    """Frames every 250ms — each one resets the tunnel's idle timer, which is
+    what made this case survive a stop entirely."""
+    s, _ = open_tunnel()
+    stop = threading.Event()
+
+    def chat():
+        while not stop.is_set():
+            try:
+                k = os.urandom(4)
+                pay = b"get"
+                s.sendall(bytes([0x81, 0x80 | len(pay)]) + k
+                          + bytes(b ^ k[i % 4] for i, b in enumerate(pay)))
+            except OSError:
+                return
+            stop.wait(0.25)
+
+    threading.Thread(target=chat, daemon=True).start()
+    return s, stop
+
+
+def open_download():
+    """A response still streaming when the stop lands."""
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+    s.sendall(b"GET /%s HTTP/1.1\r\nHost: one.test\r\n\r\n"
+              % os.path.basename(BIG).encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(4096)
+        if not chunk:
+            raise SystemExit("server closed before the response head")
+        head += chunk
+    if not head.startswith(b"HTTP/1.1 200"):
+        raise SystemExit("no 200 for the download: %r" % head[:60])
+    return s, None
 
 
 def alive(pid):
@@ -110,22 +143,41 @@ def stop_time(p):
     return el, [k for k in kids if alive(k)]
 
 
+with open(BIG, "wb") as fh:
+    fh.write(os.urandom(BIG_SIZE))
+
 bad = []
-for label, busy in (("quiet", False), ("busy", True)):
-    p = start()
-    s = open_tunnel()
-    stop = threading.Event()
-    if busy:
-        threading.Thread(target=keep_busy, args=(s, stop), daemon=True).start()
-    time.sleep(0.4)
-    el, left = stop_time(p)
-    stop.set()
-    s.close()
-    if left:
-        bad.append("%s tunnel: workers survived SIGTERM" % label)
-    elif el > LIMIT:
-        bad.append("%s tunnel delayed the stop by %.2fs" % (label, el))
-    wait_port_free()
+try:
+    for label, opener in (("quiet tunnel", open_tunnel),
+                          ("busy tunnel", open_busy_tunnel),
+                          ("streaming response", open_download)):
+        p = start()
+        try:
+            s, chatter = opener()
+            time.sleep(0.4)
+            el, left = stop_time(p)
+        finally:
+            # anything thrown above leaves a server holding the port, and the
+            # next run would blame a leftover rather than the real failure
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+                for k in subprocess.run(["pgrep", "-P", str(p.pid)],
+                                        capture_output=True,
+                                        text=True).stdout.split():
+                    if alive(int(k)):
+                        os.kill(int(k), 9)
+        if chatter:
+            chatter.set()
+        s.close()
+        if left:
+            bad.append("%s: workers survived SIGTERM" % label)
+        elif el > LIMIT:
+            bad.append("%s delayed the stop by %.2fs" % (label, el))
+        wait_port_free()
+finally:
+    if os.path.exists(BIG):
+        os.unlink(BIG)
 
 print("OK" if not bad else "; ".join(bad))
 sys.exit(1 if bad else 0)

@@ -5,7 +5,7 @@
   "workers": 1,
   "servers": [
     {
-      "host": "127.0.0.1", "port": 47448, "hostname": "localhost",
+      "host": "127.0.0.1", "port": 61448, "hostname": "localhost",
       "cert": "test/tls/server.crt", "key": "test/tls/server.key",
       "locations": [
         { "prefix": "/", "root": "test/www" }

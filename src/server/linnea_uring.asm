@@ -206,6 +206,10 @@ log_drain:          db "worker draining: accepts closed, finishing open connecti
 log_drain_len       equ $ - log_drain
 log_drained:        db "worker drained", 10
 log_drained_len     equ $ - log_drained
+log_stopped:        db "worker stopping: connections dropped", 10
+log_stopped_len     equ $ - log_stopped
+log_drain_late:     db "worker drain deadline reached, dropping what is left", 10
+log_drain_late_len  equ $ - log_drain_late
 
 dbgsplit:           db "DBG split in_len "
 dbgsplit_len        equ $ - dbgsplit
@@ -245,6 +249,15 @@ LINNEA_LINGER_TOTAL_NS equ 30000000000              ; 30 s
 ; each tick runs the retransmission sweep. 50 ms bounds how late a lost reply is
 ; resent past its probe timeout, and how often a worker wakes when idle.
 pto_timer:          dq 0, 50000000                  ; {sec, nsec} = 50 ms
+; How long a retiring generation is given to finish what it holds. Only the
+; hot upgrade drains (SIGQUIT); a stop does not, so this never delays one.
+; Without it a WebSocket tunnel pins an old worker for as long as the browser
+; tab stays open, because a tunnel is never idle and never finishes on its
+; own — measured: one worker still alive indefinitely after the new
+; generation had taken over. Thirty seconds is far longer than any request
+; this server answers and short enough that reloads cannot accumulate
+; workers.
+drain_deadline:     dq 30, 0                        ; {sec, nsec} = 30 s
 ; How long to wait before retrying an accept that keeps failing. A multishot
 ; accept the kernel disarms with an error is otherwise re-armed at once, and a
 ; standing error (EMFILE above all: the fd limit is reached before the
@@ -261,11 +274,9 @@ max_per_ip:         resq 1     ; connections one source address may hold
 sni_select_conn:    resq 1     ; the connection the SNI callback is deciding for
 idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
                                ; tunnel's last_activity comparison
-sig_mask:           resq 1     ; blocked-signal set: SIGTERM + SIGHUP
+sig_mask:           resq 1     ; blocked-signal set: SIGTERM + SIGQUIT + SIGHUP
 sig_fd:             resd 1
 drain_flag:         resd 1     ; 1 = draining: no accepts, close after serve
-fast_drain:         resd 1     ; 1 = also close connections with no request in
-                               ; flight: idle keep-alives, and tunnels
 accept_err_streak:  resd 1     ; consecutive failed accepts; drives the backoff
 conn_full_warned:   resd 1     ; the pool-full warning has been logged already
 quic_fd:    resd 1
@@ -348,9 +359,10 @@ linnea_uring_run:
 
     ; Signals arrive as cqes like everything else: block them, open a
     ; signalfd, and arm a read on the ring.
-    ;   SIGTERM  stop: finish what is in flight, close the rest at once
-    ;   SIGQUIT  drain: also let idle connections live out their keep-alive,
-    ;            used when a new generation is already serving (hot upgrade)
+    ;   SIGTERM  stop: exit at once, dropping whatever is open
+    ;   SIGQUIT  drain: stop accepting and finish what is open, on a
+    ;            deadline; used when a new generation is already serving
+    ;            (hot upgrade)
     ;   SIGHUP   reopen the log after a rotation
     ; The master's death delivers SIGTERM too (PR_SET_PDEATHSIG in
     ; linnea_start).
@@ -583,6 +595,8 @@ linnea_uring_run:
     je .on_qtimer
     cmp eax, LINNEA_UD_ARETRY
     je .on_aretry
+    cmp eax, LINNEA_UD_DRAINTIMER
+    je .on_drain_deadline
     cmp eax, LINNEA_UD_H2UP_CONNECT
     je .on_h2up
     cmp eax, LINNEA_UD_H2UP_SEND
@@ -692,12 +706,13 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 
-; --- SIGTERM arrived on the signalfd: drain --------------------------
-; Stop taking new work but finish what is open: cancel every armed
-; accept (their completions close our copies of the listener fds, which
-; releases the port once every worker has done the same), let in-flight
-; requests run to their end, close instead of keep-alive afterwards,
-; and exit when the last connection is freed.
+; --- a signal arrived on the signalfd ---------------------------------
+; SIGHUP reopens the log. SIGTERM exits at once. SIGQUIT drains: stop
+; taking new work but finish what is open — cancel every armed accept
+; (their completions close our copies of the listener fds, which releases
+; the port once every worker has done the same), let in-flight requests
+; run to their end, close instead of keep-alive afterwards, and exit when
+; the last connection is freed or the drain deadline fires.
 .on_signal:
     ; A short or failed read leaves the PREVIOUS siginfo in the buffer (or
     ; zeros on the first one), and zero is not SIGHUP — it would fall straight
@@ -716,18 +731,29 @@ linnea_uring_run:
 .on_stop_signal:
     cmp dword [drain_flag], 0
     jnz .wait                  ; a second stop signal changes nothing
+    ; The two stop signals mean different things and are answered
+    ; differently.
+    ;
+    ; SIGTERM is the unit going down. systemd sends it to every process in
+    ; the cgroup and SIGKILLs whatever is still there at TimeoutStopSec.
+    ; Nothing open outlives a stop whichever way we do it, so there is
+    ; nothing to buy by draining first: exit now. Clients reconnect to the
+    ; server that comes back, which is what a restart is. Draining here is
+    ; what made `systemctl restart` slow — a browser almost always holds an
+    ; idle keep-alive, and a WebSocket tunnel is never idle at all, so a
+    ; stop ran to the ten-second kill with a page open.
+    ;
+    ; SIGQUIT is the hot upgrade retiring the previous generation, where
+    ; finishing open connections IS the point: the new workers already have
+    ; everything arriving, and these last requests are all the old ones have
+    ; left to do. So that path still drains — but against a deadline, since
+    ; a tunnel never goes idle and would otherwise pin an old worker for as
+    ; long as its browser tab is open.
+    cmp dword [sig_buf], LINNEA_SIGQUIT
+    jne .stop_now
     mov dword [drain_flag], 1
     mov dword [linnea_quic_draining], 1  ; the QUIC module's copy: refuse new conns
-    ; SIGQUIT is the patient drain: leave idle connections to their
-    ; keep-alive timeout. SIGTERM means the unit is stopping, so an idle
-    ; connection — one with no request in flight — is closed now rather
-    ; than waited on; otherwise `systemctl stop` takes as long as the idle
-    ; timeout, since a browser almost always has one open.
-    mov dword [fast_drain], 1
-    cmp dword [sig_buf], LINNEA_SIGQUIT
-    jne .drain_go
-    mov dword [fast_drain], 0
-.drain_go:
+    call linnea_uring_arm_drain_deadline
     call linnea_log_stamp
     lea rdi, [log_drain]
     mov esi, log_drain_len
@@ -786,9 +812,9 @@ linnea_uring_run:
     jmp .close_listeners
 .listeners_closed:
     ; tell connected h3 peers we are going away before anything else, then
-    ; close the ones with nothing in flight right now — a `systemctl stop`
-    ; with only an idle browser tab connected should say goodbye and exit
-    ; immediately, not leave the peer to its idle timeout
+    ; close the ones with nothing in flight right now, so a retiring
+    ; generation holding only idle browser tabs says goodbye and goes
+    ; instead of waiting out their idle timeouts
     cmp dword [quic_fd], 0
     jl .no_goaway
     mov edi, [quic_fd]
@@ -818,49 +844,35 @@ linnea_uring_run:
     inc r13
     jmp .cancel_loop
 .cancel_submit:
-    cmp dword [fast_drain], 0
-    je .cancel_done
-    call linnea_uring_submit_now   ; flush the accept cancels before the idle
-                                   ; loop queues potentially hundreds more
-    ; cancel the read each idle connection is parked on; the cancellation
-    ; lands as -ECANCELED on that connection, which closes it
-    xor r13d, r13d
-.idle_loop:
-    cmp r13, [rbx + linnea_config.max_connections]
-    jae .cancel_done
-    mov rdi, r13
-    call linnea_connection_at
-    mov r12, rax
-    cmp qword [r12 + linnea_connection.in_use], 0
-    je .idle_next
-    mov rdi, r12
-    call conn_is_drainable
-    test eax, eax
-    jz .idle_next
-    call linnea_uring_get_sqe_zeroed
-    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_ASYNC_CANCEL
-    mov r14, r13
-    shl r14, 8
-    or r14, LINNEA_UD_RECV     ; the recv this connection is parked on
-    mov rcx, [r12 + linnea_connection.gen]     ; same packing as the arm
-    shl rcx, 32
-    or r14, rcx
-    mov [rax + LINNEA_SQE_ADDR], r14
-    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_CANCEL
-.idle_next:
-    inc r13
-    test r13d, 127
-    jnz .idle_loop
-    call linnea_uring_submit_now   ; bound the SQ (256 entries): a server holding
-                                   ; many idle connections would otherwise overflow
-    jmp .idle_loop                 ; it before .cancel_done gets to submit
-.cancel_done:
     call linnea_uring_submit_now
     jmp .wait
 .drained_exit:
     call linnea_log_stamp
     lea rdi, [log_drained]
     mov esi, log_drained_len
+    call linnea_log_write
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; SIGTERM: the unit is stopping, so stop. Nothing is cancelled or waited on —
+; exit closes every socket, and the log line is flushed by its own newline
+; before we go.
+.stop_now:
+    call linnea_log_stamp
+    lea rdi, [log_stopped]
+    mov esi, log_stopped_len
+    call linnea_log_write
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; The hot upgrade's drain ran out of time: whatever is still open is not
+; going to finish on its own. Go, rather than stay for ever holding it.
+.on_drain_deadline:
+    call linnea_log_stamp
+    lea rdi, [log_drain_late]
+    mov esi, log_drain_late_len
     call linnea_log_write
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
@@ -2221,9 +2233,6 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .tunnel_c2u_idle:
-    cmp dword [fast_drain], 0
-    jne .tunnel_drain_close    ; a cancel during a stop is the stop, not a
-                               ; linked timeout: do not re-arm
     call linnea_uring_now
     sub rax, [r12 + linnea_connection.last_activity]
     cmp rax, [idle_timeout_ns]
@@ -2236,10 +2245,6 @@ linnea_uring_run:
 .tunnel_idle_close:
     lea r14, [reason_timeout]
     mov r15d, reason_timeout_len
-    jmp .tunnel_close
-.tunnel_drain_close:
-    lea r14, [reason_drain]
-    mov r15d, reason_drain_len
     jmp .tunnel_close
 
 ; forward to the upstream completed: r15d = bytes or -errno
@@ -2304,8 +2309,6 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .tunnel_u2c_idle:
-    cmp dword [fast_drain], 0
-    jne .tunnel_drain_close    ; as above, from the upstream side
     call linnea_uring_now
     sub rax, [r12 + linnea_connection.last_activity]
     cmp rax, [idle_timeout_ns]
@@ -3208,48 +3211,6 @@ linnea_uring_arm_up_recv:
     pop rbx
     jmp linnea_uring_arm_link_timeout
 
-; conn_is_drainable(rdi = connection*) -> eax = 1 when a stop can close this
-; connection now. Every test below asks the same question — is a request still
-; in flight — and lets anything unfinished finish: nothing half-received,
-; nothing queued to send, no upstream exchange, and for HTTP/2 no open stream.
-;
-; A tunnel is the one case that question does not fit, so it is answered first
-; and the other way. After a 101 there is no request left to finish; the
-; connection is an open pipe that ends when a peer closes it, which on a stop
-; is never. Held open it made `systemctl restart` wait out the idle timeout
-; for a quiet WebSocket and TimeoutStopSec for a busy one — whose every frame
-; pushes last_activity forward, so it is never reaped and systemd SIGKILLs the
-; worker. Dropping the tunnel costs the client a reconnect, which is what a
-; WebSocket client already handles.
-conn_is_drainable:
-    push rbx
-    mov rbx, rdi
-    cmp qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
-    je .ci_idle                ; whatever is in its buffers: they are relayed
-                               ; bytes, not a reply we owe anyone
-    cmp qword [rbx + linnea_connection.in_len], 0
-    jne .ci_busy
-    cmp qword [rbx + linnea_connection.out_rem], 0
-    jne .ci_busy
-    cmp qword [rbx + linnea_connection.file_rem], 0
-    jne .ci_busy
-    cmp qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
-    jne .ci_busy
-    cmp qword [rbx + linnea_connection.is_h2], 0
-    je .ci_idle
-    mov rdi, rbx               ; an h2 connection with a stream open is busy
-    call linnea_h2_pool_active
-    test rax, rax
-    jnz .ci_busy
-.ci_idle:
-    mov eax, 1
-    pop rbx
-    ret
-.ci_busy:
-    xor eax, eax
-    pop rbx
-    ret
-
 ; h2_arm_recv_once(rdi = connection*) — arm a client recv unless one is
 ; already in flight. An HTTP/2 connection can be driven from either side (a
 ; client frame or an upstream completion), so without this the two paths
@@ -3512,6 +3473,21 @@ linnea_uring_arm_accept_retry:
     shl rdi, 8
     or rdi, LINNEA_UD_ARETRY
     mov [rax + LINNEA_SQE_USER_DATA], rdi
+    ret
+
+; linnea_uring_arm_drain_deadline() — one-shot IORING_OP_TIMEOUT bounding a
+; hot upgrade's drain. Armed once, when the SIGQUIT arrives, and never
+; re-armed: the worker is gone either way, whether by the last connection
+; closing or by this firing. Caller submits.
+linnea_uring_arm_drain_deadline:
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_TIMEOUT
+    mov dword [rax + LINNEA_SQE_FD], -1
+    lea rcx, [drain_deadline]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1        ; one timespec
+    mov qword [rax + LINNEA_SQE_OFF], 0        ; fire on the timer, not a count
+    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_DRAINTIMER
     ret
 
 ; linnea_uring_arm_qtimer() — queue the QUIC probe-timeout tick: a relative

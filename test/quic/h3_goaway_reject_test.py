@@ -15,6 +15,7 @@
 import os
 import signal
 import socket
+import subprocess
 import ssl
 import sys
 import time
@@ -23,6 +24,23 @@ import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import ConnectionTerminated, StreamDataReceived, StreamReset
+
+
+def drain_workers(master):
+    """Start a drain on the workers of `master`.
+
+    SIGTERM is an immediate stop now — it drops whatever is open — so a test
+    about the drain has to send what a hot upgrade sends: SIGQUIT, and to the
+    workers, since that is what kill_old_workers signals. The master is then
+    SIGTERMed so it cannot respawn them; a worker already draining ignores the
+    SIGTERM its PR_SET_PDEATHSIG delivers when the master goes.
+    """
+    kids = subprocess.run(["pgrep", "-P", str(master)],
+                          capture_output=True, text=True).stdout.split()
+    for k in kids:
+        os.kill(int(k), signal.SIGQUIT)
+    os.kill(master, signal.SIGTERM)
+
 
 port = int(sys.argv[1])
 master = int(sys.argv[2])
@@ -153,7 +171,7 @@ while state["got"] == 0 and time.time() < deadline:
     pump(0.01)
 assert state["got"] > 0, "no response data before the drain"
 
-os.kill(master, signal.SIGTERM)      # the drain lands mid-download, stalled
+drain_workers(master)                # the drain lands mid-download, stalled
 
 # the GOAWAY proves this worker is draining; only from then on is a request
 # at/above its id one the server has promised not to process

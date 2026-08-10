@@ -16,7 +16,7 @@ import socket
 import sys
 import time
 
-HOST, PORT = "127.0.0.1", 47080
+HOST, PORT = "127.0.0.1", 61080
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
@@ -36,7 +36,7 @@ def handshake(sock, path, extra=b""):
     read the response head. Returns (head, leftover, expected_accept)."""
     key = base64.b64encode(os.urandom(16))
     sock.sendall(b"GET " + path + b" HTTP/1.1\r\n"
-                 b"Host: 127.0.0.1:47080\r\n"
+                 b"Host: 127.0.0.1:61080\r\n"
                  b"Connection: keep-alive, Upgrade\r\n"
                  b"Upgrade: websocket\r\n"
                  b"Sec-WebSocket-Key: " + key + b"\r\n"

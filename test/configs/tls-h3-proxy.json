@@ -6,18 +6,18 @@
   "servers": [
     {
       "host": "127.0.0.1",
-      "port": 47462,
+      "port": 61462,
       "hostname": "localhost",
       "cert": "test/tls/server.crt",
       "key": "test/tls/server.key",
       "locations": [
         {
           "prefix": "/api",
-          "proxy": "127.0.0.1:47100"
+          "proxy": "127.0.0.1:61100"
         },
         {
           "prefix": "/down",
-          "proxy": "127.0.0.1:47109"
+          "proxy": "127.0.0.1:61109"
         },
         {
           "prefix": "/",

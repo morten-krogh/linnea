@@ -13,7 +13,7 @@ import time
 DECLARED = 500000
 SENT = 200000                       # well past in_buf, well short of DECLARED
 
-s = socket.create_connection(("127.0.0.1", 47080), timeout=5)
+s = socket.create_connection(("127.0.0.1", 61080), timeout=5)
 s.sendall(b"POST /api/abandoned HTTP/1.1\r\nHost: one.test\r\n"
           b"Content-Length: %d\r\n\r\n" % DECLARED)
 s.sendall(b"X" * SENT)

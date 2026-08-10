@@ -13,7 +13,7 @@
 ; in the master's fd table, so a respawn resumes the same listeners).
 ;
 ; Shutdown: every worker carries PR_SET_PDEATHSIG(SIGTERM), so a master
-; death takes them with it; a SIGTERM to the group drains them (M11).
+; death takes them with it; a SIGTERM to the group stops them at once (M11).
 ;
 ; Zero-downtime binary upgrade (SIGUSR2, i.e. `systemctl reload`): the
 ; master re-execs the new binary in place — same PID, so systemd keeps
@@ -1136,11 +1136,11 @@ parse_dec:
 .done:
     ret
 
-; kill_old_workers — retire the previous generation with SIGQUIT, the
-; patient drain: the new workers are already serving on the same listeners,
-; so an old worker holding an idle keep-alive connection costs nothing and
-; the client keeps its connection until it is done with it. A stop (SIGTERM)
-; is the impatient one, because then nobody is left to serve.
+; kill_old_workers — retire the previous generation with SIGQUIT, the drain:
+; the new workers are already serving on the same listeners, so an old worker
+; holding a connection costs nothing and the client keeps it until it is done.
+; Bounded by the drain deadline, since a WebSocket tunnel is never done. A
+; stop (SIGTERM) does not drain at all, because then nobody is left to serve.
 kill_old_workers:
     push rbx
     xor ebx, ebx

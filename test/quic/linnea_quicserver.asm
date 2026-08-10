@@ -5,7 +5,7 @@
 ; type=<byte>" and exits 0. It proves the receive path works on the wire against
 ; a real client (aioquic); the reusable handler is linnea_quic_recv_initial.
 ;
-; Usage: linnea-quicserver  (binds 127.0.0.1:47500)
+; Usage: linnea-quicserver  (binds 127.0.0.1:61500)
 
 %include "linnea_syscall.inc"
 %include "linnea_quic.inc"
@@ -45,9 +45,9 @@ _start:
     test eax, eax
     js .fail
     mov r12d, eax                    ; udp fd
-    ; sockaddr_in = { AF_INET, htons(47500), 127.0.0.1, 0 }
+    ; sockaddr_in = { AF_INET, htons(61500), 127.0.0.1, 0 }
     mov word [sa], LINNEA_AF_INET
-    mov word [sa + 2], 0x8cb9        ; htons(47500)
+    mov word [sa + 2], 0x3cf0        ; htons(61500)
     mov dword [sa + 4], 0x0100007f   ; 127.0.0.1
     mov qword [sa + 8], 0
     mov eax, LINNEA_SYS_BIND

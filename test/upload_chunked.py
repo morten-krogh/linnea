@@ -23,7 +23,7 @@ import socket
 import sys
 import time
 
-PORT = 47080
+PORT = 61080
 BACKEND_SEEN = "/tmp/linnea_backend_seen.log"
 
 

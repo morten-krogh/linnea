@@ -4,7 +4,7 @@
   "workers": 4,
   "servers": [
     {
-      "host": "127.0.0.1", "port": 47452, "hostname": "localhost",
+      "host": "127.0.0.1", "port": 61452, "hostname": "localhost",
       "cert": "test/tls/server.crt", "key": "test/tls/server.key",
       "hsts": "max-age=31536000", "nosniff": 1,
       "locations": [

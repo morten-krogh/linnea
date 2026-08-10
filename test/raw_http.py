@@ -3,7 +3,7 @@
 
 This replaces a bash /dev/tcp one-liner:
 
-    timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/47080; printf %b '$1' >&3; cat <&3"
+    timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/61080; printf %b '$1' >&3; cat <&3"
 
 whose two seconds were a single hard budget covering bash startup, the connect,
 the write AND the read. `cat` reads to EOF, so for any keep-alive response — most
@@ -37,7 +37,7 @@ def main():
         print("usage: raw_http.py <request> [port]", file=sys.stderr)
         return 2
     req = unescape(sys.argv[1])
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 47080
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 61080
 
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=CEILING_S)

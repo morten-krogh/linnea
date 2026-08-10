@@ -1,12 +1,12 @@
 {
-  "log": "test/linnea-wsdrain.log",
+  "log": "test/linnea-reload.log",
   "timeout": 2,
   "max_connections": 16,
   "workers": 2,
   "servers": [
     {
       "host": "127.0.0.1",
-      "port": 61471,
+      "port": 61473,
       "hostname": "one.test",
       "locations": [
         {

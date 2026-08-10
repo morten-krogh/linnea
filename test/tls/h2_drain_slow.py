@@ -12,10 +12,28 @@
 import os
 import signal
 import socket
+import subprocess
 import ssl
 import struct
 import sys
 import time
+
+
+def drain_workers(master):
+    """Start a drain on the workers of `master`.
+
+    SIGTERM is an immediate stop now — it drops whatever is open — so a test
+    about the drain has to send what a hot upgrade sends: SIGQUIT, and to the
+    workers, since that is what kill_old_workers signals. The master is then
+    SIGTERMed so it cannot respawn them; a worker already draining ignores the
+    SIGTERM its PR_SET_PDEATHSIG delivers when the master goes.
+    """
+    kids = subprocess.run(["pgrep", "-P", str(master)],
+                          capture_output=True, text=True).stdout.split()
+    for k in kids:
+        os.kill(int(k), signal.SIGQUIT)
+    os.kill(master, signal.SIGTERM)
+
 
 ca, port, master = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 SIZE = 3000000
@@ -82,7 +100,7 @@ try:
             s.sendall(fr(8, 0, 1, struct.pack(">I", len(p))))
             s.sendall(fr(8, 0, 0, struct.pack(">I", len(p))))
             if not drained and got >= 200000:
-                os.kill(master, signal.SIGTERM)   # the drain lands mid-transfer
+                drain_workers(master)             # the drain lands mid-transfer
                 drained = True
             if drained:
                 time.sleep(0.002)                 # a reader slower than the writer

@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 
-HOST, PORT = "127.0.0.1", 47100
+HOST, PORT = "127.0.0.1", 61100
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 SEEN = "/tmp/linnea_backend_seen.log"   # every request that reached a backend
 

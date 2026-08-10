@@ -16,16 +16,19 @@
 #
 # systemd supervises the master; the master supervises the workers.
 #
-# Stopping the unit SIGTERMs the whole control group. A worker then stops
-# accepting, finishes whatever is in flight, and closes the rest at once —
-# including connections merely parked on a keep-alive, which is what makes
-# a stop prompt: waiting for those would take as long as the idle timeout,
-# and a browser almost always has one open.
+# Stopping the unit SIGTERMs the whole control group, and a worker exits
+# straight away, dropping whatever it holds. Nothing open outlives a stop
+# in any case, so there is nothing to be gained by finishing first, and
+# waiting was expensive: a browser almost always holds an idle keep-alive,
+# and a WebSocket tunnel never goes idle at all, so a stop used to run to
+# the TimeoutStopSec kill below whenever a page was open. Clients reconnect
+# to the server that comes back.
 #
-# SIGQUIT is the patient version of the same drain: idle connections are
-# left to live out their keep-alive. That is what the master sends its old
-# workers during a reload, where the new generation is already serving and
-# nobody is waiting.
+# SIGQUIT is the drain, and the reload path: stop accepting, finish what is
+# open, exit when the last one closes or after the drain deadline in
+# linnea_uring, whichever comes first. That is what the master sends its old
+# workers during a hot upgrade, where the new generation is already serving
+# and finishing those last requests is the whole point.
 #
 # SIGHUP reopens the log, for logrotate (see config/linnea.logrotate).
 #
@@ -50,10 +53,9 @@ ExecStart=/usr/local/bin/linnea --config /home/linnea/linnea/config/linnea-tls.j
 ExecReload=/bin/kill -USR2 $MAINPID
 Restart=on-failure
 RestartSec=1
-# A stop should be quick: the drain closes idle connections immediately and
-# only waits on requests actually in flight. This bounds the exceptions —
-# an upstream that has stopped reading, a WebSocket tunnel still carrying
-# traffic — instead of letting them run out the 45s default.
+# A stop exits at once, so this should never be reached. It stays as the
+# backstop for a worker wedged somewhere it cannot answer a signal from,
+# and because the 45s default is far too long to wait to find that out.
 TimeoutStopSec=10
 # There is deliberately no LimitNOFILE here, and adding one would make things
 # worse rather than better.

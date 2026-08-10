@@ -238,6 +238,17 @@ the configuration is bad, leaving the old generation serving**. So a typo
 cannot take the site down. It picks up a new binary at the same time, since it
 re-execs — there is no config-only reload.
 
+The old workers stay just long enough to finish the requests they are already
+serving, while the new ones take everything arriving. They are given **30
+seconds**, after which they drop whatever is left and exit. That deadline
+exists because a WebSocket tunnel never finishes on its own, and without it
+one open tab would keep an old worker alive for as long as the tab was.
+
+**`systemctl stop` and `restart` are immediate** and drop every open
+connection, including uploads and downloads in progress. There is nothing to
+be gained by finishing them first when the server is going away; clients
+reconnect to the one that comes back.
+
 **SIGHUP is not a config reload.** It tells every process to reopen its log
 file, which is what a log rotation needs and nothing more:
 

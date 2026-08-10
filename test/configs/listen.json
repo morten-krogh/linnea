@@ -7,12 +7,12 @@
   "servers": [
     {
       "host": "127.0.0.1",
-      "port": 47080,
+      "port": 61080,
       "hostname": "one.test",
       "locations": [
         {
           "prefix": "/ws",
-          "proxy": "127.0.0.1:47702"
+          "proxy": "127.0.0.1:61702"
         },
         {
           "prefix": "/",
@@ -21,17 +21,17 @@
         },
         {
           "prefix": "/api",
-          "proxy": "127.0.0.1:47100"
+          "proxy": "127.0.0.1:61100"
         },
         {
           "prefix": "/down",
-          "proxy": "127.0.0.1:47199"
+          "proxy": "127.0.0.1:61199"
         }
       ]
     },
     {
       "host": "127.0.0.1",
-      "port": 47090,
+      "port": 61090,
       "hostname": "two.test",
       "locations": [
         {
@@ -50,7 +50,7 @@
     },
     {
       "host": "127.0.0.1",
-      "port": 47080,
+      "port": 61080,
       "hostname": "three.test",
       "locations": [
         {

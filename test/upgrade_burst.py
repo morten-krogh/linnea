@@ -85,7 +85,7 @@ def main():
         print("usage: upgrade_burst.py <master-pid> [port]", file=sys.stderr)
         return 2
     master = int(sys.argv[1])
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 47080
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 61080
 
     threads = [threading.Thread(target=hammer, args=(port,), daemon=True)
                for _ in range(WORKERS)]

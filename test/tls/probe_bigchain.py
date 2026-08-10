@@ -74,11 +74,11 @@ with tempfile.TemporaryDirectory() as d:
     size = os.path.getsize(chain)
 
     stop = threading.Event()
-    t = threading.Thread(target=serve_tls, args=(47467, chain, stop), daemon=True)
+    t = threading.Thread(target=serve_tls, args=(61467, chain, stop), daemon=True)
     t.start()
     import time
     time.sleep(1.0)
-    rc = run(47467, "h1")
+    rc = run(61467, "h1")
     stop.set()
 
     ok = rc == 2
@@ -105,11 +105,11 @@ with tempfile.TemporaryDirectory() as d:
             "    await serve('127.0.0.1',int(sys.argv[1]),configuration=c)\n"
             "    await asyncio.Future()\n"
             "asyncio.run(m())\n")
-        q = subprocess.Popen([sys.executable, srv, "47468", chain, KEY],
+        q = subprocess.Popen([sys.executable, srv, "61468", chain, KEY],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(2.0)
         try:
-            rc = run(47468, "h3")
+            rc = run(61468, "h3")
         finally:
             q.terminate()
             q.wait(timeout=10)

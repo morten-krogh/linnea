@@ -2,9 +2,9 @@
   "log": "test/linnea.log",
   "servers": [
     {
-      "host": "127.0.0.1", "port": 47080, "hostname": "one.test",
+      "host": "127.0.0.1", "port": 61080, "hostname": "one.test",
       "locations": [
-        { "prefix": "/", "root": "test/www", "proxy": "127.0.0.1:47100" }
+        { "prefix": "/", "root": "test/www", "proxy": "127.0.0.1:61100" }
       ]
     }
   ]

@@ -34,7 +34,7 @@ def test(cfg, label, want_ok, want_msg=None):
 
 def base(**over):
     c = {"log": os.path.join(D, "l.log"),
-         "servers": [{"host": "127.0.0.1", "port": 47899, "hostname": "x.test",
+         "servers": [{"host": "127.0.0.1", "port": 61899, "hostname": "x.test",
                       "locations": [{"prefix": "/", "root": D}]}]}
     c.update(over)
     return c
@@ -60,7 +60,7 @@ EXAMPLE = {
     "max_connections": 4096, "max_per_ip": 64, "max_upstream": 256,
     "max_body": 8388608, "http2": 1,
     "servers": [
-        {"host": "0.0.0.0", "port": 47897, "hostname": "example.com",
+        {"host": "0.0.0.0", "port": 61897, "hostname": "example.com",
          "cert": "test/tls/server.crt", "key": "test/tls/server.key",
          "hsts": "max-age=31536000; includeSubDomains", "nosniff": 1,
          "locations": [
@@ -69,7 +69,7 @@ EXAMPLE = {
               "cache_control": "public, max-age=604800"},
              {"prefix": "/old", "redirect": "https://example.com/new"},
              {"prefix": "/", "root": D}]},
-        {"host": "0.0.0.0", "port": 47898, "hostname": "example.com",
+        {"host": "0.0.0.0", "port": 61898, "hostname": "example.com",
          "locations": [
              {"prefix": "/.well-known/acme-challenge", "root": D},
              {"prefix": "/", "redirect": "https://example.com"}]}]}
@@ -108,7 +108,7 @@ test(srv(nosniff="1"), "nosniff as a string rejected", False)
 test(srv(cert="test/tls/server.crt"), "cert without key rejected", False,
      "both cert and key")
 two = base()
-two["servers"].append({"host": "127.0.0.1", "port": 47899, "hostname": "y.test",
+two["servers"].append({"host": "127.0.0.1", "port": 61899, "hostname": "y.test",
                        "cert": "test/tls/server.crt", "key": "test/tls/server.key",
                        "locations": [{"prefix": "/", "root": D}]})
 test(two, "mixed TLS/plaintext on one listener rejected", False,

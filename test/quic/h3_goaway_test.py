@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-# HTTP/3 GOAWAY on drain. When a worker receives SIGTERM it must let connected h3
-# peers know it is going away, so a client opens no new requests before the
+# HTTP/3 GOAWAY on drain. When a worker is told to drain it must let connected
+# h3 peers know it is going away, so a client opens no new requests before the
 # worker exits. linnea sends a GOAWAY frame on its control stream, carrying the
 # lowest request stream it will not process. We complete a handshake, serve one
-# request (on stream 0), signal the master to drain, and read the GOAWAY off the
+# request (on stream 0), start a drain, and read the GOAWAY off the
 # server's control stream (id 3) — it must reject streams from 4 up.
 # Usage: h3_goaway_test.py <port> <master_pid>
 import os
 import signal
 import socket
+import subprocess
 import ssl
 import sys
 import time
@@ -17,6 +18,22 @@ import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
+
+
+def drain_workers(master):
+    """Start a drain on the workers of `master`.
+
+    SIGTERM is an immediate stop now — it drops whatever is open — so a test
+    about the drain has to send what a hot upgrade sends: SIGQUIT, and to the
+    workers, since that is what kill_old_workers signals. The master is then
+    SIGTERMed so it cannot respawn them; a worker already draining ignores the
+    SIGTERM its PR_SET_PDEATHSIG delivers when the master goes.
+    """
+    kids = subprocess.run(["pgrep", "-P", str(master)],
+                          capture_output=True, text=True).stdout.split()
+    for k in kids:
+        os.kill(int(k), signal.SIGQUIT)
+    os.kill(master, signal.SIGTERM)
 
 
 def vlq(n):
@@ -80,7 +97,7 @@ while conn.next_event() is not None:
     pass
 
 # drain the server, then read the GOAWAY off its control stream
-os.kill(master, signal.SIGTERM)
+drain_workers(master)
 
 
 def find_goaway(buf):

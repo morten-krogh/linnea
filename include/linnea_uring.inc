@@ -43,13 +43,15 @@ LINNEA_UD_TIMEOUT       equ 3          ; linked-timeout cqe, always ignored
 LINNEA_UD_CONNECT       equ 4          ; connect to a proxy upstream
 LINNEA_UD_UP_SEND       equ 5          ; request bytes to the upstream
 LINNEA_UD_UP_RECV       equ 6          ; response bytes from the upstream
-LINNEA_UD_SIGNAL        equ 7          ; signalfd read: SIGTERM = drain
+LINNEA_UD_SIGNAL        equ 7          ; signalfd read: SIGTERM = stop now,
+                                       ; SIGQUIT = drain, SIGHUP = reopen log
 LINNEA_UD_CANCEL        equ 8          ; accept-cancel cqe, always ignored
 LINNEA_UD_QRECV         equ 9          ; datagram on the QUIC (UDP) listener
 LINNEA_UD_QTIMER        equ 10         ; QUIC probe-timeout tick: run the rtx sweep
 ; proxy-over-h2 upstream ops: the index field carries (conn index << 3) | slot,
 ; so a completion can find its upstream slot without touching the connection
 LINNEA_UD_ARETRY        equ 14         ; accept-retry tick after a failed accept
+LINNEA_UD_DRAINTIMER    equ 15         ; the hot upgrade's drain deadline expired
 LINNEA_UD_H2UP_CONNECT  equ 11
 LINNEA_UD_H2UP_SEND     equ 12
 LINNEA_UD_H2UP_RECV     equ 13

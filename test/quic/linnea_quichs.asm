@@ -1,6 +1,6 @@
 ; linnea_quichs.asm — test-only driver for the QUIC/HTTP/3 server handler.
 ;
-; Binds 127.0.0.1:47501, reads datagrams with a blocking recvfrom, and hands
+; Binds 127.0.0.1:61501, reads datagrams with a blocking recvfrom, and hands
 ; each to linnea_quic_server_datagram. All the protocol work — connection
 ; demultiplexing, the handshake, and serving HTTP/3 — lives in
 ; src/linnea_quic_server.asm, which the io_uring event loop drives the same way.
@@ -88,7 +88,7 @@ _start:
     lea rsi, [fake_srv + linnea_config_server.locations]
     call linnea_quic_add_vhost
     call linnea_quic_ticket_setup    ; session-ticket key for the NewSessionTicket
-    ; udp socket bound to 127.0.0.1:47501
+    ; udp socket bound to 127.0.0.1:61501
     mov eax, LINNEA_SYS_SOCKET
     mov edi, LINNEA_AF_INET
     mov esi, SOCK_DGRAM
@@ -98,7 +98,7 @@ _start:
     js .fail
     mov r12d, eax
     mov word [sa], LINNEA_AF_INET
-    mov word [sa + 2], 0x8db9        ; port 47501
+    mov word [sa + 2], 0x3df0        ; port 61501
     mov dword [sa + 4], 0x0100007f   ; 127.0.0.1
     mov qword [sa + 8], 0
     mov eax, LINNEA_SYS_BIND

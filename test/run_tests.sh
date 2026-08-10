@@ -119,6 +119,25 @@ stray_servers() {
         esac
     done
 }
+# Every port this suite binds is above 61000, and deliberately so: this box's
+# ephemeral range is 32768-60999 (/proc/sys/net/ipv4/ip_local_port_range), and
+# the fixtures used to sit inside it. An outgoing client socket — the suite
+# makes thousands — could take a fixture's port as its SOURCE port, and the
+# fixture would then fail to bind with EADDRINUSE while nothing was listening
+# on it. That surfaced as the FATAL below accusing a leftover server that did
+# not exist. Keep new fixtures above 61000 too.
+# drain_workers <master pid> — start a graceful drain and stop the master.
+# The drain lives on SIGQUIT, which is what kill_old_workers sends the
+# generation a hot upgrade retires; SIGTERM is an immediate stop that drops
+# whatever is open. The master is SIGTERMed afterwards so it cannot respawn
+# the workers, and a worker already draining ignores the SIGTERM its
+# PR_SET_PDEATHSIG delivers when the master goes.
+drain_workers() {
+    local m=$1 w
+    for w in $(pgrep -P "$m"); do kill -QUIT "$w" 2>/dev/null; done
+    kill "$m" 2>/dev/null
+}
+
 strays=$(stray_servers)
 if [ -n "$strays" ]; then
     echo "FATAL: test servers from an earlier run are still running:" >&2
@@ -130,13 +149,13 @@ if [ -n "$strays" ]; then
 fi
 
 # ...and a backend from an earlier run, which is worse than it sounds. The
-# suite starts its own on 47100 at the point it needs one, and until then
+# suite starts its own on 61100 at the point it needs one, and until then
 # nothing should answer there: several tests turn on a proxied path being
 # UNREACHABLE. A leftover backend makes /api/anything a 404 from the backend
 # rather than a 502 from a dead upstream, and the failure names the wrong
 # thing entirely. Cheap to detect, and it has caught real confusion twice.
-if (echo > /dev/tcp/127.0.0.1/47100) >/dev/null 2>&1; then
-    echo "FATAL: something is already listening on 127.0.0.1:47100." >&2
+if (echo > /dev/tcp/127.0.0.1/61100) >/dev/null 2>&1; then
+    echo "FATAL: something is already listening on 127.0.0.1:61100." >&2
     echo "  That is this suite's proxy backend port, and it starts its own" >&2
     echo "  later — tests that need an UNREACHABLE upstream would pass or" >&2
     echo "  fail for the wrong reason. Probably a leftover:" >&2
@@ -148,7 +167,7 @@ fi
 # holding one of them would answer with a counter at some arbitrary value, and
 # the checks that read the count would fail with numbers that look like a
 # framing bug.
-for wsport in 47701 47702; do
+for wsport in 61701 61702; do
     if (echo > /dev/tcp/127.0.0.1/$wsport) >/dev/null 2>&1; then
         echo "FATAL: something is already listening on 127.0.0.1:$wsport." >&2
         echo "  That is this suite's websocket backend port. Probably a leftover:" >&2
@@ -159,15 +178,15 @@ done
 
 # ...and the /api backend's, for the same reason: a leftover would answer, and
 # the checks below would be reporting on a binary nobody built.
-if (echo > /dev/tcp/127.0.0.1/47703) >/dev/null 2>&1; then
-    echo "FATAL: something is already listening on 127.0.0.1:47703." >&2
+if (echo > /dev/tcp/127.0.0.1/61703) >/dev/null 2>&1; then
+    echo "FATAL: something is already listening on 127.0.0.1:61703." >&2
     echo "  That is this suite's /api backend port. Probably a leftover:" >&2
     ps -eo pid,args | grep "[l]innea-api" >&2
     exit 1
 fi
 
 # --- config parsing and validation ---
-run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=47090 hostname=two.test locations=3" \
+run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=61090 hostname=two.test locations=3" \
     timeout 0.5 $BIN --config test/configs/listen.json
 run_test "config dump"     124 stdout "config: 3 servers timeout=2 max_connections=64" \
     timeout 0.5 $BIN --config test/configs/listen.json
@@ -240,7 +259,7 @@ run_test "empty locations"  1 stderr "at least one location" \
     $BIN --config test/configs/empty-locations.json
 # the middle server reuses the hostname on another port, which is fine;
 # the clash is on the shared listener, case-insensitively
-run_test "duplicate hostname" 1 stderr "duplicate hostname DUP.Test on 127.0.0.1:47080" \
+run_test "duplicate hostname" 1 stderr "duplicate hostname DUP.Test on 127.0.0.1:61080" \
     $BIN --config test/configs/dup-hostname.json
 
 # --- TLS config: "cert" and "key" are both-or-neither, and servers sharing
@@ -292,7 +311,7 @@ if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quicserver ]; th
     timeout 10 ./bin/linnea-quicserver >/tmp/linnea_quicsrv.out 2>&1 &
     qsrv=$!
     sleep 0.4
-    python3 test/quic/h3_initial.py 47500 >/dev/null 2>&1
+    python3 test/quic/h3_initial.py 61500 >/dev/null 2>&1
     sleep 0.4
     wait $qsrv 2>/dev/null
     # decrypt the Initial, recover the ClientHello, and read its SNI + h3 ALPN
@@ -361,7 +380,7 @@ if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
     timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
     hspid=$!
     sleep 0.4
-    python3 test/quic/hs_test.py 47501 >/dev/null 2>&1
+    python3 test/quic/hs_test.py 61501 >/dev/null 2>&1
     check "quic: full handshake completes in aioquic (h3 negotiated)" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
@@ -378,7 +397,7 @@ if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
     timeout 10 ./bin/linnea-quichs >"$cfinlog" 2>&1 &
     hspid=$!
     sleep 0.4
-    python3 test/quic/cfin_test.py 47501 >/dev/null 2>&1
+    python3 test/quic/cfin_test.py 61501 >/dev/null 2>&1
     cfinrc=$?
     sleep 0.3
     if [ $cfinrc -eq 0 ] && grep -q CFIN-OK "$cfinlog"; then cfinok=0; else cfinok=1; fi
@@ -452,7 +471,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quich
     timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
     hspid=$!
     sleep 0.4
-    python3 test/quic/h3_e2e_test.py 47501 >/dev/null 2>&1
+    python3 test/quic/h3_e2e_test.py 61501 >/dev/null 2>&1
     check "h3: serves real static files over QUIC (MIME, index, 404)" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
@@ -466,7 +485,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quich
     timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
     hspid=$!
     sleep 0.4
-    python3 test/quic/h3_multi_test.py 47501 >/dev/null 2>&1
+    python3 test/quic/h3_multi_test.py 61501 >/dev/null 2>&1
     check "h3: multiple requests on one connection, each on its own stream" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
@@ -481,7 +500,7 @@ if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
     timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
     hspid=$!
     sleep 0.4
-    python3 test/quic/h3_ticket_test.py 47501 >/dev/null 2>&1
+    python3 test/quic/h3_ticket_test.py 61501 >/dev/null 2>&1
     check "h3: server issues a NewSessionTicket (early_data for 0-RTT)" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
@@ -496,7 +515,7 @@ if python3 -c 'import aioquic' 2>/dev/null && [ -x ./bin/linnea-quichs ]; then
     timeout 12 ./bin/linnea-quichs >/dev/null 2>&1 &
     hspid=$!
     sleep 0.4
-    python3 test/quic/h3_resume_test.py 47501 >/dev/null 2>&1
+    python3 test/quic/h3_resume_test.py 61501 >/dev/null 2>&1
     check "h3: resumes from a ticket (PSK, binder, no certificate)" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
@@ -511,7 +530,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quich
     timeout 12 ./bin/linnea-quichs >/dev/null 2>&1 &
     hspid=$!
     sleep 0.4
-    python3 test/quic/h3_0rtt_test.py 47501 >/dev/null 2>&1
+    python3 test/quic/h3_0rtt_test.py 61501 >/dev/null 2>&1
     check "h3: serves a 0-RTT request (early data accepted)" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
@@ -529,102 +548,102 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     start_server test/configs/tls-h3.json
     h3_pid=$SRV_PID
     sleep 0.5
-    python3 test/quic/h3_e2e_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_e2e_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): real server serves static files over QUIC" $?
 
-    python3 test/quic/h3_etag_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_etag_test.py 61452 >/dev/null 2>&1
     check "h3 validators, date + server headers, conditional 304s" $?
 
-    python3 test/quic/h3_range_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_range_test.py 61452 >/dev/null 2>&1
     check "h3 range 206/416, if-range, cache-control, chunked slice" $?
 
-    python3 test/quic/h3_enc_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_enc_test.py 61452 >/dev/null 2>&1
     check "h3 pre-compressed variants (br/gzip, vary, variant etag 304)" $?
 
-    python3 test/quic/h3_qpack_err_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_qpack_err_test.py 61452 >/dev/null 2>&1
     check "h3 undecodable field section ends the connection (0x200)" $?
-    python3 test/quic/h3_multi_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_multi_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): several requests on one connection" $?
-    python3 test/quic/h3_conns_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_conns_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): two interleaved connections" $?
     # the idle timeout is the MINIMUM of the two advertised max_idle_timeouts
     # (RFC 9000 10.1), so a client that will forget us in a second must not hold
     # a pool slot for our 30; the paired control keeps that from being any
     # connection simply going idle
-    timeout 60 python3 test/quic/h3_idle_tp_test.py 47452 >/dev/null 2>&1
+    timeout 60 python3 test/quic/h3_idle_tp_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): the client's max_idle_timeout is honoured (and only it)" $?
     # several workers each bind the QUIC port with SO_REUSEPORT; the kernel
     # steers by 4-tuple so a connection always reaches the worker holding it
-    python3 test/quic/h3_workers_test.py 47452 8 >/dev/null 2>&1
+    python3 test/quic/h3_workers_test.py 61452 8 >/dev/null 2>&1
     check "h3 (io_uring): connections spread across workers are all served" $?
 
-    python3 test/quic/h3_ack_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_ack_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): replies acknowledge received packets" $?
 
     # loss recovery: drop the server's reply and it must retransmit (under a
     # fresh packet number) once its probe timeout fires
-    python3 test/quic/h3_rtx_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_rtx_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): a dropped reply is retransmitted after the PTO" $?
 
     # control streams: the server opens its control stream (SETTINGS first) and
     # the QPACK encoder/decoder streams once the handshake completes
-    python3 test/quic/h3_control_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_control_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): server opens control + QPACK streams with SETTINGS" $?
 
     # receive side: a client control stream that opens with SETTINGS is accepted
     # and served; one whose first frame is not SETTINGS is closed (H3_MISSING_SETTINGS)
-    python3 test/quic/h3_settings_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_settings_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): client control stream validated (SETTINGS-first enforced)" $?
 
     # and the rest of the control stream's frame sequence, not just its first two
     # bytes: DATA/HEADERS/PUSH_PROMISE, the reserved HTTP/2 types and a second
     # SETTINGS end the connection, GREASE and the control frames are skipped by
     # length, and a header split across STREAM frames still parses
-    timeout 180 python3 test/quic/h3_ctrl_frames_test.py 47452 >/dev/null 2>&1
+    timeout 180 python3 test/quic/h3_ctrl_frames_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): control-stream frames walked and validated" $?
 
     # request bodies: POST is a 405 now, but the body must still be reassembled
     # whole and the stream answered, with its flow-control credit settled
-    python3 test/quic/h3_body_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_body_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): a multi-packet request body is consumed and answered" $?
 
     # large responses: a 600 KB file streams as ack-clocked STREAM-frame chunks
     # (each datagram under the 1200-byte floor); one dropped chunk is rebuilt
     # from the file after the PTO; a small GET is answered mid-transfer; a
     # client whose flow-control window cannot take the file gets a 503
-    python3 test/quic/h3_big_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_big_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): large response streamed in chunks (loss + interleave + 503)" $?
 
     # four large (chunked) responses requested at once: all stream concurrently,
     # interleaved by the pump over the shared congestion window, none refused —
     # each arrives byte-exact. This is a full browser page load (a 503 on a
     # concurrent large request made Firefox abandon h3 for h2).
-    python3 test/quic/h3_queue_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_queue_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): four concurrent large responses, all intact" $?
 
     # concurrent large responses through an emulated lossy, REORDERING network
     # (both directions), across several seeds — the conditions a real browser hits
     # and that lockstep tests miss. Exercises ack-based fast retransmit and the
     # priority pump; every stream must arrive byte-exact on every seed.
-    python3 test/quic/h3_stress_test.py 47452 6 6 3 >/dev/null 2>&1
+    python3 test/quic/h3_stress_test.py 61452 6 6 3 >/dev/null 2>&1
     check "h3 (io_uring): concurrent responses survive loss + reordering" $?
 
     # RFC 9218 priority: default (non-incremental) responses are served to
     # completion in arrival order — sequentially, so complete images appear sooner
     # — and a `priority: u=0` request jumps ahead of default-urgency ones.
-    python3 test/quic/h3_priority_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_priority_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): responses scheduled by RFC 9218 priority" $?
 
     # static files answer GET and HEAD (and h3's own POST echo); every other
     # method used to fall through and be SERVED AS A GET, body and all, where
     # h1 and h2 both answer 405. The method is matched case-sensitively.
-    timeout 200 python3 test/quic/h3_method_test.py 47452 >/dev/null 2>&1
+    timeout 200 python3 test/quic/h3_method_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): unknown methods get 405, not the file" $?
 
     # and the client can change its mind afterwards: a PRIORITY_UPDATE on the
     # control stream reprioritises a response already streaming, and one that
     # overtakes the request it names is kept and applied when that stream opens
-    timeout 300 python3 test/quic/h3_priority_update_test.py 47452 >/dev/null 2>&1
+    timeout 300 python3 test/quic/h3_priority_update_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): PRIORITY_UPDATE reprioritises a response" $?
 
     # a size/boundary/request-style matrix: every response, from 0 bytes through
@@ -632,27 +651,27 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # terminate (deliver a FIN) — sequentially reusing one connection, all at once
     # under the priority scheduler, and as a HEAD. A request that never finishes
     # fails here.
-    python3 test/quic/h3_matrix_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_matrix_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): size/boundary/HEAD/concurrent matrix all terminate" $?
 
     # connection reuse: far more than the advertised 100 bidi streams on ONE
     # connection (a browser reusing it across refreshes) — the server must raise
     # the peer's limit with MAX_STREAMS or new requests can't be sent (images stop
     # loading, h2 fallback after ~30s).
-    python3 test/quic/h3_reuse_test.py 47452 250 >/dev/null 2>&1
+    python3 test/quic/h3_reuse_test.py 61452 250 >/dev/null 2>&1
     check "h3 (io_uring): reused connection past 100 streams (MAX_STREAMS)" $?
 
     # under load: many concurrent connections (browser tabs / refreshes) plus a
     # burst of open-load-close churn — every request completes and the workers stay
     # alive with no descriptor leak.
-    python3 test/quic/h3_load_test.py 47452 12 4 >/dev/null 2>&1
+    python3 test/quic/h3_load_test.py 61452 12 4 >/dev/null 2>&1
     check "h3 (io_uring): concurrent connections + churn under load" $?
 
     # browser reloads on one reused connection: each reload cancels the previous
     # page's in-flight downloads (STOP_SENDING). The server must tear a cancelled
     # stream down or its abandoned chunks pin the congestion window and, after
     # enough reloads, the connection stalls (hang, then h2 fallback).
-    python3 test/quic/h3_reload_test.py 47452 10 >/dev/null 2>&1
+    python3 test/quic/h3_reload_test.py 61452 10 >/dev/null 2>&1
     check "h3 (io_uring): reload-cancel (STOP_SENDING) does not stall the connection" $?
 
     # connection-level credit (MAX_DATA) must be read from every packet, including
@@ -660,14 +679,14 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # reload's cancels leave behind. The peer sends each value once (its packet is
     # acknowledged), so a raise the server misses is gone for good: the server then
     # stalls at a window the peer has long since widened, with nothing in flight.
-    python3 test/quic/h3_maxdata_test.py 47452 8 >/dev/null 2>&1
+    python3 test/quic/h3_maxdata_test.py 61452 8 >/dev/null 2>&1
     check "h3 (io_uring): MAX_DATA is absorbed with no response stream open" $?
 
     # a request whose ack is lost is retransmitted by the client; the server must
     # ack the retransmit, not serve the stream a second time — a duplicate response
     # slot resends the whole body and pins the shared congestion window (the real-
     # browser wedge). Several chunked streams over one connection, ack-loss forced.
-    python3 test/quic/h3_dup_request_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_dup_request_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): retransmitted request is not served twice (no duplicate wedge)" $?
 
     # an Initial's header carries the token a client echoes from a Retry, and the
@@ -675,7 +694,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # packet. The token is client-supplied, so an oversized one must be refused
     # rather than copied over whatever follows the buffer — a worker that dies here
     # is a remote, pre-handshake stack overwrite with attacker-chosen bytes.
-    python3 test/quic/h3_initial_token_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_initial_token_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): oversized Initial token refused, not copied past its buffer" $?
 
     # a flood of Initials that are never answered must not fill the connection pool
@@ -683,27 +702,27 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # server demands a Retry token, which only a client at a real address can echo.
     # Runs late and settles afterwards — it deliberately leaves the pool under
     # pressure, and the pool needs a moment to reclaim the forged slots.
-    python3 test/quic/h3_retry_test.py 47452 300 >/dev/null 2>&1
+    python3 test/quic/h3_retry_test.py 61452 300 >/dev/null 2>&1
     check "h3 (io_uring): forged-Initial flood does not lock out real clients" $?
     sleep 6
 
     # a spoofed packet from a different source, carrying a valid connection id but
     # no valid AEAD tag, must NOT redirect the server's sends (RFC 9000 9.3): the
     # peer address is adopted only from an authenticated packet.
-    python3 test/quic/h3_migration_spoof_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_migration_spoof_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): unauthenticated source does not redirect the connection" $?
 
     # and the replayed half: a captured 1-RTT datagram resent from another source
     # carries a VALID tag, so authenticity alone cannot gate the address change.
     # RFC 9000 12.3 (discard an already-processed packet number) + 9.3 (only the
     # highest-numbered packet may move the address) are what close it.
-    python3 test/quic/h3_replay_spoof_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_replay_spoof_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): replayed packet does not redirect the connection" $?
 
     # the server's own first flight must survive being lost. There was no loss
     # recovery for the Initial or Handshake spaces at all, so dropping that one
     # ~1150-byte datagram ended the handshake and the client fell back to TCP.
-    python3 test/quic/h3_hs_rtx_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_hs_rtx_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): a lost handshake flight is retransmitted" $?
 
     # Frames coalesced ahead of a request must not hide it (RFC 9000 12.4). Six
@@ -711,19 +730,19 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # type theirs did not list, so a CONNECTION_CLOSE hid what followed it and an
     # unknown type hid the rest of the packet from all six — silently, with the
     # packet acknowledged, so the client never retried.
-    python3 test/quic/h3_frame_walk_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_frame_walk_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): coalesced frames do not hide the rest of the packet" $?
 
     # the same field rules over HTTP/3 (RFC 9114 4.2, 4.3.1) — one shared
     # decoder, and this side had it worse: the connection-specific names were
     # matched only inside the proxy rebuild, which HTTP/3 never enters at all.
-    python3 test/quic/h3_field_rules_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_field_rules_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): request field rules" $?
 
     # The server must not name a protocol the client never offered (RFC 7301
     # 3.2): build_ee wrote "h3" into EncryptedExtensions without ever reading
     # the client's list, so a doq or hq-interop client was told it had h3.
-    python3 test/quic/h3_alpn_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_alpn_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): ALPN is checked, not assumed" $?
 
     # ...and a refusal must SAY SO (RFC 9001 4.8): the TLS alert becomes a QUIC
@@ -731,32 +750,32 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # refusal used to be silent, because the only close path needed 1-RTT keys
     # that do not exist that early, so the client could not tell "refused" from
     # "lost" and simply retransmitted its ClientHello until it gave up.
-    python3 test/quic/h3_hs_close_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_hs_close_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): a refused handshake closes with the TLS alert" $?
 
     # RESET_STREAM's Final Size is OURS, not the peer's (RFC 9000 19.4). Resetting
     # a malformed request reported the client's request length, so the peer held
     # connection-level credit for data it would never be sent — and one large
     # enough obliges a conforming client to close with FLOW_CONTROL_ERROR.
-    python3 test/quic/h3_reset_final_size_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_reset_final_size_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): RESET_STREAM reports our own final size" $?
 
     # ...and the code that reset carries has to say WHICH thing went wrong: a
     # truncated last frame is a connection error (7.1), a stream that never
     # carried HEADERS is H3_REQUEST_INCOMPLETE so the client may retry (4.1),
     # and only a request that decodes and then breaks a rule is MESSAGE_ERROR.
-    python3 test/quic/h3_stream_codes_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_stream_codes_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): a failed request stream names its fault" $?
 
     # ...and the same preconditions over h3, so the answer does not depend on
     # which protocol carried the request (RFC 9110 13.1.1, 13.1.4, 13.2.2).
-    python3 test/quic/h3_preconditions_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_preconditions_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): If-Match and If-Unmodified-Since" $?
 
     # RFC 9114 6.2: a critical stream must not be closed BY ANY MEANS. Only a
     # FIN was noticed, so a peer could RESET_STREAM its control stream and the
     # connection carried on as though it still had one.
-    python3 test/quic/h3_critical_reset_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_critical_reset_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): resetting a critical stream is detected" $?
 
     # h3-8: the QPACK encoder stream must be read, not ignored. We advertise
@@ -764,7 +783,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # to 0; an insert or another capacity means the peer's table state and
     # ours have silently diverged — QPACK_ENCODER_STREAM_ERROR. Also: a FIN
     # on a LATER frame of a QPACK stream is a critical-stream closure too.
-    python3 test/quic/h3_qpack_enc_stream_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_qpack_enc_stream_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): QPACK encoder-stream instructions are policed" $?
 
     # h3-6: control-stream enforcement must survive reordering. A STREAM frame
@@ -772,103 +791,103 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # since a reordered frame comes only once, the hole was permanent — every
     # control-stream rule quietly stopped being enforced there. Held now, and
     # legal reordering must still close nothing.
-    python3 test/quic/h3_ctrl_reorder_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_ctrl_reorder_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): control-stream rules survive reordering" $?
 
     # An ack-eliciting packet MUST be acknowledged (RFC 9000 13.2.1). An ACK was
     # only built when the server had something of its own to send, so a lone PING
     # (a browser keepalive) or a lone stream reset drew nothing and the peer
     # resent it with a doubling timeout for the life of the connection.
-    python3 test/quic/h3_ack_eliciting_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_ack_eliciting_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): a packet with nothing to answer is still acked" $?
 
     # the same for the handshake flights: no long-header packet authenticates its
     # sender, so neither a replayed Initial nor a forged Handshake may move the
     # peer address (RFC 9000 9 — no migration before the handshake is confirmed)
-    python3 test/quic/h3_longhdr_spoof_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_longhdr_spoof_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): spoofed long-header packets do not redirect the connection" $?
 
     # the client initiates a 1-RTT key update mid-transfer (RFC 9001 §6); the server
     # must derive the next key generation and follow, or it can no longer decrypt the
     # client's packets and the transfer wedges.
-    python3 test/quic/h3_key_update_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_key_update_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): follows a client-initiated 1-RTT key update" $?
 
     # quic-8: after sending a CONNECTION_CLOSE the server keeps the closing state
     # for a while (RFC 9000 10.2), re-sending the close in response to the peer's
     # packets — so the peer learns the real error even if the first close is lost,
     # instead of the stateless reset a freed connection id would draw.
-    python3 test/quic/h3_closing_state_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_closing_state_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): closing state re-sends the close, no stateless reset" $?
 
     # quic-11: once the handshake is confirmed the server discards its Initial and
     # Handshake keys (RFC 9001 4.9/4.9.1) and drops any long-header packet rather
     # than AEAD-processing it under keys that are supposed to be gone. A burst of
     # such packets on an established connection must not disturb it.
-    python3 test/quic/h3_post_handshake_long.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_post_handshake_long.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): long-header packets after confirmation are dropped" $?
 
     # a 1-RTT packet for a connection id we hold no state for gets a stateless reset
     # (RFC 9000 §10.3), so the peer fails fast instead of waiting out its idle timeout.
-    python3 test/quic/h3_stateless_reset_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_stateless_reset_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): stateless reset for an unknown connection id" $?
 
     # a peer that sends more request-stream data than the advertised window commits a
     # flow-control violation; the server closes with a transport CONNECTION_CLOSE
     # (FLOW_CONTROL_ERROR) rather than silently dropping (RFC 9000 §4.1 / §10.2).
-    python3 test/quic/h3_flow_violation_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_flow_violation_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): flow-control violation closes with a transport error" $?
 
     # a long-header packet with an unsupported version draws a Version Negotiation
     # packet listing the versions we speak (RFC 9000 §6.1), so the client can retry.
-    python3 test/quic/h3_version_negotiation_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_version_negotiation_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): unsupported version draws Version Negotiation" $?
 
     # a full QUIC v2 (RFC 9369) handshake — different Initial salt, "quicv2" labels
     # and remapped long-header packet types — serving HTTP/3 byte-exact.
-    python3 test/quic/h3_v2_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_v2_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): QUIC v2 handshake serves HTTP/3" $?
 
     # a client whose Initials start above packet number 0 (Chrome starts at 1): the
     # ServerHello ACK must cover the real [min,max] range, not [0,max] — acking an
     # unsent packet is invalid and a strict client aborts to h2 (QUIC_INVALID_ACK_DATA).
-    python3 test/quic/h3_pn_offset_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_pn_offset_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): ACK covers only received Initials (Chrome starts pn at 1)" $?
 
     # a real binary asset: a PNG served with the right MIME type, byte-exact,
     # over the chunked h3 path
-    python3 test/quic/h3_image_test.py 47452 test/www >/dev/null 2>&1
+    python3 test/quic/h3_image_test.py 61452 test/www >/dev/null 2>&1
     check "h3 (io_uring): PNG image served intact (image/png, chunked)" $?
 
     # a ClientHello too large for one Initial packet (as a browser's post-quantum
     # key share makes it) is reassembled across Initials by the client's original
     # DCID; a ClientHello with no x25519 share is refused without crashing
-    python3 test/quic/h3_bigch_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_bigch_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): multi-packet ClientHello reassembled; no-x25519 refused" $?
 
     # ngtcp2/curl fragments the ClientHello into many small CRYPTO frames sent out
     # of offset order, several per packet; the reassembly must place each at its
     # offset, not assume order (this is what made real browsers fall back to h2)
-    python3 test/quic/h3_frag_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_frag_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): out-of-order multi-frame ClientHello reassembled" $?
 
     # the request-stream reassembler: a request too big for one packet, with the
     # datagrams reversed and shuffled, so a hole opens and later fills. Every
     # other h3 test sends a request that fits one packet, which never exercises
     # the arrived-bytes map at all
-    timeout 120 python3 test/quic/h3_reorder_test.py 47452 >/dev/null 2>&1
+    timeout 120 python3 test/quic/h3_reorder_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): multi-packet request reassembled out of order" $?
 
     # a header section past our bound is our resource limit, not the peer's
     # encoder misbehaving: it must be answered on its own stream (431), not
     # reported as a decompression failure that takes the whole connection down
-    timeout 60 python3 test/quic/h3_bigheaders_test.py 47452 >/dev/null 2>&1
+    timeout 60 python3 test/quic/h3_bigheaders_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): oversized header list gets 431, connection survives" $?
 
     # a malformed request whose stream has already ended is answered with a
     # reset; it used to be dropped, leaving the client waiting on a response
     # that could never come
-    timeout 60 python3 test/quic/h3_malformed_test.py 47452 >/dev/null 2>&1
+    timeout 60 python3 test/quic/h3_malformed_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): malformed complete request is reset, not dropped" $?
 
     # QUIC TRANSPORT frames, which h3_malformed_test.py does not reach — it
@@ -889,7 +908,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
         start_server test/configs/tls-h3-fuzz.json
         fuzz_pid=$SRV_PID
         sleep 0.4
-        timeout 120 python3 test/quic/fuzz_quic_frames.py 47456 500 "$fuzz_pid" \
+        timeout 120 python3 test/quic/fuzz_quic_frames.py 61456 500 "$fuzz_pid" \
             >/dev/null 2>&1
         check "quic transport frames: 500 malformed Initials leave it serving" $?
         kill $fuzz_pid 2>/dev/null
@@ -900,17 +919,17 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
 
     # session resumption: the real server issues a NewSessionTicket with the
     # early_data extension once the handshake completes
-    python3 test/quic/h3_ticket_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_ticket_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): server issues a NewSessionTicket (early_data)" $?
 
     # and accepts it back: a second connection resumes with the ticket (PSK), so
     # the server skips the certificate
-    python3 test/quic/h3_resume_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_resume_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): resumes from a ticket (no certificate re-sent)" $?
 
     # 0-RTT: a resuming client's GET, sent as early data with the ClientHello, is
     # decrypted and served
-    python3 test/quic/h3_0rtt_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_0rtt_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): serves a 0-RTT request (early data)" $?
 
     # quic-6b: the same over QUIC v2. RFC 9369 shifts every long-header type up
@@ -918,21 +937,21 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # for it used to look for the v1 type only, so a v2 client's early data was
     # silently ignored and its request went unanswered until it resent it at
     # 1-RTT. One byte different on the wire, same assertions.
-    python3 test/quic/h3_0rtt_test.py 47452 2 >/dev/null 2>&1
+    python3 test/quic/h3_0rtt_test.py 61452 2 >/dev/null 2>&1
     check "h3 (io_uring): serves a 0-RTT request over QUIC v2 (RFC 9369 types)" $?
 
     # quic-6: the 0-RTT packet shares the Application pn space with 1-RTT and MUST
     # be acknowledged (RFC 9000 13.2.1); the server used to discard its number, so
     # the early request was never acked. The qlog must show the server ack cover
     # the packet number the client sent its 0-RTT on.
-    python3 test/quic/h3_0rtt_ack_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_0rtt_ack_test.py 61452 >/dev/null 2>&1
     check "h3 (io_uring): the 0-RTT packet is acknowledged" $?
 
     # BPF connection-ID steering: a connection survives the client migrating to a
     # fresh source port. Needs CAP_BPF on the binary (a rebuild drops the file
     # capability), so it is skipped when the steering program could not load.
     if getcap "$BIN" 2>/dev/null | grep -q cap_bpf; then
-        python3 test/quic/h3_migrate_test.py 47452 >/dev/null 2>&1
+        python3 test/quic/h3_migrate_test.py 61452 >/dev/null 2>&1
         check "h3 (io_uring): connection survives client migration (BPF CID steering)" $?
     else
         check "h3 (io_uring): CID steering (skipped: binary lacks CAP_BPF)" 0
@@ -941,20 +960,20 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # Alt-Svc: the TCP responses advertise HTTP/3 on this port, which is how a
     # browser discovers it at all
     hdrs=$(curl -si --http1.1 --cacert test/tls/server.crt \
-                --resolve localhost:47452:127.0.0.1 \
-                https://localhost:47452/hello.txt)
-    echo "$hdrs" | grep -qi 'alt-svc: h3=":47452"'
+                --resolve localhost:61452:127.0.0.1 \
+                https://localhost:61452/hello.txt)
+    echo "$hdrs" | grep -qi 'alt-svc: h3=":61452"'
     check "h3 (io_uring): HTTP/1.1 advertises Alt-Svc for h3" $?
     hdrs=$(curl -si --http2 --cacert test/tls/server.crt \
-                --resolve localhost:47452:127.0.0.1 \
-                https://localhost:47452/hello.txt)
-    echo "$hdrs" | grep -qi 'alt-svc: h3=":47452"'
+                --resolve localhost:61452:127.0.0.1 \
+                https://localhost:61452/hello.txt)
+    echo "$hdrs" | grep -qi 'alt-svc: h3=":61452"'
     check "h3 (io_uring): HTTP/2 advertises Alt-Svc for h3" $?
 
     # the UDP listener must not disturb TCP on the same host and port
     body=$(curl -s --http2 --cacert test/tls/server.crt \
-                 --resolve localhost:47452:127.0.0.1 \
-                 https://localhost:47452/hello.txt)
+                 --resolve localhost:61452:127.0.0.1 \
+                 https://localhost:61452/hello.txt)
     [ "$body" = "hello from linnea" ]
     check "h3 (io_uring): HTTP/2 over TCP still served on the same port" $?
 
@@ -962,9 +981,9 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # underflow the AEAD ciphertext length and crash a worker; the workers must
     # be the same processes afterwards, and normal h3 must still be served
     ulw_before=$(workers_of $h3_pid)
-    python3 test/quic/h3_length_underflow_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_length_underflow_test.py 61452 >/dev/null 2>&1
     sleep 0.5
-    python3 test/quic/h3_e2e_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_e2e_test.py 61452 >/dev/null 2>&1
     ulw_ok=$?
     ulw_after=$(workers_of $h3_pid)
     [ -n "$ulw_before" ] && [ "$ulw_before" = "$ulw_after" ] && [ $ulw_ok -eq 0 ]
@@ -975,9 +994,9 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # 48-byte stack slot, so an oversized identity overwrote the return address
     # of a pre-auth path. Real resumption must keep working afterwards.
     pio_before=$(workers_of $h3_pid)
-    python3 test/quic/h3_psk_id_overflow_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_psk_id_overflow_test.py 61452 >/dev/null 2>&1
     sleep 0.5
-    python3 test/quic/h3_resume_test.py 47452 >/dev/null 2>&1
+    python3 test/quic/h3_resume_test.py 61452 >/dev/null 2>&1
     pio_ok=$?
     pio_after=$(workers_of $h3_pid)
     [ -n "$pio_before" ] && [ "$pio_before" = "$pio_after" ] && [ $pio_ok -eq 0 ]
@@ -999,12 +1018,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     start_server test/configs/tls-h3-mixed.json
     mixed_pid=$SRV_PID
     sleep 0.5
-    out=$(python3 test/quic/h3_locations_test.py 47461 2>&1)
+    out=$(python3 test/quic/h3_locations_test.py 61461 2>&1)
     [ "$out" = "OK" ]
     check "h3 routes to locations: own root, longest prefix, 502 on proxy ($out)" $?
     # the same paths over h2, which has always routed: the two must agree
     body=$(curl -s --http2 --max-time 6 --cacert test/tls/server.crt \
-                https://localhost:47461/page.html)
+                https://localhost:61461/page.html)
     case "$body" in *"subdirectory page"*) true ;; *) false ;; esac
     check "h3/h2 agree on the mixed vhost's own root" $?
     kill $mixed_pid 2>/dev/null
@@ -1022,12 +1041,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     start_server test/configs/tls-h3-v6.json
     v6_pid=$SRV_PID
     sleep 0.5
-    python3 test/quic/h3_ipv6_test.py 47455 >/dev/null 2>&1
+    python3 test/quic/h3_ipv6_test.py 61455 >/dev/null 2>&1
     check "h3 (io_uring): dual-stack — served over native IPv6 (::1) and IPv4" $?
     # TCP too: the same dual-stack socket answers HTTP/2 over native IPv6
     body=$(curl -s --http2 --cacert test/tls/server.crt \
-                 --resolve localhost:47455:[::1] \
-                 https://localhost:47455/hello.txt)
+                 --resolve localhost:61455:[::1] \
+                 https://localhost:61455/hello.txt)
     [ "$body" = "hello from linnea" ]
     check "h3 (io_uring): dual-stack — HTTP/2 over TCP served on native IPv6" $?
     kill $v6_pid 2>/dev/null
@@ -1045,12 +1064,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     start_server test/configs/tls-h3-drain.json
     tr_master=$SRV_PID
     sleep 0.5
-    timeout 60 python3 test/quic/h3_trailer_test.py 47453 >/dev/null 2>&1
+    timeout 60 python3 test/quic/h3_trailer_test.py 61453 >/dev/null 2>&1
     check "h3 (io_uring): trailers do not influence the response" $?
     # Q136: frames illegal on a request stream (reserved h2 types, control/push
     # frames, DATA before HEADERS) are a connection error H3_FRAME_UNEXPECTED,
     # not silently ignored; GREASE/unknown stay ignored.
-    timeout 90 python3 test/quic/h3_frame_reject_test.py 47453 >/dev/null 2>&1
+    timeout 90 python3 test/quic/h3_frame_reject_test.py 61453 >/dev/null 2>&1
     check "h3 (io_uring): illegal request-stream frames rejected (0x105)" $?
     kill $tr_master 2>/dev/null
     wait $tr_master 2>/dev/null
@@ -1066,7 +1085,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     start_server test/configs/tls-h3-drain.json
     ga_master=$SRV_PID
     sleep 0.5
-    python3 test/quic/h3_goaway_test.py 47453 $ga_master >/dev/null 2>&1
+    python3 test/quic/h3_goaway_test.py 61453 $ga_master >/dev/null 2>&1
     check "h3 (io_uring): drain sends GOAWAY on the control stream" $?
     # Q120: the request that test served must be in the access log
     grep -qE 'request localhost from [0-9.:]+ "GET /hello.txt HTTP/3" 200 ' test/linnea.log
@@ -1089,7 +1108,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     start_server test/configs/tls-h3-drain.json
     di_master=$SRV_PID
     sleep 0.5
-    timeout 40 python3 test/quic/h3_drain_inflight_test.py 47453 $di_master >/dev/null 2>&1
+    timeout 40 python3 test/quic/h3_drain_inflight_test.py 61453 $di_master >/dev/null 2>&1
     check "h3 (io_uring): drain finishes the in-flight response, then closes" $?
     wait $di_master 2>/dev/null
     sleep 0.5
@@ -1112,7 +1131,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     start_server test/configs/tls-h3-drain.json
     gr_master=$SRV_PID
     sleep 0.5
-    timeout 60 python3 test/quic/h3_goaway_reject_test.py 47453 $gr_master >/dev/null 2>&1
+    timeout 60 python3 test/quic/h3_goaway_reject_test.py 61453 $gr_master >/dev/null 2>&1
     check "h3 (io_uring): drain rejects disowned streams (0x10b), serves owned" $?
     kill $gr_master 2>/dev/null
     wait $gr_master 2>/dev/null
@@ -1131,7 +1150,7 @@ fi
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     rm -f test/linnea.log
     timeout 30 python3 test/quic/h3_steer_base_test.py \
-        test/configs/tls-h3-drain.json 47453 >/dev/null 2>&1
+        test/configs/tls-h3-drain.json 61453 >/dev/null 2>&1
     check "h3 (io_uring): upgrade handoff stamps the other steering half" $?
     rm -f test/linnea.log
 else
@@ -1149,7 +1168,7 @@ python3 -c "open('test/www/h2drain.bin','wb').write(bytes(3000000))"
 start_server test/configs/tls-h3-drain.json
 h2d_master=$SRV_PID
 sleep 0.5
-timeout 60 python3 test/tls/h2_drain_slow.py test/tls/server.crt 47453 $h2d_master >/dev/null 2>&1
+timeout 60 python3 test/tls/h2_drain_slow.py test/tls/server.crt 61453 $h2d_master >/dev/null 2>&1
 check "http2 drain delivers the whole in-flight body to a slow reader" $?
 wait $h2d_master 2>/dev/null
 rm -f test/linnea.log test/www/h2drain.bin
@@ -1167,10 +1186,10 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     start_server test/configs/tls-h3-bigcert.json
     bc_pid=$SRV_PID
     sleep 0.6
-    python3 test/quic/h3_bigcert_test.py 47454 >/dev/null 2>&1
+    python3 test/quic/h3_bigcert_test.py 61454 >/dev/null 2>&1
     check "h3 (io_uring): large flight segmented + held to the 3x amp budget" $?
     body=$(curl -s --http2 --cacert test/tls/bigchain.crt \
-                --resolve localhost:47454:127.0.0.1 https://localhost:47454/hello.txt)
+                --resolve localhost:61454:127.0.0.1 https://localhost:61454/hello.txt)
     [ "$body" = "hello from linnea" ]
     check "h2 (kTLS): large certificate chain over TCP (past the old cap)" $?
     kill $bc_pid 2>/dev/null
@@ -1186,7 +1205,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quich
     timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
     hspid=$!
     sleep 0.4
-    python3 test/quic/h3_ack_test.py 47501 >/dev/null 2>&1
+    python3 test/quic/h3_ack_test.py 61501 >/dev/null 2>&1
     check "quic: replies acknowledge the packets we received" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
@@ -1200,7 +1219,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quich
     timeout 60 ./bin/linnea-quichs >/dev/null 2>&1 &
     hspid=$!
     sleep 0.4
-    python3 test/quic/h3_churn_test.py 47501 100 >/dev/null 2>&1
+    python3 test/quic/h3_churn_test.py 61501 100 >/dev/null 2>&1
     check "quic: 100 connections through a 64-slot pool (close frees the slot)" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
@@ -1214,7 +1233,7 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null && [ -x ./bin/linnea-quich
     timeout 10 ./bin/linnea-quichs >/dev/null 2>&1 &
     hspid=$!
     sleep 0.4
-    python3 test/quic/h3_conns_test.py 47501 >/dev/null 2>&1
+    python3 test/quic/h3_conns_test.py 61501 >/dev/null 2>&1
     check "quic: two interleaved connections keep separate state (pool demux)" $?
     kill $hspid 2>/dev/null
     wait $hspid 2>/dev/null
@@ -1238,7 +1257,7 @@ with gzip.open('test/www/enc.txt.gz', 'wb') as f:
     f.write(b'gzip payload')
 open('test/www/enc.txt.br', 'wb').write(b'br payload')
 PY
-# The suite runs two backends in turn, both on 47100: one for the plain-HTTP
+# The suite runs two backends in turn, both on 61100: one for the plain-HTTP
 # block and a second for the TLS block. SO_REUSEADDR lets the second past a
 # TIME_WAIT, but not past a first that is still listening — and the backend's
 # output goes to /dev/null, so a failed bind is invisible until every proxied
@@ -1250,11 +1269,11 @@ PY
 # a fixture that did not come up makes every result after it meaningless, so stop.
 backend_ready() {
     for _ in $(seq 1 60); do
-        (echo > /dev/tcp/127.0.0.1/47100) >/dev/null 2>&1 && return 0
+        (echo > /dev/tcp/127.0.0.1/61100) >/dev/null 2>&1 && return 0
         sleep 0.1
     done
     echo >&2
-    echo "FATAL: the proxy backend never came up on 47100." >&2
+    echo "FATAL: the proxy backend never came up on 61100." >&2
     echo "  Every proxied request in this block would answer 502 and the failures" >&2
     echo "  would point everywhere except here, so the run stops instead. Check for" >&2
     echo "  a backend an earlier run left behind:" >&2
@@ -1268,16 +1287,16 @@ rm -f "$SEEN"
 python3 test/proxy_backend.py >/dev/null 2>&1 &
 backend_pid=$!
 backend_ready
-# The websocket backend, twice: 47701 is spoken to directly, 47702 sits behind
+# The websocket backend, twice: 61701 is spoken to directly, 61702 sits behind
 # linnea's /ws location. Two instances rather than one, so the counter each
 # battery sees is its own and the two runs cannot perturb each other.
-./bin/linnea-ws 47701 >/dev/null 2>&1 &
+./bin/linnea-ws 61701 >/dev/null 2>&1 &
 ws_direct_pid=$!
-./bin/linnea-ws 47702 >/dev/null 2>&1 &
+./bin/linnea-ws 61702 >/dev/null 2>&1 &
 ws_proxy_pid=$!
 for _ in $(seq 1 60); do
-    (echo > /dev/tcp/127.0.0.1/47701) >/dev/null 2>&1 && \
-    (echo > /dev/tcp/127.0.0.1/47702) >/dev/null 2>&1 && break
+    (echo > /dev/tcp/127.0.0.1/61701) >/dev/null 2>&1 && \
+    (echo > /dev/tcp/127.0.0.1/61702) >/dev/null 2>&1 && break
     sleep 0.1
 done
 start_server test/configs/listen.json
@@ -1310,64 +1329,64 @@ raw_http() {
 }
 
 # --- log file ---
-grep -q "listening on 127.0.0.1:47080 (one.test)" "$LOG"
+grep -q "listening on 127.0.0.1:61080 (one.test)" "$LOG"
 check "log listening line" $?
-n=$(grep -c "listening on 127.0.0.1:47080" "$LOG")
+n=$(grep -c "listening on 127.0.0.1:61080" "$LOG")
 [ "$n" -eq 1 ]
 check "shared listener bound once" $?
 
 # --- bind conflict against the running server ---
-run_test "address in use"  1 stderr "cannot bind to 127.0.0.1:47080 (errno 98)" \
+run_test "address in use"  1 stderr "cannot bind to 127.0.0.1:61080 (errno 98)" \
     $BIN --config test/configs/dup-bind.json
 
 # --- static file serving ---
-resp=$(curl -s --max-time 2 http://127.0.0.1:47080/hello.txt)
+resp=$(curl -s --max-time 2 http://127.0.0.1:61080/hello.txt)
 check_http "file txt body"     "hello from linnea" "$resp"
-resp=$(curl -si --max-time 2 http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61080/hello.txt)
 check_http "file txt mime"     "Content-Type: text/plain" "$resp"
-resp=$(curl -si --max-time 2 http://127.0.0.1:47080/)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61080/)
 check_http "index html body"   "linnea index page" "$resp"
 check_http "index html mime"   "Content-Type: text/html" "$resp"
 
 # --- redirect location: 301 with the raw request target appended ---
-resp=$(curl -si --max-time 2 http://127.0.0.1:47090/old)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61090/old)
 check_http "redirect status"   "301 Moved Permanently" "$resp"
 check_http "redirect location" "Location: https://example.com/old" "$resp"
 check_http "redirect no body"  "Content-Length: 0" "$resp"
-resp=$(curl -si --max-time 2 "http://127.0.0.1:47090/old/a%20b?x=1&y=2")
+resp=$(curl -si --max-time 2 "http://127.0.0.1:61090/old/a%20b?x=1&y=2")
 check_http "redirect keeps raw path+query" "Location: https://example.com/old/a%20b?x=1&y=2" "$resp"
-resp=$(curl -si --max-time 2 http://127.0.0.1:47080/style.css)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61080/style.css)
 check_http "css mime"          "Content-Type: text/css" "$resp"
-resp=$(curl -si --max-time 2 http://127.0.0.1:47080/favicon.ico)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61080/favicon.ico)
 check_http "ico mime"          "Content-Type: image/x-icon" "$resp"
-resp=$(curl -s --max-time 2 http://127.0.0.1:47090/sub/page.html)
+resp=$(curl -s --max-time 2 http://127.0.0.1:61090/sub/page.html)
 check_http "subdirectory file" "subdirectory page" "$resp"
 
-# --- location routing: 47090 has "/" -> test/www/sub and "/sub" -> test/www ---
-resp=$(curl -s --max-time 2 http://127.0.0.1:47090/page.html)
+# --- location routing: 61090 has "/" -> test/www/sub and "/sub" -> test/www ---
+resp=$(curl -s --max-time 2 http://127.0.0.1:61090/page.html)
 check_http "location root match"  "subdirectory page" "$resp"
-resp=$(curl -si --max-time 2 http://127.0.0.1:47090/hello.txt)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61090/hello.txt)
 check_http "location root scopes" "404 Not Found" "$resp"
 # /sub/page.html matches the longer "/sub" prefix (root test/www), not "/"
-resp=$(curl -s --max-time 2 http://127.0.0.1:47090/sub/page.html)
+resp=$(curl -s --max-time 2 http://127.0.0.1:61090/sub/page.html)
 check_http "longest prefix wins"  "subdirectory page" "$resp"
-resp=$(curl -si --max-time 2 http://127.0.0.1:47080/no-such-file)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61080/no-such-file)
 check_http "http 404"          "404 Not Found" "$resp"
-resp=$(curl -si --max-time 2 -I http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -I http://127.0.0.1:61080/hello.txt)
 check_http "HEAD length"       "Content-Length: 18" "$resp"
-resp=$(curl -si --max-time 2 -X POST http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -X POST http://127.0.0.1:61080/hello.txt)
 check_http "http 405"          "405 Method Not Allowed" "$resp"
 
 # a file larger than one page: the mapped length must be the whole file
-n=$(curl -s --max-time 5 http://127.0.0.1:47080/big.txt | wc -c)
+n=$(curl -s --max-time 5 http://127.0.0.1:61080/big.txt | wc -c)
 [ "$n" -eq 100000 ]
 check "large file length ($n bytes)" $?
-junk=$(curl -s --max-time 5 http://127.0.0.1:47080/big.txt | tr -d 'B' | wc -c)
+junk=$(curl -s --max-time 5 http://127.0.0.1:61080/big.txt | tr -d 'B' | wc -c)
 [ "$junk" -eq 0 ]
 check "large file intact" $?
 
 # --- caching: ETag / Last-Modified and conditional requests ---
-resp=$(curl -si --max-time 2 http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61080/hello.txt)
 check_http "etag present"        "ETag: \"" "$resp"
 check_http "last-modified present" "Last-Modified: " "$resp"
 printf '%s' "$resp" | grep -qE '^ETag: "[0-9a-f]+-12"'
@@ -1378,14 +1397,14 @@ check_http "server header"       "Server: linnea" "$resp"
 printf '%s' "$resp" | grep -qE '^Date: [A-Z][a-z]{2}, [0-9]{2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT'
 check "date is an HTTP date" $?
 check_http "cache-control from config" "Cache-Control: max-age=60" "$resp"
-resp=$(curl -si --max-time 2 http://127.0.0.1:47080/no-such-file)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61080/no-such-file)
 check_http "404 server header"   "Server: linnea" "$resp"
 
-resp=$(curl -si --max-time 2 http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61080/hello.txt)
 etag=$(printf '%s' "$resp" | grep -i '^etag:' | tr -d '\r' | cut -d' ' -f2)
 lastmod=$(printf '%s' "$resp" | grep -i '^last-modified:' | tr -d '\r' | cut -d' ' -f2-)
 
-resp=$(curl -si --max-time 2 -H "If-None-Match: $etag" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H "If-None-Match: $etag" http://127.0.0.1:61080/hello.txt)
 check_http "if-none-match 304"   "304 Not Modified" "$resp"
 check_http "304 repeats etag"    "ETag: $etag" "$resp"
 check_http "304 keeps alive"     "Connection: keep-alive" "$resp"
@@ -1398,38 +1417,38 @@ check "304 carries no body" $?
 # a 304 that cost a new connection each time would defeat revalidation
 before=$(grep -c "accepted connection" "$LOG")
 curl -s --max-time 4 -H "If-None-Match: $etag" -o /dev/null \
-    http://127.0.0.1:47080/hello.txt http://127.0.0.1:47080/hello.txt
+    http://127.0.0.1:61080/hello.txt http://127.0.0.1:61080/hello.txt
 after=$(grep -c "accepted connection" "$LOG")
 [ $((after - before)) -eq 1 ]
 check "304 single accept" $?
 
-resp=$(curl -si --max-time 2 -H 'If-None-Match: "stale"' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'If-None-Match: "stale"' http://127.0.0.1:61080/hello.txt)
 check_http "stale etag 200"      "hello from linnea" "$resp"
-resp=$(curl -si --max-time 2 -H "If-None-Match: W/$etag" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H "If-None-Match: W/$etag" http://127.0.0.1:61080/hello.txt)
 check_http "weak etag 304"       "304 Not Modified" "$resp"
-resp=$(curl -si --max-time 2 -H 'If-None-Match: *' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'If-None-Match: *' http://127.0.0.1:61080/hello.txt)
 check_http "if-none-match star"  "304 Not Modified" "$resp"
-resp=$(curl -si --max-time 2 -H "If-None-Match: \"a\", W/\"b\", $etag" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H "If-None-Match: \"a\", W/\"b\", $etag" http://127.0.0.1:61080/hello.txt)
 check_http "etag list 304"       "304 Not Modified" "$resp"
-resp=$(curl -si --max-time 2 -I -H "If-None-Match: $etag" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -I -H "If-None-Match: $etag" http://127.0.0.1:61080/hello.txt)
 check_http "HEAD 304"            "304 Not Modified" "$resp"
 
-resp=$(curl -si --max-time 2 -H "If-Modified-Since: $lastmod" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H "If-Modified-Since: $lastmod" http://127.0.0.1:61080/hello.txt)
 check_http "if-modified-since 304" "304 Not Modified" "$resp"
-resp=$(curl -si --max-time 2 -z "$lastmod" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -z "$lastmod" http://127.0.0.1:61080/hello.txt)
 check_http "curl time-cond 304"  "304 Not Modified" "$resp"
-resp=$(curl -si --max-time 2 -H "If-Modified-Since: Wed, 01 Jan 2020 00:00:00 GMT" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H "If-Modified-Since: Wed, 01 Jan 2020 00:00:00 GMT" http://127.0.0.1:61080/hello.txt)
 check_http "older date 200"      "hello from linnea" "$resp"
 # an unparseable date must be ignored, not treated as a condition
-resp=$(curl -si --max-time 2 -H "If-Modified-Since: not a date" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H "If-Modified-Since: not a date" http://127.0.0.1:61080/hello.txt)
 check_http "bad date ignored"    "hello from linnea" "$resp"
 # An rfc850 date now PARSES (RFC 9110 5.6.7); 1994 is simply older than the
 # file, so the body is still what comes back. The name said "ignored" when the
 # format was rejected outright — the outcome is the same, the reason is not.
-resp=$(curl -si --max-time 2 -H "If-Modified-Since: Sunday, 06-Nov-94 08:49:37 GMT" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H "If-Modified-Since: Sunday, 06-Nov-94 08:49:37 GMT" http://127.0.0.1:61080/hello.txt)
 check_http "rfc850 date parses, and 1994 is older" "hello from linnea" "$resp"
 # If-None-Match wins outright when both are present
-resp=$(curl -si --max-time 2 -H 'If-None-Match: "x"' -H "If-Modified-Since: $lastmod" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'If-None-Match: "x"' -H "If-Modified-Since: $lastmod" http://127.0.0.1:61080/hello.txt)
 check_http "if-none-match wins"  "hello from linnea" "$resp"
 
 grep -qF '"GET /hello.txt HTTP/1.1" 304 0' "$LOG"
@@ -1439,11 +1458,11 @@ check "request log 304" $?
 # enc_of <accept-encoding> — the Content-Encoding linnea picked, if any.
 # grep -a: the gzip variant's body is binary.
 enc_of() {
-    curl -si --max-time 2 -H "Accept-Encoding: $1" http://127.0.0.1:47080/enc.txt \
+    curl -si --max-time 2 -H "Accept-Encoding: $1" http://127.0.0.1:61080/enc.txt \
         | grep -a -io '^content-encoding: .*' | tr -d '\r' | cut -d' ' -f2
 }
 body_of() {
-    curl -s --max-time 2 -H "Accept-Encoding: $1" http://127.0.0.1:47080/enc.txt
+    curl -s --max-time 2 -H "Accept-Encoding: $1" http://127.0.0.1:61080/enc.txt
 }
 [ "$(enc_of 'gzip, br')" = "br" ]
 check "br preferred over gzip" $?
@@ -1459,7 +1478,7 @@ check "accept-encoding is case-insensitive" $?
 check "identity gets the plain file" $?
 [ "$(body_of 'identity')" = "plain payload" ]
 check "plain body when no coding taken" $?
-resp=$(curl -si --max-time 2 http://127.0.0.1:47080/enc.txt)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61080/enc.txt)
 printf '%s' "$resp" | grep -qai '^content-encoding'
 [ $? -ne 0 ]
 check "no accept-encoding, no coding" $?
@@ -1480,7 +1499,7 @@ check "q=0.000 refuses too" $?
 # any of them accepts it, which is the answer joining them would have given.
 enc_of2() {
     curl -si --max-time 2 -H "Accept-Encoding: $1" -H "Accept-Encoding: $2" \
-        http://127.0.0.1:47080/enc.txt \
+        http://127.0.0.1:61080/enc.txt \
         | grep -ai '^content-encoding' | tr -d '\r' | sed 's/.*: //'
 }
 [ "$(enc_of2 'identity' 'br')" = "br" ]
@@ -1490,7 +1509,7 @@ check "split accept-encoding: gzip on the second line" $?
 [ "$(enc_of2 'gzip' 'br')" = "br" ]
 check "split accept-encoding: br still preferred over gzip" $?
 # the type comes from the name before the suffix, not from ".br"
-resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:47080/enc.txt)
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:61080/enc.txt)
 check_http "type ignores the suffix" "Content-Type: text/plain" "$resp"
 check_http "variant length"          "Content-Length: 10" "$resp"
 check_http "variant vary"            "Vary: Accept-Encoding" "$resp"
@@ -1500,18 +1519,18 @@ check_http "variant vary"            "Vary: Accept-Encoding" "$resp"
 # hands it to the very clients the variant was for — the 200 becomes
 # unreachable through the cache. Both answers must agree on Vary.
 printf 'br only payload' > test/www/varonly.txt.br
-resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:47080/varonly.txt)
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:61080/varonly.txt)
 check_http "variant-only file served to a br client" "HTTP/1.1 200" "$resp"
 check_http "variant-only 200 varies"                 "Vary: Accept-Encoding" "$resp"
-resp=$(curl -si --max-time 2 -H 'Accept-Encoding: identity' http://127.0.0.1:47080/varonly.txt)
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: identity' http://127.0.0.1:61080/varonly.txt)
 check_http "variant-only 404s a client that cannot take it" "HTTP/1.1 404" "$resp"
 check_http "that 404 varies too (h1-15)"                    "Vary: Accept-Encoding" "$resp"
 rm -f test/www/varonly.txt.br
 # curl decoding the real gzip end to end
-[ "$(curl -s --max-time 2 --compressed -H 'Accept-Encoding: gzip' http://127.0.0.1:47080/enc.txt)" = "gzip payload" ]
+[ "$(curl -s --max-time 2 --compressed -H 'Accept-Encoding: gzip' http://127.0.0.1:61080/enc.txt)" = "gzip payload" ]
 check "gzip variant decodes" $?
 # a file with no variants must not claim an encoding, but still varies
-resp=$(curl -si --max-time 2 -H 'Accept-Encoding: gzip, br' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: gzip, br' http://127.0.0.1:61080/hello.txt)
 printf '%s' "$resp" | grep -qai '^content-encoding'
 [ $? -ne 0 ]
 check "no variant, no coding" $?
@@ -1520,25 +1539,25 @@ check_http "no variant serves plain" "hello from linnea" "$resp"
 
 # Each variant is its own representation: a cache must never hand one to a
 # client that asked for another, so the validators have to differ.
-etag_br=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:47080/enc.txt | grep -ai '^etag:' | tr -d '\r' | cut -d' ' -f2)
-etag_gz=$(curl -si --max-time 2 -H 'Accept-Encoding: gzip' http://127.0.0.1:47080/enc.txt | grep -ai '^etag:' | tr -d '\r' | cut -d' ' -f2)
-etag_pl=$(curl -si --max-time 2 http://127.0.0.1:47080/enc.txt | grep -ai '^etag:' | tr -d '\r' | cut -d' ' -f2)
+etag_br=$(curl -si --max-time 2 -H 'Accept-Encoding: br' http://127.0.0.1:61080/enc.txt | grep -ai '^etag:' | tr -d '\r' | cut -d' ' -f2)
+etag_gz=$(curl -si --max-time 2 -H 'Accept-Encoding: gzip' http://127.0.0.1:61080/enc.txt | grep -ai '^etag:' | tr -d '\r' | cut -d' ' -f2)
+etag_pl=$(curl -si --max-time 2 http://127.0.0.1:61080/enc.txt | grep -ai '^etag:' | tr -d '\r' | cut -d' ' -f2)
 [ -n "$etag_br" ] && [ "$etag_br" != "$etag_gz" ] && [ "$etag_gz" != "$etag_pl" ] && [ "$etag_br" != "$etag_pl" ]
 check "each variant has its own etag" $?
-resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' -H "If-None-Match: $etag_br" http://127.0.0.1:47080/enc.txt)
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' -H "If-None-Match: $etag_br" http://127.0.0.1:61080/enc.txt)
 check_http "variant revalidates 304" "304 Not Modified" "$resp"
 check_http "variant 304 varies"      "Vary: Accept-Encoding" "$resp"
 printf '%s' "$resp" | grep -qai '^content-encoding'
 [ $? -ne 0 ]
 check "variant 304 omits the coding" $?
 # the br etag says nothing about the gzip or plain representations
-resp=$(curl -si --max-time 2 -H 'Accept-Encoding: gzip' -H "If-None-Match: $etag_br" http://127.0.0.1:47080/enc.txt)
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: gzip' -H "If-None-Match: $etag_br" http://127.0.0.1:61080/enc.txt)
 check_http "cross-variant etag 200" "200 OK" "$resp"
-resp=$(curl -si --max-time 2 -H "If-None-Match: $etag_br" http://127.0.0.1:47080/enc.txt)
+resp=$(curl -si --max-time 2 -H "If-None-Match: $etag_br" http://127.0.0.1:61080/enc.txt)
 check_http "variant etag vs plain 200" "plain payload" "$resp"
 
 # --- Range requests: hello.txt is the 18 bytes "hello from linnea\n" ---
-resp=$(curl -si --max-time 2 -r 0-4 http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -r 0-4 http://127.0.0.1:61080/hello.txt)
 check_http "range 206"           "206 Partial Content" "$resp"
 check_http "range content-range" "Content-Range: bytes 0-4/18" "$resp"
 check_http "range length"        "Content-Length: 5" "$resp"
@@ -1546,70 +1565,70 @@ printf '%s' "$resp" | grep -qF "hello from"
 [ $? -ne 0 ]
 check "range body is the slice" $?
 check_http "range body"          "hello" "$resp"
-resp=$(curl -s --max-time 2 -r 6- http://127.0.0.1:47080/hello.txt)
+resp=$(curl -s --max-time 2 -r 6- http://127.0.0.1:61080/hello.txt)
 [ "$resp" = "from linnea" ]     # the trailing newline is byte 17
 check "range open end" $?
-resp=$(curl -s --max-time 2 -r -7 http://127.0.0.1:47080/hello.txt)
+resp=$(curl -s --max-time 2 -r -7 http://127.0.0.1:61080/hello.txt)
 [ "$resp" = "linnea" ]
 check "range suffix" $?
-resp=$(curl -si --max-time 2 -r 0-0 http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -r 0-0 http://127.0.0.1:61080/hello.txt)
 check_http "range single byte"   "Content-Range: bytes 0-0/18" "$resp"
 check_http "range single length" "Content-Length: 1" "$resp"
 # a last past the end means "to the end"
-resp=$(curl -si --max-time 2 -H 'Range: bytes=6-9999' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'Range: bytes=6-9999' http://127.0.0.1:61080/hello.txt)
 check_http "range clamped last"  "Content-Range: bytes 6-17/18" "$resp"
 # a suffix longer than the file is the whole file, still a 206
-resp=$(curl -si --max-time 2 -H 'Range: bytes=-9999' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'Range: bytes=-9999' http://127.0.0.1:61080/hello.txt)
 check_http "range long suffix"   "Content-Range: bytes 0-17/18" "$resp"
 # 200s advertise the support
-resp=$(curl -si --max-time 2 http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 http://127.0.0.1:61080/hello.txt)
 check_http "accept-ranges"       "Accept-Ranges: bytes" "$resp"
 # unsatisfiable: starts at or past the end -> 416 naming the length
-resp=$(curl -si --max-time 2 -H 'Range: bytes=99-' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'Range: bytes=99-' http://127.0.0.1:61080/hello.txt)
 check_http "range 416"           "416 Range Not Satisfiable" "$resp"
 check_http "416 content-range"   "Content-Range: bytes */18" "$resp"
 check_http "416 keeps alive"     "Connection: keep-alive" "$resp"
-resp=$(curl -si --max-time 2 -H 'Range: bytes=-0' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'Range: bytes=-0' http://127.0.0.1:61080/hello.txt)
 check_http "range -0 is 416"     "416 Range Not Satisfiable" "$resp"
 # not understood -> ignored -> the full 200
-resp=$(curl -si --max-time 2 -H 'Range: bytes=5-2' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'Range: bytes=5-2' http://127.0.0.1:61080/hello.txt)
 check_http "backwards range 200" "200 OK" "$resp"
-resp=$(curl -si --max-time 2 -H 'Range: bytes=abc' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'Range: bytes=abc' http://127.0.0.1:61080/hello.txt)
 check_http "garbage range 200"   "200 OK" "$resp"
-resp=$(curl -si --max-time 2 -H 'Range: potatoes=0-4' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'Range: potatoes=0-4' http://127.0.0.1:61080/hello.txt)
 check_http "other unit 200"      "200 OK" "$resp"
-resp=$(curl -si --max-time 2 -H 'Range: bytes=0-1,3-4' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -H 'Range: bytes=0-1,3-4' http://127.0.0.1:61080/hello.txt)
 check_http "several ranges 200"  "200 OK" "$resp"
 check_http "several ranges full" "Content-Length: 18" "$resp"
 # Range is defined for GET alone
-resp=$(curl -si --max-time 2 -I -H 'Range: bytes=0-4' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -I -H 'Range: bytes=0-4' http://127.0.0.1:61080/hello.txt)
 check_http "HEAD ignores range"  "200 OK" "$resp"
 check_http "HEAD full length"    "Content-Length: 18" "$resp"
 # the conditionals still win over Range
-resp=$(curl -si --max-time 2 -r 0-4 -H "If-None-Match: $etag" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -r 0-4 -H "If-None-Match: $etag" http://127.0.0.1:61080/hello.txt)
 check_http "range vs 304"        "304 Not Modified" "$resp"
 # If-Range: the range only with a strong validator match
-resp=$(curl -si --max-time 2 -r 0-4 -H "If-Range: $etag" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -r 0-4 -H "If-Range: $etag" http://127.0.0.1:61080/hello.txt)
 check_http "if-range match 206"  "206 Partial Content" "$resp"
-resp=$(curl -si --max-time 2 -r 0-4 -H 'If-Range: "stale"' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -r 0-4 -H 'If-Range: "stale"' http://127.0.0.1:61080/hello.txt)
 check_http "if-range stale 200"  "200 OK" "$resp"
-resp=$(curl -si --max-time 2 -r 0-4 -H "If-Range: W/$etag" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -r 0-4 -H "If-Range: W/$etag" http://127.0.0.1:61080/hello.txt)
 check_http "if-range weak 200"   "200 OK" "$resp"
-resp=$(curl -si --max-time 2 -r 0-4 -H "If-Range: $lastmod" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -r 0-4 -H "If-Range: $lastmod" http://127.0.0.1:61080/hello.txt)
 check_http "if-range date 206"   "206 Partial Content" "$resp"
-resp=$(curl -si --max-time 2 -r 0-4 -H 'If-Range: Wed, 01 Jan 2020 00:00:00 GMT' http://127.0.0.1:47080/hello.txt)
+resp=$(curl -si --max-time 2 -r 0-4 -H 'If-Range: Wed, 01 Jan 2020 00:00:00 GMT' http://127.0.0.1:61080/hello.txt)
 check_http "if-range old date 200" "200 OK" "$resp"
 # ranges hold on big files and on pre-compressed variants
-n=$(curl -s --max-time 5 -r 90000-99999 http://127.0.0.1:47080/big.txt | tr -d 'B' | wc -c)
-[ "$n" -eq 0 ] && [ "$(curl -s --max-time 5 -r 90000-99999 http://127.0.0.1:47080/big.txt | wc -c)" -eq 10000 ]
+n=$(curl -s --max-time 5 -r 90000-99999 http://127.0.0.1:61080/big.txt | tr -d 'B' | wc -c)
+[ "$n" -eq 0 ] && [ "$(curl -s --max-time 5 -r 90000-99999 http://127.0.0.1:61080/big.txt | wc -c)" -eq 10000 ]
 check "range into big file" $?
-resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' -r 0-1 http://127.0.0.1:47080/enc.txt)
+resp=$(curl -si --max-time 2 -H 'Accept-Encoding: br' -r 0-1 http://127.0.0.1:61080/enc.txt)
 check_http "variant range slices variant" "Content-Range: bytes 0-1/10" "$resp"
 check_http "variant range body"  "br" "$resp"
 # two ranged requests ride one keep-alive connection
 before=$(grep -c "accepted connection" "$LOG")
 curl -s --max-time 4 -r 0-4 \
-    http://127.0.0.1:47080/hello.txt http://127.0.0.1:47080/hello.txt >/dev/null
+    http://127.0.0.1:61080/hello.txt http://127.0.0.1:61080/hello.txt >/dev/null
 after=$(grep -c "accepted connection" "$LOG")
 [ $((after - before)) -eq 1 ]
 check "206 keep-alive single accept" $?
@@ -1618,18 +1637,18 @@ check "request log 206" $?
 grep -qF '"GET /hello.txt HTTP/1.1" 416 0' "$LOG"
 check "request log 416" $?
 
-# --- virtual hosts: 47080 is shared by one.test (default) and three.test ---
-resp=$(curl -s --max-time 2 -H "Host: three.test" http://127.0.0.1:47080/page.html)
+# --- virtual hosts: 61080 is shared by one.test (default) and three.test ---
+resp=$(curl -s --max-time 2 -H "Host: three.test" http://127.0.0.1:61080/page.html)
 check_http "vhost three.test"  "subdirectory page" "$resp"
-resp=$(curl -s --max-time 2 -H "Host: three.test:47080" http://127.0.0.1:47080/page.html)
+resp=$(curl -s --max-time 2 -H "Host: three.test:61080" http://127.0.0.1:61080/page.html)
 check_http "vhost host:port"   "subdirectory page" "$resp"
-resp=$(curl -s --max-time 2 -H "Host: unknown.test" http://127.0.0.1:47080/hello.txt)
+resp=$(curl -s --max-time 2 -H "Host: unknown.test" http://127.0.0.1:61080/hello.txt)
 check_http "vhost default"     "hello from linnea" "$resp"
 
 # --- percent-decoding ---
-resp=$(curl -s --max-time 2 'http://127.0.0.1:47080/a%20b.txt')
+resp=$(curl -s --max-time 2 'http://127.0.0.1:61080/a%20b.txt')
 check_http "decode space"      "space file" "$resp"
-resp=$(curl -s --max-time 2 'http://127.0.0.1:47080/sub%2Fpage.html')
+resp=$(curl -s --max-time 2 'http://127.0.0.1:61080/sub%2Fpage.html')
 check_http "decode slash"      "subdirectory page" "$resp"
 check_http "encoded traversal" "400 Bad Request" "$(raw_http 'GET /%2e%2e/secret HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
 check_http "bad escape"        "400 Bad Request" "$(raw_http 'GET /%zz HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
@@ -1833,9 +1852,9 @@ resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost:\r\n\r\n')
 check_http "host: empty Host is 400" "400 Bad Request" "$resp"
 resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one test\r\n\r\n')
 check_http "host: Host with a space is 400" "400 Bad Request" "$resp"
-resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test:47080\r\n\r\n')
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test:61080\r\n\r\n')
 check_http "host: Host with a port serves" "200 OK" "$resp"
-resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: [::1]:47080\r\n\r\n')
+resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: [::1]:61080\r\n\r\n')
 check_http "host: IPv6-literal Host serves" "200 OK" "$resp"
 # the trailing OWS a field value may carry is trimmed before validation
 resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test\t\r\n\r\n')
@@ -1860,7 +1879,7 @@ check "log timestamps" $?
 
 # --- keep-alive: two requests, one connection (count accepts in the log) ---
 before=$(grep -c "accepted connection" "$LOG")
-resp=$(curl -s --max-time 4 http://127.0.0.1:47080/hello.txt http://127.0.0.1:47080/index.html)
+resp=$(curl -s --max-time 4 http://127.0.0.1:61080/hello.txt http://127.0.0.1:61080/index.html)
 after=$(grep -c "accepted connection" "$LOG")
 check_http "keep-alive body 1" "hello from linnea" "$resp"
 check_http "keep-alive body 2" "linnea index page" "$resp"
@@ -1875,7 +1894,7 @@ check "pipelined requests" $?
 
 # --- idle timeout: configured to 2s in listen.json ---
 start=$SECONDS
-if timeout 6 bash -c 'exec 3<>/dev/tcp/127.0.0.1/47080; cat <&3' >/dev/null 2>&1; then
+if timeout 6 bash -c 'exec 3<>/dev/tcp/127.0.0.1/61080; cat <&3' >/dev/null 2>&1; then
     elapsed=$((SECONDS - start))
     [ "$elapsed" -ge 1 ] && [ "$elapsed" -le 4 ]
     check "configured idle timeout (${elapsed}s)" $?
@@ -1883,75 +1902,75 @@ else
     check "configured idle timeout (connection not closed)" 1
 fi
 
-grep -qE 'accepted connection on 127\.0\.0\.1:47080 from 127\.0\.0\.1:[0-9]+ \(fd ' "$LOG"
+grep -qE 'accepted connection on 127\.0\.0\.1:61080 from 127\.0\.0\.1:[0-9]+ \(fd ' "$LOG"
 check "accept log line" $?
 
 # --- proxying: /api -> the test backend, /down -> nothing listening ---
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/simple)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/simple)
 check_http "proxy body"          "backend body" "$resp"
 check_http "proxy status"        "200 OK" "$resp"
 check_http "proxy content-length" "Content-Length: 12" "$resp"
 check_http "proxy keeps alive"   "Connection: keep-alive" "$resp"
 
 # the prefix is not stripped and the query survives: the backend echoes the target
-resp=$(curl -s --max-time 3 'http://127.0.0.1:47080/api/target?x=1&y=2')
+resp=$(curl -s --max-time 3 'http://127.0.0.1:61080/api/target?x=1&y=2')
 check_http "proxy target forwarded" "/api/target?x=1&y=2" "$resp"
 
 # the client's Connection header is replaced, everything else passes through
 resp=$(curl -s --max-time 3 -H 'X-Test: abc' -H 'Connection: keep-alive' \
-    http://127.0.0.1:47080/api/headers)
+    http://127.0.0.1:61080/api/headers)
 check_http "proxy forwards headers" "X-Test: abc" "$resp"
-check_http "proxy forwards host"    "Host: 127.0.0.1:47080" "$resp"
+check_http "proxy forwards host"    "Host: 127.0.0.1:61080" "$resp"
 check_http "proxy closes upstream"  "Connection: close" "$resp"
 
-resp=$(curl -s --max-time 3 -d 'hello body' http://127.0.0.1:47080/api/echo)
+resp=$(curl -s --max-time 3 -d 'hello body' http://127.0.0.1:61080/api/echo)
 check_http "proxy forwards body" "hello body" "$resp"
 
 # ...but a field the client's own Connection names is hop-by-hop and MUST be
 # removed before forwarding (RFC 9110 7.6.1). Only Connection and Expect were
 # dropped, so a client could mark any field hop-by-hop and have it delivered to
 # the backend anyway — the header-smuggling shape that rule exists to close.
-timeout 60 python3 test/tls/h1_proxy_hop_by_hop.py 47080 >/dev/null 2>&1
+timeout 60 python3 test/tls/h1_proxy_hop_by_hop.py 61080 >/dev/null 2>&1
 check "proxy removes hop-by-hop fields, both directions" $?
 
 # RFC 9110 7.6.3 MUST: a proxy names itself and the protocol it received on, in
 # each message it forwards. Without it a proxied request is indistinguishable
 # from a direct one — no loop detection, and no way to tell which hop
 # transformed a message.
-timeout 60 python3 test/tls/proxy_via.py 47080 >/dev/null 2>&1
+timeout 60 python3 test/tls/proxy_via.py 61080 >/dev/null 2>&1
 check "proxy adds Via to the request and the response" $?
 
 # RFC 9110 5.6.7 MUST: all three HTTP-date formats parse. Only IMF-fixdate did,
 # so a conditional request carrying an obsolete form was answered
 # unconditionally — the client got the whole body instead of its 304.
-timeout 60 python3 test/tls/http_date_formats.py 47080 >/dev/null 2>&1
+timeout 60 python3 test/tls/http_date_formats.py 61080 >/dev/null 2>&1
 check "all three HTTP-date formats are accepted" $?
 
 # RFC 9110 13.1.1 / 13.1.4: If-Match and If-Unmodified-Since were never read, so
 # a request carrying one was answered as though it had no condition at all —
 # the lost update those fields exist to prevent. 13.2.2 also fixes the order:
 # a failing If-Match is a 412 even when an If-None-Match would have said 304.
-timeout 60 python3 test/tls/preconditions.py 47080 >/dev/null 2>&1
+timeout 60 python3 test/tls/preconditions.py 61080 >/dev/null 2>&1
 check "If-Match and If-Unmodified-Since are evaluated" $?
 
 # RFC 9112 9.1: Connection is a token LIST and `close` may sit anywhere in it.
 # Only a value that was entirely "close" counted, so `keep-alive, close` was
 # answered `Connection: keep-alive` and the socket held to the idle timeout.
-timeout 60 python3 test/tls/connection_close_token.py 47080 >/dev/null 2>&1
+timeout 60 python3 test/tls/connection_close_token.py 61080 >/dev/null 2>&1
 check "Connection: close is honoured anywhere in the list" $?
 
 # RFC 9110 6.6.1: Date on everything outside 1xx/5xx. The canned blobs are
 # assembled ahead of time, so they shipped without one while every dynamically
 # built response had it. RFC 9112 9.6: and a response that closes must say so —
 # the OPTIONS * blob closed while claiming, in a comment, that it did not.
-timeout 60 python3 test/tls/canned_response_headers.py 47080 >/dev/null 2>&1
+timeout 60 python3 test/tls/canned_response_headers.py 61080 >/dev/null 2>&1
 check "canned responses carry Date and announce a close" $?
 
 # RFC 9110 10.1.1 MUST: answer a 100-continue expectation with 100 or a final
 # status. The field was never inspected, so the server waited for a body the
 # client was withholding while the client waited for permission to send it —
 # a full second added to every such request, for clients that recover at all.
-timeout 60 python3 test/tls/expect_continue.py 47080 >/dev/null 2>&1
+timeout 60 python3 test/tls/expect_continue.py 61080 >/dev/null 2>&1
 check "Expect: 100-continue is answered" $?
 
 # Chunked request bodies (RFC 9112 7.1 MUST). Any Transfer-Encoding at all used
@@ -1959,60 +1978,60 @@ check "Expect: 100-continue is answered" $?
 # refused: curl -T -, fetch() with a ReadableStream, most libraries handed a
 # stream. The arrival-pattern cases are the ones that matter — a body comes in
 # as many reads as the network likes.
-timeout 120 python3 test/tls/h1_chunked_request.py 47080 >/dev/null 2>&1
+timeout 120 python3 test/tls/h1_chunked_request.py 61080 >/dev/null 2>&1
 check "h1 decodes chunked request bodies" $?
 
 # a HEAD response is head-only even though the backend sends Content-Length:
 # waiting for that body would hang until the idle timeout
-resp=$(curl -si --max-time 3 -I http://127.0.0.1:47080/api/simple)
+resp=$(curl -si --max-time 3 -I http://127.0.0.1:61080/api/simple)
 check_http "proxy HEAD length"   "Content-Length: 12" "$resp"
 check_http "proxy HEAD no hang"  "200 OK" "$resp"
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/204)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/204)
 check_http "proxy 204 no body"   "204 No Content" "$resp"
 
 # chunked and close-delimited bodies have no length we can pass on, so the
 # client connection has to close to delimit them
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/chunked)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/chunked)
 check_http "proxy chunked body"  "chunked body" "$resp"
 check_http "proxy chunked framing" "Transfer-Encoding: chunked" "$resp"
 check_http "proxy chunked closes" "Connection: close" "$resp"
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/eof)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/eof)
 check_http "proxy eof body"      "eof delimited body" "$resp"
 check_http "proxy eof closes"    "Connection: close" "$resp"
 
 # a body bigger than the relay buffer takes several upstream reads
-n=$(curl -s --max-time 5 http://127.0.0.1:47080/api/big | wc -c)
+n=$(curl -s --max-time 5 http://127.0.0.1:61080/api/big | wc -c)
 [ "$n" -eq 40000 ]
 check "proxy large body ($n bytes)" $?
 
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/http10)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/http10)
 check_http "proxy 1.0 upstream"  "HTTP/1.1 200 OK" "$resp"
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/301)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/301)
 check_http "proxy passes status" "301 Moved Permanently" "$resp"
 check_http "proxy passes header" "Location: /elsewhere" "$resp"
 
 # proxied and static requests share one keep-alive connection
 before=$(grep -c "accepted connection" "$LOG")
-resp=$(curl -s --max-time 4 http://127.0.0.1:47080/api/simple http://127.0.0.1:47080/hello.txt)
+resp=$(curl -s --max-time 4 http://127.0.0.1:61080/api/simple http://127.0.0.1:61080/hello.txt)
 after=$(grep -c "accepted connection" "$LOG")
 check_http "proxy then static body" "hello from linnea" "$resp"
 [ $((after - before)) -eq 1 ]
 check "proxy keep-alive single accept" $?
 
 # --- proxy failures ---
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/down/x)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/down/x)
 check_http "proxy refused 502"   "502 Bad Gateway" "$resp"
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/garbage)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/garbage)
 check_http "proxy garbage 502"   "502 Bad Gateway" "$resp"
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/bighead)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/bighead)
 check_http "proxy huge head 502" "502 Bad Gateway" "$resp"
 # contradictory upstream framing must never reach the client: forwarding
 # both would let a compromised backend split the next keep-alive response
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/tecl)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/tecl)
 check_http "proxy TE+CL 502"     "502 Bad Gateway" "$resp"
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/cljunk)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/cljunk)
 check_http "proxy bad CL 502"    "502 Bad Gateway" "$resp"
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/clpad)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/clpad)
 check_http "proxy CL whitespace" "valid" "$resp"
 # Expect must not be forwarded: the body is already buffered, and an
 # interim 100 Continue would be parsed as the response itself
@@ -2023,13 +2042,13 @@ printf '%s' "$resp" | grep -qF "100 Continue"
 check "proxy no interim 100 leak" $?
 # the backend sleeps 4s; the config's timeout is 2s
 start=$SECONDS
-resp=$(curl -si --max-time 8 http://127.0.0.1:47080/api/slow)
+resp=$(curl -si --max-time 8 http://127.0.0.1:61080/api/slow)
 elapsed=$((SECONDS - start))
 check_http "proxy slow 504"      "504 Gateway Timeout" "$resp"
 [ "$elapsed" -le 4 ]
 check "proxy 504 on time (${elapsed}s)" $?
 # a body cut short of its Content-Length must not look like a clean end
-curl -s --max-time 3 http://127.0.0.1:47080/api/truncated >/dev/null 2>&1
+curl -s --max-time 3 http://127.0.0.1:61080/api/truncated >/dev/null 2>&1
 grep -qF ': upstream closed early' "$LOG"
 check "proxy truncated body" $?
 
@@ -2042,7 +2061,7 @@ random.seed(11)
 open('test/www/upload.bin','wb').write(bytes(random.getrandbits(8) for _ in range(300000)))"
 want=$(md5sum < test/www/upload.bin | cut -d' ' -f1)
 curl -s --max-time 30 --data-binary @test/www/upload.bin \
-    http://127.0.0.1:47080/api/echo > /tmp/upload_echo.bin
+    http://127.0.0.1:61080/api/echo > /tmp/upload_echo.bin
 [ "$(md5sum < /tmp/upload_echo.bin | cut -d' ' -f1)" = "$want" ]
 check "proxy captures a 300000-byte request body (byte-exact)" $?
 rm -f /tmp/upload_echo.bin
@@ -2082,7 +2101,7 @@ done
 # The bound has ~24 bytes of margin over everything the rewrite adds (Via, the
 # Connection line, a Content-Length when a chunked one was dropped); this walks
 # a head across the boundary in both framings and expects only 200 or 431.
-out=$(python3 test/h1_upbuf_test.py 47080 2>&1 | tail -1)
+out=$(python3 test/h1_upbuf_test.py 61080 2>&1 | tail -1)
 [ "$out" = "OK" ]
 check "a proxied head at the up_buf boundary is served or refused ($out)" $?
 
@@ -2093,8 +2112,8 @@ python3 -c "
 import random
 random.seed(31); open('test/www/up1.bin','wb').write(bytes(random.getrandbits(8) for _ in range(200000)))
 random.seed(41); open('test/www/up2.bin','wb').write(bytes(random.getrandbits(8) for _ in range(250000)))"
-curl -s --max-time 30 -o /tmp/up1_echo.bin --data-binary @test/www/up1.bin http://127.0.0.1:47080/api/echo \
-     --next -s --max-time 30 -o /tmp/up2_echo.bin --data-binary @test/www/up2.bin http://127.0.0.1:47080/api/echo
+curl -s --max-time 30 -o /tmp/up1_echo.bin --data-binary @test/www/up1.bin http://127.0.0.1:61080/api/echo \
+     --next -s --max-time 30 -o /tmp/up2_echo.bin --data-binary @test/www/up2.bin http://127.0.0.1:61080/api/echo
 [ "$(md5sum < /tmp/up1_echo.bin | cut -d' ' -f1)" = "$(md5sum < test/www/up1.bin | cut -d' ' -f1)" ] &&
 [ "$(md5sum < /tmp/up2_echo.bin | cut -d' ' -f1)" = "$(md5sum < test/www/up2.bin | cut -d' ' -f1)" ]
 check "two counted captures on one kept-alive connection" $?
@@ -2141,13 +2160,17 @@ out=$(python3 test/ws_client.py reject)
 [ "$out" = "OK" ]
 check "ws upgrade refusal passes through ($out)" $?
 # a 101 the client never asked for must not start a tunnel
-resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/101)
+resp=$(curl -si --max-time 3 http://127.0.0.1:61080/api/101)
 check_http "unrequested 101 becomes 502" "502 Bad Gateway" "$resp"
-# ...and a tunnel must not hold up a stop. This one runs its own server on
-# 47471, because it stops it — 47080 is serving the rest of the suite.
+# ...and nothing open may hold up a stop. These two run their own servers,
+# because they stop them — 61080 is serving the rest of the suite. The second
+# waits out the 30s drain deadline, and is the slowest check in the file.
 out=$(python3 test/ws_drain_test.py)
 [ "$out" = "OK" ]
-check "ws tunnel does not delay a stop ($out)" $?
+check "a stop is immediate whatever is open ($out)" $?
+out=$(python3 test/reload_deadline_test.py)
+case "$out" in OK*) true ;; *) false ;; esac
+check "a reload retires an old worker a tunnel pins ($out)" $?
 
 # --- the assembly websocket backend, direct and through the tunnel ---
 # The same battery both ways: RFC 6455 handshake, framing, unmasking, the
@@ -2156,22 +2179,22 @@ check "ws tunnel does not delay a stop ($out)" $?
 # The /api backend, which had no coverage at all until a read of it turned up
 # five faults — including one that stopped the whole server indefinitely. It is
 # spoken to directly: linnea's side of /api is exercised by the proxy tests.
-./bin/linnea-api 47703 >/dev/null 2>&1 &
+./bin/linnea-api 61703 >/dev/null 2>&1 &
 api_pid=$!
 for _ in $(seq 1 60); do
-    (echo > /dev/tcp/127.0.0.1/47703) >/dev/null 2>&1 && break
+    (echo > /dev/tcp/127.0.0.1/61703) >/dev/null 2>&1 && break
     sleep 0.1
 done
-api_out=$(python3 test/api/api_backend_test.py 47703 2>&1)
+api_out=$(python3 test/api/api_backend_test.py 61703 2>&1)
 [ $? -eq 0 ]
 check "the /api backend" $?
 printf '%s\n' "$api_out" | grep -q "^FAIL" && printf '%s\n' "$api_out" | sed -n 's/^FAIL /  api: /p'
 kill $api_pid 2>/dev/null
 
-ws_direct_out=$(python3 test/api/ws_backend_test.py 47701 2>&1)
+ws_direct_out=$(python3 test/api/ws_backend_test.py 61701 2>&1)
 [ $? -eq 0 ]
 check "websocket backend, spoken to directly" $?
-ws_proxy_out=$(python3 test/api/ws_backend_test.py 47080 /ws 2>&1)
+ws_proxy_out=$(python3 test/api/ws_backend_test.py 61080 /ws 2>&1)
 [ $? -eq 0 ]
 check "websocket backend, through linnea's tunnel" $?
 for out in "$ws_direct_out" "$ws_proxy_out"; do
@@ -2179,7 +2202,7 @@ for out in "$ws_direct_out" "$ws_proxy_out"; do
 done
 # an upgrade wish on a static location changes nothing
 resp=$(curl -si --max-time 3 -H 'Connection: upgrade' -H 'Upgrade: websocket' \
-    http://127.0.0.1:47080/hello.txt)
+    http://127.0.0.1:61080/hello.txt)
 check_http "upgrade on static location" "hello from linnea" "$resp"
 grep -qF '"GET /api/ws-echo HTTP/1.1" 101 0' "$LOG"
 check "ws request log 101" $?
@@ -2191,7 +2214,7 @@ check "ws termination upstream closed" $?
 # once the client's window fills the send stalls and its linked timeout
 # (2s in this config) fires.
 truncate -s 64M test/www/huge.bin
-(exec 3<>/dev/tcp/127.0.0.1/47080
+(exec 3<>/dev/tcp/127.0.0.1/61080
  printf 'GET /huge.bin HTTP/1.1\r\nHost: one.test\r\n\r\n' >&3
  sleep 6) &
 stall_pid=$!
@@ -2202,7 +2225,7 @@ kill $stall_pid 2>/dev/null
 wait $stall_pid 2>/dev/null
 # a slow but reading client must survive a transfer spanning several
 # timeout windows: partial sends re-arm with a fresh timeout each time
-n=$(curl -s --max-time 12 --limit-rate 16M http://127.0.0.1:47080/huge.bin | wc -c)
+n=$(curl -s --max-time 12 --limit-rate 16M http://127.0.0.1:61080/huge.bin | wc -c)
 [ "$n" -eq 67108864 ]
 check "slow reader outlives send timeout ($n bytes)" $?
 
@@ -2215,9 +2238,9 @@ grep -qF ': idle timeout' "$LOG"
 check "termination idle timeout" $?
 
 kill $server_pid $backend_pid $ws_direct_pid $ws_proxy_pid 2>/dev/null
-# the next block binds 47100 again, so let this one's listener go first
+# the next block binds 61100 again, so let this one's listener go first
 for _ in $(seq 1 60); do
-    (echo > /dev/tcp/127.0.0.1/47100) >/dev/null 2>&1 || break
+    (echo > /dev/tcp/127.0.0.1/61100) >/dev/null 2>&1 || break
     sleep 0.1
 done
 wait $server_pid 2>/dev/null
@@ -2233,7 +2256,7 @@ rm -f "$LOG" test/www/big.txt test/www/upload.bin test/www/upload2.bin test/www/
 start_server test/configs/limits.json
 limits_pid=$SRV_PID
 sleep 0.5
-python3 test/limits_test.py 47470 >/dev/null 2>&1
+python3 test/limits_test.py 61470 >/dev/null 2>&1
 check "connection limits: slow head cut off, per-address cap holds" $?
 kill $limits_pid 2>/dev/null
 wait $limits_pid 2>/dev/null
@@ -2245,28 +2268,33 @@ if python3 -c 'import ssl' 2>/dev/null; then
     start_server test/configs/tls-slowhead.json
     slowhs_pid=$SRV_PID
     sleep 0.5
-    timeout 40 python3 test/tls/tls_slow_handshake.py test/tls/server.crt 47455 3 \
+    timeout 40 python3 test/tls/tls_slow_handshake.py test/tls/server.crt 61455 3 \
         >/dev/null 2>&1
     check "tls handshake slowloris cut at the head deadline" $?
     kill $slowhs_pid 2>/dev/null
     wait $slowhs_pid 2>/dev/null
 fi
 
-# --- graceful drain: SIGTERM finishes in-flight work, then exits ---
-# A slow download is in flight when the master is killed; the workers
-# must complete it, refuse new connections meanwhile, and exit after.
+# --- graceful drain: SIGQUIT finishes in-flight work, then exits ---
+# A slow download is in flight when the drain starts; the workers must
+# complete it, refuse new connections meanwhile, and exit after.
+#
+# SIGQUIT, not SIGTERM: a stop is immediate now and would drop this download
+# on purpose (see "a stop is immediate whatever is open"). The drain is what a
+# hot upgrade does to the generation it retires, and kill_old_workers signals
+# the workers, so the test does the same.
 python3 -c "open('test/www/drain.bin','w').write('D' * 3000000)"
 rm -f "$LOG"
 start_server test/configs/listen.json
 drain_master=$SRV_PID
 sleep 0.3
-curl -s --max-time 30 --limit-rate 500k http://127.0.0.1:47080/drain.bin -o /tmp/drain_out &
+curl -s --max-time 30 --limit-rate 500k http://127.0.0.1:61080/drain.bin -o /tmp/drain_out &
 drain_curl=$!
 sleep 0.5                       # the transfer is under way
-kill $drain_master              # SIGTERM: master dies, workers drain
+drain_workers $drain_master     # SIGQUIT to the workers, then the master
 wait $drain_master 2>/dev/null
 sleep 0.5                       # accepts cancelled by now
-curl -s --max-time 2 http://127.0.0.1:47080/hello.txt -o /dev/null 2>/dev/null
+curl -s --max-time 2 http://127.0.0.1:61080/hello.txt -o /dev/null 2>/dev/null
 [ $? -ne 0 ]
 check "drain refuses new connections" $?
 wait $drain_curl
@@ -2305,7 +2333,7 @@ python3 - <<'PYEOF2' &
 import socket, time
 socks = []
 for i in range(24):
-    s = socket.create_connection(("127.0.0.1", 47080), timeout=5)
+    s = socket.create_connection(("127.0.0.1", 61080), timeout=5)
     s.sendall(b"GET /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n")
     s.recv(200)
     socks.append(s)
@@ -2377,7 +2405,7 @@ stop_master=$SRV_PID
 sleep 0.3
 stop_workers=$(pgrep -P $stop_master | tr '\n' ' ')
 # hold an idle keep-alive connection open across the stop
-python3 test/keepalive_holder.py 47080 20 &
+python3 test/keepalive_holder.py 61080 20 &
 stop_holder=$!
 sleep 0.5
 start=$SECONDS
@@ -2404,15 +2432,15 @@ rm -f "$LOG" "$LOG.rot"
 start_server test/configs/listen.json
 rot_master=$SRV_PID
 sleep 0.3
-curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null
+curl -s --max-time 3 http://127.0.0.1:61080/hello.txt -o /dev/null
 sleep 0.2
 mv "$LOG" "$LOG.rot"
-curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null
+curl -s --max-time 3 http://127.0.0.1:61080/hello.txt -o /dev/null
 sleep 0.2
 rotated_before=$(wc -l < "$LOG.rot")
 kill -HUP $rot_master
 sleep 0.5
-curl -s --max-time 3 http://127.0.0.1:47080/index.html -o /dev/null
+curl -s --max-time 3 http://127.0.0.1:61080/index.html -o /dev/null
 sleep 0.3
 kill -0 $rot_master 2>/dev/null
 check "sighup: the server survives it" $?
@@ -2437,7 +2465,7 @@ up_master=$SRV_PID
 sleep 0.3
 old_workers=$(pgrep -P $up_master | tr '\n' ' ')
 # a slow download in flight across the upgrade
-curl -s --max-time 30 --limit-rate 500k http://127.0.0.1:47080/up.bin \
+curl -s --max-time 30 --limit-rate 500k http://127.0.0.1:61080/up.bin \
     -o /tmp/up_out &
 up_curl=$!
 # a steady stream of quick requests, counting any refusal
@@ -2455,7 +2483,7 @@ for i in $(seq 1 60); do
     # the `if` body gets the status of the counter assignment -- which is
     # always 0 -- so this diagnostic used to record "curl0" for every failure
     # and answer none of the question it was added to answer.
-    curl -s --max-time 3 http://127.0.0.1:47080/hello.txt -o /dev/null
+    curl -s --max-time 3 http://127.0.0.1:61080/hello.txt -o /dev/null
     up_rc=$?
     if [ $up_rc -ne 0 ]; then
         up_fails=$((up_fails + 1))
@@ -2478,7 +2506,7 @@ for w in $old_workers; do kill -0 "$w" 2>/dev/null && gone=0; done
 check "upgrade drains the old workers" $?
 grep -qF 'binary upgrade complete' "$LOG"
 check "upgrade logged" $?
-curl -s --max-time 3 http://127.0.0.1:47080/hello.txt | grep -q "hello from linnea"
+curl -s --max-time 3 http://127.0.0.1:61080/hello.txt | grep -q "hello from linnea"
 check "upgraded server still serves" $?
 kill $up_master 2>/dev/null
 wait $up_master 2>/dev/null
@@ -2495,16 +2523,16 @@ rm -f /tmp/up_out test/www/up.bin "$LOG"
 # new master exits immediately -- leaving this test signalling a pid that is
 # already gone. Wait for the port to go quiet, then confirm we are up.
 for _ in $(seq 1 40); do
-    (echo > /dev/tcp/127.0.0.1/47080) >/dev/null 2>&1 || break
+    (echo > /dev/tcp/127.0.0.1/61080) >/dev/null 2>&1 || break
     sleep 0.25
 done
 start_server test/configs/listen.json
 burst_master=$SRV_PID
 for _ in $(seq 1 40); do
-    curl -s --max-time 1 http://127.0.0.1:47080/hello.txt -o /dev/null && break
+    curl -s --max-time 1 http://127.0.0.1:61080/hello.txt -o /dev/null && break
     sleep 0.25
 done
-burst_out=$(timeout 60 python3 test/upgrade_burst.py $burst_master 47080 2>&1)
+burst_out=$(timeout 60 python3 test/upgrade_burst.py $burst_master 61080 2>&1)
 burst_rc=$?
 kill $burst_master 2>/dev/null
 wait $burst_master 2>/dev/null
@@ -2517,16 +2545,16 @@ wait $burst_master 2>/dev/null
 # pre-Q177 lost 6-18 per round, every round.
 if [ $burst_rc -ne 0 ]; then
     for _ in $(seq 1 40); do
-        (echo > /dev/tcp/127.0.0.1/47080) >/dev/null 2>&1 || break
+        (echo > /dev/tcp/127.0.0.1/61080) >/dev/null 2>&1 || break
         sleep 0.25
     done
     start_server test/configs/listen.json
     burst_master=$SRV_PID
     for _ in $(seq 1 40); do
-        curl -s --max-time 1 http://127.0.0.1:47080/hello.txt -o /dev/null && break
+        curl -s --max-time 1 http://127.0.0.1:61080/hello.txt -o /dev/null && break
         sleep 0.25
     done
-    burst_out="$burst_out; retry: $(timeout 60 python3 test/upgrade_burst.py $burst_master 47080 2>&1)"
+    burst_out="$burst_out; retry: $(timeout 60 python3 test/upgrade_burst.py $burst_master 61080 2>&1)"
     burst_rc=$?
     kill $burst_master 2>/dev/null
     wait $burst_master 2>/dev/null
@@ -2548,7 +2576,7 @@ if [ -x "$TLSBIN" ] && command -v openssl >/dev/null 2>&1; then
     if openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
             -keyout "$tlsdir/k.pem" -out "$tlsdir/c.pem" -days 1 -nodes \
             -subj /CN=localhost >/dev/null 2>&1; then
-        tport=47443
+        tport=61443
         "$TLSBIN" "$tlsdir/c.pem" "$tlsdir/k.pem" $tport &
         tls_pid=$!
         sleep 0.4
@@ -2710,7 +2738,7 @@ else
     tls_server_pid=$SRV_PID
     sleep 0.3
     CA=test/tls/server.crt
-    U=https://localhost:47443
+    U=https://localhost:61443
 
     resp=$(curl -si --http1.1 --max-time 5 --cacert $CA $U/hello.txt)
     check_http "tls static body"   "hello from linnea" "$resp"
@@ -2747,7 +2775,7 @@ open('test/www/tlsupload.bin','wb').write(bytes(random.getrandbits(8) for _ in r
     check "tls proxy captures a 300000-byte request body (byte-exact)" $?
     rm -f /tmp/tls_upload_echo.bin test/www/tlsupload.bin
 
-    timeout 8 python3 - "$CA" 47443 <<'PYEOF'
+    timeout 8 python3 - "$CA" 61443 <<'PYEOF'
 import ssl, socket, sys
 ctx = ssl.create_default_context(cafile=sys.argv[1])
 with socket.create_connection(("localhost", int(sys.argv[2])), timeout=5) as raw:
@@ -2791,7 +2819,7 @@ PYEOF
     check "h3 not advertised by a redirect vhost (no alt-svc)" $?
 
     # HTTP/3 proxying end to end, against the backend already listening on
-    # 47100. A proxied h3 request has no client socket to answer on: the leg
+    # 61100. A proxied h3 request has no client socket to answer on: the leg
     # borrows a connection slot for its upstream half, captures the response
     # whole, and streams it out of a response-stream slot like a file. Every
     # part of that is checked here — status and body, the target and query, a
@@ -2808,7 +2836,7 @@ PYEOF
     h3p_pid=$SRV_PID
     sleep 0.5
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
-        out=$(timeout 120 python3 test/quic/h3_proxy_test.py 47462 2>&1)
+        out=$(timeout 120 python3 test/quic/h3_proxy_test.py 61462 2>&1)
         [ "$out" = "OK" ]
         check "h3 proxies to an HTTP/1.1 upstream ($out)" $?
 
@@ -2816,7 +2844,7 @@ PYEOF
         # a FIN on a frame carrying no bytes, and contexts left claimed by
         # clients that walked away. Both are consequences of consuming a stream
         # as it arrives, and both were silent — the client simply waited.
-        out=$(timeout 150 python3 test/quic/h3_stream_end_test.py 47462 2>&1)
+        out=$(timeout 150 python3 test/quic/h3_stream_end_test.py 61462 2>&1)
         [ "$out" = "OK" ]
         check "h3 request streams end and are reclaimed ($out)" $?
 
@@ -2833,7 +2861,7 @@ PYEOF
         h3p_worker=$(pgrep -P "$h3p_pid" | head -1)
         fd_deleted() { ls -l /proc/"$1"/fd 2>/dev/null | grep -c '(deleted)'; }
         before=$(fd_deleted "$h3p_worker")
-        timeout 120 python3 test/quic/h3_abandon_upload.py 47462 8 >/dev/null 2>&1
+        timeout 120 python3 test/quic/h3_abandon_upload.py 61462 8 >/dev/null 2>&1
         after=$(fd_deleted "$h3p_worker")
         for _ in $(seq 1 75); do          # the reap runs ~30 s in; leave room
             [ "$after" -le "$before" ] && break
@@ -2849,7 +2877,7 @@ PYEOF
     fi
     # the same path over h2, which has proxied since Q86: the two must agree
     b2=$(curl -s --http2 --max-time 6 --cacert test/tls/server.crt \
-              https://localhost:47462/api/simple)
+              https://localhost:61462/api/simple)
     [ "$b2" = "backend body" ]
     check "h3/h2 agree on the proxied body" $?
 
@@ -2859,7 +2887,7 @@ PYEOF
     # send back for an ordinary reason — so the same answer travelled
     # differently over h1 (which drops it) and h2. Checked by decoding the
     # field block: a substring search finds "te" inside "content-length".
-    timeout 60 python3 test/tls/h2_proxy_hop_by_hop.py test/tls/server.crt 47462 \
+    timeout 60 python3 test/tls/h2_proxy_hop_by_hop.py test/tls/server.crt 61462 \
         >/dev/null 2>&1
     check "h2 does not relay hop-by-hop response fields" $?
 
@@ -2869,7 +2897,7 @@ PYEOF
     # misplacement is silent rather than a parse failure. Both matter more once
     # the buffer starts sliding out from under a stream as it is consumed.
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
-        out=$(timeout 180 python3 test/quic/h3_reorder_body_test.py 47462 2>&1)
+        out=$(timeout 180 python3 test/quic/h3_reorder_body_test.py 61462 2>&1)
         [ "$out" = "OK" ]
         check "h3 request body reassembled out of order and duplicated ($out)" $?
     else
@@ -2884,12 +2912,12 @@ PYEOF
     rm -f "$SEEN"
     code=$(head -c 199000 /dev/zero | tr '\0' 'a' | curl -s -o /dev/null \
            -w '%{http_code}' --http2 --max-time 20 --cacert test/tls/server.crt \
-           -X POST --data-binary @- https://localhost:47462/api/echo)
+           -X POST --data-binary @- https://localhost:61462/api/echo)
     [ "$code" = "200" ]
     check "h2 upload under max_body is served ($code)" $?
     code=$(head -c 400000 /dev/zero | tr '\0' 'b' | curl -s -o /dev/null \
            -w '%{http_code}' --http2 --max-time 20 --cacert test/tls/server.crt \
-           -X POST --data-binary @- https://localhost:47462/api/echo)
+           -X POST --data-binary @- https://localhost:61462/api/echo)
     [ "$code" = "413" ]
     check "h2 upload past max_body is 413 ($code)" $?
     # and the point of a cap: the bytes never land
@@ -2912,7 +2940,7 @@ PYEOF
         start_server test/configs/tls-h3-cancel.json
         h3c_pid=$SRV_PID
         sleep 0.5
-        out=$(timeout 120 python3 test/quic/h3_cancel_test.py 47463 2>&1)
+        out=$(timeout 120 python3 test/quic/h3_cancel_test.py 61463 2>&1)
         [ "$out" = "OK" ]
         check "h3 cancel releases the upstream leg ($out)" $?
         kill $h3c_pid 2>/dev/null
@@ -2925,7 +2953,7 @@ PYEOF
     # read, so an orderly shutdown must not be logged as a recv error.
     curl -s --max-time 5 --cacert $CA $U/hello.txt >/dev/null
     sleep 0.3
-    grep -q "closed connection on 127.0.0.1:47443 .*: peer closed" "$LOG"
+    grep -q "closed connection on 127.0.0.1:61443 .*: peer closed" "$LOG"
     check "tls close_notify logs as peer closed" $?
     ! grep -q "recv error" "$LOG"
     check "tls orderly close is not a recv error" $?
@@ -2937,34 +2965,34 @@ PYEOF
     # connection makes a full request and reads to EOF (-ign_eof), so the
     # post-handshake ticket is received before -sess_out writes it.
     req=$'GET /hello.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
-    printf '%s' "$req" | timeout 5 openssl s_client -connect 127.0.0.1:47443 \
+    printf '%s' "$req" | timeout 5 openssl s_client -connect 127.0.0.1:61443 \
         -CAfile $CA -tls1_3 -ign_eof -sess_out "$LOG.sess" >/dev/null 2>&1
     reused=$(printf '%s' "$req" | timeout 5 openssl s_client \
-        -connect 127.0.0.1:47443 -CAfile $CA -tls1_3 -ign_eof \
+        -connect 127.0.0.1:61443 -CAfile $CA -tls1_3 -ign_eof \
         -sess_in "$LOG.sess" 2>/dev/null | grep -c '^Reused')
     [ "$reused" -eq 1 ]
     check "tls resumption over kTLS (Reused)" $?
     rm -f "$LOG.sess"
 
     # ALPN: since Q86 a proxy location is served over h2 too, so this
-    # server (47443, which has proxy locations) offers h2 like any other.
+    # server (61443, which has proxy locations) offers h2 like any other.
     # Offering nothing gets no ALPN extension back.
-    echo | timeout 5 openssl s_client -connect 127.0.0.1:47443 -CAfile $CA \
+    echo | timeout 5 openssl s_client -connect 127.0.0.1:61443 -CAfile $CA \
         -tls1_3 -alpn h2,http/1.1 2>/dev/null | grep -q "ALPN protocol: h2"
     check "alpn: proxy vhost offers h2 (proxy-over-h2)" $?
 
     # security headers over h2, on static, error and proxied responses
     sec() { timeout 10 curl -s --http2 -D - -o /dev/null --cacert $CA \
-        --resolve localhost:47443:127.0.0.1 "$1"; }
-    h=$(sec "https://localhost:47443/hello.txt")
+        --resolve localhost:61443:127.0.0.1 "$1"; }
+    h=$(sec "https://localhost:61443/hello.txt")
     echo "$h" | grep -qi '^strict-transport-security: max-age=31536000' \
         && echo "$h" | grep -qi '^x-content-type-options: nosniff'
     check "http2 security headers (static)" $?
-    h=$(sec "https://localhost:47443/nope")
+    h=$(sec "https://localhost:61443/nope")
     echo "$h" | grep -qi '^strict-transport-security:' \
         && echo "$h" | grep -qi '^x-content-type-options:'
     check "http2 security headers (404)" $?
-    h=$(sec "https://localhost:47443/api/simple")
+    h=$(sec "https://localhost:61443/api/simple")
     echo "$h" | grep -qi '^strict-transport-security:' \
         && echo "$h" | grep -qi '^x-content-type-options:'
     check "http2 security headers (proxied response)" $?
@@ -2973,7 +3001,7 @@ PYEOF
     # off and, for a directory, put back the slash normalize consumed. Without
     # that, every URL carrying a query and every directory but "/" 404'd on h2.
     q() { timeout 10 curl -s -o /dev/null -w '%{http_code}' --http2 --cacert $CA \
-              --resolve localhost:47443:127.0.0.1 "https://localhost:47443$1"; }
+              --resolve localhost:61443:127.0.0.1 "https://localhost:61443$1"; }
     [ "$(q '/index.html?v=1')" = 200 ] && [ "$(q '/hello.txt?a=b&c=d')" = 200 ]
     check "http2: a query string is not part of the file name" $?
     # (a directory without the trailing slash 404s on h1 too — no redirect)
@@ -2986,8 +3014,8 @@ PYEOF
 
     # --- proxy over HTTP/2 (Q86): each stream runs its own HTTP/1.1 upstream
     # exchange, so the backend still only ever speaks h1 (and WebSocket).
-    h2p() { timeout 10 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 "$@"; }
-    P=https://localhost:47443
+    h2p() { timeout 10 curl -s --http2 --cacert $CA --resolve localhost:61443:127.0.0.1 "$@"; }
+    P=https://localhost:61443
     [ "$(h2p "$P/api/simple")" = "backend body" ]
     check "http2 proxy: counted body relayed" $?
     v=$(h2p -o /dev/null -w '%{http_version}' "$P/api/simple")
@@ -3007,7 +3035,7 @@ PYEOF
     # a stream pool slot that once served a proxied stream keeps its .up unless
     # the static path clears it, which sent the scheduler to the upstream branch
     # and left the file body unsent (200 with an empty body, slot never reaped)
-    sz=$(timeout 15 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+    sz=$(timeout 15 curl -s --http2 --cacert $CA --resolve localhost:61443:127.0.0.1 \
              -o /dev/null -o /dev/null -o /dev/null -o /dev/null \
              -w '%{size_download} ' \
              "$P/api/simple" "$P/index.html" "$P/api/simple" "$P/index.html")
@@ -3016,7 +3044,7 @@ PYEOF
     # request-body bytes are debited from the connection window on arrival and
     # credited only once they go upstream, so a reset mid-upload used to strand
     # them: four ~16KB rounds exhausted the 65535 window for the connection's life
-    python3 test/tls/h2_upload_credit.py $CA 47443 >/dev/null 2>&1
+    python3 test/tls/h2_upload_credit.py $CA 61443 >/dev/null 2>&1
     check "http2: an aborted upload returns its connection flow control" $?
     # tearing an h2 connection down while the other direction still has an op in
     # flight now shuts the socket down and defers the free until it completes,
@@ -3026,11 +3054,11 @@ PYEOF
     fd0=$(ls /proc/$w1/fd 2>/dev/null | wc -l)
     for _ in $(seq 1 30); do
         timeout 5 curl -s --http2 --max-time 0.05 --cacert $CA \
-            --resolve localhost:47443:127.0.0.1 -o /dev/null \
-            "https://localhost:47443/api/big" 2>/dev/null
+            --resolve localhost:61443:127.0.0.1 -o /dev/null \
+            "https://localhost:61443/api/big" 2>/dev/null
         timeout 5 curl -s --http2 --max-time 0.05 --cacert $CA \
-            --resolve localhost:47443:127.0.0.1 -o /dev/null \
-            "https://localhost:47443/big.txt" 2>/dev/null
+            --resolve localhost:61443:127.0.0.1 -o /dev/null \
+            "https://localhost:61443/big.txt" 2>/dev/null
     done
     sleep 3
     fd1=$(ls /proc/$w1/fd 2>/dev/null | wc -l)
@@ -3040,7 +3068,7 @@ PYEOF
     # the rewritten upstream request: Host from :authority, client headers
     # forwarded, Content-Length re-derived, Connection: close ours
     head=$(h2p -H 'X-Probe: abc' "$P/api/headers")
-    echo "$head" | grep -qi '^Host: localhost:47443' \
+    echo "$head" | grep -qi '^Host: localhost:61443' \
         && echo "$head" | grep -qi '^x-probe: abc' \
         && echo "$head" | grep -qi '^Connection: close' \
         && ! echo "$head" | grep -qi '^:'
@@ -3056,14 +3084,14 @@ PYEOF
     [ "$code" = "502" ]
     check "http2 proxy: dead upstream answers 502" $?
     # static and proxied streams multiplexed on ONE connection
-    out=$(timeout 15 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+    out=$(timeout 15 curl -s --http2 --cacert $CA --resolve localhost:61443:127.0.0.1 \
         -w '%{num_connects}\n' -o /dev/null "$P/hello.txt" \
         -w '%{num_connects}\n' -o /dev/null "$P/api/simple" | awk '{t += $1} END {print t}')
     [ "$out" = "1" ]
     check "http2 proxy: static + proxied share one connection" $?
     # several proxied streams in flight at once (the slot pool)
     S=$(mktemp -d)
-    timeout 20 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 --parallel \
+    timeout 20 curl -s --http2 --cacert $CA --resolve localhost:61443:127.0.0.1 --parallel \
         -o "$S/a" "$P/api/simple" -o "$S/b" "$P/api/chunked" \
         -o "$S/c" "$P/api/big" -o "$S/d" "$P/api/eof"
     [ "$(cat "$S/a")" = "backend body" ] && [ "$(cat "$S/b")" = "chunked body" ] \
@@ -3071,7 +3099,7 @@ PYEOF
     check "http2 proxy: four concurrent upstream exchanges" $?
     rm -rf "$S"
     # a page's worth of concurrent API calls (six, the usual browser cap)
-    codes=$(timeout 20 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 --parallel \
+    codes=$(timeout 20 curl -s --http2 --cacert $CA --resolve localhost:61443:127.0.0.1 --parallel \
         -w '%{http_code} ' -o /dev/null "$P/api/simple" -o /dev/null "$P/api/simple" \
         -o /dev/null "$P/api/simple" -o /dev/null "$P/api/simple" \
         -o /dev/null "$P/api/simple" -o /dev/null "$P/api/simple")
@@ -3084,15 +3112,15 @@ import random
 random.seed(13)
 open('test/www/upload2.bin','wb').write(bytes(random.getrandbits(8) for _ in range(300000)))"
 uwant=$(md5sum < test/www/upload2.bin | cut -d' ' -f1)
-timeout 60 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 \
-    --data-binary @test/www/upload2.bin "https://localhost:47443/api/echo" \
+timeout 60 curl -s --http2 --cacert $CA --resolve localhost:61443:127.0.0.1 \
+    --data-binary @test/www/upload2.bin "https://localhost:61443/api/echo" \
     > /tmp/upload2_echo.bin
 [ "$(md5sum < /tmp/upload2_echo.bin | cut -d' ' -f1)" = "$uwant" ]
 check "http2 streams a 300000-byte request body (byte-exact)" $?
 rm -f /tmp/upload2_echo.bin
 # and over TLS HTTP/1.1, where the client pipelines it behind the handshake
-timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:47443:127.0.0.1 \
-    --data-binary @test/www/upload2.bin "https://localhost:47443/api/echo" \
+timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:61443:127.0.0.1 \
+    --data-binary @test/www/upload2.bin "https://localhost:61443/api/echo" \
     > /tmp/upload3_echo.bin
 [ "$(md5sum < /tmp/upload3_echo.bin | cut -d' ' -f1)" = "$uwant" ]
 check "tls http1.1 streams a 300000-byte request body (byte-exact)" $?
@@ -3103,14 +3131,14 @@ rm -f /tmp/upload3_echo.bin
     # keep-alive bookkeeping never sees in_len below head_len — that
     # underflowed into a gigabyte-scale copy off the end of the connection
     # pool, killing the worker.
-    timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+    timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:61443:127.0.0.1 \
         -o /dev/null -w '%{http_code}' --data-binary @test/www/upload2.bin \
-        "https://localhost:47443/api/echo" > /tmp/upl_code.txt
-    timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+        "https://localhost:61443/api/echo" > /tmp/upl_code.txt
+    timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:61443:127.0.0.1 \
         -o /dev/null -w '%{num_connects} %{http_code}' --data-binary @test/www/upload2.bin \
-        "https://localhost:47443/api/echo" --next --http1.1 --cacert $CA \
-        --resolve localhost:47443:127.0.0.1 -o /dev/null \
-        -w ' %{num_connects} %{http_code}' "https://localhost:47443/hello.txt" \
+        "https://localhost:61443/api/echo" --next --http1.1 --cacert $CA \
+        --resolve localhost:61443:127.0.0.1 -o /dev/null \
+        -w ' %{num_connects} %{http_code}' "https://localhost:61443/hello.txt" \
         > /tmp/upl_ka.txt
     [ "$(cat /tmp/upl_ka.txt)" = "1 200 0 200" ]
     check "tls upload: keep-alive survives a streamed body" $?
@@ -3125,7 +3153,7 @@ rm -f /tmp/upload3_echo.bin
     # bodiless requests than there are slots, all on one connection
     args=""
     for i in $(seq 12); do args="$args -I -o /dev/null $P/api/simple"; done
-    codes=$(timeout 20 curl -s --http2 --cacert $CA --resolve localhost:47443:127.0.0.1 \
+    codes=$(timeout 20 curl -s --http2 --cacert $CA --resolve localhost:61443:127.0.0.1 \
         -w '%{http_code}\n' $args)
     [ "$(echo "$codes" | grep -c '^200$')" -eq 12 ]
     check "http2 proxy: bodiless HEAD responses free their slot" $?
@@ -3141,7 +3169,7 @@ rm -f /tmp/upload3_echo.bin
     echo "$hdrs" | grep -qi '^HTTP/2 301' \
         && echo "$hdrs" | grep -qi '^location: https://example.com/old/page.html'
     check "http2 redirect location (301 + Location)" $?
-    echo | timeout 5 openssl s_client -connect 127.0.0.1:47443 -CAfile $CA \
+    echo | timeout 5 openssl s_client -connect 127.0.0.1:61443 -CAfile $CA \
         -tls1_3 2>/dev/null | grep -q "No ALPN negotiated"
     check "alpn absent when not offered" $?
 
@@ -3150,7 +3178,7 @@ rm -f /tmp/upload3_echo.bin
     start_server test/configs/tls-h2.json
     h2_pid=$SRV_PID
     sleep 0.3
-    timeout 10 python3 test/tls/h2_bringup.py $CA 47446 >/dev/null 2>&1
+    timeout 10 python3 test/tls/h2_bringup.py $CA 61446 >/dev/null 2>&1
     check "http2 connection bring-up (preface, settings, ping, goaway)" $?
 
     # M16/M17: a real HTTP/2 client (curl's nghttp2 — genuine HPACK with
@@ -3163,7 +3191,7 @@ rm -f /tmp/upload3_echo.bin
     # cipher list. Six cases, one of them a control that must NOT move, and one
     # (bad_record_mac) read out of a record sealed under the server's handshake
     # key. 5 of the 6 report the wrong code before the fix.
-    timeout 60 python3 test/tls/alert_codes.py 47446 >/dev/null 2>&1
+    timeout 60 python3 test/tls/alert_codes.py 61446 >/dev/null 2>&1
     check "tls alert codes name the actual fault (tls-8, tls-9)" $?
 
     # RFC 8446 7.4.2 MUST: a low-order X25519 key share drives the ECDHE
@@ -3173,7 +3201,7 @@ rm -f /tmp/upload3_echo.bin
     # the non-canonical encodings p, p+1 and p-1 — which is why the check is on
     # the computed secret and not a blocklist of inputs. Every one of them was
     # accepted before the check existed.
-    timeout 60 python3 test/tls/low_order_share.py 127.0.0.1 47446 >/dev/null 2>&1
+    timeout 60 python3 test/tls/low_order_share.py 127.0.0.1 61446 >/dev/null 2>&1
     check "a low-order x25519 share is refused, not keyed from (RFC 8446 7.4.2)" $?
 
     # linnea-probe is a SHIPPED product whose purpose is pointing at servers
@@ -3205,14 +3233,14 @@ rm -f /tmp/upload3_echo.bin
     #     generation twice would still serve the second request. Hence two.
     ku_req() { printf 'GET /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n'; }
     ku_n=$({ ku_req; sleep 0.6; sleep 0.6; ku_req; sleep 1; } | timeout 15 \
-        openssl s_client -connect 127.0.0.1:47446 -alpn http/1.1 2>/dev/null \
+        openssl s_client -connect 127.0.0.1:61446 -alpn http/1.1 2>/dev/null \
         | grep -c '^HTTP/1.1')
     [ "$ku_n" = "2" ]
     check "tls control: two requests on one kTLS connection" $?
 
     ku_n=$({ ku_req; sleep 0.6; echo k; sleep 0.6; ku_req; sleep 0.6; echo k; \
              sleep 0.6; ku_req; sleep 1; } | timeout 20 \
-        openssl s_client -connect 127.0.0.1:47446 -alpn http/1.1 2>/dev/null \
+        openssl s_client -connect 127.0.0.1:61446 -alpn http/1.1 2>/dev/null \
         | grep -c '^HTTP/1.1')
     [ "$ku_n" = "3" ]
     check "tls survives two mid-connection KeyUpdates (kTLS rekey)" $?
@@ -3223,7 +3251,7 @@ rm -f /tmp/upload3_echo.bin
     # prove our sending secret advances as well as our receiving one.
     ku_n=$({ ku_req; sleep 0.6; echo K; sleep 0.6; ku_req; sleep 0.6; echo K; \
              sleep 0.6; ku_req; sleep 1; } | timeout 25 \
-        openssl s_client -connect 127.0.0.1:47446 -alpn http/1.1 2>/dev/null \
+        openssl s_client -connect 127.0.0.1:61446 -alpn http/1.1 2>/dev/null \
         | grep -c '^HTTP/1.1')
     [ "$ku_n" = "3" ]
     check "tls answers an update_requested KeyUpdate (both directions rekey)" $?
@@ -3231,7 +3259,7 @@ rm -f /tmp/upload3_echo.bin
     # the KeyUpdate must be OURS, on the wire, not merely survived: -msg prints
     # both directions, so two lines mean the peer's and the answer to it
     ku_m=$({ ku_req; sleep 0.6; echo K; sleep 0.6; ku_req; sleep 1; } | timeout 20 \
-        openssl s_client -connect 127.0.0.1:47446 -alpn http/1.1 -msg 2>&1 \
+        openssl s_client -connect 127.0.0.1:61446 -alpn http/1.1 -msg 2>&1 \
         | grep -ac 'KeyUpdate')
     [ "$ku_m" = "2" ]
     check "tls sends its own KeyUpdate in answer ($ku_m records)" $?
@@ -3242,13 +3270,13 @@ rm -f /tmp/upload3_echo.bin
     # so it waits for the socket to go quiet. Both responses must still arrive.
     ku_out=$({ printf 'GET /h3s11.bin HTTP/1.1\r\nHost: localhost\r\n\r\n'; \
                sleep 0.03; echo K; sleep 3; ku_req; sleep 2; } | timeout 30 \
-        openssl s_client -connect 127.0.0.1:47446 -alpn http/1.1 2>/dev/null \
+        openssl s_client -connect 127.0.0.1:61446 -alpn http/1.1 2>/dev/null \
         | grep -ac -e 'Content-Length: 690000' -e 'hello from linnea')
     [ "$ku_out" = "2" ]
     check "tls KeyUpdate mid-stream: the response and the next request survive" $?
 
-    rl="--resolve localhost:47446:127.0.0.1"
-    u="https://localhost:47446"
+    rl="--resolve localhost:61446:127.0.0.1"
+    u="https://localhost:61446"
     body=$(curl -s --http2 --cacert $CA $rl "$u/hello.txt")
     [ "$body" = "hello from linnea" ]
     check "http2 serves a static file (HPACK decode -> file)" $?
@@ -3461,14 +3489,14 @@ PY
 
     # M18: multiplexing — concurrent streams with interleaved DATA, the
     # rapid-reset (CVE-2023-44487) defense, and stream-pool exhaustion.
-    timeout 30 python3 test/tls/h2_multiplex.py $CA 47446 >/dev/null 2>&1
+    timeout 30 python3 test/tls/h2_multiplex.py $CA 61446 >/dev/null 2>&1
     check "http2 multiplexing (concurrent streams, rapid-reset, pool cap)" $?
 
     # RFC 9218 scheduling, the same policy h3's pump applies: the default
     # priority is NON-incremental, so concurrent responses complete one at a
     # time in arrival order; u=0 jumps the queue; i opts back in to sharing the
     # window. h2 parsed the priority field and then ignored it entirely.
-    timeout 200 python3 test/tls/h2_priority.py $CA 47446 >/dev/null 2>&1
+    timeout 200 python3 test/tls/h2_priority.py $CA 61446 >/dev/null 2>&1
     check "http2 responses scheduled by RFC 9218 priority" $?
 
     # M19: fuzz the frame layer and HPACK decoder — malformed streams must
@@ -3478,14 +3506,14 @@ PY
     # early, so the client waits out its own timeout on more cases. The run is
     # slower by design — it measures ~80s — and a crash still shows as a
     # non-zero exit rather than as the timeout.
-    timeout 150 python3 test/tls/fuzz_h2.py $CA 47446 120 >/dev/null 2>&1
+    timeout 150 python3 test/tls/fuzz_h2.py $CA 61446 120 >/dev/null 2>&1
     check "http2 fuzz (malformed frames + HPACK survive, server serves)" $?
 
     # M20: strict stream-id validation + honouring SETTINGS_INITIAL_WINDOW_SIZE.
     # A connection error must carry the code RFC 9113 names for it. Every fault
     # reported PROTOCOL_ERROR, because the reason was never threaded through to
     # the single site that writes the GOAWAY.
-    timeout 30 python3 test/tls/h2_error_codes.py $CA 47446 >/dev/null 2>&1
+    timeout 30 python3 test/tls/h2_error_codes.py $CA 61446 >/dev/null 2>&1
     check "http2 connection errors carry the RFC's code" $?
 
     # RFC 9113 8.1.1: content-length must equal the sum of the DATA payloads.
@@ -3493,10 +3521,10 @@ PY
     # noticed at all — the request sat holding an upstream slot until the body
     # clock timed it out, reporting a timeout for a framing fault visible at
     # once. Runs against the proxy vhost, which is where bodies go.
-    timeout 60 python3 test/tls/h2_content_length.py $CA 47443 >/dev/null 2>&1
+    timeout 60 python3 test/tls/h2_content_length.py $CA 61443 >/dev/null 2>&1
     check "http2 content-length is reconciled with the DATA sent" $?
 
-    timeout 20 python3 test/tls/h2_conformance.py $CA 47446 >/dev/null 2>&1
+    timeout 20 python3 test/tls/h2_conformance.py $CA 61446 >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
 
     # A biggish cookie load (4.8 KB) fits the Q121 limits and must be SERVED —
@@ -3504,20 +3532,20 @@ PY
     # and certainly not by killing the connection (the pre-Q121 behaviour).
     bigck=$(python3 -c "print('a'*4800)")
     code=$(timeout 10 curl -s -o /dev/null -w '%{http_code}' --http2 --cacert $CA \
-        --resolve localhost:47446:127.0.0.1 -H "Cookie: $bigck" \
-        https://localhost:47446/hello.txt 2>/dev/null)
+        --resolve localhost:61446:127.0.0.1 -H "Cookie: $bigck" \
+        https://localhost:61446/hello.txt 2>/dev/null)
     [ "$code" = 200 ]
     check "http2 big-but-legal cookie served (fits the raised limits)" $?
 
     # Q121: an oversized header block answers the stream 431 (the connection
     # survives and keeps serving), and SETTINGS advertises the real
     # MAX_HEADER_LIST_SIZE so clients can trim before hitting it.
-    timeout 30 python3 test/tls/h2_big_headers.py $CA 47446 >/dev/null 2>&1
+    timeout 30 python3 test/tls/h2_big_headers.py $CA 61446 >/dev/null 2>&1
     check "http2 oversized header block: stream 431, connection survives" $?
 
     # wrong-length PING / WINDOW_UPDATE are a connection error, not an over-read
     # (a zero-length PING used to echo 8 stale in_buf bytes to the peer)
-    timeout 20 python3 test/tls/h2_frame_size.py $CA 47446 >/dev/null 2>&1
+    timeout 20 python3 test/tls/h2_frame_size.py $CA 61446 >/dev/null 2>&1
     check "http2 control-frame size validated (no PING over-read/echo)" $?
 
     kill $h2_pid 2>/dev/null
@@ -3538,12 +3566,12 @@ PY
     # worth chasing is still the same one: on failure ask the same server for
     # an ordinary page — if that answers, the server is healthy and the 2s
     # reply deadline was simply missed; if it does not, a worker is wedged.
-    timeout 30 python3 test/tls/oversized_record.py $CA 47443 \
+    timeout 30 python3 test/tls/oversized_record.py $CA 61443 \
         test/tls/clienthello_seed.bin >/dev/null 2>&1
     ovr_rc=$?
     if [ $ovr_rc -ne 0 ]; then
         ovr_probe=$(timeout 5 curl -s -o /dev/null -w '%{http_code}' --cacert $CA \
-            --resolve localhost:47443:127.0.0.1 https://localhost:47443/hello.txt 2>&1)
+            --resolve localhost:61443:127.0.0.1 https://localhost:61443/hello.txt 2>&1)
         echo "  (oversized-record failed; the same server answers /hello.txt with: ${ovr_probe:-nothing})"
     fi
     [ $ovr_rc -eq 0 ]
@@ -3553,18 +3581,18 @@ PY
     # handshake message is a byte stream carried by records, so a client may
     # fragment it at will — and one over 2^14 bytes has no choice. Every
     # fragmented hello used to draw a fatal alert.
-    timeout 60 python3 test/tls/fragmented_ch.py 47443 >/dev/null 2>&1
+    timeout 60 python3 test/tls/fragmented_ch.py 61443 >/dev/null 2>&1
     check "tls fragmented ClientHello completes the handshake" $?
 
     # Records pipelined behind the Finished, including one split the way an
     # MSS boundary would split it — the case loopback never produces.
-    timeout 40 python3 test/tls/pipelined_early.py $CA 47443 >/dev/null 2>&1
+    timeout 40 python3 test/tls/pipelined_early.py $CA 61443 >/dev/null 2>&1
     check "tls pipelined early records (whole and split)" $?
 
     # A tunnelled upgrade over TLS: the tunnel has its own recv path, so it
     # needs the close_notify handling too, and the relay must stay blind to
     # the fact that the kernel is encrypting underneath it.
-    timeout 10 python3 - "$CA" 47443 <<'PYEOF' >/dev/null 2>&1
+    timeout 10 python3 - "$CA" 61443 <<'PYEOF' >/dev/null 2>&1
 import base64, os, socket, ssl, sys
 ctx = ssl.create_default_context(cafile=sys.argv[1])
 raw = socket.create_connection(("localhost", int(sys.argv[2])), timeout=5)
@@ -3589,7 +3617,7 @@ PYEOF
     # is live and in flight (h2p_kill closing it with a syscall), and RST on
     # stream 0 (a connection error, not a lookup that re-frees a reaped slot).
     prst_before=$(workers_of $tls_server_pid)
-    timeout 60 python3 test/tls/h2_proxy_rst.py $CA 47443 >/dev/null 2>&1
+    timeout 60 python3 test/tls/h2_proxy_rst.py $CA 61443 >/dev/null 2>&1
     sleep 0.5
     resp=$(curl -si --http2 --max-time 5 --cacert $CA $U/hello.txt)
     prst_after=$(workers_of $tls_server_pid)
@@ -3601,7 +3629,7 @@ PYEOF
     # a Host contradicting it, a misplaced pseudo-header or a missing
     # authority must fail THAT STREAM (the connection keeps serving), while
     # a Host standing in for :authority still works.
-    timeout 90 python3 test/tls/h2_authority.py $CA 47443 >/dev/null 2>&1
+    timeout 90 python3 test/tls/h2_authority.py $CA 61443 >/dev/null 2>&1
     check "http2 authority rules (stream errors, connection survives)" $?
 
     # RFC 9113 5.1.1: a client's stream id is odd and above the floor, and
@@ -3610,27 +3638,27 @@ PYEOF
     # stream reset and stamped the floor with an even number. The last case
     # guards the other side: a malformed request on a VALID id must still fail
     # only its stream.
-    timeout 60 python3 test/tls/h2_stream_id.py $CA 47443 >/dev/null 2>&1
+    timeout 60 python3 test/tls/h2_stream_id.py $CA 61443 >/dev/null 2>&1
     check "http2 stream-id rules are connection errors" $?
 
     # A GOAWAY must name the highest stream we might have acted on (RFC 9113 6.8).
     # Every error GOAWAY said 0 — "nothing was processed" — so a client would
     # retry everything in flight, including a proxied POST already executed.
-    timeout 60 python3 test/tls/h2_goaway_last_stream.py $CA 47443 >/dev/null 2>&1
+    timeout 60 python3 test/tls/h2_goaway_last_stream.py $CA 61443 >/dev/null 2>&1
     check "http2 GOAWAY names the last processed stream" $?
 
     # Inline error bodies are flow-controlled too (RFC 9113 6.9.1). They were
     # written straight at the out cursor and charged against nothing, so a peer
     # advertising a zero window was sent one anyway, and the server's idea of the
     # connection window drifted above the peer's by every error body it had sent.
-    timeout 120 python3 test/tls/h2_error_flow_control.py $CA 47443 >/dev/null 2>&1
+    timeout 120 python3 test/tls/h2_error_flow_control.py $CA 61443 >/dev/null 2>&1
     check "http2 error bodies respect the flow-control window" $?
 
     # Request-field rules the shared HPACK/QPACK decoder enforces: :scheme must
     # be present, :path must not be empty, connection-specific fields are
     # malformed (TE only for "trailers"), a space may not sit in a field name and
     # a value may not begin or end with whitespace (RFC 9113 8.2-8.3).
-    timeout 60 python3 test/tls/h2_field_rules.py $CA 47443 >/dev/null 2>&1
+    timeout 60 python3 test/tls/h2_field_rules.py $CA 61443 >/dev/null 2>&1
     check "http2 request field rules" $?
 
     # A trailer section is allowed (RFC 9113 8.1) and used to draw a GOAWAY: its
@@ -3638,14 +3666,14 @@ PYEOF
     # broken numbering, taking every concurrent stream down with it. The last
     # case checks the subtle half — the trailer's fields are decoded even though
     # unused, or HPACK's connection-wide table falls out of step.
-    timeout 60 python3 test/tls/h2_trailers.py $CA 47443 >/dev/null 2>&1
+    timeout 60 python3 test/tls/h2_trailers.py $CA 61443 >/dev/null 2>&1
     check "http2 trailer sections do not kill the connection" $?
 
     # Every TLS connection must end with close_notify (RFC 8446 6.1) or the peer
     # cannot tell a finished response from a cut one. The alert may only be
     # written where no other send is outstanding, so the cases after a large
     # response and after h2 traffic are the ones that matter.
-    timeout 90 python3 test/tls/close_notify.py $CA 47443 >/dev/null 2>&1
+    timeout 90 python3 test/tls/close_notify.py $CA 61443 >/dev/null 2>&1
     check "tls connections end with close_notify" $?
 
 
@@ -3655,28 +3683,28 @@ PYEOF
     # the peer's, and a later request referencing a dynamic index then decoded
     # against the wrong entry — the probe sees a 'range' header from the
     # rejected request applied to a later one, turning its 200 into a 206.
-    timeout 30 python3 test/tls/hpack_sync.py $CA 47443 >/dev/null 2>&1
+    timeout 30 python3 test/tls/hpack_sync.py $CA 61443 >/dev/null 2>&1
     check "http2 HPACK table stays in sync across a rejected block" $?
 
     # ...and across the arena's wrap. The arena was a bump allocator that
     # reclaimed only when the table emptied, so an entry landing at the end was
     # silently not stored while the peer DID store it — leaving our table an
     # entry behind and every later dynamic index resolving to the wrong header.
-    timeout 240 python3 test/tls/hpack_arena.py $CA 47443 >/dev/null 2>&1
+    timeout 240 python3 test/tls/hpack_arena.py $CA 61443 >/dev/null 2>&1
     check "http2 HPACK entries survive the arena wrapping" $?
 
     # We advertise HEADER_TABLE_SIZE 4096, so the table is load-bearing for real
     # traffic rather than dead state: this drives eviction from "drop one" to
     # "drop everything", the entry-slot ceiling, size updates down to 0 and back,
     # and reads back a marker by dynamic index after every phase.
-    timeout 400 python3 test/tls/hpack_stress.py $CA 47443 >/dev/null 2>&1
+    timeout 400 python3 test/tls/hpack_stress.py $CA 61443 >/dev/null 2>&1
     check "http2 HPACK dynamic table under sustained use" $?
 
     # Q130: h2/h3 read a SEPARATE mime table from h1's, so the types are
     # checked here too — a type added to one table only is the easy mistake.
     printf 'x' > test/www/probe.wasm
     ct=$(timeout 10 curl -s -D - -o /dev/null --http2 --cacert $CA \
-        --resolve localhost:47443:127.0.0.1 https://localhost:47443/probe.wasm \
+        --resolve localhost:61443:127.0.0.1 https://localhost:61443/probe.wasm \
         | grep -i '^content-type' | tr -d '\r')
     printf '%s' "$ct" | grep -qF "application/wasm"
     check "http2 mime table has the same types (.wasm)" $?
@@ -3684,14 +3712,14 @@ PYEOF
     # RFC 9110 15.5.6: a 405 must name what the resource does take. h1 always
     # sent Allow; h2 sent none, so a client could not tell what to retry with.
     al=$(timeout 10 curl -si --http2 --cacert $CA \
-        --resolve localhost:47443:127.0.0.1 -X PROPFIND \
-        https://localhost:47443/hello.txt | tr -d '\r')
+        --resolve localhost:61443:127.0.0.1 -X PROPFIND \
+        https://localhost:61443/hello.txt | tr -d '\r')
     printf '%s' "$al" | grep -q "405" && printf '%s' "$al" | grep -qi "^allow: GET, HEAD"
     check "http2 405 carries Allow: GET, HEAD" $?
     # and nothing else claims to: a 200 and a 404 carry no allow
     for u in /hello.txt /nope.txt; do
         n=$(timeout 10 curl -si --http2 --cacert $CA \
-            --resolve localhost:47443:127.0.0.1 https://localhost:47443$u \
+            --resolve localhost:61443:127.0.0.1 https://localhost:61443$u \
             | tr -d '\r' | grep -ci "^allow:")
         [ "$n" -eq 0 ]
         check "http2 no Allow on a normal response ($u)" $?
@@ -3712,7 +3740,7 @@ PYEOF
     # h2-14: a GOAWAY from the client announces it will open no NEW streams; the
     # ones already running still have to be finished (RFC 9113 6.8). Closing on
     # receipt threw away a response that was already in flight.
-    timeout 30 python3 test/tls/h2_goaway_inflight.py $CA 47443 >/dev/null 2>&1
+    timeout 30 python3 test/tls/h2_goaway_inflight.py $CA 61443 >/dev/null 2>&1
     check "http2 client GOAWAY still finishes the in-flight response" $?
 
     # h2-16 receive-window accounting: a request body costs the client both its
@@ -3745,7 +3773,7 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     start_server test/configs/tls-slowbody.json
     slowbody_pid=$SRV_PID
     sleep 0.3
-    timeout 60 python3 test/tls/slow_body.py $CA 47457 >/dev/null 2>&1
+    timeout 60 python3 test/tls/slow_body.py $CA 61457 >/dev/null 2>&1
     check "request-body slowloris cut on h1 and h2; honest uploads untouched" $?
     kill $slowbody_pid 2>/dev/null
     wait $slowbody_pid 2>/dev/null
@@ -3755,23 +3783,23 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     wait $tls_backend_pid 2>/dev/null
     rm -f "$LOG" test/www/big.txt
 
-    # --- SNI: two TLS vhosts share 127.0.0.1:47444, each with its own cert
+    # --- SNI: two TLS vhosts share 127.0.0.1:61444, each with its own cert
     start_server test/configs/tls-sni.json
     sni_server_pid=$SRV_PID
     sleep 0.3
-    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 \
+    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:61444 \
         -servername sni.test 2>/dev/null | openssl x509 -noout -subject)
     echo "$subj" | grep -q "CN=sni.test"
     check "sni selects the named vhost cert" $?
-    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 \
+    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:61444 \
         -servername localhost 2>/dev/null | openssl x509 -noout -subject)
     echo "$subj" | grep -q "CN=localhost"
     check "sni selects the owner cert by name" $?
-    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 \
+    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:61444 \
         -noservername 2>/dev/null | openssl x509 -noout -subject)
     echo "$subj" | grep -q "CN=localhost"
     check "no sni falls back to the listener owner" $?
-    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 \
+    subj=$(echo | timeout 5 openssl s_client -connect 127.0.0.1:61444 \
         -servername unknown.test 2>/dev/null | openssl x509 -noout -subject)
     echo "$subj" | grep -q "CN=localhost"
     check "unknown sni falls back to the listener owner" $?
@@ -3779,20 +3807,20 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     # vhosts, and the ClientHello SNI selects the certificate (before this, h3 always
     # served the first vhost's cert, so a second name got the wrong one).
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
-        python3 test/quic/h3_sni_cert_test.py 47444 sni.test sni.test >/dev/null 2>&1
+        python3 test/quic/h3_sni_cert_test.py 61444 sni.test sni.test >/dev/null 2>&1
         check "h3 sni selects the named vhost cert" $?
-        python3 test/quic/h3_sni_cert_test.py 47444 localhost localhost >/dev/null 2>&1
+        python3 test/quic/h3_sni_cert_test.py 61444 localhost localhost >/dev/null 2>&1
         check "h3 sni selects the owner cert by name" $?
     fi
     # every h3 vhost advertises Alt-Svc, not only the socket owner, so each origin
     # tells its own clients they can switch to h3 (a non-owner vhost is checked).
     curl -s -D - -o /dev/null --http2 --cacert test/tls/sni.crt \
-        --resolve sni.test:47444:127.0.0.1 https://sni.test:47444/page.html \
+        --resolve sni.test:61444:127.0.0.1 https://sni.test:61444/page.html \
         | grep -qi 'alt-svc: h3='
     check "h3 alt-svc advertised by a non-owner vhost" $?
     # h2 is on by default (tls-sni.json sets no "http2" key): a static vhost
     # negotiates h2.
-    echo | timeout 5 openssl s_client -connect 127.0.0.1:47444 -CAfile test/tls/sni.crt \
+    echo | timeout 5 openssl s_client -connect 127.0.0.1:61444 -CAfile test/tls/sni.crt \
         -servername sni.test -tls1_3 -alpn h2,http/1.1 2>/dev/null \
         | grep -q "ALPN protocol: h2"
     check "alpn: h2 on by default (static vhost)" $?
@@ -3801,7 +3829,7 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     # holds page.html; the listener owner does not). h2 is on by default now,
     # so this also exercises SNI vhost routing over HTTP/2.
     resp=$(curl -s --max-time 5 --cacert test/tls/sni.crt \
-        --resolve sni.test:47444:127.0.0.1 https://sni.test:47444/page.html)
+        --resolve sni.test:61444:127.0.0.1 https://sni.test:61444/page.html)
     check_http "sni end to end (cert + vhost routing)" "subdirectory page" "$resp"
 
     # Q126: h2 answers only for names the certificate it presented covers —
@@ -3815,7 +3843,7 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     coal_h2_pid=$SRV_PID
     sleep 0.4
     md_before=$(workers_of $sni_server_pid)
-    timeout 60 python3 test/tls/h2_misdirected.py $CA 47444 47459 >/dev/null 2>&1
+    timeout 60 python3 test/tls/h2_misdirected.py $CA 61444 61459 >/dev/null 2>&1
     md_rc=$?
     md_after=$(workers_of $sni_server_pid)
     [ "$md_rc" -eq 0 ] && [ -n "$md_before" ] && [ "$md_before" = "$md_after" ]
@@ -3827,7 +3855,7 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     # chose, and answers a name this connection's certificate does not cover
     # with 421 rather than the other vhost's page.
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
-        timeout 90 python3 test/quic/h3_authority_test.py 47444 >/dev/null 2>&1
+        timeout 90 python3 test/quic/h3_authority_test.py 61444 >/dev/null 2>&1
         check "h3 authority selects the vhost; cross-cert gets 421" $?
     else
         check "h3 authority test (skipped: deps unavailable)" 0
@@ -3841,7 +3869,7 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
         start_server test/configs/tls-coalesce.json
         coal_pid=$SRV_PID
         sleep 0.4
-        timeout 60 python3 test/quic/h3_coalesce_test.py 47459 >/dev/null 2>&1
+        timeout 60 python3 test/quic/h3_coalesce_test.py 61459 >/dev/null 2>&1
         check "h3 coalescing: one cert, two vhosts, one connection" $?
         kill $coal_pid 2>/dev/null
         wait $coal_pid 2>/dev/null
@@ -3864,7 +3892,7 @@ cat > $emf <<EOF
   "log": "$LOG",
   "timeout": 30, "head_timeout": 30, "workers": 1,
   "max_connections": 1024, "max_per_ip": 4096,
-  "servers": [ { "host": "127.0.0.1", "port": 47671, "hostname": "localhost",
+  "servers": [ { "host": "127.0.0.1", "port": 61671, "hostname": "localhost",
       "locations": [ { "prefix": "/", "root": "test/www" } ] } ]
 }
 EOF
@@ -3881,7 +3909,7 @@ import socket, time
 socks = []
 for _ in range(200):
     try:
-        socks.append(socket.create_connection(("127.0.0.1", 47671), timeout=2))
+        socks.append(socket.create_connection(("127.0.0.1", 61671), timeout=2))
     except OSError:
         pass
 time.sleep(6)
@@ -3904,7 +3932,7 @@ sleep 1
 lines=$(wc -l < test/emfile.err)
 [ "$ticks" -ge 0 ] && [ "$ticks" -lt 100 ] && [ "$lines" -lt 1000 ] \
     && [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-            http://127.0.0.1:47671/hello.txt)" = 200 ]
+            http://127.0.0.1:61671/hello.txt)" = 200 ]
 check "accept: a standing EMFILE backs off instead of spinning (${ticks} ticks, ${lines} log lines)" $?
 kill $emf_pid 2>/dev/null
 wait $emf_pid 2>/dev/null
