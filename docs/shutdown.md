@@ -72,6 +72,15 @@ reporting the original "active since", and briefly show more tasks than usual
 while the old generation drains. If the PID *has* changed and "active since"
 has reset, what happened was a restart, not an upgrade — see below.
 
+**A reload re-reads the certificates.** They are loaded once at startup, so
+replacing the files under a running server changes nothing until it re-execs
+— and then the new chain is served immediately. Verified by swapping a cert
+under a live server: unchanged after the copy, the new subject after the
+SIGUSR2, master intact throughout. This is why certbot's deploy hook
+(`config/certbot-deploy-hook.sh`) reloads rather than restarts: a renewal
+does not alter the listener set, so the upgrade is a hot one and no
+connection is dropped to pick up a new certificate.
+
 ### When a reload cannot be hot
 
 The upgrade hands the listening sockets to the new binary, which matches them
