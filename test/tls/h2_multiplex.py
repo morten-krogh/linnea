@@ -58,6 +58,26 @@ def rd(s):
     return h[3], h[4], int.from_bytes(h[5:9], "big") & 0x7fffffff, p
 
 
+def advertised_max_streams(s):
+    """Read SETTINGS_MAX_CONCURRENT_STREAMS off the server's own SETTINGS.
+
+    Taken from the wire rather than written here: this test used to assert a
+    literal 16, so raising the pool turned a passing check into a failing one
+    that was testing nothing but the old number. Asking the server means the
+    ceiling and the test move together.
+    """
+    for _ in range(10):
+        r = rd(s)
+        if r is None:
+            break
+        if r[0] == 4 and not (r[1] & 0x01):        # SETTINGS, not the ACK
+            for i in range(0, len(r[3]), 6):
+                k, v = struct.unpack(">HI", r[3][i:i + 6])
+                if k == 3:
+                    return v
+    raise AssertionError("server never sent MAX_CONCURRENT_STREAMS")
+
+
 def test_concurrent():
     s = connect()
     ids = list(range(1, 13, 2))         # 6 concurrent streams
@@ -113,8 +133,9 @@ def test_rapid_reset():
 
 def test_pool_exhaustion():
     s = connect()
+    limit = advertised_max_streams(s)
     s.sendall(fr(8, 0, 0, struct.pack(">I", 1 << 30)))
-    n = 22
+    n = limit + 6                       # comfortably over, whatever the limit is
     for i in range(n):
         s.sendall(fr(1, 0x05, 1 + 2 * i, req("/big.txt")))
     served, refused = set(), 0
@@ -131,8 +152,13 @@ def test_pool_exhaustion():
     except socket.timeout:
         pass
     s.close()
-    assert len(served) <= 16, "served more than the advertised limit: %d" % len(served)
+    assert len(served) <= limit, ("served %d, more than the advertised limit of %d"
+                                  % (len(served), limit))
     assert refused >= 1, "excess streams were not refused"
+    # and the pool really does go as wide as it claims — advertising a ceiling
+    # the server cannot reach would be worse than the low one it replaced
+    assert len(served) >= limit - 2, ("only %d of an advertised %d streams were "
+                                      "served" % (len(served), limit))
 
 
 test_concurrent()

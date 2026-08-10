@@ -60,8 +60,24 @@ LINNEA_H2_MAX_FRAME    equ 16384    ; DATA payload we cap each frame at
 ; decoded (they are small); only a body that must stream as DATA holds a slot,
 ; so a slot is pure body-send bookkeeping. A round-robin scheduler emits one
 ; DATA frame per send, interleaving streams at frame granularity.
-LINNEA_H2_MAX_STREAMS  equ 16       ; concurrent streaming bodies (= advertised
-                                    ; SETTINGS_MAX_CONCURRENT_STREAMS)
+; Concurrent streaming bodies, and what we advertise as
+; SETTINGS_MAX_CONCURRENT_STREAMS — the two are the same number by
+; construction (see h2_settings_be32 below), because a server that advertises
+; more than it can hold invites REFUSED_STREAM and one that advertises less
+; makes the client queue for nothing.
+;
+; RFC 9113 6.5.2 recommends no smaller than 100 "so as not to unnecessarily
+; limit parallelism", and 16 was below that: the site's own page asks for 14
+; sub-resources at once, so the video's Range requests queued behind the
+; gallery and Firefox showed them Blocked. 64 is four times what the page
+; needs while leaving most of up_buf, which the pool is overlaid on, unclaimed.
+; The rapid-reset budget below is rate-based and does not scale with this, so
+; raising it does not widen CVE-2023-44487.
+LINNEA_H2_MAX_STREAMS  equ 64
+; ...as a big-endian u32 for the SETTINGS frame, so the wire value cannot
+; drift from the pool size.
+%define LINNEA_H2_BE32(x) ((((x) & 0xff) << 24) | ((((x) >> 8) & 0xff) << 16) | \
+                           ((((x) >> 16) & 0xff) << 8) | (((x) >> 24) & 0xff))
 LINNEA_H2_RST_LIMIT    equ 200      ; RST_STREAMs before GOAWAY (rapid-reset,
                                     ; CVE-2023-44487)
 

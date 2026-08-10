@@ -147,11 +147,12 @@ linnea_h2_init:
     mov byte [rax + 9], 0
     mov byte [rax + 10], LINNEA_H2_SETTINGS_HEADER_TABLE_SIZE
     mov dword [rax + 11], 0x00100000    ; value 4096, big-endian
-    ; MAX_CONCURRENT_STREAMS = LINNEA_H2_MAX_STREAMS (16): the size of our
-    ; per-connection body-streaming pool.
+    ; MAX_CONCURRENT_STREAMS: the size of our per-connection body-streaming
+    ; pool, derived from the constant rather than restated, so the number on
+    ; the wire is the number of slots we actually have.
     mov byte [rax + 15], 0
     mov byte [rax + 16], LINNEA_H2_SETTINGS_MAX_CONCURRENT_STREAMS
-    mov dword [rax + 17], 0x10000000    ; value 16, big-endian
+    mov dword [rax + 17], LINNEA_H2_BE32(LINNEA_H2_MAX_STREAMS)
     ; MAX_HEADER_LIST_SIZE = the decoder's real list bound, so a conforming
     ; client trims its cookies instead of discovering the limit as a 431.
     mov byte [rax + 21], 0
