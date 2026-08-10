@@ -69,7 +69,39 @@ no configuration-only reload.
 
 The main PID does not change across a reload. `systemctl status` will keep
 reporting the original "active since", and briefly show more tasks than usual
-while the old generation drains.
+while the old generation drains. If the PID *has* changed and "active since"
+has reset, what happened was a restart, not an upgrade — see below.
+
+### When a reload cannot be hot
+
+The upgrade hands the listening sockets to the new binary, which matches them
+against the servers in the configuration. That only works while the set of
+servers is unchanged. **Add or remove a server and the re-exec'd binary
+refuses the handover and exits:**
+
+```
+linnea: hot upgrade needs an unchanged listener set; use restart
+```
+
+The old image is already gone by then — the check happens after the re-exec,
+which is the point of no return — so there is nothing left to keep serving.
+`Restart=on-failure` in the unit brings the server back within a second, but
+as a **restart**: every connection is dropped, the main PID changes, and the
+log shows a fresh `listening on …` rather than `adopted listener …`. The
+refusal itself goes to stderr, so it lands in the journal and **not** in the
+access log, which makes this look unexplained if you only read the log.
+
+So: **use `systemctl restart` when adding or removing a server**, and reload
+for everything else — values inside an existing server, locations, globals,
+and a new binary.
+
+Telling the two apart afterwards, in the log:
+
+| A hot upgrade | A refused one |
+|---|---|
+| `adopted listener 0.0.0.0:443 (…)` | `listening on 0.0.0.0:443 (…)` |
+| `binary upgrade complete: new workers up, draining old` | *(absent)* |
+| old workers log `worker draining` / `worker drained` | they log `worker stopping: connections dropped` — the master died and PDEATHSIG reached them |
 
 ## What the log tells you
 

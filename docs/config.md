@@ -240,6 +240,16 @@ the configuration is bad, leaving the old generation serving**. So a typo
 cannot take the site down. It picks up a new binary at the same time, since it
 re-execs — there is no config-only reload.
 
+> **Adding or removing a server needs a restart, not a reload.** A hot upgrade
+> hands the listening sockets to the new binary and matches them against the
+> configured servers, so it can only work when that set is unchanged. Change
+> it and the re-exec'd binary refuses — *"hot upgrade needs an unchanged
+> listener set; use restart"* — and **exits**, leaving systemd's
+> `Restart=on-failure` to bring the server back. It comes back, but as a
+> restart: connections are dropped, and the message goes to the journal, not
+> to the access log. Editing values inside existing servers, adding or
+> removing *locations*, and changing globals are all fine to reload.
+
 Two things that catch people out:
 
 - **A value read at startup needs two reloads to take visible effect.**
