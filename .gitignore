@@ -75,3 +75,9 @@ test/www/up2.bin
 test/www/h2upload.bin
 test/www/tlsupload.bin
 linnea-qdbg
+
+# Python bytecode. The suite's helpers are run as scripts, so this only appears
+# when one is imported as a module — which a verification script did once, and
+# the .pyc rode into a commit behind `git add -A`.
+__pycache__/
+*.pyc

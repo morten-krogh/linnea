@@ -859,6 +859,33 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     timeout 60 python3 test/quic/h3_malformed_test.py 47452 >/dev/null 2>&1
     check "h3 (io_uring): malformed complete request is reset, not dropped" $?
 
+    # QUIC TRANSPORT frames, which h3_malformed_test.py does not reach — it
+    # covers HTTP/3 application frames one layer up. These are the parsers in
+    # src/lib/linnea_quic.asm walking raw bytes from an UNAUTHENTICATED peer:
+    # Initial keys come from the connection id, so none of this needs a
+    # handshake. Every length in them is a varint that can claim up to 2^62,
+    # and the whole of their safety is bounds checks. Deterministic seed, so a
+    # failure is reproducible. Passing is not "it refused" — refusing is the
+    # point — it is that every worker survived and the port still serves.
+    #
+    # ON A SERVER OF ITS OWN, which cost a suite run to learn: five hundred
+    # half-open connections from five hundred unrelated connection ids leave a
+    # pool nothing like the one the other h3 tests expect, and run against the
+    # shared fixture this broke the 0-RTT test forty lines later. Ordering it
+    # last would have worked until someone appended a test after it.
+    if python3 -c 'import cryptography' 2>/dev/null; then
+        start_server test/configs/tls-h3-fuzz.json
+        fuzz_pid=$SRV_PID
+        sleep 0.4
+        timeout 120 python3 test/quic/fuzz_quic_frames.py 47456 500 "$fuzz_pid" \
+            >/dev/null 2>&1
+        check "quic transport frames: 500 malformed Initials leave it serving" $?
+        kill $fuzz_pid 2>/dev/null
+        wait $fuzz_pid 2>/dev/null
+    else
+        check "quic frame fuzz (skipped: cryptography unavailable)" 0
+    fi
+
     # session resumption: the real server issues a NewSessionTicket with the
     # early_data extension once the handshake completes
     python3 test/quic/h3_ticket_test.py 47452 >/dev/null 2>&1

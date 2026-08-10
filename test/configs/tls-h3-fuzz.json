@@ -1,0 +1,23 @@
+{
+  "log": "test/linnea-h3fz.log",
+  "timeout": 5,
+  "workers": 4,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 47456,
+      "hostname": "localhost",
+      "cert": "test/tls/server.crt",
+      "key": "test/tls/server.key",
+      "hsts": "max-age=31536000",
+      "nosniff": 1,
+      "locations": [
+        {
+          "prefix": "/",
+          "root": "test/www",
+          "cache_control": "max-age=60"
+        }
+      ]
+    }
+  ]
+}
