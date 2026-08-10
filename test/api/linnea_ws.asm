@@ -16,12 +16,13 @@
 ;   * The opening handshake of RFC 6455 4.2.2, including Sec-WebSocket-Accept
 ;     = base64(sha1(key ++ GUID)). Anything that is not a version-13 upgrade
 ;     is refused with 400, not with a half-open socket.
-;   * Origin is checked (RFC 6455 10.2). This backend is reached cross-origin
-;     by design — the page is on linnea.amberbio.com, the socket on
-;     linnea2.amberbio.com — so an allowlist is the only thing standing
-;     between it and any other site on the internet opening a socket here.
-;     An ABSENT Origin is allowed: that is a non-browser client, which the
-;     tests are, and which the same-origin rules were never about.
+;   * Origin is checked (RFC 6455 10.2) against an allowlist. A WebSocket
+;     handshake is not subject to the same-origin policy and carries no
+;     preflight, so without this any site on the internet could open a socket
+;     here from a visitor's browser. The list is the only thing preventing
+;     that, whether or not the socket happens to share an origin with the
+;     page today. An ABSENT Origin is allowed: that is a non-browser client,
+;     which the tests are, and which the same-origin rules were never about.
 ;   * Frames: text, binary, ping (answered), pong (ignored), close (echoed).
 ;     Client frames must be masked, and are unmasked in place.
 ;   * Fragmented messages are NOT supported and are refused with close code
@@ -109,12 +110,12 @@ ver_13_len      equ $ - ver_13
 ws_guid:        db "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 ws_guid_len     equ $ - ws_guid
 
-; Origins allowed to open a socket here. The page's own origin, and this
-; backend's own vhost so that a page moved there keeps working. Each entry is
-; a length byte followed by the text; a zero length ends the list.
+; Origins allowed to open a socket here. Each entry is a length byte followed
+; by the text; a zero length ends the list. linnea2.amberbio.com was here
+; while the socket lived on that vhost; the vhost was retired on 2026-08-10
+; and the origin with it, so nothing is allowed that cannot be reached.
 origins:
     db 27, "https://linnea.amberbio.com"
-    db 28, "https://linnea2.amberbio.com"
     db 0
 
 resp_101:       db "HTTP/1.1 101 Switching Protocols", 13, 10
