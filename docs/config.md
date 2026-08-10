@@ -101,7 +101,7 @@ every other global has a working default.
 | `servers` | array | — **required** | 1–16 | The virtual servers. At least one. |
 | `timeout` | integer | `5` | 1–3600 | Seconds an idle connection is held before closing. |
 | `head_timeout` | integer | `10` | 1–3600 | Seconds a client has to finish sending a request head. Slow-loris bound. |
-| `drain_timeout` | integer | `30` | 1–3600 | Seconds a **reload's** old workers may take to finish what they hold before dropping it. A stop ignores this — it is immediate. |
+| `drain_timeout` | integer | `30` | 1–3600 | Seconds a **reload's** old workers may take to finish what they hold before dropping it ([shutdown.md](shutdown.md)). A stop ignores this — it is immediate. Raise it if you serve long downloads and would rather a reload waited for them; lower it if you would rather old workers went quickly. |
 | `max_connections` | integer | `1024` | 1–65536 | Concurrent client connections, across all workers. |
 | `max_per_ip` | integer | `64` | 1–65536 | Concurrent connections from one source address, so one host cannot take the pool. |
 | `max_upstream` | integer | `256` | 1–65536 | Concurrent connections to proxy backends. |
@@ -240,19 +240,16 @@ the configuration is bad, leaving the old generation serving**. So a typo
 cannot take the site down. It picks up a new binary at the same time, since it
 re-execs — there is no config-only reload.
 
-The old workers stay just long enough to finish the requests they are already
-serving, while the new ones take everything arriving. They are given
-`drain_timeout` seconds — **30** by default — after which they drop whatever
-is left and exit. That deadline exists because a WebSocket tunnel never
-finishes on its own, and without it one open tab would keep an old worker
-alive for as long as the tab was. Raise it if you serve long downloads and
-would rather a reload waited for them; lower it if you would rather old
-workers went quickly.
+Two things that catch people out:
 
-**`systemctl stop` and `restart` are immediate** and drop every open
-connection, including uploads and downloads in progress. There is nothing to
-be gained by finishing them first when the server is going away; clients
-reconnect to the one that comes back.
+- **A value read at startup needs two reloads to take visible effect.**
+  `drain_timeout` is the clear case: the first reload only loads the new value
+  into the generation it starts, and the second is when that generation
+  retires under it.
+- **Adding a key ties the configuration to the binary.** Unknown keys are an
+  error, so a binary older than a key refuses a file that uses it. A reload
+  survives that — the master checks first and keeps serving — but a cold start
+  does not. Rolling a binary back means removing the newer keys too.
 
 **SIGHUP is not a config reload.** It tells every process to reopen its log
 file, which is what a log rotation needs and nothing more:
@@ -262,3 +259,6 @@ kill -HUP $MAINPID        # reopen the log after rotating it
 ```
 
 Both signals can be sent without root when the unit runs as the `linnea` user.
+
+For what a stop, a reload and a restart each do to open connections, and what
+the drain writes to the log, see **[shutdown.md](shutdown.md)**.
