@@ -3159,6 +3159,20 @@ rm -f /tmp/upload3_echo.bin
     timeout 60 python3 test/tls/low_order_share.py 127.0.0.1 47446 >/dev/null 2>&1
     check "a low-order x25519 share is refused, not keyed from (RFC 8446 7.4.2)" $?
 
+    # linnea-probe is a SHIPPED product whose purpose is pointing at servers
+    # someone else runs, and it appended every handshake message a server sent
+    # into fixed .bss buffers with a rep movsb and no bound. A 22 KB chain
+    # walked over tr_len, th_buf, every TLS secret and both key schedules:
+    # SIGSEGV on TLS and on QUIC alike. h3buf had the same shape at one of its
+    # two reassembly sites — 875154c had bounded only the other. The assertion
+    # is exit 2 (the "larger than this prober can hold" diagnostic), never 139,
+    # and never 0, which would mean a silently truncated transcript reporting a
+    # handshake fault that was not the server's.
+    timeout 200 python3 test/tls/probe_bigchain.py ./bin/linnea-probe \
+        test/tls/server.crt test/tls/bigchain.crt test/tls/server.key \
+        >/dev/null 2>&1
+    check "linnea-probe survives an oversized certificate chain" $?
+
     # tls-4: a mid-connection KeyUpdate (RFC 8446 4.6.3). The peer derives the
     # next generation of its traffic secret and switches to it; a receiver that
     # cannot follow loses the connection. kTLS reports the KeyUpdate record by

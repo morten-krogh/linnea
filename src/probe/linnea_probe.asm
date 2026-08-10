@@ -65,6 +65,13 @@ RESP_CAP        equ 65536
 REQ_CAP         equ 65536
 HOSTBUF_CAP     equ 256
 DNSBUF_CAP      equ 1024
+; Capacities of the four buffers a SERVER decides how much to put in. Named,
+; because each was a bare number beside its `resb` and the bound that should
+; have guarded it did not exist at all — see hs_overflow.
+TR_BUF_CAP      equ 16384
+QTR_CAP         equ 8192
+QHSC_CAP        equ 8192
+H3BUF_CAP       equ 4096
 
 section .rodata
 
@@ -427,6 +434,11 @@ qpack_idx2status_end:
 err_h3_tls: db "error: h3 requires https:// (QUIC over UDP)", 10
 err_h3_tls_len equ $ - err_h3_tls
 
+msg_hsbig:  db "linnea-probe: the server's handshake is larger than this prober "
+            db "can hold (certificate chain?) — stopping rather than reporting a "
+            db "fault that is not the server's", 10
+msg_hsbig_len equ $ - msg_hsbig
+
 section .bss
 alignb 16
 sa:         resb 16                     ; sockaddr_in
@@ -474,7 +486,7 @@ tls_srvpub: resb 32                     ; the server's key_share
 tls_shared: resb 32                     ; ECDH shared secret
 tls_random: resb 32                     ; client random
 tls_sessid: resb 32                     ; legacy session id (middlebox compat)
-tr_buf:     resb 16384                  ; handshake transcript (all HS messages)
+tr_buf:     resb TR_BUF_CAP                  ; handshake transcript (all HS messages)
 tr_len:     resq 1
 th_buf:     resb 32                     ; a transcript hash
 sec_early:  resb 32
@@ -531,9 +543,9 @@ q_srv_ap_secret: resb 32                ; key update derives the next generation
 q_ku_next:  resb 32                     ; from the SECRET, not from the keys
 q_secrets:  resb 96                     ; c_hs || s_hs || handshake_secret
 q_fin_key:  resb 32                     ; client Finished MAC key
-qtr:        resb 8192                   ; TLS transcript (CH || SH || flight)
+qtr:        resb QTR_CAP                   ; TLS transcript (CH || SH || flight)
 qtr_len:    resq 1
-qhsc:       resb 8192                   ; reassembled Handshake CRYPTO stream
+qhsc:       resb QHSC_CAP                   ; reassembled Handshake CRYPTO stream
 qhsc_len:   resq 1                      ; contiguous bytes from offset 0
 q_hs_ready: resq 1                      ; 1 once Handshake keys are derived
 q_init_largest: resq 1                  ; largest Initial pn the server sent
@@ -588,7 +600,7 @@ q_acked:    resq 1                      ; 1 once we have sent a Handshake ACK
 q_cli_ap_pn: resq 1                     ; our next client 1-RTT packet number
 fs_scratch: resb 768                    ; the request QPACK field section
 fs_scratch2: resb 768                   ; a second field section (urgency probe)
-h3buf:      resb 4096                   ; response stream-0 data, reassembled
+h3buf:      resb H3BUF_CAP                   ; response stream-0 data, reassembled
 h3buf_len:  resq 1
 h3_bytes_s0: resq 1                     ; urgency probe: bytes seen on stream 0
 h3_bytes_s4: resq 1                     ; urgency probe: bytes seen on stream 4
@@ -2071,6 +2083,18 @@ streq_z:
 .no:
     ret
 
+; hs_overflow: the server sent more handshake than we can hold. Prints and
+; exits rather than truncating, because a truncated transcript hashes to the
+; wrong value and surfaces as a Finished mismatch — which sends whoever is
+; probing to look at the server's key schedule instead of at this message.
+; A prober that reports the wrong fault is worse than one that stops.
+hs_overflow:
+    lea rsi, [msg_hsbig]
+    mov edx, msg_hsbig_len
+    call puts_err
+    mov edi, 2
+    jmp exit
+
 ; exit(edi=code)
 exit:
     mov eax, LINNEA_SYS_EXIT
@@ -2564,6 +2588,15 @@ dns_query:
 ; =======================================================================
 ; tr_add(rsi=ptr, rdx=len): append handshake bytes to the transcript buffer
 tr_add:
+    ; Room computed as cap - used and compared against the wire length, never
+    ; used + length compared against cap: the second form is one `add` away
+    ; from wrapping. Unbounded, this was a rep movsb straight over tr_len,
+    ; th_buf, every TLS secret and both key schedules — a 22 KB certificate
+    ; chain segfaulted the prober.
+    mov rcx, TR_BUF_CAP
+    sub rcx, [tr_len]
+    cmp rdx, rcx
+    ja hs_overflow
     push rdi
     push rcx
     mov rdi, [tr_len]
@@ -4647,6 +4680,10 @@ quic_recv_serverhello:
 
 ; qtr_add(rsi=ptr, rdx=len): append to the TLS transcript buffer.
 qtr_add:
+    mov rcx, QTR_CAP                      ; as tr_add, and for the same reason:
+    sub rcx, [qtr_len]                    ; the same chain over QUIC crashed it
+    cmp rdx, rcx
+    ja hs_overflow
     push rdi
     push rcx
     mov rdi, [qtr_len]
@@ -4975,6 +5012,10 @@ quic_walk_datagram:
     cmp r8, [qhsc_len]
     jne .adv                              ; out of order: skip (Linnea is in order)
     mov rsi, rax
+    mov rcx, QHSC_CAP                     ; the reassembled flight has the same
+    sub rcx, [qhsc_len]                   ; server-chosen size as the transcript
+    cmp rdx, rcx
+    ja hs_overflow
     mov rdi, [qhsc_len]
     lea rdi, [qhsc + rdi]
     mov rcx, rdx
@@ -5960,8 +6001,21 @@ quic_h3_get:
     mov r13, r9                           ; resume after this STREAM frame
     test r8, r8
     jnz .frames                          ; not the request stream
-    ; append rax..rax+rdx to h3buf
+    ; Append rax..rax+rdx to h3buf, clamped to the room left. This is the
+    ; SECOND site doing this reassembly; 875154c bounded the other one (search
+    ; H3BUF_CAP below) and left this copy unbounded, so a stream-0 response
+    ; past 4096 bytes still ran off the end here. Only the head of the stream
+    ; is ever needed — the field section carrying :status is at its start — so
+    ; a full buffer keeps walking the frames and copies nothing, exactly as the
+    ; other site does.
     mov rcx, [h3buf_len]
+    mov r8, H3BUF_CAP
+    sub r8, rcx                          ; room left
+    jbe .frames                          ; full: copy nothing, keep walking
+    cmp rdx, r8
+    jbe .h3a_fits
+    mov rdx, r8
+.h3a_fits:
     lea rdi, [h3buf + rcx]
     mov rsi, rax
     mov rcx, rdx
@@ -6252,7 +6306,7 @@ quic_h3_classify:
     ; killed the prober. Only the head of the stream is ever needed — the field
     ; section carrying :status sits at its start.
     mov rcx, [h3buf_len]
-    mov r8, 4096
+    mov r8, H3BUF_CAP
     sub r8, rcx                          ; room left
     jbe .frame                           ; full: keep walking, copy nothing
     cmp rdx, r8
