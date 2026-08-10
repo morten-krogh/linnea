@@ -2143,6 +2143,11 @@ check "ws upgrade refusal passes through ($out)" $?
 # a 101 the client never asked for must not start a tunnel
 resp=$(curl -si --max-time 3 http://127.0.0.1:47080/api/101)
 check_http "unrequested 101 becomes 502" "502 Bad Gateway" "$resp"
+# ...and a tunnel must not hold up a stop. This one runs its own server on
+# 47471, because it stops it — 47080 is serving the rest of the suite.
+out=$(python3 test/ws_drain_test.py)
+[ "$out" = "OK" ]
+check "ws tunnel does not delay a stop ($out)" $?
 
 # --- the assembly websocket backend, direct and through the tunnel ---
 # The same battery both ways: RFC 6455 handshake, framing, unmasking, the

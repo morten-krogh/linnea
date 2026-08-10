@@ -1,0 +1,23 @@
+{
+  "log": "test/linnea-wsdrain.log",
+  "timeout": 2,
+  "max_connections": 16,
+  "workers": 2,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 47471,
+      "hostname": "one.test",
+      "locations": [
+        {
+          "prefix": "/ws",
+          "proxy": "127.0.0.1:47702"
+        },
+        {
+          "prefix": "/",
+          "root": "test/www"
+        }
+      ]
+    }
+  ]
+}

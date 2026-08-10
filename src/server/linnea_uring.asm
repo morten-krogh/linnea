@@ -264,7 +264,8 @@ idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
 sig_mask:           resq 1     ; blocked-signal set: SIGTERM + SIGHUP
 sig_fd:             resd 1
 drain_flag:         resd 1     ; 1 = draining: no accepts, close after serve
-fast_drain:         resd 1     ; 1 = also close connections that are merely idle
+fast_drain:         resd 1     ; 1 = also close connections with no request in
+                               ; flight: idle keep-alives, and tunnels
 accept_err_streak:  resd 1     ; consecutive failed accepts; drives the backoff
 conn_full_warned:   resd 1     ; the pool-full warning has been logged already
 quic_fd:    resd 1
@@ -833,7 +834,7 @@ linnea_uring_run:
     cmp qword [r12 + linnea_connection.in_use], 0
     je .idle_next
     mov rdi, r12
-    call conn_is_idle
+    call conn_is_drainable
     test eax, eax
     jz .idle_next
     call linnea_uring_get_sqe_zeroed
@@ -2220,6 +2221,9 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .tunnel_c2u_idle:
+    cmp dword [fast_drain], 0
+    jne .tunnel_drain_close    ; a cancel during a stop is the stop, not a
+                               ; linked timeout: do not re-arm
     call linnea_uring_now
     sub rax, [r12 + linnea_connection.last_activity]
     cmp rax, [idle_timeout_ns]
@@ -2232,6 +2236,10 @@ linnea_uring_run:
 .tunnel_idle_close:
     lea r14, [reason_timeout]
     mov r15d, reason_timeout_len
+    jmp .tunnel_close
+.tunnel_drain_close:
+    lea r14, [reason_drain]
+    mov r15d, reason_drain_len
     jmp .tunnel_close
 
 ; forward to the upstream completed: r15d = bytes or -errno
@@ -2296,6 +2304,8 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .tunnel_u2c_idle:
+    cmp dword [fast_drain], 0
+    jne .tunnel_drain_close    ; as above, from the upstream side
     call linnea_uring_now
     sub rax, [r12 + linnea_connection.last_activity]
     cmp rax, [idle_timeout_ns]
@@ -3198,14 +3208,25 @@ linnea_uring_arm_up_recv:
     pop rbx
     jmp linnea_uring_arm_link_timeout
 
-; conn_is_idle(rdi = connection*) -> eax = 1 when the connection has no work
-; in flight: nothing half-received, nothing queued to send, no upstream
-; exchange or tunnel, and for HTTP/2 no open stream. Such a connection is
-; only holding its keep-alive open, so a stop can close it at once; anything
-; else is finished first.
-conn_is_idle:
+; conn_is_drainable(rdi = connection*) -> eax = 1 when a stop can close this
+; connection now. Every test below asks the same question — is a request still
+; in flight — and lets anything unfinished finish: nothing half-received,
+; nothing queued to send, no upstream exchange, and for HTTP/2 no open stream.
+;
+; A tunnel is the one case that question does not fit, so it is answered first
+; and the other way. After a 101 there is no request left to finish; the
+; connection is an open pipe that ends when a peer closes it, which on a stop
+; is never. Held open it made `systemctl restart` wait out the idle timeout
+; for a quiet WebSocket and TimeoutStopSec for a busy one — whose every frame
+; pushes last_activity forward, so it is never reaped and systemd SIGKILLs the
+; worker. Dropping the tunnel costs the client a reconnect, which is what a
+; WebSocket client already handles.
+conn_is_drainable:
     push rbx
     mov rbx, rdi
+    cmp qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
+    je .ci_idle                ; whatever is in its buffers: they are relayed
+                               ; bytes, not a reply we owe anyone
     cmp qword [rbx + linnea_connection.in_len], 0
     jne .ci_busy
     cmp qword [rbx + linnea_connection.out_rem], 0
