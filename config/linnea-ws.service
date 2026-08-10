@@ -1,5 +1,6 @@
-# The WebSocket backend behind linnea2.amberbio.com's /ws location: the shared
+# The WebSocket backend behind linnea.amberbio.com's /ws location: the shared
 # counter the site's index page increments, and broadcasts to every open tab.
+# It sat behind linnea2.amberbio.com until that vhost was retired 2026-08-10.
 #
 # One-time install:
 #   make && sudo make install
