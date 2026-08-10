@@ -5,7 +5,7 @@ differently on purpose.
 
 | Signal | Sent by | What a worker does |
 |---|---|---|
-| **SIGTERM** | `systemctl stop`, `systemctl restart`, and the kernel when the master dies (`PR_SET_PDEATHSIG`) | **Exits immediately**, dropping everything open — keep-alives, WebSocket tunnels, uploads and downloads in progress. |
+| **SIGTERM** | `systemctl stop`, `systemctl restart`, and the kernel when the master dies (`PR_SET_PDEATHSIG`) | **Exits immediately**, dropping everything open — keep-alives, WebSocket tunnels, uploads and downloads in progress. HTTP/3 peers are sent `CONNECTION_CLOSE(H3_NO_ERROR)` on the way out. |
 | **SIGQUIT** | the master alone, retiring the previous generation during a reload | **Drains**: stops accepting, finishes what is already open, exits when the last connection closes or when `drain_timeout` expires, whichever comes first. |
 | **SIGHUP** | a log rotation | Reopens the log file. Nothing else — it is *not* a configuration reload. |
 | **SIGUSR2** | `systemctl reload` | The master re-execs in place, then SIGQUITs the old generation. |
@@ -34,6 +34,17 @@ SIGKILL. Measured, from the signal to the last worker gone:
 Clients reconnect to the server that comes back, which is what a restart is.
 `TimeoutStopSec=10` remains in the unit as a backstop for a worker too wedged
 to answer a signal; in normal operation it is never reached.
+
+**Immediate is not the same as silent.** TCP needs nothing: exiting closes
+those sockets and the peer sees it at once. QUIC does — a connection whose
+server simply stops answering leaves the client waiting out an idle timeout
+with nothing to explain it, and a browser that sees that happen a few times
+concludes the origin's HTTP/3 is unreliable and stops offering it. So a stop
+sends `CONNECTION_CLOSE(H3_NO_ERROR)` to every connected h3 peer before
+exiting: one datagram each, orderly rather than an error code, so the client
+reconnects without holding it against the origin. Measured at 0.16 s from
+signal to the client having the close in hand, against an 8-second timeout
+when the server merely vanished.
 
 ## Why a reload drains
 
