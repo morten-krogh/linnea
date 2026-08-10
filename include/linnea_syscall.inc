@@ -88,6 +88,7 @@ LINNEA_O_CLOEXEC     equ 0x80000
 ; O_TMPFILE is __O_TMPFILE | O_DIRECTORY: the path names the filesystem, and
 ; the file it creates there has no directory entry at all
 LINNEA_O_TMPFILE     equ 0x410000
+LINNEA_O_DIRECTORY   equ 0x10000   ; open only if the path IS a directory
 LINNEA_O_TRUNC       equ 0x200
 LINNEA_MODE_0600     equ 384  ; rw-------
 LINNEA_MODE_0644     equ 420  ; rw-r--r--

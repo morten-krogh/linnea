@@ -17,6 +17,7 @@ extern linnea_error_exit
 extern linnea_error_duplicate_hostname
 extern linnea_string_equal
 extern linnea_string_iequal
+extern linnea_network_fill_sockaddr6
 
 section .rodata
 
@@ -85,6 +86,12 @@ msg_empty_log:          db "config log must not be empty"
 msg_empty_log_len       equ $ - msg_empty_log
 msg_cert_key:           db "server needs both cert and key, or neither"
 msg_cert_key_len        equ $ - msg_cert_key
+msg_bad_host_ip:        db 'server host must be an IPv4 literal or "::" (a name is not resolved)' 
+msg_bad_host_ip_len     equ $ - msg_bad_host_ip
+msg_no_root_dir:        db "location root is not an existing directory"
+msg_no_root_dir_len     equ $ - msg_no_root_dir
+msg_no_log_dir:         db "the log's directory does not exist"
+msg_no_log_dir_len      equ $ - msg_no_log_dir
 msg_tls_mismatch:       db "servers sharing a listener must all set TLS or none"
 msg_tls_mismatch_len    equ $ - msg_tls_mismatch
 
@@ -92,6 +99,8 @@ dump_tls_on:            db " tls=on cert="
 dump_tls_on_len         equ $ - dump_tls_on
 
 section .bss
+log_dir_buf: resb LINNEA_MAX_ROOT + 2   ; the log path, cut at its last /
+host_probe_sa: resb 28                  ; scratch sockaddr_in6, to ask the binder
 
 linnea_config_instance: resb linnea_config_size
 
@@ -99,9 +108,69 @@ section .text
 
 ; linnea_config_validate(rdi=config*) — semantic rules, checked after parse.
 ; Exits with an error message on the first violation.
+; dir_exists(rdi = NUL-terminated path) -> eax = 1 when it opens as a
+; directory. openat with O_DIRECTORY does the whole job: a missing path, a
+; path that is a plain file, and a path we may not traverse all fail it.
+; Clobbers only the caller-saved set the callers already push.
+dir_exists:
+    mov esi, LINNEA_O_RDONLY | LINNEA_O_DIRECTORY | LINNEA_O_CLOEXEC
+    xor edx, edx
+    mov eax, LINNEA_SYS_OPEN
+    syscall
+    cmp rax, -4095
+    jae .de_no
+    mov edi, eax
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    mov eax, 1
+    ret
+.de_no:
+    xor eax, eax
+    ret
+
 linnea_config_validate:
     cmp qword [rdi + linnea_config.log_len], 0
     je .empty_log
+    ; The log's DIRECTORY must exist — the file itself is created on open, so
+    ; only the directory can be wrong, and it was another thing --test used to
+    ; miss. Copy the path and cut it at the last '/'; a bare filename means the
+    ; working directory, which by definition exists.
+    push rax
+    push rdi
+    mov rsi, rdi
+    mov rcx, [rsi + linnea_config.log_len]
+    lea rsi, [rsi + linnea_config.log]
+    lea rdi, [log_dir_buf]
+    push rcx
+    rep movsb
+    pop rcx
+    mov byte [log_dir_buf + rcx], 0
+.ld_scan:
+    test rcx, rcx
+    jz .ld_ok                     ; no '/': the cwd, which exists
+    dec rcx
+    cmp byte [log_dir_buf + rcx], '/'
+    jne .ld_scan
+    test rcx, rcx
+    jnz .ld_cut
+    mov byte [log_dir_buf + 1], 0 ; "/x" -> the root directory
+    jmp .ld_check
+.ld_cut:
+    mov byte [log_dir_buf + rcx], 0
+.ld_check:
+    lea rdi, [log_dir_buf]
+    call dir_exists
+    test eax, eax
+    jz .ld_bad
+.ld_ok:
+    pop rdi
+    pop rax
+    jmp .have_log
+.ld_bad:
+    pop rdi
+    pop rax
+    jmp .no_log_dir
+.have_log:
     mov rax, [rdi + linnea_config.server_count]
     test rax, rax
     jz .no_servers
@@ -117,6 +186,33 @@ linnea_config_validate:
     je .empty_host
     cmp qword [r9 + linnea_config_server.hostname_len], 0
     je .empty_hostname
+    ; The bind address must be one the listener can actually use. Discovered
+    ; only at bind time before, so `--test` passed a config that could not
+    ; start — and --test is what gates the hot upgrade, so the reload succeeded
+    ; (listeners are inherited, never re-bound) and the fault surfaced at the
+    ; next cold restart, detached from the edit that caused it.
+    ;
+    ; Asks the binder's own function rather than restating the rule: the first
+    ; attempt here duplicated it as "must parse as IPv4" and immediately
+    ; diverged, rejecting the "::" wildcard that the listener accepts and that
+    ; the IPv6 fixtures use. One definition, in the place that binds.
+    push rax
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov rdi, r9
+    lea rsi, [host_probe_sa]
+    call linnea_network_fill_sockaddr6
+    cmp rax, -1
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rax
+    je .bad_host_ip
     mov r10, [r9 + linnea_config_server.location_count]
     test r10, r10
     jz .no_locations
@@ -134,6 +230,24 @@ linnea_config_validate:
     jne .loc_not_root
     cmp qword [rdx + linnea_config_location.root_len], 0
     je .empty_root
+    push rax
+    push rdi
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [rdx + linnea_config_location.root]
+    call dir_exists
+    test eax, eax
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rdi
+    pop rax
+    jz .no_root_dir
     jmp .loc_next
 .loc_not_root:
     cmp qword [rdx + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
@@ -275,6 +389,18 @@ linnea_config_validate:
 .no_locations:
     lea rdi, [msg_no_locations]
     mov esi, msg_no_locations_len
+    jmp linnea_error_exit
+.bad_host_ip:
+    lea rdi, [msg_bad_host_ip]
+    mov esi, msg_bad_host_ip_len
+    jmp linnea_error_exit
+.no_root_dir:
+    lea rdi, [msg_no_root_dir]
+    mov esi, msg_no_root_dir_len
+    jmp linnea_error_exit
+.no_log_dir:
+    lea rdi, [msg_no_log_dir]
+    mov esi, msg_no_log_dir_len
     jmp linnea_error_exit
 .bad_prefix:
     lea rdi, [msg_bad_prefix]

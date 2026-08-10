@@ -131,7 +131,7 @@ msg_maxup_range:        db "max_upstream must be between 1 and 65536"
 msg_maxup_range_len     equ $ - msg_maxup_range
 msg_maxbody_range:      db "max_body must be between 1 and 68719476736"
 msg_maxbody_range_len   equ $ - msg_maxbody_range
-msg_workers_range:      db "workers must be between 1 and 256"
+msg_workers_range:      db "workers must be between 0 and 256 (0 = one per CPU)"
 msg_workers_range_len   equ $ - msg_workers_range
 msg_http2_range:        db "http2 must be 0 or 1"
 msg_http2_range_len     equ $ - msg_http2_range
@@ -143,6 +143,10 @@ msg_root_long:          db "root too long"
 msg_root_long_len       equ $ - msg_root_long
 msg_redirect_long:      db "redirect too long"
 msg_redirect_long_len   equ $ - msg_redirect_long
+msg_hsts_type:          db "hsts takes the header VALUE as a string, e.g. "
+                        db '"max-age=31536000; includeSubDomains"'
+                        db " -- the nosniff beside it is the 0/1 one"
+msg_hsts_type_len       equ $ - msg_hsts_type
 msg_nosniff:            db "nosniff must be 0 or 1"
 msg_nosniff_len         equ $ - msg_nosniff
 msg_cc_long:            db "cache_control too long"
@@ -406,8 +410,10 @@ linnea_config_parse:
     jnz .top_dup
     or r13d, 16
     call linnea_parse_u64
-    test rax, rax
-    jz .workers_range
+    ; 0 is legal and means "one worker per online CPU" — which is also the
+    ; default, and used to be unwritable: the range started at 1, so the only
+    ; way to ASK for the default was to leave the key out. resolve_workers has
+    ; always turned 0 into the CPU count, so this only stops rejecting it.
     cmp rax, LINNEA_MAX_WORKERS
     ja .workers_range
     mov [rbx + linnea_config.workers], rax
@@ -668,6 +674,14 @@ linnea_parse_server:
     test r12d, 64
     jnz .dup
     or r12d, 64
+    ; hsts is a STRING (the header value) while nosniff beside it is a flag, so
+    ; "hsts": 1 is the natural thing to write and the natural thing to get
+    ; wrong. Peeking first turns a bare `expected '"'` into a message that says
+    ; what to write instead.
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, '"'
+    jne .hsts_type
     call linnea_parse_string
     cmp rdx, LINNEA_MAX_ROOT
     ja .path_long
@@ -686,6 +700,11 @@ linnea_parse_server:
     ja .nosniff_range
     mov [rbx + linnea_config_server.nosniff], rax
     jmp .member_sep
+.hsts_type:
+    lea rdi, [msg_hsts_type]
+    mov esi, msg_hsts_type_len
+    jmp linnea_parse_fail
+
 .nosniff_range:
     lea rdi, [msg_nosniff]
     mov esi, msg_nosniff_len

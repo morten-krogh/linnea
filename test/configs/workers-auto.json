@@ -1,6 +1,6 @@
 {
   "log": "test/linnea.log",
-  "workers": 257,
+  "workers": 0,
   "servers": [
     {
       "host": "127.0.0.1",

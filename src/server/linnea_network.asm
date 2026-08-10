@@ -17,6 +17,7 @@ global linnea_network_peer_format
 global linnea_network_addr_format
 global linnea_network_peer_addr
 global linnea_network_parse_ipv4
+global linnea_network_fill_sockaddr6
 global linnea_network_quic_listener
 
 extern linnea_error_server

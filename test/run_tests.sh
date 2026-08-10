@@ -182,9 +182,21 @@ run_test "bad timeout"     1 stderr "timeout must be between 1 and 3600" \
     $BIN --config test/configs/bad-timeout.json
 run_test "workers dump"    124 stdout "workers=2" \
     timeout 0.5 $BIN --config test/configs/listen.json
-run_test "bad workers"     1 stderr "workers must be between 1 and 256" \
+run_test "bad workers"     1 stderr "workers must be between 0 and 256" \
     $BIN --config test/configs/bad-workers.json
-run_test "invalid host"    1 stderr "invalid host address" \
+# 0 is the DEFAULT (one worker per online CPU) and used to be the one value you
+# could not write: the range started at 1, so the only way to ask for the
+# default was to omit the key. resolve_workers always understood it.
+run_test "workers auto"    124 stdout "config:" \
+    timeout 0.5 $BIN --config test/configs/workers-auto.json
+
+# docs/config.md documents every key, its scope, default and range, plus a
+# complete example. A reference that drifts from the parser is worse than
+# none, so every claim in it is asserted against the binary — the example
+# included, since that is what a reader copies.
+python3 test/configs/doc_claims_test.py >/dev/null 2>&1
+check "docs/config.md still describes the parser" $?
+run_test "invalid host"    1 stderr "host must be an IPv4 literal" \
     $BIN --config test/configs/bad-host.json
 # a hard fd limit below the configured pool is fatal: the pool could never
 # fill, and accept would fail with EMFILE while the server thought it had room
