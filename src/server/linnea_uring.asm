@@ -125,6 +125,7 @@ extern linnea_quic_server_datagram
 extern linnea_quic_server_rtx_sweep
 extern linnea_quic_server_goaway_all
 extern linnea_quic_server_drain_sweep
+extern linnea_quic_server_close_all
 extern linnea_quic_conn_active
 extern linnea_quic_draining
 extern linnea_quic_rxbuf
@@ -189,6 +190,8 @@ reason_timeout:     db "idle timeout"
 reason_timeout_len  equ $ - reason_timeout
 reason_recv_err:    db "recv error"
 reason_recv_err_len equ $ - reason_recv_err
+reason_peer_reset:  db "peer reset"
+reason_peer_reset_len equ $ - reason_peer_reset
 reason_send_err:    db "send error"
 reason_send_err_len equ $ - reason_send_err
 reason_send_timeout: db "send timeout"
@@ -211,6 +214,8 @@ log_stopped_len     equ $ - log_stopped
 log_drain_late:     db "worker drain deadline reached, dropping what is left", 10
 log_drain_late_len  equ $ - log_drain_late
 
+dbgrecv:            db "recv failed, errno "
+dbgrecv_len         equ $ - dbgrecv
 dbgsplit:           db "DBG split in_len "
 dbgsplit_len        equ $ - dbgsplit
 msg_signalfd:       db "signalfd failed"
@@ -861,6 +866,17 @@ linnea_uring_run:
 ; exit closes every socket, and the log line is flushed by its own newline
 ; before we go.
 .stop_now:
+    ; Say goodbye to h3 peers before going. A QUIC connection that just stops
+    ; answering leaves its client to an idle timeout and reads as the protocol
+    ; failing — which is how a browser decides an origin's HTTP/3 is
+    ; unreliable and stops offering it. One datagram each, so the stop is
+    ; still immediate. TCP needs nothing here: exit closes those sockets and
+    ; the peer sees it at once.
+    cmp dword [quic_fd], 0
+    jl .stop_log
+    mov edi, [quic_fd]
+    call linnea_quic_server_close_all
+.stop_log:
     call linnea_log_stamp
     lea rdi, [log_stopped]
     mov esi, log_stopped_len
@@ -995,8 +1011,7 @@ linnea_uring_run:
     call tls_recv_is_eof
     test eax, eax
     jnz .recv_eof
-    lea r14, [reason_recv_err]
-    mov r15d, reason_recv_err_len
+    call recv_fail_reason
     jmp .conn_close
 .ktls_rekeyed:
     ; The receive keys have moved on. Re-arm the very read the KeyUpdate
@@ -1581,8 +1596,7 @@ linnea_uring_run:
     jz .tls_peer_closed
     cmp r15d, -LINNEA_ECANCELED
     je .tls_recv_timeout
-    lea r14, [reason_recv_err]
-    mov r15d, reason_recv_err_len
+    call recv_fail_reason
     jmp .conn_close
 .tls_peer_closed:
     lea r14, [reason_peer]
@@ -2213,8 +2227,7 @@ linnea_uring_run:
     call tls_recv_is_eof
     test eax, eax
     jnz .tunnel_client_eof
-    lea r14, [reason_recv_err]
-    mov r15d, reason_recv_err_len
+    call recv_fail_reason
     jmp .tunnel_close
 .tunnel_client_eof:
     lea r14, [reason_peer]
@@ -3212,6 +3225,46 @@ linnea_uring_arm_up_recv:
     pop r12
     pop rbx
     jmp linnea_uring_arm_link_timeout
+
+; recv_fail_reason(r15d = the negative errno) -> r14 = reason, r15d = its
+; length. Called where a read has failed and the connection is going.
+;
+; ECONNRESET is not a fault: it is what a browser closing a tab, navigating
+; away or trimming its connection pool looks like, and it was the bulk of the
+; "recv error" lines in the log — around sixty a day, every one of them
+; ordinary. It gets a reason of its own so the log stops reporting routine
+; behaviour as an error.
+;
+; Everything else keeps "recv error" and now writes the errno alongside it.
+; "recv error" on its own is undiagnosable, which is exactly what the kTLS
+; handoff line taught: a discarded errno turns a question into a shrug.
+recv_fail_reason:
+    cmp r15d, -LINNEA_ECONNRESET
+    je .rfr_reset
+    push rbx
+    push r12
+    push r13                   ; 3 pushes: the call sites are 16-aligned
+    mov ebx, r15d              ; the logging calls clobber freely
+    call linnea_log_stamp
+    lea rdi, [dbgrecv]
+    mov esi, dbgrecv_len
+    call linnea_log_write
+    xor rdi, rdi
+    sub edi, ebx               ; -errno -> errno
+    call linnea_log_u64
+    lea rdi, [log_nl]
+    mov esi, 1
+    call linnea_log_write
+    pop r13
+    pop r12
+    pop rbx
+    lea r14, [reason_recv_err]
+    mov r15d, reason_recv_err_len
+    ret
+.rfr_reset:
+    lea r14, [reason_peer_reset]
+    mov r15d, reason_peer_reset_len
+    ret
 
 ; h2_arm_recv_once(rdi = connection*) — arm a client recv unless one is
 ; already in flight. An HTTP/2 connection can be driven from either side (a

@@ -75,6 +75,7 @@ global linnea_quic_server_datagram
 global linnea_quic_server_rtx_sweep
 global linnea_quic_server_goaway_all
 global linnea_quic_server_drain_sweep
+global linnea_quic_server_close_all
 global linnea_quic_rxbuf
 global linnea_quic_altsvc_set
 global linnea_h3_altsvc
@@ -6545,6 +6546,47 @@ linnea_quic_server_drain_sweep:
     inc r13d
     cmp r13d, LINNEA_QUIC_MAX_CONNS
     jb .ds_conn
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_server_close_all(edi = UDP socket fd) — tell every connected
+; peer we are going away NOW: CONNECTION_CLOSE(H3_NO_ERROR) to each, whatever
+; it still has in flight. This is the stop path, not the drain. The process is
+; about to exit, so a peer holding a half-sent response loses it either way,
+; and the only question is whether it learns that at once or waits out an idle
+; timeout. A QUIC connection that simply stops answering is how a browser
+; decides an origin's HTTP/3 is unreliable and quietly stops offering it, so
+; the difference is worth one datagram per connection — which is cheap enough
+; that a stop is still immediate.
+;
+; NO_ERROR, not an error code: this is an orderly shutdown, and a peer told so
+; reconnects without holding it against the origin.
+;
+; Slots are not freed and handshakes in progress are skipped — the latter for
+; the same reason drain_sweep skips them, a 1-RTT close would not decrypt.
+linnea_quic_server_close_all:
+    push rbx
+    push r12
+    push r13                         ; 3 pushes: the call sites are 16-aligned
+    mov r12d, edi                    ; fd, for emit_1rtt
+    xor r13d, r13d                   ; connection index
+.ca_conn:
+    mov edi, r13d
+    call linnea_quic_conn_slot       ; rax = conn* or 0
+    test rax, rax
+    jz .ca_next
+    mov rbx, rax
+    cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
+    jne .ca_next
+    mov [cur_conn], rbx
+    mov edi, LINNEA_H3_ERR_NO_ERROR
+    call send_app_close
+.ca_next:
+    inc r13d
+    cmp r13d, LINNEA_QUIC_MAX_CONNS
+    jb .ca_conn
     pop r13
     pop r12
     pop rbx

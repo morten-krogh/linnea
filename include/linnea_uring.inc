@@ -154,3 +154,7 @@ LINNEA_EAGAIN           equ 11
 LINNEA_EIO              equ 5
 LINNEA_EBUSY            equ 16
 LINNEA_ECANCELED        equ 125
+; A peer that hung up abruptly rather than closing. Routine from a browser —
+; a tab closed, a navigation, a connection pool trimmed — so it is told apart
+; from a real read failure rather than logged as one.
+LINNEA_ECONNRESET       equ 104

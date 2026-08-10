@@ -1097,6 +1097,24 @@ else
     check "h3 GOAWAY drain test (skipped: deps unavailable)" 0
 fi
 
+# A STOP must tell h3 peers, not merely vanish. SIGTERM exits at once — there
+# is nothing to drain — but a QUIC connection that goes silent leaves its peer
+# to an idle timeout, and a browser reads repeated unexplained losses as the
+# origin's h3 being unreliable. One CONNECTION_CLOSE each fixes that without
+# making the stop slower.
+if python3 -c 'import aioquic' 2>/dev/null; then
+    start_server test/configs/tls-h3-drain.json
+    sc_master=$SRV_PID
+    sleep 0.5
+    out=$(timeout 40 python3 test/quic/h3_stop_close_test.py 61453 $sc_master 2>&1)
+    case "$out" in OK*) true ;; *) false ;; esac
+    check "h3 (io_uring): a stop closes peers instead of vanishing ($out)" $?
+    kill -9 $sc_master 2>/dev/null
+    wait $sc_master 2>/dev/null
+else
+    check "h3 stop-close test (skipped: deps unavailable)" 0
+fi
+
 # Drain with an in-flight h3 response (Q117): the drain-exit test used to count
 # only TCP connections, so a worker whose work was all QUIC exited the moment
 # the drain began (and stopped re-arming the datagram recv besides) — the peer
@@ -2234,6 +2252,21 @@ grep -qF ': close after response' "$LOG"
 check "termination close-after-response" $?
 grep -qF ': peer closed' "$LOG"
 check "termination peer closed" $?
+# A client that hangs up abruptly (RST) is ECONNRESET, which is what a browser
+# closing a tab looks like — routine, and told apart from a real read failure
+# rather than logged as "recv error" with the errno thrown away.
+python3 - <<'RST'
+import socket, struct, time
+s = socket.create_connection(("127.0.0.1", 61080), timeout=5)
+s.sendall(b"GET /hello.txt HTTP/1.1\r\nHost: one.test\r\n")   # unfinished
+s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+s.close()
+time.sleep(0.6)
+RST
+grep -qF ': peer reset' "$LOG"
+check "termination peer reset (RST is not an error)" $?
+! grep -qF 'recv failed, errno 104' "$LOG"
+check "a reset does not log an errno line" $?
 grep -qF ': idle timeout' "$LOG"
 check "termination idle timeout" $?
 
