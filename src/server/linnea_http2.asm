@@ -109,6 +109,10 @@ section .text
 ; linnea_h2_init(rdi=conn) — queue the server's initial SETTINGS frame
 ; (empty) into out_buf and mark the connection awaiting the client
 ; preface. The caller sends out_ptr/out_rem, then reads.
+%if LINNEA_H2_POOL_BYTES > LINNEA_CONN_UP_BUF
+  %error "the h2 stream pool does not fit in up_buf: reduce LINNEA_H2_MAX_STREAMS"
+%endif
+
 linnea_h2_init:
     mov qword [rdi + linnea_connection.h2_state], LINNEA_H2_PREFACE
     mov qword [rdi + linnea_connection.h2_saw_settings], 0
@@ -4299,8 +4303,7 @@ h2_schedule:
 .scan:
     cmp r14d, LINNEA_H2_MAX_STREAMS
     jae .scan_done
-    mov rax, r13
-    and eax, LINNEA_H2_MAX_STREAMS - 1   ; MAX_STREAMS is a power of two (16)
+    mov rax, r13                     ; the cursor is kept in [0, MAX_STREAMS)
     imul rax, rax, linnea_h2_stream_size
     lea r15, [r12 + rax]             ; slot ptr
     cmp qword [r15 + linnea_h2_stream.id], 0
@@ -4374,6 +4377,10 @@ h2_schedule:
     mov [rsp + 16], r13
 .scan_next:
     inc r13
+    cmp r13, LINNEA_H2_MAX_STREAMS
+    jb .scan_wrapped
+    xor r13d, r13d
+.scan_wrapped:
     inc r14d
     jmp .scan
 .scan_done:
@@ -4475,6 +4482,10 @@ h2_schedule:
     cmp qword [r15 + linnea_h2_stream.incremental], 0
     je .emit_done
     inc r13
+    cmp r13, LINNEA_H2_MAX_STREAMS
+    jb .emit_store
+    xor r13d, r13d
+.emit_store:
     mov [rbx + linnea_connection.h2_rr_cursor], r13
 .emit_done:
     mov eax, 1

@@ -3525,6 +3525,16 @@ PY
     timeout 30 python3 test/tls/h2_multiplex.py $CA 61446 >/dev/null 2>&1
     check "http2 multiplexing (concurrent streams, rapid-reset, pool cap)" $?
 
+    # A whole docroot over ONE connection, every body compared to the file:
+    # the ordinary case a browser performs and the one no other h2 test did.
+    # It is what caught the round-robin cursor wrapping with a power-of-two
+    # mask — raise MAX_STREAMS to anything else and most slots became
+    # unreachable, so their streams were accepted, logged 200, and never sent
+    # a byte. The single-stream and six-stream tests all passed throughout.
+    out=$(timeout 90 python3 test/tls/h2_page_load.py $CA 61446 test/www 2>&1)
+    case "$out" in ok*) true ;; *) false ;; esac
+    check "http2 page load: every body byte-exact ($out)" $?
+
     # RFC 9218 scheduling, the same policy h3's pump applies: the default
     # priority is NON-incremental, so concurrent responses complete one at a
     # time in arrival order; u=0 jumps the queue; i opts back in to sharing the

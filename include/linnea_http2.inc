@@ -69,11 +69,16 @@ LINNEA_H2_MAX_FRAME    equ 16384    ; DATA payload we cap each frame at
 ; RFC 9113 6.5.2 recommends no smaller than 100 "so as not to unnecessarily
 ; limit parallelism", and 16 was below that: the site's own page asks for 14
 ; sub-resources at once, so the video's Range requests queued behind the
-; gallery and Firefox showed them Blocked. 64 is four times what the page
-; needs while leaving most of up_buf, which the pool is overlaid on, unclaimed.
-; The rapid-reset budget below is rate-based and does not scale with this, so
-; raising it does not widen CVE-2023-44487.
-LINNEA_H2_MAX_STREAMS  equ 64
+; gallery and Firefox showed them Blocked. 100 matches both the RFC and the
+; initial_max_streams_bidi HTTP/3 already advertises, so the same page gets
+; the same parallelism whichever protocol the browser picked.
+;
+; The pool is overlaid on up_buf, which is 8448 bytes: 100 slots at 80 bytes
+; is 8000, so it fits with room and nothing else claims that space once the
+; TLS handshake state it shares has been consumed. The rapid-reset budget
+; below is rate-based and does not scale with this, so raising it does not
+; widen CVE-2023-44487.
+LINNEA_H2_MAX_STREAMS  equ 100
 ; ...as a big-endian u32 for the SETTINGS frame, so the wire value cannot
 ; drift from the pool size.
 %define LINNEA_H2_BE32(x) ((((x) & 0xff) << 24) | ((((x) >> 8) & 0xff) << 16) | \
