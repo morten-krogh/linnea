@@ -254,10 +254,10 @@ pto_timer:          dq 0, 50000000                  ; {sec, nsec} = 50 ms
 ; Without it a WebSocket tunnel pins an old worker for as long as the browser
 ; tab stays open, because a tunnel is never idle and never finishes on its
 ; own — measured: one worker still alive indefinitely after the new
-; generation had taken over. Thirty seconds is far longer than any request
-; this server answers and short enough that reloads cannot accumulate
-; workers.
-drain_deadline:     dq 30, 0                        ; {sec, nsec} = 30 s
+; generation had taken over. tv_sec is overwritten from the config's
+; drain_timeout at startup; the value here is only what a worker would use if
+; it somehow ran before that.
+drain_deadline:     dq LINNEA_DEFAULT_DRAIN_TIMEOUT, 0   ; struct timespec
 ; How long to wait before retrying an accept that keeps failing. A multishot
 ; accept the kernel disarms with an error is otherwise re-armed at once, and a
 ; standing error (EMFILE above all: the fd limit is reached before the
@@ -335,6 +335,8 @@ linnea_uring_run:
     mov rax, [rbx + linnea_config.head_timeout]
     imul rax, rax, 1000000000
     mov [head_timeout_ns], rax
+    mov rax, [rbx + linnea_config.drain_timeout]
+    mov [drain_deadline], rax  ; tv_sec of the timespec; tv_nsec stays 0
     mov rax, [rbx + linnea_config.max_per_ip]
     mov [max_per_ip], rax
     mov rax, [rbx + linnea_config.max_upstream]

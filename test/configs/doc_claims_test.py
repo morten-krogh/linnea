@@ -56,7 +56,7 @@ def loc(l):
 ex = json.load(open(os.path.join(D, "..", "x"), "r")) if False else None
 EXAMPLE = {
     "log": os.path.join(D, "access.log"),
-    "workers": 4, "timeout": 30, "head_timeout": 10,
+    "workers": 4, "timeout": 30, "head_timeout": 10, "drain_timeout": 30,
     "max_connections": 4096, "max_per_ip": 64, "max_upstream": 256,
     "max_body": 8388608, "http2": 1,
     "servers": [
@@ -143,6 +143,13 @@ test(srv(hsts=1), "hsts:1 names the shape to use", False,
 # --- limits --------------------------------------------------------------
 test(base(timeout=3601), "timeout above 3600 rejected", False)
 test(base(timeout=3600), "timeout at 3600 accepted", True)
+test(base(drain_timeout=3601), "drain_timeout above 3600 rejected", False,
+     "drain_timeout must be between 1 and 3600")
+test(base(drain_timeout=0), "drain_timeout:0 rejected (no way to disable it)",
+     False, "drain_timeout must be between 1 and 3600")
+test(base(drain_timeout=1), "drain_timeout at 1 accepted", True)
+test(srv(drain_timeout=30), "drain_timeout on a SERVER is unknown", False,
+     "unknown key")
 test(srv(port=65536), "port above 65535 rejected", False)
 big = base()
 big["servers"][0]["locations"] = [{"prefix": "/p%d" % i, "root": D}

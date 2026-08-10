@@ -1,6 +1,7 @@
 {
   "log": "test/linnea-reload.log",
   "timeout": 2,
+  "drain_timeout": 3,
   "max_connections": 16,
   "workers": 2,
   "servers": [

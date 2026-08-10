@@ -32,8 +32,8 @@ change.
 
 > **The one thing `--test` cannot check** is whether the port is actually
 > bindable — that needs a real bind, and something else may hold it. Everything
-> else a cold start would reject, `--test` rejects: the `host` must parse as an
-> IPv4 literal, and the `root` and `log` directories must exist.
+> else a cold start would reject, `--test` rejects: the `host` must be an IPv4
+> literal or `"::"`, and the `root` and `log` directories must exist.
 
 ---
 
@@ -101,6 +101,7 @@ every other global has a working default.
 | `servers` | array | — **required** | 1–16 | The virtual servers. At least one. |
 | `timeout` | integer | `5` | 1–3600 | Seconds an idle connection is held before closing. |
 | `head_timeout` | integer | `10` | 1–3600 | Seconds a client has to finish sending a request head. Slow-loris bound. |
+| `drain_timeout` | integer | `30` | 1–3600 | Seconds a **reload's** old workers may take to finish what they hold before dropping it. A stop ignores this — it is immediate. |
 | `max_connections` | integer | `1024` | 1–65536 | Concurrent client connections, across all workers. |
 | `max_per_ip` | integer | `64` | 1–65536 | Concurrent connections from one source address, so one host cannot take the pool. |
 | `max_upstream` | integer | `256` | 1–65536 | Concurrent connections to proxy backends. |
@@ -179,6 +180,7 @@ to HTTPS and serve ACME challenges.
   "workers": 4,
   "timeout": 30,
   "head_timeout": 10,
+  "drain_timeout": 30,
   "max_connections": 4096,
   "max_per_ip": 64,
   "max_upstream": 256,
@@ -239,10 +241,13 @@ cannot take the site down. It picks up a new binary at the same time, since it
 re-execs — there is no config-only reload.
 
 The old workers stay just long enough to finish the requests they are already
-serving, while the new ones take everything arriving. They are given **30
-seconds**, after which they drop whatever is left and exit. That deadline
-exists because a WebSocket tunnel never finishes on its own, and without it
-one open tab would keep an old worker alive for as long as the tab was.
+serving, while the new ones take everything arriving. They are given
+`drain_timeout` seconds — **30** by default — after which they drop whatever
+is left and exit. That deadline exists because a WebSocket tunnel never
+finishes on its own, and without it one open tab would keep an old worker
+alive for as long as the tab was. Raise it if you serve long downloads and
+would rather a reload waited for them; lower it if you would rather old
+workers went quickly.
 
 **`systemctl stop` and `restart` are immediate** and drop every open
 connection, including uploads and downloads in progress. There is nothing to

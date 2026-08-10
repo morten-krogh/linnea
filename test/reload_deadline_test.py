@@ -11,8 +11,10 @@ and it ends only when a peer closes it, which a reload does not. Without a
 deadline on the drain, one open tab pinned an old worker indefinitely and
 every reload left another behind. This checks the deadline releases it.
 
-Slow by nature: the deadline is 30s (drain_deadline in linnea_uring.asm), and
-the point of the test is waiting it out. Prints OK, or what went wrong.
+The fixture sets drain_timeout to 3s so the test waits that out rather than
+the 30s default — which also checks the config key reaches the timespec, since
+a value that were ignored would leave the worker there for the full default
+and fail. Prints OK, or what went wrong.
 """
 import base64
 import os
@@ -25,8 +27,8 @@ import time
 
 PORT = 61473
 CONFIG = "test/configs/reload-deadline.json"
-DEADLINE = 30.0              # drain_deadline in src/server/linnea_uring.asm
-SLACK = 15.0                 # generous: a loaded box, plus the re-exec itself
+DEADLINE = 3.0               # "drain_timeout" in the fixture below
+SLACK = 12.0                 # generous: a loaded box, plus the re-exec itself
 
 
 def alive(pid):
@@ -125,11 +127,17 @@ problems = []
 if retired is None:
     problems.append("old workers still alive %.0fs after the reload"
                     % (time.time() - t0))
-elif retired < DEADLINE - 5:
+elif retired < DEADLINE - 1.0:
     # Going early would mean the tunnel was dropped rather than drained, which
     # is the stop's job, not the upgrade's.
-    problems.append("old workers went after only %.1fs, before the drain "
-                    "deadline" % retired)
+    problems.append("old workers went after only %.1fs, before the %.0fs drain "
+                    "deadline" % (retired, DEADLINE))
+elif retired > DEADLINE + SLACK / 2:
+    # Late by a lot means the configured value did not reach the timespec and
+    # the built-in default was used instead.
+    problems.append("old workers went after %.1fs, far past the configured "
+                    "%.0fs — is drain_timeout reaching the timer?"
+                    % (retired, DEADLINE))
 if not fresh:
     problems.append("no new generation after the reload")
 

@@ -5,8 +5,9 @@
 ; where the top-level members are "log" (string) and "servers" (array of
 ; server objects), both required, plus the optional "timeout" (seconds,
 ; 1-3600), "max_connections" (1-65536), "head_timeout" (1-3600, the total a
-; request head may take) and "max_per_ip" (1-65536, connections one source
-; address may hold at once), in any order, each at most once.
+; request head may take), "drain_timeout" (1-3600, how long a reload's drain
+; may take) and "max_per_ip" (1-65536, connections one source address may hold
+; at once), in any order, each at most once.
 ;   server := ws '{' member (ws ',' member)* ws '}'
 ;   member := ws string ws ':' ws value
 ;
@@ -46,6 +47,8 @@ key_maxconn:            db "max_connections"
 key_maxconn_len         equ $ - key_maxconn
 key_headtmo:            db "head_timeout"
 key_headtmo_len         equ $ - key_headtmo
+key_drain:              db "drain_timeout"
+key_drain_len           equ $ - key_drain
 key_perip:              db "max_per_ip"
 key_perip_len           equ $ - key_perip
 key_maxup:              db "max_upstream"
@@ -125,6 +128,8 @@ msg_maxconn_range:      db "max_connections must be between 1 and 65536"
 msg_maxconn_range_len   equ $ - msg_maxconn_range
 msg_headtmo_range:      db "head_timeout must be between 1 and 3600"
 msg_headtmo_range_len   equ $ - msg_headtmo_range
+msg_drain_range:        db "drain_timeout must be between 1 and 3600"
+msg_drain_range_len     equ $ - msg_drain_range
 msg_perip_range:        db "max_per_ip must be between 1 and 65536"
 msg_perip_range_len     equ $ - msg_perip_range
 msg_maxup_range:        db "max_upstream must be between 1 and 65536"
@@ -194,6 +199,7 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.timeout], LINNEA_DEFAULT_TIMEOUT
     mov qword [rbx + linnea_config.max_connections], LINNEA_DEFAULT_MAX_CONNECTIONS
     mov qword [rbx + linnea_config.head_timeout], LINNEA_DEFAULT_HEAD_TIMEOUT
+    mov qword [rbx + linnea_config.drain_timeout], LINNEA_DEFAULT_DRAIN_TIMEOUT
     mov qword [rbx + linnea_config.max_per_ip], LINNEA_DEFAULT_MAX_PER_IP
     mov qword [rbx + linnea_config.max_upstream], LINNEA_DEFAULT_MAX_UPSTREAM
     mov qword [rbx + linnea_config.max_body], LINNEA_DEFAULT_MAX_BODY
@@ -244,6 +250,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_headtmo
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_drain]
+    mov ecx, key_drain_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_drain
     mov rdi, r14
     mov rsi, r15
     lea rdx, [key_perip]
@@ -368,6 +381,18 @@ linnea_config_parse:
     mov [rbx + linnea_config.head_timeout], rax
     jmp .top_sep
 
+.top_drain:
+    test r13d, 1024
+    jnz .top_dup
+    or r13d, 1024
+    call linnea_parse_u64
+    test rax, rax
+    jz .drain_range
+    cmp rax, 3600
+    ja .drain_range
+    mov [rbx + linnea_config.drain_timeout], rax
+    jmp .top_sep
+
 .top_perip:
     test r13d, 128
     jnz .top_dup
@@ -480,6 +505,10 @@ linnea_config_parse:
 .headtmo_range:
     lea rdi, [msg_headtmo_range]
     mov esi, msg_headtmo_range_len
+    jmp linnea_parse_fail
+.drain_range:
+    lea rdi, [msg_drain_range]
+    mov esi, msg_drain_range_len
     jmp linnea_parse_fail
 
 .maxbody_range:

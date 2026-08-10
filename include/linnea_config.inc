@@ -18,6 +18,12 @@ LINNEA_DEFAULT_TIMEOUT          equ 5     ; idle timeout, seconds
 ; slot for as long as it likes (measured: 6x the timeout and still holding, for
 ; eight small writes). This is the total the head gets, however slowly it arrives.
 LINNEA_DEFAULT_HEAD_TIMEOUT     equ 10    ; seconds to finish a request head
+; How long a retiring generation gets to finish what it holds during a hot
+; upgrade. Only a reload drains (SIGQUIT); a stop exits at once, so this never
+; delays one. It exists because a WebSocket tunnel never finishes on its own —
+; without a deadline one open tab pins an old worker for as long as the tab
+; lives, and every reload leaves another behind.
+LINNEA_DEFAULT_DRAIN_TIMEOUT    equ 30    ; seconds a reload's drain may take
 ; Connections one source address may hold at once, per worker. Without it a
 ; single host can take every slot in the pool — with well-formed traffic, no
 ; trickery needed — and everyone else is refused.
@@ -95,6 +101,7 @@ struc linnea_config
     .timeout:       resq 1                        ; idle timeout, seconds
     .max_connections: resq 1                      ; connection pool size, per worker
     .head_timeout:  resq 1                        ; seconds to complete a request head
+    .drain_timeout: resq 1                        ; seconds a reload's drain may take
     .max_per_ip:    resq 1                        ; connections one address may hold
     .max_upstream:  resq 1                        ; upstream connections in flight
     .max_body:      resq 1                        ; largest request body accepted
