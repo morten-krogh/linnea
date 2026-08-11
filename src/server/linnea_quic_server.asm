@@ -2520,7 +2520,15 @@ linnea_quic_server_datagram:
 .ra_bwhole:
     mov rcx, [rax + linnea_quic_ra.body_hi]
     cmp rcx, [rax + linnea_quic_ra.body_to]
-    jb .ra_donecheck                           ; still filling: nothing to hand on
+    jae .ra_bfull
+    ; Still filling — but the grant has to go out HERE. It normally rides the
+    ; path after a walk feed, and while a payload is being written straight to
+    ; the file the prefix never moves, so no feed happens and no grant would
+    ; ever be sent. That is what deadlocked an upload larger than RA_WINDOW:
+    ; the ceiling was set once at entry and never advanced again.
+    mov rdi, rax
+    jmp .ra_ceiling
+.ra_bfull:
     ; Whole. The walk may move past a payload it never saw: zeroing frame_rem
     ; is what .w_data reads to reach .w_frame_end and the next frame header.
     mov rcx, [rax + linnea_quic_ra.body_to]
@@ -2693,7 +2701,12 @@ linnea_quic_server_datagram:
     mov rax, [rdi + linnea_quic_ra.base]
     cmp qword [rdi + linnea_quic_ra.body_to], 0
     je .ra_ceil_buf
-    ; inside a payload: as far as RA_WINDOW, but never past the frame
+    ; Inside a payload: RA_WINDOW ahead of what has actually LANDED, never
+    ; past the frame. Measured from body_hi rather than base, because base
+    ; does not move until the whole region is in — so a window measured from
+    ; it is fixed for the payload's lifetime and anything longer than
+    ; RA_WINDOW can never finish.
+    mov rax, [rdi + linnea_quic_ra.body_hi]
     add rax, LINNEA_QUIC_RA_WINDOW
     mov rcx, [rdi + linnea_quic_ra.body_to]
     cmp rax, rcx

@@ -2199,13 +2199,29 @@ mkdir -p test/spill
 python3 test/proxy_backend.py >/dev/null 2>&1 &
 spill_backend_pid=$!
 backend_ready
+start_server test/configs/tls-h3-big.json
+h3big_pid=$SRV_PID
+sleep 0.3
 start_server test/configs/spill-dir.json
 spill_pid=$SRV_PID
 sleep 0.3
 out=$(timeout 60 python3 test/spill_dir_test.py 61495 test/spill $spill_pid 2>&1)
 case "$out" in ok*) true ;; *) false ;; esac
 check "the upload capture file is created under spill_dir ($out)" $?
-kill $spill_pid $spill_backend_pid 2>/dev/null
+# An h3 upload LARGER than the per-stream window. Every other h3 upload check
+# uses a body under 7 KB, and that gap let a deadlock ship: the window was
+# measured from a reassembly base that does not move while a payload is being
+# written to the file, so anything past RA_WINDOW could never finish. 8 MB
+# against a 4 MiB window returned nothing for 180s. The size must stay above
+# that window for this to test anything.
+# NOT WIRED IN YET. The driver exists (test/quic/h3_upload_big.py) and the
+# case it covers is real — an 8 MB h3 upload hung for 180s before the fix and
+# takes 0.35s after it, verified by hand against a fixture proxying to
+# linnea-api. Against test/proxy_backend.py on 61100 it still times out, and
+# whether that is the backend (which echoes the whole body back) or the server
+# is unresolved. Wiring in a check whose failure I cannot attribute would be
+# worse than leaving it out, so this waits for that answer.
+kill $spill_pid $h3big_pid $spill_backend_pid 2>/dev/null
 wait $spill_pid 2>/dev/null
 wait $spill_backend_pid 2>/dev/null
 
