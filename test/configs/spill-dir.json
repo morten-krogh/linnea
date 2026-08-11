@@ -1,0 +1,16 @@
+{
+  "log": "test/linnea.log",
+  "timeout": 30,
+  "head_timeout": 30,
+  "max_body": 8388608,
+  "spill_dir": "test/spill",
+  "servers": [
+    {
+      "host": "127.0.0.1", "port": 61495, "hostname": "localhost",
+      "locations": [
+        { "prefix": "/api", "proxy": "127.0.0.1:61100" },
+        { "prefix": "/", "root": "test/www" }
+      ]
+    }
+  ]
+}

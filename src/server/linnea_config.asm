@@ -31,6 +31,14 @@ dump_workers:           db " workers="
 dump_workers_len        equ $ - dump_workers
 dump_http2:             db " http2="
 dump_http2_len          equ $ - dump_http2
+dump_spill:             db " spill_dir="
+dump_spill_len          equ $ - dump_spill
+; Named on the startup line, and called out when it is tmpfs: that is the
+; difference between an upload capture the kernel can write back and reclaim
+; and one that is simply RAM. Silent before, and the cost only showed up as
+; memory pressure under concurrent uploads.
+warn_spill_tmpfs:       db " (tmpfs: uploads are held in RAM, not written back)"
+warn_spill_tmpfs_len    equ $ - warn_spill_tmpfs
 dump_headtmo:           db " head_timeout="
 dump_headtmo_len        equ $ - dump_headtmo
 dump_drain:             db " drain_timeout="
@@ -92,6 +100,10 @@ msg_bad_host_ip:        db 'server host must be an IPv4 literal or "::" (a name 
 msg_bad_host_ip_len     equ $ - msg_bad_host_ip
 msg_no_root_dir:        db "location root is not an existing directory"
 msg_no_root_dir_len     equ $ - msg_no_root_dir
+msg_no_spill_dir:       db "spill_dir is not an existing directory"
+msg_no_spill_dir_len    equ $ - msg_no_spill_dir
+msg_spill_notmp:        db "spill_dir does not support O_TMPFILE (try a directory on a local disk)"
+msg_spill_notmp_len     equ $ - msg_spill_notmp
 msg_no_log_dir:         db "the log's directory does not exist"
 msg_no_log_dir_len      equ $ - msg_no_log_dir
 msg_tls_mismatch:       db "servers sharing a listener must all set TLS or none"
@@ -114,6 +126,28 @@ section .text
 ; directory. openat with O_DIRECTORY does the whole job: a missing path, a
 ; path that is a plain file, and a path we may not traverse all fail it.
 ; Clobbers only the caller-saved set the callers already push.
+; spill_is_tmpfs(rdi = NUL-terminated path) -> rax = 1 when the path is on
+; tmpfs. f_type is the first qword of struct statfs. A failed statfs answers 0:
+; this only drives a warning, and a path that cannot be interrogated has
+; already been proved openable by the validate above.
+spill_is_tmpfs:
+    sub rsp, LINNEA_STATFS_BUF + 8
+    mov rsi, rsp
+    mov eax, LINNEA_SYS_STATFS
+    syscall
+    cmp rax, -4095
+    jae .st_no
+    mov rax, [rsp]
+    cmp rax, LINNEA_TMPFS_MAGIC
+    jne .st_no
+    add rsp, LINNEA_STATFS_BUF + 8
+    mov eax, 1
+    ret
+.st_no:
+    add rsp, LINNEA_STATFS_BUF + 8
+    xor eax, eax
+    ret
+
 dir_exists:
     mov esi, LINNEA_O_RDONLY | LINNEA_O_DIRECTORY | LINNEA_O_CLOEXEC
     xor edx, edx
@@ -173,6 +207,41 @@ linnea_config_validate:
     pop rax
     jmp .no_log_dir
 .have_log:
+    ; The upload capture directory has to exist AND support O_TMPFILE — the
+    ; open is the only honest test, since plenty of directories exist that
+    ; cannot give an unnamed file (some network filesystems, and older ones).
+    ; Checked here so a bad value is a startup error and a --test failure,
+    ; rather than surfacing as a failed upload on the first big POST.
+    push rax
+    push rdi
+    lea rdi, [rdi + linnea_config.spill_dir]
+    call dir_exists
+    test eax, eax
+    jz .sd_bad
+    pop rdi
+    push rdi
+    lea rdi, [rdi + linnea_config.spill_dir]
+    mov esi, LINNEA_O_TMPFILE | LINNEA_O_RDWR | LINNEA_O_CLOEXEC
+    mov edx, LINNEA_MODE_0600
+    mov eax, LINNEA_SYS_OPEN
+    syscall
+    cmp rax, -4095
+    jae .sd_notmp
+    mov edi, eax
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    pop rdi
+    pop rax
+    jmp .spill_ok
+.sd_bad:
+    pop rdi
+    pop rax
+    jmp .no_spill_dir
+.sd_notmp:
+    pop rdi
+    pop rax
+    jmp .spill_no_tmpfile
+.spill_ok:
     mov rax, [rdi + linnea_config.server_count]
     test rax, rax
     jz .no_servers
@@ -396,6 +465,14 @@ linnea_config_validate:
     lea rdi, [msg_bad_host_ip]
     mov esi, msg_bad_host_ip_len
     jmp linnea_error_exit
+.no_spill_dir:
+    lea rdi, [msg_no_spill_dir]
+    mov esi, msg_no_spill_dir_len
+    jmp linnea_error_exit
+.spill_no_tmpfile:
+    lea rdi, [msg_spill_notmp]
+    mov esi, msg_spill_notmp_len
+    jmp linnea_error_exit
 .no_root_dir:
     lea rdi, [msg_no_root_dir]
     mov esi, msg_no_root_dir_len
@@ -466,6 +543,20 @@ linnea_config_dump:
     call linnea_print_stdout
     mov rdi, [rbx + linnea_config.http2]
     call linnea_print_u64_stdout
+    lea rdi, [dump_spill]
+    mov esi, dump_spill_len
+    call linnea_print_stdout
+    lea rdi, [rbx + linnea_config.spill_dir]
+    mov rsi, [rbx + linnea_config.spill_dir_len]
+    call linnea_print_stdout
+    lea rdi, [rbx + linnea_config.spill_dir]
+    call spill_is_tmpfs
+    test eax, eax
+    jz .dump_spill_ok
+    lea rdi, [warn_spill_tmpfs]
+    mov esi, warn_spill_tmpfs_len
+    call linnea_print_stdout
+.dump_spill_ok:
     lea rdi, [dump_headtmo]
     mov esi, dump_headtmo_len
     call linnea_print_stdout

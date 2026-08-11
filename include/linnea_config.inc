@@ -110,6 +110,16 @@ struc linnea_config
     .http2:         resq 1                        ; 1 = offer HTTP/2 via ALPN
     .log:           resb LINNEA_MAX_LOG + 1       ; NUL-terminated log file path
     .log_len:       resq 1
+    ; Where a request body is captured before it goes upstream — one O_TMPFILE
+    ; per upload, on h1, h2 and h3 alike. It only supplies the FILESYSTEM;
+    ; O_TMPFILE creates no directory entry. This is a config key rather than a
+    ; constant because the right answer is deployment-specific and the wrong
+    ; answer is expensive: the default of /tmp is tmpfs on most systems (and
+    ; always so under systemd's PrivateTmp), which makes a "spill" plain
+    ; anonymous memory — an upload then costs its own size in RAM, up to
+    ; max_body, with no writeback and no way for the kernel to reclaim it.
+    .spill_dir:     resb LINNEA_MAX_ROOT + 1
+    .spill_dir_len: resq 1
     .servers:       resb linnea_config_server_size * LINNEA_MAX_SERVERS
 endstruc
 

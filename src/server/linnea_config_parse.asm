@@ -41,6 +41,14 @@ key_servers:            db "servers"
 key_servers_len         equ $ - key_servers
 key_log:                db "log"
 key_log_len             equ $ - key_log
+key_spill:              db "spill_dir"
+key_spill_len           equ $ - key_spill
+; The default is what every deployment got before the key existed. It is a
+; poor default — see the note in linnea_config.inc — so validate warns when
+; the directory it names turns out to be tmpfs rather than silently costing
+; RAM per upload.
+default_spill:          db "/tmp"
+default_spill_len       equ $ - default_spill
 key_timeout:            db "timeout"
 key_timeout_len         equ $ - key_timeout
 key_maxconn:            db "max_connections"
@@ -164,6 +172,8 @@ msg_proxy_long:         db "proxy address too long"
 msg_proxy_long_len      equ $ - msg_proxy_long
 msg_log_long:           db "log too long"
 msg_log_long_len        equ $ - msg_log_long
+msg_spill_bad:          db "spill_dir must be a non-empty path of at most 255 bytes"
+msg_spill_bad_len       equ $ - msg_spill_bad
 
 section .data
 
@@ -205,6 +215,16 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.max_body], LINNEA_DEFAULT_MAX_BODY
     mov qword [rbx + linnea_config.workers], LINNEA_DEFAULT_WORKERS
     mov qword [rbx + linnea_config.http2], 1     ; HTTP/2 on by default (M19)
+    push rdi
+    push rsi
+    lea rdi, [rbx + linnea_config.spill_dir]
+    lea rsi, [default_spill]
+    mov ecx, default_spill_len
+    rep movsb
+    mov byte [rdi], 0
+    pop rsi
+    pop rdi
+    mov qword [rbx + linnea_config.spill_dir_len], default_spill_len
     xor r13d, r13d             ; top-level key mask
 
     mov edi, '{'
@@ -229,6 +249,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_log
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_spill]
+    mov ecx, key_spill_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_spill
     mov rdi, r14
     mov rsi, r15
     lea rdx, [key_timeout]
@@ -341,6 +368,21 @@ linnea_config_parse:
     ja .log_long
     mov [rbx + linnea_config.log_len], rdx
     lea rdi, [rbx + linnea_config.log]
+    mov rsi, rax
+    call linnea_string_copy
+    jmp .top_sep
+
+.top_spill:
+    test r13d, 2048
+    jnz .top_dup
+    or r13d, 2048
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_ROOT
+    ja .spill_long
+    test rdx, rdx
+    jz .spill_long                 ; empty names no filesystem at all
+    mov [rbx + linnea_config.spill_dir_len], rdx
+    lea rdi, [rbx + linnea_config.spill_dir]
     mov rsi, rax
     call linnea_string_copy
     jmp .top_sep
@@ -497,6 +539,10 @@ linnea_config_parse:
 .log_long:
     lea rdi, [msg_log_long]
     mov esi, msg_log_long_len
+    jmp linnea_parse_fail
+.spill_long:
+    lea rdi, [msg_spill_bad]
+    mov esi, msg_spill_bad_len
     jmp linnea_parse_fail
 .timeout_range:
     lea rdi, [msg_timeout_range]

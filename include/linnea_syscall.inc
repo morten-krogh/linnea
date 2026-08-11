@@ -8,6 +8,12 @@ LINNEA_SYS_WRITE     equ 1
 LINNEA_SYS_OPEN      equ 2
 LINNEA_SYS_CLOSE     equ 3
 LINNEA_SYS_FSTAT     equ 5
+LINNEA_SYS_STATFS    equ 137     ; what KIND of filesystem a path is on, which
+                                 ; is the difference between an upload capture
+                                 ; that can be written back and evicted and one
+                                 ; that is simply RAM (see spill_dir)
+LINNEA_STATFS_BUF    equ 120     ; struct statfs; f_type is the first qword
+LINNEA_TMPFS_MAGIC   equ 0x01021994
 LINNEA_SYS_LSEEK     equ 8
 LINNEA_SEEK_SET      equ 0
 LINNEA_SYS_PWRITE64  equ 18      ; write at an explicit offset, without moving

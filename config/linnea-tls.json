@@ -3,6 +3,7 @@
   "timeout": 60,
   "drain_timeout": 10,
   "max_body": 83886080,
+  "spill_dir": "/home/linnea/spill",
   "servers": [
     {
       "host": "0.0.0.0",

@@ -2190,6 +2190,25 @@ out=$(python3 test/reload_deadline_test.py)
 case "$out" in OK*) true ;; *) false ;; esac
 check "a reload retires an old worker a tunnel pins ($out)" $?
 
+# --- the upload capture lands on the filesystem spill_dir names -----------
+# doc_claims_test covers the parsing and validation of the key. What it cannot
+# see is the two open() sites going back to a hardcoded "/tmp" — silent, and
+# its only symptom is uploads held in RAM instead of on disk. An O_TMPFILE has
+# no directory entry, so the descriptor in /proc is the only evidence there is.
+mkdir -p test/spill
+python3 test/proxy_backend.py >/dev/null 2>&1 &
+spill_backend_pid=$!
+backend_ready
+start_server test/configs/spill-dir.json
+spill_pid=$SRV_PID
+sleep 0.3
+out=$(timeout 60 python3 test/spill_dir_test.py 61495 test/spill $spill_pid 2>&1)
+case "$out" in ok*) true ;; *) false ;; esac
+check "the upload capture file is created under spill_dir ($out)" $?
+kill $spill_pid $spill_backend_pid 2>/dev/null
+wait $spill_pid 2>/dev/null
+wait $spill_backend_pid 2>/dev/null
+
 # --- the assembly websocket backend, direct and through the tunnel ---
 # The same battery both ways: RFC 6455 handshake, framing, unmasking, the
 # broadcast, and the protocol errors. Passing directly but failing proxied

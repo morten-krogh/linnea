@@ -227,7 +227,7 @@ extern linnea_quic_ticket_within_lifetime
 section .rodata
 ; The directory only supplies the filesystem — O_TMPFILE creates no entry in
 ; it. The unit runs with PrivateTmp, so this is a namespace of our own.
-ra_spill_dir: db "/tmp", 0
+; (the upload capture directory now comes from the config: spill_dir)
 quic_alpn_h3:   db "h3"        ; the one application protocol this server offers
 ; Retry integrity tag key and nonce, fixed by the RFC per QUIC version:
 ; v1 RFC 9001 5.8, v2 RFC 9369 3.3. They authenticate a Retry to any client
@@ -6608,7 +6608,8 @@ ra_body_sink:
     mov r13, rdx
     cmp qword [rbx + linnea_quic_ra.spill_fd], -1
     jne .bs_have_fd
-    lea rdi, [ra_spill_dir]
+    lea rdi, [linnea_config_instance]
+    lea rdi, [rdi + linnea_config.spill_dir]
     mov esi, LINNEA_O_TMPFILE | LINNEA_O_RDWR | LINNEA_O_CLOEXEC
     mov edx, LINNEA_MODE_0600
     mov eax, LINNEA_SYS_OPEN

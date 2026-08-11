@@ -37,8 +37,10 @@ global linnea_spill_reset
 section .rodata
 
 ; The directory only supplies the filesystem — O_TMPFILE creates no entry in
-; it. The unit runs with PrivateTmp, so this is a namespace of our own.
-spill_dir: db "/tmp", 0
+; it. It comes from the config (spill_dir) rather than being fixed here: the
+; old literal was "/tmp", which under PrivateTmp is always tmpfs, so every
+; captured upload was held in RAM up to max_body with no writeback and nothing
+; the kernel could reclaim.
 
 section .text
 
@@ -49,7 +51,8 @@ linnea_spill_open:
     cmp dword [rdi + linnea_connection.spill_fd], -1
     jne .already
     push rdi
-    lea rdi, [spill_dir]
+    lea rdi, [linnea_config_instance]
+    lea rdi, [rdi + linnea_config.spill_dir]
     mov esi, LINNEA_O_TMPFILE | LINNEA_O_RDWR | LINNEA_O_CLOEXEC
     mov edx, LINNEA_MODE_0600
     mov eax, LINNEA_SYS_OPEN

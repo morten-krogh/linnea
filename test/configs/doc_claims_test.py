@@ -148,6 +148,21 @@ test(base(drain_timeout=3601), "drain_timeout above 3600 rejected", False,
 test(base(drain_timeout=0), "drain_timeout:0 rejected (no way to disable it)",
      False, "drain_timeout must be between 1 and 3600")
 test(base(drain_timeout=1), "drain_timeout at 1 accepted", True)
+
+# spill_dir: the doc says it must exist, must support O_TMPFILE, is a global,
+# and is <= 255 bytes. It also says the default is /tmp -- which the doc warns
+# about rather than recommends, so what is asserted is that omitting the key is
+# ACCEPTED, not that /tmp is a good idea.
+test(base(spill_dir="/no/such/directory"), "spill_dir must exist", False,
+     "spill_dir is not an existing directory")
+test(base(spill_dir="/proc"), "spill_dir must support O_TMPFILE", False,
+     "does not support O_TMPFILE")
+test(base(spill_dir=""), "spill_dir may not be empty", False,
+     "spill_dir must be a non-empty path")
+test(base(spill_dir="x" * 256), "spill_dir over 255 bytes rejected", False,
+     "spill_dir must be a non-empty path")
+test(base(spill_dir=D), "spill_dir on a real directory accepted", True)
+test(base(), "spill_dir is optional (defaults to /tmp)", True)
 test(srv(drain_timeout=30), "drain_timeout on a SERVER is unknown", False,
      "unknown key")
 test(srv(port=65536), "port above 65535 rejected", False)
