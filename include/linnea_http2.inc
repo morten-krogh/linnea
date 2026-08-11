@@ -266,10 +266,12 @@ struc linnea_h2p
     .chunk_rem: resq 1            ; data bytes left in the current chunk
     .status:    resq 1            ; upstream status (or our 502/504)
     .flags:     resq 1            ; LINNEA_H2P_F_*
-    ; Streaming request body: a FIFO in the connection's upload buffer. A
-    ; client may have a full receive window in flight before it has even
-    ; processed our SETTINGS, so the FIFO is sized for the protocol default
-    ; (65535) rather than anything we could advertise; the window is credited
+    ; Streaming request body: a FIFO in the connection's upload buffer, whose
+    ; size IS the window we advertise (LINNEA_H2P_UPLOAD_BUF). It has to hold
+    ; a full receive window, and both ways round: a client that has not yet
+    ; processed our SETTINGS may have the protocol default of 65535 in flight,
+    ; and one that has may have the whole advertised window — the buffer
+    ; covers the larger of the two by construction. The window is credited
     ; back only as bytes go upstream, which paces everything after that.
     .rq_buf:    resq 1            ; the FIFO (0 = collecting, not streaming)
     .rq_rd:     resq 1            ; next body byte to send upstream

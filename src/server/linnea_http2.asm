@@ -1938,10 +1938,18 @@ h2_serve:
     ja .proxy_toolarge
     test rax, rax
     jz .proxy_nobody
-    ; claim the connection's upload buffer; without it (a second concurrent
-    ; upload) fall back to collecting a bounded body
-    cmp qword [rbx + linnea_connection.h2_upload], 0
-    jne .proxy_done
+    ; Claim the connection's upload buffer; without it — a GENUINELY
+    ; concurrent second upload — fall back to collecting a bounded body.
+    ; h2_upload_owner first drops a claim whose owner has already finished,
+    ; which is what made the ordinary case (two uploads one after another on
+    ; the same connection) fail with 413. Testing the raw field here was the
+    ; bug.
+    push rax                         ; the declared length, wanted below
+    mov rdi, rbx
+    call h2_upload_owner
+    test rax, rax
+    pop rax                          ; pop leaves the flags alone
+    jnz .proxy_done                  ; someone really is streaming: collect
     lea rcx, [r14 + 1]
     mov [rbx + linnea_connection.h2_upload], rcx
     mov rcx, [rbx + linnea_connection.index]
@@ -2873,6 +2881,41 @@ h2p_free_slot:
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FREE
     ret
 
+; h2_upload_owner(rdi = conn) -> rax = the slot still streaming into this
+; connection's upload buffer, or 0 — dropping the claim when its owner has
+; finished. Clobbers rax, rcx, rdx; a leaf, and touches no SSE.
+;
+; The claim test and the release used to disagree about when a claim ends.
+; It was released only by h2p_service's unclaim pass, but tested whenever a
+; request head was parsed — so a SECOND upload arriving before the next
+; service pass saw a claim whose owner was long gone, fell back to the
+; bounded collect path, and was refused 413 at LINNEA_H2P_BODY_MAX (8 KiB)
+; however large max_body was. Reproduced dead on: three uploads over one
+; connection gave 200, 413, 200. Deciding it where it is USED makes it
+; self-healing, and both callers now go through here rather than keeping two
+; copies of what "still streaming" means.
+h2_upload_owner:
+    mov rcx, [rdi + linnea_connection.h2_upload]
+    test rcx, rcx
+    jz .none
+    dec rcx                          ; stored as slot index + 1
+    imul rax, rcx, linnea_h2p_size
+    mov rdx, [rdi + linnea_connection.index]
+    imul rdx, rdx, LINNEA_H2P_SLOTS
+    imul rdx, rdx, linnea_h2p_size
+    add rax, rdx
+    add rax, [h2p_pool]
+    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
+    jz .stale
+    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
+    je .stale
+    ret
+.stale:
+    mov qword [rdi + linnea_connection.h2_upload], 0
+.none:
+    xor eax, eax
+    ret
+
 ; linnea_h2p_service(rdi = conn) -> rax = 1 when out_ptr/out_rem now hold
 ; frames to send, else 0. Emits whatever the slots have made ready: a
 ; translated response HEADERS, an error response, or a RST_STREAM. Body DATA
@@ -2887,20 +2930,10 @@ linnea_h2p_service:
     mov rbx, rdi                     ; conn
     ; the upload buffer belongs to one streaming request at a time: hand it
     ; back as soon as that slot is done, so the next upload can have it
-    mov rcx, [rbx + linnea_connection.h2_upload]
-    test rcx, rcx
+    mov rdi, rbx
+    call h2_upload_owner             ; releases it too, if the owner is done
+    test rax, rax
     jz .sv_claim_ok
-    dec rcx
-    imul rax, rcx, linnea_h2p_size
-    mov rdx, [rbx + linnea_connection.index]
-    imul rdx, rdx, LINNEA_H2P_SLOTS
-    imul rdx, rdx, linnea_h2p_size
-    add rax, rdx
-    add rax, [h2p_pool]
-    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
-    jz .sv_unclaim
-    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
-    je .sv_unclaim
     ; Still streaming: the body clock. Every received byte paid it forward
     ; (LINNEA_BODY_NS_PER_BYTE, the DATA path); a client trickling — or gone
     ; silent, with the recv timeout driving this pass — falls behind by more
@@ -2924,9 +2957,6 @@ linnea_h2p_service:
     jbe .sv_claim_ok
     mov qword [r12 + linnea_h2p.state], LINNEA_H2P_FAILED
     mov qword [r12 + linnea_h2p.status], 408
-    jmp .sv_claim_ok
-.sv_unclaim:
-    mov qword [rbx + linnea_connection.h2_upload], 0
 .sv_claim_ok:
     cmp qword [rbx + linnea_connection.h2_tx_busy], 0
     jne .sv_none                     ; out_buf is in flight; retry on drain

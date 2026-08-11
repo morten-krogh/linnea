@@ -3815,6 +3815,28 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     timeout 90 python3 test/tls/h2_upload_window.py $CA 61443 >/dev/null 2>&1
     check "http2 upload: window advertised, credit batched, round trips bounded" $?
 
+    # Uploads one after another on ONE connection. The streaming buffer's
+    # claim (conn.h2_upload) was released by the service pass but TESTED when
+    # the next request head was parsed, so the second upload saw a claim whose
+    # owner had finished, fell back to the bounded collect path, and was
+    # refused 413 at LINNEA_H2P_BODY_MAX — 8 KiB — however large max_body was.
+    # Dead alternation: 200 413 200 413. Every existing upload check used a
+    # fresh connection, so none of them could see it.
+    # The local_port comparison is load-bearing: if curl ever stopped reusing
+    # the connection this would pass while testing nothing.
+    python3 -c "open('test/www/h2seq.bin','wb').write(b'S'*100000)"
+    u3=$(curl -s --http2 --cacert $CA -H "Expect:" --max-time 30 \
+            -X POST --data-binary @test/www/h2seq.bin -w '%{http_code}:%{local_port} ' -o /dev/null $U/api/echo \
+         --next -s --http2 --cacert $CA -H "Expect:" \
+            -X POST --data-binary @test/www/h2seq.bin -w '%{http_code}:%{local_port} ' -o /dev/null $U/api/echo \
+         --next -s --http2 --cacert $CA -H "Expect:" \
+            -X POST --data-binary @test/www/h2seq.bin -w '%{http_code}:%{local_port}' -o /dev/null $U/api/echo)
+    u3codes=$(echo "$u3" | tr ' ' '\n' | cut -d: -f1 | tr '\n' ' ')
+    u3conns=$(echo "$u3" | tr ' ' '\n' | cut -d: -f2 | sort -u | grep -c .)
+    [ "$u3codes" = "200 200 200 " ] && [ "$u3conns" -eq 1 ]
+    check "http2: three uploads in a row on one connection all stream ($u3codes on $u3conns conn)" $?
+    rm -f test/www/h2seq.bin
+
     # Body-phase slowloris (Q119): head_timeout used to stop at the request
     # head, so a client trickling a proxied request body — or sitting silent
     # on an h2 upload, dodging the idle timeout — held its upstream slot
