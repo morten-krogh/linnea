@@ -3806,6 +3806,15 @@ open('test/www/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in ra
     check "http2 streams a 300000-byte request body past the flow-control window" $?
     rm -f /tmp/h2upload_echo.bin test/www/h2upload.bin
 
+    # ...and what that check structurally cannot see: how many ROUND TRIPS the
+    # body costs. It passed, byte-exact, while the server advertised no
+    # SETTINGS_INITIAL_WINDOW_SIZE and credited 16 KiB at a time — 16 KiB per
+    # RTT, invisible on loopback and 546 KB/s from a laptop. The round-trip
+    # count is a property of the flow-control policy alone, so it reads the
+    # same here as it would over a real network.
+    timeout 90 python3 test/tls/h2_upload_window.py $CA 61443 >/dev/null 2>&1
+    check "http2 upload: window advertised, credit batched, round trips bounded" $?
+
     # Body-phase slowloris (Q119): head_timeout used to stop at the request
     # head, so a client trickling a proxied request body — or sitting silent
     # on an h2 upload, dodging the idle timeout — held its upstream slot

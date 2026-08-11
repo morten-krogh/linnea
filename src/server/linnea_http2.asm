@@ -131,10 +131,10 @@ linnea_h2_init:
     rep stosq
     pop rdi
     lea rax, [rdi + linnea_connection.out_buf]
-    ; SETTINGS frame: length 18, type 4, flags 0, stream 0, three settings
+    ; SETTINGS frame: length 24, type 4, flags 0, stream 0, four settings
     mov byte [rax], 0
     mov byte [rax + 1], 0
-    mov byte [rax + 2], 18
+    mov byte [rax + 2], 24
     mov byte [rax + 3], LINNEA_H2_FT_SETTINGS
     mov byte [rax + 4], 0
     mov dword [rax + 5], 0          ; stream 0
@@ -162,8 +162,26 @@ linnea_h2_init:
     mov byte [rax + 21], 0
     mov byte [rax + 22], LINNEA_H2_SETTINGS_MAX_HEADER_LIST
     mov dword [rax + 23], 0x00200000    ; value 8192, big-endian
+    ; INITIAL_WINDOW_SIZE: the per-stream RECEIVE window, which is exactly the
+    ; upload buffer that has to hold what arrives in it — derived from the
+    ; constant, like MAX_CONCURRENT_STREAMS above, so the number on the wire
+    ; cannot drift from the buffer behind it. Left unsent, this defaulted to
+    ; 65535 and an upload advanced one frame per round trip.
+    mov byte [rax + 27], 0
+    mov byte [rax + 28], LINNEA_H2_SETTINGS_INITIAL_WINDOW_SIZE
+    mov dword [rax + 29], LINNEA_H2_BE32(LINNEA_H2P_UPLOAD_BUF)
+    ; ...and the connection window, which SETTINGS cannot carry: RFC 9113
+    ; 6.9.2 fixes it at 65535 until a WINDOW_UPDATE moves it. Without this the
+    ; stream window above would be advertised and then never reachable.
+    push rdi
+    lea rdi, [rax + 33]
+    xor esi, esi                        ; stream 0: the connection window
+    mov edx, LINNEA_H2_CONN_WINDOW_INC
+    call h2p_emit_window                ; -> rax = 13
+    pop rdi
+    lea rax, [rdi + linnea_connection.out_buf]
     mov [rdi + linnea_connection.out_ptr], rax
-    mov qword [rdi + linnea_connection.out_rem], 27
+    mov qword [rdi + linnea_connection.out_rem], 33 + 13
     mov qword [rdi + linnea_connection.file_rem], 0
     mov qword [rdi + linnea_connection.h2_tx_busy], 1
     ret
@@ -2956,6 +2974,21 @@ linnea_h2p_service:
     mov r14, [r12 + linnea_h2p.rq_credit]
     test r14, r14
     jz .sv_no_credit
+    ; Batched, not per frame: a grant is worth a round trip only once it is
+    ; big enough to matter. This ran on every 16 KiB DATA frame, which is why
+    ; an upload advanced 16 KiB per RTT however fast the link was. Holding a
+    ; part-grant back cannot stall the client, because GRANT_MIN is smaller
+    ; than the window it is topping up (asserted where they are defined), so
+    ; there is always room left to send into.
+    cmp r14, LINNEA_H2P_GRANT_MIN
+    jae .sv_grant
+    ; ...unless the body has all arrived. Nothing more is coming to trip the
+    ; threshold, and this is CONNECTION credit as well as stream credit: left
+    ; unreturned it is gone for good, and a connection doing upload after
+    ; upload would starve its own window a remainder at a time.
+    cmp qword [r12 + linnea_h2p.rq_rem], 0
+    jne .sv_no_credit
+.sv_grant:
     mov qword [r12 + linnea_h2p.rq_credit], 0
     mov rdi, r15
     mov rsi, [r12 + linnea_h2p.sid]

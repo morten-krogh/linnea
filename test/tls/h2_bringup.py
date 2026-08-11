@@ -37,8 +37,22 @@ s.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0))
 
 t, f, sid, p = readframe()
 assert t == 4, f"expected server SETTINGS, got type {t}"
-t, f, sid, p = readframe()
-assert t == 4 and f & 1, f"expected SETTINGS ACK, got type {t} flags {f}"
+# The server's opening SETTINGS carries the per-stream receive window, but the
+# CONNECTION window can only be moved by a WINDOW_UPDATE (RFC 9113 6.9.2), so
+# bring-up sends one before it gets round to acking our SETTINGS. Read to the
+# ACK rather than assuming it comes second, and require that what precedes it
+# is that grant — the ordering used to be asserted by accident, and the grant
+# is the thing worth checking is there.
+saw_conn_window = 0
+while True:
+    t, f, sid, p = readframe()
+    if t == 4:
+        assert f & 1, f"expected SETTINGS ACK, got SETTINGS flags {f}"
+        break
+    assert t == 8 and sid == 0, f"unexpected frame {t} on stream {sid} at bring-up"
+    saw_conn_window += int.from_bytes(p[:4], "big") & 0x7fffffff
+assert saw_conn_window >= 262144, \
+    f"connection window raised by only {saw_conn_window} at bring-up"
 
 # PING must be answered with an ACK echoing the payload
 s.sendall(frame(6, 0, 0, b"linnea!!"))

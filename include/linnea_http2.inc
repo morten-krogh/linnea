@@ -168,11 +168,48 @@ LINNEA_H2P_HEAD_ROOM  equ 7680
 ; largest is a redirect, whose Location carries a URL prefix plus the request
 ; target (bounded at 2048 where it is built).
 LINNEA_H2_RESP_ROOM   equ 3072
-; One streaming upload per connection gets this buffer (the h2 default
-; receive window, rounded up). Mapped lazily, so a connection that never
-; uploads never touches it; a second concurrent upload on the same
-; connection falls back to the bounded collect path.
-LINNEA_H2P_UPLOAD_BUF equ 65536
+; One streaming upload per connection gets this buffer, and it IS the receive
+; window we advertise as SETTINGS_INITIAL_WINDOW_SIZE. The two are one
+; constant on purpose: the FIFO cannot overflow only because a client may not
+; send past its window, which is what makes the bound at .fd_toobig ("past a
+; full receive window: impossible") true. Advertise more than the buffer and
+; that stops being true.
+;
+; 64 KiB — the RFC default, rounded up — used to be the whole upload
+; pipeline, and credit was returned as bytes drained to the backend, one
+; 16 KiB frame at a time. Steady-state upload throughput was therefore
+; 16 KiB per ROUND TRIP: invisible on loopback, where every upload test runs
+; and passes, but 546 KB/s at a laptop's 30 ms and a quarter of a minute for
+; an 8 MiB upload. 1 MiB matches HTTP/3's LINNEA_QUIC_INITIAL_MAX_DATA, so an
+; upload runs at the same rate whichever protocol the browser picked — the
+; same argument that pinned LINNEA_H2_MAX_STREAMS to h3's stream limit.
+;
+; Cost: mapped lazily and claimed only while a streaming upload is actually
+; in flight, so nothing is resident until a client uploads; the worst case is
+; max_connections uploading at once, 1 GiB per worker at the default 1024.
+; A second concurrent upload on one connection still falls back to the
+; bounded collect path.
+LINNEA_H2P_UPLOAD_BUF equ 1048576
+%if LINNEA_H2P_UPLOAD_BUF > 0x7fffffff
+  %error "SETTINGS_INITIAL_WINDOW_SIZE is capped at 2^31-1 (RFC 9113 6.5.2)"
+%endif
+; Credit is batched rather than returned per frame: a grant goes out once this
+; much has drained upstream, cutting the round trips by the ratio between the
+; two. It cannot stall an upload while it stays below the window — withholding
+; less than a full step still leaves the client UPLOAD_BUF - GRANT_MIN of room
+; to send into — which is what the build guard below enforces. 256 KiB is the
+; step h3 already uses (LINNEA_QUIC_FC_GRANT_MIN).
+LINNEA_H2P_GRANT_MIN  equ 262144
+%if LINNEA_H2P_GRANT_MIN >= LINNEA_H2P_UPLOAD_BUF
+  %error "the h2 upload grant step must stay below the window, or a body smaller than one step can stall"
+%endif
+; SETTINGS_INITIAL_WINDOW_SIZE governs STREAM windows only. The CONNECTION
+; window starts at 65535 by RFC 9113 6.9.2 and moves only on a WINDOW_UPDATE,
+; so bring-up sends one; without it the connection window is the binding
+; constraint and a bigger stream window buys nothing at all. One streaming
+; upload plus the bounded collect bodies is everything a connection can have
+; in flight at once, so that is what we grant on top of the default.
+LINNEA_H2_CONN_WINDOW_INC equ LINNEA_H2P_UPLOAD_BUF + LINNEA_H2P_SLOTS * LINNEA_H2P_BODY_MAX
 ; The request-body clock (h1 streaming relay and h2 uploads): the head deadline
 ; keeps running through the body, and every received byte buys this much more
 ; time. 2 ms/byte = a 500 B/s floor — any real uploader outruns it thousands of
