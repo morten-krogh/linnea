@@ -2,7 +2,7 @@
   "log": "linnea.log",
   "timeout": 60,
   "drain_timeout": 10,
-  "max_body": 8388608,
+  "max_body": 83886080,
   "servers": [
     {
       "host": "0.0.0.0",
