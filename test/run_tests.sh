@@ -2250,6 +2250,15 @@ done
 out3=$(timeout 120 python3 test/quic/h3_fin_at_limit_test.py 61498 2>&1)
 case "$out3" in ok*) true ;; *) false ;; esac
 check "h3 a stream ended at the flow-control limit is not a violation ($out3)" $?
+# An upload in progress survives other connections ending. A teardown releases
+# all RA_CTXS contexts and closes any descriptor they hold, but "holds one" was
+# spelled != -1 while a freshly allocated connection slot is ZEROED -- so every
+# connection that ended closed fd 0 once per unused context, and fd 0 is
+# routinely another request's capture file (the worker closes stdin). That
+# upload then died with a 413 naming no method and no path.
+out4=$(timeout 120 python3 test/quic/h3_capture_fd_test.py 61498 2>&1)
+case "$out4" in ok*) true ;; *) false ;; esac
+check "h3 an upload survives other connections being torn down ($out4)" $?
 kill $spill_pid $h3big_pid $spill_backend_pid 2>/dev/null
 wait $spill_pid 2>/dev/null
 wait $spill_backend_pid 2>/dev/null

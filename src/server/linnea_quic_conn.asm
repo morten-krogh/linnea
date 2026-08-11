@@ -156,6 +156,23 @@ linnea_quic_conn_alloc:
     mov qword [rbx + linnea_quic_conn.in_use], 1
     mov qword [rbx + linnea_quic_conn.idle_secs], LINNEA_QUIC_IDLE_SECS
     mov qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_NEW
+    ; "no capture file" is -1, and the zeroing above writes 0 -- which is a
+    ; PERFECTLY GOOD descriptor. The teardown releases all RA_CTXS contexts
+    ; unconditionally (a completed one has given its slot back and still holds
+    ; its file), so without this every connection that ended closed fd 0 once
+    ; per context it never used. The worker closes stdin, so fd 0 is routinely
+    ; the capture file of a request on ANOTHER connection: that upload's next
+    ; pwrite returned EBADF and the client got a 413 naming no method and no
+    ; path, because the request head had not been parsed yet. Intermittent by
+    ; nature -- it needs the two to overlap -- and it cost a long detour from
+    ; the bug it was hiding behind.
+    lea rdi, [rbx + linnea_quic_conn.ra_ctx]
+    mov ecx, LINNEA_QUIC_RA_CTXS
+.spill_none:
+    mov qword [rdi + linnea_quic_ra.spill_fd], -1
+    add rdi, linnea_quic_ra_size
+    dec ecx
+    jnz .spill_none
     ; connection id = steering index || pool index || 6 random bytes. The
     ; steering index routes the connection back to this worker (BPF reuseport);
     ; the pool index locates the slot; the random tail authenticates it.
