@@ -2537,19 +2537,19 @@ linnea_quic_server_datagram:
     pop rax
     jmp .ra_donecheck
 .ra_body_failed:
-    ; the payload could not be put where it was going -- a full filesystem, or
-    ; a peer fragmenting past what the range list will track. Ours to answer,
-    ; not a protocol error, so the same verdict the walk gives for its sink.
+    ; The payload could not be put where it was going -- a full filesystem, a
+    ; peer fragmenting past what the range list will track, or a DECLARED
+    ; payload past max_body. All three are ours to answer rather than protocol
+    ; errors, and all three mean the same thing to the client, so they share
+    ; the sink verdict: .req_body_toolarge turns it into a 413 on the stream,
+    ; which is what h1 and h2 answer an oversized upload with.
+    ;
+    ; This label sits behind an unconditional jump ON PURPOSE. The max_body
+    ; refusal first lived next to .ra_fed_none, where it read more naturally
+    ; and where it sat directly after the grant's call -- so every
+    ; MAX_STREAM_DATA the server successfully sent fell through into it. Every
+    ; value was correct; only the position was wrong.
     mov rax, -LINNEA_H3_ERR_SINK
-    jmp .ra_walk_failed
-.ra_body_toolarge:
-    ; A declared payload past max_body: refuse before the bytes land, the rule
-    ; h1 and h2 apply to Content-Length. It lives HERE, behind an unconditional
-    ; jump, and not next to .ra_fed_none where it reads more naturally — there
-    ; it sat directly after the grant's call, so every MAX_STREAM_DATA the
-    ; server successfully sent fell through into this refusal and answered 431.
-    ; Every value involved was correct; only the label's position was wrong.
-    mov rax, -LINNEA_H3_ERR_TOOLARGE
     jmp .ra_walk_failed
 .ra_win:
     sub r9, r11                                ; offset within the window
@@ -2676,7 +2676,7 @@ linnea_quic_server_datagram:
     lea rcx, [linnea_config_instance]
     cmp rax, [rcx + linnea_config.max_body]
     pop rcx
-    ja .ra_body_toolarge
+    ja .ra_body_failed          ; 413, via the sink verdict — see there
     mov rax, [rdi + linnea_quic_ra.base]
     mov [rdi + linnea_quic_ra.body_from], rax
     mov [rdi + linnea_quic_ra.body_hi], rax
