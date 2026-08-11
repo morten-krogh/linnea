@@ -178,6 +178,7 @@ extern linnea_quic_tp_error
 extern linnea_quic_tp_iscid
 extern linnea_quic_tp_iscid_len
 extern linnea_quic_flow_scan
+extern linnea_quic_flow_blocked
 extern linnea_quic_parse_priority
 extern linnea_quic_reset_scan
 extern linnea_quic_path_seen
@@ -2261,11 +2262,25 @@ linnea_quic_server_datagram:
     ; a new connection recovers.
     mov qword [fc_scan], 0
     mov qword [fc_scan + 8], 0
+    mov byte [linnea_quic_flow_blocked], 0
     lea rdi, [plaintext]
     mov rsi, r14
     mov rdx, -1                       ; matches no stream id: MAX_STREAM_DATA is left
     lea rcx, [fc_scan]                ; to the per-stream walk, which owns the slots
     call linnea_quic_flow_scan
+    ; The peer says it is blocked on the connection window. Re-arm the grant so
+    ; the ceiling we have already committed to goes out again: MAX_DATA is
+    ; monotonic, so re-sending the same value is always safe, and it is the only
+    ; repair there is for one that was lost. A grant normally rides a bare ACK,
+    ; which is emitted untracked and therefore never retransmitted, and the next
+    ; grant only fires when more data arrives -- which is precisely what a
+    ; blocked peer cannot send. Three of today's stalls were a grant that was
+    ; never sent; this is the one that could be lost instead.
+    cmp byte [linnea_quic_flow_blocked], 0
+    je .no_blocked
+    mov rcx, [cur_conn]
+    mov qword [rcx + linnea_quic_conn.fc_pending], 1
+.no_blocked:
     mov rcx, [cur_conn]
     mov rdx, [fc_scan]                ; largest MAX_DATA in this packet
     test rdx, rdx

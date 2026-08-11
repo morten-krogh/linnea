@@ -47,6 +47,7 @@ global linnea_quic_tp_iscid_len
 global linnea_quic_tp_cid_lim
 global linnea_quic_tp_error
 global linnea_quic_flow_scan
+global linnea_quic_flow_blocked
 global linnea_quic_parse_priority
 global linnea_quic_reset_scan
 global linnea_quic_path_seen
@@ -2261,7 +2262,7 @@ linnea_quic_flow_scan:
     cmp bl, 0x13                     ; MAX_STREAMS uni (1 varint)
     je .fw_v1
     cmp bl, 0x14                     ; DATA_BLOCKED (1 varint)
-    je .fw_v1
+    je .fw_blocked
     cmp bl, 0x16                     ; STREAMS_BLOCKED bidi (1 varint)
     je .fw_v1
     cmp bl, 0x17                     ; STREAMS_BLOCKED uni (1 varint)
@@ -2284,6 +2285,19 @@ linnea_quic_flow_scan:
 .fw_skip8:
     add rdi, 9                       ; type byte + 8 fixed bytes
     jmp .fw_scan
+.fw_blocked:
+    ; The peer says it has data to send and no credit for it. Skipped like any
+    ; other frame until now -- but it is the ONLY way a grant that never
+    ; arrived can be noticed. MAX_DATA rides whatever 1-RTT packet is going
+    ; out, and for a peer that is uploading that is usually a bare ACK, which
+    ; is emitted untracked and so never retransmitted; the next grant only
+    ; fires when more data arrives, which is exactly what a blocked peer
+    ; cannot send. Re-advertising costs one frame and settles it.
+    ;
+    ; Falls through to .fw_v1 ON PURPOSE: noting the frame does not consume it,
+    ; and DATA_BLOCKED is still one varint that has to be stepped over like any
+    ; other. A jmp here would leave the cursor on the frame's own body.
+    mov byte [linnea_quic_flow_blocked], 1
 .fw_v1:
     inc rdi
     call linnea_quic_varint_decode
@@ -3685,6 +3699,9 @@ linnea_quic_varint_encode:
     ret
 
 section .bss
+; Set by linnea_quic_flow_scan when the packet carried a DATA_BLOCKED. The
+; caller clears it before the scan and acts on it after.
+linnea_quic_flow_blocked: resb 1
 ; retry_source_connection_id (RFC 9000 7.3): the id a Retry issued for this
 ; handshake, which the client verifies. Zero length = no Retry, parameter omitted.
 linnea_quic_retry_scid:     resb LINNEA_QUIC_MAX_CID

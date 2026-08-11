@@ -2268,6 +2268,19 @@ check "h3 an upload survives other connections being torn down ($out4)" $?
 out5=$(timeout 120 python3 test/quic/h3_multi_data_test.py 61498 2>&1)
 case "$out5" in ok*) true ;; *) false ;; esac
 check "h3 a body in several DATA frames keeps its credit ($out5)" $?
+# A peer that says it is blocked must be told the window again. MAX_DATA rides
+# whatever 1-RTT packet is going out, and for an uploading peer that is usually
+# a bare ACK -- which this server emits UNTRACKED, so a lost one is never
+# retransmitted, and the next grant only fires when more data arrives, which is
+# what a blocked peer cannot send. DATA_BLOCKED is the peer's own remedy under
+# RFC 9000 4.1 and was parsed only to be stepped over.
+if python3 -c 'import aioquic' 2>/dev/null; then
+    outb=$(timeout 90 python3 test/quic/h3_data_blocked_test.py 61498 2>&1)
+    case "$outb" in ok*) true ;; *) false ;; esac
+    check "h3 DATA_BLOCKED re-advertises the connection window ($outb)" $?
+else
+    check "h3 DATA_BLOCKED (skipped: aioquic unavailable)" 0
+fi
 # A body the server CANNOT CAPTURE must not be reported as one the client sent
 # too much of. Opening the capture file, writing it, a full filesystem and a
 # payload fragmented past the range list all returned a bare -1, and the caller
