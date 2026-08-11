@@ -2644,11 +2644,11 @@ linnea_quic_server_datagram:
     ; zero. Skipping the feed here left such a request buffered for ever: no
     ; response, no reset, and the context never given back.
     cmp qword [rax + linnea_quic_ra.fin], 0
-    je .ra_fed_none
+    je .ra_grant_only
     mov r9, [rax + linnea_quic_ra.base]
     add r9, r10
     cmp r9, [rax + linnea_quic_ra.final]
-    jne .ra_fed_none                           ; a gap remains before the end
+    jne .ra_grant_only                         ; a gap remains before the end
 .ra_feed:
     mov [s_ra_ctx], rax                        ; the walk may fail; the handlers
                                                ; below need to find its context
@@ -2789,6 +2789,29 @@ linnea_quic_server_datagram:
                                                ; lost grant is a stalled upload
 .ra_fed_none:
     jmp .ra_more                               ; more of the stream to come
+.ra_grant_only:
+    ; Nothing to feed the walk -- but the peer may still be owed credit, and
+    ; the grant lives only on the feed's tail, so leaving here directly meant
+    ; never sending one.
+    ;
+    ; That deadlocked a body split across SEVERAL DATA frames. Closing a
+    ; payload region slides base to its end and comes straight here, and on
+    ; that pass len == fed and no FIN has arrived: the ceiling the peer holds
+    ; is the payload's end, which is now exactly base, so it has no credit for
+    ; the next frame's header and cannot send the byte that would let us grant
+    ; more. Both sides then wait for ever. The trace reads adv == base with a
+    ; whole body already captured.
+    ;
+    ; A single-frame body hides it completely: there the FIN arrives with the
+    ; payload's last bytes, so this pass completes the request instead of
+    ; needing more of the stream. A streaming upload (fetch with a
+    ; ReadableStream) whose chunks exceed RA_BUF is what reaches it.
+    ;
+    ; Costs nothing when no credit is owed: the ceiling block's own renege
+    ; check and grant floor turn every such pass into the same jump to
+    ; .ra_fed_none it would have taken anyway.
+    mov rdi, rax                               ; the ceiling block reads the ctx
+    jmp .ra_ceiling                            ; from rdi, .ra_donecheck from rax
 .ra_complete:
     ; the capture file is NOT closed here: its contents are the request body,
     ; and the serve is about to be handed it. The close comes after — and

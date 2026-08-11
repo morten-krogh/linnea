@@ -2259,6 +2259,15 @@ check "h3 a stream ended at the flow-control limit is not a violation ($out3)" $
 out4=$(timeout 120 python3 test/quic/h3_capture_fd_test.py 61498 2>&1)
 case "$out4" in ok*) true ;; *) false ;; esac
 check "h3 an upload survives other connections being torn down ($out4)" $?
+# A body split across several DATA frames, where a non-final one is big enough
+# to take the capture-file path. Closing a payload region leaves through the
+# done-check with nothing to feed, and the grant lived only on the feed's tail
+# -- so the peer was left holding a ceiling equal to the base, with no credit
+# for the next frame's header, and both sides waited for ever. Every other h3
+# upload check sends ONE DATA frame, which is what hid it.
+out5=$(timeout 120 python3 test/quic/h3_multi_data_test.py 61498 2>&1)
+case "$out5" in ok*) true ;; *) false ;; esac
+check "h3 a body in several DATA frames keeps its credit ($out5)" $?
 kill $spill_pid $h3big_pid $spill_backend_pid 2>/dev/null
 wait $spill_pid 2>/dev/null
 wait $spill_backend_pid 2>/dev/null
