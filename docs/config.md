@@ -245,7 +245,7 @@ re-execs — there is no config-only reload.
 > configured servers, so it can only work when that set is unchanged. Change
 > it and the re-exec'd binary refuses — *"hot upgrade needs an unchanged
 > listener set; use restart"* — and **exits**, leaving systemd's
-> `Restart=on-failure` to bring the server back. It comes back, but as a
+> `Restart=always` to bring the server back. It comes back, but as a
 > restart: connections are dropped, and the message goes to the journal, not
 > to the access log. Editing values inside existing servers, adding or
 > removing *locations*, and changing globals are all fine to reload.

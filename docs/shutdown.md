@@ -35,6 +35,14 @@ Clients reconnect to the server that comes back, which is what a restart is.
 `TimeoutStopSec=10` remains in the unit as a backstop for a worker too wedged
 to answer a signal; in normal operation it is never reached.
 
+**The unit sets `Restart=always`, and that is deliberate.** systemd counts a
+SIGTERM exit as a *clean* one, so under `Restart=on-failure` any TERM the
+service did not ask for — a stray `pkill`, the OOM killer, an admin script
+matching more broadly than intended — left the unit sitting in
+`inactive (dead)` with nothing to bring it back. An explicit
+`systemctl stop` is still honoured and is not restarted, so `always` costs
+nothing operationally and closes that hole.
+
 **Immediate is not the same as silent.** TCP needs nothing: exiting closes
 those sockets and the peer sees it at once. QUIC does — a connection whose
 server simply stops answering leaves the client waiting out an idle timeout
@@ -105,7 +113,7 @@ linnea: hot upgrade needs an unchanged listener set; use restart
 
 The old image is already gone by then — the check happens after the re-exec,
 which is the point of no return — so there is nothing left to keep serving.
-`Restart=on-failure` in the unit brings the server back within a second, but
+`Restart=always` in the unit brings the server back within a second, but
 as a **restart**: every connection is dropped, the main PID changes, and the
 log shows a fresh `listening on …` rather than `adopted listener …`. The
 refusal itself goes to stderr, so it lands in the journal and **not** in the

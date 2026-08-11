@@ -51,7 +51,16 @@ ExecStart=/usr/local/bin/linnea --config /home/linnea/linnea/config/linnea-tls.j
 # reload = zero-downtime binary upgrade (SIGUSR2, re-exec in place). The
 # PID is preserved across the exec, so MainPID tracking survives.
 ExecReload=/bin/kill -USR2 $MAINPID
-Restart=on-failure
+# Restart=always, not on-failure: systemd counts a SIGTERM exit as CLEAN, so
+# under on-failure any TERM the service did not ask for — a stray pkill, the
+# OOM killer, an admin script matching too broadly — left the site down
+# indefinitely with the unit sitting in "inactive (dead)" and nothing to
+# notice it. An explicit "systemctl stop" is still honoured and is not
+# restarted, so this costs nothing operationally. A refused hot upgrade also
+# relies on it: the re-exec'd binary exits and this is what brings the server
+# back (as a restart) — see the "when a reload cannot be hot" section of
+# docs/shutdown.md.
+Restart=always
 RestartSec=1
 # A stop exits at once, so this should never be reached. It stays as the
 # backstop for a worker wedged somewhere it cannot answer a signal from,
