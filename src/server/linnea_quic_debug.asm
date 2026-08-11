@@ -86,6 +86,18 @@ s_hi:    db " hi="
 s_hi_len    equ $ - s_hi
 s_fin:   db " fin="
 s_fin_len   equ $ - s_fin
+s_base:  db " base="
+s_base_len  equ $ - s_base
+s_bf:    db " bf="
+s_bf_len    equ $ - s_bf
+s_bt:    db " bt="
+s_bt_len    equ $ - s_bt
+s_bhi:   db " bhi="
+s_bhi_len   equ $ - s_bhi
+s_adv:   db " adv="
+s_adv_len   equ $ - s_adv
+s_sl:    db " sl="
+s_sl_len    equ $ - s_sl
 s_rx:    db "qrx dcid="
 s_rx_len   equ $ - s_rx
 s_rxsrc: db " src="
@@ -281,6 +293,18 @@ linnea_quic_dbg_conn:
     NUM r13, linnea_quic_ra.hi
     W s_fin
     NUM r13, linnea_quic_ra.fin
+    W s_base
+    NUM r13, linnea_quic_ra.base
+    W s_bf
+    NUM r13, linnea_quic_ra.body_from
+    W s_bt
+    NUM r13, linnea_quic_ra.body_to
+    W s_bhi
+    NUM r13, linnea_quic_ra.body_hi
+    W s_adv
+    NUM r13, linnea_quic_ra.fc_adv
+    W s_sl
+    NUM r13, linnea_quic_ra.spill_len
     W s_nl
 .ra_n:
     add r13, linnea_quic_ra_size

@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
-# An HTTP/3 upload LARGER than the per-stream window, checked byte-for-byte.
+# An HTTP/3 upload big enough to be written straight to the capture file rather
+# than held in the RAM reassembly buffer, checked byte-for-byte.
 #
-# Every other h3 upload test uses a body under 7 KB, and that blind spot let a
-# deadlock ship: while a DATA payload is being written straight to the capture
-# file the reassembly base does not move, so a window measured from it was
-# fixed for the payload's lifetime and anything longer than
-# LINNEA_QUIC_RA_WINDOW could never finish. The peer sent up to the ceiling and
-# stopped; the server was waiting for bytes it had told the peer not to send.
-# 8 MB against a 4 MiB window hung for 180s and returned nothing.
+# Every other h3 upload test uses a body under 7 KB, which never leaves the RAM
+# path -- so none of them reaches this code, and that blind spot let two
+# deadlocks ship. Both stalled the same way, with the peer sitting at a ceiling
+# the server would never raise again while the server waited for bytes it had
+# told the peer not to send:
 #
-# So the size here must stay comfortably ABOVE that window for this to test
-# anything: it is the crossing that matters, not the volume.
+#   - the ceiling was measured from the reassembly base, which does not move
+#     while a payload is being written to the file, so it was fixed for the
+#     payload's whole life and anything past LINNEA_QUIC_RA_WINDOW could never
+#     finish;
+#   - and then, with the ceiling following body_hi properly, the LAST step up to
+#     the payload's end was dropped whenever it came to less than RA_GRANT
+#     (16 KiB), which the grant path skipped as not worth a packet.
+#
+# The size therefore decides WHICH fault this exercises, and neither one is
+# about volume. Anything from RA_BUF up to about 49000 lands in the second
+# fault's band and hangs deterministically; something past 4 MiB exercises the
+# first. See the two sizes run in test/run_tests.sh.
 #
 # Usage: h3_upload_big.py <host> <bytes> [port]
 import hashlib, socket, ssl, sys, time

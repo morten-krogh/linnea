@@ -2723,7 +2723,28 @@ linnea_quic_server_datagram:
     mov rcx, rax
     sub rcx, [rdi + linnea_quic_ra.fc_adv]
     cmp rcx, LINNEA_QUIC_RA_GRANT
-    jb .ra_fed_none
+    jae .ra_grant
+    ; A step smaller than RA_GRANT is normally not worth a packet: the ceiling
+    ; will move again shortly and one grant can carry both. Inside a payload it
+    ; will NOT, because there the ceiling is capped at the payload's end -- so
+    ; the last step up to that cap is whatever is left over, frequently only a
+    ; few bytes, and suppressing it strands the peer that many bytes short of a
+    ; body whose length it has already been told. It waits for credit, we wait
+    ; for the bytes, and neither side ever speaks again.
+    ;
+    ; This is what hung an h3 upload, and it was never about being large: the
+    ; leftover is just body_to modulo how far body_hi happened to jump between
+    ; evaluations. 8 MB completed three times and then hung on the same binary,
+    ; which read as a mysterious size threshold and sent a bisect chasing one.
+    ; A 40000-byte upload hangs every time and a 60000-byte one never does.
+    ;
+    ; Firing here costs one extra packet per payload at most: the ceiling is at
+    ; its cap afterwards, so every later evaluation stops at the renege guard.
+    cmp qword [rdi + linnea_quic_ra.body_to], 0
+    je .ra_fed_none                            ; buffer path: base keeps moving
+    cmp rax, [rdi + linnea_quic_ra.body_to]
+    jne .ra_fed_none                           ; not the cap: a bigger step comes
+.ra_grant:
     mov [rdi + linnea_quic_ra.fc_adv], rax
     mov byte [msd_pay], 0x11                   ; MAX_STREAM_DATA
     push rax

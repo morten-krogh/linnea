@@ -2208,27 +2208,37 @@ sleep 0.3
 out=$(timeout 60 python3 test/spill_dir_test.py 61495 test/spill $spill_pid 2>&1)
 case "$out" in ok*) true ;; *) false ;; esac
 check "the upload capture file is created under spill_dir ($out)" $?
-# An h3 upload LARGER than the per-stream window. Every other h3 upload check
-# uses a body under 7 KB, and that gap let a deadlock ship: the window was
-# measured from a reassembly base that does not move while a payload is being
-# written to the file, so anything past RA_WINDOW could never finish. 8 MB
-# against a 4 MiB window returned nothing for 180s. The size must stay above
-# that window for this to test anything.
-# An h3 upload well past the per-stream window. THIS CHECK IS EXPECTED TO FAIL
-# until the h3 direct-to-file body path is fixed — it is here to hold the bug
-# still, not because it passes. 8 MB completes byte-exact in ~1.3s; 16 MB gets
-# no response at all. Both on a FRESHLY STARTED fixture, which matters: a
-# failed attempt drags the working size down, so a run after another run
-# measures that instead and reads as a tidy size threshold that is not real.
+# h3 uploads whose body goes straight to the capture file, at two sizes that
+# fail for two different reasons. Every OTHER h3 upload check in the suite uses
+# a body under 7 KB, which keeps the whole request on the RAM path -- so none of
+# them reaches this code at all, and 635/0 said nothing about the case the
+# direct-to-file change was FOR.
 #
-# Attribution is settled: test/proxy_backend.py echoes 8 MB over h1 in 0.28s,
-# so the timeout is the server. An earlier version of this driver looked for
-# the JSON checksum that /api/upload returns, against /api/echo which returns
-# the body verbatim — it reported "body differs" on a request that had in fact
-# succeeded. The comparison is the body itself now.
-out2=$(timeout 120 python3 test/quic/h3_upload_big.py localhost 16000000 61498 2>&1)
-case "$out2" in ok*) true ;; *) false ;; esac
-check "h3 upload past the per-stream window completes ($out2)" $?
+# 40000 is the one that pins the bug. Inside a payload the granted ceiling is
+# capped at the payload's end, and a grant smaller than RA_GRANT (16 KiB) was
+# suppressed as not worth a packet -- so the last step up to that cap was never
+# sent and the peer stalled a few bytes short of a body it had already declared.
+# The broken band was payloads from RA_BUF (where the file path engages) up to
+# where the final step reaches RA_GRANT: 34000..49000 hung every time, 33000 and
+# 50000 never did. It is deterministic and answers in ~0.1s, so it is the cheap
+# guard; if only this one fails, the grant floor has come back.
+#
+# 16000000 crosses RA_WINDOW (4 MiB) instead, where the ceiling has to keep
+# following body_hi across many grants rather than being set once. It is slow
+# (~8s) but it is the only check that exercises a payload longer than the window.
+#
+# A NOTE ON MEASURING THESE, which cost most of a day: the leftover that
+# triggered the stall is just the payload end modulo how far body_hi happened to
+# jump between grant evaluations, so at a size near the band edge one run hangs
+# and the next does not. 8 MB completed three times and then hung on the same
+# binary, and a bisect read that as a tidy "2 x RA_WINDOW" threshold that never
+# existed. Sizes inside the band above are deterministic; sizes outside it are
+# not evidence of anything.
+for n in 40000 16000000; do
+    out2=$(timeout 120 python3 test/quic/h3_upload_big.py localhost $n 61498 2>&1)
+    case "$out2" in ok*) true ;; *) false ;; esac
+    check "h3 upload of $n bytes goes to the capture file and echoes back ($out2)" $?
+done
 kill $spill_pid $h3big_pid $spill_backend_pid 2>/dev/null
 wait $spill_pid 2>/dev/null
 wait $spill_backend_pid 2>/dev/null
