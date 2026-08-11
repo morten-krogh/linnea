@@ -3061,6 +3061,30 @@ PYEOF
     # and the point of a cap: the bytes never land
     ! grep -q ' 400000$' "$SEEN"
     check "the refused h2 upload never reached the backend" $?
+    # TWO uploads on ONE connection. Every other h2 upload check is its own
+    # curl, i.e. its own connection, and that shape is what let a026f0d ship:
+    # every SECOND upload on a connection was refused 413 at 8192 bytes however
+    # large max_body was, because the first left an exclusive claim behind and
+    # the second fell to the bounded collect path. Verified against the parent
+    # of a026f0d, which answers 200 then 413 here.
+    up1=$(mktemp); up2=$(mktemp); upf=$(mktemp)
+    head -c 50000 /dev/zero | tr '\0' 'x' > "$upf"
+    codes=$(curl -sS --http2 --cacert test/tls/server.crt \
+              -o "$up1" -w '%{http_code} ' -X POST --data-binary @"$upf" \
+              https://localhost:61462/api/echo \
+              --next --http2 --cacert test/tls/server.crt \
+              -o "$up2" -w '%{http_code}' -X POST --data-binary @"$upf" \
+              https://localhost:61462/api/echo)
+    [ "$codes" = "200 200" ] && cmp -s "$up1" "$upf" && cmp -s "$up2" "$upf"
+    check "h2 a second upload on the same connection is served ($codes)" $?
+    # ...and it really WAS one connection. Without this the check quietly stops
+    # testing anything the day curl decides not to reuse: two 200s from two
+    # connections is exactly what the broken build would also have produced.
+    reused=$(grep 'POST /api/echo HTTP/2' test/linnea-h3p.log | tail -2 |
+             sed 's/.*from [0-9.]*:\([0-9]*\) .*/\1/' | sort -u | wc -l)
+    [ "$reused" = "1" ]
+    check "...and both of those really shared one connection" $?
+    rm -f "$up1" "$up2" "$upf"
     kill $h3p_pid 2>/dev/null
     wait $h3p_pid 2>/dev/null
 
