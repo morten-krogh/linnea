@@ -2430,6 +2430,11 @@ linnea_quic_server_datagram:
     mov qword [rax + linnea_quic_ra.spill_fd], -1
     mov qword [rax + linnea_quic_ra.spill_len], 0
     mov qword [rax + linnea_quic_ra.base], 0
+    mov qword [rax + linnea_quic_ra.body_from], 0
+    mov qword [rax + linnea_quic_ra.body_to], 0
+    mov qword [rax + linnea_quic_ra.body_file], 0
+    mov qword [rax + linnea_quic_ra.body_hi], 0
+    mov qword [rax + linnea_quic_ra.body_nr], 0
     mov qword [rax + linnea_quic_ra.fc_adv], LINNEA_QUIC_RA_BUF
     mov [rax + linnea_quic_ra.walk + linnea_h3_walk.sink_ctx], rax
     push rax
@@ -2472,6 +2477,81 @@ linnea_quic_server_datagram:
     sub r10, rcx
     mov r9, r11
 .ra_rel:
+    ; Inside a DATA payload? Then this frame's bytes have a known place in the
+    ; capture file -- the mapping is a constant subtraction within one frame --
+    ; so they go straight there wherever in the payload they land, and the RAM
+    ; window neither holds them nor bounds how many may be in flight.
+    cmp qword [rax + linnea_quic_ra.body_to], 0
+    je .ra_win
+    cmp r9, [rax + linnea_quic_ra.body_from]
+    jb .ra_win                                 ; below it: framing, not body
+    mov rcx, [rax + linnea_quic_ra.body_to]
+    cmp r9, rcx
+    jae .ra_win                                ; at or past its end
+    mov rdx, rcx
+    sub rdx, r9                                ; a frame may straddle the end
+    cmp r10, rdx
+    jbe .ra_bplace
+    mov r10, rdx
+.ra_bplace:
+    push rax
+    push r9
+    push r10
+    push rsi
+    mov rdi, rax
+    mov rdx, rsi
+    mov rsi, r9
+    mov rcx, r10
+    call ra_body_place
+    mov r8d, eax
+    pop rsi
+    pop r10
+    pop r9
+    pop rax
+    mov [s_ra_ctx], rax
+    test r8d, r8d
+    js .ra_body_failed
+    cmp qword [s_sfin], 0
+    je .ra_bwhole
+    mov qword [rax + linnea_quic_ra.fin], 1
+    mov rcx, [s_soff]
+    add rcx, [s_slen]
+    mov [rax + linnea_quic_ra.final], rcx
+.ra_bwhole:
+    mov rcx, [rax + linnea_quic_ra.body_hi]
+    cmp rcx, [rax + linnea_quic_ra.body_to]
+    jb .ra_donecheck                           ; still filling: nothing to hand on
+    ; Whole. The walk may move past a payload it never saw: zeroing frame_rem
+    ; is what .w_data reads to reach .w_frame_end and the next frame header.
+    mov rcx, [rax + linnea_quic_ra.body_to]
+    sub rcx, [rax + linnea_quic_ra.body_from]
+    add [rax + linnea_quic_ra.spill_len], rcx  ; the sink writes on after it
+    mov qword [rax + linnea_quic_ra.walk + linnea_h3_walk.frame_rem], 0
+    mov rcx, [rax + linnea_quic_ra.body_to]
+    sub rcx, [rax + linnea_quic_ra.base]
+    mov qword [rax + linnea_quic_ra.body_to], 0
+    push rax
+    mov rdi, rax
+    mov rsi, rcx
+    call ra_slide                              ; the window resumes at its end
+    pop rax
+    jmp .ra_donecheck
+.ra_body_failed:
+    ; The payload could not be put where it was going -- a full filesystem, a
+    ; peer fragmenting past what the range list will track, or a DECLARED
+    ; payload past max_body. All three are ours to answer rather than protocol
+    ; errors, and all three mean the same thing to the client, so they share
+    ; the sink verdict: .req_body_toolarge turns it into a 413 on the stream,
+    ; which is what h1 and h2 answer an oversized upload with.
+    ;
+    ; This label sits behind an unconditional jump ON PURPOSE. The max_body
+    ; refusal first lived next to .ra_fed_none, where it read more naturally
+    ; and where it sat directly after the grant's call -- so every
+    ; MAX_STREAM_DATA the server successfully sent fell through into it. Every
+    ; value was correct; only the position was wrong.
+    mov rax, -LINNEA_H3_ERR_SINK
+    jmp .ra_walk_failed
+.ra_win:
     sub r9, r11                                ; offset within the window
     mov r11, r9
     add r11, r10                               ; where the frame ends in it
@@ -2569,9 +2649,64 @@ linnea_quic_server_datagram:
     mov rdi, [s_ra_ctx]
     mov rsi, [rdi + linnea_quic_ra.len]
     call ra_slide
+    ; Did the walk stop waiting on a DATA payload? Then its extent is known,
+    ; and with it every byte's place in the capture file — so take the payload
+    ; over: the ingest writes it straight to the file and the walk is handed
+    ; the far side of it once it is whole. This is what lets the window below
+    ; exceed the RAM buffer, and it is bounded by the frame, so we never invite
+    ; a byte we could not place.
     mov rdi, [s_ra_ctx]
+    cmp qword [rdi + linnea_quic_ra.body_to], 0
+    jne .ra_ceiling                            ; already in one
+    cmp qword [rdi + linnea_quic_ra.walk + linnea_h3_walk.phase], LINNEA_H3_W_DATA
+    jne .ra_ceiling
+    mov rcx, [rdi + linnea_quic_ra.walk + linnea_h3_walk.frame_rem]
+    cmp rcx, LINNEA_QUIC_RA_BUF
+    jb .ra_ceiling                             ; a payload the window already
+                                               ; covers: leave it on the RAM
+                                               ; path, which is cheaper and is
+                                               ; what a body split into many
+                                               ; small DATA frames looks like
+    ; max_body bounds it up front, on the length the frame DECLARES, so the
+    ; bytes never land — the same rule the h1 and h2 paths apply to
+    ; Content-Length.
+    push rcx
+    mov rax, [rdi + linnea_quic_ra.spill_len]
+    add rax, rcx
+    lea rcx, [linnea_config_instance]
+    cmp rax, [rcx + linnea_config.max_body]
+    pop rcx
+    ja .ra_body_failed          ; 413, via the sink verdict — see there
     mov rax, [rdi + linnea_quic_ra.base]
+    mov [rdi + linnea_quic_ra.body_from], rax
+    mov [rdi + linnea_quic_ra.body_hi], rax
+    add rax, rcx
+    mov [rdi + linnea_quic_ra.body_to], rax
+    mov rax, [rdi + linnea_quic_ra.spill_len]
+    mov [rdi + linnea_quic_ra.body_file], rax
+    mov qword [rdi + linnea_quic_ra.body_nr], 0
+    call ra_body_migrate                       ; anything already buffered
+    test eax, eax
+    js .ra_body_failed
+    mov rdi, [s_ra_ctx]
+.ra_ceiling:
+    mov rax, [rdi + linnea_quic_ra.base]
+    cmp qword [rdi + linnea_quic_ra.body_to], 0
+    je .ra_ceil_buf
+    ; inside a payload: as far as RA_WINDOW, but never past the frame
+    add rax, LINNEA_QUIC_RA_WINDOW
+    mov rcx, [rdi + linnea_quic_ra.body_to]
+    cmp rax, rcx
+    jbe .ra_ceil_have
+    mov rax, rcx
+    jmp .ra_ceil_have
+.ra_ceil_buf:
     add rax, LINNEA_QUIC_RA_BUF                ; the ceiling it may now reach
+.ra_ceil_have:
+    cmp rax, [rdi + linnea_quic_ra.fc_adv]
+    jbe .ra_fed_none                           ; never renege: a lower ceiling
+                                               ; wraps the unsigned subtraction
+                                               ; below into a huge "grant"
     mov rcx, rax
     sub rcx, [rdi + linnea_quic_ra.fc_adv]
     cmp rcx, LINNEA_QUIC_RA_GRANT
@@ -2627,9 +2762,12 @@ linnea_quic_server_datagram:
     mov rdi, rax
     call ra_release                             ; abandon the over-long stream
     pop rax
-    ; the peer sent more stream data than the window we advertised
-    ; (initial_max_stream_data_bidi_remote == the reassembly buffer): a flow-control
-    ; violation, so close the connection (RFC 9000 4.1: FLOW_CONTROL_ERROR = 0x03).
+    ; The peer sent past the window it was given. OUTSIDE a DATA payload that
+    ; window is still the reassembly buffer — the handshake advertises
+    ; initial_max_stream_data_bidi_remote = RA_BUF, and it is only raised past
+    ; it once a payload's extent makes every further byte placeable — so this
+    ; remains a flow-control violation, and the connection closes for it
+    ; (RFC 9000 4.1: FLOW_CONTROL_ERROR = 0x03).
     mov edi, 0x03                               ; FLOW_CONTROL_ERROR
     mov esi, 0x08                               ; a STREAM frame triggered it
     jmp .transport_close
@@ -6597,6 +6735,280 @@ linnea_quic_server_close_all:
 ; over one run per piece of DATA payload; they are appended to a file of the
 ; context's own, because .buf is reused the moment this datagram is finished
 ; with and an upstream leg does not send until its connect completes.
+; ra_spill_ensure(rdi = ctx) -> rax = 0 ok, -1 could not open.
+; The capture file is opened on first use, by whichever of the two writers
+; gets there first: the walk's sink for in-order payload, or ra_body_place for
+; payload that arrived out of order and never passes through RAM.
+ra_spill_ensure:
+    cmp qword [rdi + linnea_quic_ra.spill_fd], -1
+    jne .se_have
+    push rdi
+    lea rdi, [linnea_config_instance]
+    lea rdi, [rdi + linnea_config.spill_dir]
+    mov esi, LINNEA_O_TMPFILE | LINNEA_O_RDWR | LINNEA_O_CLOEXEC
+    mov edx, LINNEA_MODE_0600
+    mov eax, LINNEA_SYS_OPEN
+    syscall
+    pop rdi
+    cmp rax, -4095
+    jae .se_fail
+    mov [rdi + linnea_quic_ra.spill_fd], rax
+.se_have:
+    xor eax, eax
+    ret
+.se_fail:
+    mov eax, -1
+    ret
+
+; ra_body_place(rdi = ctx, rsi = absolute stream offset, rdx = data, rcx = len)
+; -> rax = 0 placed, -1 the stream must be failed.
+;
+; Payload bytes go straight into the capture file at the offset they belong
+; at, wherever in the payload they land. A QUIC STREAM frame states its own
+; offset, and inside a DATA frame whose extent is known the stream-to-file
+; mapping is a constant subtraction -- so out-of-order data needs no buffer,
+; only a place in the file. The file is sparse: a hole costs nothing and a
+; later write fills it, with no compaction and nothing moved afterwards.
+;
+; Duplicates are free, being the same bytes at the same offset (RFC 9000 2.2),
+; so the range list only has to answer when the region is whole.
+ra_body_place:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi
+    mov r12, rsi                       ; absolute stream offset
+    mov r13, rdx                       ; data
+    mov r14, rcx                       ; length
+    test r14, r14
+    jz .bp_ok
+    mov rdi, rbx
+    call ra_spill_ensure
+    test eax, eax
+    js .bp_fail
+    mov rax, r12
+    sub rax, [rbx + linnea_quic_ra.body_from]
+    add rax, [rbx + linnea_quic_ra.body_file]
+    mov r15, rax                       ; file offset
+.bp_write:
+    mov edi, [rbx + linnea_quic_ra.spill_fd]
+    mov rsi, r13
+    mov rdx, r14
+    mov r10, r15
+    mov eax, LINNEA_SYS_PWRITE64
+    syscall
+    cmp rax, -4095
+    jae .bp_wfail
+    test rax, rax
+    jz .bp_fail                        ; no progress: a full filesystem
+    add r13, rax
+    add r15, rax
+    sub r14, rax
+    jnz .bp_write
+    ; --- record what arrived -------------------------------------------
+    mov rsi, r12                       ; start
+    mov rdx, r15                       ; the file cursor advanced by the whole
+    sub rdx, [rbx + linnea_quic_ra.body_file]
+    add rdx, [rbx + linnea_quic_ra.body_from]   ; run, so end = that, mapped back
+    mov rdi, rbx
+    call ra_range_add
+    test eax, eax
+    js .bp_fail
+.bp_ok:
+    xor eax, eax
+    jmp .bp_ret
+.bp_wfail:
+    cmp rax, -LINNEA_EINTR
+    je .bp_write
+.bp_fail:
+    mov eax, -1
+.bp_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ra_body_migrate(rdi = ctx) -> rax = 0 ok, -1 fail.
+;
+; Payload bytes may already be sitting in the reassembly window when the
+; payload is taken over — received ahead of the contiguous prefix, so the walk
+; never consumed them. They have to move to the file now. Left where they are
+; they would be stranded: in RAM, unknown to the range list, so the region
+; could never be whole and the request would hang with the trace showing
+; len=0 against a non-zero hi. That is exactly how this was found.
+;
+; The window's base is the payload start here, so a run at window offset k is
+; stream offset body_from + k. Migrated bits are cleared, which also stops the
+; prefix advancing over payload the walk must never be handed.
+ra_body_migrate:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi
+    mov r14, [rbx + linnea_quic_ra.body_to]
+    sub r14, [rbx + linnea_quic_ra.body_from]   ; the payload's length
+    mov rax, [rbx + linnea_quic_ra.hi]
+    cmp rax, r14
+    jbe .mg_lim
+    mov rax, r14
+.mg_lim:
+    mov r14, rax                                ; scan [0, r14)
+    xor r15d, r15d
+.mg_scan:
+    cmp r15, r14
+    jae .mg_clear
+    lea rdx, [rbx + linnea_quic_ra.seen]
+    bt [rdx], r15
+    jnc .mg_next
+    mov r12, r15                                ; run start
+.mg_run:
+    inc r15
+    cmp r15, r14
+    jae .mg_place
+    lea rdx, [rbx + linnea_quic_ra.seen]
+    bt [rdx], r15
+    jc .mg_run
+.mg_place:
+    mov rdi, rbx
+    mov rsi, [rbx + linnea_quic_ra.body_from]
+    add rsi, r12
+    lea rdx, [rbx + linnea_quic_ra.buf]
+    add rdx, r12
+    mov rcx, r15
+    sub rcx, r12
+    call ra_body_place
+    test eax, eax
+    js .mg_fail
+    jmp .mg_scan
+.mg_next:
+    inc r15
+    jmp .mg_scan
+.mg_clear:
+    ; forget what moved, so the prefix cannot advance over it
+    xor r15d, r15d
+.mg_clr_loop:
+    cmp r15, r14
+    jae .mg_ok
+    lea rdx, [rbx + linnea_quic_ra.seen]
+    btr [rdx], r15
+    inc r15
+    jmp .mg_clr_loop
+.mg_ok:
+    xor eax, eax
+    jmp .mg_ret
+.mg_fail:
+    mov eax, -1
+.mg_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ra_range_add(rdi = ctx, rsi = start, rdx = end) -> rax = 0, or -1 when the
+; peer has fragmented its upload past what we will track.
+;
+; .body_hi is the contiguous end; the list holds only the pieces beyond it.
+; Almost every arrival is in order and simply advances .body_hi, at which
+; point any listed range that has become contiguous is absorbed.
+ra_range_add:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    lea r14, [rbx + linnea_quic_ra.body_rng]     ; entry i is at r14 + i*16
+    cmp r12, [rbx + linnea_quic_ra.body_hi]
+    ja .rr_gap                         ; starts past the prefix: a hole remains
+    cmp r13, [rbx + linnea_quic_ra.body_hi]
+    jbe .rr_ok                         ; entirely behind it: a duplicate
+    mov [rbx + linnea_quic_ra.body_hi], r13
+.rr_absorb:
+    ; Sweep for anything the prefix has now reached. Restarted after each
+    ; absorption, because taking one range in can make an earlier one
+    ; contiguous too.
+    xor ecx, ecx
+    mov rdx, [rbx + linnea_quic_ra.body_nr]
+.rr_scan:
+    cmp rcx, rdx
+    jae .rr_ok
+    lea r15, [rcx + rcx]
+    mov rsi, [r14 + r15*8]             ; start
+    mov rdi, [r14 + r15*8 + 8]         ; end
+    cmp rsi, [rbx + linnea_quic_ra.body_hi]
+    ja .rr_next                        ; still beyond the prefix
+    cmp rdi, [rbx + linnea_quic_ra.body_hi]
+    jbe .rr_drop                       ; wholly covered now
+    mov [rbx + linnea_quic_ra.body_hi], rdi
+.rr_drop:
+    ; remove entry rcx by moving the last one down into its slot
+    dec rdx
+    lea rsi, [rdx + rdx]
+    mov rdi, [r14 + rsi*8]
+    mov [r14 + r15*8], rdi
+    mov rdi, [r14 + rsi*8 + 8]
+    mov [r14 + r15*8 + 8], rdi
+    mov [rbx + linnea_quic_ra.body_nr], rdx
+    jmp .rr_absorb
+.rr_next:
+    inc rcx
+    jmp .rr_scan
+.rr_gap:
+    ; beyond the prefix: merge into an overlapping range where there is one
+    xor ecx, ecx
+    mov rdx, [rbx + linnea_quic_ra.body_nr]
+.rr_mscan:
+    cmp rcx, rdx
+    jae .rr_new
+    lea r15, [rcx + rcx]
+    mov rsi, [r14 + r15*8]
+    mov rdi, [r14 + r15*8 + 8]
+    cmp r12, rdi
+    ja .rr_mnext                       ; starts after this range ends
+    cmp r13, rsi
+    jb .rr_mnext                       ; ends before it starts
+    cmp r12, rsi
+    jae .rr_mlo
+    mov [r14 + r15*8], r12
+.rr_mlo:
+    cmp r13, rdi
+    jbe .rr_ok
+    mov [r14 + r15*8 + 8], r13
+    jmp .rr_ok
+.rr_mnext:
+    inc rcx
+    jmp .rr_mscan
+.rr_new:
+    cmp rdx, LINNEA_QUIC_RA_RANGES
+    jae .rr_full
+    lea r15, [rdx + rdx]
+    mov [r14 + r15*8], r12
+    mov [r14 + r15*8 + 8], r13
+    inc rdx
+    mov [rbx + linnea_quic_ra.body_nr], rdx
+.rr_ok:
+    xor eax, eax
+    jmp .rr_ret
+.rr_full:
+    mov eax, -1
+.rr_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; The walk keeps its position in callee-saved registers, so this touches none.
 ra_body_sink:
     push rbx
@@ -6632,8 +7044,15 @@ ra_body_sink:
     mov edi, [rbx + linnea_quic_ra.spill_fd]
     mov rsi, r12
     mov rdx, r13
-    mov eax, LINNEA_SYS_WRITE
-    syscall
+    mov r10, [rbx + linnea_quic_ra.spill_len]
+    mov eax, LINNEA_SYS_PWRITE64
+    syscall                                      ; at an explicit offset, not the
+                                                 ; file position: ra_body_place
+                                                 ; writes out-of-order payload
+                                                 ; with pwrite and leaves the
+                                                 ; position where it was, so a
+                                                 ; later sequential write landed
+                                                 ; back on top of it
     cmp rax, -4095
     jae .bs_retry
     test rax, rax

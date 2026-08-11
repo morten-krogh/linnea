@@ -162,6 +162,31 @@ LINNEA_QUIC_RA_WALK     equ 8288    ; room for one linnea_h3_walk (asserted)
 ; buffer: grant sooner and it is a packet per datagram, later and the client
 ; stalls waiting on credit it has already earned.
 LINNEA_QUIC_RA_GRANT    equ LINNEA_QUIC_RA_BUF / 2
+; --- direct-to-file body (the upload window) -------------------------------
+; RA_BUF bounds how much UNCONSUMED stream we can hold, and because the window
+; we advertise had to equal it, it also bounded the upload RATE: a client may
+; have at most one window unacknowledged, so throughput was 32 KiB per ROUND
+; TRIP however fast the link. 2.4 MB/s at a 13.5 ms client, against h2's
+; 4 MiB window, which is why the same file uploaded far faster over h2.
+;
+; A DATA frame's payload does not need to pass through RAM at all. Its bytes
+; are going to the capture file regardless, and a QUIC STREAM frame states its
+; own offset — so once the payload's extent is known, every byte in it has a
+; known file offset and can be pwritten straight there, in order or not. The
+; file is sparse; a hole costs nothing and a later write fills it.
+;
+; What makes this safe is that the grant is bounded by the frame extent: we
+; never invite a byte we could not place. Beyond the payload we are back to
+; RA_BUF, because a gap there might hide the next frame header and we would
+; not know whether a byte is body or framing.
+LINNEA_QUIC_RA_WINDOW   equ 0x400000   ; 4 MiB: most we invite in flight on one
+                                       ; request stream, matching h2's window
+; Out-of-order arrivals to track while filling a payload. Real reordering
+; makes a handful of large ranges; a peer that deliberately fragments into
+; more than this has its stream refused rather than being allowed to cost
+; unbounded bookkeeping. Duplicates are free -- the same bytes rewritten at
+; the same offset -- so this only has to answer "is the region whole yet".
+LINNEA_QUIC_RA_RANGES   equ 32
 ; How long a request stream may go without a single frame before its context is
 ; considered abandoned and may be taken from it (see linnea_quic_ra.act_ms). An
 ; upload in progress is ack-clocked, so frames arrive every round trip; five
@@ -323,6 +348,15 @@ struc linnea_quic_ra
     .hi:       resq 1               ; highest offset+len seen (extent of the seen set)
     .fin:      resq 1               ; the FIN has been seen
     .final:    resq 1               ; the stream's total size (valid once fin)
+    ; Direct-to-file body. .body_to == 0 means not in it; while it is set, the
+    ; payload of the DATA frame the walk is waiting on is being written
+    ; straight to the capture file and .buf holds none of it.
+    .body_from: resq 1              ; absolute stream offset of the payload
+    .body_to:   resq 1              ; ...and one past its end (0 = inactive)
+    .body_file: resq 1              ; file offset .body_from maps to
+    .body_hi:   resq 1              ; contiguous bytes placed from .body_from
+    .body_nr:   resq 1              ; ranges in use
+    .body_rng:  resq LINNEA_QUIC_RA_RANGES * 2   ; [start, end) absolute pairs
     .buf:      resb LINNEA_QUIC_RA_BUF
     ; bit i = 1 once stream byte i has arrived. A bit, not a byte: at one byte
     ; per byte this array alone was half the size of a connection, and there
