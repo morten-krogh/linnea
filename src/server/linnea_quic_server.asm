@@ -2481,20 +2481,6 @@ linnea_quic_server_datagram:
     ; capture file -- the mapping is a constant subtraction within one frame --
     ; so they go straight there wherever in the payload they land, and the RAM
     ; window neither holds them nor bounds how many may be in flight.
-    push rax
-    push r9
-    push r10
-    push rsi
-    mov rsi, [rax + linnea_quic_ra.body_to]
-    mov edi, 9
-    call linnea_quic_dbg_num                   ; 9 = body_to seen at ingest
-    mov rsi, [rsp + 16]
-    mov edi, 10
-    call linnea_quic_dbg_num                   ; 10 = this frame's offset
-    pop rsi
-    pop r10
-    pop r9
-    pop rax
     cmp qword [rax + linnea_quic_ra.body_to], 0
     je .ra_win
     cmp r9, [rax + linnea_quic_ra.body_from]
@@ -2532,15 +2518,6 @@ linnea_quic_server_datagram:
     add rcx, [s_slen]
     mov [rax + linnea_quic_ra.final], rcx
 .ra_bwhole:
-    push rax
-    mov rsi, [rax + linnea_quic_ra.body_hi]
-    mov edi, 7
-    call linnea_quic_dbg_num                   ; 7 = body_hi
-    mov rax, [rsp]
-    mov rsi, [rax + linnea_quic_ra.body_to]
-    mov edi, 8
-    call linnea_quic_dbg_num                   ; 8 = body_to
-    pop rax
     mov rcx, [rax + linnea_quic_ra.body_hi]
     cmp rcx, [rax + linnea_quic_ra.body_to]
     jb .ra_donecheck                           ; still filling: nothing to hand on
@@ -2564,6 +2541,15 @@ linnea_quic_server_datagram:
     ; a peer fragmenting past what the range list will track. Ours to answer,
     ; not a protocol error, so the same verdict the walk gives for its sink.
     mov rax, -LINNEA_H3_ERR_SINK
+    jmp .ra_walk_failed
+.ra_body_toolarge:
+    ; A declared payload past max_body: refuse before the bytes land, the rule
+    ; h1 and h2 apply to Content-Length. It lives HERE, behind an unconditional
+    ; jump, and not next to .ra_fed_none where it reads more naturally — there
+    ; it sat directly after the grant's call, so every MAX_STREAM_DATA the
+    ; server successfully sent fell through into this refusal and answered 431.
+    ; Every value involved was correct; only the label's position was wrong.
+    mov rax, -LINNEA_H3_ERR_TOOLARGE
     jmp .ra_walk_failed
 .ra_win:
     sub r9, r11                                ; offset within the window
@@ -2670,42 +2656,17 @@ linnea_quic_server_datagram:
     ; exceed the RAM buffer, and it is bounded by the frame, so we never invite
     ; a byte we could not place.
     mov rdi, [s_ra_ctx]
-    ; ---- TEMPORARY INSTRUMENTATION (remove before committing) ----
-    push rdi
-    mov esi, 1
-    mov rdi, [rsp]
-    mov rsi, [rdi + linnea_quic_ra.walk + linnea_h3_walk.phase]
-    mov edi, 1
-    call linnea_quic_dbg_num                   ; 1 = phase
-    mov rdi, [rsp]
-    mov rsi, [rdi + linnea_quic_ra.walk + linnea_h3_walk.frame_rem]
-    mov edi, 2
-    call linnea_quic_dbg_num                   ; 2 = frame_rem
-    mov rdi, [rsp]
-    mov rsi, [rdi + linnea_quic_ra.base]
-    mov edi, 3
-    call linnea_quic_dbg_num                   ; 3 = base
-    mov rdi, [rsp]
-    mov rsi, [rdi + linnea_quic_ra.spill_len]
-    mov edi, 4
-    call linnea_quic_dbg_num                   ; 4 = spill_len
-    lea rax, [linnea_config_instance]
-    mov rsi, [rax + linnea_config.max_body]
-    mov edi, 5
-    call linnea_quic_dbg_num                   ; 5 = max_body
-    mov rdi, [rsp]
-    mov rsi, [rdi + linnea_quic_ra.hi]
-    mov edi, 6
-    call linnea_quic_dbg_num                   ; 6 = hi
-    pop rdi
-    ; ---- end instrumentation ----
     cmp qword [rdi + linnea_quic_ra.body_to], 0
     jne .ra_ceiling                            ; already in one
     cmp qword [rdi + linnea_quic_ra.walk + linnea_h3_walk.phase], LINNEA_H3_W_DATA
     jne .ra_ceiling
     mov rcx, [rdi + linnea_quic_ra.walk + linnea_h3_walk.frame_rem]
-    test rcx, rcx
-    jz .ra_ceiling
+    cmp rcx, LINNEA_QUIC_RA_BUF
+    jb .ra_ceiling                             ; a payload the window already
+                                               ; covers: leave it on the RAM
+                                               ; path, which is cheaper and is
+                                               ; what a body split into many
+                                               ; small DATA frames looks like
     ; max_body bounds it up front, on the length the frame DECLARES, so the
     ; bytes never land — the same rule the h1 and h2 paths apply to
     ; Content-Length.
@@ -2742,6 +2703,10 @@ linnea_quic_server_datagram:
 .ra_ceil_buf:
     add rax, LINNEA_QUIC_RA_BUF                ; the ceiling it may now reach
 .ra_ceil_have:
+    cmp rax, [rdi + linnea_quic_ra.fc_adv]
+    jbe .ra_fed_none                           ; never renege: a lower ceiling
+                                               ; wraps the unsigned subtraction
+                                               ; below into a huge "grant"
     mov rcx, rax
     sub rcx, [rdi + linnea_quic_ra.fc_adv]
     cmp rcx, LINNEA_QUIC_RA_GRANT
@@ -2763,10 +2728,6 @@ linnea_quic_server_datagram:
     lea rsi, [msd_pay]
     call .send_1rtt                            ; buffered for loss recovery: a
                                                ; lost grant is a stalled upload
-.ra_body_toolarge:
-    ; a declared payload past max_body: refuse the stream before the bytes land
-    mov rax, -LINNEA_H3_ERR_TOOLARGE
-    jmp .ra_walk_failed
 .ra_fed_none:
     jmp .ra_more                               ; more of the stream to come
 .ra_complete:
@@ -7083,8 +7044,15 @@ ra_body_sink:
     mov edi, [rbx + linnea_quic_ra.spill_fd]
     mov rsi, r12
     mov rdx, r13
-    mov eax, LINNEA_SYS_WRITE
-    syscall
+    mov r10, [rbx + linnea_quic_ra.spill_len]
+    mov eax, LINNEA_SYS_PWRITE64
+    syscall                                      ; at an explicit offset, not the
+                                                 ; file position: ra_body_place
+                                                 ; writes out-of-order payload
+                                                 ; with pwrite and leaves the
+                                                 ; position where it was, so a
+                                                 ; later sequential write landed
+                                                 ; back on top of it
     cmp rax, -4095
     jae .bs_retry
     test rax, rax
