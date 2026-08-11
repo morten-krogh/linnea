@@ -180,16 +180,26 @@ LINNEA_H2_RESP_ROOM   equ 3072
 ; 16 KiB frame at a time. Steady-state upload throughput was therefore
 ; 16 KiB per ROUND TRIP: invisible on loopback, where every upload test runs
 ; and passes, but 546 KB/s at a laptop's 30 ms and a quarter of a minute for
-; an 8 MiB upload. 1 MiB matches HTTP/3's LINNEA_QUIC_INITIAL_MAX_DATA, so an
-; upload runs at the same rate whichever protocol the browser picked — the
-; same argument that pinned LINNEA_H2_MAX_STREAMS to h3's stream limit.
+; an 8 MiB upload.
+;
+; The window IS the upload rate a client can reach: it may have at most this
+; much unacknowledged, so throughput is bounded by WINDOW / RTT no matter how
+; fast the link is. 1 MiB served a 13.5 ms client at 78 MB/s (621 Mbit/s),
+; which is short of a symmetric gigabit line; 4 MiB carries that to 310 MB/s
+; and keeps a 100 ms client above 10 MB/s. h3 grants 1 MiB
+; (LINNEA_QUIC_INITIAL_MAX_DATA) with a 4 MiB ceiling (FC_WINDOW), so h2 is
+; no longer the narrower of the two whichever protocol the browser picks.
 ;
 ; Cost: mapped lazily and claimed only while a streaming upload is actually
-; in flight, so nothing is resident until a client uploads; the worst case is
-; max_connections uploading at once, 1 GiB per worker at the default 1024.
-; A second concurrent upload on one connection still falls back to the
-; bounded collect path.
-LINNEA_H2P_UPLOAD_BUF equ 1048576
+; in flight, so nothing is resident until a client uploads. But the mapping is
+; max_connections * this, per worker — 4 GiB of address space at the default
+; 1024, and the same again in RESIDENT memory if every connection were to
+; upload at once. That ceiling is now larger than a small box's RAM, and it is
+; bounded by max_connections rather than by anything this file controls: if
+; the answer to a crowd of uploaders has to be refusal, it must come from
+; max_connections. A second concurrent upload on one connection still falls
+; back to the bounded collect path.
+LINNEA_H2P_UPLOAD_BUF equ 4194304
 %if LINNEA_H2P_UPLOAD_BUF > 0x7fffffff
   %error "SETTINGS_INITIAL_WINDOW_SIZE is capped at 2^31-1 (RFC 9113 6.5.2)"
 %endif
