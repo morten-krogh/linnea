@@ -3369,6 +3369,17 @@ rm -f /tmp/upload3_echo.bin
     timeout 60 python3 test/tls/alert_codes.py 61446 >/dev/null 2>&1
     check "tls alert codes name the actual fault (tls-8, tls-9)" $?
 
+    # ...and the log has to say WHICH of them happened. "tls handshake failed"
+    # was the single largest close reason in the production log -- 4018 in
+    # eighteen days -- with nothing whatever to tell a bad ClientHello from an
+    # unsupported version from a client that walked away. The alert we already
+    # send the client names the fault exactly; it was simply never written
+    # down. The six cases above must leave at least four distinct codes.
+    alerts=$(grep -c 'tls handshake failed, alert ' "$LOG" 2>/dev/null || echo 0)
+    distinct=$(grep -oE 'tls handshake failed, alert [0-9]+' "$LOG" 2>/dev/null |
+               sort -u | wc -l)
+    [ "$alerts" -ge 4 ] && [ "$distinct" -ge 4 ]
+    check "tls a failed handshake records which alert it sent ($alerts lines, $distinct distinct)" $?
 
     # RFC 8446 7.4.2 MUST: a low-order X25519 key share drives the ECDHE
     # product to all-zero whatever the server's private key is, and the

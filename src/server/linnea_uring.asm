@@ -226,6 +226,10 @@ reason_up_closed:   db "upstream closed"
 reason_up_closed_len equ $ - reason_up_closed
 reason_up_send_err: db "upstream send error"
 reason_up_send_err_len equ $ - reason_up_send_err
+dbgsend:            db "send failed, errno "
+dbgsend_len         equ $ - dbgsend
+dbgtlsalert:        db "tls handshake failed, alert "
+dbgtlsalert_len     equ $ - dbgtlsalert
 reason_tls_failed:  db "tls handshake failed"
 reason_tls_failed_len equ $ - reason_tls_failed
 reason_tls_badrec:  db "tls bad record"
@@ -1398,8 +1402,7 @@ linnea_uring_run:
     cmp r15d, -LINNEA_ECANCELED
     je .send_timeout
     mov qword [r12 + linnea_connection.h2_tx_busy], 0   ; this send is over
-    lea r14, [reason_send_err]
-    mov r15d, reason_send_err_len
+    call send_fail_reason
     jmp .conn_close
 .send_timeout:
     mov qword [r12 + linnea_connection.h2_tx_busy], 0   ; this send is over
@@ -1694,14 +1697,20 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .tls_send_failed:
+    ; WHICH failure. The alert we just sent the client says exactly that, and
+    ; dropping it made "tls handshake failed" the single largest close reason
+    ; in the production log -- 4018 of them in eighteen days, every one
+    ; indistinguishable from the next, covering a bad ClientHello, no shared
+    ; cipher, an unsupported version and a client that simply went away. The
+    ; same lesson as the discarded recv errno, one layer up.
+    call log_tls_alert
     lea r14, [reason_tls_failed]
     mov r15d, reason_tls_failed_len
     jmp .conn_close
 .tls_send_err:
     cmp r15d, -LINNEA_ECANCELED
     je .tls_send_stall
-    lea r14, [reason_send_err]
-    mov r15d, reason_send_err_len
+    call send_fail_reason
     jmp .conn_close
 .tls_send_stall:
     lea r14, [reason_send_timeout]
@@ -2361,8 +2370,7 @@ linnea_uring_run:
 .tunnel_client_send_err:
     cmp r15d, -LINNEA_ECANCELED
     je .tunnel_client_send_stall
-    lea r14, [reason_send_err]
-    mov r15d, reason_send_err_len
+    call send_fail_reason
     jmp .tunnel_close
 .tunnel_client_send_stall:
     lea r14, [reason_send_timeout]
@@ -3264,6 +3272,73 @@ recv_fail_reason:
 .rfr_reset:
     lea r14, [reason_peer_reset]
     mov r15d, reason_peer_reset_len
+    ret
+
+; log_tls_alert(r12 = connection*) — record the alert the handshake failed
+; with. Preserves r14/r15, which the caller is about to set to its reason, and
+; leaves r14/r15 alone -- they are callee-saved, so the log calls preserve
+; them, and the caller sets them straight afterwards anyway.
+log_tls_alert:
+    push rbx
+    push r12
+    push r13                   ; 3 pushes: the call sites are 16-aligned
+    mov ebx, [r12 + linnea_connection.up_buf + linnea_tls_hs.alert]
+    call linnea_log_stamp
+    lea rdi, [dbgtlsalert]
+    mov esi, dbgtlsalert_len
+    call linnea_log_write
+    mov edi, ebx
+    call linnea_log_u64
+    lea rdi, [log_nl]
+    mov esi, 1
+    call linnea_log_write
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; send_fail_reason(r15d = the negative errno) -> r14 = reason, r15d = its
+; length. The send-side twin of recv_fail_reason, and it exists for the same
+; reason: "send error" carried no errno at all, so the 49 of them in the
+; production log said only that a write had failed, never which write or why.
+;
+; ECONNRESET and EPIPE are not faults here either -- they are what a client
+; that closed the tab looks like from the sending side -- so they get the
+; reasons that describe what actually happened instead of being filed as
+; errors. ECANCELED is a send timeout and is split by the callers, which have
+; their own stall handling.
+send_fail_reason:
+    cmp r15d, -LINNEA_ECONNRESET
+    je .sfr_reset
+    cmp r15d, -LINNEA_EPIPE
+    je .sfr_gone
+    push rbx
+    push r12
+    push r13                   ; 3 pushes: the call sites are 16-aligned
+    mov ebx, r15d
+    call linnea_log_stamp
+    lea rdi, [dbgsend]
+    mov esi, dbgsend_len
+    call linnea_log_write
+    xor rdi, rdi
+    sub edi, ebx               ; -errno -> errno
+    call linnea_log_u64
+    lea rdi, [log_nl]
+    mov esi, 1
+    call linnea_log_write
+    pop r13
+    pop r12
+    pop rbx
+    lea r14, [reason_send_err]
+    mov r15d, reason_send_err_len
+    ret
+.sfr_reset:
+    lea r14, [reason_peer_reset]
+    mov r15d, reason_peer_reset_len
+    ret
+.sfr_gone:
+    lea r14, [reason_peer]
+    mov r15d, reason_peer_len
     ret
 
 ; h2_arm_recv_once(rdi = connection*) — arm a client recv unless one is

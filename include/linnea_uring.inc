@@ -158,3 +158,4 @@ LINNEA_ECANCELED        equ 125
 ; a tab closed, a navigation, a connection pool trimmed — so it is told apart
 ; from a real read failure rather than logged as one.
 LINNEA_ECONNRESET       equ 104
+LINNEA_EPIPE            equ 32      ; a send to a peer that has gone: routine
