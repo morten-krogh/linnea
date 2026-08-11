@@ -2268,6 +2268,18 @@ check "h3 an upload survives other connections being torn down ($out4)" $?
 out5=$(timeout 120 python3 test/quic/h3_multi_data_test.py 61498 2>&1)
 case "$out5" in ok*) true ;; *) false ;; esac
 check "h3 a body in several DATA frames keeps its credit ($out5)" $?
+# Several uploads at once on ONE connection. Every other upload check runs one
+# request at a time, so nothing asked what happens when the RA_CTXS (6)
+# reassembly contexts are all in use -- which a browser posting several files
+# does immediately. Six at once must work and come back byte-exact; the bodies
+# differ in length so a reassembly landing in the wrong context cannot pass.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    out7=$(timeout 200 python3 test/quic/h3_concurrent_uploads_test.py 61498 2>&1 | tail -1)
+    case "$out7" in ok*) true ;; *) false ;; esac
+    check "h3 six concurrent uploads on one connection ($out7)" $?
+else
+    check "h3 concurrent uploads (skipped: aioquic/pylsqpack unavailable)" 0
+fi
 # A peer that says it is blocked must be told the window again. MAX_DATA rides
 # whatever 1-RTT packet is going out, and for an uploading peer that is usually
 # a bare ACK -- which this server emits UNTRACKED, so a lost one is never
