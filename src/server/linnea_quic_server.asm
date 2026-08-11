@@ -2481,6 +2481,20 @@ linnea_quic_server_datagram:
     ; capture file -- the mapping is a constant subtraction within one frame --
     ; so they go straight there wherever in the payload they land, and the RAM
     ; window neither holds them nor bounds how many may be in flight.
+    push rax
+    push r9
+    push r10
+    push rsi
+    mov rsi, [rax + linnea_quic_ra.body_to]
+    mov edi, 9
+    call linnea_quic_dbg_num                   ; 9 = body_to seen at ingest
+    mov rsi, [rsp + 16]
+    mov edi, 10
+    call linnea_quic_dbg_num                   ; 10 = this frame's offset
+    pop rsi
+    pop r10
+    pop r9
+    pop rax
     cmp qword [rax + linnea_quic_ra.body_to], 0
     je .ra_win
     cmp r9, [rax + linnea_quic_ra.body_from]
@@ -2518,6 +2532,15 @@ linnea_quic_server_datagram:
     add rcx, [s_slen]
     mov [rax + linnea_quic_ra.final], rcx
 .ra_bwhole:
+    push rax
+    mov rsi, [rax + linnea_quic_ra.body_hi]
+    mov edi, 7
+    call linnea_quic_dbg_num                   ; 7 = body_hi
+    mov rax, [rsp]
+    mov rsi, [rax + linnea_quic_ra.body_to]
+    mov edi, 8
+    call linnea_quic_dbg_num                   ; 8 = body_to
+    pop rax
     mov rcx, [rax + linnea_quic_ra.body_hi]
     cmp rcx, [rax + linnea_quic_ra.body_to]
     jb .ra_donecheck                           ; still filling: nothing to hand on
@@ -2647,6 +2670,35 @@ linnea_quic_server_datagram:
     ; exceed the RAM buffer, and it is bounded by the frame, so we never invite
     ; a byte we could not place.
     mov rdi, [s_ra_ctx]
+    ; ---- TEMPORARY INSTRUMENTATION (remove before committing) ----
+    push rdi
+    mov esi, 1
+    mov rdi, [rsp]
+    mov rsi, [rdi + linnea_quic_ra.walk + linnea_h3_walk.phase]
+    mov edi, 1
+    call linnea_quic_dbg_num                   ; 1 = phase
+    mov rdi, [rsp]
+    mov rsi, [rdi + linnea_quic_ra.walk + linnea_h3_walk.frame_rem]
+    mov edi, 2
+    call linnea_quic_dbg_num                   ; 2 = frame_rem
+    mov rdi, [rsp]
+    mov rsi, [rdi + linnea_quic_ra.base]
+    mov edi, 3
+    call linnea_quic_dbg_num                   ; 3 = base
+    mov rdi, [rsp]
+    mov rsi, [rdi + linnea_quic_ra.spill_len]
+    mov edi, 4
+    call linnea_quic_dbg_num                   ; 4 = spill_len
+    lea rax, [linnea_config_instance]
+    mov rsi, [rax + linnea_config.max_body]
+    mov edi, 5
+    call linnea_quic_dbg_num                   ; 5 = max_body
+    mov rdi, [rsp]
+    mov rsi, [rdi + linnea_quic_ra.hi]
+    mov edi, 6
+    call linnea_quic_dbg_num                   ; 6 = hi
+    pop rdi
+    ; ---- end instrumentation ----
     cmp qword [rdi + linnea_quic_ra.body_to], 0
     jne .ra_ceiling                            ; already in one
     cmp qword [rdi + linnea_quic_ra.walk + linnea_h3_walk.phase], LINNEA_H3_W_DATA
@@ -2713,7 +2765,7 @@ linnea_quic_server_datagram:
                                                ; lost grant is a stalled upload
 .ra_body_toolarge:
     ; a declared payload past max_body: refuse the stream before the bytes land
-    mov rax, -LINNEA_H3_ERR_NOHEADERS
+    mov rax, -LINNEA_H3_ERR_TOOLARGE
     jmp .ra_walk_failed
 .ra_fed_none:
     jmp .ra_more                               ; more of the stream to come

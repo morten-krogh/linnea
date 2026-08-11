@@ -121,6 +121,7 @@ s_rstk_len equ $ - s_rstk
 
 section .bss
 qdbg_on:   resb 1               ; 1 while tracing is enabled (readable by others)
+                                ; TEMP: forced on at startup in this WIP build
 qdbg_pass: resb 1               ; 1 on the sweep pass that should dump connections
 qdbg_tick: resq 1
 
@@ -462,9 +463,9 @@ linnea_quic_dbg_fc:
 ; linnea_quic_dbg_num(rdi = tag, rsi = value) — log one labelled number. Dark
 ; unless the trigger is set; used while tracing a path that has no state to dump.
 linnea_quic_dbg_num:
-    cmp byte [qdbg_on], 0
-    jne .on
-    ret
+    jmp .on                      ; TEMP WIP: ungated, so no trigger file is
+                                 ; needed — that file lives in the working
+                                 ; directory, which is production's too
 .on:
     push rbx
     push r13
