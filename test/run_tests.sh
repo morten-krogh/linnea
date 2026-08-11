@@ -2268,6 +2268,29 @@ check "h3 an upload survives other connections being torn down ($out4)" $?
 out5=$(timeout 120 python3 test/quic/h3_multi_data_test.py 61498 2>&1)
 case "$out5" in ok*) true ;; *) false ;; esac
 check "h3 a body in several DATA frames keeps its credit ($out5)" $?
+# A body the server CANNOT CAPTURE must not be reported as one the client sent
+# too much of. Opening the capture file, writing it, a full filesystem and a
+# payload fragmented past the range list all returned a bare -1, and the caller
+# turned every -1 into the same verdict as a body past max_body: 413. The
+# access line carries no method and no path (the head never parsed), so a
+# failed write and an oversized upload were indistinguishable in the log too --
+# which is how a capture file closed by another connection went unattributed.
+# The check walks 200 -> 413 -> 500 -> 200, the last so that a server which
+# answered 500 for ever afterwards could not pass it.
+mkdir -p test/spill_fail
+start_server test/configs/tls-h3-spillfail.json
+h3sf_pid=$SRV_PID
+sleep 0.3
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    out6=$(timeout 200 python3 test/quic/h3_capture_fail_test.py 61492 test/spill_fail 2>&1)
+    case "$out6" in ok*|skipped*) true ;; *) false ;; esac
+    check "h3 an uncapturable body is a 500, not the client's fault ($out6)" $?
+else
+    check "h3 uncapturable body (skipped: aioquic/pylsqpack unavailable)" 0
+fi
+kill $h3sf_pid 2>/dev/null
+wait $h3sf_pid 2>/dev/null
+chmod 755 test/spill_fail 2>/dev/null
 kill $spill_pid $h3big_pid $spill_backend_pid 2>/dev/null
 wait $spill_pid 2>/dev/null
 wait $spill_backend_pid 2>/dev/null
@@ -3308,6 +3331,7 @@ rm -f /tmp/upload3_echo.bin
     # key. 5 of the 6 report the wrong code before the fix.
     timeout 60 python3 test/tls/alert_codes.py 61446 >/dev/null 2>&1
     check "tls alert codes name the actual fault (tls-8, tls-9)" $?
+
 
     # RFC 8446 7.4.2 MUST: a low-order X25519 key share drives the ECDHE
     # product to all-zero whatever the server's private key is, and the

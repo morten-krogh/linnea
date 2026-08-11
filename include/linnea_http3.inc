@@ -71,10 +71,23 @@ LINNEA_H3_ERR_UNEXPECTED equ 5
 ; truncated, that is a CONNECTION error of type H3_FRAME_ERROR. Kept apart from
 ; the malformed-request sentinel above because that one fails only the stream.
 LINNEA_H3_ERR_TRUNCATED equ 6
-; The body could not be written where it was going — the capture file. Ours to
-; own, not the peer's: nothing about the request was wrong, so it earns a 500
-; rather than a stream reset that would tell the client to blame itself.
+; The body could not be written where it was going — the capture file could not
+; be opened, a write failed, or the peer fragmented the payload past the range
+; list. Ours to own, not the peer's: nothing about the request was wrong, so it
+; earns a 500 rather than a stream reset that would tell the client to blame
+; itself.
+;
+; This constant said exactly that from the day it was written, and the dispatch
+; answered 413 anyway, because the max_body refusal was routed through it too —
+; so "too large" became the answer to a failed write, and once to a capture file
+; some other connection had closed. The cause is now logged with its errno; see
+; ra_fail_errno.
 LINNEA_H3_ERR_SINK equ 7
+; The body outgrew max_body. The peer's to know about and ours to state: a 413,
+; the same answer h1 and h2 give an oversized upload. Kept apart from the sink
+; verdict above so that a server-side failure can never be reported as the
+; client having sent too much.
+LINNEA_H3_ERR_TOOBIG equ 8
 
 ; --- the request-stream frame walk -----------------------------------------
 ; A request stream is a sequence of frames, and until now it was walked in one

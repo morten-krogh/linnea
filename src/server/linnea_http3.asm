@@ -15,6 +15,7 @@ global linnea_h3_walk_decode
 global linnea_h3_build_response
 global linnea_h3_build_431
 global linnea_h3_build_413
+global linnea_h3_build_500
 global linnea_h3_build_421
 global linnea_h3_build_response_head
 global linnea_h3_serve
@@ -88,6 +89,8 @@ body_413:      db "413 Content Too Large", 10
 body_413_len   equ $ - body_413
 body_503:      db "503 Service Unavailable", 10
 body_503_len   equ $ - body_503
+body_500:      db "500 Internal Server Error", 10
+body_500_len   equ $ - body_500
 
 section .bss
 fs_buf:   resb 768                    ; encoded response field section
@@ -450,9 +453,17 @@ linnea_h3_walk_feed:
     mov rax, -LINNEA_H3_ERR_QPACK
     jmp .w_fail
 .w_sink_failed:
-    ; the body could not be put where it was going (the capture file). Ours,
-    ; not the peer's, so it is not a protocol error at all
+    ; The body could not be put where it was going. Two different things, and
+    ; they must not answer alike: -2 is the body outgrowing max_body, which is
+    ; the peer's to hear about as a 413; anything else is the capture file
+    ; failing us, which is ours and earns a 500. Collapsing them is how a write
+    ; to a descriptor another connection had closed came back as "too large".
+    cmp eax, -2
+    je .w_sink_toobig
     mov rax, -LINNEA_H3_ERR_SINK
+    jmp .w_fail
+.w_sink_toobig:
+    mov rax, -LINNEA_H3_ERR_TOOBIG
     jmp .w_fail
 .w_err:
     mov rax, -LINNEA_H3_ERR
@@ -704,6 +715,21 @@ linnea_h3_build_413:
     mov ecx, txt_plain_len
     lea r8, [body_413]
     mov r9d, body_413_len
+    jmp linnea_h3_build_response
+
+; linnea_h3_build_500(rdi=out) -> rax = length written.
+; The whole response for a request we could not carry out through no fault of
+; the client's: the capture file could not be opened or written, or the payload
+; was fragmented past what the range list will track. The request never finished
+; parsing, so there is no path or vhost to serve from — only a status, and the
+; status has to say OURS. Answering 413 here (which it did) tells the client to
+; send less, which cannot help and is not true.
+linnea_h3_build_500:
+    mov esi, 500
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_500]
+    mov r9d, body_500_len
     jmp linnea_h3_build_response
 
 ; linnea_h3_build_431(rdi=out) -> rax = length written.

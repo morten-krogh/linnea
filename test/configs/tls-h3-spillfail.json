@@ -1,0 +1,26 @@
+{
+  "log": "test/linnea-h3sf.log",
+  "timeout": 5,
+  "workers": 1,
+  "max_body": 200000,
+  "spill_dir": "test/spill_fail",
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 61492,
+      "hostname": "localhost",
+      "cert": "test/tls/server.crt",
+      "key": "test/tls/server.key",
+      "locations": [
+        {
+          "prefix": "/api",
+          "proxy": "127.0.0.1:61100"
+        },
+        {
+          "prefix": "/",
+          "root": "test/www"
+        }
+      ]
+    }
+  ]
+}

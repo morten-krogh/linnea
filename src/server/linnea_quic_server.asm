@@ -99,6 +99,10 @@ global linnea_h3_cancel_hook
 
 extern linnea_h3_build_431
 extern linnea_h3_build_413
+extern linnea_h3_build_500
+extern linnea_log_write
+extern linnea_log_u64
+extern linnea_log_stamp
 extern linnea_h3_build_421
 extern linnea_h3_read_headers
 extern linnea_h3_walk_feed
@@ -263,8 +267,39 @@ h3_uni_setup_len equ $ - h3_uni_setup
 ; Bytes of control-stream data in h3_uni_setup (the 0x00 type + the 6-byte
 ; SETTINGS frame) — the offset at which a later GOAWAY continues that stream.
 H3_CTRL_OFF equ 7
+; Why a body could not be captured. One reason per cause, because the whole
+; point of splitting the sink verdict is that these stop being the same event
+; in the log: an unwritable file and a peer fragmenting past the range list
+; want different answers from whoever is reading it at 3am.
+cap_open:  db "h3 upload: the capture file could not be opened"
+cap_open_len  equ $ - cap_open
+cap_write: db "h3 upload: writing the capture file failed"
+cap_write_len equ $ - cap_write
+cap_full:  db "h3 upload: the capture file took no bytes (a full filesystem)"
+cap_full_len  equ $ - cap_full
+cap_ranges: db "h3 upload: the payload was fragmented past the range list"
+cap_ranges_len equ $ - cap_ranges
+cap_pre:   db "] "
+cap_pre_len equ $ - cap_pre
+cap_errno: db " (errno "
+cap_errno_len equ $ - cap_errno
+cap_errno_end: db ")", 10
+cap_errno_end_len equ $ - cap_errno_end
 
 section .bss
+; What went wrong the last time a body could not be captured, kept for the
+; response path to log. The kTLS handoff keeps its errno the same way
+; (linnea_ktls_fail_errno) and for the same reason: the failure and the only
+; place that can report it are several returns apart.
+; Which canned status .req_status_only should send. A memory slot and NOT a
+; register: r14/r15 are the frame-scan cursor and its end across this whole
+; function, and both of these handlers return to .stream_scan, which compares
+; them. Parking it in r15d corrupted the scan of every later frame in the same
+; datagram -- the same shape as the tp_parse rax clobber from the 07-30 audit.
+req_status_pick:    resq 1
+ra_fail_reason:     resq 1
+ra_fail_reason_len: resq 1
+ra_fail_errno:      resq 1
 sa:          resb 28
 salen:       resq 1
 linnea_quic_rxbuf: resb LINNEA_QUIC_RXBUF_SIZE
@@ -2569,13 +2604,19 @@ linnea_quic_server_datagram:
     call ra_slide                              ; the window resumes at its end
     pop rax
     jmp .ra_donecheck
+.ra_body_toobig:
+    ; The DECLARED payload is past max_body, which is the peer's to hear about
+    ; and ours to state plainly: a 413, the same answer h1 and h2 give. It used
+    ; to share the label below, which is how a failed write came to be reported
+    ; as the client having sent too much.
+    mov rax, -LINNEA_H3_ERR_TOOBIG
+    jmp .ra_walk_failed
 .ra_body_failed:
-    ; The payload could not be put where it was going -- a full filesystem, a
-    ; peer fragmenting past what the range list will track, or a DECLARED
-    ; payload past max_body. All three are ours to answer rather than protocol
-    ; errors, and all three mean the same thing to the client, so they share
-    ; the sink verdict: .req_body_toolarge turns it into a 413 on the stream,
-    ; which is what h1 and h2 answer an oversized upload with.
+    ; The payload could not be put where it was going -- the capture file could
+    ; not be opened or written, or the peer fragmented it past the range list.
+    ; None of that is the peer's fault and none of it is a protocol error, so
+    ; it takes the sink verdict, which .req_capture_failed answers with a 500.
+    ; ra_fail_note has already recorded which of them it was.
     ;
     ; This label sits behind an unconditional jump ON PURPOSE. The max_body
     ; refusal first lived next to .ra_fed_none, where it read more naturally
@@ -2709,7 +2750,7 @@ linnea_quic_server_datagram:
     lea rcx, [linnea_config_instance]
     cmp rax, [rcx + linnea_config.max_body]
     pop rcx
-    ja .ra_body_failed          ; 413, via the sink verdict — see there
+    ja .ra_body_toobig          ; the declared payload is past the cap: 413
     mov rax, [rdi + linnea_quic_ra.base]
     mov [rdi + linnea_quic_ra.body_from], rax
     mov [rdi + linnea_quic_ra.body_hi], rax
@@ -3038,6 +3079,8 @@ linnea_quic_server_datagram:
     cmp rax, -LINNEA_H3_ERR_TOOLARGE
     je .req_toolarge
     cmp rax, -LINNEA_H3_ERR_SINK
+    je .req_capture_failed
+    cmp rax, -LINNEA_H3_ERR_TOOBIG
     je .req_body_toolarge
     cmp rax, -LINNEA_H3_ERR_QPACK
     je .req_qpack_bad
@@ -3123,11 +3166,48 @@ linnea_quic_server_datagram:
     call .send_1rtt
     jmp .stream_scan
 
+.req_capture_failed:
+    ; The body could not be captured, through no fault of the client's. Log
+    ; WHICH failure it was, with its errno: the access line below carries no
+    ; method and no path (the head never parsed), so without this the only
+    ; trace of a full disk, a bad descriptor and an over-fragmented payload is
+    ; one indistinguishable status. That is exactly how a capture file closed
+    ; by another connection went unattributed for hours.
+    cmp qword [ra_fail_reason], 0
+    je .rcf_answer
+    call linnea_log_stamp
+    mov rdi, [ra_fail_reason]
+    mov rsi, [ra_fail_reason_len]
+    call linnea_log_write
+    cmp qword [ra_fail_errno], 0
+    je .rcf_nl
+    lea rdi, [cap_errno]
+    mov esi, cap_errno_len
+    call linnea_log_write
+    mov rdi, [ra_fail_errno]
+    call linnea_log_u64
+    lea rdi, [cap_errno_end]
+    mov esi, cap_errno_end_len
+    call linnea_log_write
+    jmp .rcf_done
+.rcf_nl:
+    lea rdi, [cap_errno_end + 1]     ; just the newline
+    mov esi, 1
+    call linnea_log_write
+.rcf_done:
+    mov qword [ra_fail_reason], 0    ; consumed: the next failure sets its own
+.rcf_answer:
+    mov qword [req_status_pick], 500
+    jmp .req_status_only
 .req_body_toolarge:
-    ; The body outgrew max_body (or its capture file could not be written).
-    ; Ours, not the peer's: the request was well formed and we will not hold
-    ; it, which is a 413 on the stream and not a reset -- h1 and h2 both answer
-    ; an oversized upload that way, and a reset would leave the client to guess.
+    ; The body outgrew max_body. Ours to state, the peer's to act on: the
+    ; request was well formed and we will not hold it, which is a 413 on the
+    ; stream and not a reset -- h1 and h2 both answer an oversized upload that
+    ; way, and a reset would leave the client to guess.
+    mov qword [req_status_pick], 413
+.req_status_only:
+    ; One canned status on the stream, for a request whose head never parsed.
+    ; req_status_pick chooses it; the rest is the same either way.
     CONNLEA rdi, peer
     lea rsi, [acc_peer_buf]
     call linnea_network_addr_format
@@ -3151,7 +3231,13 @@ linnea_quic_server_datagram:
     add rbx, rax
     inc rbx
     lea rdi, [strm_pay + rbx]
+    cmp qword [req_status_pick], 500
+    je .rso_500
     call linnea_h3_build_413         ; rax = response length
+    jmp .rso_sent
+.rso_500:
+    call linnea_h3_build_500
+.rso_sent:
     lea rdx, [rax + rbx]
     lea rsi, [strm_pay]
     call .send_1rtt
@@ -6839,6 +6925,15 @@ ra_spill_ensure:
     xor eax, eax
     ret
 .se_fail:
+    ; the open's own errno, recorded here because this is the only place that
+    ; still has it -- the caller sees a bare -1
+    push rax                           ; ...and squares rsp for the call
+    neg rax
+    mov rdx, rax
+    lea rdi, [cap_open]
+    mov esi, cap_open_len
+    call ra_fail_note
+    pop rax
     mov eax, -1
     ret
 
@@ -6854,6 +6949,15 @@ ra_spill_ensure:
 ;
 ; Duplicates are free, being the same bytes at the same offset (RFC 9000 2.2),
 ; so the range list only has to answer when the region is whole.
+; ra_fail_note(rdi = reason ptr, rsi = reason length, rdx = errno or 0) --
+; remember why a capture failed, for the response path to log. Clobbers nothing
+; a caller keeps: the three stores and a return.
+ra_fail_note:
+    mov [ra_fail_reason], rdi
+    mov [ra_fail_reason_len], rsi
+    mov [ra_fail_errno], rdx
+    ret
+
 ra_body_place:
     push rbx
     push r12
@@ -6869,7 +6973,7 @@ ra_body_place:
     mov rdi, rbx
     call ra_spill_ensure
     test eax, eax
-    js .bp_fail
+    js .bp_open_failed
     mov rax, r12
     sub rax, [rbx + linnea_quic_ra.body_from]
     add rax, [rbx + linnea_quic_ra.body_file]
@@ -6884,7 +6988,7 @@ ra_body_place:
     cmp rax, -4095
     jae .bp_wfail
     test rax, rax
-    jz .bp_fail                        ; no progress: a full filesystem
+    jz .bp_nospace                     ; no progress: a full filesystem
     add r13, rax
     add r15, rax
     sub r14, rax
@@ -6897,13 +7001,35 @@ ra_body_place:
     mov rdi, rbx
     call ra_range_add
     test eax, eax
-    js .bp_fail
+    js .bp_ranges
 .bp_ok:
     xor eax, eax
     jmp .bp_ret
 .bp_wfail:
     cmp rax, -LINNEA_EINTR
     je .bp_write
+    ; a real write error, and rax is still the errno -- which is the whole
+    ; point: this used to fall into a bare -1 and reach the client as "your
+    ; body is too large", once for a descriptor another connection had closed.
+    neg rax
+    mov rdx, rax
+    lea rdi, [cap_write]
+    mov esi, cap_write_len
+    call ra_fail_note
+    jmp .bp_fail
+.bp_open_failed:
+    jmp .bp_fail                       ; ra_spill_ensure noted it, with its errno
+.bp_nospace:
+    lea rdi, [cap_full]
+    mov esi, cap_full_len
+    xor edx, edx
+    call ra_fail_note
+    jmp .bp_fail
+.bp_ranges:
+    lea rdi, [cap_ranges]
+    mov esi, cap_ranges_len
+    xor edx, edx
+    call ra_fail_note
 .bp_fail:
     mov eax, -1
 .bp_ret:
@@ -7097,6 +7223,10 @@ ra_body_sink:
     push r12
     push r13
     push r14
+    push r15                                     ; not used: it makes the push
+                                                 ; count odd so rsp is 16-aligned
+                                                 ; at the calls below, the way
+                                                 ; ra_body_place's five already are
     mov rbx, [rdi + linnea_h3_walk.sink_ctx]     ; the context this walk is in
     mov r12, rsi
     mov r13, rdx
@@ -7109,7 +7239,7 @@ ra_body_sink:
     mov eax, LINNEA_SYS_OPEN
     syscall
     cmp rax, -4095
-    jae .bs_fail
+    jae .bs_open_failed
     mov [rbx + linnea_quic_ra.spill_fd], rax
 .bs_have_fd:
     ; the cap is max_body, the same one an h1 upload is held to
@@ -7119,7 +7249,7 @@ ra_body_sink:
     lea rax, [linnea_config_instance]
     mov rax, [rax + linnea_config.max_body]
     cmp r14, rax
-    ja .bs_fail
+    ja .bs_toobig                                ; the cap, not a failure: -2
 .bs_write:
     test r13, r13
     jz .bs_done
@@ -7138,7 +7268,7 @@ ra_body_sink:
     cmp rax, -4095
     jae .bs_retry
     test rax, rax
-    jz .bs_fail                                  ; no progress: a full filesystem
+    jz .bs_nospace                               ; no progress: a full filesystem
     add [rbx + linnea_quic_ra.spill_len], rax
     add r12, rax
     sub r13, rax
@@ -7148,12 +7278,35 @@ ra_body_sink:
     je .bs_write
     cmp rax, -LINNEA_EAGAIN
     je .bs_write
+    ; a real write error, and rax still holds the errno
+    neg rax
+    mov rdx, rax
+    lea rdi, [cap_write]
+    mov esi, cap_write_len
+    call ra_fail_note
+    jmp .bs_fail
+.bs_open_failed:
+    neg rax                            ; the open's errno, still in rax
+    mov rdx, rax
+    lea rdi, [cap_open]
+    mov esi, cap_open_len
+    call ra_fail_note
+    jmp .bs_fail
+.bs_nospace:
+    lea rdi, [cap_full]
+    mov esi, cap_full_len
+    xor edx, edx
+    call ra_fail_note
 .bs_fail:
-    mov rax, -1
+    mov rax, -1                                  ; ours: answered 500
+    jmp .bs_ret
+.bs_toobig:
+    mov rax, -2                                  ; the peer's: answered 413
     jmp .bs_ret
 .bs_done:
     xor eax, eax
 .bs_ret:
+    pop r15
     pop r14
     pop r13
     pop r12
