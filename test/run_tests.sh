@@ -2239,6 +2239,17 @@ for n in 40000 16000000; do
     case "$out2" in ok*) true ;; *) false ;; esac
     check "h3 upload of $n bytes goes to the capture file and echoes back ($out2)" $?
 done
+# A stream ENDED at exactly the flow-control limit, in an empty frame of its
+# own, while a gap remains in the payload. Inside a payload the limit we grant
+# IS the payload's end, and the reassembly base stays pinned at its start, so
+# that offset looked a whole payload past a 32 KiB window: the connection was
+# closed with FLOW_CONTROL_ERROR against a peer that had done nothing wrong.
+# The check also sends 64 bytes PAST the end, which must STILL be refused --
+# without that half it would pass just as well against a server that stopped
+# checking the bound at all.
+out3=$(timeout 120 python3 test/quic/h3_fin_at_limit_test.py 61498 2>&1)
+case "$out3" in ok*) true ;; *) false ;; esac
+check "h3 a stream ended at the flow-control limit is not a violation ($out3)" $?
 kill $spill_pid $h3big_pid $spill_backend_pid 2>/dev/null
 wait $spill_pid 2>/dev/null
 wait $spill_backend_pid 2>/dev/null

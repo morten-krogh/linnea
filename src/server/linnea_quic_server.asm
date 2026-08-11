@@ -2487,7 +2487,32 @@ linnea_quic_server_datagram:
     jb .ra_win                                 ; below it: framing, not body
     mov rcx, [rax + linnea_quic_ra.body_to]
     cmp r9, rcx
-    jae .ra_win                                ; at or past its end
+    jb .ra_binside
+    ; At the payload's end exactly, carrying nothing: the peer is ENDING THE
+    ; STREAM at the limit it was granted, which inside a payload is body_to.
+    ; RFC 9000 4.1 allows a final size equal to the limit, and nothing obliges
+    ; the FIN to ride a frame that also carries data -- so this is a conforming
+    ; peer, not a violation.
+    ;
+    ; It cannot go through the window below. That window is indexed from base,
+    ; which stays pinned at the payload's START for as long as the payload is
+    ; being written to the file, so this offset reads as a whole payload past a
+    ; 32 KiB buffer and trips the bound. It closed the connection with
+    ; FLOW_CONTROL_ERROR against a peer that had done nothing wrong.
+    ;
+    ; Record the end and leave the window alone. The completion check cannot
+    ; fire yet (base + len is still the payload's start, not its end), so this
+    ; waits for the payload exactly as it should; ra_slide moves base to
+    ; body_to when the region closes, and the check fires on that pass.
+    jne .ra_win                                ; PAST the end: a real violation
+    test r10, r10
+    jnz .ra_win                                ; data past it: likewise
+    mov qword [rax + linnea_quic_ra.fin], 1
+    mov rcx, [s_soff]
+    add rcx, [s_slen]
+    mov [rax + linnea_quic_ra.final], rcx      ; an absolute stream offset
+    jmp .ra_donecheck
+.ra_binside:
     mov rdx, rcx
     sub rdx, r9                                ; a frame may straddle the end
     cmp r10, rdx
