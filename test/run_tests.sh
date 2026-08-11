@@ -2214,13 +2214,21 @@ check "the upload capture file is created under spill_dir ($out)" $?
 # written to the file, so anything past RA_WINDOW could never finish. 8 MB
 # against a 4 MiB window returned nothing for 180s. The size must stay above
 # that window for this to test anything.
-# NOT WIRED IN YET. The driver exists (test/quic/h3_upload_big.py) and the
-# case it covers is real — an 8 MB h3 upload hung for 180s before the fix and
-# takes 0.35s after it, verified by hand against a fixture proxying to
-# linnea-api. Against test/proxy_backend.py on 61100 it still times out, and
-# whether that is the backend (which echoes the whole body back) or the server
-# is unresolved. Wiring in a check whose failure I cannot attribute would be
-# worse than leaving it out, so this waits for that answer.
+# An h3 upload well past the per-stream window. THIS CHECK IS EXPECTED TO FAIL
+# until the h3 direct-to-file body path is fixed — it is here to hold the bug
+# still, not because it passes. 8 MB completes byte-exact in ~1.3s; 16 MB gets
+# no response at all. Both on a FRESHLY STARTED fixture, which matters: a
+# failed attempt drags the working size down, so a run after another run
+# measures that instead and reads as a tidy size threshold that is not real.
+#
+# Attribution is settled: test/proxy_backend.py echoes 8 MB over h1 in 0.28s,
+# so the timeout is the server. An earlier version of this driver looked for
+# the JSON checksum that /api/upload returns, against /api/echo which returns
+# the body verbatim — it reported "body differs" on a request that had in fact
+# succeeded. The comparison is the body itself now.
+out2=$(timeout 120 python3 test/quic/h3_upload_big.py localhost 16000000 61498 2>&1)
+case "$out2" in ok*) true ;; *) false ;; esac
+check "h3 upload past the per-stream window completes ($out2)" $?
 kill $spill_pid $h3big_pid $spill_backend_pid 2>/dev/null
 wait $spill_pid 2>/dev/null
 wait $spill_backend_pid 2>/dev/null

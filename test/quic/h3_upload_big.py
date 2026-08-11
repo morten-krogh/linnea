@@ -62,7 +62,7 @@ h3.send_data(sid, body, end_stream=True)
 flush()
 
 status, data, done = None, b"", False
-end = time.time() + 180
+end = time.time() + 60   # a working upload of this size takes ~3s
 while time.time() < end and not done:
     try:
         conn.receive_datagram(s.recvfrom(2048)[0], ADDR, now=time.time())
@@ -83,11 +83,16 @@ while time.time() < end and not done:
 dt = time.time() - t0
 s.close()
 
+# /api/echo returns the body verbatim, so the comparison is the body itself —
+# a byte placed at the wrong file offset shows up as a wrong answer rather
+# than as a request that merely completed.
 if status != "200":
     print("status %s after %.1fs (want 200)" % (status, dt))
     sys.exit(1)
-got = data.split(b'"checksum":"')[1].split(b'"')[0].decode() if b'"checksum":"' in data else ""
-if got != want:
-    print("body differs after %.1fs (%s)" % (dt, got[:16] or "no checksum"))
+if len(data) != n:
+    print("echoed %d of %d bytes after %.1fs" % (len(data), n, dt))
+    sys.exit(1)
+if hashlib.sha256(data).hexdigest() != want:
+    print("echoed %d bytes but the content differs" % len(data))
     sys.exit(1)
 print("ok (%d bytes, %.2fs, byte-exact)" % (n, dt))
