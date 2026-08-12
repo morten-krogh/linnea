@@ -262,9 +262,9 @@ linnea_ring_get_sqe:
 
 ; linnea_ring_submit(rdi = ring*) -> eax = sqes submitted, or a negative errno.
 ; Publishes every sqe prepared since the last call and enters the kernel to start
-; them. The kernel never writes the submission tail, so it doubles as the record
-; of what has already been published. Everything but rax is preserved (see
-; linnea_ring_get_sqe).
+; everything it has not consumed yet. The kernel never writes the submission
+; tail, so it doubles as the record of what has already been published.
+; Everything but rax is preserved (see linnea_ring_get_sqe).
 linnea_ring_submit:
     push rdi
     push rsi
@@ -277,11 +277,28 @@ linnea_ring_submit:
     mov rcx, [rdi + linnea_ring.sq_ktail]
     mov edx, [rcx]                    ; last published tail
     mov rsi, [rdi + linnea_ring.sq_tail]
-    mov eax, esi
-    sub eax, edx                      ; sqes to submit
-    jz .none
+    cmp edx, esi
+    je .published                     ; nothing new was prepared
     mov [rcx], esi                    ; publish (plain store: x86 orders it after
                                       ; the sqe writes above)
+.published:
+    ; What to ask for is what the KERNEL has not consumed — not what was just
+    ; published. io_uring_enter(2) may stop part-way through a batch and report
+    ; a smaller count: it breaks out of the submission loop on an sqe it cannot
+    ; init, and on failing to allocate a request under memory pressure. Counting
+    ; from the published tail would never offer the remainder again, so the sq
+    ; head would trail our tail by the shortfall for the life of the process:
+    ; every later batch would start that many operations behind, and a loop that
+    ; then went quiet would leave them unstarted — with their linked timeouts
+    ; unstarted too, so nothing would ever time them out. Counting from the head
+    ; is what liburing's io_uring_submit did, and it clears the shortfall on the
+    ; next call. Measured on 7.0.8: a three-sqe batch with an unknown opcode in
+    ; the middle submits 2, and the difference is a permanent one-sqe lag versus
+    ; none (test/uring/linnea_ringtest.asm).
+    mov rcx, [rdi + linnea_ring.sq_khead]
+    mov eax, esi
+    sub eax, [rcx]                    ; sqes the kernel has still to consume
+    jz .none
     mov edi, [rdi + linnea_ring.fd]   ; fd (edi is preserved across ring_enter)
     push rax                          ; [rsp+8] to_submit (regs don't survive the
     mov r9d, 1024                     ;         syscall; keep it on the stack)

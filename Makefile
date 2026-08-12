@@ -291,6 +291,20 @@ $(POOLTEST_BIN): $(POOLTEST_OBJS)
 pooltest: $(POOLTEST_BIN)
 	./$(POOLTEST_BIN)
 
+# --- test-only: io_uring submission accounting, against the real kernel ---
+RINGTEST_BIN  = bin/linnea-ringtest
+RINGTEST_OBJS = test/uring/linnea_ringtest.o src/server/linnea_ring.o \
+                src/lib/linnea_print.o src/lib/linnea_string.o
+
+test/uring/linnea_ringtest.o: test/uring/linnea_ringtest.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(RINGTEST_BIN): $(RINGTEST_OBJS)
+	$(LD) -o $@ $^
+
+ringtest: $(RINGTEST_BIN)
+	./$(RINGTEST_BIN)
+
 # --- test-only: QPACK decoder (reads a field section on stdin) ---
 QPACKTEST_BIN  = bin/linnea-qpacktest
 QPACKTEST_OBJS = test/quic/linnea_qpacktest.o src/server/linnea_qpack.o src/server/linnea_hpack.o \
@@ -369,7 +383,7 @@ test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
       bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs $(QPACKTEST_BIN) \
       $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN) $(RTXTEST_BIN) $(REPLAYTEST_BIN) \
-      $(WS_BIN)
+      $(RINGTEST_BIN) $(WS_BIN)
 	./test/run_tests.sh
 
 # Install all four products to /usr/local/bin: bin_t under SELinux, so systemd

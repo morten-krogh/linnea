@@ -418,6 +418,17 @@ else
     check "quic pool selftest (skipped: binary unavailable)" 0
 fi
 
+# io_uring submission accounting: when the kernel consumes fewer sqes than it was
+# told (a batch with an sqe it cannot init), the remainder must still be offered
+# again rather than trailing our tail for the life of the process.
+if [ -x ./bin/linnea-ringtest ]; then
+    out=$(./bin/linnea-ringtest)
+    rc=$?
+    check "io_uring partial-submission recovery selftest ($out)" $rc
+else
+    check "io_uring partial-submission selftest (skipped: binary unavailable)" 0
+fi
+
 # QUIC 1-RTT loss recovery: the sent-packet ring (record/ack-range/inflight) and
 # the ACK-frame range decoder, in isolation and together.
 if [ -x ./bin/linnea-rtxtest ]; then
