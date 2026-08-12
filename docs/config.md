@@ -109,7 +109,22 @@ every other global has a working default.
 | `workers` | integer | `0` | 0–256 | Worker processes. **`0` means one per online CPU**, which is the default. |
 | `http2` | integer | `1` | 0 or 1 | Offer HTTP/2 via ALPN on TLS listeners. |
 | `spill_dir` | string | `/tmp` | ≤ 255 | Directory whose **filesystem** holds request-body capture files. Must exist and support `O_TMPFILE`; no directory entry is ever created in it. **Put this on a real disk.** |
+| `port_file` | string | none | ≤ 255 | Path to write the ports actually bound, one line per server: `<hostname> <host> <port>`. Written once, after every listener is up and before any worker is forked. Unset means no file. Mainly for `"port": 0`, where the config cannot say what the port will be. |
 
+> **`"port": 0` and `port_file` go together.** With `0`, the kernel picks a free
+> port at bind time and the answer is written back everywhere the configured
+> number would have been read: the `listening on host:port` log line, `Alt-Svc`,
+> and `port_file`. Every worker's listener binds the *same* chosen port, so the
+> `SO_REUSEPORT` set stays a set. Two servers that both say `0` get two
+> different ports and two listeners — sharing one listener between vhosts needs
+> a real number they can agree on. Across a hot upgrade the inherited socket
+> keeps its port, so a reload does not move it.
+>
+> `port_file` is written through a temporary file and `rename(2)`, so a reader
+> polling for it sees either nothing or the finished contents, never a
+> half-written line. If it cannot be written the server stops, with the errno —
+> silently starting would leave whoever is waiting on the file to time out.
+>
 > **`spill_dir` decides whether an upload costs RAM or disk.** An HTTP/1.1 or
 > HTTP/3 upload is captured whole before it goes upstream, so the capture is as
 > large as the body — up to `max_body`. The default, `/tmp`, is tmpfs on most
@@ -137,7 +152,7 @@ and be told apart by `hostname` (SNI on TLS, the `Host` header on plaintext).
 | Key | Type | Default | Limit | What it does |
 |---|---|---|---|---|
 | `host` | string | — **required** | ≤ 63 | Bind address: **an IPv4 literal, or `"::"`**. Names are not resolved — `"localhost"` and `"::1"` are both refused. |
-| `port` | integer | — **required** | 1–65535 | Bind port. |
+| `port` | integer | — **required** | `0`, or 1–65535 | Bind port. **`0` means "let the kernel choose a free one"** — see below. The key itself is still required, so a random port is always something the config asked for. |
 | `hostname` | string | — **required** | ≤ 255 | The name this server answers to. Not empty. |
 | `locations` | array | — **required** | 1–8 | Path routing. At least one. |
 | `cert` | string | none | ≤ 255 | Path to a PEM certificate chain. Enables TLS. |

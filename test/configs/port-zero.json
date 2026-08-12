@@ -1,0 +1,16 @@
+{
+  "log": "test/linnea-p0.log",
+  "port_file": "test/port-zero.ports",
+  "timeout": 2,
+  "workers": 2,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 0,
+      "hostname": "auto.test",
+      "locations": [
+        { "prefix": "/", "root": "test/www" }
+      ]
+    }
+  ]
+}

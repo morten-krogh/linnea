@@ -43,6 +43,8 @@ key_log:                db "log"
 key_log_len             equ $ - key_log
 key_spill:              db "spill_dir"
 key_spill_len           equ $ - key_spill
+key_portfile:           db "port_file"
+key_portfile_len        equ $ - key_portfile
 ; The default is what every deployment got before the key existed. It is a
 ; poor default — see the note in linnea_config.inc — so validate warns when
 ; the directory it names turns out to be tmpfs rather than silently costing
@@ -126,7 +128,7 @@ msg_control:            db "control character in string"
 msg_control_len         equ $ - msg_control
 msg_number:             db "expected number"
 msg_number_len          equ $ - msg_number
-msg_port_range:         db "port must be between 1 and 65535"
+msg_port_range:         db "port must be 0 (kernel-chosen) or between 1 and 65535"
 msg_port_range_len      equ $ - msg_port_range
 msg_number_range:       db "number too large"
 msg_number_range_len    equ $ - msg_number_range
@@ -174,6 +176,8 @@ msg_log_long:           db "log too long"
 msg_log_long_len        equ $ - msg_log_long
 msg_spill_bad:          db "spill_dir must be a non-empty path of at most 255 bytes"
 msg_spill_bad_len       equ $ - msg_spill_bad
+msg_portfile_bad:       db "port_file must be a non-empty path of at most 255 bytes"
+msg_portfile_bad_len    equ $ - msg_portfile_bad
 
 section .data
 
@@ -256,6 +260,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_spill
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_portfile]
+    mov ecx, key_portfile_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_portfile
     mov rdi, r14
     mov rsi, r15
     lea rdx, [key_timeout]
@@ -386,6 +397,25 @@ linnea_config_parse:
     mov rsi, rax
     call linnea_string_copy
     jmp .top_sep
+
+.top_portfile:
+    test r13d, 4096
+    jnz .top_dup
+    or r13d, 4096
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_ROOT
+    ja .portfile_bad
+    test rdx, rdx
+    jz .portfile_bad               ; an empty path names no file
+    mov [rbx + linnea_config.port_file_len], rdx
+    lea rdi, [rbx + linnea_config.port_file]
+    mov rsi, rax
+    call linnea_string_copy
+    jmp .top_sep
+.portfile_bad:
+    lea rdi, [msg_portfile_bad]
+    mov esi, msg_portfile_bad_len
+    jmp linnea_parse_fail
 
 .top_timeout:
     test r13d, 4
@@ -696,8 +726,11 @@ linnea_parse_server:
     jnz .dup
     or r12d, 2
     call linnea_parse_u64
-    test rax, rax
-    jz .port_range
+    ; 0 is allowed and means "let the kernel choose a free one": the bind
+    ; resolves it and writes the answer back into this field, so everything
+    ; downstream — the shared-listener scan, the log line, Alt-Svc, port_file —
+    ; reads the real port. parse_u64 never returns to signal failure, so a 0
+    ; here is a 0 the config actually wrote.
     cmp rax, 65535
     ja .port_range
     mov [rbx + linnea_config_server.port], ax

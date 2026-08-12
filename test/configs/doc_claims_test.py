@@ -179,6 +179,26 @@ test(base(), "spill_dir is optional (defaults to /tmp)", True)
 test(srv(drain_timeout=30), "drain_timeout on a SERVER is unknown", False,
      "unknown key")
 test(srv(port=65536), "port above 65535 rejected", False)
+
+# port: 0 means "let the kernel choose" (doc: the port row and the note under
+# it). The key stays REQUIRED, which is what keeps a random port something the
+# config asked for rather than something it forgot -- so both halves are
+# asserted, not just the permissive one.
+test(srv(port=0), "port 0 accepted (kernel-chosen)", True)
+nokey = base()
+del nokey["servers"][0]["port"]
+test(nokey, "port key still required (0 is deliberate, not missing)", False,
+     "server requires host, port, hostname and locations")
+
+# port_file: a global, <= 255 bytes, optional, and not a server key.
+test(base(port_file=""), "port_file may not be empty", False,
+     "port_file must be a non-empty path")
+test(base(port_file="x" * 256), "port_file over 255 bytes rejected", False,
+     "port_file must be a non-empty path")
+test(base(port_file=os.path.join(D, "ports")), "port_file path accepted", True)
+test(base(), "port_file is optional", True)
+test(srv(port_file="/tmp/x"), "port_file on a SERVER is unknown", False,
+     "unknown key")
 big = base()
 big["servers"][0]["locations"] = [{"prefix": "/p%d" % i, "root": D}
                                   for i in range(9)]

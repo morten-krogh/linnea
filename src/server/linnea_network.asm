@@ -10,6 +10,7 @@ default rel
 %include "linnea_config.inc"
 
 global linnea_network_listen_all
+global linnea_network_write_port_file
 global linnea_network_probe_owner
 global linnea_listen_reuseport
 global linnea_listen_quiet
@@ -26,6 +27,8 @@ extern linnea_string_from_u64
 extern linnea_log_write
 extern linnea_log_u64
 extern linnea_log_stamp
+extern linnea_print_stderr
+extern linnea_print_u64_stderr
 
 section .rodata
 
@@ -39,6 +42,14 @@ msg_bind:           db "cannot bind to"
 msg_bind_len        equ $ - msg_bind
 msg_listen:         db "cannot listen on"
 msg_listen_len      equ $ - msg_listen
+msg_getsockname:    db "bound but could not read back the kernel-chosen port for"
+msg_getsockname_len equ $ - msg_getsockname
+msg_port_file:      db "linnea: cannot write port_file "
+msg_port_file_len   equ $ - msg_port_file
+msg_pf_errno:       db " (errno "
+msg_pf_errno_len    equ $ - msg_pf_errno
+msg_pf_close:       db ")", 10
+msg_pf_close_len    equ $ - msg_pf_close
 
 log_listen:         db "listening on "
 log_listen_len      equ $ - log_listen
@@ -58,6 +69,14 @@ sockopt_zero:       dd 0
 sockopt_rcvbuf:     dd 4194304
 
 section .bss
+
+; port_file scratch. One line is a hostname, a host, a port and two spaces plus
+; the newline; linnea_string_from_u64 writes into 20 bytes from the cursor it is
+; given, so the per-line allowance carries that rather than the 5 digits a port
+; needs, and the whole buffer carries one more for the last line.
+PF_LINE_MAX equ LINNEA_MAX_HOSTNAME + LINNEA_MAX_HOST + 24
+pf_buf:     resb PF_LINE_MAX * LINNEA_MAX_SERVERS + 32
+pf_tmp:     resb LINNEA_MAX_ROOT + 8      ; the path plus ".tmp" and a NUL
 
 ; 1 = listener_create binds SO_REUSEPORT: one listener set per worker, so the
 ; kernel spreads accepted connections across the workers instead of one ring
@@ -142,6 +161,142 @@ linnea_network_listen_all:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; linnea_network_write_port_file(rdi=config*) — report the ports actually bound,
+; one line per server in declaration order:
+;
+;   <hostname> <host> <port>
+;
+; Nothing is written when no port_file is configured. It goes to "<path>.tmp"
+; and is renamed into place, so a reader polling for the file sees either
+; nothing or the finished contents — never a truncated first line, which is
+; exactly the race a test would hit, once in a hundred runs, on the very
+; mechanism meant to remove races.
+;
+; Called from the master after every listener exists and before any worker is
+; forked, so the file is there by the time anything can connect.
+linnea_network_write_port_file:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    cmp qword [rbx + linnea_config.port_file_len], 0
+    je .wp_done
+    ; --- build the contents ---
+    lea r12, [pf_buf]                       ; write cursor
+    xor r13d, r13d                          ; server index
+.wp_loop:
+    cmp r13, [rbx + linnea_config.server_count]
+    jae .wp_built
+    imul r14, r13, linnea_config_server_size
+    lea r14, [rbx + r14 + linnea_config.servers]
+    lea rdi, [r14 + linnea_config_server.hostname]
+    mov rsi, [r14 + linnea_config_server.hostname_len]
+    mov rdx, r12
+    call pf_append
+    mov r12, rax
+    mov byte [r12], ' '
+    inc r12
+    lea rdi, [r14 + linnea_config_server.host]
+    mov rsi, [r14 + linnea_config_server.host_len]
+    mov rdx, r12
+    call pf_append
+    mov r12, rax
+    mov byte [r12], ' '
+    inc r12
+    movzx edi, word [r14 + linnea_config_server.port]
+    mov rsi, r12
+    call linnea_string_from_u64
+    add r12, rax
+    mov byte [r12], 10
+    inc r12
+    inc r13
+    jmp .wp_loop
+.wp_built:
+    ; --- <path>.tmp, then rename ---
+    lea rdi, [rbx + linnea_config.port_file]
+    mov rsi, [rbx + linnea_config.port_file_len]
+    lea rdx, [pf_tmp]
+    call pf_append                          ; rax = end of the copied path
+    mov dword [rax], '.tmp'                 ; 4 bytes plus the NUL below
+    mov byte [rax + 4], 0
+    lea rdi, [pf_tmp]
+    mov esi, LINNEA_O_WRONLY | LINNEA_O_CREAT | LINNEA_O_TRUNC | LINNEA_O_CLOEXEC
+    mov edx, 0o644
+    mov eax, LINNEA_SYS_OPEN
+    syscall
+    cmp rax, -4095
+    jae .wp_fail
+    mov r13d, eax                           ; fd
+    mov eax, LINNEA_SYS_WRITE
+    mov edi, r13d
+    lea rsi, [pf_buf]
+    mov rdx, r12
+    sub rdx, rsi                            ; bytes built
+    syscall
+    mov r14, rax                            ; keep the write result
+    mov eax, LINNEA_SYS_CLOSE
+    mov edi, r13d
+    syscall
+    cmp r14, -4095
+    jae .wp_fail
+    mov eax, LINNEA_SYS_RENAME
+    lea rdi, [pf_tmp]
+    lea rsi, [rbx + linnea_config.port_file]
+    syscall
+    cmp rax, -4095
+    jae .wp_fail
+.wp_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.wp_fail:
+    ; A port_file nobody can write is a silent failure for whoever is waiting on
+    ; it, so it stops the start rather than leaving them to time out. The errno
+    ; is carried, not collapsed: ENOENT (a directory that is not there) and
+    ; EACCES are different mistakes and the reader has to be told which.
+    neg rax
+    mov r13, rax
+    lea rdi, [msg_port_file]
+    mov esi, msg_port_file_len
+    call linnea_print_stderr
+    lea rdi, [rbx + linnea_config.port_file]
+    mov rsi, [rbx + linnea_config.port_file_len]
+    call linnea_print_stderr
+    lea rdi, [msg_pf_errno]
+    mov esi, msg_pf_errno_len
+    call linnea_print_stderr
+    mov rdi, r13
+    call linnea_print_u64_stderr
+    lea rdi, [msg_pf_close]
+    mov esi, msg_pf_close_len
+    call linnea_print_stderr
+    mov edi, 1
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; pf_append(rdi = src, rsi = len, rdx = dst) -> rax = dst + len.
+; A plain copy; the buffer is sized for the worst case in .bss below.
+pf_append:
+    push rcx
+    mov rcx, rsi
+    mov rax, rdx
+    add rax, rsi
+    test rcx, rcx
+    jz .pa_done
+.pa_copy:
+    mov r8b, [rdi]
+    mov [rdx], r8b
+    inc rdi
+    inc rdx
+    dec rcx
+    jnz .pa_copy
+.pa_done:
+    pop rcx
     ret
 
 ; linnea_network_probe_owner(rdi=server*) — bind the server's port WITHOUT
@@ -371,6 +526,20 @@ linnea_network_listener_create:
     syscall
     cmp rax, -4095
     jae .bind_fail
+    ; "port": 0 asked the kernel to choose. Write its answer back into the
+    ; config, because every later reader takes the port from this field: the
+    ; shared-listener scan in listen_all, the log line below, Alt-Svc, the
+    ; port_file. Above all, the NEXT worker's listener binds from here too —
+    ; without the write-back each worker in a SO_REUSEPORT set would ask for 0
+    ; again and get a different port, which is not a set at all.
+    cmp word [rbx + linnea_config_server.port], 0
+    jne .have_port
+    mov rdi, r12
+    call resolve_bound_port
+    test ax, ax
+    jz .getsockname_fail
+    mov [rbx + linnea_config_server.port], ax
+.have_port:
     mov eax, LINNEA_SYS_LISTEN
     mov rdi, r12
     mov esi, LINNEA_BACKLOG
@@ -439,6 +608,33 @@ linnea_network_listener_create:
     mov esi, msg_listen_len
     mov rdx, rbx
     jmp linnea_error_server
+.getsockname_fail:
+    xor ecx, ecx
+    lea rdi, [msg_getsockname]
+    mov esi, msg_getsockname_len
+    mov rdx, rbx
+    jmp linnea_error_server
+
+; resolve_bound_port(rdi = a bound socket fd) -> ax = the port in host byte
+; order, or 0 if the kernel would not say. sin6_port sits at offset 2 of
+; sockaddr_in6, network order, exactly as in sockaddr_in.
+resolve_bound_port:
+    sub rsp, 48                ; sockaddr (28) + socklen (8); keeps calls aligned
+    mov qword [rsp + 32], LINNEA_SOCKADDR_IN6_SIZE
+    mov eax, LINNEA_SYS_GETSOCKNAME
+    mov rsi, rsp
+    lea rdx, [rsp + 32]
+    syscall
+    cmp rax, -4095
+    jae .rbp_none
+    movzx eax, word [rsp + 2]
+    xchg al, ah                ; network to host order
+    add rsp, 48
+    ret
+.rbp_none:
+    xor eax, eax
+    add rsp, 48
+    ret
 
 ; linnea_network_listener_adopt(rdi=server*) — the listen_fd is already
 ; set to an inherited socket; just log "adopted listener host:port
@@ -446,6 +642,16 @@ linnea_network_listener_create:
 linnea_network_listener_adopt:
     push rbx
     mov rbx, rdi
+    ; A config that said "port": 0 still says 0 in the next generation, but the
+    ; inherited socket already carries the port the previous one was given —
+    ; ask it, so a hot upgrade keeps serving on the same number rather than
+    ; logging and reporting a 0.
+    cmp word [rbx + linnea_config_server.port], 0
+    jne .la_have_port
+    mov edi, [rbx + linnea_config_server.listen_fd]
+    call resolve_bound_port
+    mov [rbx + linnea_config_server.port], ax
+.la_have_port:
     cmp dword [linnea_listen_quiet], 0
     jne .la_quiet
     call linnea_log_stamp

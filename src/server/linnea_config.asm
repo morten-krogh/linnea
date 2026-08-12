@@ -78,8 +78,6 @@ scheme_https_len        equ $ - scheme_https
 
 msg_no_servers:         db "config must define at least one server"
 msg_no_servers_len      equ $ - msg_no_servers
-msg_port_zero:          db "server port must be between 1 and 65535"
-msg_port_zero_len       equ $ - msg_port_zero
 msg_empty_host:         db "server host must not be empty"
 msg_empty_host_len      equ $ - msg_empty_host
 msg_empty_hostname:     db "server hostname must not be empty"
@@ -251,8 +249,9 @@ linnea_config_validate:
     jae .ok
     imul r9, r8, linnea_config_server_size
     lea r9, [rdi + r9 + linnea_config.servers]
-    cmp word [r9 + linnea_config_server.port], 0
-    je .port_zero
+    ; port 0 is deliberate here, not missing: it means "let the kernel choose",
+    ; resolved at bind time. A key left out entirely is caught by the parser's
+    ; required-key check, so nothing silently binds a random port.
     cmp qword [r9 + linnea_config_server.host_len], 0
     je .empty_host
     cmp qword [r9 + linnea_config_server.hostname_len], 0
@@ -444,10 +443,6 @@ linnea_config_validate:
 .no_servers:
     lea rdi, [msg_no_servers]
     mov esi, msg_no_servers_len
-    jmp linnea_error_exit
-.port_zero:
-    lea rdi, [msg_port_zero]
-    mov esi, msg_port_zero_len
     jmp linnea_error_exit
 .empty_host:
     lea rdi, [msg_empty_host]

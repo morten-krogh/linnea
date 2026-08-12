@@ -58,6 +58,7 @@ extern linnea_log_stamp
 extern linnea_log_write
 extern linnea_log_u64
 extern linnea_network_listen_all
+extern linnea_network_write_port_file
 extern linnea_connections_init
 extern linnea_h2p_init
 extern linnea_uring_run
@@ -266,6 +267,11 @@ _start:
 .adopt_rows:
     call adopt_worker_listeners
 .listeners_ready:
+    ; Every port is now settled — including any the kernel chose for a
+    ; "port": 0 — so whoever is waiting to learn them can be told. Before the
+    ; fork, so the file exists by the time a worker can accept anything.
+    lea rdi, [linnea_config_instance]
+    call linnea_network_write_port_file
 
     mov eax, LINNEA_SYS_GETPID
     syscall
@@ -1010,7 +1016,12 @@ probe_ports:
     jae .pp_done
     imul rdi, rbx, linnea_config_server_size
     lea rdi, [rdi + linnea_config_instance + linnea_config.servers]
+    ; "port": 0 has nothing to probe — there is no number for another program
+    ; to be holding, and probing would bind and free an unrelated one.
+    cmp word [rdi + linnea_config_server.port], 0
+    je .pp_next
     call linnea_network_probe_owner
+.pp_next:
     inc rbx
     jmp .pp_loop
 .pp_done:

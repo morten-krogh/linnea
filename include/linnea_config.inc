@@ -119,6 +119,15 @@ struc linnea_config
     ; max_body, with no writeback and no way for the kernel to reclaim it.
     .spill_dir:     resb LINNEA_MAX_ROOT + 1
     .spill_dir_len: resq 1
+    ; Where to report the ports actually bound, one line per server:
+    ;   <hostname> <host> <port>
+    ; Written once, after every listener is up and before any worker is forked,
+    ; through a temporary file and rename(2) — so a reader sees either nothing
+    ; or the whole thing, never a half-written line. Only useful together with
+    ; "port": 0, where the config cannot say what the port will be; unset means
+    ; no file is written.
+    .port_file:     resb LINNEA_MAX_ROOT + 1
+    .port_file_len: resq 1
     .servers:       resb linnea_config_server_size * LINNEA_MAX_SERVERS
 endstruc
 

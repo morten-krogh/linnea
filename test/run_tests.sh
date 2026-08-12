@@ -16,7 +16,13 @@ run_test() {
     shift 4
     local tmp stdout stderr rc text
     tmp=$(mktemp)
-    stdout=$("$@" 2>"$tmp")
+    # Bounded, because every caller here expects the command to EXIT. A config
+    # fixture that the parser starts accepting does not fail this check, it
+    # starts serving and never returns -- the whole run then hangs on it with
+    # no output at all, which is how a deliberate change to the port rule cost
+    # 26 minutes and looked like a slow suite. A timeout turns that into one
+    # loud failure, and 30s is far longer than any of these take.
+    stdout=$(timeout 30 "$@" 2>"$tmp")
     rc=$?
     stderr=$(<"$tmp")
     rm -f "$tmp"
@@ -233,8 +239,12 @@ run_test "truncated json"  1 stderr "parse error at line" \
     $BIN --config test/configs/truncated.json
 run_test "port too large"  1 stderr "port" \
     $BIN --config test/configs/bad-port-large.json
-run_test "port zero"       1 stderr "port" \
-    $BIN --config test/configs/bad-port-zero.json
+# "port": 0 is legal now and means "let the kernel choose"; what must still be
+# refused is leaving the key OUT, which is what keeps a kernel-chosen port
+# something the config asked for rather than something it forgot. This fixture
+# used to carry the 0 and assert the opposite.
+run_test "port missing"    1 stderr "requires host, port" \
+    $BIN --config test/configs/bad-port-missing.json
 run_test "empty servers"   1 stderr "at least one server" \
     $BIN --config test/configs/empty-servers.json
 run_test "unknown key"     1 stderr "unknown key" \
@@ -2575,6 +2585,42 @@ check "cli: -h is the same as --help" $?
 out=$($BIN --bpf-probe 2>&1)
 printf '%s' "$out" | grep -Eq "ok prog fd=[0-9]+|FAILED at [a-zA-Z_ ]+: errno=[0-9]+|FAILED: loaded and attached, but a datagram did not steer"
 check "cli: --bpf-probe names its outcome ($(printf '%s' "$out" | tail -1))" $?
+
+# "port": 0 — the kernel picks the port and port_file reports it. This is the
+# one fixture that needs no port of its own, so it cannot collide with another
+# run: everything else here holds a fixed number above the ephemeral range,
+# which stops an unrelated process stealing it but does nothing about a second
+# copy of this suite.
+#
+# Three things have to hold together, and each is worthless alone: the file
+# must appear, the port in it must actually serve, and every worker must be on
+# THAT port -- a listener set whose members bound different ports would still
+# answer here, through whichever one the file happened to name.
+pf=test/port-zero.ports
+rm -f "$pf" test/linnea-p0.log
+start_server test/configs/port-zero.json
+p0pid=$SRV_PID
+p0port=""
+for _ in $(seq 1 40); do
+    [ -s "$pf" ] && { p0port=$(awk '$1=="auto.test"{print $3}' "$pf"); break; }
+    sleep 0.1
+done
+if [ -n "$p0port" ]; then
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: auto.test' \
+           "http://127.0.0.1:$p0port/" 2>/dev/null)
+    [ "$code" = "200" ]
+    check "port 0: the kernel-chosen port in port_file serves ($p0port -> $code)" $?
+    # workers=2, so two listeners must sit on the same chosen port
+    n=$(ss -lnt 2>/dev/null | grep -c ":$p0port ")
+    [ "$n" = "2" ]
+    check "port 0: both workers bound the same chosen port ($n listeners)" $?
+    grep -q "listening on 127.0.0.1:$p0port (auto.test)" test/linnea-p0.log
+    check "port 0: the log reports the real port, not 0" $?
+else
+    check "port 0: port_file never appeared" 1
+fi
+kill $p0pid 2>/dev/null; wait $p0pid 2>/dev/null
+rm -f "$pf" test/linnea-p0.log
 for bad in "--bogus x" "-x x" "--config" "-c" "--config=" "-" \
            "test/configs/listen.json" \
            "-t test/configs/listen.json" \

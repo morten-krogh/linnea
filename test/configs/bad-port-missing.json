@@ -1,0 +1,6 @@
+{
+  "log": "test/linnea.log",
+  "servers": [
+    { "host": "0.0.0.0", "hostname": "example.com", "locations": [ { "prefix": "/", "root": "test/www" } ] }
+  ]
+}
