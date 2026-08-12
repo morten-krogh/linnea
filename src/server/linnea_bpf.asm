@@ -79,15 +79,44 @@ msg_setup: db "bpf setup: "
 msg_setup_len equ $ - msg_setup
 msg_ok:   db "ok prog fd="
 msg_ok_len   equ $ - msg_ok
-msg_err:  db "FAILED err="
-msg_err_len  equ $ - msg_err
+; The probe is the only thing an operator has to find out why QUIC steering is
+; not working, so it must say WHICH step refused and with what errno. It used
+; to answer "FAILED err=1" for all six causes: every failure path returned the
+; sentinel -1, and the probe negated it. That the sentinel happens to print as
+; EPERM — much the commonest real cause — is why it read as plausible.
+msg_failat: db "FAILED at "
+msg_failat_len equ $ - msg_failat
+msg_errno: db ": errno="
+msg_errno_len equ $ - msg_errno
+; and a steering mismatch is not an errno at all: everything loaded, and the
+; packets went to the wrong sockets. The per-worker "W>R " lines above say which.
+msg_steer: db "FAILED: loaded and attached, but a datagram did not steer by its "
+           db "worker byte", 10
+msg_steer_len equ $ - msg_steer
 msg_log:  db 10, "verifier log:", 10
 msg_log_len equ $ - msg_log
 msg_nl:   db 10
 
-section .rodata
-; sockaddr_in for 127.0.0.1:47610 (the self-test's reuseport group)
-st_saddr: db 0x02,0x00, 0xB9,0xFA, 0x7F,0x00,0x00,0x01, 0,0,0,0,0,0,0,0
+stg_mapcreate: db "map create"
+stg_mapcreate_len equ $ - stg_mapcreate
+stg_progload:  db "program load"
+stg_progload_len equ $ - stg_progload
+stg_socket:    db "socket"
+stg_socket_len equ $ - stg_socket
+stg_reuseport: db "SO_REUSEPORT"
+stg_reuseport_len equ $ - stg_reuseport
+stg_bind:      db "bind"
+stg_bind_len   equ $ - stg_bind
+stg_client:    db "client socket"
+stg_client_len equ $ - stg_client
+stg_send:      db "sendto"
+stg_send_len   equ $ - stg_send
+stg_mapupdate: db "map update"
+stg_mapupdate_len equ $ - stg_mapupdate
+stg_attach:    db "attach"
+stg_attach_len equ $ - stg_attach
+stg_getsockname: db "getsockname"
+stg_getsockname_len equ $ - stg_getsockname
 
 section .bss
 bpf_attr:      resb 128
@@ -101,8 +130,31 @@ st_socks:      resd 4                ; the self-test's reuseport sockets
 st_one:        resd 1
 st_pkt:        resb 32
 st_rcv:        resb 64
+; The address the self-test's reuseport group binds. Built at run time with
+; port 0 so the KERNEL picks one that is free, then overwritten by getsockname
+; with the port it picked, which the remaining three binds and the client's
+; sendto then use. A hardcoded port was the bug: the old 47610 sits inside this
+; box's ephemeral range (32768-60999), so an unrelated process's client socket
+; could already hold it and the probe would report the bind failure as if BPF
+; itself were broken. Choosing a higher fixed number only narrows that window;
+; asking the kernel closes it, and cannot collide with a suite fixture either.
+st_saddr:      resb 16
+st_alen:       resd 1                ; socklen_t, in and out
+; which step is in flight, so a refusal can name itself rather than collapse
+st_stage_ptr:  resq 1
+st_stage_len:  resq 1
+st_mismatch:   resb 1                ; steering went to the wrong socket
 
 section .text
+
+; STAGE name — record which step is about to run. Clobbers rax, so it goes
+; immediately before the syscall number is loaded.
+%macro STAGE 1
+    lea rax, [%1]
+    mov [st_stage_ptr], rax
+    mov rax, %1 %+ _len
+    mov [st_stage_len], rax
+%endmacro
 
 ; linnea_bpf_reuseport_setup() -> rax = program fd (>= 0), or -errno on failure.
 ; Creates the REUSEPORT_SOCKARRAY (stored in linnea_bpf_map_fd) and loads the
@@ -117,6 +169,7 @@ linnea_bpf_reuseport_setup:
     mov dword [bpf_attr + 4], 4               ; key_size = u32 index
     mov dword [bpf_attr + 8], 4               ; value_size = socket fd
     mov dword [bpf_attr + 12], 128            ; max_entries (>= worker count)
+    STAGE stg_mapcreate
     mov eax, SYS_BPF
     mov edi, BPF_MAP_CREATE
     lea rsi, [bpf_attr]
@@ -144,6 +197,7 @@ linnea_bpf_reuseport_setup:
     mov dword [bpf_attr + 28], 8192           ; log_size
     lea rax, [verifier_log]
     mov [bpf_attr + 32], rax                  ; log_buf
+    STAGE stg_progload
     mov eax, SYS_BPF
     mov edi, BPF_PROG_LOAD
     lea rsi, [bpf_attr]
@@ -203,22 +257,33 @@ zero_attr:
     pop rdi
     ret
 
-; linnea_bpf_selftest() -> rax = program fd (>= 0) if steering routes a datagram
-; by its worker byte, else -1. Builds a 4-socket reuseport group, registers and
-; attaches the program, and checks a short-header packet with worker byte W lands
-; on socket W. Confirms the packet offsets the program reads.
+; linnea_bpf_selftest() -> rax = the program fd (>= 0) once the whole sequence
+; ran, or -errno from whichever syscall refused, with st_stage_* naming it.
+; Steering that ran but routed wrongly is NOT an errno and is reported through
+; st_mismatch instead, so no sentinel can be mistaken for one. Builds a
+; 4-socket reuseport group, registers and attaches the program, and checks a
+; short-header packet with worker byte W lands on socket W. Confirms the packet
+; offsets the program reads.
 linnea_bpf_selftest:
     push rbx
     push r12
     push r13
     push r14
     push r15
+    mov byte [st_mismatch], 0
     call linnea_bpf_reuseport_setup
     test rax, rax
     js .st_fail
-    mov r15d, eax                     ; program fd
+    ; 127.0.0.1, port 0 — the first bind makes the kernel choose a free port,
+    ; and getsockname below writes it back here for the other three and the send
+    mov word [st_saddr], 2                    ; AF_INET
+    mov word [st_saddr + 2], 0                ; port 0
+    mov dword [st_saddr + 4], 0x0100007F      ; 127.0.0.1, network order
+    mov dword [st_saddr + 8], 0
+    mov dword [st_saddr + 12], 0
     xor r12d, r12d                    ; socket index
 .st_mk:
+    STAGE stg_socket
     mov eax, LINNEA_SYS_SOCKET
     mov edi, 2                        ; AF_INET
     mov esi, 2                        ; SOCK_DGRAM
@@ -229,6 +294,7 @@ linnea_bpf_selftest:
     mov [st_socks + r12*4], eax
     mov r13d, eax
     mov dword [st_one], 1
+    STAGE stg_reuseport
     mov eax, LINNEA_SYS_SETSOCKOPT
     mov edi, r13d
     mov esi, SOL_SOCKET
@@ -236,6 +302,9 @@ linnea_bpf_selftest:
     lea r10, [st_one]
     mov r8d, 4
     syscall
+    test rax, rax                     ; unchecked, this surfaced as the SECOND
+    js .st_fail                       ; bind's EADDRINUSE — a different step
+    STAGE stg_bind
     mov eax, LINNEA_SYS_BIND
     mov edi, r13d
     lea rsi, [st_saddr]
@@ -243,6 +312,19 @@ linnea_bpf_selftest:
     syscall
     test rax, rax
     js .st_fail
+    test r12d, r12d
+    jnz .st_bound                     ; the port is already the kernel's answer
+    STAGE stg_getsockname
+    mov dword [st_alen], 16
+    mov eax, LINNEA_SYS_GETSOCKNAME
+    mov edi, r13d
+    lea rsi, [st_saddr]
+    lea rdx, [st_alen]
+    syscall
+    test rax, rax
+    js .st_fail
+.st_bound:
+    STAGE stg_mapupdate
     mov edi, r12d
     mov esi, r13d
     call linnea_bpf_map_add           ; map[i] = socket
@@ -251,16 +333,20 @@ linnea_bpf_selftest:
     inc r12d
     cmp r12d, 4
     jb .st_mk
+    STAGE stg_attach
     mov edi, [st_socks]               ; attach the program to the group
-    mov esi, r15d
+    mov esi, [linnea_bpf_prog_fd]     ; not a register: r15 is the receiver below
     call linnea_bpf_attach
     test rax, rax
     js .st_fail
+    STAGE stg_client
     mov eax, LINNEA_SYS_SOCKET        ; a client socket to send from
     mov edi, 2
     mov esi, 2
     xor edx, edx
     syscall
+    test rax, rax                     ; unchecked, a refusal here reached the
+    js .st_fail                       ; loop below and read as a steering failure
     mov r14d, eax
     mov rbx, -1                       ; rbx = 0 while every W steers to socket W
     xor r12d, r12d                    ; worker byte W
@@ -268,6 +354,7 @@ linnea_bpf_selftest:
 .st_send:
     mov byte [st_pkt], 0x40           ; short header
     mov [st_pkt + 1], r12b            ; worker byte
+    STAGE stg_send
     mov eax, LINNEA_SYS_SENDTO
     mov edi, r14d
     lea rsi, [st_pkt]
@@ -276,6 +363,8 @@ linnea_bpf_selftest:
     lea r8, [st_saddr]
     mov r9d, 16
     syscall
+    test rax, rax                     ; a datagram that never left is not a
+    js .st_fail                       ; steering failure, though it looked like one
     ; find which of the four sockets received it
     xor r13d, r13d                    ; socket index
     mov r15d, -1                      ; receiver, -1 = dropped
@@ -316,12 +405,11 @@ linnea_bpf_selftest:
     cmp r12d, 4
     jb .st_send
     test rbx, rbx
-    jnz .st_fail
-    xor eax, eax                      ; all four steered correctly
-    jmp .st_ret
-.st_fail:
-    mov rax, -1
-.st_ret:
+    jz .st_done
+    mov byte [st_mismatch], 1         ; the steering failed, not a syscall
+.st_done:
+    mov rax, [linnea_bpf_prog_fd]     ; the fd the probe reports on success
+.st_fail:                             ; a refused syscall arrives with -errno in rax
     pop r15
     pop r14
     pop r13
@@ -339,11 +427,13 @@ linnea_bpf_probe:
     mov esi, msg_setup_len
     call linnea_print_stderr
     test rbx, rbx
-    js .fail
+    js .fail_errno
+    cmp byte [st_mismatch], 0
+    jne .fail_steer
     lea rdi, [msg_ok]
     mov esi, msg_ok_len
     call linnea_print_stderr
-    mov edi, ebx
+    mov edi, ebx                               ; the real program fd
     call linnea_print_u64_stderr
     lea rdi, [msg_nl]
     mov esi, 1
@@ -351,26 +441,54 @@ linnea_bpf_probe:
     xor eax, eax
     pop rbx
     ret
-.fail:
-    lea rdi, [msg_err]
-    mov esi, msg_err_len
+.fail_steer:
+    lea rdi, [msg_steer]
+    mov esi, msg_steer_len
+    call linnea_print_stderr
+    mov eax, -1
+    pop rbx
+    ret
+.fail_errno:
+    lea rdi, [msg_failat]
+    mov esi, msg_failat_len
+    call linnea_print_stderr
+    mov rdi, [st_stage_ptr]
+    mov rsi, [st_stage_len]
+    call linnea_print_stderr
+    lea rdi, [msg_errno]
+    mov esi, msg_errno_len
     call linnea_print_stderr
     mov edi, ebx
     neg edi
     call linnea_print_u64_stderr
+    lea rdi, [msg_nl]
+    mov esi, 1
+    call linnea_print_stderr
+    ; the verifier only speaks about a program load; printing an empty section
+    ; after a bind or socket failure is noise that reads like a missing log
+    cmp byte [verifier_log], 0
+    je .no_log
     lea rdi, [msg_log]
     mov esi, msg_log_len
     call linnea_print_stderr
     lea rdi, [verifier_log]
+    mov esi, 8192
     call print_cstr
+.no_log:
     mov eax, -1
     pop rbx
     ret
 
-; print_cstr(rdi = NUL-terminated string) — write it to stderr.
+; print_cstr(rdi = string, rsi = the buffer's size) — write it to stderr, up to
+; a NUL or the buffer's end. The bound matters because the scan is over a .bss
+; buffer the KERNEL fills: an unterminated log would otherwise walk into
+; whatever follows and print it.
 print_cstr:
     mov rax, rdi
+    lea rdx, [rdi + rsi]
 .count:
+    cmp rax, rdx
+    jae .done
     cmp byte [rax], 0
     je .done
     inc rax

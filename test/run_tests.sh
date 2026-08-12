@@ -2567,6 +2567,14 @@ out=$($BIN --help 2>/dev/null); rc=$?
 check "cli: --help prints the options to stdout, exit 0" $?
 $BIN -h >/dev/null 2>&1
 check "cli: -h is the same as --help" $?
+# --bpf-probe must SAY something: which step refused and with what errno, or the
+# program fd it loaded. It used to answer "FAILED err=1" for all six causes,
+# which reads as EPERM whatever actually happened. Runs unprivileged here, so
+# the map create is refused; on a box with CAP_BPF it succeeds instead, and both
+# shapes are accepted — what is asserted is that the message carries a cause.
+out=$($BIN --bpf-probe 2>&1)
+printf '%s' "$out" | grep -Eq "ok prog fd=[0-9]+|FAILED at [a-zA-Z_ ]+: errno=[0-9]+|FAILED: loaded and attached, but a datagram did not steer"
+check "cli: --bpf-probe names its outcome ($(printf '%s' "$out" | tail -1))" $?
 for bad in "--bogus x" "-x x" "--config" "-c" "--config=" "-" \
            "test/configs/listen.json" \
            "-t test/configs/listen.json" \
