@@ -2379,6 +2379,17 @@ wait $stall_pid 2>/dev/null
 n=$(curl -s --max-time 12 --limit-rate 16M http://127.0.0.1:61080/huge.bin | wc -c)
 [ "$n" -eq 67108864 ]
 check "slow reader outlives send timeout ($n bytes)" $?
+# ...and a client that RESETS mid-response is not an error at all. ECONNRESET
+# and EPIPE on the sending side are what a closed tab looks like from this end;
+# the receive side learned that in 911e0b9 while the send side filed all of it
+# as "send error", 49 times in the production log with no errno to say which
+# write failed. huge.bin is still here and is larger than any socket buffer, so
+# a client that reads one byte and then closes with SO_LINGER 0 leaves a send in
+# flight for the RST to break. Verified against 8d67ffd~1, which calls the same
+# scenario "send error".
+out8=$(timeout 60 python3 test/send_reset_test.py 61080 "$LOG" "peer reset" plain 2>&1)
+case "$out8" in ok*) true ;; *) false ;; esac
+check "a reset mid-response is peer reset, not a send error ($out8)" $?
 
 # --- connection termination log lines ---
 grep -qF ': close after response' "$LOG"
