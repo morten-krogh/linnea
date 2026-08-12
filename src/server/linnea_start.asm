@@ -99,6 +99,8 @@ msg_wait:       db "wait4 failed in the master"
 msg_wait_len    equ $ - msg_wait
 msg_storm:      db "worker died within a second of starting; giving up"
 msg_storm_len   equ $ - msg_storm
+log_up_forkfail: db "upgrade failed: cannot fork the config check, continuing with old binary", 10
+log_up_forkfail_len equ $ - log_up_forkfail
 msg_topology:   db "hot upgrade needs an unchanged listener set; use restart"
 msg_topology_len equ $ - msg_topology
 msg_fdlimit:    db "file descriptor limit too low for max_connections; raise LimitNOFILE"
@@ -146,8 +148,19 @@ adopt_fd_table: resd LINNEA_MAX_SERVERS  ; inherited listener fds (legacy)
 ; One listener set per worker (Q122): the master binds workers x servers
 ; SO_REUSEPORT sockets so the kernel spreads accepted connections, and each
 ; child rewrites its config's listen_fds from its row after the fork. The
-; master keeps every fd for respawns; they are FD_CLOEXEC, so a hot upgrade's
-; execve drops them and the next generation binds its own group alongside.
+; master keeps every fd for respawns, and they are deliberately NOT
+; close-on-exec: the hot upgrade hands their NUMBERS to the next generation in
+; LINNEA_UPGRADE and adopt_worker_listeners takes the same sockets over, which
+; is the whole of the zero downtime. A connection the kernel has already queued
+; on one is accepted by the new worker that inherits it; binding a fresh group
+; instead would reset it.
+;
+; This said the opposite until it was checked — that they were FD_CLOEXEC and
+; that execve dropped them so the next generation bound afresh, which is the
+; mechanism this REPLACED, not the one here. Nothing sets FD_CLOEXEC on them:
+; the socket is created SOCK_STREAM/SOCK_DGRAM with no CLOEXEC bit and no
+; F_SETFD follows. Verified rather than reasoned: across a SIGUSR2 the master
+; keeps its pid and both listener sockets keep their inode numbers.
 ; legacy_shared marks the fallback: an upgrade env that carried real fds (a
 ; pre-Q122 generation) adopts the old shared sockets exactly as before — and
 ; must hand THOSE on in the old format too, because a fresh reuseport group
@@ -639,7 +652,7 @@ do_upgrade:
     mov eax, LINNEA_SYS_FORK
     syscall
     cmp rax, -4095
-    jae .execfail              ; fork failed: keep serving
+    jae .forkfail              ; fork failed: keep serving, and say THAT
     test rax, rax
     jz .check_child
     mov r12, rax               ; check pid
@@ -695,6 +708,17 @@ do_upgrade:
     call linnea_log_stamp
     lea rdi, [log_up_execfail]
     mov esi, log_up_execfail_len
+    call linnea_log_write
+    ret
+.forkfail:
+    ; Not an execve error: we never got as far as one. Both mean "the upgrade
+    ; was refused and the old generation keeps serving", which is why they
+    ; shared a line — but they are opposite problems. A fork that fails is the
+    ; machine out of processes or memory; an execve that fails is the new binary
+    ; missing or unrunnable, and only one of those is fixed by looking at it.
+    call linnea_log_stamp
+    lea rdi, [log_up_forkfail]
+    mov esi, log_up_forkfail_len
     call linnea_log_write
     ret
 .reject:

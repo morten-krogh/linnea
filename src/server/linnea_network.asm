@@ -59,9 +59,13 @@ sockopt_rcvbuf:     dd 4194304
 
 section .bss
 
-; 1 = listener_create binds SO_REUSEPORT + FD_CLOEXEC: one listener set per
-; worker, so the kernel spreads accepted connections across the workers
-; instead of one ring winning them all. Off for the legacy adopted-fd path.
+; 1 = listener_create binds SO_REUSEPORT: one listener set per worker, so the
+; kernel spreads accepted connections across the workers instead of one ring
+; winning them all. Off for the legacy adopted-fd path.
+;
+; NOT close-on-exec, whatever this line used to claim: the hot upgrade hands
+; these fds to the next generation by number and it adopts the same sockets, so
+; they have to survive the execve. Nothing here sets FD_CLOEXEC.
 linnea_listen_reuseport: resd 1
 ; 1 = bind silently. The per-worker listener sets are the same sockets from
 ; the operator's point of view, so only the first pass logs "listening on".
