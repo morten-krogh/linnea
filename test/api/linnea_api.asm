@@ -43,10 +43,18 @@ HEAD_BUF        equ 8192          ; request head, plus whatever body rode with i
 IO_BUF          equ 65536
 RESP_BUF        equ 1024          ; the composed JSON answer
 NAME_MAX        equ 255           ; decoded filename bytes we will repeat back
-; A ceiling of our own, well above anything linnea will pass on: it enforces its
-; own max_body first (8 MiB in the live config, 64 MB by default), so this is
-; the backstop for a request that somehow arrives without having gone through
-; it, not a limit that tracks linnea's.
+; The SAME ceiling linnea's max_body carries, deliberately. linnea refuses an
+; oversized body before the bytes land; this is the backstop for a request that
+; reaches 127.0.0.1:7700 without having come through it.
+;
+; Kept equal rather than "comfortably above", which is what it used to claim.
+; It was not: the live config sat at 80 MiB against this 64, so an upload
+; between the two passed the front door and was refused back here — the
+; confusing failure, not a safe one. If you move either, move both.
+;
+; The claim this replaces also said the live config was 8 MiB, years after it
+; stopped being. A number written where the server cannot correct it goes
+; stale; the site's upload card carried the same 8 MiB for the same reason.
 MAX_UPLOAD      equ 67108864
 ; This server handles one connection at a time and blocks while it does, so a
 ; peer that connects and then says nothing stops every other request until it
