@@ -75,6 +75,7 @@ linnea_quic_txchunk_record:
     mov [rax + linnea_quic_txchunk.pn], rsi
     mov [rax + linnea_quic_txchunk.pn0], rsi        ; original pn (never overwritten)
     mov [rax + linnea_quic_txchunk.sent_ms], r8
+    mov [rax + linnea_quic_txchunk.first_ms], r8    ; and never again
     mov [rax + linnea_quic_txchunk.off], rdx
     mov [rax + linnea_quic_txchunk.len], rcx
     mov qword [rax + linnea_quic_txchunk.tries], 0

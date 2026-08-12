@@ -207,6 +207,7 @@ extern linnea_quic_dbg_reset
 extern linnea_quic_dbg_chunk
 extern linnea_quic_dbg_fc
 extern linnea_quic_dbg_num
+extern linnea_quic_dbg_pc
 extern qdbg_pass
 extern qdbg_on
 extern linnea_string_from_u64
@@ -387,6 +388,10 @@ s_hs_type:   resq 1                   ; long-header Handshake type bits for this
 s_zrtt_type: resq 1                   ; ...and the 0-RTT and Initial ones, likewise
 s_ini_type:  resq 1                   ; per-version (RFC 9369 shifts them all by one)
 s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK freed
+; Persistent congestion (RFC 9002 7.6), measured across one loss detection pass:
+; when the oldest chunk declared lost FIRST went out, and how many were lost.
+s_pc_first:  resq 1
+s_pc_count:  resq 1
 fc_scan:     resq 2                   ; [max_data, max_stream_data] from a flow scan
 LINNEA_QUIC_RESET_MAX equ 16
 reset_ids:   resq LINNEA_QUIC_RESET_MAX  ; stream ids the peer cancelled this packet
@@ -6043,6 +6048,8 @@ tx_detect_loss:
     cmp r13, LINNEA_QUIC_LOSS_THRESH
     jb .dl_ret                        ; too few packets to declare anything lost
     sub r13, LINNEA_QUIC_LOSS_THRESH  ; a chunk with pn <= this is lost
+    mov qword [s_pc_count], 0
+    mov qword [s_pc_first], -1
     lea r14, [rbx + linnea_quic_conn.tx_infl]
     xor ebp, ebp
 .dl_scan:
@@ -6062,6 +6069,14 @@ tx_detect_loss:
     ; routinely."
     cmp qword [r14 + linnea_quic_txchunk.tries], LINNEA_QUIC_TX_PTO_MAX
     jae .dl_next                      ; out of attempts: the sweep will abandon it
+    ; Remember when this one went out, before the resend below overwrites it:
+    ; persistent congestion is a question about the SPAN of a loss episode.
+    inc qword [s_pc_count]
+    mov rcx, [r14 + linnea_quic_txchunk.first_ms]
+    cmp rcx, [s_pc_first]
+    jae .dl_pc_done
+    mov [s_pc_first], rcx             ; the oldest thing still not delivered
+.dl_pc_done:
     mov rdi, rbx                      ; a loss is a congestion signal
     mov rsi, rax
     call cc_on_loss
@@ -6080,6 +6095,45 @@ tx_detect_loss:
     inc ebp
     cmp ebp, LINNEA_QUIC_TXINFL_SLOTS
     jb .dl_scan
+    ; --- persistent congestion (RFC 9002 7.6) --------------------------------
+    ; Halving once per round trip answers ordinary loss. It does not answer a
+    ; path that has stopped delivering anything for a long time, and since a
+    ; PTO expiry no longer reduces the window (7.6.1, and rightly) something
+    ; has to. This is that something, and it is the RFC's own test: two or more
+    ; ack-eliciting packets declared lost, spanning more than
+    ; kPersistentCongestionThreshold (3) times the PTO, means the window should
+    ; go to the floor rather than merely halve.
+    ;
+    ; Only with an RTT sample in hand: before one, the PTO is the kInitialRtt
+    ; guess and a span measured against it means nothing.
+    cmp qword [s_pc_count], 2
+    jb .dl_ret
+    cmp qword [rbx + linnea_quic_conn.rtt_have], 0
+    je .dl_ret
+    mov rdi, rbx
+    mov esi, 1                        ; the peer may delay its acks: include it
+    call linnea_quic_pto_ms
+    lea rcx, [rax + rax * 2]          ; x3 = kPersistentCongestionThreshold
+    ; How long the oldest chunk still undelivered has been outstanding, dated
+    ; from when it FIRST went out rather than its latest resend. The resends are
+    ; the symptom of the dead path; dating the episode by them would report
+    ; every episode as brand new, which is exactly what it did.
+    mov rax, r15                      ; now
+    sub rax, [s_pc_first]
+    cmp rax, rcx
+    jbe .dl_ret
+    ; The window goes to the floor, and ssthresh is deliberately LEFT where it
+    ; is: cwnd below it means the recovery runs in slow start, which climbs back
+    ; exponentially instead of one packet per round trip. A path that has gone
+    ; away and come back should not take a minute to notice.
+    mov qword [rbx + linnea_quic_conn.cwnd], LINNEA_QUIC_MIN_CWND
+    push rax
+    push rcx
+    mov rdi, rax                      ; the span we measured
+    mov rsi, rcx                      ; against 3x the PTO
+    call linnea_quic_dbg_pc
+    pop rcx
+    pop rax
 .dl_ret:
     pop r15
     pop r14

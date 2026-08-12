@@ -29,6 +29,7 @@ global linnea_quic_dbg_reset
 global linnea_quic_dbg_chunk
 global linnea_quic_dbg_fc
 global linnea_quic_dbg_num
+global linnea_quic_dbg_pc
 global qdbg_pass
 
 extern linnea_log_write
@@ -114,6 +115,10 @@ s_num:   db "qnum tag="
 s_num_len equ $ - s_num
 s_numv:  db " val="
 s_numv_len equ $ - s_numv
+s_pc:    db "qpc persistent congestion: cwnd to the floor, loss span "
+s_pc_len equ $ - s_pc
+s_pcms:  db " ms > 3x pto "
+s_pcms_len equ $ - s_pcms
 s_fcd:   db "qfcd max="
 s_fcd_len equ $ - s_fcd
 s_fcdc:  db " cur="
@@ -476,6 +481,31 @@ linnea_quic_dbg_fc:
     mov rdi, rbx
     call linnea_log_u64
     W s_fcdc
+    mov rdi, r13
+    call linnea_log_u64
+    W s_nl
+    pop r13
+    pop rbx
+    ret
+
+; linnea_quic_dbg_pc(rdi = the loss episode's span in ms, rsi = 3x the PTO)
+; RFC 9002 7.6 persistent congestion was declared. Rare and consequential — the
+; window goes to its floor — so it says so in full rather than as a number, and
+; it is the only way to tell this apart from an ordinary halving in a trace.
+linnea_quic_dbg_pc:
+    cmp byte [qdbg_on], 0
+    jne .on
+    ret
+.on:
+    push rbx
+    push r13
+    mov rbx, rdi
+    mov r13, rsi
+    call linnea_log_stamp
+    W s_pc
+    mov rdi, rbx
+    call linnea_log_u64
+    W s_pcms
     mov rdi, r13
     call linnea_log_u64
     W s_nl

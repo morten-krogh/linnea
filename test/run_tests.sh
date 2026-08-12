@@ -3052,6 +3052,25 @@ PYEOF
         check "h3 request streams end and are reclaimed (skipped)" 0
         check "h3 abandoned uploads release their capture file (skipped)" 0
     fi
+    # RFC 9002 7.6: a path that stops delivering for longer than 3x the PTO is
+    # persistent congestion, and the window must go to its floor rather than
+    # merely halve. It is the ONLY thing answering a dead path now that a PTO
+    # expiry no longer reduces cwnd (7.6.1 forbids that, and obeying it is what
+    # unstalled large downloads) -- so this shows it FIRING, by going deaf for a
+    # second mid-transfer, and shows the transfer finishing anyway. A floor with
+    # ssthresh left above it recovers in slow start; that is the difference
+    # between a pause and a dead connection. Verified against 1077793, which
+    # does not declare it.
+    if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+        truncate -s 32M test/www/pcbig.bin
+        outpc=$(timeout 200 python3 test/quic/h3_persistent_congestion_test.py \
+                  61462 /pcbig.bin test/linnea-h3p.log 2>&1 | tail -1)
+        case "$outpc" in ok*) true ;; *) false ;; esac
+        check "h3 persistent congestion is declared, and recovered from ($outpc)" $?
+        rm -f test/www/pcbig.bin
+    else
+        check "h3 persistent congestion (skipped: aioquic unavailable)" 0
+    fi
     # the same path over h2, which has proxied since Q86: the two must agree
     b2=$(curl -s --http2 --max-time 6 --cacert test/tls/server.crt \
               https://localhost:61462/api/simple)

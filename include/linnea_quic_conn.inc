@@ -260,6 +260,12 @@ struc linnea_quic_txchunk
                                     ; covers the original, so we must match .pn0 too
                                     ; or the chunk never frees and pins the window.
     .sent_ms:  resq 1               ; CLOCK_MONOTONIC ms when (re)sent, for the PTO
+    .first_ms: resq 1               ; ...and when it FIRST went out, never overwritten:
+                                    ; the time twin of .pn0. A resend moves .sent_ms,
+                                    ; so after a few of them every outstanding chunk
+                                    ; looks freshly sent and the SPAN of a loss episode
+                                    ; collapses to nothing -- which is the one thing
+                                    ; RFC 9002 7.6 has to measure.
     .off:      resq 1               ; the chunk's stream offset (to rebuild it)
     .len:      resq 1               ; chunk length (stream bytes; for bytes_in_flight)
     .tries:    resq 1               ; retransmissions so far
