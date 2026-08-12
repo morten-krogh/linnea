@@ -6719,9 +6719,23 @@ linnea_quic_server_rtx_sweep:
     jmp .sw_tc_next                   ; keep sweeping the remaining streams' chunks
 .sw_tc_resend:
     mov [cur_conn], rbx
-    mov rdi, rbx                      ; a timeout is a congestion signal
-    mov rsi, [r14 + linnea_quic_txchunk.pn]
-    call cc_on_loss
+    ; A PTO expiry is NOT loss, and RFC 9002 7.6.1 says so in as many words:
+    ; it "does not indicate packet loss and MUST NOT cause prior unacknowledged
+    ; packets to be marked as lost". The probe goes out; if the data really was
+    ; lost, the acks that follow say so and tx_detect_loss reduces the window
+    ; then, through the proper path.
+    ;
+    ; Halving here instead put a transfer into a hole it could not climb out
+    ; of. Once cwnd reaches its floor only two to four chunks are in flight,
+    ; which is fewer than LOSS_THRESH, so ACK-based detection can no longer
+    ; fire at all and every recovery has to come from a PTO — each of which
+    ; halved the window again. Traced: a perfect oscillation, 2200 -> 4400 ->
+    ; 2200, one halving and one growth per 50 ms tick, for as long as the
+    ; transfer lasted. It advanced one window per tick, 88 KB/s, and a 31 MB
+    ; response could not finish inside a minute.
+    ;
+    ; Nothing here replaces the reduction: real loss still reduces, via the
+    ; ACK-based path that RFC 9002 reserves it for.
     ; rebuild from the file under a fresh pn — the ctx points at the stream slot
     ; the chunk belongs to (its mapping, head and stream id).
     mov rdi, [r14 + linnea_quic_txchunk.ctx]
