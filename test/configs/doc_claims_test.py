@@ -141,6 +141,19 @@ test(srv(hsts=1), "hsts:1 names the shape to use", False,
      "takes the header VALUE as a string")
 
 # --- limits --------------------------------------------------------------
+# max_body's range, which was the one range claim never asserted here — and
+# the one that was false. The doc and this file are two hand-written
+# transcriptions of the same table, so a row nobody asserts drifts silently:
+# the doc and the key's own error message both promised 68719476736 while the
+# parser refused anything past 4294967296, a generic 2^32 guard overriding the
+# specific range above it.
+test(base(max_body=0), "max_body 0 rejected", False, "max_body must be at least 1")
+test(base(max_body=1), "max_body 1 accepted", True)
+test(base(max_body=4294967297), "max_body past the old 2**32 guard accepted", True)
+test(base(max_body=18446744073709551615), "max_body at 2**64-1 accepted", True)
+test(base(max_body=18446744073709551616), "max_body past 64 bits rejected", False,
+     "number too large")
+
 test(base(timeout=3601), "timeout above 3600 rejected", False)
 test(base(timeout=3600), "timeout at 3600 accepted", True)
 test(base(drain_timeout=3601), "drain_timeout above 3600 rejected", False,

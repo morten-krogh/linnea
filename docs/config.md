@@ -105,7 +105,7 @@ every other global has a working default.
 | `max_connections` | integer | `1024` | 1–65536 | Concurrent client connections, across all workers. |
 | `max_per_ip` | integer | `64` | 1–65536 | Concurrent connections from one source address, so one host cannot take the pool. |
 | `max_upstream` | integer | `256` | 1–65536 | Concurrent connections to proxy backends. |
-| `max_body` | integer | `67108864` (64 MiB) | 1–68719476736 | Largest request body accepted, on h1, h2 and h3 alike. A larger upload is refused with 413 before the bytes land. |
+| `max_body` | integer | `67108864` (64 MiB) | 1–18446744073709551615 | Largest request body accepted, on h1, h2 and h3 alike. A larger upload is refused with 413 before the bytes land. There is deliberately no ceiling below what a 64-bit count holds: this key is meant to BE the limit. |
 | `workers` | integer | `0` | 0–256 | Worker processes. **`0` means one per online CPU**, which is the default. |
 | `http2` | integer | `1` | 0 or 1 | Offer HTTP/2 via ALPN on TLS listeners. |
 | `spill_dir` | string | `/tmp` | ≤ 255 | Directory whose **filesystem** holds request-body capture files. Must exist and support `O_TMPFILE`; no directory entry is ever created in it. **Put this on a real disk.** |

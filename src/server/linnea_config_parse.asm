@@ -142,7 +142,7 @@ msg_perip_range:        db "max_per_ip must be between 1 and 65536"
 msg_perip_range_len     equ $ - msg_perip_range
 msg_maxup_range:        db "max_upstream must be between 1 and 65536"
 msg_maxup_range_len     equ $ - msg_maxup_range
-msg_maxbody_range:      db "max_body must be between 1 and 68719476736"
+msg_maxbody_range:      db "max_body must be at least 1"
 msg_maxbody_range_len   equ $ - msg_maxbody_range
 msg_workers_range:      db "workers must be between 0 and 256 (0 = one per CPU)"
 msg_workers_range_len   equ $ - msg_workers_range
@@ -464,11 +464,12 @@ linnea_config_parse:
     jnz .top_dup
     or r13d, 512
     call linnea_parse_u64
+    ; No ceiling of our own beyond what a u64 holds: the point of the key is to
+    ; BE the limit, and a bound invented here is one more number to go stale.
+    ; Zero is still refused — it would mean "accept no body at all", which is a
+    ; way of turning uploads off that nobody would guess at.
     test rax, rax
     jz .maxbody_range
-    mov rcx, LINNEA_MAX_BODY_CEILING
-    cmp rax, rcx
-    ja .maxbody_range
     mov [rbx + linnea_config.max_body], rax
     jmp .top_sep
 
@@ -1235,8 +1236,20 @@ linnea_parse_string:
     jmp linnea_parse_fail
 
 ; linnea_parse_u64() -> rax = value
-; Non-negative decimal integer, capped at 2^32 against overflow; range
-; validation with a key-specific message is the caller's job.
+; A non-negative decimal integer, over the FULL 64-bit range. Only a value that
+; will not fit in 64 bits is refused here; what a key will actually accept is
+; the key's own business, and its own message says so.
+;
+; This used to stop at 2^32 "against overflow", which is a real hazard handled
+; the wrong way: it silently overrode the key ranges above it. max_body
+; documented and advertised a ceiling of 68719476736, and its own error message
+; named that number, but anything past 4294967296 was refused by this generic
+; guard before max_body's check ever ran — so a documented range was a quarter
+; of a percent reachable, and the specific message unreachable.
+;
+; Overflow is now detected exactly rather than approximated: an accumulator
+; above (2^64-1)/10 cannot survive the multiply, and the carry out of the digit
+; catches the one value that can.
 linnea_parse_u64:
     call linnea_parse_skip_ws
     call linnea_parse_peek
@@ -1246,7 +1259,7 @@ linnea_parse_u64:
     mov r8, [linnea_parser_state + linnea_parser.pos]
     mov r9, [linnea_parser_state + linnea_parser.base]
     mov r10, [linnea_parser_state + linnea_parser.size]
-    mov r11, 1 << 32
+    mov r11, 1844674407370955161   ; (2^64-1)/10
     xor eax, eax               ; accumulator
 .loop:
     cmp r8, r10
@@ -1255,10 +1268,11 @@ linnea_parse_u64:
     sub ecx, '0'
     cmp ecx, 9
     ja .done
-    imul rax, rax, 10
-    add rax, rcx
-    cmp rax, r11
+    cmp rax, r11               ; would the multiply wrap?
     ja .range
+    imul rax, rax, 10          ; ...it cannot now: the product fits
+    add rax, rcx
+    jc .range                  ; ...but the digit still can
     inc r8
     jmp .loop
 .done:

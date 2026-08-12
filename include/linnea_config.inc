@@ -37,7 +37,6 @@ LINNEA_DEFAULT_MAX_UPSTREAM     equ 256
 ; what stands between one client and the filesystem. 64 MB by default; the
 ; ceiling is a sanity bound on the config value, not a promise of disk.
 LINNEA_DEFAULT_MAX_BODY         equ 67108864
-LINNEA_MAX_BODY_CEILING         equ 68719476736
 LINNEA_DEFAULT_MAX_CONNECTIONS  equ 1024
 LINNEA_DEFAULT_WORKERS          equ 0     ; 0 = one worker per online CPU
 LINNEA_MAX_WORKERS              equ 256
