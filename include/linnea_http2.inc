@@ -256,6 +256,16 @@ LINNEA_H2P_F_REAP      equ 2048   ; fully framed: free once no send is reading
 LINNEA_H2P_F_REQ_STREAM equ 4096  ; the request body streams upstream as it
                                   ; arrives instead of being collected whole
 LINNEA_H2P_F_REQ_DONE  equ 8192   ; every request-body byte has been forwarded
+; The request body was captured to a file and is sent upstream from a mapping
+; of it, the way h1 and h3 already do. The collecting path buffers into the
+; slot up to LINNEA_H2P_BODY_MAX and spills past that, so a body with no
+; usable Content-Length — or a second concurrent upload on one connection —
+; runs to max_body instead of being refused at 8 KiB. Shares the send path
+; with F_REQ_STREAM: head from the slot buffer, then body from rq_buf. It
+; differs in two ways, and both matter: the mapping must not be slid down
+; (there is no window to make room in), and its bytes were credited back to
+; the client as they were captured, not as they go upstream.
+LINNEA_H2P_F_REQ_FILE  equ 16384
 
 struc linnea_h2p
     .state:     resq 1
@@ -306,6 +316,14 @@ struc linnea_h2p
     ; clock timed it out. The collecting path did not know the declared length
     ; at all: it measured what arrived and forwarded that.
     .rq_declared: resq 1
+    ; The capture file for a collected body that outgrew the slot buffer, and
+    ; the mapping of it that the send reads. O_TMPFILE, so closing the fd IS
+    ; the delete and a crash leaves nothing behind. -1/0 when unused, which is
+    ; every request that fits in the slot.
+    .rq_fd:     resd 1
+    .rq_fdpad:  resd 1
+    .rq_map:    resq 1            ; mmap base (0 = none); rq_buf points at it
+    .rq_maplen: resq 1            ; its length, for munmap
     .lg_bytes:  resq 1            ; body bytes framed to the client, for the
                                   ; access line (.off gets rebased by the
                                   ; buffer compaction, so it cannot serve)

@@ -28,6 +28,7 @@ default rel
 extern linnea_config_instance
 
 global linnea_spill_open
+global linnea_spill_open_fd
 global linnea_spill_write
 global linnea_spill_chunked
 global linnea_spill_finish
@@ -44,6 +45,25 @@ section .rodata
 
 section .text
 
+; linnea_spill_open_fd() -> rax = an open capture fd, or -1.
+; The one place that knows where captures live and how they are opened. HTTP/2
+; captures per STREAM rather than per connection (several uploads may share a
+; connection), so it needs the file without the connection bookkeeping — and
+; a second copy of this would be a second place for spill_dir to be wrong,
+; which is how the directory came to be the literal "/tmp" once already.
+linnea_spill_open_fd:
+    lea rdi, [linnea_config_instance]
+    lea rdi, [rdi + linnea_config.spill_dir]
+    mov esi, LINNEA_O_TMPFILE | LINNEA_O_RDWR | LINNEA_O_CLOEXEC
+    mov edx, LINNEA_MODE_0600
+    mov eax, LINNEA_SYS_OPEN
+    syscall
+    cmp rax, -4095
+    jb .ok
+    mov eax, -1
+.ok:
+    ret
+
 ; linnea_spill_open(rdi=connection*) -> rax = 0 ok, -1 failed
 ; Idempotent: a body arriving in several chunks calls this once per chunk
 ; rather than tracking whose turn it is to create the file.
@@ -51,15 +71,10 @@ linnea_spill_open:
     cmp dword [rdi + linnea_connection.spill_fd], -1
     jne .already
     push rdi
-    lea rdi, [linnea_config_instance]
-    lea rdi, [rdi + linnea_config.spill_dir]
-    mov esi, LINNEA_O_TMPFILE | LINNEA_O_RDWR | LINNEA_O_CLOEXEC
-    mov edx, LINNEA_MODE_0600
-    mov eax, LINNEA_SYS_OPEN
-    syscall
+    call linnea_spill_open_fd
     pop rdi
-    cmp rax, -4095
-    jae .fail
+    test eax, eax
+    js .fail
     mov [rdi + linnea_connection.spill_fd], eax
     mov qword [rdi + linnea_connection.spill_len], 0
 .already:

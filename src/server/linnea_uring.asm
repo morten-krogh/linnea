@@ -3423,7 +3423,9 @@ linnea_uring_arm_h2p_ops:
     mov rcx, [r12 + linnea_h2p.sent]
     cmp rcx, [r12 + linnea_h2p.req_len]
     jb .ao_send_head
-    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
+    ; ...or, for a body captured to a file, from a mapping of it. Same cursors,
+    ; so the two share this.
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM | LINNEA_H2P_F_REQ_FILE
     jz .ao_send_head                 ; nothing left; the send is a no-op
     mov rcx, [r12 + linnea_h2p.rq_buf]
     add rcx, [r12 + linnea_h2p.rq_rd]

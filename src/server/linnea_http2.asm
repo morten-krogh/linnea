@@ -85,6 +85,7 @@ global linnea_h2p_conn_close
 global h2p_compact
 global linnea_h2_busy
 
+extern linnea_spill_open_fd
 extern linnea_upstream_count
 extern linnea_upstream_open
 extern linnea_upstream_closed
@@ -544,17 +545,25 @@ linnea_h2_handle:
 .fd_collect:
     mov r8, [rdi + linnea_h2p.len]
     lea r9, [r8 + rax]
-    cmp r9, LINNEA_H2P_BODY_MAX
-    ja .fd_toobig
-    ; ...and max_body too, which can be configured below this buffer. A body
-    ; with no Content-Length is collected and measured here, so this is the
-    ; only place its size is ever judged.
+    ; max_body is the cap, and now the ONLY one. A body with no Content-Length
+    ; is collected and measured here, so this is the only place its size is
+    ; ever judged.
     push rcx
     lea rcx, [linnea_config_instance]
     mov rcx, [rcx + linnea_config.max_body]
     cmp r9, rcx
     pop rcx
     ja .fd_toobig
+    ; Past the slot buffer the body goes to a capture file, the way h1 and h3
+    ; already do, instead of being refused. It used to stop at
+    ; LINNEA_H2P_BODY_MAX whatever max_body said — 8 KiB — which caught every
+    ; h2 upload that arrived without a usable Content-Length, and every second
+    ; CONCURRENT upload on one connection, since the streaming buffer is
+    ; per-connection and the loser falls back to here.
+    cmp r9, LINNEA_H2P_BODY_MAX
+    ja .fd_spill
+    cmp dword [rdi + linnea_h2p.rq_fd], -1
+    jne .fd_spill                    ; already spilling: everything goes to it
     ; append at buf[BODY_OFF + len)
     mov rsi, rcx
     lea rdx, [rdi + linnea_h2p.buf + LINNEA_H2P_BODY_OFF]
@@ -569,6 +578,7 @@ linnea_h2_handle:
     pop r11
     pop r10
     pop rdi
+.fd_end_check:
     test r10b, LINNEA_H2_FLAG_END_STREAM
     jz .fd_done                      ; more body to come
     ; ...and what arrived must be what was declared, when a length was given.
@@ -583,6 +593,31 @@ linnea_h2_handle:
     push r11
     call h2p_finalize                ; body complete: terminate and connect
     pop r11
+    jmp .fd_done
+.fd_spill:
+    ; rdi = slot, rax = payload length, rcx = payload, r9 = the new total.
+    ; h2p_capture takes the write offset from slot.len and moves the buffered
+    ; prefix in on its first call, so len is updated only AFTER it returns.
+    push rdi
+    push r10
+    push r11
+    push r9
+    mov rsi, rcx
+    mov rdx, rax
+    call h2p_capture
+    pop r9
+    pop r11
+    pop r10
+    pop rdi
+    test eax, eax
+    js .fd_capture_failed
+    mov [rdi + linnea_h2p.len], r9
+    jmp .fd_end_check
+.fd_capture_failed:
+    ; the upload was fine and it was we who could not hold it: 500, not the
+    ; 413 that would blame the client for our full filesystem
+    mov qword [rdi + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [rdi + linnea_h2p.status], 500
     jmp .fd_done
 .fd_toobig:
     ; more than we will forward without a length to declare: the exchange
@@ -1845,6 +1880,9 @@ h2_serve:
     mov qword [r13 + linnea_h2p.rq_credit], 0
     mov qword [r13 + linnea_h2p.rq_buf], 0
     mov qword [r13 + linnea_h2p.rq_declared], -1
+    mov dword [r13 + linnea_h2p.rq_fd], -1      ; NOT 0: fd 0 is a real one, and
+    mov qword [r13 + linnea_h2p.rq_map], 0      ; a zeroed slot once closed it
+    mov qword [r13 + linnea_h2p.rq_maplen], 0
     mov qword [r13 + linnea_h2p.lg_bytes], 0
     mov rcx, [rsp + S_HEAD]
     imul rcx, rcx, LINNEA_H2P_F_IS_HEAD
@@ -2475,18 +2513,29 @@ h2p_release:
 .rel_nofd:
     pop rax
     mov dword [rax + linnea_h2p.fd], -1
+    push rax
+    mov rdi, rax
+    call h2p_capture_release         ; unmap and close: the close IS the delete
+    pop rax
     ; scrub what the walkers act on: a stale WANT_* would arm an op on the
     ; closed fd, a stale HEAD_RDY would emit a HEADERS frame for a stream
     ; that no longer exists, and a stale credit a WINDOW_UPDATE on an idle
     ; stream — which is a connection error to the peer
+    mov rsi, [rax + linnea_h2p.flags]            ; read BEFORE the scrub
     mov qword [rax + linnea_h2p.flags], 0
     ; the connection still owes the peer for every request-body byte it sent:
-    ; what went upstream uncredited, plus whatever is still sitting in the FIFO
+    ; what went upstream uncredited, plus whatever is still sitting in the FIFO.
+    ; A CAPTURED body owes nothing — its bytes were credited as they were
+    ; written to the file, so counting the unsent remainder here would credit
+    ; the same bytes twice and overflow the peer's connection window.
+    test rsi, LINNEA_H2P_F_REQ_FILE
+    jnz .rel_owed_done
     mov rcx, [rax + linnea_h2p.rq_credit]
     mov rdx, [rax + linnea_h2p.rq_wr]
     sub rdx, [rax + linnea_h2p.rq_rd]
     add rcx, rdx
     add [rax + linnea_h2p.rq_owed], rcx
+.rel_owed_done:
     mov qword [rax + linnea_h2p.rq_rd], 0
     mov qword [rax + linnea_h2p.rq_wr], 0
     mov qword [rax + linnea_h2p.rq_credit], 0
@@ -2537,6 +2586,173 @@ linnea_h2p_conn_close:
     pop rbx
     ret
 
+; h2p_capture(rdi = slot*, rsi = payload, rdx = len) -> rax = 0 ok, -1 failed.
+; Append request-body bytes to the slot's capture file, opening it on first
+; use — and, on that first use, moving the bytes already buffered in the slot
+; into the file ahead of them, so the file always holds the body from byte 0.
+; slot.len is the body length so far and doubles as the write offset.
+h2p_capture:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    cmp dword [rbx + linnea_h2p.rq_fd], -1
+    jne .cap_write
+    call linnea_spill_open_fd
+    test eax, eax
+    js .cap_fail
+    mov [rbx + linnea_h2p.rq_fd], eax
+    ; the prefix that fitted in the slot goes first, at offset 0
+    mov r14, [rbx + linnea_h2p.len]
+    test r14, r14
+    jz .cap_write
+    lea rsi, [rbx + linnea_h2p.buf + LINNEA_H2P_BODY_OFF]
+    xor edx, edx
+    mov rdi, rbx
+    mov rcx, r14
+    call h2p_pwrite
+    test eax, eax
+    js .cap_fail
+.cap_write:
+    mov rsi, r12
+    mov rdx, [rbx + linnea_h2p.len]
+    mov rdi, rbx
+    mov rcx, r13
+    call h2p_pwrite
+    test eax, eax
+    js .cap_fail
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.cap_fail:
+    mov eax, -1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; h2p_pwrite(rdi = slot*, rsi = buf, rdx = file offset, rcx = len)
+;   -> rax = 0 ok, -1 failed.
+; A regular file writes short only on a full filesystem or a signal, so the
+; loop is for correctness rather than the common case — the same reasoning as
+; linnea_spill_write, which cannot be reused here because it is keyed on the
+; connection and an h2 capture belongs to one stream of several.
+h2p_pwrite:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    mov r14, rcx
+.pw_loop:
+    test r14, r14
+    jz .pw_done
+    mov eax, LINNEA_SYS_PWRITE64
+    mov edi, [rbx + linnea_h2p.rq_fd]
+    mov rsi, r12
+    mov rdx, r14
+    mov r10, r13
+    syscall
+    cmp rax, -4095
+    jae .pw_retry
+    test rax, rax
+    jz .pw_fail                      ; no progress: a full filesystem
+    add r12, rax
+    add r13, rax
+    sub r14, rax
+    jmp .pw_loop
+.pw_retry:
+    cmp rax, -LINNEA_EINTR
+    je .pw_loop
+    cmp rax, -LINNEA_EAGAIN
+    je .pw_loop
+.pw_fail:
+    mov eax, -1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.pw_done:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; h2p_capture_map(rdi = slot*) -> rax = 0 ok, -1 failed.
+; The body is complete in the file: map it and point the send at it. rq_buf
+; and rq_rd/rq_wr are the streaming path's cursors, so the send needs no new
+; case beyond not sliding a mapping it cannot make room in.
+h2p_capture_map:
+    push rbx
+    mov rbx, rdi
+    mov rdx, [rbx + linnea_h2p.len]
+    test rdx, rdx
+    jz .cm_empty                     ; captured nothing: nothing to map
+    mov eax, LINNEA_SYS_MMAP
+    xor edi, edi
+    mov rsi, rdx
+    mov edx, LINNEA_PROT_READ
+    mov r10d, LINNEA_MAP_PRIVATE
+    mov r8d, [rbx + linnea_h2p.rq_fd]
+    xor r9d, r9d
+    syscall
+    cmp rax, -4095
+    jae .cm_fail
+    mov [rbx + linnea_h2p.rq_map], rax
+    mov [rbx + linnea_h2p.rq_buf], rax
+    mov rdx, [rbx + linnea_h2p.len]
+    mov [rbx + linnea_h2p.rq_maplen], rdx
+    mov [rbx + linnea_h2p.rq_wr], rdx
+    mov qword [rbx + linnea_h2p.rq_rd], 0
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_REQ_FILE
+.cm_empty:
+    xor eax, eax
+    pop rbx
+    ret
+.cm_fail:
+    mov eax, -1
+    pop rbx
+    ret
+
+; h2p_capture_release(rdi = slot*) — unmap and close, whichever exist. The
+; close IS the delete (O_TMPFILE), so this is the whole cleanup. Called from
+; every path that gives a slot up.
+h2p_capture_release:
+    push rbx
+    mov rbx, rdi
+    mov rax, [rbx + linnea_h2p.rq_map]
+    test rax, rax
+    jz .cr_nomap
+    push rax
+    mov eax, LINNEA_SYS_MUNMAP
+    pop rdi
+    mov rsi, [rbx + linnea_h2p.rq_maplen]
+    syscall
+    mov qword [rbx + linnea_h2p.rq_map], 0
+    mov qword [rbx + linnea_h2p.rq_maplen], 0
+.cr_nomap:
+    mov edi, [rbx + linnea_h2p.rq_fd]
+    cmp edi, -1
+    je .cr_nofd
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    mov dword [rbx + linnea_h2p.rq_fd], -1
+.cr_nofd:
+    pop rbx
+    ret
+
 ; h2p_finalize(rdi = slot*) — the request is complete: append Content-Length
 ; (when a body was collected) and the empty line, open the upstream socket
 ; and ask the loop to connect.
@@ -2573,9 +2789,13 @@ h2p_finalize:
     lea rsi, [h2p_conn_close]              ; "Connection: close" CRLF CRLF
     mov ecx, h2p_conn_close_len
     rep movsb
-    ; the collected body follows the head
+    ; the collected body follows the head — unless it outgrew the slot and was
+    ; captured to a file, in which case it is sent from a mapping instead and
+    ; the head must stay head-only
     test r12, r12
     jz .fin_head_only
+    cmp dword [rbx + linnea_h2p.rq_fd], -1
+    jne .fin_head_only
     lea rsi, [rbx + linnea_h2p.buf + LINNEA_H2P_BODY_OFF]
     mov rcx, r12
     rep movsb
@@ -2584,9 +2804,26 @@ h2p_finalize:
     sub rdi, rax
     mov [rbx + linnea_h2p.req_len], rdi
     mov qword [rbx + linnea_h2p.rd], 0
+    ; a captured body is mapped BEFORE len is cleared — the map takes its size
+    ; from it, and buf becomes the response buffer straight after
+    cmp dword [rbx + linnea_h2p.rq_fd], -1
+    je .fin_nofile
+    mov rdi, rbx
+    call h2p_capture_map
+    test eax, eax
+    js .fin_capture_failed
+.fin_nofile:
     mov qword [rbx + linnea_h2p.len], 0    ; buf is the response buffer now
     mov rdi, rbx
     call h2p_open_upstream
+    pop r12
+    pop rbx
+    ret
+.fin_capture_failed:
+    ; the body is on disk but unreadable: 500, because the client's upload was
+    ; fine and it was us that could not carry it — 413 would blame the request
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [rbx + linnea_h2p.status], 500
     pop r12
     pop rbx
     ret
@@ -2744,6 +2981,8 @@ linnea_h2p_event:
 .ev_send:
     test r14d, r14d
     js .ev_send_err
+    test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_REQ_FILE
+    jnz .ev_send_file
     test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
     jnz .ev_send_stream
     add [rbx + linnea_h2p.sent], r14d
@@ -2753,6 +2992,30 @@ linnea_h2p_event:
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_HEAD
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
     jmp .ev_service
+.ev_send_file:
+    ; a captured request: head first, then straight out of the mapping. No
+    ; slide — a mapping has no window to make room in — and no credit, because
+    ; these bytes were credited back to the client as they were captured.
+    mov rax, [rbx + linnea_h2p.sent]
+    cmp rax, [rbx + linnea_h2p.req_len]
+    jae .ev_file_body
+    add [rbx + linnea_h2p.sent], r14d          ; still the head
+    jmp .ev_file_next
+.ev_file_body:
+    mov eax, r14d
+    add [rbx + linnea_h2p.rq_rd], rax
+.ev_file_next:
+    mov rax, [rbx + linnea_h2p.sent]
+    cmp rax, [rbx + linnea_h2p.req_len]
+    jb .ev_send_more                           ; head not fully out
+    mov rax, [rbx + linnea_h2p.rq_rd]
+    cmp rax, [rbx + linnea_h2p.rq_wr]
+    jb .ev_send_more                           ; mapping has bytes left
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_REQ_DONE
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_HEAD
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
+    jmp .ev_service
+
 .ev_send_stream:
     ; a streamed request: the head goes out first, then FIFO body bytes.
     ; Body bytes that have left are owed back to the client as flow-control
@@ -2867,12 +3130,21 @@ h2p_free_slot:
     call linnea_upstream_closed
 .fsl_nofd:
     mov dword [rbx + linnea_h2p.fd], -1
+    mov rdi, rbx
+    call h2p_capture_release
+    mov rsi, [rbx + linnea_h2p.flags]            ; read BEFORE the scrub
     mov qword [rbx + linnea_h2p.flags], 0        ; see h2p_release
+    ; a CAPTURED body owes nothing: its bytes were credited as they were
+    ; written to the file, and counting the unsent remainder here would credit
+    ; them a second time and overflow the peer's connection window
+    test rsi, LINNEA_H2P_F_REQ_FILE
+    jnz .fsl_owed_done
     mov rcx, [rbx + linnea_h2p.rq_credit]        ; still owed on stream 0
     mov rdx, [rbx + linnea_h2p.rq_wr]
     sub rdx, [rbx + linnea_h2p.rq_rd]
     add rcx, rdx
     add [rbx + linnea_h2p.rq_owed], rcx
+.fsl_owed_done:
     mov qword [rbx + linnea_h2p.rq_rd], 0
     mov qword [rbx + linnea_h2p.rq_wr], 0
     mov qword [rbx + linnea_h2p.rq_credit], 0

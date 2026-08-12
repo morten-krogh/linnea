@@ -3403,6 +3403,23 @@ timeout 60 curl -s --http2 --cacert $CA --resolve localhost:61443:127.0.0.1 \
 [ "$(md5sum < /tmp/upload2_echo.bin | cut -d' ' -f1)" = "$uwant" ]
 check "http2 streams a 300000-byte request body (byte-exact)" $?
 rm -f /tmp/upload2_echo.bin
+# The bodies that do NOT get the streaming buffer: one with no usable
+# Content-Length, and the second of two uploads running at the same time on one
+# connection. Both fall to the collecting path, which was capped at 8 KiB
+# whatever max_body said; they are captured to a file now, like h1 and h3.
+#
+# curl cannot express the concurrent case at all -- --parallel opens a second
+# connection, so it measures two independent uploads and proves nothing --
+# hence the hand-rolled client. Against the pre-fix binary it reports
+# "stream 3: status 413".
+timeout 60 curl -s --http2 --cacert $CA --resolve localhost:61443:127.0.0.1 \
+    -o /dev/null -w '%{http_code}' -X POST -T - \
+    "https://localhost:61443/api/echo" < test/www/upload2.bin > /tmp/upl_nocl.txt
+[ "$(cat /tmp/upl_nocl.txt)" = "200" ]
+check "http2 captures a 300000-byte body with no Content-Length ($(cat /tmp/upl_nocl.txt))" $?
+rm -f /tmp/upl_nocl.txt
+out=$(timeout 90 python3 test/h2_concurrent_upload.py 61443 200000 2>&1)
+check "http2: two 200000-byte uploads at once on one connection ($out)" $?
 # and over TLS HTTP/1.1, where the client pipelines it behind the handshake
 timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:61443:127.0.0.1 \
     --data-binary @test/www/upload2.bin "https://localhost:61443/api/echo" \
