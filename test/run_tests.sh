@@ -3420,6 +3420,21 @@ check "http2 captures a 300000-byte body with no Content-Length ($(cat /tmp/upl_
 rm -f /tmp/upl_nocl.txt
 out=$(timeout 90 python3 test/h2_concurrent_upload.py 61443 200000 2>&1)
 check "http2: two 200000-byte uploads at once on one connection ($out)" $?
+# ...and one PAST the advertised stream window. This size is the point: a
+# collected body is credited back as it is consumed, and crediting only the
+# CONNECTION window was enough while such a body could not exceed 8 KiB. With
+# the cap lifted, an upload stalled for ever at exactly
+# SETTINGS_INITIAL_WINDOW_SIZE (4 MiB) with the stream window at zero and the
+# connection window wide open. Every other upload check here is under that, so
+# none of them can catch it — keep this one above LINNEA_H2P_UPLOAD_BUF.
+dd if=/dev/urandom of=/tmp/upload5.bin bs=1M count=5 2>/dev/null
+u5=$(md5sum < /tmp/upload5.bin | cut -d' ' -f1)
+timeout 90 curl -s --http2 --max-time 80 --cacert $CA \
+    --resolve localhost:61443:127.0.0.1 -X POST -T - \
+    "https://localhost:61443/api/echo" < /tmp/upload5.bin > /tmp/upload5_echo.bin
+[ "$(md5sum < /tmp/upload5_echo.bin | cut -d' ' -f1)" = "$u5" ]
+check "http2: a 5 MiB no-Content-Length body past the stream window completes" $?
+rm -f /tmp/upload5.bin /tmp/upload5_echo.bin
 # and over TLS HTTP/1.1, where the client pipelines it behind the handshake
 timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:61443:127.0.0.1 \
     --data-binary @test/www/upload2.bin "https://localhost:61443/api/echo" \

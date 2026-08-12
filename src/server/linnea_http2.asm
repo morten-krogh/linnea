@@ -457,6 +457,7 @@ linnea_h2_handle:
     ; keeps the FIFO within the window we advertised.
     mov [h2_fd_len], eax             ; the payload's flow-control cost
     mov dword [h2_fd_credit], 1
+    mov dword [h2_fd_sid], 0         ; set only where the bytes are consumed
     movzx edx, byte [rsi + 5]        ; stream id
     and edx, 0x7f
     shl edx, 8
@@ -579,6 +580,15 @@ linnea_h2_handle:
     pop r10
     pop rdi
 .fd_end_check:
+    ; The payload is consumed — buffered in the slot or written to the capture
+    ; file — so the STREAM window can be given back now, not only the
+    ; connection window. Crediting stream 0 alone was enough while a collected
+    ; body could not exceed 8 KiB; with the cap lifted to max_body the client
+    ; ran out of stream window at exactly SETTINGS_INITIAL_WINDOW_SIZE and
+    ; waited for ever. Measured before the fix: 4 MiB sent, 0 bytes of stream
+    ; credit returned, 8.4 MB of connection credit returned.
+    mov eax, [rdi + linnea_h2p.sid]
+    mov [h2_fd_sid], eax
     test r10b, LINNEA_H2_FLAG_END_STREAM
     jz .fd_done                      ; more body to come
     ; ...and what arrived must be what was declared, when a length was given.
@@ -636,6 +646,22 @@ linnea_h2_handle:
     mov byte [r13 + 3], LINNEA_H2_FT_WINDOW_UPDATE
     mov byte [r13 + 4], 0
     mov dword [r13 + 5], 0           ; stream 0: the connection window
+    mov ecx, eax
+    bswap ecx
+    mov [r13 + 9], ecx
+    add r13, 13
+    ; ...and the same amount on the stream itself, when a slot consumed the
+    ; payload. Two frames is 26 bytes of the 32 the frame loop reserves.
+    cmp dword [h2_fd_sid], 0
+    je .f_ignore
+    mov byte [r13], 0
+    mov byte [r13 + 1], 0
+    mov byte [r13 + 2], 4
+    mov byte [r13 + 3], LINNEA_H2_FT_WINDOW_UPDATE
+    mov byte [r13 + 4], 0
+    mov ecx, [h2_fd_sid]
+    bswap ecx                        ; the reserved bit is clear: sid < 2^31
+    mov [r13 + 5], ecx
     mov ecx, eax
     bswap ecx
     mov [r13 + 9], ecx
@@ -5451,6 +5477,11 @@ h2_hb_pool:    resq 1                ; per-connection header-block assembly +
 h2_cur_srv:   resq 1                 ; vhost whose response is being built
 h2_fd_len:    resd 1                 ; a DATA frame's flow-control cost
 h2_fd_credit: resd 1                 ; and whether it is owed back now
+; The stream to credit alongside the connection, or 0. Only a slot that
+; CONSUMED the payload outright sets it — a dropped frame or a body being
+; streamed upstream must not, because a WINDOW_UPDATE on a stream that is idle
+; or already reset is a connection error to the peer.
+h2_fd_sid:    resd 1
 h2p_numbuf:   resb 24
 h2p_stbuf:    resb 4                 ; a status as three ASCII digits
 h2p_nmbuf:    resb 64                ; a response field name, lowercased
