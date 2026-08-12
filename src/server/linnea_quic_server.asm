@@ -6051,7 +6051,16 @@ tx_detect_loss:
     mov rax, [r14 + linnea_quic_txchunk.pn]
     cmp rax, r13
     ja .dl_next                       ; still within the reorder window: not lost
-    cmp qword [r14 + linnea_quic_txchunk.tries], LINNEA_QUIC_PTO_MAX
+    ; TX_PTO_MAX, not PTO_MAX: this is a response CHUNK, and the two limits
+    ; differ by design — 6 attempts for a small control reply, 16 for stream
+    ; data, which is reliable by contract. Testing the small one here stopped
+    ; ACK-based recovery at 6 while the PTO sweep below went on to 16, so a
+    ; chunk in that window lost prompt recovery and crawled on a backoff capped
+    ; at 4 s, with every resend halving cwnd again. Exactly the case the
+    ; constant's own comment warns about: "a client that drops half our
+    ; packets, as one does when its receive buffer overflows, hits it
+    ; routinely."
+    cmp qword [r14 + linnea_quic_txchunk.tries], LINNEA_QUIC_TX_PTO_MAX
     jae .dl_next                      ; out of attempts: the sweep will abandon it
     mov rdi, rbx                      ; a loss is a congestion signal
     mov rsi, rax
