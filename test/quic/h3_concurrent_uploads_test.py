@@ -7,22 +7,19 @@
 # happens when the contexts run out: a browser posting several files, or an
 # XHR-per-file uploader, does exactly that.
 #
-# SIX fills every context at once, which must simply work, and that is what
-# this asserts.
+# SIX fills every context at once and must all be served.
 #
-# NINE is deliberately NOT asserted, because the answer today is a KNOWN and
-# documented limitation rather than a bug to catch: measured here, three of the
-# nine never answer at all -- no response and no reset -- and they never will.
-# .ra_reclaim only takes a context back once it has been silent for
-# RA_STALE_MS (5s), so during a genuine burst none is stale and the frame is
-# dropped; the packet carrying it has already been acknowledged, so nothing
-# retransmits it. The comment there says as much: "this falls through to
-# dropping the frame exactly as before".
+# NINE cannot fit, and the three that miss out must be REFUSED rather than
+# dropped: RESET_STREAM + STOP_SENDING carrying H3_REQUEST_REJECTED (0x10b),
+# which means "not processed, safe to retry". That is what makes a limit of six
+# acceptable — the client is told, in a way it can act on, instead of holding a
+# request that never returns.
 #
-# Worth knowing if that is ever revisited: the alternative costs nothing to the
-# client, because H3_REQUEST_REJECTED (0x010b) means "not processed -- safe to
-# retry", and .ra_reclaim already sends exactly that to the stream it evicts. A
-# refusal a client can retry strictly beats a stream that hangs for ever.
+# An earlier version of this check asserted only the six and described the
+# other three as hanging for ever. They were not hanging: the check simply
+# never looked at StreamReset, so a correct refusal was indistinguishable from
+# silence. Both terminal outcomes are asserted now, and a stream that ends in
+# NEITHER is the actual regression to catch.
 #
 # Each body is distinct and checked byte for byte: with several reassemblies
 # in flight through one connection, bytes landing in the wrong context is the
@@ -39,6 +36,7 @@ PORT = int(sys.argv[1])
 ADDR = ("127.0.0.1", PORT)
 # Past LINNEA_QUIC_RA_BUF (32768) so each one really needs a context and a
 # capture file; different lengths so a mixed-up body cannot look right.
+H3_REQUEST_REJECTED = 0x10b
 SIZES = [40000, 41000, 42000, 43000, 44000, 45000, 46000, 47000, 48000]
 
 
@@ -86,6 +84,7 @@ def run(count):
     flush()
 
     done = set()
+    refused = {}
     dl = time.time() + 120
     while time.time() < dl and len(done) < count:
         try:
@@ -96,10 +95,16 @@ def run(count):
             ev = conn.next_event()
             if ev is None:
                 break
-            if type(ev).__name__ == "ConnectionTerminated":
+            evname = type(ev).__name__
+            if evname == "ConnectionTerminated":
                 sock.close()
                 return "the server closed the connection: error 0x%x %r" % (
                     ev.error_code, ev.reason_phrase)
+            if evname == "StreamReset" and ev.stream_id in bodies:
+                # refused rather than served: a terminal answer, and the only
+                # acceptable one when every context is taken
+                refused[ev.stream_id] = ev.error_code
+                done.add(ev.stream_id)
             for e in h3.handle_event(ev):
                 if isinstance(e, HeadersReceived):
                     status[e.stream_id] = dict(e.headers).get(b":status", b"?").decode()
@@ -114,24 +119,38 @@ def run(count):
 
     if len(done) < count:
         missing = [s for s in bodies if s not in done]
-        return ("%d of %d finished; %d never answered (statuses %s)"
-                % (len(done), count, len(missing),
-                   sorted({status.get(s, "none") for s in missing})))
-    bad = [s for s in bodies if status.get(s) != "200"]
+        return ("%d of %d reached a terminal answer; %d got NEITHER a response "
+                "nor a reset, which is the silent drop this guards against"
+                % (len(done), count, len(missing)))
+    wrongcode = {s: c for s, c in refused.items() if c != H3_REQUEST_REJECTED}
+    if wrongcode:
+        return ("refused with %s, want H3_REQUEST_REJECTED 0x10b (the code that "
+                "tells the client it may retry)"
+                % sorted({hex(c) for c in wrongcode.values()}))
+    served = [s for s in bodies if s not in refused]
+    if not served:
+        return "every one of the %d was refused; none was served" % count
+    bad = [s for s in served if status.get(s) != "200"]
     if bad:
         return "statuses %s (want all 200)" % sorted({status.get(s) for s in bad})
-    wrong = [s for s in bodies if got[s] != bodies[s]]
+    wrong = [s for s in served if got[s] != bodies[s]]
     if wrong:
         return ("%d of %d bodies came back wrong -- reassemblies crossed"
-                % (len(wrong), count))
-    return None
+                % (len(wrong), len(served)))
+    return (None, len(served), len(refused))
 
 
-for count in (6,):
+for count in (6, 9):
     t0 = time.time()
-    bad = run(count)
-    if bad:
-        print("%d at once: %s" % (count, bad))
+    r = run(count)
+    if isinstance(r, str):
+        print("%d at once: %s" % (count, r))
         sys.exit(1)
-    print("  %d at once: ok (%.1fs)" % (count, time.time() - t0))
-print("ok (%d concurrent uploads on one connection, all byte-exact)" % count)
+    _, served, refused = r
+    if count <= 6 and refused:
+        print("%d at once: %d were refused, but all six contexts were free"
+              % (count, refused))
+        sys.exit(1)
+    print("  %d at once: %d served byte-exact, %d refused 0x10b (%.1fs)"
+          % (count, served, refused, time.time() - t0))
+print("ok (six served at once; past that, refused retryably rather than dropped)")

@@ -2271,8 +2271,11 @@ check "h3 a body in several DATA frames keeps its credit ($out5)" $?
 # Several uploads at once on ONE connection. Every other upload check runs one
 # request at a time, so nothing asked what happens when the RA_CTXS (6)
 # reassembly contexts are all in use -- which a browser posting several files
-# does immediately. Six at once must work and come back byte-exact; the bodies
-# differ in length so a reassembly landing in the wrong context cannot pass.
+# does immediately. Six must be served byte-exact (the bodies differ in length,
+# so a reassembly landing in the wrong context cannot pass), and past six the
+# rest must be REFUSED with H3_REQUEST_REJECTED rather than dropped: that is
+# what makes a limit of six acceptable, because the client is told it may
+# retry. A stream ending in NEITHER a response nor a reset is the regression.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     out7=$(timeout 200 python3 test/quic/h3_concurrent_uploads_test.py 61498 2>&1 | tail -1)
     case "$out7" in ok*) true ;; *) false ;; esac
