@@ -30,6 +30,11 @@ export LINNEA_TEST_RUNDIR=$RUNDIR
 rm -rf "$RUNDIR"
 mkdir -p "$RUNDIR"
 CFG=$RUNDIR/configs
+# The HTTP/3 curl (ngtcp2 + nghttp3), used by several blocks below and defined
+# once here so a block that runs before the independent-client section does not
+# silently take its "skipped" branch against an unset name. See that section
+# for how to build one and why it is worth having.
+CURLH3=${LINNEA_CURL_H3:-$HOME/curl-h3/bin/curl}
 # test/www is a template now, like test/configs: a run copies it and is free to
 # generate into and delete from its own. 8 MB, so the copy costs nothing.
 WWW=$RUNDIR/www
@@ -3331,6 +3336,37 @@ PYEOF
               https://localhost:${P61462}/api/simple)
     [ "$b2" = "backend body" ]
     check "h3/h2 agree on the proxied body" $?
+
+    # ...and they must agree about REFUSING one. A response carrying both
+    # Transfer-Encoding: chunked and Content-Length is contradictory (RFC 9112
+    # 6.3) and h1 has always answered 502 -- "forwarding both would let a
+    # compromised backend split the next keep-alive response". h2 and h3 each
+    # picked a side and relayed instead, so one backend answer produced three
+    # different client-visible outcomes: 502 on h1, a 200 on h2 declaring the
+    # upstream's content-length over a de-chunked body of a different length
+    # (which the client rejects as PROTOCOL_ERROR), and a clean 200 on h3 with
+    # the chunked length restated. Which one a client saw came down to the
+    # protocol it happened to negotiate.
+    tc2=$(curl -s --http2 -o /dev/null -w '%{http_code}' --max-time 6 \
+          --cacert test/tls/server.crt https://localhost:${P61462}/api/tecl)
+    [ "$tc2" = "502" ]
+    check "h2 refuses a proxied response framed both ways ($tc2)" $?
+    if [ -x "$CURLH3" ] && "$CURLH3" -V 2>/dev/null | grep -q HTTP3; then
+        tc3=$("$CURLH3" --http3-only -s -o /dev/null -w '%{http_code}' --max-time 15 \
+              --cacert test/tls/server.crt https://localhost:${P61462}/api/tecl)
+        [ "$tc3" = "502" ]
+        check "h3 refuses the same response h1 and h2 refuse ($tc3)" $?
+    else
+        check "h3 refuses a doubly-framed proxied response (skipped: no HTTP/3 curl)" 0
+    fi
+    # The control, and it is the one that matters: a legitimately chunked
+    # response carries no Content-Length and must still relay. Without it the
+    # two checks above would pass on a build that had simply stopped
+    # de-chunking anything.
+    ch2=$(curl -s --http2 --max-time 6 --cacert test/tls/server.crt \
+          https://localhost:${P61462}/api/chunked)
+    [ "$ch2" = "chunked body" ]
+    check "h2 still relays an ordinary chunked response ($ch2)" $?
 
     # RFC 9110 7.6.1 / RFC 9113 8.2.2: the backend's connection fields describe
     # its connection to us, and a message carrying one is malformed on h2. Six

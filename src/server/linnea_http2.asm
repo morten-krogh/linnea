@@ -3770,6 +3770,20 @@ h2p_parse_head:
     jz .ph_clen
     mov qword [rbx + linnea_h2p.chunked], 1     ; phase 1: reading a size line
     mov qword [rbx + linnea_h2p.body_rem], -1
+    ; ...but a response carrying BOTH is contradictory and must not be relayed
+    ; (RFC 9112 6.3). h1 refuses it with a 502 and says why: forwarding both
+    ; lets a compromised backend split the next keep-alive response. h2 picked
+    ; a side instead, and picked badly — it de-chunked the body while
+    ; forwarding the upstream's content-length verbatim, so the message it
+    ; emitted declared 5 bytes and carried 7, and the client rejected the
+    ; stream with PROTOCOL_ERROR. Refuse it here, where h1 does.
+    mov rdi, r12
+    mov rsi, [rbx + linnea_h2p.rd]
+    lea rdx, [h2p_hn_cl]
+    mov ecx, h2p_hn_cl_len
+    call h2p_head_find
+    test rdx, rdx
+    jnz .ph_bad
     jmp .ph_bodyflag
 .ph_clen:
     mov rdi, r12

@@ -267,6 +267,22 @@ linnea_h3_proxy_start:
     sub rax, [rbx + linnea_h2_req.hb_start]
     add rcx, rax
     add rcx, http11_host_len + hdr_clen_len + hdr_via_len + hdr_close_len + 32
+    ; ...and the body, when it is the in-memory kind. A captured body is mapped
+    ; and queued behind the head (.st_body_file) and costs up_buf nothing, but a
+    ; request that arrived whole in one datagram is COPIED in behind the head by
+    ; the same unchecked .up_append this bound exists to protect — and the bound
+    ; did not count it.
+    ;
+    ; Nothing reachable overruns it today: a datagram is at most
+    ; LINNEA_QUIC_RXBUF_SIZE, and the header-list bound caps how far QPACK can
+    ; expand that into rebuilt lines, so head and body together stay well inside
+    ; up_buf. But that is arithmetic across three constants in two other files,
+    ; written down nowhere, and it is the only thing between an unchecked copy
+    ; and the next connection in the pool.
+    cmp qword [linnea_h3_body_fd], -1
+    jne .st_bound_done
+    add rcx, [linnea_h3_proxy_body_len]
+.st_bound_done:
     cmp rcx, LINNEA_CONN_UP_BUF
     ja .st_toobig
     lea rbp, [r12 + linnea_connection.up_buf]         ; append cursor
@@ -573,6 +589,22 @@ linnea_h3_proxy_head:
     jz .ph_clen
     mov qword [rbx + linnea_connection.capture_chunked], 1
     mov qword [rbx + linnea_connection.body_rem], -1
+    ; ...but a response carrying BOTH is contradictory, and the two lengths
+    ; disagreeing is the whole response-splitting vector (RFC 9112 6.3). h1 has
+    ; always refused it — "forwarding both would let a compromised backend split
+    ; the next keep-alive response" — while h2 and h3 each picked a side and
+    ; relayed. One backend answer, three client-visible outcomes: h1 502, h2 a
+    ; 200 stating the upstream's content-length over a de-chunked body that is a
+    ; different length (which its own client rejects as PROTOCOL_ERROR), h3 a
+    ; clean 200 with the chunked length restated. Which one a client sees came
+    ; down to the protocol it happened to negotiate. Refuse, like h1.
+    mov rdi, r12
+    mov rsi, [rbx + linnea_connection.h3_hlen]
+    lea rdx, [hn_cl]
+    mov ecx, 14
+    call .ph_find                    ; preserves rbx/r12/r13
+    test rdx, rdx
+    jnz .ph_bad
     jmp .ph_nobody_chk
 .ph_clen:
     mov rdi, r12
