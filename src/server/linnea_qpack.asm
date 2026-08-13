@@ -27,6 +27,8 @@ global linnea_qpack_encode_proxy
 global linnea_qpack_send_validators
 global linnea_qpack_crange_ptr
 global linnea_qpack_crange_len
+global linnea_qpack_location_ptr
+global linnea_qpack_location_len
 global linnea_qpack_ccontrol_ptr
 global linnea_qpack_ccontrol_len
 global linnea_qpack_cenc
@@ -125,6 +127,10 @@ linnea_qpack_crange_ptr: resq 1
 linnea_qpack_crange_len: resq 1
 ; the vhost's configured Cache-Control value (0 = none); set per request by
 ; the QUIC server before the serve, emitted only alongside the validators
+; Location, for a redirect location. Set by the serve path, cleared with the
+; other per-response fields; static table index 12 is "location".
+linnea_qpack_location_ptr: resq 1
+linnea_qpack_location_len: resq 1
 linnea_qpack_ccontrol_ptr: resq 1
 linnea_qpack_ccontrol_len: resq 1
 ; the coding of the variant served (0 plain, 1 gzip, 2 br); set per response
@@ -493,6 +499,24 @@ linnea_qpack_encode_response:
     call qenc_str
     mov rbx, rdi
 .no_allow:
+    ; --- location, for a redirect ---
+    ; Ahead of the validators branch on purpose: a redirect has no validators,
+    ; so it takes the .vary_only shortcut below and would skip anything emitted
+    ; after it. Put here first, the 301 went out with no Location at all — the
+    ; status was right and the header simply absent, which curl showed by
+    ; declining to follow it.
+    cmp qword [linnea_qpack_location_ptr], 0
+    je .no_location
+    mov rdi, rbx
+    mov eax, 12                      ; location: name reference (RFC 9204 A)
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    mov rsi, [linnea_qpack_location_ptr]
+    mov rdx, [linnea_qpack_location_len]
+    call qenc_str
+    mov rbx, rdi
+.no_location:
     ; --- validators, when the serve path computed them for this response ---
     cmp qword [linnea_qpack_send_validators], 0
     je .vary_only                    ; no validators: an error response, but a

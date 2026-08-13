@@ -43,6 +43,8 @@ extern linnea_qpack_decode
 extern linnea_qpack_encode_response
 extern linnea_qpack_send_validators
 extern linnea_qpack_crange_ptr
+extern linnea_qpack_location_ptr
+extern linnea_qpack_location_len
 extern linnea_qpack_crange_len
 extern linnea_qpack_cenc
 extern linnea_qpack_ccontrol_ptr
@@ -96,6 +98,10 @@ section .bss
 fs_buf:   resb 768                    ; encoded response field section
 clen_buf: resb 20                     ; content-length as decimal ASCII
 h3_path_buf: resb 4096                ; root ++ decoded path ++ NUL
+; the Location value of a redirect: the configured target with the request's
+; RAW target appended, exactly as h1 builds it — same resource, other origin,
+; percent-encoding untouched
+h3_loc_buf:  resb 4096
 h3_join:     resq 1                   ; where the joined root++path starts
 ; The vhost's config server*, set by the caller before linnea_h3_serve so the
 ; request can be routed to a location. Zero means "no routing": serve the root
@@ -805,6 +811,7 @@ linnea_h3_serve:
     ; conditionals and range are evaluated
     mov qword [linnea_qpack_send_validators], 0
     mov qword [linnea_qpack_crange_ptr], 0
+    mov qword [linnea_qpack_location_ptr], 0
     mov qword [linnea_qpack_cenc], 0
     ; The path is normalized at a fixed offset, leaving room in front of it for
     ; a root that is not known yet: which root depends on which location the
@@ -834,6 +841,8 @@ linnea_h3_serve:
     call linnea_config_match_location
     test rax, rax
     jz .notfound                     ; no location claims this path
+    cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
+    je .redirect
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
     jne .not_static
     ; Cache-Control belongs to the matched location, not to whichever location
@@ -1182,12 +1191,58 @@ linnea_h3_serve:
     mov r9d, body_503_len
     call linnea_h3_build_response
     jmp .sret
+.redirect:
+    ; --- redirect location: 301 with Location = target ++ the raw request ---
+    ; h3 could not do this at all until now: a vhost with a redirect location
+    ; was kept off HTTP/3 entirely, so ONE such location silently cost the whole
+    ; server its QUIC listener. QPACK has a static name for "location" (index
+    ; 12) and always did; nothing was stopping it but the missing branch.
+    mov r10, [rax + linnea_config_location.redirect_len]
+    mov r11, [rbx + linnea_h2_req.path_len]
+    lea rcx, [r10 + r11]
+    cmp rcx, 4096                    ; the value must fit h3_loc_buf
+    ja .redirect_too_long
+    push rax
+    push rbx
+    lea rdi, [h3_loc_buf]
+    lea rsi, [rax + linnea_config_location.redirect]
+    mov rcx, r10
+    rep movsb
+    mov rsi, [rbx + linnea_h2_req.path_ptr]
+    mov rcx, [rbx + linnea_h2_req.path_len]
+    rep movsb
+    pop rbx
+    pop rax
+    lea rcx, [h3_loc_buf]
+    mov [linnea_qpack_location_ptr], rcx
+    mov r10, [rax + linnea_config_location.redirect_len]
+    add r10, [rbx + linnea_h2_req.path_len]
+    mov [linnea_qpack_location_len], r10
+    mov rdi, r12
+    mov esi, 301
+    xor edx, edx                     ; no content-type
+    xor ecx, ecx
+    xor r8d, r8d                     ; and no body: the Location is the answer
+    xor r9d, r9d
+    call linnea_h3_build_response
+    jmp .sret
+.redirect_too_long:
+    ; the configured target plus this request's own target does not fit; 414 is
+    ; what h1 answers for the same case
+    mov rdi, r12
+    mov esi, 414
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    xor r8d, r8d
+    xor r9d, r9d
+    call linnea_h3_build_response
+    jmp .sret
+
 .not_static:
     ; A proxy location. The request goes to the location's upstream on a leg of
     ; its own and this stream is PARKED: the answer arrives on an io_uring
-    ; completion, long after this datagram has been dealt with. Redirect
-    ; locations never get here — a vhost that has one is still kept off h3 by
-    ; the registration, QPACK having no Location header to emit.
+    ; completion, long after this datagram has been dealt with. A redirect
+    ; location is handled above and never reaches here.
     ; Is there a response-stream slot to park this request in? The caller
     ; already scanned for one (linnea_h3_tx_cap). Asking now rather than at the
     ; park matters: the upstream is contacted before the stream is parked, so

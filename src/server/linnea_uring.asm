@@ -420,23 +420,11 @@ linnea_uring_run:
     je .quic_next
     cmp qword [rdx + linnea_config_server.location_count], 0
     je .quic_next
-    ; The owner must be a vhost that h3 can actually serve, on the same terms as
-    ; the registration loop below — otherwise a mixed config could bind a QUIC
-    ; listener that no vhost ever registers on. h3 routes to locations now, so a
-    ; proxy location no longer disqualifies a vhost; only a redirect does, which
-    ; h3 has no way to express (QPACK emits no Location header).
-    lea rcx, [rdx + linnea_config_server.locations]
-    mov rax, [rdx + linnea_config_server.location_count]
-    xor r9d, r9d
-.quic_owner_kinds:
-    cmp r9, rax
-    jae .quic_owner_ok
-    cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
-    je .quic_next              ; a redirect location: not an h3 owner
-    add rcx, linnea_config_location_size
-    inc r9
-    jmp .quic_owner_kinds
-.quic_owner_ok:
+    ; The owner must be a vhost that h3 can actually serve. It once had to have
+    ; no redirect location either, because h3 could not emit a Location header —
+    ; so a single "/old" redirect silently cost the WHOLE server its QUIC
+    ; listener, every other location included. h3 serves redirects now (QPACK
+    ; static index 12), so nothing here disqualifies a vhost.
     lea rcx, [rdx + linnea_config_server.locations]
     push rdx
     push rcx
@@ -468,28 +456,15 @@ linnea_uring_run:
     je .quic_vhost_next
     cmp word [rax + linnea_config_server.port], r13w
     jne .quic_vhost_next                                ; a vhost on another port
-    ; A vhost with a REDIRECT location is still kept off h3: QPACK has no
-    ; Location header to emit, so a redirect could not be expressed, and
-    ; Alt-Svc migration is per-origin — a browser that switched would break
-    ; those paths with no fallback. Such a vhost keeps h1/h2, as before.
+    ; Neither a proxy nor a redirect location disqualifies a vhost any more.
+    ; h3 routes to locations, reaches upstreams, and emits Location for a
+    ; redirect (QPACK static index 12), so every kind can be served.
     ;
-    ; A proxy location no longer disqualifies one. h3 routes to locations now,
-    ; and until it can reach an upstream those paths answer 502 rather than
-    ; resolving under a static root. Leaving such a vhost UNREGISTERED was the
-    ; worse failure by far: its h3 requests fell through to whichever vhost
-    ; owned the listener and were served from that one's document root, under
-    ; that one's certificate.
-    lea rcx, [rax + linnea_config_server.locations]
-    mov r8, [rax + linnea_config_server.location_count]
-    xor r9d, r9d
-.quic_vhost_kinds:
-    cmp r9, r8
-    jae .quic_vhost_static
-    cmp qword [rcx + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
-    je .quic_vhost_next                                 ; a redirect: no h3
-    add rcx, linnea_config_location_size
-    inc r9
-    jmp .quic_vhost_kinds
+    ; Leaving a vhost UNREGISTERED was the worse failure by far: its h3 requests
+    ; fell through to whichever vhost owned the listener and were served from
+    ; THAT one's document root, under THAT one's certificate. A redirect vhost
+    ; kept its h1 and h2, so the loss was quiet — the browser simply never used
+    ; h3 for it, or worse, used it and got another vhost's pages.
 .quic_vhost_static:
     ; Register with the first ROOT location as the default. Every request
     ; routes for itself now, so this only matters when routing is unavailable.
