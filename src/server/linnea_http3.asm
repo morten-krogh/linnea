@@ -1,6 +1,13 @@
-; linnea_http3.asm — HTTP/3 (RFC 9114) request-stream framing. For now this
-; parses the frame layer on a client request stream and decodes the HEADERS
-; frame with QPACK. The response path and stream demux come later.
+; linnea_http3.asm — HTTP/3 (RFC 9114) request streams, end to end: the frame
+; walk over a client's request stream (resumable, so one stream may arrive over
+; many datagrams), the QPACK decode of its HEADERS, and the whole response side
+; — routing to a location, serving a file with its validators, ranges and
+; pre-compressed variants, redirects, the canned errors, and handing a proxied
+; request to the upstream hook.
+;
+; The header said "the response path and stream demux come later" until well
+; after both arrived, which is worth a line of its own: a file header is the
+; first thing a reader trusts and the last thing anyone updates.
 
 default rel
 
