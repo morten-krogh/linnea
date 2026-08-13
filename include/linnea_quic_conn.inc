@@ -25,6 +25,10 @@
 ; the ceiling on concurrent h3 clients per worker.
 LINNEA_QUIC_MAX_CONNS equ 256       ; connections per worker
 LINNEA_QUIC_RXBUF_SIZE equ 2048     ; linnea_quic_rxbuf, the datagram we read into
+; strm_pay: one 1-RTT packet's payload — ACK, the STREAM header, and an inline
+; HTTP/3 response. Named so the serve path can check against it rather than
+; against a literal that drifts from the buffer it is meant to describe.
+LINNEA_QUIC_STRM_PAY   equ 4096
 LINNEA_QUIC_SCID_LEN  equ 8         ; every connection ID we issue is 8 bytes
 LINNEA_QUIC_IDLE_SECS equ 30        ; reclaim a slot after this long with no packet
 ; A handshake that has stalled is reclaimed far sooner than an established

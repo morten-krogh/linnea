@@ -314,7 +314,7 @@ cur_conn:    resq 1                   ; connection this datagram belongs to
 expfin:      resb 64                  ; expected client Finished message
 onertt_pay:  resb 512                 ; ACK + HANDSHAKE_DONE + NEW_CONNECTION_ID + uni + NST
 onertt_pkt:  resb 4096                ; the protected 1-RTT packet
-strm_pay:    resb 4096                ; STREAM frame carrying the h3 response
+strm_pay:    resb LINNEA_QUIC_STRM_PAY ; STREAM frame carrying the h3 response
 fc_grant_pay: resb 4096               ; MAX_DATA prepended to an outgoing payload (quic-9)
 req:         resb linnea_h2_req_size  ; decoded h3 request
 ; QPACK literal scratch: every Huffman-decoded header value of one request goes
@@ -3522,9 +3522,27 @@ linnea_quic_server_datagram:
     je .serve_parked
     test r9, r9
     jnz .serve_large
+    ; An inline response rides one packet, assembled in strm_pay behind the ACK
+    ; and the STREAM header. .serve_large below bounds ITS head against the slot
+    ; it is copied into, and says why; this arm had no bound at all, on the
+    ; arithmetic that a field section plus an inlined body cannot reach 4096.
+    ; That arithmetic is real but it is spread across three constants in two
+    ; other files, and one of them (LINNEA_H3_FS_BUF) now permits a section
+    ; larger than strm_pay on its own — a redirect's Location is the only thing
+    ; that gets near it, and a redirect carries no body, which is the whole
+    ; reason the sum stays under. Nothing should rest on that coincidence.
     lea rdx, [rax + rbx]             ; STREAM frame length
+    cmp rdx, LINNEA_QUIC_STRM_PAY
+    ja .serve_toolong
     lea rsi, [strm_pay]
     call .send_1rtt
+    jmp .stream_scan
+.serve_toolong:
+    ; Unreachable today, and it stays a backstop rather than a policy: the
+    ; stream is reset, exactly as an over-long chunked head is at .sl_toolong.
+    mov rdi, [s_sid]
+    xor esi, esi                      ; nothing of the response was sent
+    call tx_reset_stream
     jmp .stream_scan
 .serve_large:
     ; the response is a stream, not a packet: place its head and file mapping in a

@@ -141,12 +141,13 @@ linnea_h3_body_fd: resq 1
 ; the request we send upstream. Same size as h2's, and overflow is detectable:
 ; the rebuild parks hb_cur past hb_end rather than writing past it.
 h3_hdrs_buf: resb LINNEA_H3_HDRS_BUF
-; The caller's flow-control allowance for one chunked response: the most stream
-; bytes (head + body) the requesting client can accept, set by the QUIC server
-; per request before linnea_h3_serve — 0 while another chunked response is in
-; flight on the connection. A body that will not fit is refused with a 503
-; rather than overrun the client's window (a flow-control violation kills the
-; connection; a 503 is retryable).
+; May this request start a CHUNKED response? 1 while any of the connection's
+; response-stream slots is free, 0 when all are busy — set by the QUIC server
+; per request before linnea_h3_serve, which refuses a large body with a 503
+; (retryable) rather than have nowhere to stream it from.
+;
+; A flag, not a byte count. It was an allowance once, and the description
+; outlived the change: every reader here tests it against 0.
 linnea_h3_tx_cap: resq 1
 ; For a chunked (large-body) response: where the body starts within the file
 ; mapping linnea_h3_serve hands back, and how many bytes of it to stream — a
