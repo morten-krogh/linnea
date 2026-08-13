@@ -1376,7 +1376,13 @@ linnea_http_handle:
     mov rcx, [rsp + 80]
     test rcx, rcx
     jz .resp_400
-    mov r9, 1 << 32
+    ; The guard here is against OVERFLOW, not against size. It used to stop at
+    ; 1 << 32, which made 4 GiB a hard ceiling on h1 no matter what max_body
+    ; said — a 6 GiB upload was refused instantly with 413 while the same body
+    ; went through h2 at full speed, because h2's parser guards the multiply
+    ; instead of capping the value. What may be accepted is max_body's decision
+    ; and is made below; all this has to do is not wrap.
+    mov r9, 1844674407370955161      ; (2^64-1)/10
     xor eax, eax
     xor edx, edx
 .cl_digits:
@@ -1386,10 +1392,11 @@ linnea_http_handle:
     sub r8d, '0'
     cmp r8d, 9
     ja .resp_400
+    cmp rax, r9                      ; would the multiply wrap?
+    ja .resp_413
     imul rax, rax, 10
     add rax, r8
-    cmp rax, r9
-    ja .resp_413
+    jc .resp_413                     ; ...and the digit can still carry
     inc rdx
     jmp .cl_digits
 .cl_done:
@@ -3478,11 +3485,12 @@ linnea_http_proxy_head:
     sub eax, '0'
     cmp eax, 9
     ja .bad
-    imul r8, r8, 10
-    add r8, rax
-    mov r10, 1 << 32
+    mov r10, 1844674407370955161     ; (2^64-1)/10: guard the wrap, not the size
     cmp r8, r10
     ja .bad
+    imul r8, r8, 10
+    add r8, rax
+    jc .bad
     inc r9d
     inc rcx
     jmp .cl_loop
