@@ -55,6 +55,10 @@ NAME_MAX        equ 255           ; decoded filename bytes we will repeat back
 ; The claim this replaces also said the live config was 8 MiB, years after it
 ; stopped being. A number written where the server cannot correct it goes
 ; stale; the site's upload card carried the same 8 MiB for the same reason.
+; Aligned with linnea's max_body, so a client is told the same limit whichever
+; of the two refuses it. The comparison below goes through a register rather
+; than an immediate: past 2^31 this no longer fits one, and a raise would
+; otherwise truncate with only a warning to say so.
 MAX_UPLOAD      equ 67108864
 ; This server handles one connection at a time and blocks while it does, so a
 ; peer that connects and then says nothing stops every other request until it
@@ -88,7 +92,15 @@ path_random_len equ $ - path_random
 
 ; The directory only supplies the filesystem — O_TMPFILE creates no entry in it,
 ; so there is no name for a client to have a say in.
-tmp_dir:        db "/tmp", 0
+; A real disk, NOT "/tmp". The unit sets PrivateTmp=true, which makes /tmp a
+; private tmpfs — so every upload was being written into RAM, costing its own
+; size up to MAX_UPLOAD with no writeback and nothing for the kernel to
+; reclaim. At 64 MiB that merely wasted memory; while the cap was briefly
+; raised to test large uploads it would have taken the machine down, and prod
+; shares it. The directory only supplies the filesystem: O_TMPFILE still makes
+; no entry in it, so nothing is visible there and the close is still the
+; delete. Same reasoning as linnea's own spill_dir (docs/config.md).
+tmp_dir:        db "/home/linnea/spill", 0
 
 ; Status lines and bodies are kept apart so that no Content-Length is ever
 ; written by hand: send_status counts the body. Three of these four were
@@ -352,7 +364,8 @@ do_upload:
     jz .fail400                    ; present but not a number: not 411, and not
                                    ; a zero-length upload either
     mov r12, rax                   ; declared length
-    cmp r12, MAX_UPLOAD
+    mov rax, MAX_UPLOAD            ; via a register: see the note above
+    cmp r12, rax
     ja .too_big
     call temp_open                 ; rax = fd
     test rax, rax
