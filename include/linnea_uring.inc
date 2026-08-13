@@ -139,6 +139,17 @@ struc linnea_ring
 endstruc
 LINNEA_RING_SIZE        equ linnea_ring_size
 
+; The largest byte count an io_uring op may be given. sqe->len is a u32, but a
+; completion reports its result in a SIGNED 32-bit res, so the kernel refuses a
+; length it could not describe: measured on 7.0.8, len 0x7fffffff sends fine and
+; len 0x80000000 comes back -EINVAL. linnea used to hand the whole remaining
+; body to one SEND, so a 2 GiB upload -- exactly 2^31 -- failed outright and the
+; proxy answered 502. Every send completion already advances by the count it got
+; and re-arms, so clamping costs an extra round of the loop and nothing else.
+; The value is INT_MAX rounded down to a page, which is the same bound the
+; kernel puts on read(2) and write(2) (MAX_RW_COUNT).
+LINNEA_IO_MAX           equ 0x7ffff000
+
 LINNEA_URING_ENTRIES    equ 256  ; submission queue depth
 ; Completion queue depth, sized explicitly rather than taking the kernel's
 ; default of twice the submission queue. Every operation here carries a linked

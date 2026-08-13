@@ -304,6 +304,14 @@ sig_buf:            resb 128   ; struct signalfd_siginfo
 tls_early_scratch:  resb LINNEA_CONN_IN_BUF
 tls_early_scratch_size equ LINNEA_CONN_IN_BUF
 
+; CLAMP_IO_LEN reg — an op may not be given more than LINNEA_IO_MAX bytes.
+%macro CLAMP_IO_LEN 1
+    cmp %1, LINNEA_IO_MAX
+    jbe %%len_ok
+    mov %1, LINNEA_IO_MAX
+%%len_ok:
+%endmacro
+
 section .text
 
 ; A TLS connection's handshake state is overlaid on its up_buf (see the
@@ -3070,6 +3078,7 @@ linnea_uring_arm_recv_buf:
     mov ecx, [rbx + linnea_connection.fd]
     mov [rax + LINNEA_SQE_FD], ecx
     mov [rax + LINNEA_SQE_ADDR], r12
+    CLAMP_IO_LEN r13
     mov [rax + LINNEA_SQE_LEN], r13d
     mov qword [rbx + linnea_connection.rx_msg_armed], 0
     cmp qword [rbx + linnea_connection.tls_phase], LINNEA_TLS_PHASE_KTLS
@@ -3118,6 +3127,7 @@ linnea_uring_arm_send_buf:
     mov ecx, [rbx + linnea_connection.fd]
     mov [rax + LINNEA_SQE_FD], ecx
     mov [rax + LINNEA_SQE_ADDR], r12
+    CLAMP_IO_LEN r13
     mov [rax + LINNEA_SQE_LEN], r13d
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
@@ -3190,6 +3200,7 @@ linnea_uring_arm_up_send_buf:
     mov ecx, [rbx + linnea_connection.up_fd]
     mov [rax + LINNEA_SQE_FD], ecx
     mov [rax + LINNEA_SQE_ADDR], r12
+    CLAMP_IO_LEN r13
     mov [rax + LINNEA_SQE_LEN], r13d
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
@@ -3220,6 +3231,7 @@ linnea_uring_arm_up_recv:
     mov ecx, [rbx + linnea_connection.up_fd]
     mov [rax + LINNEA_SQE_FD], ecx
     mov [rax + LINNEA_SQE_ADDR], r12
+    CLAMP_IO_LEN r13
     mov [rax + LINNEA_SQE_LEN], r13d
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
@@ -3432,7 +3444,8 @@ linnea_uring_arm_h2p_ops:
     mov [rax + LINNEA_SQE_ADDR], rcx
     mov rcx, [r12 + linnea_h2p.rq_wr]
     sub rcx, [r12 + linnea_h2p.rq_rd]
-    mov [rax + LINNEA_SQE_LEN], ecx
+    CLAMP_IO_LEN rcx                 ; a CAPTURED body is a mapping of up to
+    mov [rax + LINNEA_SQE_LEN], ecx  ; max_body, not the bounded upload FIFO
     mov edx, LINNEA_UD_H2UP_SEND
     jmp .ao_finish
 .ao_send_head:
