@@ -13,6 +13,7 @@ global linnea_h3_read_headers
 global linnea_h3_walk_feed
 global linnea_h3_walk_decode
 global linnea_h3_build_response
+global linnea_h3_build_canned
 global linnea_h3_build_431
 global linnea_h3_build_413
 global linnea_h3_build_500
@@ -41,6 +42,7 @@ extern linnea_log_acc_status
 extern linnea_log_acc_bytes
 extern linnea_qpack_decode
 extern linnea_qpack_encode_response
+extern linnea_qpack_reset_response
 extern linnea_qpack_send_validators
 extern linnea_qpack_crange_ptr
 extern linnea_qpack_location_ptr
@@ -708,7 +710,7 @@ linnea_h3_build_421:
     mov ecx, txt_plain_len
     lea r8, [body_421]
     mov r9d, body_421_len
-    jmp linnea_h3_build_response
+    jmp linnea_h3_build_canned
 
 ; linnea_h3_build_413(rdi=out) -> rax = length written.
 ; The whole response for a request body larger than max_body. The request never
@@ -721,7 +723,7 @@ linnea_h3_build_413:
     mov ecx, txt_plain_len
     lea r8, [body_413]
     mov r9d, body_413_len
-    jmp linnea_h3_build_response
+    jmp linnea_h3_build_canned
 
 ; linnea_h3_build_500(rdi=out) -> rax = length written.
 ; The whole response for a request we could not carry out through no fault of
@@ -736,7 +738,7 @@ linnea_h3_build_500:
     mov ecx, txt_plain_len
     lea r8, [body_500]
     mov r9d, body_500_len
-    jmp linnea_h3_build_response
+    jmp linnea_h3_build_canned
 
 ; linnea_h3_build_431(rdi=out) -> rax = length written.
 ; The whole response for a request whose header section we will not hold: the
@@ -749,12 +751,35 @@ linnea_h3_build_431:
     mov ecx, txt_plain_len
     lea r8, [body_431]
     mov r9d, body_431_len
-    jmp linnea_h3_build_response
+    jmp linnea_h3_build_canned
+
+; linnea_h3_build_canned(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
+;   r8=body_ptr, r9=body_len) -> rax = total length written.
+; linnea_h3_build_response for a response built OUTSIDE linnea_h3_serve: the
+; canned errors the reader answers before a request has routed (413/421/431/
+; 500), and the proxy's 502/503/504, which is built on an io_uring completion
+; long after the serve that parked its request returned. Only linnea_h3_serve
+; clears the encoder's per-response fields, so a response built out here
+; encodes with whatever the worker's most recent OTHER request left behind —
+; measured, not supposed: one static hit was enough to make the next 413 go
+; out with that file's content-encoding, etag, last-modified and
+; Cache-Control. A client honouring the encoding could not decode the error at
+; all, and the Cache-Control made a transient failure storable for a week.
+;
+; It is the same hazard the proxy's .fl_build already works around for the
+; shared log block; that fix restored the access line and left the field
+; section, so this is the rest of it. Reset first, then build.
+linnea_h3_build_canned:
+    call linnea_qpack_reset_response ; clobbers no register: the arguments
+                                     ; above stay live across it
+    ; fall through
 
 ; linnea_h3_build_response(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
 ;   r8=body_ptr, r9=body_len) -> rax = total length written.
 ; The head (HEADERS frame + DATA frame header) followed by the body bytes.
 ; The out buffer must hold the field section + body + framing.
+; Reached by fall-through from linnea_h3_build_canned above — keep them
+; adjacent, and do not put anything between them.
 linnea_h3_build_response:
     push r12
     push r13

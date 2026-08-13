@@ -24,6 +24,7 @@ default rel
 global linnea_qpack_decode
 global linnea_qpack_encode_response
 global linnea_qpack_encode_proxy
+global linnea_qpack_reset_response
 global linnea_qpack_send_validators
 global linnea_qpack_crange_ptr
 global linnea_qpack_crange_len
@@ -125,12 +126,12 @@ linnea_qpack_send_validators: resq 1
 ; by the h3 serve path
 linnea_qpack_crange_ptr: resq 1
 linnea_qpack_crange_len: resq 1
-; the vhost's configured Cache-Control value (0 = none); set per request by
-; the QUIC server before the serve, emitted only alongside the validators
 ; Location, for a redirect location. Set by the serve path, cleared with the
 ; other per-response fields; static table index 12 is "location".
 linnea_qpack_location_ptr: resq 1
 linnea_qpack_location_len: resq 1
+; the vhost's configured Cache-Control value (0 = none); set per request by
+; the QUIC server before the serve, emitted only alongside the validators
 linnea_qpack_ccontrol_ptr: resq 1
 linnea_qpack_ccontrol_len: resq 1
 ; the coding of the variant served (0 plain, 1 gzip, 2 br); set per response
@@ -397,6 +398,27 @@ qenc_status:
     mov rdx, 3
     call qenc_str
     add rsp, 24
+    ret
+
+; linnea_qpack_reset_response() — clobbers no register, so it can be called
+; with a builder's arguments already live in rdi/rsi/rdx/rcx/r8/r9.
+; The five fields below describe the ENTITY of one response: the variant's
+; coding, the validators of the file it came from, its content-range, a
+; redirect's target and the matched location's Cache-Control. They live in
+; .bss — per WORKER, not per connection or per request — so until something
+; clears them they describe whichever request this worker answered most
+; recently, on any connection it holds.
+;
+; linnea_h3_serve clears the first four at entry, which covers every response
+; it builds itself. A response built anywhere else has to clear them here, or
+; it inherits a stranger's. Cache-Control is in the list because the canned
+; errors are built before a request has routed, so no location owns it yet.
+linnea_qpack_reset_response:
+    mov qword [linnea_qpack_send_validators], 0
+    mov qword [linnea_qpack_crange_ptr], 0
+    mov qword [linnea_qpack_location_ptr], 0
+    mov qword [linnea_qpack_cenc], 0
+    mov qword [linnea_qpack_ccontrol_ptr], 0
     ret
 
 ; linnea_qpack_encode_response(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,

@@ -3385,6 +3385,42 @@ PYEOF
     kill $h3p_pid 2>/dev/null
     wait $h3p_pid 2>/dev/null
 
+    # A canned h3 error must describe ITSELF. The QPACK encoder reads
+    # content-encoding, the validators, content-range, location and
+    # cache-control out of .bss globals that only linnea_h3_serve clears — and
+    # they are per WORKER, so every connection it holds shares them. Responses
+    # built anywhere else inherited the last request's: the reader's
+    # 413/421/431/500, answered before a request has routed at all, and the
+    # proxy's 502/503/504, built on a completion long after the serve that
+    # parked it returned. One static hit was enough to make the next 413 go out
+    # as content-encoding: gzip over a plain-text body — undecodable to any
+    # client that honours it — with that file's etag and its location's
+    # Cache-Control, which made a transient failure storable for as long as the
+    # static content was. A separate fixture because it needs workers:1, an
+    # upstream timeout short enough to fire while a second request runs, and a
+    # location carrying a cache_control.
+    if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+        rm -f $RUNDIR/linnea-h3canned.log
+        start_server $CFG/tls-h3-canned.json
+        P61464=$SRV_PORT
+        h3cn_pid=$SRV_PID
+        # a pre-compressed variant to arm the encoding, beside a plain file so
+        # the negotiation is real rather than a .gz served to everyone
+        printf 'canned plain payload' > $WWW/canned.txt
+        python3 -c "
+import gzip, sys
+with gzip.open(sys.argv[1], 'wb') as f:
+    f.write(b'canned gzip payload')" "$WWW/canned.txt.gz"
+        out=$(timeout 90 python3 test/quic/h3_canned_fields_test.py ${P61464} 2>&1)
+        [ "$out" = "OK" ]
+        check "h3 canned errors carry no other request's field section ($out)" $?
+        rm -f $WWW/canned.txt $WWW/canned.txt.gz
+        kill $h3cn_pid 2>/dev/null
+        wait $h3cn_pid 2>/dev/null
+    else
+        check "h3 canned error field sections (skipped: aioquic unavailable)" 0
+    fi
+
     # A cancelled h3 request must let its upstream leg go rather than run it to
     # completion. Dropping the answer at delivery was always correct, but the
     # leg held a connection slot and an upstream socket for as long as the

@@ -48,7 +48,7 @@ if base + (HIGH - LOW) > 65535:
 # Fixtures that ask the KERNEL for their port. Single-server only: two servers
 # that both say 0 get two different ports, which is precisely what a shared
 # listener must not have. The port_file is how the harness learns the answer.
-PORT_ZERO = ['limits.json', 'spill-dir.json', 'tls-h2.json', 'tls-h3-big.json', 'tls-h3-bigcert.json', 'tls-h3-cancel.json', 'tls-h3-drain.json', 'tls-h3-fuzz.json', 'tls-h3-proxy.json', 'tls-h3-spillfail.json', 'tls-h3-v6.json', 'tls-h3.json', 'tls-slowbody.json', 'tls-slowhead.json', 'tls.json']
+PORT_ZERO = ['limits.json', 'spill-dir.json', 'tls-h2.json', 'tls-h3-big.json', 'tls-h3-bigcert.json', 'tls-h3-canned.json', 'tls-h3-cancel.json', 'tls-h3-drain.json', 'tls-h3-fuzz.json', 'tls-h3-proxy.json', 'tls-h3-spillfail.json', 'tls-h3-v6.json', 'tls-h3.json', 'tls-slowbody.json', 'tls-slowhead.json', 'tls.json']
 
 port_re = re.compile(r"\b(6[01][0-9]{3})\b")
 

@@ -65,6 +65,7 @@ extern linnea_qpack_hsts_len
 extern linnea_qpack_nosniff
 extern linnea_quic_varint_encode
 extern linnea_h3_build_response
+extern linnea_h3_build_canned
 ; the request body the serve path parked for us, and where the serve path looks
 ; for this module (it is installed as a hook, so the framing and response
 ; builders stay linkable without any of the upstream machinery)
@@ -1080,6 +1081,8 @@ linnea_h3_proxy_fail:
     ; linnea_h3_build_response writes the access line itself, from the shared
     ; log block — which by now describes whichever request was served most
     ; recently, not this one. Put this leg's own facts back first.
+    ; The encoder's per-response fields are stale for exactly the same reason,
+    ; and linnea_h3_build_canned below is what clears those.
     push rax
     push rcx
     mov rdi, rbx
@@ -1095,7 +1098,7 @@ linnea_h3_proxy_fail:
     mov r8, rax
     mov r9d, ecx
     mov ecx, txt_plain_len
-    call linnea_h3_build_response    ; rax = the whole response's length
+    call linnea_h3_build_canned      ; rax = the whole response's length
     cmp rax, LINNEA_H3_HEAD_MAX
     ja .fl_free                      ; unreachable: these bodies are fixed
     mov [linnea_h3d_hlen], rax
