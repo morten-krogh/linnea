@@ -134,3 +134,4 @@ LINNEA_IPV6_V6ONLY   equ 26
 LINNEA_SOCKADDR_IN_SIZE equ 16  ; struct sockaddr_in: family u16, port u16 (BE), addr u32 (BE), zero[8]
 LINNEA_SOCKADDR_IN6_SIZE equ 28 ; struct sockaddr_in6: family u16, port u16 (BE), flowinfo u32, addr[16], scope_id u32
 LINNEA_BACKLOG       equ 128
+LINNEA_ENOSPC   equ 28

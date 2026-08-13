@@ -70,6 +70,7 @@ endstruc
 %endif
 
 global linnea_quic_server_init
+global linnea_quic_cfin_echo
 global linnea_quic_add_vhost
 global linnea_quic_server_datagram
 global linnea_quic_server_rtx_sweep
@@ -289,6 +290,9 @@ cap_errno_end: db ")", 10
 cap_errno_end_len equ $ - cap_errno_end
 
 section .bss
+; 1 = print the CFIN-OK marker on a completed handshake. Only
+; bin/linnea-quichs sets it; the server leaves it 0.
+linnea_quic_cfin_echo: resq 1
 ; What went wrong the last time a body could not be captured, kept for the
 ; response path to log. The kTLS handoff keeps its errno the same way
 ; (linnea_ktls_fail_errno) and for the same reason: the failure and the only
@@ -1886,12 +1890,20 @@ linnea_quic_server_datagram:
     lea rsi, [onertt_pay]
     mov rdx, rcx                     ; total payload length
     call .send_1rtt
-    ; announce it
+    ; announce it — but only for the standalone handshake server
+    ; (bin/linnea-quichs), whose caller greps this marker off its stdout. The
+    ; write was unconditional, so the PRODUCTION server emitted "CFIN-OK" on
+    ; every handshake that issues a NewSessionTicket: measured at 4 lines from
+    ; one h3 test against bin/linnea, and the unit sets no StandardOutput, so
+    ; they land in the journal. A test's marker does not belong in a hot path.
+    cmp qword [linnea_quic_cfin_echo], 0
+    je .no_cfin_marker
     mov eax, LINNEA_SYS_WRITE
     mov edi, 1
     lea rsi, [cfin_marker]
     mov edx, cfin_marker_len
     syscall
+.no_cfin_marker:
     ; 0-RTT: now that the 1-RTT keys are up, serve any early request the client
     ; sent before the handshake completed. Its frames were buffered at CH time;
     ; replay them through the ordinary stream path (the response rides 1-RTT).

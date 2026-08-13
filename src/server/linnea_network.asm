@@ -230,18 +230,45 @@ linnea_network_write_port_file:
     cmp rax, -4095
     jae .wp_fail
     mov r13d, eax                           ; fd
+    lea rsi, [pf_buf]
+    mov r14, r12
+    sub r14, rsi                            ; bytes still to write
+    ; LOOP over it. write(2) returns a COUNT, and a caller that takes a short
+    ; write for a whole one truncates the file — which the rename below would
+    ; then publish as complete, defeating the one thing the rename is for. A
+    ; regular file writes short only on a full filesystem or a signal, so this
+    ; is for correctness rather than the common case, exactly as
+    ; linnea_spill_write's loop is.
+.wp_write:
+    test r14, r14
+    jz .wp_written
     mov eax, LINNEA_SYS_WRITE
     mov edi, r13d
-    lea rsi, [pf_buf]
-    mov rdx, r12
-    sub rdx, rsi                            ; bytes built
+    mov rdx, r14
     syscall
-    mov r14, rax                            ; keep the write result
+    cmp rax, -4095
+    jae .wp_wclose                          ; a real error: close, then fail
+    test rax, rax
+    jz .wp_wclose                           ; no progress: a full filesystem
+    add rsi, rax
+    sub r14, rax
+    jmp .wp_write
+.wp_written:
     mov eax, LINNEA_SYS_CLOSE
     mov edi, r13d
     syscall
-    cmp r14, -4095
-    jae .wp_fail
+    jmp .wp_renamed
+.wp_wclose:
+    mov r14, rax                            ; keep the errno (or 0 for no space)
+    mov eax, LINNEA_SYS_CLOSE
+    mov edi, r13d
+    syscall
+    mov rax, r14
+    test rax, rax
+    jnz .wp_fail
+    mov rax, -LINNEA_ENOSPC                 ; no progress: say so, not "errno 0"
+    jmp .wp_fail
+.wp_renamed:
     mov eax, LINNEA_SYS_RENAME
     lea rdi, [pf_tmp]
     lea rsi, [rbx + linnea_config.port_file]

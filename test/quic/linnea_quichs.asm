@@ -13,6 +13,7 @@
 
 global _start
 
+extern linnea_quic_cfin_echo
 extern linnea_quic_server_init
 extern linnea_quic_add_vhost
 extern linnea_quic_server_datagram
@@ -44,6 +45,7 @@ fake_srv:  resb linnea_config_server_size
 
 section .text
 _start:
+    mov qword [linnea_quic_cfin_echo], 1   ; this binary's caller greps CFIN-OK
     mov r14, [rsp]                   ; argc
     mov r15, [rsp + 16]              ; argv[1], if there is one
     ; frame the chain and decode the key, then hand them to the handler
