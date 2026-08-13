@@ -1224,8 +1224,16 @@ h2_build_request:
     ; table the same reference could instead resolve to the WRONG entry and be
     ; served as a request the client never sent, silently. So an unread block
     ; on a connection whose table holds anything ends the connection instead.
-    ; (In practice the table is always empty: we advertise HEADER_TABLE_SIZE 0
-    ; and a conforming encoder inserts nothing, so real clients keep the 431.)
+    ; This used to note that the table is "in practice always empty", because
+    ; we advertised HEADER_TABLE_SIZE 0 and a conforming encoder inserted
+    ; nothing. Advertising 4096 (Q153) inverted that: a browser populates the
+    ; table on its first request, so from then on a block too big to hold ends
+    ; the CONNECTION rather than answering 431 on the stream. That is still the
+    ; only safe answer — an unread block leaves our table behind the peer's —
+    ; but it is now the common case, not the unreachable one. Reaching it takes
+    ; a client that ignores the MAX_HEADER_LIST_SIZE we advertise: a block
+    ; within it always fits here, since list size counts 32 more per field than
+    ; the wire does.
     mov rdi, rbx
     call h2_dyn_for                  ; -> rax = this connection's table
     cmp qword [rax + linnea_hpack_dyn.count], 0

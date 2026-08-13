@@ -3,10 +3,14 @@
 ; Decodes one header block (already reassembled from HEADERS + CONTINUATION)
 ; into request pseudo-headers.
 ;
-; We advertise SETTINGS_HEADER_TABLE_SIZE = 0, so a conforming encoder stops
-; inserting once it has applied that setting — but it is entitled to use the
-; 4096-octet default until then, so the decoder keeps a REAL dynamic table and
-; is stateful across the header blocks of a connection. That state is the thing
+; We advertise SETTINGS_HEADER_TABLE_SIZE = 4096 (Q153), so the dynamic table
+; is load-bearing for real traffic rather than dead state a conforming peer
+; never touches — a browser's cookie and user-agent are identical on every
+; request of a page load, and indexed they cost one byte each. The decoder is
+; therefore stateful across the header blocks of a connection.
+; (This block used to say we advertised 0. Enabling the table is what made
+; hpack_dyn_get's copy-out reachable from real traffic, and with it the scratch
+; bound at .fault.) That state is the thing
 ; to protect: a block we start decoding must be walked to its end even when the
 ; request is doomed, or our table falls behind the peer's and a later block
 ; decodes against the wrong entries. See .fault.
@@ -65,6 +69,13 @@ lit_form:      resq 1
 ; block has been read to its end. A file-scope slot for the same reason
 ; lit_form is one: one decode runs at a time.
 dec_fault:     resq 1
+; The req's scratch cursor as it stood before the field now being decoded. A
+; field the walk goes on to REJECT keeps nothing — emit_field records its
+; pointers only after the bounds pass — so its scratch is reclaimed at .fault
+; and the next field reuses it. Without that, the walk-on-after-fault below
+; (which exists to keep the dynamic table in sync) left nothing bounding
+; scratch at all: see the comment there.
+dec_scratch:   resq 1
 
 section .text
 
@@ -83,6 +94,10 @@ linnea_hpack_decode:
 .next:
     cmp r12, r13
     jae .ok                         ; consumed the whole block
+    ; remember where this field's decoded bytes will start, so a field the
+    ; bounds reject can give its scratch back (see dec_scratch)
+    mov rax, [rbx + linnea_h2_req.scratch]
+    mov [dec_scratch], rax
     movzx eax, byte [r12]
     test al, 0x80
     jnz .indexed
@@ -254,6 +269,19 @@ linnea_hpack_decode:
     ; wrong entries. Walk the rest for its table side effects and report the
     ; first fault at the end, where RFC 9113 8.1.1 can fail just the stream
     ; because the field section did, in the end, decode.
+    ;
+    ; And give the field's scratch back. Walking on is what keeps the table in
+    ; sync, but it also meant the header-list bound stopped bounding scratch:
+    ; every field past the fault was still DECODED on the way by, and an
+    ; indexed reference to a dynamic entry is copied into scratch by
+    ; hpack_dyn_get -- one wire byte, up to 4064 of scratch. Eight of them, a
+    ; 76-byte block, exhausted a 16384-byte scratch sized only for Huffman
+    ; expansion, and the resulting .dg_bad came back as a COMPRESSION_ERROR:
+    ; the whole connection, where our own limit is a stream error and the same
+    ; over-limit block built from literals correctly got one. A rejected field
+    ; keeps nothing, so its bytes are free to reuse.
+    mov rax, [dec_scratch]
+    mov [rbx + linnea_h2_req.scratch], rax
     cmp qword [dec_fault], 0
     jne .next                        ; keep the first cause, not the last
     mov qword [dec_fault], -LINNEA_HPACK_ERR_LIMIT
@@ -1092,8 +1120,10 @@ hpack_dyn_insert:
     ; (our slots or the non-compacting arena ran out). The index spaces are now
     ; out of sync, so every later reference would resolve to the wrong entry —
     ; a decode error, not a silently-substituted header. Signal it: the caller
-    ; ends the connection (COMPRESSION_ERROR). A compliant peer never reaches
-    ; here because we advertise SETTINGS_HEADER_TABLE_SIZE = 0.
+    ; ends the connection (COMPRESSION_ERROR). A compliant peer still never
+    ; reaches here, but no longer because it inserts nothing — we advertise
+    ; 4096 now — rather because every entry costs at least 32 against that,
+    ; so 4096/32 = 128 live entries is exactly the slot count.
     lea rax, [r13 + r15]
     add rax, 32
     sub [rbx + linnea_hpack_dyn.size], rax   ; keep the accounting honest

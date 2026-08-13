@@ -235,6 +235,35 @@ report("a fat header indexed on the next request is served the same",
        f"the cookie costs {len(first) - len(later)} bytes fewer once indexed")
 c.close()
 
+# --- our own limit must cost a STREAM, not the connection -----------------
+# The decoder does not stop walking a block when the header-list bound faults:
+# walking on is what keeps our dynamic table level with the peer's. But every
+# field past the fault is still DECODED on the way by, and an indexed reference
+# to a dynamic entry is COPIED into the request scratch -- one wire byte in,
+# thousands of scratch bytes out. That made the header-list bound stop bounding
+# scratch, and exhausting it surfaced as a COMPRESSION_ERROR: the whole
+# connection, for hitting a limit of ours that is a stream error everywhere
+# else. Eight references and a 76-byte block were enough.
+#
+# The literal form of the same over-limit block is the control. It has always
+# been answered on the stream, so if it ever stops being, the failure is the
+# bound itself and not the scratch.
+c = Conn()
+over = PSEUDO + b"".join(lit(b"x-pad-%03d" % i, b"v" * 100) for i in range(60))
+r_lit = c.send(over)
+report("over the header-list bound with literals is a stream error (control)",
+       r_lit.startswith("RST"), f"{len(over)} B block -> {r_lit}")
+c.close()
+
+c = Conn()
+c.send(PSEUDO + lit_idx(b"x-big", b"x" * 4000))      # one near-table-sized entry
+tiny = PSEUDO + idx(62) * 8                          # eight one-byte references
+r_idx = c.send(tiny)
+report("...and so is the same bound reached through dynamic references",
+       r_idx.startswith("RST"),
+       f"{len(tiny)} B block -> {r_idx} (was GOAWAY err=9: the connection)")
+c.close()
+
 if fails:
     sys.exit(1)
 print("ok")
