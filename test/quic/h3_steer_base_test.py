@@ -14,6 +14,11 @@ import subprocess
 import sys
 import time
 
+# its own working directory, so the run gets its own "linnea-qdbg"
+RUNDIR = os.environ.get("LINNEA_TEST_RUNDIR", ".")
+
+import waitfor
+
 import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
@@ -30,7 +35,8 @@ lfd = ls.fileno()
 
 # an "old worker" pid that is safely signal-inert: our own unreaped zombie
 zomb = subprocess.Popen(["true"])
-time.sleep(0.2)
+while zomb.poll() is None:          # wait for it to BE a zombie, don't guess
+    time.sleep(0.01)
 
 # two fds that exist but are not bpf objects, standing in for the map+program
 pr, pw = os.pipe()
@@ -39,11 +45,14 @@ os.set_inheritable(pw, True)
 
 env = dict(os.environ)
 env["LINNEA_UPGRADE"] = f"{lfd};{zomb.pid};{pr}:{pw}:0"
-srv = subprocess.Popen(["bin/linnea", "--config", config],
+srv = subprocess.Popen([os.path.abspath("bin/linnea"), "--config",
+                        os.path.abspath(config)], cwd=RUNDIR,
                        pass_fds=[lfd, pr, pw], env=env,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-time.sleep(0.6)
-assert srv.poll() is None, "server did not survive the steering handoff"
+# Not a fixed sleep: wait until it actually SERVES. 0.6s was a guess tuned on
+# an idle machine, and it is the reason this test failed under a second suite.
+assert waitfor.server_ready(port, config=config, proc=srv), \
+    "server did not survive the steering handoff, or never began serving"
 
 cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
 cfg.verify_mode = ssl.CERT_NONE
@@ -51,7 +60,7 @@ cfg.server_name = "localhost"
 conn = QuicConnection(configuration=cfg)
 conn.connect(("127.0.0.1", port), now=0.0)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(3)
+s.settimeout(12)
 
 
 def flush(t):
@@ -86,7 +95,7 @@ try:
     conn.send_stream_data(0, vlq(1) + vlq(len(fields)) + fields, end_stream=True)
     flush(0.4)
     got, fin = 0, False
-    deadline = time.time() + 5
+    deadline = time.time() + 20
     while not fin and time.time() < deadline:
         try:
             r, _ = s.recvfrom(4096)

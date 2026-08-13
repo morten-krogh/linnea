@@ -5,6 +5,7 @@
 # the keys, transcript, connection IDs and packet numbers live per connection —
 # with shared state, B's handshake would clobber A's.
 # Usage: h3_conns_test.py <port>
+import os
 import socket
 import ssl
 import sys
@@ -13,6 +14,10 @@ import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
+
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
 
 
 def vlq(n):
@@ -124,8 +129,8 @@ b.close()
 
 assert ha.get(b":status") == b"200", ha
 assert ha.get(b"content-type") == b"text/plain; charset=utf-8", ha
-assert ba == open("test/www/hello.txt", "rb").read(), ba
+assert ba == open(os.path.join(WWW, "hello.txt"), "rb").read(), ba
 assert hb.get(b":status") == b"200", hb
 assert hb.get(b"content-type") == b"text/css; charset=utf-8", hb
-assert bb == open("test/www/style.css", "rb").read(), bb
+assert bb == open(os.path.join(WWW, "style.css"), "rb").read(), bb
 print("ok")

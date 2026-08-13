@@ -7,6 +7,7 @@
 # intact. Needs the real server (the io_uring loop's periodic timer drives the
 # retransmission; the blocking test driver has no timer).
 # Usage: h3_rtx_test.py <port>
+import os
 import socket
 import ssl
 import sys
@@ -16,6 +17,10 @@ import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
+
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
 
 
 def vlq(n):
@@ -128,5 +133,5 @@ dec = pylsqpack.Decoder(0, 0)
 _, headers = dec.feed_header(0, hdr)
 hd = dict(headers)
 assert hd.get(b":status") == b"200", hd
-assert body == open("test/www/hello.txt", "rb").read(), body
+assert body == open(os.path.join(WWW, "hello.txt"), "rb").read(), body
 print("ok")

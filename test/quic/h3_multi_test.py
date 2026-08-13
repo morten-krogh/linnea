@@ -5,6 +5,7 @@
 # and check linnea walks them all and answers each on the stream it arrived on,
 # with the correct file, MIME type and body.
 # Usage: h3_multi_test.py <port>
+import os
 import socket
 import ssl
 import sys
@@ -13,6 +14,10 @@ import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
+
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
 
 
 def vlq(n):
@@ -105,6 +110,6 @@ for sid, (path, ctype) in PATHS.items():
     hd = dict(headers)
     assert hd.get(b":status") == b"200", (sid, hd)
     assert hd.get(b"content-type") == ctype, (sid, hd)
-    assert body == open("test/www" + path, "rb").read(), (sid, path)
+    assert body == open(WWW + path, "rb").read(), (sid, path)
 
 print("ok")

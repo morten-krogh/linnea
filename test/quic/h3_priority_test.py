@@ -21,6 +21,10 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
 
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
+
 port = int(sys.argv[1])
 here = os.path.dirname(__file__)
 
@@ -29,7 +33,7 @@ for i in range(5):
     n = 300000 + i * 20000
     body = bytes((j * (97 + i) + (j >> 8) * 13 + i) & 0xFF for j in range(n))
     name = f"h3p{i}.bin"
-    with open(os.path.join(here, "..", "www", name), "wb") as f:
+    with open(os.path.join(WWW, name), "wb") as f:
         f.write(body)
     FILES.append((name.encode(), body))
 

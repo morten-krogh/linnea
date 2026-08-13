@@ -28,10 +28,14 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
 
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
+
 port = int(sys.argv[1])
 CYCLES = int(sys.argv[2]) if len(sys.argv) > 2 else 8
 BIG = b"/h3big.bin"
-big_path = os.path.join(os.path.dirname(__file__), "..", "www", "h3big.bin")
+big_path = os.path.join(WWW, "h3big.bin")
 if not os.path.exists(big_path):
     with open(big_path, "wb") as f:
         f.write(bytes((i * 131) & 0xFF for i in range(600000)))

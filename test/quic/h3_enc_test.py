@@ -18,9 +18,13 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
 
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
+
 port = int(sys.argv[1])
 
-www = os.path.join(os.path.dirname(__file__), "..", "www")
+www = WWW
 open(os.path.join(www, "enc.txt"), "w").write("plain payload")
 with gzip.open(os.path.join(www, "enc.txt.gz"), "wb") as f:
     f.write(b"gzip payload")

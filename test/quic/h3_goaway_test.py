@@ -58,7 +58,7 @@ cfg.server_name = "localhost"
 conn = QuicConnection(configuration=cfg)
 conn.connect(("127.0.0.1", port), now=0.0)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(3)
+s.settimeout(12)
 
 
 def flush(t):
@@ -119,7 +119,7 @@ def find_goaway(buf):
 
 
 goaway_id = find_goaway(ctrl)
-deadline = time.time() + 3
+deadline = time.time() + 12
 while goaway_id is None and time.time() < deadline:
     try:
         r, _ = s.recvfrom(4096)

@@ -16,7 +16,10 @@ import socket
 import sys
 import time
 
-HOST, PORT = "127.0.0.1", 61080
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
+HOST, PORT = "127.0.0.1", _p(61080)
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
@@ -35,8 +38,8 @@ def handshake(sock, path, extra=b""):
     """Send the upgrade request (plus optional early tunnel bytes) and
     read the response head. Returns (head, leftover, expected_accept)."""
     key = base64.b64encode(os.urandom(16))
-    sock.sendall(b"GET " + path + b" HTTP/1.1\r\n"
-                 b"Host: 127.0.0.1:61080\r\n"
+    host_line = b"Host: 127.0.0.1:%d\r\n" % _p(61080)
+    sock.sendall(b"GET " + path + b" HTTP/1.1\r\n" + host_line +
                  b"Connection: keep-alive, Upgrade\r\n"
                  b"Upgrade: websocket\r\n"
                  b"Sec-WebSocket-Key: " + key + b"\r\n"

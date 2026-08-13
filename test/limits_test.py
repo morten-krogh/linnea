@@ -19,12 +19,15 @@ import sys
 import threading
 import time
 
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
 port = int(sys.argv[1])
 HOST = "127.0.0.1"
 HEAD_TIMEOUT = 3
 MAX_PER_IP = 8
 MAX_UPSTREAM = 2
-BACKEND_PORT = 61471
+BACKEND_PORT = _p(61471)
 
 
 def get(sock, path="/hello.txt"):

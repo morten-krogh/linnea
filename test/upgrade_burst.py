@@ -30,6 +30,9 @@ import sys
 import threading
 import time
 
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
 REQ = b"GET /hello.txt HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n"
 WORKERS = 40
 DURATION = 2.5
@@ -85,7 +88,7 @@ def main():
         print("usage: upgrade_burst.py <master-pid> [port]", file=sys.stderr)
         return 2
     master = int(sys.argv[1])
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 61080
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else _p(61080)
 
     threads = [threading.Thread(target=hammer, args=(port,), daemon=True)
                for _ in range(WORKERS)]

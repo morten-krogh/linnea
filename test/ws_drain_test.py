@@ -2,7 +2,7 @@
 """A stop is immediate, whatever is open.
 
 This test owns its own server, because it stops it — the shared fixture on
-61080 is serving the rest of the suite.
+_p(61080) is serving the rest of the suite.
 
 SIGTERM means the unit is going down, and nothing open outlives that however
 politely we treat it, so a worker exits at once rather than draining. What
@@ -27,11 +27,24 @@ import sys
 import threading
 import time
 
-PORT = 61471                 # test/configs/ws-drain.json
-CONFIG = "test/configs/ws-drain.json"
+# its own working directory, so the run gets its own "linnea-qdbg"
+RUNDIR = os.environ.get("LINNEA_TEST_RUNDIR", ".")
+
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
+
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
+PORT = _p(61471)                 # test/configs/ws-drain.json
+CONFIG = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"),
+                      "configs", "ws-drain.json")
+# the generated config, not the template: the template still names the
+# base-61000 ports and the shared document root
 # NOT ws_*: the fixture routes the /ws prefix to the WebSocket
 # backend, and "/ws_big.bin" would match it
-BIG = "test/www/drain_big.bin"
+BIG = os.path.join(WWW, "drain_big.bin")
 BIG_SIZE = 6 << 20
 LIMIT = 1.5                  # under the fixture's own 2s idle timeout, so a
                              # pass cannot be the idle reaper doing the work
@@ -49,7 +62,8 @@ def wait_port_free():
 
 def start():
     wait_port_free()
-    p = subprocess.Popen(["./bin/linnea", "--config", CONFIG],
+    p = subprocess.Popen([os.path.abspath("bin/linnea"), "--config",
+                          os.path.abspath(CONFIG)], cwd=RUNDIR,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(60):
         try:

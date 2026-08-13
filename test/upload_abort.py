@@ -10,10 +10,13 @@ the backend holding a truncated POST it could not tell from a complete one.
 import socket
 import time
 
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
 DECLARED = 500000
 SENT = 200000                       # well past in_buf, well short of DECLARED
 
-s = socket.create_connection(("127.0.0.1", 61080), timeout=5)
+s = socket.create_connection(("127.0.0.1", _p(61080)), timeout=5)
 s.sendall(b"POST /api/abandoned HTTP/1.1\r\nHost: one.test\r\n"
           b"Content-Length: %d\r\n\r\n" % DECLARED)
 s.sendall(b"X" * SENT)

@@ -44,6 +44,8 @@ fake_srv:  resb linnea_config_server_size
 
 section .text
 _start:
+    mov r14, [rsp]                   ; argc
+    mov r15, [rsp + 16]              ; argv[1], if there is one
     ; frame the chain and decode the key, then hand them to the handler
     lea rdi, [cert_pem]
     mov esi, cert_pem_len
@@ -98,7 +100,13 @@ _start:
     js .fail
     mov r12d, eax
     mov word [sa], LINNEA_AF_INET
-    mov word [sa + 2], 0x3df0        ; port 61501
+    mov word [sa + 2], 0x3df0        ; the default: htons(61501)
+    cmp r14, 2
+    jb .port_set
+    mov rsi, r15
+    call parse_port
+    mov [sa + 2], ax
+    .port_set:
     mov dword [sa + 4], 0x0100007f   ; 127.0.0.1
     mov qword [sa + 8], 0
     mov eax, LINNEA_SYS_BIND
@@ -130,3 +138,22 @@ _start:
     mov edi, 1
     mov eax, LINNEA_SYS_EXIT
     syscall
+
+; parse_port(rsi = NUL-terminated decimal) -> ax = the port in NETWORK order.
+; A test server with a compiled-in port cannot be run twice at once, and the
+; suite's whole port scheme exists so two runs can. argv[1] overrides the
+; default; no argument keeps the number this file has always used.
+parse_port:
+    xor eax, eax
+.pp_digit:
+    movzx ecx, byte [rsi]
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .pp_done
+    imul eax, eax, 10
+    add eax, ecx
+    inc rsi
+    jmp .pp_digit
+.pp_done:
+    xchg al, ah                      ; host order -> network order
+    ret

@@ -22,6 +22,7 @@
 # exchange takes a few milliseconds, well under any PTO, so the client never
 # spuriously retransmits its Initial and the multi-round resume stays orderly.
 # Usage: h3_bigcert_test.py <port>
+import os
 import socket
 import ssl
 import sys
@@ -30,6 +31,10 @@ import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
+
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
 
 MTU_FLOOR = 1200                 # every QUIC endpoint must accept this; we stay under it
 
@@ -180,7 +185,7 @@ dec = pylsqpack.Decoder(0, 0)
 _, headers = dec.feed_header(0, hdr)
 headers = dict(headers)
 assert headers.get(b":status") == b"200", headers
-assert body == open("test/www/hello.txt", "rb").read(), body
+assert body == open(os.path.join(WWW, "hello.txt"), "rb").read(), body
 
 print(f"ok (burst {server_burst}B <= 3x{client_sent}, total {server_total}B in "
       f"{len(burst)}+ datagrams, all <= {MTU_FLOOR}B)")

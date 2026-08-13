@@ -18,14 +18,18 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
 
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
+
 port = int(sys.argv[1])
 
 # the served fixture: patterned, so a slice from the wrong offset breaks equality
 BIG = bytes((i * 131 + (i >> 8) * 17 + 7) & 0xFF for i in range(200000))
-with open(os.path.join(os.path.dirname(__file__), "..", "www", "h3range.bin"),
+with open(os.path.join(WWW, "h3range.bin"),
           "wb") as f:
     f.write(BIG)
-with open(os.path.join(os.path.dirname(__file__), "..", "www", "hello.txt"),
+with open(os.path.join(WWW, "hello.txt"),
           "rb") as f:
     HELLO = f.read()
 

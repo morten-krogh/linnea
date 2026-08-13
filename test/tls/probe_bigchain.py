@@ -27,6 +27,9 @@ import sys
 import tempfile
 import threading
 
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
 PROBE, LEAF, FILLER, KEY = sys.argv[1:5]
 bad = []
 
@@ -74,11 +77,11 @@ with tempfile.TemporaryDirectory() as d:
     size = os.path.getsize(chain)
 
     stop = threading.Event()
-    t = threading.Thread(target=serve_tls, args=(61467, chain, stop), daemon=True)
+    t = threading.Thread(target=serve_tls, args=(_p(61467), chain, stop), daemon=True)
     t.start()
     import time
     time.sleep(1.0)
-    rc = run(61467, "h1")
+    rc = run(_p(61467), "h1")
     stop.set()
 
     ok = rc == 2
@@ -105,11 +108,11 @@ with tempfile.TemporaryDirectory() as d:
             "    await serve('127.0.0.1',int(sys.argv[1]),configuration=c)\n"
             "    await asyncio.Future()\n"
             "asyncio.run(m())\n")
-        q = subprocess.Popen([sys.executable, srv, "61468", chain, KEY],
+        q = subprocess.Popen([sys.executable, srv, str(_p(61468)), chain, KEY],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(2.0)
         try:
-            rc = run(61468, "h3")
+            rc = run(_p(61468), "h3")
         finally:
             q.terminate()
             q.wait(timeout=10)

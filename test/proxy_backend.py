@@ -7,6 +7,7 @@ be tested against counted, chunked, close-delimited and truncated bodies.
 Routes match on the path suffix: linnea does not strip location prefixes,
 so the backend sees "/api/simple" and friends.
 """
+import os
 import base64
 import hashlib
 import socket
@@ -14,9 +15,13 @@ import sys
 import threading
 import time
 
-HOST, PORT = "127.0.0.1", 61100
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
+HOST, PORT = "127.0.0.1", _p(61100)
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-SEEN = "/tmp/linnea_backend_seen.log"   # every request that reached a backend
+SEEN = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "/tmp"),
+        "linnea_backend_seen.log")
 
 
 def read_request(conn):

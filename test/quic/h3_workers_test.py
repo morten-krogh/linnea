@@ -5,6 +5,7 @@
 # pool. Opening many connections from different source ports spreads them over
 # the workers; each must still get its own file back intact.
 # Usage: h3_workers_test.py <port> [count]
+import os
 import socket
 import ssl
 import sys
@@ -13,6 +14,10 @@ import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
+
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
 
 
 def vlq(n):
@@ -93,7 +98,7 @@ for j in range(count):
     path = FILES[j % len(FILES)]
     try:
         body = fetch(port, path)
-        want = open("test/www" + path, "rb").read()
+        want = open(WWW + path, "rb").read()
         if body != want:
             failures.append(f"connection {j} ({path}): body mismatch")
     except Exception as exc:                       # noqa: BLE001 - report and continue

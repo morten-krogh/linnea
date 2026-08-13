@@ -74,7 +74,7 @@ def pump(dur):
 
 
 pump(0.05)
-deadline = time.time() + 5
+deadline = time.time() + 20
 while not conn._handshake_confirmed and time.time() < deadline:
     pump(0.05)
 if not conn._handshake_confirmed:

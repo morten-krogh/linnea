@@ -15,6 +15,10 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
 
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
+
 
 def vlq(n):
     if n < 64:
@@ -98,8 +102,8 @@ port = int(sys.argv[1])
 # a 200 carries the validators, date and server
 hd, body = fetch(port, "/hello.txt")
 assert hd.get(b":status") == b"200", hd
-assert body == open("test/www/hello.txt", "rb").read(), body
-st = os.stat("test/www/hello.txt")
+assert body == open(os.path.join(WWW, "hello.txt"), "rb").read(), body
+st = os.stat(os.path.join(WWW, "hello.txt"))
 etag = hd.get(b"etag")
 assert etag == b'"%x-%x"' % (int(st.st_mtime), st.st_size), hd
 assert re.match(DATE_RE, hd.get(b"last-modified", b"")), hd
@@ -126,7 +130,7 @@ assert hd.get(b":status") == b"304", hd
 # a stale etag draws the full 200 again
 hd, body = fetch(port, "/hello.txt", [(b"if-none-match", b'"stale"')])
 assert hd.get(b":status") == b"200", hd
-assert body == open("test/www/hello.txt", "rb").read(), body
+assert body == open(os.path.join(WWW, "hello.txt"), "rb").read(), body
 
 # if-modified-since: current copy -> 304, older copy -> 200
 lastmod = fetch(port, "/hello.txt")[0][b"last-modified"]

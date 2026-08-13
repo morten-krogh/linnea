@@ -27,12 +27,16 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
 
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
+
 port = int(sys.argv[1])
 SEEDS = int(sys.argv[2]) if len(sys.argv) > 2 else 6
 NSTREAMS = int(sys.argv[3]) if len(sys.argv) > 3 else 6
 LOSS = (float(sys.argv[4]) if len(sys.argv) > 4 else 3.0) / 100.0
 here = os.path.dirname(os.path.abspath(__file__))
-DOCROOT = os.path.join(here, "..", "www")
+DOCROOT = WWW
 
 # distinct large fixtures so a reordered/swapped/duplicated chunk breaks equality.
 # Sized so many chunks stream per response (exercising loss recovery and the tail)

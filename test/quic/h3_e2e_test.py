@@ -4,6 +4,7 @@
 # document root with the right status, MIME type and body — plus a 404 for a
 # missing path. Each request uses a fresh connection (one request per stream).
 # Usage: h3_e2e_test.py <port>
+import os
 import socket
 import ssl
 import sys
@@ -12,6 +13,10 @@ import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
+
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
 
 
 def vlq(n):
@@ -93,20 +98,20 @@ port = int(sys.argv[1])
 hd, body = fetch(port, "/hello.txt")
 assert hd.get(b":status") == b"200", hd
 assert hd.get(b"content-type") == b"text/plain; charset=utf-8", hd
-assert body == open("test/www/hello.txt", "rb").read(), body
+assert body == open(os.path.join(WWW, "hello.txt"), "rb").read(), body
 assert hd.get(b"content-length") == str(len(body)).encode(), hd
 
 # a directory serves index.html, and the MIME comes from the resolved file
 hd, body = fetch(port, "/")
 assert hd.get(b":status") == b"200", hd
 assert hd.get(b"content-type") == b"text/html; charset=utf-8", hd
-assert body == open("test/www/index.html", "rb").read(), body
+assert body == open(os.path.join(WWW, "index.html"), "rb").read(), body
 
 # a stylesheet picks up text/css
 hd, body = fetch(port, "/style.css")
 assert hd.get(b":status") == b"200", hd
 assert hd.get(b"content-type") == b"text/css; charset=utf-8", hd
-assert body == open("test/www/style.css", "rb").read(), body
+assert body == open(os.path.join(WWW, "style.css"), "rb").read(), body
 
 # a missing path is a 404
 hd, body = fetch(port, "/nope.txt")

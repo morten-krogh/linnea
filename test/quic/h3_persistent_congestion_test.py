@@ -36,8 +36,17 @@ from aioquic.h3.events import DataReceived, HeadersReceived
 
 PORT, PATH, LOG = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 ADDR = ("127.0.0.1", PORT)
-TRIGGER = "linnea-qdbg"
-PAUSE = 1.0                     # >> 3x PTO (~78 ms)
+# in the run's own directory, which is the server's working directory now:
+# a shared trigger switched QUIC tracing on in a concurrent run's servers
+TRIGGER = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "."), "linnea-qdbg")
+# Must be MUCH longer than 3x the PTO, which is the RFC's threshold. 1.0 was
+# chosen against a PTO of ~78 ms measured on an idle machine, and that is the
+# trap: the PTO is derived from RTT samples, so anything else running inflates
+# it, and a second suite on this box pushed 3x PTO past a one-second pause --
+# the episode then measured under the threshold and nothing was declared. The
+# number wants headroom over a LOADED machine's PTO, not an idle one's; three
+# seconds is still a fraction of the 90s budget this check runs under.
+PAUSE = 3.0
 
 created = not os.path.exists(TRIGGER)
 if created:

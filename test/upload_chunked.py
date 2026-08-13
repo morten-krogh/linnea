@@ -17,14 +17,19 @@ Each mode prints OK or a reason. Modes:
           capture file is per REQUEST, not per connection, or the second
           upload appends to the first and is described by the wrong length
 """
+import os
 import hashlib
 import random
 import socket
 import sys
 import time
 
-PORT = 61080
-BACKEND_SEEN = "/tmp/linnea_backend_seen.log"
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
+PORT = _p(61080)
+BACKEND_SEEN = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "/tmp"),
+                "linnea_backend_seen.log")
 
 
 def body_of(n, seed):

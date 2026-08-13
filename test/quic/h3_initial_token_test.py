@@ -24,7 +24,7 @@ from aioquic.quic.events import StreamDataReceived
 
 port = int(sys.argv[1])
 HOST = "127.0.0.1"
-LOG = "test/linnea.log"
+LOG = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "linnea.log")
 
 
 def respawns():
@@ -155,8 +155,11 @@ assert b"hello" in body, body
 assert respawns() == before, (
     "a worker died handling the oversized Initial token: the header was copied "
     "past the buffer it belongs in")
-out = subprocess.run(["pgrep", "-c", "-f", "bin/linnea"], capture_output=True,
-                     text=True).stdout.strip()
+# scoped to this run's config dir: "bin/linnea" counts every linnea on the
+# box, including a suite running beside this one
+out = subprocess.run(["pgrep", "-c", "-f",
+                      os.environ.get("LINNEA_TEST_RUNDIR", "test") + "/configs"],
+                     capture_output=True, text=True).stdout.strip()
 assert out and int(out) > 0, "no linnea process left alive"
 
 print("ok (oversized Initial token refused; h3 still served)")

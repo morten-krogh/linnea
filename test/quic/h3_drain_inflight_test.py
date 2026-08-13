@@ -19,6 +19,10 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import ConnectionTerminated, StreamDataReceived
 
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
+
 
 def drain_workers(master):
     """Start a drain on the workers of `master`.
@@ -38,7 +42,7 @@ def drain_workers(master):
 
 port = int(sys.argv[1])
 master = int(sys.argv[2])
-big_path = os.path.join(os.path.dirname(__file__), "..", "www", "h3big.bin")
+big_path = os.path.join(WWW, "h3big.bin")
 if not os.path.exists(big_path):
     with open(big_path, "wb") as f:
         f.write(bytes((i * 131) & 0xFF for i in range(600000)))
@@ -104,7 +108,7 @@ def vlq(n):
 
 
 pump(0.05)
-deadline = time.time() + 5
+deadline = time.time() + 20
 while not conn._handshake_confirmed and time.time() < deadline:
     pump(0.05)
 assert conn._handshake_confirmed, "handshake not confirmed"
@@ -115,14 +119,14 @@ _, fields = enc.encode(0, [(b":method", b"GET"), (b":path", b"/h3big.bin"),
                            (b":scheme", b"https"), (b":authority", b"localhost")])
 conn.send_stream_data(0, vlq(1) + vlq(len(fields)) + fields, end_stream=True)
 
-deadline = time.time() + 5
+deadline = time.time() + 20
 while state["got"] == 0 and time.time() < deadline:
     pump(0.01)
 assert state["got"] > 0, "no response data before the drain"
 
 drain_workers(master)                # the drain lands mid-download
 
-deadline = time.time() + 20
+deadline = time.time() + 80
 while not state["fin"] and state["closed"] is None and time.time() < deadline:
     pump(0.05)
 assert state["fin"], (
@@ -133,7 +137,7 @@ assert state["got"] >= BIG_SIZE, f"short body: {state['got']} < {BIG_SIZE}"
 
 # and the goodbye must arrive: the drain closes the connection the moment
 # nothing is left in flight
-deadline = time.time() + 5
+deadline = time.time() + 20
 while state["closed"] is None and time.time() < deadline:
     pump(0.05)
 assert state["closed"] == 0x100, \

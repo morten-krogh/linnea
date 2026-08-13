@@ -81,3 +81,4 @@ linnea-qdbg
 # the .pyc rode into a commit behind `git add -A`.
 __pycache__/
 *.pyc
+test/run-*/

@@ -27,6 +27,10 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import ConnectionTerminated, StreamDataReceived
 
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
+
 PORT = int(sys.argv[1])
 ADDR = ("127.0.0.1", PORT)
 here = os.path.dirname(__file__)
@@ -36,7 +40,7 @@ for i in range(3):
     n = 300000 + i * 20000
     body = bytes((j * (89 + i) + (j >> 8) * 7 + i) & 0xFF for j in range(n))
     name = f"h3pu{i}.bin"
-    with open(os.path.join(here, "..", "www", name), "wb") as f:
+    with open(os.path.join(WWW, name), "wb") as f:
         f.write(body)
     FILES.append((name.encode(), body))
 BODIES = dict(FILES)
@@ -286,7 +290,7 @@ report("PRIORITY_UPDATE on a request stream is H3_FRAME_UNEXPECTED",
 
 for name, _ in FILES:
     try:
-        os.remove(os.path.join(here, "..", "www", name.decode()))
+        os.remove(os.path.join(WWW, name.decode()))
     except OSError:
         pass
 if fails:

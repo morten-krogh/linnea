@@ -21,6 +21,9 @@ genuinely slow one still has room, and a connection that fails says so.
 import socket
 import sys
 
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
 QUIET_S = 0.4        # no more bytes for this long: the peer has said its piece
 CEILING_S = 15.0     # ...but never hang the suite
 
@@ -37,7 +40,7 @@ def main():
         print("usage: raw_http.py <request> [port]", file=sys.stderr)
         return 2
     req = unescape(sys.argv[1])
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 61080
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else _p(61080)
 
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=CEILING_S)

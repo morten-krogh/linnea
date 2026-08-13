@@ -13,6 +13,7 @@
 # server sees the tail first and must buffer it, hold an incomplete prefix,
 # and only serve once the hole is filled.
 # Usage: h3_reorder_test.py <port>
+import os
 import random
 import socket
 import ssl
@@ -22,6 +23,10 @@ import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import StreamDataReceived
+
+WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
+# the run's own document root: a copy, so a run may generate into it and
+# delete from it without colliding with a suite running beside it
 
 ADDR = None
 
@@ -115,7 +120,7 @@ def fetch_reordered(port, path, filler, order):
 
 port = int(sys.argv[1])
 ADDR = ("127.0.0.1", port)
-want = open("test/www/hello.txt", "rb").read()
+want = open(os.path.join(WWW, "hello.txt"), "rb").read()
 
 # Header sizes chosen so the field section ends at a variety of offsets — the
 # bitmap is per bit, so a frame boundary that is not a multiple of 8 is exactly

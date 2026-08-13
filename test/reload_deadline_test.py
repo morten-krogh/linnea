@@ -25,8 +25,17 @@ import sys
 import threading
 import time
 
-PORT = 61473
-CONFIG = "test/configs/reload-deadline.json"
+# its own working directory, so the run gets its own "linnea-qdbg"
+RUNDIR = os.environ.get("LINNEA_TEST_RUNDIR", ".")
+
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
+PORT = _p(61473)
+CONFIG = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"),
+                      "configs", "reload-deadline.json")
+# the generated config, not the template: the template still names the
+# base-61000 ports and the shared document root
 DEADLINE = 3.0               # "drain_timeout" in the fixture below
 SLACK = 12.0                 # generous: a loaded box, plus the re-exec itself
 
@@ -54,7 +63,8 @@ def start():
     # hold one; retry rather than report that as a result.
     for _ in range(8):
         wait_port_free()
-        p = subprocess.Popen(["./bin/linnea", "--config", CONFIG],
+        p = subprocess.Popen([os.path.abspath("bin/linnea"), "--config",
+                              os.path.abspath(CONFIG)], cwd=RUNDIR,
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
         for _ in range(60):

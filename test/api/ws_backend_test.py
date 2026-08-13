@@ -5,7 +5,7 @@ This talks to the backend on loopback with no linnea in the middle, so a
 failure here is the backend's framing or handshake and nothing else. The
 proxy path is covered separately.
 
-Usage: ws_backend_test.py [port] [path]   (default 61701, /ws)
+Usage: ws_backend_test.py [port] [path]   (default _p(61701), /ws)
 
 Given linnea's port and a proxied location, it runs the identical battery
 through the proxy — so a check that passes directly and fails here is
@@ -19,7 +19,10 @@ import socket
 import struct
 import sys
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 61701
+_PB = int(__import__("os").environ.get("LINNEA_TEST_PORT_BASE", 61000))
+_p = lambda n: _PB + n - 61000   # the suite's port rule, one base per run
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else _p(61701)
 PATH = sys.argv[2].encode() if len(sys.argv) > 2 else b"/ws"
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
