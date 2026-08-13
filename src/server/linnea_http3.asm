@@ -97,7 +97,11 @@ body_500:      db "500 Internal Server Error", 10
 body_500_len   equ $ - body_500
 
 section .bss
-fs_buf:   resb 768                    ; encoded response field section
+; The encoded response field section. Sized by LINNEA_H3_FS_BUF for the worst
+; section the documented config can produce (a redirect's Location dominates),
+; and passed to the encoder as a hard limit — it was 768 with no limit at all,
+; which a long request target to a redirect location wrote straight past.
+fs_buf:   resb LINNEA_H3_FS_BUF
 clen_buf: resb 20                     ; content-length as decimal ASCII
 h3_path_buf: resb 4096                ; root ++ decoded path ++ NUL
 ; the Location value of a redirect: the configured target with the request's
@@ -649,7 +653,30 @@ linnea_h3_build_headers:
     xor edx, edx
     xor r8d, r8d
 .enc:
-    call linnea_qpack_encode_response ; rax = field-section length
+    lea r10, [fs_buf + LINNEA_H3_FS_BUF]
+    call linnea_qpack_encode_response ; rax = field-section length, or -1
+    test rax, rax
+    jns .encoded
+    ; It would not fit. Nothing here can be shortened selectively — the long
+    ; fields are the vhost's policy and a redirect's target — so drop every
+    ; optional one and state the failure instead. A bare 500 is a few dozen
+    ; bytes and cannot fail this second time.
+    ;
+    ; A backstop, not a path with a budget: fs_buf is sized for the largest
+    ; section any documented config can produce, so reaching here means that
+    ; sizing is wrong rather than that some request was too big. The access line
+    ; has already been written above, and it names the status this response was
+    ; going to have — one more reason this must stay unreachable.
+    call linnea_qpack_reset_response
+    lea rdi, [fs_buf]
+    mov esi, 500
+    xor edx, edx                     ; no content-type
+    xor ecx, ecx
+    xor r8d, r8d                     ; and no content-length
+    xor r9d, r9d
+    lea r10, [fs_buf + LINNEA_H3_FS_BUF]
+    call linnea_qpack_encode_response
+.encoded:
     mov rbp, rax                     ; field-section length
     ; HEADERS frame: type 0x01, length varint, field section
     mov byte [r14], LINNEA_H3_FRAME_HEADERS

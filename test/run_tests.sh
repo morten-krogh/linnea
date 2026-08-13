@@ -626,6 +626,22 @@ else
     check "qpack decode test (skipped: pylsqpack/binary unavailable)" 0
 fi
 
+# The response ENCODER's output bound. It assembled a field section into a
+# 768-byte buffer with no limit at all, while the proxy-relay encoder beside it
+# in the same file had carried one all along -- and a redirect's Location is the
+# configured target plus the CLIENT's request target, so a long path ran a
+# couple of thousand bytes past the end. Nothing observed it: the bytes landed
+# in a neighbouring buffer nothing read again. Only a canary can fail on that,
+# which is what this asserts, alongside a control that a section which FITS is
+# still produced (or the checks would pass on an encoder that wrote nothing).
+if [ -x ./bin/linnea-qpacktest ]; then
+    out=$(./bin/linnea-qpacktest encode 2>&1)
+    [ "${out%% *}" = "qpack-encode" ] && [ "${out##* }" = "6/6" ]
+    check "qpack: the response encoder refuses to write past its buffer ($out)" $?
+else
+    check "qpack encoder bound (skipped: binary unavailable)" 0
+fi
+
 # HTTP/3 request framing: linnea walks the request-stream frames, skips
 # DATA/unknown frames, and QPACK-decodes the HEADERS frame to the request.
 if python3 -c 'import pylsqpack' 2>/dev/null && [ -x ./bin/linnea-h3test ]; then
@@ -3420,6 +3436,47 @@ with gzip.open(sys.argv[1], 'wb') as f:
     else
         check "h3 canned error field sections (skipped: aioquic unavailable)" 0
     fi
+
+    # The response buffers must fit the LARGEST head the documented config can
+    # produce, not a typical one. hsts and cache_control are each up to 255
+    # bytes, which is 510 of the old 512-byte per-connection head buffer on
+    # their own — so a vhost setting both at their documented maxima could not
+    # serve ANY file over LINNEA_H3_INLINE_MAX over h3: the head failed the
+    # bound and the stream was RESET, with no status and no body, while h1 and
+    # h2 served the same file normally. Silent, and invisible to every other
+    # check here because they all use short header values.
+    rm -f $RUNDIR/linnea-h3maxhdr.log
+    start_server $CFG/tls-h3-maxhdr.json
+    P61465=$SRV_PORT
+    h3mx_pid=$SRV_PID
+    python3 -c "
+import sys
+open(sys.argv[1],'wb').write(bytes(range(256))*40)" "$WWW/maxhdr.bin"     # 10240 bytes
+    # the independent-client block below sets this too; both want it, and the
+    # assignment is idempotent
+    CURLH3=${LINNEA_CURL_H3:-$HOME/curl-h3/bin/curl}
+    if [ -x "$CURLH3" ] && "$CURLH3" -V 2>/dev/null | grep -q HTTP3; then
+        got=$("$CURLH3" --http3-only -s --max-time 20 --cacert $CA \
+              --resolve localhost:${P61465}:127.0.0.1 \
+              -o $RUNDIR/maxhdr.out -w '%{http_code}' \
+              https://localhost:${P61465}/maxhdr.bin)
+        [ "$got" = "200" ] && cmp -s $RUNDIR/maxhdr.out "$WWW/maxhdr.bin"
+        check "h3 serves a chunked response with max-length hsts+cache_control ($got)" $?
+        rm -f $RUNDIR/maxhdr.out
+    else
+        check "h3 max-length header response (skipped: no HTTP/3 curl)" 0
+    fi
+    # h2 is the control: it always could, so a failure above is h3's buffer
+    # and not the config being rejected somewhere earlier.
+    g2=$(curl -s --http2 --max-time 20 --cacert $CA \
+         --resolve localhost:${P61465}:127.0.0.1 \
+         -o $RUNDIR/maxhdr2.out -w '%{http_code}' \
+         https://localhost:${P61465}/maxhdr.bin)
+    [ "$g2" = "200" ] && cmp -s $RUNDIR/maxhdr2.out "$WWW/maxhdr.bin"
+    check "h2 serves the same max-length-header response ($g2)" $?
+    rm -f $RUNDIR/maxhdr2.out $WWW/maxhdr.bin
+    kill $h3mx_pid 2>/dev/null
+    wait $h3mx_pid 2>/dev/null
 
     # A cancelled h3 request must let its upstream leg go rather than run it to
     # completion. Dropping the answer at delivery was always correct, but the

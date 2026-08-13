@@ -1,0 +1,23 @@
+{
+  "log": "test/linnea-h3maxhdr.log",
+  "timeout": 5,
+  "workers": 1,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 61465,
+      "hostname": "localhost",
+      "cert": "test/tls/server.crt",
+      "key": "test/tls/server.key",
+      "hsts": "max-age=31536000; includeSubDomains; preload; xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "nosniff": 1,
+      "locations": [
+        {
+          "prefix": "/",
+          "root": "test/www",
+          "cache_control": "public, max-age=604800, immutable, yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+        }
+      ]
+    }
+  ]
+}

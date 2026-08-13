@@ -215,7 +215,17 @@ LINNEA_QUIC_EARLY_BUF   equ 1024
 ; therefore never refused for lack of a slot. Slots cost only fixed memory (they
 ; share one congestion window), not bandwidth.
 LINNEA_QUIC_TX_CHUNK    equ 1100    ; stream bytes per 1-RTT packet
-LINNEA_QUIC_TX_HDR      equ 512     ; HEADERS frame + DATA frame header prefix cap
+; HEADERS frame + DATA frame header prefix cap. Sized from the LARGEST head the
+; documented config can produce, not from a typical one: hsts and cache_control
+; are each up to 255 bytes (docs/config.md), which is 510 of the old 512 on
+; their own, so a vhost setting both at their documented maxima could not serve
+; any file over LINNEA_H3_INLINE_MAX at all — the head failed this check and the
+; stream was RESET, silently, while h1 and h2 served the same file. Worst case
+; now: 2 prefix + 5 status + 32 content-type + 22 content-length + 95
+; content-range + 3 accept-ranges/vary/content-encoding + 50 etag + 31
+; last-modified + 259 cache-control + 31 date + 8 server + 1 nosniff + 259 hsts
+; + 12 framing = 810.
+LINNEA_QUIC_TX_HDR      equ 1024
 LINNEA_QUIC_TXSTREAMS   equ 100     ; = advertised initial_max_streams_bidi
 LINNEA_QUIC_RST_SEEN    equ 32      ; cancelled stream ids remembered per connection
 ; Bidi-stream flow control (RFC 9000 4.6). We advertise this many streams up front,

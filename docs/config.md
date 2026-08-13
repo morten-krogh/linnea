@@ -174,8 +174,11 @@ and be told apart by `hostname` (SNI on TLS, the `Host` header on plaintext).
   *"servers sharing a listener must all set TLS or none"*. TLS and cleartext
   cannot share a socket.
 - HTTP/3 is offered automatically on a TLS listener whose servers can express
-  it. A server with a `redirect` location is kept off h3 (QPACK has no
-  `Location` header to emit) and keeps h1/h2.
+  it, including servers with a `redirect` location: those are served over h3
+  like any other, with `Location` emitted from QPACK's static table (RFC 9204
+  index 12). They used to be kept off h3 entirely on the premise that QPACK had
+  no `Location` to emit, which was never true; the cost was not the redirect
+  but that one such location took the whole vhost's QUIC listener with it.
 
 ---
 

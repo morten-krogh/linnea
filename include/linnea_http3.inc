@@ -149,11 +149,20 @@ LINNEA_H3_WALK_RESET equ linnea_h3_walk.fs
 ; frame and the DATA frame header — and the QUIC layer sends the body as
 ; STREAM-frame chunks straight from the mapping.
 LINNEA_H3_INLINE_MAX   equ 1024
-; Upper bound on that head (status, content-type, content-length, the
-; validators, date and server QPACK fields plus framing come to well under
-; this). Must not exceed the per-connection head buffer it is copied into
-; (LINNEA_QUIC_TX_HDR in linnea_quic_conn.inc).
-LINNEA_H3_HEAD_MAX     equ 512
+; Upper bound on that head. Must not exceed the per-connection head buffer it is
+; copied into (LINNEA_QUIC_TX_HDR in linnea_quic_conn.inc), which is where the
+; derivation lives. The old value enumerated "status, content-type,
+; content-length, the validators, date and server" and left out the two fields
+; that actually dominate — cache-control and hsts, 255 bytes each by the
+; documented config limits.
+LINNEA_H3_HEAD_MAX     equ 1024
+; The buffer linnea_qpack_encode_response assembles a field section in. Sized
+; for the worst section the documented config can produce, which is a redirect:
+; a 255-byte target plus a 2047-byte request target is a 2302-byte Location, and
+; the other fields add ~800 on top. The encoder is passed this as a hard limit
+; and refuses rather than running past it — h1 has always bounded its own head
+; this way ("the head is assembled unchecked into out_buf, so bound it first").
+LINNEA_H3_FS_BUF       equ 4096
 LINNEA_H3_PATH_ROOT equ LINNEA_MAX_ROOT + 1   ; room for the root in front of the path
 LINNEA_H3_HDRS_BUF equ 8192      ; proxy header rebuild for an h3 request
 

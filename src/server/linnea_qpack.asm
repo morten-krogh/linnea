@@ -421,8 +421,18 @@ linnea_qpack_reset_response:
     mov qword [linnea_qpack_ccontrol_ptr], 0
     ret
 
+; QROOM n — refuse the whole section unless n more bytes fit before the limit.
+; rbx is the cursor, [rsp + 16] the limit. Clobbers rax, so it goes before the
+; argument loads for the field it guards.
+%macro QROOM 1
+    lea rax, [rbx + %1]
+    cmp rax, [rsp + 16]
+    ja .too_long
+%endmacro
+
 ; linnea_qpack_encode_response(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
-;   r8=clen_ptr, r9=clen_len) -> rax = field-section length.
+;   r8=clen_ptr, r9=clen_len, r10=out limit) -> rax = field-section length,
+;   or -1 when the section would not fit under the limit.
 ; Encodes :status (indexed if a static value, else literal with name ref 24),
 ; content-type (name ref 44) and content-length (name ref 4) with literal
 ; values — either is skipped when its pointer is 0 (a 304 carries neither).
@@ -435,6 +445,14 @@ linnea_qpack_reset_response:
 ; is set — cache-control (name ref 36) follow. Every response ends with date
 ; (name ref 6) and server (name ref 92). No dynamic table — matches a
 ; zero-capacity decoder.
+;
+; Every variable-length value is checked against the limit before it is written.
+; It used to write whatever it was given into a 768-byte fs_buf with no bound at
+; all, while linnea_qpack_encode_proxy — the same file, the same job for a
+; relayed head — carried an out limit and honoured it. The redirect Location
+; made the difference reachable from the wire: a client's own request target is
+; appended to it, so a 2000-byte path produced a 2070-byte section and ~1300
+; bytes went past the end of the buffer.
 linnea_qpack_encode_response:
     push rbx
     push r12
@@ -442,15 +460,17 @@ linnea_qpack_encode_response:
     push r14
     push r15
     push rbp
-    sub rsp, 24                      ; [0]=out start, [8..11]=status digits
+    sub rsp, 24                      ; [0]=out start, [16]=out limit
     mov rbx, rdi                     ; out cursor
     mov [rsp], rdi                   ; out start
+    mov [rsp + 16], r10              ; the caller's buffer end
     mov r12d, esi                    ; status
     mov r13, rdx                     ; content-type ptr
     mov r14, rcx                     ; content-type len
     mov r15, r8                      ; content-length ptr
     mov rbp, r9                      ; content-length len
     ; field section prefix: Required Insert Count = 0, Delta Base = 0
+    QROOM 8                          ; the prefix and the longest :status
     mov word [rbx], 0x0000
     add rbx, 2
     ; --- :status ---
@@ -462,6 +482,7 @@ linnea_qpack_encode_response:
     ; --- content-type: literal with name reference (static index 44) ---
     test r13, r13
     jz .no_ct
+    QROOM r14 + 4
     mov rdi, rbx
     mov eax, 44
     mov cl, 4
@@ -473,8 +494,10 @@ linnea_qpack_encode_response:
     mov rbx, rdi
 .no_ct:
     ; --- content-length: literal with name reference (static index 4) ---
+
     test r15, r15
     jz .no_clen
+    QROOM rbp + 4
     mov rdi, rbx
     mov eax, 4
     mov cl, 4
@@ -489,6 +512,8 @@ linnea_qpack_encode_response:
     ; static table has no content-range entry, so the name is a literal. ---
     cmp qword [linnea_qpack_crange_ptr], 0
     je .no_crange
+    mov rax, [linnea_qpack_crange_len]
+    QROOM rax + 18
     mov rdi, rbx
     mov rax, crange_name_len         ; literal field line with literal name
     mov cl, 3                        ; (001 N H namelen(3)), name not Huffman
@@ -507,6 +532,7 @@ linnea_qpack_encode_response:
     ; the name is a literal: RFC 9204's static table has no allow entry. ---
     cmp r12d, 405
     jne .no_allow
+    QROOM 20
     mov rdi, rbx
     mov rax, allow_name_len          ; literal field line with literal name
     mov cl, 3                        ; (001 N H namelen(3)), name not Huffman
@@ -529,6 +555,8 @@ linnea_qpack_encode_response:
     ; declining to follow it.
     cmp qword [linnea_qpack_location_ptr], 0
     je .no_location
+    mov rax, [linnea_qpack_location_len]
+    QROOM rax + 6
     mov rdi, rbx
     mov eax, 12                      ; location: name reference (RFC 9204 A)
     mov cl, 4
@@ -543,7 +571,8 @@ linnea_qpack_encode_response:
     cmp qword [linnea_qpack_send_validators], 0
     je .vary_only                    ; no validators: an error response, but a
                                      ; 404 still has to carry Vary (see below)
-    cmp r12d, 304
+    QROOM 3                          ; accept-ranges, vary and content-encoding
+    cmp r12d, 304                    ; are one indexed byte each
     je .no_aranges                   ; a 304 restates no accept-ranges
     mov rdi, rbx
     mov al, 0xc0 | 32                ; accept-ranges: bytes — indexed, static
@@ -573,6 +602,8 @@ linnea_qpack_encode_response:
     inc rdi
     mov rbx, rdi
 .no_cenc:
+    mov rax, [linnea_static_etag_len]
+    QROOM rax + LINNEA_HTTP_DATE_LEN + 8
     mov rdi, rbx
     mov eax, 7                       ; etag: literal with name reference
     mov cl, 4
@@ -592,6 +623,8 @@ linnea_qpack_encode_response:
     ; --- cache-control, when the vhost's location configures one ---
     cmp qword [linnea_qpack_ccontrol_ptr], 0
     je .no_ccontrol
+    mov rax, [linnea_qpack_ccontrol_len]
+    QROOM rax + 6
     mov rdi, rbx
     mov eax, 36                      ; cache-control: name reference
     mov cl, 4
@@ -612,6 +645,7 @@ linnea_qpack_encode_response:
     ; entries for nothing.
     cmp r12d, 404
     jne .no_validators
+    QROOM 2
     mov rdi, rbx
     mov byte [rdi], 0xc0 | 59        ; vary: accept-encoding — indexed, static
     inc rdi
@@ -620,6 +654,7 @@ linnea_qpack_encode_response:
     ; --- the vhost's security headers, on every response ---
     cmp qword [linnea_qpack_nosniff], 0
     je .no_nosniff
+    QROOM 2
     mov rdi, rbx
     mov byte [rdi], 0xc0 | 61        ; x-content-type-options: nosniff —
     inc rdi                          ; name and value both in the table
@@ -627,6 +662,8 @@ linnea_qpack_encode_response:
 .no_nosniff:
     cmp qword [linnea_qpack_hsts_ptr], 0
     je .no_hsts
+    mov rax, [linnea_qpack_hsts_len]
+    QROOM rax + 6
     mov rdi, rbx
     mov eax, 56                      ; strict-transport-security: name ref
     mov cl, 4
@@ -638,6 +675,7 @@ linnea_qpack_encode_response:
     mov rbx, rdi
 .no_hsts:
     ; --- date and server, on every response ---
+    QROOM LINNEA_HTTP_DATE_LEN + qpack_srv_name_len + 8
     call linnea_time_http_now        ; rax = current IMF-fixdate text
     mov r13, rax
     mov rdi, rbx
@@ -659,6 +697,13 @@ linnea_qpack_encode_response:
     ; length = cursor - start
     mov rax, rbx
     sub rax, [rsp]
+    jmp .enc_ret
+.too_long:
+    ; The section does not fit the buffer it was given. Say so rather than write
+    ; past the end: the caller answers with something that does fit. Same
+    ; contract linnea_qpack_encode_proxy has had all along.
+    mov rax, -1
+.enc_ret:
     add rsp, 24
     pop rbp
     pop r15
