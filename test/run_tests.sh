@@ -3770,7 +3770,18 @@ rm -f $RUNDIR/upload3_echo.bin
     # streaming cannot rekey immediately -- switching the transmit key with a
     # send in flight would encrypt data under a key the peer is not expecting --
     # so it waits for the socket to go quiet. Both responses must still arrive.
-    ku_out=$({ printf 'GET /h3s11.bin HTTP/1.1\r\nHost: localhost\r\n\r\n'; \
+    # Its own fixture, generated here. This asked for /h3s11.bin, which NOTHING
+    # in the suite produces: h3_stress_test.py makes h3s0..h3s5 at 70000+i*12000,
+    # so index 11 would be 202000 bytes even if it existed. The 690000-byte file
+    # on disk was a fossil from an older version of that test, and this check had
+    # been passing on it — on a clean checkout it failed, which is how it was
+    # found. A test that borrows another's artefact is one refactor from silently
+    # asserting nothing.
+    python3 -c "
+import sys
+open(sys.argv[1], 'wb').write(bytes((i * 131 + (i >> 8) * 17) & 0xFF
+                                    for i in range(690000)))" "$WWW/kuflow.bin"
+    ku_out=$({ printf 'GET /kuflow.bin HTTP/1.1\r\nHost: localhost\r\n\r\n'; \
                sleep 0.03; echo K; sleep 3; ku_req; sleep 2; } | timeout 30 \
         openssl s_client -connect 127.0.0.1:${P61446} -alpn http/1.1 2>/dev/null \
         | grep -ac -e 'Content-Length: 690000' -e 'hello from linnea')
