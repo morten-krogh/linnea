@@ -3475,6 +3475,7 @@ h2_429_stream:
     lea rax, [body_429]
     mov [h2_err_body], rax
     mov qword [h2_err_bodylen], body_429_len
+    mov qword [h2_err_code], 429
     jmp h2_err_stream
 h2_431_stream:
     lea rax, [status_431_h2]
@@ -3482,6 +3483,7 @@ h2_431_stream:
     lea rax, [body_431]
     mov [h2_err_body], rax
     mov qword [h2_err_bodylen], body_431_len
+    mov qword [h2_err_code], 431
 h2_err_stream:
     push rbx
     push r12
@@ -3587,8 +3589,13 @@ h2_err_stream:
     xor ecx, ecx
     mov [linnea_log_acc_meth], rcx
     mov [linnea_log_acc_tgt], rcx
-    mov qword [linnea_log_acc_status], 431
-    mov qword [linnea_log_acc_bytes], body_431_len
+    ; the status the client actually received, not the one this builder was
+    ; written for: parameterising the wire response and leaving the ACCESS LINE
+    ; hardcoded logged 156 rate-limited requests as 431 on the live server
+    mov rax, [h2_err_code]
+    mov [linnea_log_acc_status], rax
+    mov rax, [h2_err_bodylen]
+    mov [linnea_log_acc_bytes], rax
     lea rcx, [proto_h2]
     mov [linnea_log_acc_proto], rcx
     mov qword [linnea_log_acc_proto_len], proto_h2_len
@@ -5533,6 +5540,7 @@ h2_goaway_code: resd 1                ; the code the GOAWAY below reports
 h2_err_conn:  resq 1                  ; the connection an inline error is answering
 h2_err_blen:  resq 1                  ; its body length after the flow-control check
 h2_err_status:  resq 1     ; which bodied stream error h2_err_stream is building
+h2_err_code:    resq 1     ; ...as a number, for the access line
 h2_err_body:    resq 1
 h2_err_bodylen: resq 1
 h2_numbuf:    resb 24

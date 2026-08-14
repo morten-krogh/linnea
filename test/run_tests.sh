@@ -2351,6 +2351,17 @@ if [ -x "$CURLH3" ] && "$CURLH3" -V 2>/dev/null | grep -q HTTP3; then
 else
     check "rate_limit meters h3 (skipped: no HTTP/3 curl)" 0
 fi
+# What the SERVER recorded, not what the client saw. The client's view cannot
+# tell 429 from 431, and it was 431 in the log on the first cut: the wire
+# response was parameterised and the access line left hardcoded. h3 was worse —
+# it wrote the access line from the SHARED log block, so a refusal carried the
+# previous request's method and target.
+rl_logged=$(grep -cE '"- - HTTP/[0-9.]+" 429 ' $RUNDIR/linnea-rl.log 2>/dev/null || true)
+rl_wrong=$(grep -cE ' (431|200) $' /dev/null 2>/dev/null || true)
+rl_mislabelled=$(grep -c ' 431 ' $RUNDIR/linnea-rl.log 2>/dev/null || true)
+[ "${rl_logged:-0}" -ge 2 ] && [ "${rl_mislabelled:-1}" = "0" ]
+check "rate_limit logs a refusal as 429, with no method or target ($rl_logged recorded, $rl_mislabelled mislabelled 431)" $?
+
 # ...and it recovers: a client that waits is served again rather than stuck
 sleep 1.3
 rl_again=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 --cacert $CA \

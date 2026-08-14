@@ -3333,7 +3333,23 @@ linnea_quic_server_datagram:
     test eax, eax
     jz .rl_ok
     ; refused: a canned 429 on this stream, framed like the other pre-routing
-    ; errors above it
+    ; errors above it.
+    ;
+    ; linnea_h3_build_response writes the access line itself, out of the SHARED
+    ; log block — which by now describes whichever request this worker answered
+    ; most recently, not this one. Put this refusal's own facts there first, as
+    ; .req_toolarge does for its 431: the peer is known, and method, target and
+    ; host print "-" because the request is turned away before it is routed.
+    CONNLEA rdi, peer
+    lea rsi, [acc_peer_buf]
+    call linnea_network_addr_format
+    mov [linnea_log_acc_peer_len], rax
+    lea rax, [acc_peer_buf]
+    mov [linnea_log_acc_peer], rax
+    xor eax, eax
+    mov [linnea_log_acc_meth], rax
+    mov [linnea_log_acc_tgt], rax
+    mov [linnea_log_acc_host], rax
     lea rdi, [strm_pay]
     CONNLEA rsi, rx_have
     call linnea_quic_build_ack       ; the ack must precede the STREAM frame
