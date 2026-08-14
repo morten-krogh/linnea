@@ -31,7 +31,16 @@ Group=linnea-svc
 # It reads and writes nothing outside its PrivateTmp, so it needs no working
 # directory in /home -- and with that gone, ProtectHome can be turned on below.
 WorkingDirectory=/
-ExecStart=/usr/local/bin/linnea-api 7700
+ExecStart=/usr/local/bin/linnea-api 7700 /var/lib/linnea-api
+# The upload scratch directory, passed as argv[2] above and created by the
+# StateDirectory below -- the two are one setting and must move together.
+# Explicit rather than left to the backend's /tmp default, because PrivateTmp
+# makes /tmp a private tmpfs and every upload would then be a RAM allocation of
+# its own size, up to 64 MiB. It was a hard-coded /home/linnea/spill until
+# 2026-08-14; when the service moved out of /home that directory was deleted,
+# temp_open failed, and the backend answered 400 to every upload saying nothing
+# about why -- reaching the browser as a 502, three layers from the cause.
+StateDirectory=linnea-api
 Restart=on-failure
 RestartSec=1
 TimeoutStopSec=10

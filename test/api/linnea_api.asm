@@ -20,7 +20,7 @@
 ; is why both socket deadlines are set: with no concurrency, one peer that says
 ; nothing is the whole service, and a blocking read has no other way back.
 ;
-; Usage: linnea-api [port]        (default 7700, bound to 127.0.0.1)
+; Usage: linnea-api [port] [scratch-dir]   (default 7700 on 127.0.0.1, /tmp)
 
 default rel
 
@@ -100,7 +100,23 @@ path_random_len equ $ - path_random
 ; shares it. The directory only supplies the filesystem: O_TMPFILE still makes
 ; no entry in it, so nothing is visible there and the close is still the
 ; delete. Same reasoning as linnea's own spill_dir (docs/config.md).
-tmp_dir:        db "/home/linnea/spill", 0
+;
+; The scratch directory is argv[2] now, NOT a constant. It used to be the
+; hard-coded /home/linnea/spill, shared with linnea's own capture dir and
+; checked by nothing. When the service moved out of /home on 2026-08-14 that
+; directory was deleted, temp_open began failing, and because its failure
+; funnelled into .fail400 the backend answered a bare "bad request" to EVERY
+; upload. h1 relayed that 400 honestly; h2 turned it into 502 and h3 into 500,
+; so the visible symptom sat three layers from the cause. A hard-coded path in a
+; component nobody thinks of as configured is what a layout change forgets.
+;
+; The unit passes its StateDirectory (/var/lib/linnea-api). This default exists
+; so the suite and an ad-hoc run work with no argument; prod must NOT rely on
+; it, because the unit sets PrivateTmp=true and /tmp is then a private tmpfs --
+; every upload becoming a RAM allocation of its own size, up to MAX_UPLOAD.
+default_tmp:    db "/tmp", 0
+body_500_dir:   db '{"error":"scratch directory unavailable"}'
+body_500_dir_len equ $ - body_500_dir
 
 ; Status lines and bodies are kept apart so that no Content-Length is ever
 ; written by hand: send_status counts the body. Three of these four were
@@ -173,6 +189,10 @@ ctx:            resb linnea_sha256_ctx_size
 digest:         resb LINNEA_SHA256_DIGEST
 hexsum:         resb 64
 
+section .data
+; Where uploads are captured. Set from argv[2], else default_tmp.
+tmp_dir_ptr:    dq 0
+
 section .text
 
 _start:
@@ -192,6 +212,16 @@ _start:
 .default_port:
     mov qword [port], DEFAULT_PORT
 .have_port:
+    ; argv[2] is an optional scratch directory. rsp still points at argc: every
+    ; call above balances, so [rsp] and [rsp+24] are argc and argv[2].
+    lea rax, [default_tmp]
+    mov [tmp_dir_ptr], rax
+    mov rax, [rsp]                 ; argc
+    cmp rax, 3
+    jb .have_dir
+    mov rax, [rsp + 24]            ; argv[2]
+    mov [tmp_dir_ptr], rax
+.have_dir:
     call setup_listener
     lea rdi, [msg_listen]
     mov esi, msg_listen_len
@@ -369,7 +399,7 @@ do_upload:
     ja .too_big
     call temp_open                 ; rax = fd
     test rax, rax
-    js .fail400
+    js .fail_dir
     mov r13, rax                   ; file fd
     lea rdi, [ctx]
     call linnea_sha256_init
@@ -488,6 +518,13 @@ do_upload:
     mov ecx, body_413_len
     call send_status
     jmp .out
+.fail_dir:
+    lea rdi, [st_500]
+    mov esi, st_500_len
+    lea rdx, [body_500_dir]
+    mov ecx, body_500_dir_len
+    call send_status
+    jmp .out
 .fail400:
     lea rdi, [st_400]
     mov esi, st_400_len
@@ -563,7 +600,7 @@ absorb:
 ; It is written because receiving an upload onto disk is what this endpoint
 ; exists to demonstrate.
 temp_open:
-    lea rdi, [tmp_dir]
+    mov rdi, [tmp_dir_ptr]
     mov esi, LINNEA_O_TMPFILE | LINNEA_O_WRONLY | LINNEA_O_CLOEXEC
     mov edx, LINNEA_MODE_0600
     mov eax, LINNEA_SYS_OPEN
