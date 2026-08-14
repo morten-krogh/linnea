@@ -97,12 +97,14 @@ every other global has a working default.
 
 | Key | Type | Default | Range | What it does |
 |---|---|---|---|---|
-| `log` | string | — **required** | ≤ 255 | Path to the access/error log. Its directory must exist; the file itself is created. |
+| `log` | string | — **required** | ≤ 255 | Path to the access log — and to everything else, unless `error_log` names a second file. Its directory must exist; the file itself is created. |
+| `error_log` | string | none | ≤ 255 | Path for the **diagnostics**: the connection lifecycle, handshake failures, capture faults — everything that is not a request record. Unset means one file for both, exactly as before this key existed. Reopened alongside `log` on SIGHUP, so a rotation does not leave diagnostics writing into a renamed inode. |
 | `servers` | array | — **required** | 1–16 | The virtual servers. At least one. |
-| `timeout` | integer | `5` | 1–3600 | Seconds an idle connection is held before closing. |
+| `timeout` | integer | `5` | 1–3600 | Seconds an idle **client** connection is held before closing. |
+| `proxy_timeout` | integer | the value of `timeout` | 1–3600 | Seconds an **upstream** exchange may go without progress before the request is failed with 504. Covers the connect, the request send and the response read. Unset means it follows `timeout`, which is what one knob did for both before this key existed — set it when the two want different numbers, which they usually do: a browser may idle for a minute between requests, while a backend that has not answered in five seconds is holding an upstream slot for nothing. |
 | `head_timeout` | integer | `10` | 1–3600 | Seconds a client has to finish sending a request head. Slow-loris bound. |
 | `drain_timeout` | integer | `30` | 1–3600 | Seconds a **reload's** old workers may take to finish what they hold before dropping it ([shutdown.md](shutdown.md)). A stop ignores this — it is immediate. Raise it if you serve long downloads and would rather a reload waited for them; lower it if you would rather old workers went quickly. |
-| `max_connections` | integer | `1024` | 1–65536 | Concurrent client connections, across all workers. |
+| `max_connections` | integer | `1024` | 1–65536 | Concurrent client connections **per worker** — each worker allocates a pool of this size, so the whole server's ceiling is this times `workers`. (It said "across all workers" until 2026-08-14; measured at 4 concurrent with `max_connections: 2` and `workers: 2`.) |
 | `max_per_ip` | integer | `64` | 1–65536 | Concurrent connections from one source address, so one host cannot take the pool. |
 | `max_upstream` | integer | `256` | 1–65536 | Concurrent connections to proxy backends. |
 | `max_body` | integer | `67108864` (64 MiB) | 1–18446744073709551615 | Largest request body accepted, on h1, h2 and h3 alike. A larger upload is refused with 413 before the bytes land. There is deliberately no ceiling below what a 64-bit count holds: this key is meant to BE the limit. |

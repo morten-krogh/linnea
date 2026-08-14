@@ -12,6 +12,9 @@ LINNEA_MAX_CONFIG_FILE  equ 1 << 20  ; sanity cap on config file size
 
 ; defaults for the optional top-level config keys
 LINNEA_DEFAULT_TIMEOUT          equ 5     ; idle timeout, seconds
+; 0 = follow `timeout`. Resolved at the end of parsing, so the default is
+; "whatever timeout is" and existing configs behave exactly as before.
+LINNEA_DEFAULT_PROXY_TIMEOUT    equ 0
 ; A connection may hold a slot only so long without completing a request head.
 ; The idle timeout alone cannot bound this: it is armed per operation and any
 ; progress rearms it, so a client dribbling one byte per timeout period holds a
@@ -98,6 +101,16 @@ endstruc
 struc linnea_config
     .server_count:  resq 1
     .timeout:       resq 1                        ; idle timeout, seconds
+    ; How long an UPSTREAM exchange may go without progress, separately from
+    ; the client idle timeout above. One knob governed both until now, so a
+    ; deployment could not say "clients may idle for a minute, but a backend
+    ; that has not answered in five seconds is wedged" — and the two want very
+    ; different numbers: prod holds client connections for 60s, which is 60s of
+    ; an upstream slot held by a backend that will never reply. 0 means "follow
+    ; timeout", which is exactly what every config did before the key existed;
+    ; it is resolved to the real value once, at the end of parsing, so nothing
+    ; downstream has to know about the sentinel.
+    .proxy_timeout: resq 1                        ; upstream deadline, seconds
     .max_connections: resq 1                      ; connection pool size, per worker
     .head_timeout:  resq 1                        ; seconds to complete a request head
     .drain_timeout: resq 1                        ; seconds a reload's drain may take
@@ -109,6 +122,13 @@ struc linnea_config
     .http2:         resq 1                        ; 1 = offer HTTP/2 via ALPN
     .log:           resb LINNEA_MAX_LOG + 1       ; NUL-terminated log file path
     .log_len:       resq 1
+    ; Where the diagnostics go, when they are to be kept apart from the request
+    ; record: the connection lifecycle, handshake failures, capture faults —
+    ; nginx's split, and the one that matters when something is wrong at three
+    ; in the morning and the access log is thousands of lines an hour. Unset
+    ; (len 0) means one file for both, exactly as before the key existed.
+    .error_log:     resb LINNEA_MAX_LOG + 1
+    .error_log_len: resq 1
     ; Where a request body is captured before it goes upstream — one O_TMPFILE
     ; per upload, on h1, h2 and h3 alike. It only supplies the FILESYSTEM;
     ; O_TMPFILE creates no directory entry. This is a config key rather than a

@@ -41,6 +41,8 @@ key_servers:            db "servers"
 key_servers_len         equ $ - key_servers
 key_log:                db "log"
 key_log_len             equ $ - key_log
+key_errlog:             db "error_log"
+key_errlog_len          equ $ - key_errlog
 key_spill:              db "spill_dir"
 key_spill_len           equ $ - key_spill
 key_portfile:           db "port_file"
@@ -53,6 +55,8 @@ default_spill:          db "/tmp"
 default_spill_len       equ $ - default_spill
 key_timeout:            db "timeout"
 key_timeout_len         equ $ - key_timeout
+key_proxytmo:           db "proxy_timeout"
+key_proxytmo_len        equ $ - key_proxytmo
 key_maxconn:            db "max_connections"
 key_maxconn_len         equ $ - key_maxconn
 key_headtmo:            db "head_timeout"
@@ -136,6 +140,8 @@ msg_timeout_range:      db "timeout must be between 1 and 3600"
 msg_timeout_range_len   equ $ - msg_timeout_range
 msg_maxconn_range:      db "max_connections must be between 1 and 65536"
 msg_maxconn_range_len   equ $ - msg_maxconn_range
+msg_proxytmo_range:     db "proxy_timeout must be between 1 and 3600"
+msg_proxytmo_range_len  equ $ - msg_proxytmo_range
 msg_headtmo_range:      db "head_timeout must be between 1 and 3600"
 msg_headtmo_range_len   equ $ - msg_headtmo_range
 msg_drain_range:        db "drain_timeout must be between 1 and 3600"
@@ -172,6 +178,8 @@ msg_prefix_long:        db "prefix too long"
 msg_prefix_long_len     equ $ - msg_prefix_long
 msg_proxy_long:         db "proxy address too long"
 msg_proxy_long_len      equ $ - msg_proxy_long
+msg_errlog_bad:         db "error_log must not be empty"
+msg_errlog_bad_len      equ $ - msg_errlog_bad
 msg_log_long:           db "log too long"
 msg_log_long_len        equ $ - msg_log_long
 msg_spill_bad:          db "spill_dir must be a non-empty path of at most 255 bytes"
@@ -210,7 +218,9 @@ linnea_config_parse:
     mov qword [linnea_parser_state + linnea_parser.pos], 0
     mov qword [rbx + linnea_config.server_count], 0
     mov qword [rbx + linnea_config.log_len], 0
+    mov qword [rbx + linnea_config.error_log_len], 0
     mov qword [rbx + linnea_config.timeout], LINNEA_DEFAULT_TIMEOUT
+    mov qword [rbx + linnea_config.proxy_timeout], LINNEA_DEFAULT_PROXY_TIMEOUT
     mov qword [rbx + linnea_config.max_connections], LINNEA_DEFAULT_MAX_CONNECTIONS
     mov qword [rbx + linnea_config.head_timeout], LINNEA_DEFAULT_HEAD_TIMEOUT
     mov qword [rbx + linnea_config.drain_timeout], LINNEA_DEFAULT_DRAIN_TIMEOUT
@@ -248,6 +258,13 @@ linnea_config_parse:
     jnz .top_servers
     mov rdi, r14
     mov rsi, r15
+    lea rdx, [key_errlog]
+    mov ecx, key_errlog_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_errlog
+    mov rdi, r14
+    mov rsi, r15
     lea rdx, [key_log]
     mov ecx, key_log_len
     call linnea_string_equal
@@ -274,6 +291,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_timeout
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_proxytmo]
+    mov ecx, key_proxytmo_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_proxytmo
     mov rdi, r14
     mov rsi, r15
     lea rdx, [key_maxconn]
@@ -383,6 +407,23 @@ linnea_config_parse:
     call linnea_string_copy
     jmp .top_sep
 
+.top_errlog:
+    test r13d, 16384
+    jnz .top_dup
+    or r13d, 16384
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_LOG
+    ja .log_long
+    test rdx, rdx
+    jz .errlog_bad                 ; an empty path names no file — and saying
+                                   ; "too long" about an empty string is the
+                                   ; cause-collapse this tree keeps finding
+    mov [rbx + linnea_config.error_log_len], rdx
+    lea rdi, [rbx + linnea_config.error_log]
+    mov rsi, rax
+    call linnea_string_copy
+    jmp .top_sep
+
 .top_spill:
     test r13d, 2048
     jnz .top_dup
@@ -439,6 +480,18 @@ linnea_config_parse:
     cmp rax, 65536
     ja .maxconn_range
     mov [rbx + linnea_config.max_connections], rax
+    jmp .top_sep
+
+.top_proxytmo:
+    test r13d, 8192
+    jnz .top_dup
+    or r13d, 8192
+    call linnea_parse_u64
+    test rax, rax
+    jz .proxytmo_range
+    cmp rax, 3600
+    ja .proxytmo_range
+    mov [rbx + linnea_config.proxy_timeout], rax
     jmp .top_sep
 
 .top_headtmo:
@@ -545,6 +598,15 @@ linnea_config_parse:
     and eax, 3                 ; log and servers are required
     cmp eax, 3
     jne .top_missing
+    ; "unset" means "follow timeout". Resolve it HERE rather than at each
+    ; consumer: a sentinel that survives into the running server is one more
+    ; thing every reader has to remember, and the startup line would print 0
+    ; for a deadline that is really 5.
+    cmp qword [rbx + linnea_config.proxy_timeout], 0
+    jne .top_ptmo_set
+    mov rax, [rbx + linnea_config.timeout]
+    mov [rbx + linnea_config.proxy_timeout], rax
+.top_ptmo_set:
     call linnea_parse_skip_ws
     mov rax, [linnea_parser_state + linnea_parser.pos]
     cmp rax, [linnea_parser_state + linnea_parser.size]
@@ -578,6 +640,14 @@ linnea_config_parse:
 .timeout_range:
     lea rdi, [msg_timeout_range]
     mov esi, msg_timeout_range_len
+    jmp linnea_parse_fail
+.errlog_bad:
+    lea rdi, [msg_errlog_bad]
+    mov esi, msg_errlog_bad_len
+    jmp linnea_parse_fail
+.proxytmo_range:
+    lea rdi, [msg_proxytmo_range]
+    mov esi, msg_proxytmo_range_len
     jmp linnea_parse_fail
 .headtmo_range:
     lea rdi, [msg_headtmo_range]

@@ -7,11 +7,13 @@ default rel
 %include "linnea_time.inc"
 
 global linnea_log_open
+global linnea_log_open_error
 global linnea_log_reopen
 global linnea_log_write
 global linnea_log_u64
 global linnea_log_stamp
 global linnea_log_access
+global linnea_log_access_begin
 global linnea_log_acc_host
 global linnea_log_acc_host_len
 global linnea_log_acc_peer
@@ -49,6 +51,17 @@ acc_nl:         db 10
 section .data
 
 linnea_log_fd:  dd LINNEA_STDOUT
+; The error stream, when the config names one. 0 means "not configured", and
+; then everything shares linnea_log_fd exactly as it always did — so a config
+; without error_log produces the identical single file, byte for byte.
+linnea_errlog_fd: dd 0
+; Which stream the line now being built belongs to. Access lines are the
+; request record; everything else — the connection lifecycle, the handshake
+; failures, the capture diagnostics — is the error stream, which is the split
+; nginx draws and the one worth having at three in the morning. Lines are
+; flushed on their trailing newline and the worker is single-threaded, so the
+; buffer is empty between lines and one flag is enough.
+line_sink:      dd 0          ; 0 = error stream, 1 = access stream
 
 LOG_LINE_CAP equ 2048
 
@@ -60,6 +73,7 @@ stamp_buf:      resb 24        ; "[YYYY-MM-DD HH:MM:SS] "
 line_buf:       resb LOG_LINE_CAP
 line_len:       resq 1
 log_path:       resq 1     ; the configured path, for reopening after a rotate
+errlog_path:    resq 1     ; ...and the error stream's, 0 when unset
 ; The access-line parameter block (see linnea_log_access): seven fields
 ; outgrow the argument registers, and the worker is single-threaded, so the
 ; caller fills these and calls. A zero text pointer prints as "-".
@@ -103,6 +117,28 @@ linnea_log_open:
     mov rdx, rbx
     jmp linnea_error_open      ; never returns
 
+; linnea_log_open_error(rdi = path) — open the error stream. Unset leaves the
+; fd at 0 and every line keeps going to the one file, which is what a config
+; written before this key gets.
+linnea_log_open_error:
+    push rbx
+    mov rbx, rdi
+    mov [errlog_path], rdi
+    mov eax, LINNEA_SYS_OPEN
+    mov esi, LINNEA_O_WRONLY | LINNEA_O_CREAT | LINNEA_O_APPEND | LINNEA_O_CLOEXEC
+    mov edx, LINNEA_MODE_0644
+    syscall
+    cmp rax, -4095
+    jae .efail
+    mov [linnea_errlog_fd], eax
+    pop rbx
+    ret
+.efail:
+    lea rdi, [msg_open]
+    mov esi, msg_open_len
+    mov rdx, rbx
+    jmp linnea_error_open      ; never returns
+
 ; linnea_log_reopen() — reopen the log file at its configured path, for
 ; SIGHUP after a rotation: without it every process keeps writing into the
 ; renamed (or deleted) inode, so the lines are lost and the disk is never
@@ -130,6 +166,27 @@ linnea_log_reopen:
 .lr_store:
     mov [linnea_log_fd], ebx
     mov qword [line_len], 0
+    ; ...and the error stream, when there is one. A rotation that reopened only
+    ; the access log would leave every diagnostic going into the renamed inode
+    ; — the exact failure this call exists to prevent, just moved to the other
+    ; file.
+    mov rdi, [errlog_path]
+    test rdi, rdi
+    jz .lr_ret
+    mov eax, LINNEA_SYS_OPEN
+    mov esi, LINNEA_O_WRONLY | LINNEA_O_CREAT | LINNEA_O_APPEND | LINNEA_O_CLOEXEC
+    mov edx, LINNEA_MODE_0644
+    syscall
+    cmp rax, -4095
+    jae .lr_ret                ; keep the old fd
+    mov ebx, eax
+    mov edi, [linnea_errlog_fd]
+    test edi, edi
+    jz .lr_estore
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+.lr_estore:
+    mov [linnea_errlog_fd], ebx
 .lr_ret:
     pop rbx
     ret
@@ -163,6 +220,8 @@ linnea_log_write:
     cmp byte [rbx + r12 - 1], 10
     jne .done
     call log_flush
+    mov dword [line_sink], 0   ; the record ended; the next one is diagnostics
+                               ; until a writer says otherwise
 .done:
     pop r12
     pop rbx
@@ -170,6 +229,13 @@ linnea_log_write:
 .direct:
     call log_flush
     mov edi, [linnea_log_fd]
+    cmp dword [line_sink], 1
+    je .dfd
+    mov eax, [linnea_errlog_fd]
+    test eax, eax
+    jz .dfd
+    mov edi, eax
+.dfd:
     mov rsi, rbx
     mov rdx, r12
     call linnea_print_fd
@@ -182,6 +248,13 @@ log_flush:
     jz .none
     mov qword [line_len], 0
     mov edi, [linnea_log_fd]
+    cmp dword [line_sink], 1
+    je .lf_have                ; an access line always goes to the access log
+    mov eax, [linnea_errlog_fd]
+    test eax, eax
+    jz .lf_have                ; no error_log configured: one file, as before
+    mov edi, eax
+.lf_have:
     lea rsi, [line_buf]
     jmp linnea_print_fd
 .none:
@@ -264,12 +337,21 @@ linnea_log_stamp:
 ; request line of their own, but the shape is what log tools expect).
 ; A zero host/peer/method/target pointer prints as "-" (a request that never
 ; parsed far enough to have one). Clobbers no callee-saved registers.
-linnea_log_access:
-    push rbx
+; linnea_log_access_begin() — open an access record: mark the stream, stamp it,
+; and write the "request " prefix every protocol's line starts with. Anything
+; that emits a request record calls this; h1 builds the rest of its line
+; itself, h2/h3 use linnea_log_access below, and both must land in the same
+; file. Clobbers caller-saved registers only.
+linnea_log_access_begin:
+    mov dword [line_sink], 1
     call linnea_log_stamp
     lea rdi, [acc_req]
     mov esi, acc_req_len
-    call linnea_log_write
+    jmp linnea_log_write
+
+linnea_log_access:
+    push rbx
+    call linnea_log_access_begin
     lea rbx, [linnea_log_acc_host]
     call .acc_field
     lea rdi, [acc_from]
@@ -304,7 +386,7 @@ linnea_log_access:
     call linnea_log_u64
     lea rdi, [acc_nl]
     mov esi, 1
-    call linnea_log_write
+    call linnea_log_write      ; the newline flushes it and clears the mark
     pop rbx
     ret
 .acc_field:                    ; rbx = ptr slot (its length follows); "-" if 0

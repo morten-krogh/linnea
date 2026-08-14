@@ -248,6 +248,12 @@ dbgktls_errno_len   equ $ - dbgktls_errno
 section .data
 
 idle_timeout:       dq LINNEA_DEFAULT_TIMEOUT, 0    ; struct __kernel_timespec
+; The same shape for the UPSTREAM half. A backend that stops making progress
+; is a different question from a client that has gone quiet, and they want
+; different answers: a browser may idle a minute between requests, while a
+; backend that has not answered in five seconds is holding an upstream slot
+; for nothing. Both were this one timespec until proxy_timeout existed.
+proxy_timeout_ts:   dq LINNEA_DEFAULT_TIMEOUT, 0    ; struct __kernel_timespec
 ; How long a lingering close waits between signs of life from the peer — a
 ; client consuming the response tail keeps sending WINDOW_UPDATEs, so only a
 ; vanished one goes this quiet. LINNEA_LINGER_TOTAL_NS bounds the linger as a
@@ -349,6 +355,8 @@ linnea_uring_run:
     mov [idle_timeout], rax
     imul rax, rax, 1000000000
     mov [idle_timeout_ns], rax
+    mov rax, [rbx + linnea_config.proxy_timeout]   ; already resolved: never 0
+    mov [proxy_timeout_ts], rax
     mov rax, [rbx + linnea_config.head_timeout]
     imul rax, rax, 1000000000
     mov [head_timeout_ns], rax
@@ -2615,6 +2623,18 @@ linnea_uring_get_sqe_zeroed:
 ; must have IOSQE_IO_LINK set. If the linked op makes no progress before
 ; the timeout it completes with -ECANCELED; the timeout's own cqe carries
 ; LINNEA_UD_TIMEOUT and is dropped at dispatch. Caller submits.
+; linnea_uring_arm_link_timeout_up(rdi = connection*) — the same, bounded by
+; proxy_timeout instead of the client idle timeout. Every op that talks to a
+; BACKEND arms through here: connect, the request send, the response recv.
+linnea_uring_arm_link_timeout_up:
+    push rbx
+    mov rbx, rdi
+    call linnea_uring_get_sqe_zeroed
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_LINK_TIMEOUT
+    mov dword [rax + LINNEA_SQE_FD], -1
+    lea rcx, [proxy_timeout_ts]
+    jmp linnea_uring_arm_link_timeout.lt_fill
+
 linnea_uring_arm_link_timeout:
     push rbx
     mov rbx, rdi
@@ -2622,6 +2642,7 @@ linnea_uring_arm_link_timeout:
     mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_LINK_TIMEOUT
     mov dword [rax + LINNEA_SQE_FD], -1
     lea rcx, [idle_timeout]
+.lt_fill:
     mov [rax + LINNEA_SQE_ADDR], rcx
     mov dword [rax + LINNEA_SQE_LEN], 1
     mov rcx, [rbx + linnea_connection.index]
@@ -3151,7 +3172,7 @@ linnea_uring_arm_connect:
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx               ; the timeout sqe must immediately follow
     pop rbx
-    jmp linnea_uring_arm_link_timeout
+    jmp linnea_uring_arm_link_timeout_up
 
 ; linnea_uring_arm_up_send(rdi=connection*)
 ; Queue a send of the unsent request bytes (out_ptr/out_rem) to the
@@ -3188,7 +3209,7 @@ linnea_uring_arm_up_send_buf:
     pop r13
     pop r12
     pop rbx
-    jmp linnea_uring_arm_link_timeout
+    jmp linnea_uring_arm_link_timeout_up
 
 ; linnea_uring_arm_up_recv(rdi=connection*, rsi=buffer, rdx=len)
 ; Queue a recv from the upstream with a linked idle timeout, so a silent
@@ -3219,7 +3240,7 @@ linnea_uring_arm_up_recv:
     pop r13
     pop r12
     pop rbx
-    jmp linnea_uring_arm_link_timeout
+    jmp linnea_uring_arm_link_timeout_up
 
 ; recv_fail_reason(r15d = the negative errno) -> r14 = reason, r15d = its
 ; length. Called where a read has failed and the connection is going.
@@ -3471,7 +3492,7 @@ linnea_uring_arm_h2p_ops:
     or rcx, rdx
     mov [rax + LINNEA_SQE_USER_DATA], rcx
     mov rdi, rbx                      ; the linked timeout must follow it
-    call linnea_uring_arm_link_timeout
+    call linnea_uring_arm_link_timeout_up
     jmp .ao_next
 
 

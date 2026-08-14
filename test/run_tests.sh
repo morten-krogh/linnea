@@ -35,6 +35,11 @@ CFG=$RUNDIR/configs
 # silently take its "skipped" branch against an unset name. See that section
 # for how to build one and why it is worth having.
 CURLH3=${LINNEA_CURL_H3:-$HOME/curl-h3/bin/curl}
+# The suite's CA, likewise defined once up here. It was set partway down, in
+# the TLS section, so a block added above that point named a variable that did
+# not exist yet -- `set -u` stops the run there, which is the good outcome;
+# without it the curl would simply have gone unverified.
+CA=test/tls/server.crt
 # test/www is a template now, like test/configs: a run copies it and is free to
 # generate into and delete from its own. 8 MB, so the copy costs nothing.
 WWW=$RUNDIR/www
@@ -47,6 +52,8 @@ P61000=$((PORTBASE + 0))
 P61080=$((PORTBASE + 80))
 P61090=$((PORTBASE + 90))
 P61100=$((PORTBASE + 100))
+P61466=$((PORTBASE + 466))
+P61467=$((PORTBASE + 467))
 P61443=$((PORTBASE + 443))
 P61444=$((PORTBASE + 444))
 P61446=$((PORTBASE + 446))
@@ -2255,6 +2262,62 @@ check_http "proxy huge head 502" "502 Bad Gateway" "$resp"
 # both would let a compromised backend split the next keep-alive response
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/api/tecl)
 check_http "proxy TE+CL 502"     "502 Bad Gateway" "$resp"
+
+# The upstream deadline is its own key. One `timeout` governed both halves, so
+# a deployment could not hold a client connection open longer than it was
+# willing to wait for a backend -- or the reverse, which is the common one.
+# This fixture is the case that could not be expressed: timeout 2, backend
+# deadline 10, against /api/slow, which sleeps 4s. Before proxy_timeout the
+# client idle timeout cut it at 2s and the answer was a 504.
+start_server $CFG/proxy-timeout.json
+ptmo_pid=$SRV_PID
+ptmo=$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' \
+       http://127.0.0.1:${P61466}/api/slow)
+[ "$ptmo" = "200" ]
+check "proxy_timeout outlives a shorter client timeout ($ptmo, backend sleeps 4s)" $?
+# ...and the ordinary path through the same server still answers, so the check
+# above cannot pass on a build that simply stopped timing anything out.
+ptmo2=$(curl -s --max-time 10 http://127.0.0.1:${P61466}/api/simple)
+[ "$ptmo2" = "backend body" ]
+check "proxy_timeout fixture serves an ordinary proxied request ($ptmo2)" $?
+kill $ptmo_pid 2>/dev/null
+wait $ptmo_pid 2>/dev/null
+
+# error_log splits the diagnostics from the request record. One file held both,
+# so the stream you want when something is wrong was interleaved with thousands
+# of access lines an hour. The split is nginx's: access_log is the requests,
+# error_log is everything else.
+rm -f $RUNDIR/linnea-split-acc.log $RUNDIR/linnea-split-err.log
+start_server $CFG/error-log.json
+elog_pid=$SRV_PID
+# BOTH protocols this fixture speaks. h1 and h2 write their access records
+# through different code, and marking only one of them is exactly how this
+# shipped broken the first time: the manual check used h2, so h1's own writer
+# went unnoticed until the suite ran.
+curl -s -o /dev/null --max-time 5 --http1.1 https://localhost:${P61467}/hello.txt --cacert $CA --resolve localhost:${P61467}:127.0.0.1
+curl -s -o /dev/null --max-time 5 --http2  https://localhost:${P61467}/nope     --cacert $CA --resolve localhost:${P61467}:127.0.0.1
+sleep 0.3
+# the access log holds the request records and NOTHING else
+# `grep -c` PRINTS 0 and EXITS 1 when nothing matches, so "|| echo 0" appends a
+# second zero and the variable becomes "0\n0" -- which fails every comparison
+# and truncates the label. "|| true" keeps grep's own count.
+#
+# And the property, not the count: start_server makes its own readiness request,
+# so how many records land here is the harness's business. What must hold is
+# that the access log contains request records and NOTHING else, from both
+# protocols.
+acc_req=$(grep -c "request localhost" $RUNDIR/linnea-split-acc.log 2>/dev/null || true)
+acc_other=$(grep -vc "request localhost" $RUNDIR/linnea-split-acc.log 2>/dev/null || true)
+acc_protos=$(grep -oE "HTTP/[0-9.]+" $RUNDIR/linnea-split-acc.log 2>/dev/null | sort -u | tr '\n' ' ')
+[ "${acc_req:-0}" -ge 2 ] && [ "${acc_other:-1}" = "0" ] && [ "$acc_protos" = "HTTP/1.1 HTTP/2 " ]
+check "error_log: the access log holds only request records, from both protocols ($acc_req req, $acc_other other: $acc_protos)" $?
+# ...and the diagnostics went to the other file, with no request lines in it
+err_life=$(grep -c "accepted connection" $RUNDIR/linnea-split-err.log 2>/dev/null || true)
+err_req=$(grep -c "request localhost" $RUNDIR/linnea-split-err.log 2>/dev/null || true)
+[ "${err_life:-0}" -ge 2 ] && [ "${err_req:-1}" = "0" ]
+check "error_log: the diagnostics went to the other file ($err_life lifecycle, $err_req req)" $?
+kill $elog_pid 2>/dev/null
+wait $elog_pid 2>/dev/null
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/api/cljunk)
 check_http "proxy bad CL 502"    "502 Bad Gateway" "$resp"
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/api/clpad)

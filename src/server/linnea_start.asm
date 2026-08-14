@@ -53,6 +53,7 @@ extern linnea_config_dump
 extern linnea_config_instance
 extern linnea_tls_setup
 extern linnea_log_open
+extern linnea_log_open_error
 extern linnea_log_reopen
 extern linnea_log_stamp
 extern linnea_log_write
@@ -234,6 +235,14 @@ _start:
     call ensure_fd_limit       ; the pool is only real if we have the fds for it
     lea rdi, [linnea_config_instance + linnea_config.log]
     call linnea_log_open
+    ; ...and the error stream beside it, when the config names one. Opened
+    ; here so a bad path fails at startup like the access log's does, rather
+    ; than the first time something goes wrong and wants reporting.
+    cmp qword [linnea_config_instance + linnea_config.error_log_len], 0
+    je .no_errlog
+    lea rdi, [linnea_config_instance + linnea_config.error_log]
+    call linnea_log_open_error
+.no_errlog:
     lea rdi, [linnea_config_instance]
     call linnea_config_dump
     lea rdi, [linnea_config_instance]     ; CPUID gate + cert/key loading

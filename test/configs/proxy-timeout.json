@@ -1,0 +1,17 @@
+{
+  "log": "test/linnea-ptmo.log",
+  "timeout": 2,
+  "proxy_timeout": 10,
+  "workers": 1,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 61466,
+      "hostname": "localhost",
+      "locations": [
+        { "prefix": "/api", "proxy": "127.0.0.1:61100" },
+        { "prefix": "/", "root": "test/www" }
+      ]
+    }
+  ]
+}

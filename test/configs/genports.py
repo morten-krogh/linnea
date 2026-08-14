@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Write the suite's configs into test/configs/run/ with their ports rebased.
 
+NB: every config key naming a path a server READS or WRITES has to appear in
+the rewrites at the bottom, or a fixture using it keeps a repo-relative path
+while the server runs with the run directory as its CWD. error_log joined that
+list the day it was added, after the suite stopped with "cannot open log file"
+-- loudly, which is the only reason it took a minute rather than an afternoon.
+
 Every port the suite binds lives in 61000..61999, and each is rewritten to
 LINNEA_TEST_PORT_BASE + (port - 61000). One base per run means two suites can
 run at once without fighting over a single number — which fixed ports cannot
@@ -80,6 +86,7 @@ for name in sorted(os.listdir(srcdir)):
     if rundir:
         # what the server writes or serves moves into the run's own directory
         out = re.sub(r'("log": ")test/([^"]*)"', r'\1%s/\2"' % rundir, out)
+        out = re.sub(r'("error_log": ")test/([^"]*)"', r'\1%s/\2"' % rundir, out)
         out = re.sub(r'("port_file": ")test/([^"]*)"', r'\1%s/\2"' % rundir, out)
         out = re.sub(r'("root": ")test/www', r'\1%s/www' % rundir, out)
         # Every path a server reads or writes becomes ABSOLUTE, because the
@@ -92,7 +99,7 @@ for name in sorted(os.listdir(srcdir)):
         # which is extra work and log I/O on every packet, and removing it
         # again pulled the trace out from under a concurrent test. Measured: 0
         # qdbg lines before a neighbouring run touched the file, 4 after.
-    out = re.sub(r'("(?:log|root|cert|key|spill_dir|port_file)": ")(test/)',
+    out = re.sub(r'("(?:log|error_log|root|cert|key|spill_dir|port_file)": ")(test/)',
                  r'\1%s/\2' % REPO, out)
     open(dst, "w", errors="surrogateescape").write(out)
     n += 1

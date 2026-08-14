@@ -156,6 +156,26 @@ test(base(max_body=18446744073709551616), "max_body past 64 bits rejected", Fals
 
 test(base(timeout=3601), "timeout above 3600 rejected", False)
 test(base(timeout=3600), "timeout at 3600 accepted", True)
+# error_log: the diagnostics stream. Unset is the interesting claim -- one file
+# for both, which is what every config written before the key relies on.
+test(base(error_log=os.path.join(D, "e.log")), "error_log accepted", True)
+test(base(error_log=""), "empty error_log rejected", False,
+     "error_log must not be empty")
+test(srv(error_log=os.path.join(D, "e.log")), "error_log on a SERVER is unknown",
+     False, "unknown key")
+
+# proxy_timeout: the upstream deadline, separate from the client idle timeout.
+# The default claim is the interesting one -- "whatever timeout is" -- because
+# it is what keeps every config written before the key behaving identically.
+test(base(proxy_timeout=3601), "proxy_timeout above 3600 rejected", False,
+     "proxy_timeout must be between 1 and 3600")
+test(base(proxy_timeout=0), "proxy_timeout:0 rejected (unset is how you follow timeout)",
+     False, "proxy_timeout must be between 1 and 3600")
+test(base(proxy_timeout=1), "proxy_timeout at 1 accepted", True)
+test(base(proxy_timeout=3600), "proxy_timeout at 3600 accepted", True)
+test(srv(proxy_timeout=5), "proxy_timeout on a SERVER is unknown", False,
+     "unknown key")
+
 test(base(drain_timeout=3601), "drain_timeout above 3600 rejected", False,
      "drain_timeout must be between 1 and 3600")
 test(base(drain_timeout=0), "drain_timeout:0 rejected (no way to disable it)",

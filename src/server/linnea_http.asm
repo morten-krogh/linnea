@@ -116,6 +116,7 @@ extern linnea_http_range_parse
 extern linnea_log_write
 extern linnea_log_u64
 extern linnea_log_stamp
+extern linnea_log_access_begin
 
 extern linnea_upstream_count
 extern linnea_upstream_open
@@ -2748,10 +2749,7 @@ linnea_http_handle:
 
 ; access log: 'request <hostname> "<METHOD> <TARGET>" <status> <bytes>'
 .log_request:
-    call linnea_log_stamp
-    lea rdi, [log_req]
-    mov esi, log_req_len
-    call linnea_log_write
+    call linnea_log_access_begin   ; marks the stream AND writes "request "
     mov rax, [rsp + 120]
     lea rdi, [rax + linnea_config_server.hostname]
     mov rsi, [rax + linnea_config_server.hostname_len]
@@ -3174,10 +3172,7 @@ linnea_http_log_conn:
     sub r15, r13
     mov [rsp + 24], r15        ; target len
     add r13, r14               ; target ptr
-    call linnea_log_stamp
-    lea rdi, [log_req]
-    mov esi, log_req_len
-    call linnea_log_write
+    call linnea_log_access_begin   ; marks the stream AND writes "request "
     mov rax, [rbx + linnea_connection.vhost]
     lea rdi, [rax + linnea_config_server.hostname]
     mov rsi, [rax + linnea_config_server.hostname_len]

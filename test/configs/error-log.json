@@ -1,0 +1,21 @@
+{
+  "log": "test/linnea-split-acc.log",
+  "error_log": "test/linnea-split-err.log",
+  "timeout": 5,
+  "workers": 1,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 61467,
+      "hostname": "localhost",
+      "locations": [
+        {
+          "prefix": "/",
+          "root": "test/www"
+        }
+      ],
+      "cert": "test/tls/server.crt",
+      "key": "test/tls/server.key"
+    }
+  ]
+}

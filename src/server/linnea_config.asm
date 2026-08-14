@@ -41,6 +41,8 @@ warn_spill_tmpfs:       db " (tmpfs: uploads are held in RAM, not written back)"
 warn_spill_tmpfs_len    equ $ - warn_spill_tmpfs
 dump_headtmo:           db " head_timeout="
 dump_headtmo_len        equ $ - dump_headtmo
+dump_proxytmo:          db " proxy_timeout="
+dump_proxytmo_len       equ $ - dump_proxytmo
 dump_drain:             db " drain_timeout="
 dump_drain_len          equ $ - dump_drain
 dump_perip:             db " max_per_ip="
@@ -552,6 +554,11 @@ linnea_config_dump:
     mov esi, warn_spill_tmpfs_len
     call linnea_print_stdout
 .dump_spill_ok:
+    lea rdi, [dump_proxytmo]
+    mov esi, dump_proxytmo_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.proxy_timeout]
+    call linnea_print_u64_stdout
     lea rdi, [dump_headtmo]
     mov esi, dump_headtmo_len
     call linnea_print_stdout
