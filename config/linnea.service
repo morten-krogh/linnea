@@ -41,11 +41,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=linnea
-Group=linnea
-# the config's root and log paths are relative to this directory
-WorkingDirectory=/home/linnea/linnea
-ExecStart=/usr/local/bin/linnea --config /home/linnea/linnea/config/linnea-tls.json
+# A service identity of its own, NOT the human account that owns the repo.
+# kill(2) permits a signal only between matching UIDs, so this is what stops a
+# stray `pkill -x linnea` in a development shell from taking production with it
+# -- which happened five times on 2026-08-14, the unit name being identical to
+# the test fixtures'. Discipline had already failed at that; a UID boundary is
+# enforced by the kernel and does not depend on anyone remembering.
+# The `linnea` account is a MEMBER of this group, which grants it read access to
+# the config and the logs without granting it the right to signal anything:
+# signals are governed by UID, group membership is not a way back in.
+User=linnea-svc
+Group=linnea-svc
+# Everything the service reads or writes now lives in system paths, so the
+# working directory only has to be somewhere it may write: the qdbg trigger
+# (docs/quic-debug) is resolved against it.
+WorkingDirectory=/var/lib/linnea
+ExecStart=/usr/local/bin/linnea --config /etc/linnea/linnea-tls.json
 # An ExecStartPre=/usr/local/bin/linnea --test --config <path> would refuse to
 # start on a bad config rather than failing in ExecStart; left off by default.
 # reload = zero-downtime binary upgrade (SIGUSR2, re-exec in place). The
@@ -95,9 +106,33 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN
 NoNewPrivileges=true
 
-# Hardening: read-only /usr /boot /etc, private /tmp, no kernel tunables.
-# /home stays visible: the binary, config, docroot, log and certs live there.
-ProtectSystem=full
+# The two directories the server writes, created and owned by systemd at start:
+#   /var/lib/linnea       state -- spill_dir for captured upload bodies
+#   /var/log/linnea       the access log and the error log
+# Declaring them is what lets ProtectSystem=strict below work: everything else
+# is read-only, and these stay writable without naming them twice.
+# Mode 0770 on the state directory so a member of linnea-svc (the `linnea`
+# account) can create the qdbg trigger file without root. Use 0750 instead if
+# you would rather that needed sudo -- it is the only thing the mode is for.
+StateDirectory=linnea linnea/spill
+StateDirectoryMode=0770
+LogsDirectory=linnea
+# 0755, and the log files themselves 0644, so the logs stay readable from an
+# ordinary account. That is deliberate and load-bearing: the journal is already
+# closed to a non-root user, and on 2026-08-14 these two files were the ONLY
+# evidence available for nine unexplained worker deaths. A split that also
+# hides them would have made that investigation impossible.
+LogsDirectoryMode=0755
+
+# Hardening. ProtectSystem=strict makes the whole filesystem read-only except
+# /dev, /proc, /sys and the State/Logs directories above; ProtectHome hides
+# /home entirely, which nothing here needs any more and which structurally
+# prevents the service from reading the development tree.
+# If the service ever fails to start after a change here, these two are the
+# first suspects: relax to ProtectSystem=full and ProtectHome=read-only to
+# confirm, rather than guessing.
+ProtectSystem=strict
+ProtectHome=true
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true

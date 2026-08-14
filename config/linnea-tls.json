@@ -1,34 +1,25 @@
 {
-  "log": "linnea.log",
-  "error_log": "linnea-error.log",
+  "log": "/var/log/linnea/linnea.log",
+  "error_log": "/var/log/linnea/linnea-error.log",
   "timeout": 60,
   "proxy_timeout": 10,
   "drain_timeout": 10,
   "max_body": 67108864,
   "rate_limit": 200,
-  "spill_dir": "/home/linnea/spill",
+  "spill_dir": "/var/lib/linnea/spill",
   "servers": [
     {
       "host": "0.0.0.0",
       "port": 443,
       "hostname": "linnea.amberbio.com",
-      "cert": "/home/linnea/certs/linnea.amberbio.com/fullchain.pem",
-      "key": "/home/linnea/certs/linnea.amberbio.com/privkey.pem",
+      "cert": "/etc/linnea/certs/linnea.amberbio.com/fullchain.pem",
+      "key": "/etc/linnea/certs/linnea.amberbio.com/privkey.pem",
       "hsts": "max-age=86400",
       "nosniff": 1,
       "locations": [
-        {
-          "prefix": "/api",
-          "proxy": "127.0.0.1:7700"
-        },
-        {
-          "prefix": "/ws",
-          "proxy": "127.0.0.1:7701"
-        },
-        {
-          "prefix": "/",
-          "root": "/home/linnea/www/linnea"
-        }
+        { "prefix": "/api", "proxy": "127.0.0.1:7700" },
+        { "prefix": "/ws",  "proxy": "127.0.0.1:7701" },
+        { "prefix": "/",    "root": "/var/www/linnea" }
       ]
     },
     {
@@ -36,14 +27,8 @@
       "port": 80,
       "hostname": "linnea.amberbio.com",
       "locations": [
-        {
-          "prefix": "/.well-known/acme-challenge",
-          "root": "/home/linnea/acme"
-        },
-        {
-          "prefix": "/",
-          "redirect": "https://linnea.amberbio.com"
-        }
+        { "prefix": "/.well-known/acme-challenge", "root": "/var/www/acme" },
+        { "prefix": "/", "redirect": "https://linnea.amberbio.com" }
       ]
     }
   ]

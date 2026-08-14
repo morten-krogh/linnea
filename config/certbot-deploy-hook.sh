@@ -14,8 +14,12 @@
 # Certbot sets RENEWED_LINEAGE to /etc/letsencrypt/live/<domain>.
 set -eu
 domain=$(basename "$RENEWED_LINEAGE")
-dir=/home/linnea/certs/$domain
-install -d -m 0755 "$dir"
-install -m 0644 -o linnea -g linnea "$RENEWED_LINEAGE/fullchain.pem" "$dir/fullchain.pem"
-install -m 0600 -o linnea -g linnea "$RENEWED_LINEAGE/privkey.pem" "$dir/privkey.pem"
+dir=/etc/linnea/certs/$domain
+install -d -m 0755 -o root -g root "$dir"
+# root owns them; the service reads the key through its group. 0640 rather than
+# 0600 because the running server is linnea-svc, not root -- and 0644, which the
+# initial hand-copied key actually had on the box until 2026-08-14, means every
+# local account can read the private key.
+install -m 0644 -o root -g linnea-svc "$RENEWED_LINEAGE/fullchain.pem" "$dir/fullchain.pem"
+install -m 0640 -o root -g linnea-svc "$RENEWED_LINEAGE/privkey.pem" "$dir/privkey.pem"
 systemctl reload linnea

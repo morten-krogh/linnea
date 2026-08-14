@@ -10,10 +10,17 @@
 # the signal to each worker. `systemctl reload` would also work (it re-execs
 # the master), but that is a heavier hammer than a rotation needs.
 #
-# `su linnea linnea` lets logrotate create the new file as the server's own
-# user, so the reopen after the rotation can write to it.
+# `su linnea-svc linnea-svc` lets logrotate create the new file as the server's
+# own user, so the reopen after the rotation can write to it.
+#
+# BOTH streams are listed. error_log arrived on 2026-08-14 and this snippet was
+# not extended with it, so the error log had no rotation at all and would have
+# grown without bound -- a new log needs a new line here, not just a config key.
+# One postrotate covers both: SIGHUP makes linnea_log_reopen reopen each stream
+# it holds, not merely the access log.
 
-/home/linnea/linnea/linnea.log {
+/var/log/linnea/linnea.log
+/var/log/linnea/linnea-error.log {
     daily
     # and whenever it gets large, not only once a day: every request writes a
     # line, so a flood can fill the disk long before the daily run comes round
@@ -23,8 +30,8 @@
     delaycompress
     missingok
     notifempty
-    create 0644 linnea linnea
-    su linnea linnea
+    create 0644 linnea-svc linnea-svc
+    su linnea-svc linnea-svc
     postrotate
         /bin/kill -HUP $(systemctl show --property MainPID --value linnea) 2>/dev/null || true
     endscript
