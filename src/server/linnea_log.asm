@@ -15,6 +15,7 @@ global linnea_log_stamp
 global linnea_log_access
 global linnea_log_access_begin
 global linnea_log_fatal
+global linnea_log_error_fd
 global linnea_log_acc_host
 global linnea_log_acc_host_len
 global linnea_log_acc_peer
@@ -270,6 +271,18 @@ linnea_log_u64:
     lea rdi, [num_buf]
     mov rsi, rax
     jmp linnea_log_write
+
+; linnea_log_error_fd() -> eax = the descriptor diagnostics go to.
+; For a caller that must not touch the line buffer -- the crash handler, which
+; may have interrupted a half-built line and cannot take the risk of appending
+; to it. Falls back to the single log when no error_log is configured.
+linnea_log_error_fd:
+    mov eax, [linnea_errlog_fd]
+    test eax, eax
+    jnz .have
+    mov eax, [linnea_log_fd]
+.have:
+    ret
 
 ; linnea_log_fatal(rdi = msg, rsi = len) — "[stamp] fatal: <msg>" on the error
 ; stream. The one place a worker's dying words land somewhere an operator can

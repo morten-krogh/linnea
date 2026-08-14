@@ -59,6 +59,7 @@ extern linnea_config_instance
 extern linnea_network_peer_format
 extern linnea_network_peer_addr
 extern linnea_connection_count_ip
+extern linnea_crash_install
 extern linnea_ratelimit_init
 extern linnea_upstream_closed
 extern linnea_upstream_limit
@@ -394,6 +395,11 @@ linnea_uring_run:
     call linnea_ring_init
     test eax, eax
     js .init_fail
+
+    ; Report a memory fault before dying. Installed in the WORKER — the master
+    ; has no request handling to fault in — and after the ring and the log are
+    ; up, so the line has somewhere to go.
+    call linnea_crash_install
 
     ; Signals arrive as cqes like everything else: block them, open a
     ; signalfd, and arm a read on the ring.

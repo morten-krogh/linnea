@@ -2336,6 +2336,42 @@ check "a worker killed by a signal is logged with that signal" $?
 # ...on the error stream, where diagnostics live -- not among the request records
 ! grep -q "exited on signal" $RUNDIR/linnea-split-acc.log 2>/dev/null
 check "a worker death is a diagnostic, not an access record" $?
+# A memory fault must report WHERE, not merely that it happened. The master's
+# line gives the signal; this gives the instruction. Without it a segfault on
+# this unit is unattributable -- AmbientCapabilities clears the dumpable flag,
+# so production cannot leave a core however LimitCORE is set, and seven
+# segfaults on 2026-08-14 produced none.
+#
+# Asserted because the install can fail SILENTLY: the first attempt at wiring
+# it never inserted the call at all (the target line ended in a continuation
+# backslash), the handler never ran, and the only symptom was a missing line
+# that nothing was looking for.
+elog_worker3=$(workers_of_now $elog_pid | awk '{print $1}')
+kill -11 $elog_worker3 2>/dev/null
+for i in $(seq 1 40); do
+    grep -q "fatal: SIGSEGV" $RUNDIR/linnea-split-err.log 2>/dev/null && break
+    sleep 0.1
+done
+crash_line=$(grep "fatal: SIGSEGV" $RUNDIR/linnea-split-err.log 2>/dev/null | tail -1)
+case "$crash_line" in
+    *"fatal: SIGSEGV addr=0x"*"rip=0x"*"rsp=0x"*) true ;;
+    *) false ;;
+esac
+check "a memory fault reports addr, rip and rsp before dying (${crash_line:-nothing logged})" $?
+# and the rip must be a real code address -- a zero or a truncated field would
+# satisfy the shape above while naming nothing
+crash_rip=$(printf '%s' "$crash_line" | grep -oE "rip=0x[0-9a-f]{16}" | cut -d= -f2)
+[ -n "$crash_rip" ] && [ "$crash_rip" != "0x0000000000000000" ]
+check "the reported rip is a real address ($crash_rip)" $?
+# the handler must not CHANGE the outcome: the worker still dies of signal 11
+for i in $(seq 1 40); do
+    grep -q "exited on signal 11" $RUNDIR/linnea-split-err.log 2>/dev/null && break
+    sleep 0.1
+done
+grep -q "worker $elog_worker3 exited on signal 11, respawning" $RUNDIR/linnea-split-err.log
+check "a reported fault still kills the worker with its own signal" $?
+
+sleep 1.3
 # The control: a worker that exits of its own accord must read DIFFERENTLY, or
 # the line cannot answer the only question it exists to answer.
 #
