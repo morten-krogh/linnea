@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""linnea-ws pings its clients, and drops the ones that stop answering.
+
+An idle socket and a vanished one look identical on the wire, so silence
+cannot tell them apart -- which is why reaping a tunnel on silence drops
+healthy connections and why RFC 6455 5.5.2 provides Ping/Pong instead.
+
+Both halves matter and each is the other's control:
+
+  * a client that ANSWERS survives past the point a silence-based timer would
+    have closed it -- if only this half passed, a server that never reaped
+    anything would look correct;
+  * a client that IGNORES the ping is dropped soon after the grace period --
+    if only this half passed, a server that dropped everyone would look
+    correct.
+
+usage: ws_heartbeat_test.py <port>
+"""
+import base64
+import os
+import socket
+import sys
+import time
+
+PORT = int(sys.argv[1])
+PING_EVERY = 30
+PONG_WITHIN = 15
+bad = []
+
+
+def connect():
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+    s.settimeout(PING_EVERY + PONG_WITHIN + 20)
+    k = base64.b64encode(os.urandom(16)).decode()
+    s.sendall(("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n" % k).encode())
+    h = b""
+    while b"\r\n\r\n" not in h:
+        d = s.recv(1)
+        if not d:
+            raise RuntimeError("handshake closed")
+        h += d
+    return s
+
+
+def run(answer):
+    """Hold a socket until it is closed or the window ends. Returns the
+    seconds until close (None if it stayed up) and the pings seen."""
+    s = connect()
+    t0 = time.time()
+    pings = 0
+    deadline = t0 + PING_EVERY + PONG_WITHIN + 12
+    try:
+        while time.time() < deadline:
+            b = s.recv(512)
+            if not b:
+                return time.time() - t0, pings
+            if b[0] & 0x0f == 0x9:
+                pings += 1
+                if answer:
+                    s.sendall(b"\x8a\x80\x00\x00\x00\x00")   # masked empty Pong
+    except socket.timeout:
+        pass
+    finally:
+        s.close()
+    return None, pings
+
+
+closed, pings = run(answer=True)
+if pings < 1:
+    bad.append("a client that answers saw no ping in %ds" % (PING_EVERY + 12))
+if closed is not None:
+    bad.append("a client that answers was dropped after %.0fs" % closed)
+
+closed, pings = run(answer=False)
+if pings < 1:
+    bad.append("a silent client saw no ping at all")
+if closed is None:
+    bad.append("a silent client was never dropped")
+elif not (PING_EVERY <= closed <= PING_EVERY + PONG_WITHIN + 8):
+    bad.append("a silent client was dropped at %.0fs, outside %d-%ds"
+               % (closed, PING_EVERY, PING_EVERY + PONG_WITHIN + 8))
+
+print("OK" if not bad else "; ".join(bad))
+sys.exit(0 if not bad else 1)

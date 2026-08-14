@@ -43,6 +43,8 @@ dump_headtmo:           db " head_timeout="
 dump_headtmo_len        equ $ - dump_headtmo
 dump_proxytmo:          db " proxy_timeout="
 dump_proxytmo_len       equ $ - dump_proxytmo
+dump_tunneltmo:         db " tunnel_timeout="
+dump_tunneltmo_len      equ $ - dump_tunneltmo
 dump_ratelimit:         db " rate_limit="
 dump_ratelimit_len      equ $ - dump_ratelimit
 dump_drain:             db " drain_timeout="
@@ -560,6 +562,11 @@ linnea_config_dump:
     mov esi, dump_ratelimit_len
     call linnea_print_stdout
     mov rdi, [rbx + linnea_config.rate_limit]
+    call linnea_print_u64_stdout
+    lea rdi, [dump_tunneltmo]
+    mov esi, dump_tunneltmo_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.tunnel_timeout]
     call linnea_print_u64_stdout
     lea rdi, [dump_proxytmo]
     mov esi, dump_proxytmo_len

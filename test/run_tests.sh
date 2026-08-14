@@ -2522,6 +2522,14 @@ check_http "unrequested 101 becomes 502" "502 Bad Gateway" "$resp"
 # ...and nothing open may hold up a stop. These two run their own servers,
 # because they stop them — 61080 is serving the rest of the suite. The second
 # waits out the 30s drain deadline, and is the slowest check in the file.
+# linnea-ws heartbeats its clients rather than letting the proxy reap them on
+# silence. Both halves are checked, and each is the other's control: a server
+# that never reaped, and one that dropped everyone, each pass exactly one of
+# them. ~50s, which is the price of a real 30s ping and its 15s grace.
+hb=$(timeout 120 python3 test/ws_heartbeat_test.py ${P61701} 2>&1)
+[ "$hb" = "OK" ]
+check "ws: clients that answer the ping live, silent ones are dropped ($hb)" $?
+
 out=$(python3 test/ws_drain_test.py)
 [ "$out" = "OK" ]
 check "a stop is immediate whatever is open ($out)" $?

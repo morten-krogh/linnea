@@ -54,6 +54,18 @@ MAX_CLIENTS     equ 64
 IN_BUF          equ 2048          ; a request head, or one client frame
 OUT_BUF         equ 1024          ; queued frames not yet written
 
+; Heartbeat. Every 30s a Ping goes out; a client that has not answered 15s
+; later is gone and its slot is reclaimed. That detects a vanished peer FASTER
+; than the proxy's 60s idle timer did, and — unlike a timer — never drops one
+; that is merely quiet. The traffic also keeps linnea's tunnel off its own idle
+; deadline, which is what the page's JavaScript ping was standing in for.
+;
+; A browser answers a Ping inside the browser, below JavaScript, so this works
+; in a backgrounded tab where a JS timer is throttled or frozen. That is the
+; reason this belongs here and not on the page.
+PING_EVERY_MS   equ 30000
+PONG_WITHIN_MS  equ 15000
+
 ST_HANDSHAKE    equ 0
 ST_OPEN         equ 1
 ST_DRAIN        equ 2             ; write what is queued, then close
@@ -76,6 +88,12 @@ struc ws_client
     .in_len:    resq 1
     .out_len:   resq 1
     .out_off:   resq 1            ; how much of .out has been written
+    ; Liveness. An idle socket and a vanished one look identical on the wire,
+    ; so silence is not evidence of either: RFC 6455 5.5.2 gives Ping/Pong to
+    ; tell them apart. .ping_at is when the next Ping is due; .pong_by is the
+    ; deadline for the answer, 0 when we are not waiting for one.
+    .ping_at:   resq 1
+    .pong_by:   resq 1
     .in:        resb IN_BUF
     .out:       resb OUT_BUF
 endstruc
@@ -216,7 +234,7 @@ _start:
     mov eax, LINNEA_SYS_POLL
     lea rdi, [pollfds]
     mov rsi, [poll_n]
-    mov edx, -1                    ; block: there is no timer work to do
+    mov edx, 1000                  ; wake once a second for the heartbeat
     syscall
     test rax, rax
     js .poll_err
@@ -229,7 +247,7 @@ _start:
     mov rbx, 1
 .each:
     cmp rbx, [poll_n]
-    jae .loop
+    jae .pass_done
     lea r12, [pollfds]
     lea r12, [r12 + rbx * 8]
     movzx r13d, word [r12 + 6]     ; revents
@@ -253,6 +271,12 @@ _start:
 .next:
     inc rbx
     jmp .each
+.pass_done:
+    ; AFTER the fd work, not before. pollfds and poll_map are built before the
+    ; poll and indexed by slot, so a heartbeat that closed a client first would
+    ; leave the loop above walking an entry whose slot is already free.
+    call heartbeat
+    jmp .loop
 .poll_err:
     ; EINTR is the ordinary one and comes straight back round. Anything else —
     ; ENOMEM is the realistic candidate — would spin this loop at the speed of
@@ -725,6 +749,10 @@ try_handshake:
     mov rsi, r14
     call consume
     mov qword [rbx + ws_client.state], ST_OPEN
+    call now_ms                    ; the first Ping is due one interval from now
+    add rax, PING_EVERY_MS
+    mov [rbx + ws_client.ping_at], rax
+    mov qword [rbx + ws_client.pong_by], 0
     inc qword [open_count]
     ; tell the newcomer where the counter stands — only it, since nothing
     ; changed for anyone else
@@ -934,6 +962,10 @@ dispatch_frame:
     je .text
     cmp r8d, OP_BIN
     je .text
+    ; Anything at all from the peer answers the liveness question, so the
+    ; grace period ends here rather than only in .pong — a client that sends
+    ; "inc" while we wait is plainly not gone.
+    mov qword [rbx + ws_client.pong_by], 0
     cmp r8d, OP_PING
     je .ping
     cmp r8d, OP_PONG
@@ -1131,6 +1163,70 @@ broadcast_state:
     pop rbx
     ret
 
+
+; now_ms() -> rax, milliseconds from a monotonic clock. Only differences are
+; ever taken, so the epoch does not matter.
+now_ms:
+    sub rsp, 24
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    mov edi, LINNEA_CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]                 ; seconds only: the deadlines here are 30s
+    imul rax, rax, 1000            ; and 15s, so second granularity is ample,
+    add rsp, 24                    ; and it avoids a division in the loop
+    ret
+
+; heartbeat() — run once per loop pass. Ping whoever is due, and drop whoever
+; has not answered the last one.
+heartbeat:
+    push rbx
+    push r12
+    push r13
+    call now_ms
+    mov r13, rax
+    xor r12d, r12d
+.hb_next:
+    cmp r12, MAX_CLIENTS
+    jae .hb_done
+    mov rax, r12
+    imul rax, rax, ws_client_size
+    lea rbx, [clients + rax]
+    cmp qword [rbx + ws_client.fd], 0
+    jl .hb_step                    ; free slot
+    cmp qword [rbx + ws_client.state], ST_OPEN
+    jne .hb_step                   ; still handshaking, or draining
+    cmp qword [rbx + ws_client.pong_by], 0
+    je .hb_maybe_ping
+    mov rax, r13
+    cmp rax, [rbx + ws_client.pong_by]
+    jb .hb_step                    ; still inside the grace period
+    mov rdi, rbx                   ; no answer: the peer is gone
+    call close_client
+    jmp .hb_step
+.hb_maybe_ping:
+    mov rax, r13
+    cmp rax, [rbx + ws_client.ping_at]
+    jb .hb_step
+    mov rdi, rbx
+    xor esi, esi                   ; an empty payload: RFC 6455 allows it, and
+    xor edx, edx                   ; there is nothing to say
+    mov ecx, OP_PING
+    call send_frame
+    mov rax, r13
+    add rax, PONG_WITHIN_MS
+    mov [rbx + ws_client.pong_by], rax
+    mov rax, r13
+    add rax, PING_EVERY_MS
+    mov [rbx + ws_client.ping_at], rax
+.hb_step:
+    inc r12
+    jmp .hb_next
+.hb_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; send_frame(rdi = client, rsi = payload, rdx = length, ecx = opcode)
 ; A server frame is never masked, and nothing sent from here reaches 126

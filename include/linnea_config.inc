@@ -15,6 +15,7 @@ LINNEA_DEFAULT_TIMEOUT          equ 5     ; idle timeout, seconds
 ; 0 = follow `timeout`. Resolved at the end of parsing, so the default is
 ; "whatever timeout is" and existing configs behave exactly as before.
 LINNEA_DEFAULT_PROXY_TIMEOUT    equ 0
+LINNEA_DEFAULT_TUNNEL_TIMEOUT   equ 0     ; 0 = follow `timeout`
 ; A connection may hold a slot only so long without completing a request head.
 ; The idle timeout alone cannot bound this: it is armed per operation and any
 ; progress rearms it, so a client dribbling one byte per timeout period holds a
@@ -112,6 +113,14 @@ struc linnea_config
     ; it is resolved to the real value once, at the end of parsing, so nothing
     ; downstream has to know about the sentinel.
     .proxy_timeout: resq 1                        ; upstream deadline, seconds
+    ; How long an upgraded connection — a WebSocket tunnel — may go without
+    ; traffic. A tunnel is not a request and should not inherit the request's
+    ; deadline: an idle WebSocket is a normal, healthy thing, and reaping it on
+    ; silence cannot tell a quiet peer from a vanished one. HAProxy draws the
+    ; same distinction with `timeout tunnel`. 0 means "follow timeout", which is
+    ; what one knob did for both before this key existed; resolved at the end of
+    ; parsing so nothing downstream sees the sentinel.
+    .tunnel_timeout: resq 1
     .max_connections: resq 1                      ; connection pool size, per worker
     .head_timeout:  resq 1                        ; seconds to complete a request head
     .drain_timeout: resq 1                        ; seconds a reload's drain may take

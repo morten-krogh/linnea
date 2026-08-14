@@ -288,8 +288,13 @@ head_timeout_ns:    resq 1     ; head_timeout as nanoseconds (same units as
                                ; linnea_uring_now), for the request-head deadline
 max_per_ip:         resq 1     ; connections one source address may hold
 sni_select_conn:    resq 1     ; the connection the SNI callback is deciding for
-idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds, for the
-                               ; tunnel's last_activity comparison
+idle_timeout_ns:    resq 1     ; the idle timeout as nanoseconds
+; ...and the tunnel's own, which is what the two WebSocket idle comparisons use.
+; An upgraded connection is not a request and does not inherit the request's
+; deadline: an idle tunnel is normal, and silence cannot distinguish a quiet
+; peer from a vanished one — that is what the backend's Ping/Pong is for. This
+; is the backstop for a tunnelled backend that does NOT heartbeat.
+tunnel_timeout_ns:  resq 1
 sig_mask:           resq 1     ; blocked-signal set: SIGTERM + SIGQUIT + SIGHUP
 sig_fd:             resd 1
 drain_flag:         resd 1     ; 1 = draining: no accepts, close after serve
@@ -358,6 +363,9 @@ linnea_uring_run:
     mov [idle_timeout_ns], rax
     mov rax, [rbx + linnea_config.proxy_timeout]   ; already resolved: never 0
     mov [proxy_timeout_ts], rax
+    mov rax, [rbx + linnea_config.tunnel_timeout]  ; likewise resolved
+    imul rax, rax, 1000000000
+    mov [tunnel_timeout_ns], rax
     mov rax, [rbx + linnea_config.head_timeout]
     imul rax, rax, 1000000000
     mov [head_timeout_ns], rax
@@ -2253,7 +2261,7 @@ linnea_uring_run:
 .tunnel_c2u_idle:
     call linnea_uring_now
     sub rax, [r12 + linnea_connection.last_activity]
-    cmp rax, [idle_timeout_ns]
+    cmp rax, [tunnel_timeout_ns]
     jge .tunnel_idle_close
     mov qword [r12 + linnea_connection.ws_c2u_busy], 1
     mov rdi, r12               ; the other direction was active: re-arm
@@ -2329,7 +2337,7 @@ linnea_uring_run:
 .tunnel_u2c_idle:
     call linnea_uring_now
     sub rax, [r12 + linnea_connection.last_activity]
-    cmp rax, [idle_timeout_ns]
+    cmp rax, [tunnel_timeout_ns]
     jge .tunnel_idle_close
     mov qword [r12 + linnea_connection.ws_u2c_busy], 1
     mov rdi, r12               ; the other direction was active: re-arm

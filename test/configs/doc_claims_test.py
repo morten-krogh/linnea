@@ -173,6 +173,14 @@ test(base(error_log=""), "empty error_log rejected", False,
 test(srv(error_log=os.path.join(D, "e.log")), "error_log on a SERVER is unknown",
      False, "unknown key")
 
+# tunnel_timeout: the upgraded-connection deadline, separate again.
+test(base(tunnel_timeout=86401), "tunnel_timeout above 86400 rejected", False,
+     "tunnel_timeout must be between 1 and 86400")
+test(base(tunnel_timeout=0), "tunnel_timeout:0 rejected (unset follows timeout)",
+     False, "tunnel_timeout must be between 1 and 86400")
+test(base(tunnel_timeout=86400), "tunnel_timeout at 86400 accepted", True)
+test(srv(tunnel_timeout=60), "tunnel_timeout on a SERVER is unknown", False, "unknown key")
+
 # proxy_timeout: the upstream deadline, separate from the client idle timeout.
 # The default claim is the interesting one -- "whatever timeout is" -- because
 # it is what keeps every config written before the key behaving identically.

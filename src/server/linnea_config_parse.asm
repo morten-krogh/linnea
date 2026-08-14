@@ -57,6 +57,8 @@ key_timeout:            db "timeout"
 key_timeout_len         equ $ - key_timeout
 key_proxytmo:           db "proxy_timeout"
 key_proxytmo_len        equ $ - key_proxytmo
+key_tunneltmo:          db "tunnel_timeout"
+key_tunneltmo_len       equ $ - key_tunneltmo
 key_maxconn:            db "max_connections"
 key_maxconn_len         equ $ - key_maxconn
 key_headtmo:            db "head_timeout"
@@ -144,6 +146,8 @@ msg_maxconn_range:      db "max_connections must be between 1 and 65536"
 msg_maxconn_range_len   equ $ - msg_maxconn_range
 msg_ratelimit_range:    db "rate_limit must be between 0 and 1000000"
 msg_ratelimit_range_len equ $ - msg_ratelimit_range
+msg_tunneltmo_range:    db "tunnel_timeout must be between 1 and 86400"
+msg_tunneltmo_range_len equ $ - msg_tunneltmo_range
 msg_proxytmo_range:     db "proxy_timeout must be between 1 and 3600"
 msg_proxytmo_range_len  equ $ - msg_proxytmo_range
 msg_headtmo_range:      db "head_timeout must be between 1 and 3600"
@@ -225,6 +229,7 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.error_log_len], 0
     mov qword [rbx + linnea_config.timeout], LINNEA_DEFAULT_TIMEOUT
     mov qword [rbx + linnea_config.proxy_timeout], LINNEA_DEFAULT_PROXY_TIMEOUT
+    mov qword [rbx + linnea_config.tunnel_timeout], LINNEA_DEFAULT_TUNNEL_TIMEOUT
     mov qword [rbx + linnea_config.max_connections], LINNEA_DEFAULT_MAX_CONNECTIONS
     mov qword [rbx + linnea_config.head_timeout], LINNEA_DEFAULT_HEAD_TIMEOUT
     mov qword [rbx + linnea_config.drain_timeout], LINNEA_DEFAULT_DRAIN_TIMEOUT
@@ -296,6 +301,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_timeout
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_tunneltmo]
+    mov ecx, key_tunneltmo_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_tunneltmo
     mov rdi, r14
     mov rsi, r15
     lea rdx, [key_proxytmo]
@@ -494,6 +506,18 @@ linnea_config_parse:
     mov [rbx + linnea_config.max_connections], rax
     jmp .top_sep
 
+.top_tunneltmo:
+    test r13d, 65536
+    jnz .top_dup
+    or r13d, 65536
+    call linnea_parse_u64
+    test rax, rax
+    jz .tunneltmo_range
+    cmp rax, 86400                 ; a day: a tunnel may legitimately be long
+    ja .tunneltmo_range
+    mov [rbx + linnea_config.tunnel_timeout], rax
+    jmp .top_sep
+
 .top_proxytmo:
     test r13d, 8192
     jnz .top_dup
@@ -629,6 +653,11 @@ linnea_config_parse:
     mov rax, [rbx + linnea_config.timeout]
     mov [rbx + linnea_config.proxy_timeout], rax
 .top_ptmo_set:
+    cmp qword [rbx + linnea_config.tunnel_timeout], 0
+    jne .top_ttmo_set
+    mov rax, [rbx + linnea_config.timeout]
+    mov [rbx + linnea_config.tunnel_timeout], rax
+.top_ttmo_set:
     call linnea_parse_skip_ws
     mov rax, [linnea_parser_state + linnea_parser.pos]
     cmp rax, [linnea_parser_state + linnea_parser.size]
@@ -670,6 +699,10 @@ linnea_config_parse:
 .ratelimit_range:
     lea rdi, [msg_ratelimit_range]
     mov esi, msg_ratelimit_range_len
+    jmp linnea_parse_fail
+.tunneltmo_range:
+    lea rdi, [msg_tunneltmo_range]
+    mov esi, msg_tunneltmo_range_len
     jmp linnea_parse_fail
 .proxytmo_range:
     lea rdi, [msg_proxytmo_range]
