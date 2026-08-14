@@ -22,6 +22,7 @@ global linnea_h3_walk_decode
 global linnea_h3_build_response
 global linnea_h3_build_canned
 global linnea_h3_build_431
+global linnea_h3_build_429
 global linnea_h3_build_413
 global linnea_h3_build_500
 global linnea_h3_build_421
@@ -96,6 +97,8 @@ body_421: db "421 Misdirected Request", 10
 body_421_len equ $ - body_421
 body_431:      db "431 Request Header Fields Too Large", 10
 body_431_len   equ $ - body_431
+body_429:      db "429 Too Many Requests", 10
+body_429_len   equ $ - body_429
 body_413:      db "413 Content Too Large", 10
 body_413_len   equ $ - body_413
 body_503:      db "503 Service Unavailable", 10
@@ -773,6 +776,20 @@ linnea_h3_build_500:
     mov ecx, txt_plain_len
     lea r8, [body_500]
     mov r9d, body_500_len
+    jmp linnea_h3_build_canned
+
+; linnea_h3_build_429(rdi=out) -> rax = length written.
+; The whole response for a request refused by rate_limit. Like the others here
+; it is built OUTSIDE linnea_h3_serve — the request is turned away before it is
+; routed — so it goes through linnea_h3_build_canned, which clears the
+; encoder's per-response fields. A 429 wearing the previous request's
+; content-encoding would be the same defect as every other canned error here.
+linnea_h3_build_429:
+    mov esi, 429
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_429]
+    mov r9d, body_429_len
     jmp linnea_h3_build_canned
 
 ; linnea_h3_build_431(rdi=out) -> rax = length written.

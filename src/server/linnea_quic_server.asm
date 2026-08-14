@@ -99,6 +99,10 @@ global linnea_h3d_flen
 global linnea_h3_cancel_hook
 
 extern linnea_h3_build_431
+extern linnea_uring_now
+extern linnea_h3_build_429
+extern linnea_ratelimit_take_sa
+extern linnea_ratelimit_on
 extern linnea_h3_build_413
 extern linnea_h3_build_500
 extern linnea_log_write
@@ -3310,6 +3314,45 @@ linnea_quic_server_datagram:
     call .send_1rtt
     jmp .stream_scan
 .req_ok:
+    ; One decoded request is one request, and h3 multiplexes as freely as h2 —
+    ; 100 streams on a connection, so max_per_ip bounds the request rate hardly
+    ; at all. Checked before the drain and authority gates below because it is
+    ; the cheapest of them and refusing costs nothing.
+    ;
+    ; The address comes from the connection's sockaddr rather than a socket:
+    ; a QUIC connection never had one to ask. linnea_ratelimit_take_sa extracts
+    ; exactly what the TCP side extracts, so one client keys to ONE bucket
+    ; whichever protocol it arrives over.
+    cmp qword [linnea_ratelimit_on], 0
+    je .rl_ok
+    call linnea_uring_now
+    mov rdx, rax
+    mov rdi, [cur_conn]
+    add rdi, linnea_quic_conn.peer
+    call linnea_ratelimit_take_sa
+    test eax, eax
+    jz .rl_ok
+    ; refused: a canned 429 on this stream, framed like the other pre-routing
+    ; errors above it
+    lea rdi, [strm_pay]
+    CONNLEA rsi, rx_have
+    call linnea_quic_build_ack       ; the ack must precede the STREAM frame
+    mov [s_acklen], rax
+    mov rcx, rax
+    mov byte [strm_pay + rcx], 0x09  ; STREAM | FIN
+    lea rdi, [strm_pay + rcx + 1]
+    mov rsi, [s_sid]
+    call linnea_quic_varint_encode
+    mov rbx, [s_acklen]
+    add rbx, rax
+    inc rbx
+    lea rdi, [strm_pay + rbx]
+    call linnea_h3_build_429         ; rax = response length
+    lea rdx, [rax + rbx]             ; STREAM frame length
+    lea rsi, [strm_pay]
+    call .send_1rtt
+    jmp .stream_scan
+.rl_ok:
     ; Draining: the GOAWAY promised that streams at or above h3_goaway_id would
     ; not be processed (RFC 9114 5.2), so serving one anyway means the client
     ; may see the same request run twice — here and on the connection it retried

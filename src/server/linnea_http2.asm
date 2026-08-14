@@ -88,6 +88,9 @@ global linnea_h2_busy
 extern linnea_spill_open_fd
 extern linnea_upstream_count
 extern linnea_upstream_open
+extern linnea_ratelimit_take
+extern linnea_ratelimit_on
+extern linnea_uring_now
 extern linnea_upstream_closed
 extern linnea_upstream_limit
 
@@ -1144,6 +1147,28 @@ h2_build_request:
     cmp qword [rsp + REQ + linnea_h2_req.path_ptr], 0
     je .malformed_stream
 .serve:
+    ; One decoded request is one request, which is what rate_limit meters. On a
+    ; multiplexed protocol that is very far from what max_per_ip counts: 100
+    ; streams may share one connection, so a per-connection cap barely bounds
+    ; the request rate at all.
+    cmp qword [linnea_ratelimit_on], 0
+    je .rl_ok
+    call linnea_uring_now            ; clock first: it takes rdi/rsi for the
+    mov rdx, rax                     ; syscall and would eat the address
+    lea rdi, [rbx + linnea_connection.peer_ip]
+    mov rsi, [rbx + linnea_connection.peer_ip_len]
+    call linnea_ratelimit_take
+    test eax, eax
+    jz .rl_ok
+    mov rdi, rbx
+    mov rsi, [rsp + L_SID]
+    mov rdx, [rsp + L_OUT]
+    call h2_429_stream               ; -> rax = response length
+    mov rdx, rax
+    mov rax, r12
+    sub rax, [rsp + L_START]         ; bytes consumed
+    jmp .ret
+.rl_ok:
     ; --- serve the request: write the response at the out cursor --------
     mov rdi, rbx                     ; conn
     lea rsi, [rsp + REQ]             ; decoded request
@@ -3439,7 +3464,25 @@ linnea_h2p_service:
 ; no :authority, so the accepting server stands in as the vhost (its security
 ; headers ride the response, and its name goes in the access line, where the
 ; method and target print "-").
+; h2_429_stream / h2_431_stream(rdi=conn, rsi=stream id, rdx=out) -> rax.
+; One builder, two statuses. It was written for 431 alone and every byte of it
+; except the status text and the body is the same for any bodied stream error,
+; so the second caller parameterises rather than copies -- eighty lines of
+; near-identical assembly is how a fix comes to land on one of them.
+h2_429_stream:
+    lea rax, [status_429_h2]
+    mov [h2_err_status], rax
+    lea rax, [body_429]
+    mov [h2_err_body], rax
+    mov qword [h2_err_bodylen], body_429_len
+    jmp h2_err_stream
 h2_431_stream:
+    lea rax, [status_431_h2]
+    mov [h2_err_status], rax
+    lea rax, [body_431]
+    mov [h2_err_body], rax
+    mov qword [h2_err_bodylen], body_431_len
+h2_err_stream:
     push rbx
     push r12
     push r13
@@ -3454,9 +3497,10 @@ h2_431_stream:
     mov [h2_cur_srv], rax
     ; the body is flow-controlled (RFC 9113 6.9.1): withhold it if the peer has
     ; advertised no room, and let content-length agree at 0
-    mov qword [h2_err_blen], body_431_len
+    mov rax, [h2_err_bodylen]
+    mov [h2_err_blen], rax
     mov rdi, rbx
-    mov esi, body_431_len
+    mov rsi, [h2_err_bodylen]
     call h2_data_window_take
     test eax, eax
     jnz .b431_fits
@@ -3471,7 +3515,7 @@ h2_431_stream:
     lea rdi, [r14 + 9]
     mov rbp, rdi                     ; payload start
     mov esi, 8                       ; :status
-    lea rdx, [status_431_h2]
+    mov rdx, [h2_err_status]
     mov ecx, 3
     call h2_enc_hdr
     mov esi, 31                      ; content-type: text/plain
@@ -3525,7 +3569,7 @@ h2_431_stream:
     mov [rdi + 7], al
     mov [rdi + 8], r12b
     add rdi, 9
-    lea rsi, [body_431]
+    mov rsi, [h2_err_body]
     mov rcx, [h2_err_blen]
     rep movsb
     mov r13, rdi
@@ -5405,7 +5449,10 @@ h2_nosniff_val:  db "nosniff"
 h2_nosniff_val_len equ $ - h2_nosniff_val
 status_301_h2:   db "301"
 status_421_h2:   db "421"
+status_429_h2:   db "429"
 status_431_h2:   db "431"
+body_429: db "429 Too Many Requests", 10
+body_429_len equ $ - body_429
 body_431: db "431 Request Header Fields Too Large", 10
 body_431_len equ $ - body_431
 body_502: db "502 Bad Gateway", 10
@@ -5485,6 +5532,9 @@ h2_path_buf:  resb LINNEA_HTTP2_PATH_BUF
 h2_goaway_code: resd 1                ; the code the GOAWAY below reports
 h2_err_conn:  resq 1                  ; the connection an inline error is answering
 h2_err_blen:  resq 1                  ; its body length after the flow-control check
+h2_err_status:  resq 1     ; which bodied stream error h2_err_stream is building
+h2_err_body:    resq 1
+h2_err_bodylen: resq 1
 h2_numbuf:    resb 24
 h2_crbuf:     resb 80                ; "bytes first-last/size" / "bytes */size"
 h2_locbuf:    resb 2560              ; a redirect's Location value

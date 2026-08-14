@@ -59,6 +59,7 @@ extern linnea_config_instance
 extern linnea_network_peer_format
 extern linnea_network_peer_addr
 extern linnea_connection_count_ip
+extern linnea_ratelimit_init
 extern linnea_upstream_closed
 extern linnea_upstream_limit
 extern linnea_connection_alloc
@@ -364,6 +365,8 @@ linnea_uring_run:
     mov [drain_deadline], rax  ; tv_sec of the timespec; tv_nsec stays 0
     mov rax, [rbx + linnea_config.max_per_ip]
     mov [max_per_ip], rax
+    mov rdi, [rbx + linnea_config.rate_limit]
+    call linnea_ratelimit_init
     mov rax, [rbx + linnea_config.max_upstream]
     mov [linnea_upstream_limit], rax
     ; A proxied HTTP/3 request builds its upstream leg in linnea_h3_proxy.asm

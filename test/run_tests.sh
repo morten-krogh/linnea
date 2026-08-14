@@ -54,6 +54,7 @@ P61090=$((PORTBASE + 90))
 P61100=$((PORTBASE + 100))
 P61466=$((PORTBASE + 466))
 P61467=$((PORTBASE + 467))
+P61468=$((PORTBASE + 468))
 P61443=$((PORTBASE + 443))
 P61444=$((PORTBASE + 444))
 P61446=$((PORTBASE + 446))
@@ -2318,6 +2319,62 @@ err_req=$(grep -c "request localhost" $RUNDIR/linnea-split-err.log 2>/dev/null |
 check "error_log: the diagnostics went to the other file ($err_life lifecycle, $err_req req)" $?
 kill $elog_pid 2>/dev/null
 wait $elog_pid 2>/dev/null
+
+# rate_limit meters REQUESTS, which is what max_per_ip cannot: h2 and h3 allow
+# 100 streams per connection, so a connection cap barely bounds the request
+# rate. Every protocol must be metered -- a limit two of the three walk past is
+# a control with a hole, and it is the same address either way, so all three
+# share ONE bucket. Exact counts are timing (the bucket refills while the loop
+# runs), so this asserts the property: some allowed, some refused, on each.
+rm -f $RUNDIR/linnea-rl.log
+start_server $CFG/rate-limit.json
+rl_pid=$SRV_PID
+rl_burst() {   # $1 = label, rest = the curl that prints a status
+    local lbl=$1; shift
+    local ok=0 ref=0 i c
+    sleep 1.3                       # let the bucket refill before each protocol
+    for i in $(seq 1 12); do
+        c=$("$@" 2>/dev/null)
+        [ "$c" = "200" ] && ok=$((ok+1))
+        [ "$c" = "429" ] && ref=$((ref+1))
+    done
+    [ "$ok" -ge 1 ] && [ "$ref" -ge 1 ]
+    check "rate_limit meters $lbl ($ok served, $ref refused of 12)" $?
+}
+rl_burst "h1" curl -sS -o /dev/null -w '%{http_code}' --max-time 5 --http1.1 \
+    --cacert $CA --resolve localhost:${P61468}:127.0.0.1 https://localhost:${P61468}/hello.txt
+rl_burst "h2" curl -sS -o /dev/null -w '%{http_code}' --max-time 5 --http2 \
+    --cacert $CA --resolve localhost:${P61468}:127.0.0.1 https://localhost:${P61468}/hello.txt
+if [ -x "$CURLH3" ] && "$CURLH3" -V 2>/dev/null | grep -q HTTP3; then
+    rl_burst "h3" "$CURLH3" --http3-only -s -o /dev/null -w '%{http_code}' --max-time 15 \
+        --cacert $CA --resolve localhost:${P61468}:127.0.0.1 https://localhost:${P61468}/hello.txt
+else
+    check "rate_limit meters h3 (skipped: no HTTP/3 curl)" 0
+fi
+# ...and it recovers: a client that waits is served again rather than stuck
+sleep 1.3
+rl_again=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 --cacert $CA \
+    --resolve localhost:${P61468}:127.0.0.1 https://localhost:${P61468}/hello.txt)
+[ "$rl_again" = "200" ]
+check "rate_limit refills: a client that waits is served again ($rl_again)" $?
+kill $rl_pid 2>/dev/null
+wait $rl_pid 2>/dev/null
+# The control, and the one that matters for every deployment that has not asked
+# for this: with the key unset nothing is metered at all. The fixture above is
+# the only one in the suite that sets it, so any other server serving a burst
+# would do -- assert it explicitly rather than by implication.
+start_server $CFG/error-log.json      # no rate_limit key
+rlctl_pid=$SRV_PID
+rlctl=0
+for i in $(seq 1 25); do
+    c=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 --cacert $CA \
+        --resolve localhost:${P61467}:127.0.0.1 https://localhost:${P61467}/hello.txt)
+    [ "$c" = "200" ] && rlctl=$((rlctl+1))
+done
+[ "$rlctl" = "25" ]
+check "rate_limit unset meters nothing ($rlctl/25 served)" $?
+kill $rlctl_pid 2>/dev/null
+wait $rlctl_pid 2>/dev/null
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/api/cljunk)
 check_http "proxy bad CL 502"    "502 Bad Gateway" "$resp"
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/api/clpad)

@@ -1,0 +1,16 @@
+{
+  "log": "test/linnea-rl.log",
+  "timeout": 10,
+  "workers": 1,
+  "rate_limit": 5,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 61468,
+      "hostname": "localhost",
+      "cert": "test/tls/server.crt",
+      "key": "test/tls/server.key",
+      "locations": [ { "prefix": "/", "root": "test/www" } ]
+    }
+  ]
+}

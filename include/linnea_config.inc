@@ -31,6 +31,7 @@ LINNEA_DEFAULT_DRAIN_TIMEOUT    equ 30    ; seconds a reload's drain may take
 ; single host can take every slot in the pool — with well-formed traffic, no
 ; trickery needed — and everyone else is refused.
 LINNEA_DEFAULT_MAX_PER_IP       equ 64
+LINNEA_DEFAULT_RATE_LIMIT       equ 0     ; 0 = no request-rate limit
 ; Upstream (backend) connections in flight at once, per worker. Past this a
 ; proxied request is answered 503 rather than opening one more: the backend is
 ; usually far smaller than the flood that can reach us, and refusing here is
@@ -120,6 +121,11 @@ struc linnea_config
     .workers:       resq 1                        ; worker processes; 0 until the
                                                   ; auto count is resolved at startup
     .http2:         resq 1                        ; 1 = offer HTTP/2 via ALPN
+    ; Requests per second one source address may make, 0 = unlimited. The
+    ; REQUEST control; max_per_ip is the CONNECTION control, and on h2/h3 the
+    ; two are far apart — 64 connections x 100 streams is 6400 requests in
+    ; flight from one address without breaking a single rule.
+    .rate_limit:    resq 1
     .log:           resb LINNEA_MAX_LOG + 1       ; NUL-terminated log file path
     .log_len:       resq 1
     ; Where the diagnostics go, when they are to be kept apart from the request

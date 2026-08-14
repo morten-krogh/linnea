@@ -156,6 +156,15 @@ test(base(max_body=18446744073709551616), "max_body past 64 bits rejected", Fals
 
 test(base(timeout=3601), "timeout above 3600 rejected", False)
 test(base(timeout=3600), "timeout at 3600 accepted", True)
+# rate_limit: the request-rate control. 0 is legal and means off, which is the
+# claim that keeps every config written before the key behaving as it did.
+test(base(rate_limit=0), "rate_limit:0 accepted (means off)", True)
+test(base(rate_limit=1), "rate_limit at 1 accepted", True)
+test(base(rate_limit=1000000), "rate_limit at 1000000 accepted", True)
+test(base(rate_limit=1000001), "rate_limit above 1000000 rejected", False,
+     "rate_limit must be between 0 and 1000000")
+test(srv(rate_limit=10), "rate_limit on a SERVER is unknown", False, "unknown key")
+
 # error_log: the diagnostics stream. Unset is the interesting claim -- one file
 # for both, which is what every config written before the key relies on.
 test(base(error_log=os.path.join(D, "e.log")), "error_log accepted", True)

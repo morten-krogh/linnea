@@ -65,6 +65,8 @@ key_drain:              db "drain_timeout"
 key_drain_len           equ $ - key_drain
 key_perip:              db "max_per_ip"
 key_perip_len           equ $ - key_perip
+key_ratelimit:          db "rate_limit"
+key_ratelimit_len       equ $ - key_ratelimit
 key_maxup:              db "max_upstream"
 key_maxup_len           equ $ - key_maxup
 key_maxbody:            db "max_body"
@@ -140,6 +142,8 @@ msg_timeout_range:      db "timeout must be between 1 and 3600"
 msg_timeout_range_len   equ $ - msg_timeout_range
 msg_maxconn_range:      db "max_connections must be between 1 and 65536"
 msg_maxconn_range_len   equ $ - msg_maxconn_range
+msg_ratelimit_range:    db "rate_limit must be between 0 and 1000000"
+msg_ratelimit_range_len equ $ - msg_ratelimit_range
 msg_proxytmo_range:     db "proxy_timeout must be between 1 and 3600"
 msg_proxytmo_range_len  equ $ - msg_proxytmo_range
 msg_headtmo_range:      db "head_timeout must be between 1 and 3600"
@@ -225,6 +229,7 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.head_timeout], LINNEA_DEFAULT_HEAD_TIMEOUT
     mov qword [rbx + linnea_config.drain_timeout], LINNEA_DEFAULT_DRAIN_TIMEOUT
     mov qword [rbx + linnea_config.max_per_ip], LINNEA_DEFAULT_MAX_PER_IP
+    mov qword [rbx + linnea_config.rate_limit], LINNEA_DEFAULT_RATE_LIMIT
     mov qword [rbx + linnea_config.max_upstream], LINNEA_DEFAULT_MAX_UPSTREAM
     mov qword [rbx + linnea_config.max_body], LINNEA_DEFAULT_MAX_BODY
     mov qword [rbx + linnea_config.workers], LINNEA_DEFAULT_WORKERS
@@ -319,6 +324,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_drain
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_ratelimit]
+    mov ecx, key_ratelimit_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_ratelimit
     mov rdi, r14
     mov rsi, r15
     lea rdx, [key_perip]
@@ -518,6 +530,16 @@ linnea_config_parse:
     mov [rbx + linnea_config.drain_timeout], rax
     jmp .top_sep
 
+.top_ratelimit:
+    test r13d, 32768
+    jnz .top_dup
+    or r13d, 32768
+    call linnea_parse_u64
+    cmp rax, 1000000               ; 0 is legal: it means "no limit"
+    ja .ratelimit_range
+    mov [rbx + linnea_config.rate_limit], rax
+    jmp .top_sep
+
 .top_perip:
     test r13d, 128
     jnz .top_dup
@@ -644,6 +666,10 @@ linnea_config_parse:
 .errlog_bad:
     lea rdi, [msg_errlog_bad]
     mov esi, msg_errlog_bad_len
+    jmp linnea_parse_fail
+.ratelimit_range:
+    lea rdi, [msg_ratelimit_range]
+    mov esi, msg_ratelimit_range_len
     jmp linnea_parse_fail
 .proxytmo_range:
     lea rdi, [msg_proxytmo_range]

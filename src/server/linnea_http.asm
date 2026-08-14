@@ -120,6 +120,9 @@ extern linnea_log_access_begin
 
 extern linnea_upstream_count
 extern linnea_upstream_open
+extern linnea_ratelimit_take
+extern linnea_ratelimit_on
+extern linnea_uring_now
 extern linnea_upstream_closed
 extern linnea_upstream_limit
 
@@ -178,6 +181,13 @@ resp_414:       db "HTTP/1.1 414 URI Too Long", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_414_len    equ $ - resp_414
+; RFC 6585 4. Connection: close on purpose — a client being metered should not
+; hold the connection open waiting to spend the next bucket on it.
+resp_429:       db "HTTP/1.1 429 Too Many Requests", 13, 10
+                db "Server: linnea", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_429_len    equ $ - resp_429
 resp_431:       db "HTTP/1.1 431 Request Header Fields Too Large", 13, 10
                 db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
@@ -779,6 +789,23 @@ linnea_http_handle:
     jmp .ret
 
 .found:
+    ; One complete head is one request — which on a keep-alive connection is a
+    ; very different count from max_per_ip's. Checked before the method is read,
+    ; so a refused request costs the parse of nothing.
+    cmp qword [linnea_ratelimit_on], 0
+    je .rl_ok
+    push r13
+    push r12
+    call linnea_uring_now            ; the clock FIRST: it takes rdi/rsi for its
+    mov rdx, rax                     ; syscall and would destroy the address
+    lea rdi, [rbx + linnea_connection.peer_ip]
+    mov rsi, [rbx + linnea_connection.peer_ip_len]
+    call linnea_ratelimit_take
+    pop r12
+    pop r13
+    test eax, eax
+    jnz .resp_429
+.rl_ok:
     ; whole head = terminator offset + 4 bytes; lines end strictly
     ; before r13 + 2 (the terminating empty line's CRLF).
     lea rax, [r13 + 4]
@@ -2693,6 +2720,11 @@ linnea_http_handle:
     lea rax, [resp_405]
     mov ecx, resp_405_len
     mov qword [rsp + 112], 405
+    jmp .resp_static
+.resp_429:
+    lea rax, [resp_429]
+    mov ecx, resp_429_len
+    mov qword [rsp + 112], 429
     jmp .resp_static
 .resp_413:
     lea rax, [resp_413]
