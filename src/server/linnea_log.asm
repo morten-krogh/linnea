@@ -14,6 +14,7 @@ global linnea_log_u64
 global linnea_log_stamp
 global linnea_log_access
 global linnea_log_access_begin
+global linnea_log_fatal
 global linnea_log_acc_host
 global linnea_log_acc_host_len
 global linnea_log_acc_peer
@@ -44,6 +45,8 @@ acc_from:       db " from "
 acc_from_len    equ $ - acc_from
 acc_quote:      db ' "'
 acc_endq:       db '" '
+fatal_pfx:      db "fatal: "
+fatal_pfx_len   equ $ - fatal_pfx
 acc_dash:       db "-"
 acc_sp:         db " "
 acc_nl:         db 10
@@ -267,6 +270,36 @@ linnea_log_u64:
     lea rdi, [num_buf]
     mov rsi, rax
     jmp linnea_log_write
+
+; linnea_log_fatal(rdi = msg, rsi = len) — "[stamp] fatal: <msg>" on the error
+; stream. The one place a worker's dying words land somewhere an operator can
+; actually read: linnea_error_exit prints to stderr, which under systemd is the
+; journal, and a deployment that configured error_log precisely so it would not
+; need the journal could see only that the master noticed a worker was gone —
+; never WHICH of the fatal sites fired. The master's line and this one together
+; are the cause; the master's alone is just the reason.
+; A fatal can land mid-record, so any half-built line is dropped first: a
+; truncated access line spliced onto the fatal is worse than the fatal alone.
+linnea_log_fatal:
+    push rbx
+    push r12
+    mov r12, rdi
+    mov rbx, rsi
+    mov qword [line_len], 0        ; discard a partial line
+    mov dword [line_sink], 0       ; diagnostics, not a request record
+    call linnea_log_stamp
+    lea rdi, [fatal_pfx]
+    mov esi, fatal_pfx_len
+    call linnea_log_write
+    mov rdi, r12
+    mov rsi, rbx
+    call linnea_log_write
+    lea rdi, [acc_nl]              ; the newline flushes it
+    mov esi, 1
+    call linnea_log_write
+    pop r12
+    pop rbx
+    ret
 
 ; linnea_log_stamp() — write "[YYYY-MM-DD HH:MM:SS] " (UTC) to the log.
 linnea_log_stamp:

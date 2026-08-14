@@ -18,6 +18,7 @@ extern linnea_print_stderr
 extern linnea_print_u64_stderr
 extern linnea_string_length
 extern linnea_parser_state
+extern linnea_log_fatal
 
 section .rodata
 
@@ -53,6 +54,9 @@ linnea_error_usage:
     jmp linnea_error_die
 
 ; linnea_error_exit(rdi=msg, rsi=len) — prints "linnea: <msg>\n", exit(1)
+; This is the fatal path a RUNNING worker takes (the startup variants below all
+; fire before there are workers), so the message is also written to the log —
+; see linnea_log_fatal for why stderr alone was not enough.
 linnea_error_exit:
     mov r12, rdi
     mov r13, rsi
@@ -65,6 +69,9 @@ linnea_error_exit:
     lea rdi, [newline_msg]
     mov esi, 1
     call linnea_print_stderr
+    mov rdi, r12
+    mov rsi, r13
+    call linnea_log_fatal
     jmp linnea_error_die
 
 ; linnea_error_open(rdi=msg, rsi=len, rdx=path cstr)

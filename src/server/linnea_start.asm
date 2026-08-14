@@ -112,8 +112,17 @@ log_worker:     db "worker "
 log_worker_len  equ $ - log_worker
 log_started:    db " started", 10
 log_started_len equ $ - log_started
-log_died:       db " exited, respawning", 10
-log_died_len    equ $ - log_died
+; A worker's exit is logged with its CAUSE, not just the fact of it. "exited"
+; alone cannot tell a signal death from a deliberate linnea_error_exit, and
+; those want opposite investigations — one is a fault in this binary, the other
+; is a limit this binary reached and named. wait4 hands us the status; throwing
+; it away here made the log say a worker was gone and nothing about why.
+log_died_sig:   db " exited on signal "
+log_died_sig_len equ $ - log_died_sig
+log_died_st:    db " exited with status "
+log_died_st_len equ $ - log_died_st
+log_died_end:   db ", respawning", 10
+log_died_end_len equ $ - log_died_end
 log_up_req:     db "binary upgrade requested", 10
 log_up_req_len  equ $ - log_up_req
 log_up_reject:  db "upgrade rejected: new binary failed the config check", 10
@@ -368,8 +377,33 @@ _start:
     call linnea_log_write
     mov rdi, r13
     call linnea_log_u64
-    lea rdi, [log_died]
-    mov esi, log_died_len
+    ; wait4's status, decoded: the low 7 bits are the signal that killed it,
+    ; and zero there means it exited of its own accord (a fatal path that has
+    ; already named itself through linnea_log_fatal). Re-read rather than hold
+    ; it in a register across the writes -- wait_status is ours until the next
+    ; wait4, and a value living in a bare register across an inserted call is
+    ; the trap this tree has been bitten by before.
+    mov eax, [wait_status]
+    and eax, 0x7f
+    jz .died_exit
+    lea rdi, [log_died_sig]
+    mov esi, log_died_sig_len
+    call linnea_log_write
+    mov eax, [wait_status]
+    and eax, 0x7f
+    mov edi, eax
+    jmp .died_num
+.died_exit:
+    lea rdi, [log_died_st]
+    mov esi, log_died_st_len
+    call linnea_log_write
+    mov eax, [wait_status]
+    shr eax, 8
+    movzx edi, al
+.died_num:
+    call linnea_log_u64
+    lea rdi, [log_died_end]
+    mov esi, log_died_end_len
     call linnea_log_write
     mov rdi, r12
     call spawn_worker

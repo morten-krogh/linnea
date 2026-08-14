@@ -210,7 +210,8 @@ bin/linnea-quichs: test/quic/linnea_quichs.o $(QUICMSG_OBJS) \
                    src/server/linnea_static.o src/lib/linnea_string.o src/server/linnea_time.o \
                    src/server/linnea_quic_conn.o src/server/linnea_quic_rtx.o src/server/linnea_quic_server.o \
                    src/server/linnea_quic_debug.o src/server/linnea_log.o src/server/linnea_error.o src/lib/linnea_print.o \
-                   src/server/linnea_config.o src/server/linnea_config_parse.o src/server/linnea_network.o
+                   src/server/linnea_config.o src/server/linnea_config_parse.o src/server/linnea_network.o \
+                   src/server/linnea_ratelimit.o
 	$(LD) -o $@ $^
 
 quichs: bin/linnea-quichs

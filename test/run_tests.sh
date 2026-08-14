@@ -2317,6 +2317,45 @@ err_life=$(grep -c "accepted connection" $RUNDIR/linnea-split-err.log 2>/dev/nul
 err_req=$(grep -c "request localhost" $RUNDIR/linnea-split-err.log 2>/dev/null || true)
 [ "${err_life:-0}" -ge 2 ] && [ "${err_req:-1}" = "0" ]
 check "error_log: the diagnostics went to the other file ($err_life lifecycle, $err_req req)" $?
+
+# A dead worker must say HOW it died. wait4 hands the master the status and the
+# master used to log only the pid, so nine worker deaths in one day (2026-08-14)
+# could not be told from nine clean exits -- and those want opposite
+# investigations. The worker's OWN fatal message went to stderr, which under
+# systemd is a journal an unprivileged operator cannot read, on a unit whose
+# AmbientCapabilities also forbid a core dump. Both halves are asserted here
+# because either alone leaves the cause unreadable.
+elog_worker=$(workers_of_now $elog_pid | awk '{print $1}')
+kill -9 $elog_worker 2>/dev/null
+for i in $(seq 1 40); do
+    grep -q "exited on signal" $RUNDIR/linnea-split-err.log 2>/dev/null && break
+    sleep 0.1
+done
+grep -q "worker $elog_worker exited on signal 9, respawning" $RUNDIR/linnea-split-err.log
+check "a worker killed by a signal is logged with that signal" $?
+# ...on the error stream, where diagnostics live -- not among the request records
+! grep -q "exited on signal" $RUNDIR/linnea-split-acc.log 2>/dev/null
+check "a worker death is a diagnostic, not an access record" $?
+# The control: a worker that exits of its own accord must read DIFFERENTLY, or
+# the line cannot answer the only question it exists to answer.
+#
+# Wait out the master's spawn-storm guard first. A worker that exits WITHOUT a
+# signal within one second of being spawned is treated as a startup error that
+# would repeat for ever, so the master gives up (.storm) instead of logging and
+# respawning -- and the worker respawned a moment ago by the kill -9 above is
+# well inside that window. Sending the SIGTERM immediately makes the master
+# exit and produces no status line at all, which is the server behaving
+# correctly and the test asking the wrong question.
+sleep 1.3
+elog_worker2=$(workers_of_now $elog_pid | awk '{print $1}')
+kill -TERM $elog_worker2 2>/dev/null
+for i in $(seq 1 40); do
+    grep -q "exited with status" $RUNDIR/linnea-split-err.log 2>/dev/null && break
+    sleep 0.1
+done
+grep -q "worker $elog_worker2 exited with status 0, respawning" $RUNDIR/linnea-split-err.log
+check "a worker that exits on its own is logged with its status, not a signal" $?
+
 kill $elog_pid 2>/dev/null
 wait $elog_pid 2>/dev/null
 
@@ -3903,8 +3942,12 @@ rm -f $RUNDIR/upload3_echo.bin
     check "tls upload: keep-alive survives a streamed body" $?
     grep -q '"POST /api/echo HTTP/1.1" 200' "$LOG"
     check "tls upload: the streamed request is logged with its target" $?
-    # the worker must still be the one that started (no crash + respawn)
-    ! grep -q "exited, respawning" "$LOG"
+    # the worker must still be the one that started (no crash + respawn).
+    # Match ", respawning" and not the whole old sentence: the line now carries
+    # the exit cause between the pid and that word ("exited on signal 9,
+    # respawning"), so the former pattern would never match again and this
+    # assertion would pass whatever happened.
+    ! grep -q ", respawning" "$LOG"
     check "tls upload: no worker died" $?
     rm -f $RUNDIR/upl_code.txt $RUNDIR/upl_ka.txt
 

@@ -98,8 +98,8 @@ global linnea_h3d_foff
 global linnea_h3d_flen
 global linnea_h3_cancel_hook
 
+extern linnea_error_exit
 extern linnea_h3_build_431
-extern linnea_uring_now
 extern linnea_h3_build_429
 extern linnea_ratelimit_take_sa
 extern linnea_ratelimit_on
@@ -239,6 +239,13 @@ section .rodata
 ; The directory only supplies the filesystem — O_TMPFILE creates no entry in
 ; it. The unit runs with PrivateTmp, so this is a namespace of our own.
 ; (the upload capture directory now comes from the config: spill_dir)
+
+; See the twin in linnea_tls.asm: a bare exit(1) here left a dead worker with no
+; log line, no stderr and no core, which is exactly the gap that made the
+; 2026-08-14 deaths unattributable.
+msg_gr_quic:    db "getrandom failed while generating QUIC randomness"
+msg_gr_quic_len equ $ - msg_gr_quic
+
 quic_alpn_h3:   db "h3"        ; the one application protocol this server offers
 ; Retry integrity tag key and nonce, fixed by the RFC per QUIC version:
 ; v1 RFC 9001 5.8, v2 RFC 9369 3.3. They authenticate a Retry to any client
@@ -3325,7 +3332,14 @@ linnea_quic_server_datagram:
     ; whichever protocol it arrives over.
     cmp qword [linnea_ratelimit_on], 0
     je .rl_ok
-    call linnea_uring_now
+    ; This file's OWN clock, not linnea_uring_now, and the reason is linkage:
+    ; bin/linnea-quichs links this object without the uring, so reaching for
+    ; that symbol broke that binary's link the moment rate_limit landed --
+    ; unnoticed, because the stale binary from the previous day stayed on disk
+    ; and the suite guards its use with [ -x ]. The limiter divides back down to
+    ; milliseconds, so ms*1e6 is the identical value to uring_now's exact ns.
+    call now_ms
+    imul rax, rax, 1000000
     mov rdx, rax
     mov rdi, [cur_conn]
     add rdi, linnea_quic_conn.peer
@@ -5316,9 +5330,9 @@ linnea_quic_server_datagram:
     pop rbx
     ret
 .gr_fail:
-    mov edi, 1
-    mov eax, LINNEA_SYS_EXIT
-    syscall
+    lea rdi, [msg_gr_quic]
+    mov esi, msg_gr_quic_len
+    jmp linnea_error_exit          ; names itself in the error log, then exits
 
 ; now_ms -> rax = CLOCK_MONOTONIC milliseconds. Monotonic so the probe timeout
 ; cannot be thrown off by a wall-clock step. Standalone (not a datagram-local)

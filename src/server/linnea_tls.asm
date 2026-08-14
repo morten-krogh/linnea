@@ -45,6 +45,13 @@ extern linnea_aesgcm_open
 
 section .rodata
 
+; A worker that dies here used to leave NOTHING behind -- no log line, no
+; stderr, and (this unit's AmbientCapabilities forbidding a core) no dump
+; either. Nine such deaths on 2026-08-14 could not be attributed at all,
+; because a bare exit(1) is indistinguishable from every other way to vanish.
+msg_getrandom:      db "linnea: getrandom failed while generating TLS randomness", 10
+msg_getrandom_len   equ $ - msg_getrandom
+
 align 16
 x25519_base:  db 9
               times 31 db 0
@@ -1994,6 +2001,21 @@ getrandom32:
     pop rbx
     ret
 .fail:
+    ; A bare write(2), calling NOTHING, and that is deliberate. This object is
+    ; linked into three binaries with three different object sets — bin/linnea,
+    ; bin/linnea-selftest (crypto helpers) and bin/linnea-tlstest — so every
+    ; extern added here is a link that can break in a product nobody rebuilds.
+    ; Both richer options did break one: linnea_error_exit pulled the log and,
+    ; through linnea_error_parse, the config parser into the self-test;
+    ; linnea_print_stderr broke linnea-tlstest, which has no linnea_print.o.
+    ; The twin in linnea_quic_server.asm is server-only and uses the full path
+    ; into the error log. What matters here is only that it no longer exits
+    ; saying NOTHING — the master's "exited with status 1" points at this line.
+    mov eax, LINNEA_SYS_WRITE
+    mov edi, 2                     ; stderr
+    lea rsi, [msg_getrandom]
+    mov edx, msg_getrandom_len
+    syscall
     mov edi, 1
     mov eax, LINNEA_SYS_EXIT
     syscall
