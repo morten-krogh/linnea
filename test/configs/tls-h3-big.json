@@ -4,9 +4,18 @@
   "max_body": 33554432,
   "servers": [
     {
-      "host": "127.0.0.1", "port": 61498, "hostname": "localhost",
-      "cert": "test/tls/server.crt", "key": "test/tls/server.key",
-      "locations": [ { "prefix": "/api", "proxy": "127.0.0.1:61100" } ]
+      "host": "127.0.0.1",
+      "port": 61498,
+      "hostname": "localhost",
+      "cert": "test/tls/server.crt",
+      "key": "test/tls/server.key",
+      "locations": [
+        {
+          "prefix": "/api",
+          "proxy": "127.0.0.1:61100"
+        }
+      ]
     }
-  ]
+  ],
+  "rate_limit": 200
 }

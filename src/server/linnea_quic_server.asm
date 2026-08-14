@@ -3332,6 +3332,21 @@ linnea_quic_server_datagram:
     ; whichever protocol it arrives over.
     cmp qword [linnea_ratelimit_on], 0
     je .rl_ok
+    ; r8 and r9 are the REQUEST BODY -- pointer and length -- left there by
+    ; linnea_h3_read_headers / the walk decode above, and not stored anywhere
+    ; until .req_owned's first two instructions. Everything called here is free
+    ; to clobber them, and both of these do. Without this save an h3 upload lost
+    ; its body the moment rate_limit was switched on: every POST answered 500
+    ; while GETs, having no body, were untouched -- so the suite and every
+    ; hand check stayed green and only a real upload showed it.
+    ;
+    ; The hook sits deliberately early (before the drain and authority gates,
+    ; being cheaper than either), which is exactly what put it between the
+    ; parse and the one place that saves what the parse returned.
+    ;
+    ; Two pushes, so rsp stays 16-aligned across the calls.
+    push r8
+    push r9
     ; This file's OWN clock, not linnea_uring_now, and the reason is linkage:
     ; bin/linnea-quichs links this object without the uring, so reaching for
     ; that symbol broke that binary's link the moment rate_limit landed --
@@ -3344,6 +3359,8 @@ linnea_quic_server_datagram:
     mov rdi, [cur_conn]
     add rdi, linnea_quic_conn.peer
     call linnea_ratelimit_take_sa
+    pop r9
+    pop r8
     test eax, eax
     jz .rl_ok
     ; refused: a canned 429 on this stream, framed like the other pre-routing
