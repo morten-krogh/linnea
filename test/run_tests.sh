@@ -2710,6 +2710,19 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # lookup missed and the sample was discarded. Measured 1035 ms before, 33 ms
     # after. The bound is generous: anything near a second means the sampling has
     # stopped working again, whatever the box is doing.
+    # A browser-shaped upload: several LARGE DATA frames, which is what a Chrome
+    # netlog showed (three of 371,712 bytes for 1 MB). The stall lives at the
+    # frame BOUNDARY -- inside a payload the ceiling runs body_hi + RA_WINDOW, so
+    # every other upload check here is single-frame and blind to it. Between
+    # frames the ceiling is base + RA_BUF, and that step IS the credit a client
+    # crosses the boundary on: under its bandwidth x RTT it blocks, once per
+    # frame. Chrome did, five times, for ~390 ms of a 3.1 s upload, on a link
+    # whose BDP was 37 KB against 32 KiB of runway.
+    #
+    # The floor asserts the step, not a time (loopback grants instantly) and not
+    # the grant count (identical at both sizes -- they coalesce here).
+    out10=$(timeout 180 python3 test/quic/h3_upload_frames.py localhost ${P61498} 3 371712 --min-step 131072 2>&1)
+    check "h3 a multi-frame upload gets a full buffer of credit per boundary ($out10)" $?
     out8=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 1 --max-ms 400 2>&1)
     check "h3 a lost final response is recovered from a MEASURED rtt ($out8)" $?
     out9=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 0 --max-ms 400 2>&1)

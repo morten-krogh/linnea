@@ -47,10 +47,17 @@ from aioquic.h3.events import DataReceived, HeadersReceived
 
 PORT = int(sys.argv[1])
 ADDR = ("127.0.0.1", PORT)
-# Past LINNEA_QUIC_RA_BUF (32768), so the body takes the direct-to-file path and
-# the payload's end sits more than a window above the pinned base -- which is
-# what turns the offset into an apparent violation.
-N = 40000
+# N MUST EXCEED LINNEA_QUIC_RA_BUF, so the body takes the direct-to-file path
+# and the payload's end sits more than a window above the pinned base -- which is
+# what turns the offset into an apparent violation. Under that, the whole payload
+# plus the 64 bytes past it fits inside base + RA_BUF, accepting them is correct,
+# and the data case below tests nothing.
+#
+# It broke exactly that way when RA_BUF went 32768 -> 131072 and N was 40000: the
+# check reported "the bound is not being enforced" against a server enforcing it
+# perfectly at a higher offset. Keep this comfortably above RA_BUF, and if that
+# constant moves again, this number moves with it.
+N = 200000
 BODY = bytes((i * 37 + 11) & 0xFF for i in range(N))
 HOLD = 2
 FLOW_CONTROL_ERROR = 0x03

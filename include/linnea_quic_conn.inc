@@ -168,7 +168,27 @@ LINNEA_QUIC_PU_PEND equ 8
 ; would drop all but one (the packet is already acknowledged, so the dropped
 ; request is never retransmitted — it is lost, and the page stalls). Requests
 ; larger than the buffer, or a burst deeper than the contexts, are still dropped.
-LINNEA_QUIC_RA_BUF      equ 32768   ; reassembly capacity for one request stream
+; It is also the RUNWAY a client gets at every DATA frame boundary, and that is
+; what sets its size. Between frames the ceiling is base + RA_BUF (a gap there
+; might hide the next frame header, so we cannot invite past it -- see the
+; upload window below), so a client must cross each boundary on RA_BUF of credit
+; while a fresh grant makes a round trip. Under bandwidth x RTT, it stalls.
+;
+; 32 KiB was under it for an ordinary browser on an ordinary link. Measured from
+; a Chrome netlog of one 1 MB upload: THREE DATA frames of 371,712 bytes -- 11x
+; the window -- and five STREAM_DATA_BLOCKED frames, one per boundary, ~390 ms
+; of a 3.1 s upload spent stalled on us before counting the congestion-window
+; recovery each stall costs. That client's bandwidth-delay product was 37 KB
+; against 32 KiB of runway: short by a hair, every single frame.
+;
+; 128 KiB clears that by 3.5x and covers ~1 MB/s at 120 ms. The cost is address
+; space rather than memory -- the pool is a private anonymous mapping, faulted
+; on touch -- but state it plainly: RA_CTXS(6) * (buf + its arrival bitmap) is
+; 864 KB per connection, so 226 MB per worker in the pathological case where all
+; 256 connections run six concurrent uploads each. It was 57 MB at 32 KiB.
+LINNEA_QUIC_RA_BUF      equ 131072  ; reassembly capacity for one request stream,
+                                    ; and the credit a client crosses a frame
+                                    ; boundary on
 ; Receive-side connection flow control (quic-9). We advertise INITIAL_MAX_DATA and
 ; keep the ceiling FC_WINDOW ahead of what the peer has sent, re-granting via
 ; MAX_DATA whenever a fresh grant would advance the ceiling by >= FC_GRANT_MIN.
