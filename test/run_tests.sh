@@ -2721,8 +2721,8 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     #
     # The floor asserts the step, not a time (loopback grants instantly) and not
     # the grant count (identical at both sizes -- they coalesce here).
-    out10=$(timeout 180 python3 test/quic/h3_upload_frames.py localhost ${P61498} 3 371712 --min-step 131072 2>&1)
-    check "h3 a multi-frame upload gets a full buffer of credit per boundary ($out10)" $?
+    out10=$(timeout 180 python3 test/quic/h3_upload_frames.py localhost ${P61498} 3 371712 --max-blocked 0 --rtt-ms 20 2>&1)
+    check "h3 a browser-shaped multi-frame upload never blocks on our window ($out10)" $?
     out8=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 1 --max-ms 400 2>&1)
     check "h3 a lost final response is recovered from a MEASURED rtt ($out8)" $?
     out9=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 0 --max-ms 400 2>&1)
