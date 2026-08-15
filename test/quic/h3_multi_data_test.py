@@ -30,12 +30,32 @@ from aioquic.h3.events import DataReceived, HeadersReceived
 
 PORT = int(sys.argv[1])
 ADDR = ("127.0.0.1", PORT)
-RA_BUF = 32768
+# Only sizes the two cases; which path each one actually took is asserted from
+# the window the SERVER advertises, so a stale value here cannot silently turn
+# the file-path case into a second RAM-path one the way it once did.
+RA_BUF = 131072
 SECOND = bytes((i * 11 + 37) & 0xFF for i in range(20000))
 
 
-def echo(first_len, label):
-    """POST first_len bytes then SECOND, as two DATA frames. -> None, or why not."""
+def echo(first_len, label, want_file_path, drain_between=True):
+    """POST first_len bytes then SECOND, as two DATA frames. -> None, or why not.
+
+    want_file_path says which of the two ingest paths the first frame is meant
+    to take, and the window the server advertises is what decides it. Asserting
+    that here is not ceremony: this file had RA_BUF written into it as 32768,
+    and when the server's went to 131072 the "capture-file path" case quietly
+    became a second RAM-path case. Both cases passed, the label still said
+    otherwise, and the multi-frame file path -- the one with a payload region,
+    a straddling frame and a split -- went untested through two rewrites of it.
+
+    drain_between=False queues both frames before anything is sent, which is
+    what a browser does and what produces a STREAM frame carrying the END of one
+    DATA payload and the START of the next. The server has to split that frame,
+    writing the first half to the capture file and buffering the second, and an
+    off-by-one in the split shows up here as a body that differs rather than as
+    anything failing loudly. Draining between the frames -- which is all this
+    test used to do -- never produces one.
+    """
     part1 = bytes((i * 37 + 11) & 0xFF for i in range(first_len))
     body = part1 + SECOND
 
@@ -71,14 +91,27 @@ def echo(first_len, label):
     if not conn._handshake_confirmed:
         return "%s: handshake failed" % label
 
+    # A DATA frame the reassembly window already covers stays on the RAM path
+    # deliberately; only one larger than it opens a payload region written
+    # straight to the capture file.
+    window = conn._remote_max_stream_data_bidi_remote
+    if want_file_path and first_len <= window:
+        return ("%s: a first frame of %d does not exceed the server's stream "
+                "window %d, so it takes the RAM path and this case is a "
+                "duplicate of the control" % (label, first_len, window))
+    if not want_file_path and first_len > window:
+        return ("%s: a first frame of %d exceeds the server's stream window %d, "
+                "so the control is not on the RAM path" % (label, first_len, window))
+
     h3 = H3Connection(conn)
     sid = conn.get_next_available_stream_id()
     h3.send_headers(sid, [(b":method", b"POST"), (b":scheme", b"https"),
                           (b":authority", b"localhost"), (b":path", b"/api/echo"),
                           (b"content-length", str(len(body)).encode())], end_stream=False)
-    h3.send_data(sid, part1, end_stream=False)      # the first DATA frame, alone
-    flush()
-    pump(0.5)                                       # ...fully ingested before the next
+    h3.send_data(sid, part1, end_stream=False)      # the first DATA frame
+    if drain_between:
+        flush()
+        pump(0.5)                                   # ...fully ingested before the next
     h3.send_data(sid, SECOND, end_stream=True)      # the frame that needs fresh credit
     flush()
 
@@ -116,13 +149,18 @@ def echo(first_len, label):
     return None
 
 
-bad = echo(RA_BUF // 2, "small first frame (control, RAM path)")
+bad = echo(RA_BUF // 2, "small first frame (control, RAM path)", False)
 if bad:
     print(bad)
     sys.exit(1)
-bad = echo(40000, "large first frame (capture-file path)")
+bad = echo(RA_BUF * 3, "large first frame (capture-file path)", True)
 if bad:
     print(bad)
     sys.exit(1)
-print("ok (a body in two DATA frames completes byte-exact, first frame either "
-      "side of RA_BUF)")
+bad = echo(RA_BUF * 3, "large first frame, both queued at once (straddling frame)",
+           True, drain_between=False)
+if bad:
+    print(bad)
+    sys.exit(1)
+print("ok (a body in two DATA frames completes byte-exact: RAM path, capture-file "
+      "path, and a frame straddling the boundary between them)")

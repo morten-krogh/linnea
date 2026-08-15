@@ -17,11 +17,19 @@
 #     (16 KiB), which the grant path skipped as not worth a packet.
 #
 # The size therefore decides WHICH fault this exercises, and neither one is
-# about volume. Anything from RA_BUF up to about 49000 lands in the second
-# fault's band and hangs deterministically; something past 4 MiB exercises the
-# first. See the two sizes run in test/run_tests.sh.
+# about volume. See the sizes run in test/run_tests.sh.
 #
-# Usage: h3_upload_big.py <host> <bytes> [port]
+# Which path a size takes is DERIVED FROM THE SERVER and printed, never assumed
+# from a number written here. When RA_BUF went 32768 -> 131072 the 40000-byte
+# case stopped reaching the capture file altogether, and the suite went on
+# reporting "goes to the capture file and echoes back" for a body that never
+# left RAM. The second fault's band -- a payload just over RA_BUF, where the
+# last grant step up to the cap fell under RA_GRANT and was suppressed -- also
+# moved, and then closed: a payload shorter than RA_WINDOW now has its whole
+# ceiling granted in one step at take-over, so only a payload past RA_WINDOW
+# reaches the grant loop that fault lived in at all.
+#
+# Usage: h3_upload_big.py <host> <bytes> [port] [--path ram|file]
 import hashlib, socket, ssl, sys, time
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
@@ -29,13 +37,15 @@ from aioquic.h3.connection import H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived
 
 host, n = sys.argv[1], int(sys.argv[2])
-ADDR = ("127.0.0.1", int(sys.argv[3])) if len(sys.argv) > 3 else (socket.gethostbyname(host), 443)
+WANT_PATH = sys.argv[sys.argv.index("--path") + 1] if "--path" in sys.argv else None
+have_port = len(sys.argv) > 3 and not sys.argv[3].startswith("--")
+ADDR = ("127.0.0.1", int(sys.argv[3])) if have_port else (socket.gethostbyname(host), 443)
 body = bytes((i * 37 + 11) & 0xFF for i in range(n))
 want = hashlib.sha256(body).hexdigest()
 
 cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
 cfg.server_name = host
-if len(sys.argv) > 3: cfg.verify_mode = ssl.CERT_NONE
+if have_port: cfg.verify_mode = ssl.CERT_NONE
 conn = QuicConnection(configuration=cfg)
 conn.connect(ADDR, now=time.time())
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -57,6 +67,17 @@ while not conn._handshake_confirmed and time.time() < dl:
     flush()
 if not conn._handshake_confirmed:
     print("handshake failed")
+    sys.exit(1)
+
+# Which ingest path this size takes, decided by the window the SERVER advertises
+# (initial_max_stream_data_bidi_remote, which is RA_BUF): a DATA payload the
+# window already covers stays in RAM, a larger one opens a region written
+# straight to the capture file.
+window = conn._remote_max_stream_data_bidi_remote
+path = "capture-file" if n > window else "RAM"
+if WANT_PATH and path != {"ram": "RAM", "file": "capture-file"}[WANT_PATH]:
+    print("%d bytes takes the %s path against the server's %d-byte stream window, "
+          "not the %s path this case is for" % (n, path, window, WANT_PATH))
     sys.exit(1)
 
 h3 = H3Connection(conn)
@@ -104,4 +125,4 @@ if len(data) != n:
 if hashlib.sha256(data).hexdigest() != want:
     print("echoed %d bytes but the content differs" % len(data))
     sys.exit(1)
-print("ok (%d bytes, %.2fs, byte-exact)" % (n, dt))
+print("ok (%d bytes, %.2fs, byte-exact, %s path)" % (n, dt, path))

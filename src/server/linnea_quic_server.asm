@@ -349,6 +349,11 @@ s_sdata:     resq 1                   ; that stream's data pointer
 s_slen:      resq 1                   ; and length
 s_soff:      resq 1                   ; and offset (0 = the stream's first bytes)
 s_sfin:      resq 1                   ; and whether its FIN bit is set
+; How many of an arriving frame's bytes fall inside the open DATA payload. A
+; frame that ends past the payload carries the start of the NEXT one, and the
+; two halves go to different places -- the file and the reassembly window -- so
+; the split point has to survive the call that writes the first half.
+s_bhead:     resq 1
 s_rst_code:  resq 1                   ; app error code for the next RESET_STREAM
 s_body_ptr:  resq 1                   ; request body captured by read_headers
 s_body_len:  resq 1
@@ -2502,14 +2507,24 @@ linnea_quic_server_datagram:
     mov r9, [s_soff]                           ; the frame's stream offset
     mov r10, [s_slen]                          ; and length
     mov rsi, [s_sdata]
-    ; The window has a base: everything below it has been consumed already, so
-    ; a retransmit of those bytes says nothing new. Trim them rather than
-    ; treating the frame as out of range.
+    ; Everything below the floor has been consumed already, so a retransmit of
+    ; those bytes says nothing new. Trim them rather than treating the frame as
+    ; out of range.
+    ;
+    ; The floor is the window's base -- EXCEPT while a payload region is open.
+    ; There base has already been moved to the payload's END, so that the buffer
+    ; holds what FOLLOWS the payload and a peer can be invited across the frame
+    ; boundary; the payload's own bytes then lie BELOW base and would be trimmed
+    ; away as stale. body_from is the floor for as long as that lasts.
     mov r11, [rax + linnea_quic_ra.base]
+    cmp qword [rax + linnea_quic_ra.body_to], 0
+    je .ra_floor
+    mov r11, [rax + linnea_quic_ra.body_from]
+.ra_floor:
     cmp r9, r11
     jae .ra_rel
     mov rcx, r11
-    sub rcx, r9                                ; bytes below the base
+    sub rcx, r9                                ; bytes below the floor
     cmp rcx, r10
     jae .ra_below                              ; all of it: nothing to place
     add rsi, rcx
@@ -2520,52 +2535,32 @@ linnea_quic_server_datagram:
     ; capture file -- the mapping is a constant subtraction within one frame --
     ; so they go straight there wherever in the payload they land, and the RAM
     ; window neither holds them nor bounds how many may be in flight.
+    ;
+    ; A frame that runs PAST the payload carries the start of the next one, and
+    ; that half belongs in the window. Splitting here is what makes it safe to
+    ; invite a peer beyond the payload's end: the bytes the invitation brings
+    ; have somewhere to go. Before the split they had none, so the ceiling had
+    ; to stop dead at body_to and every DATA frame boundary cost a round trip.
     cmp qword [rax + linnea_quic_ra.body_to], 0
-    je .ra_win
-    cmp r9, [rax + linnea_quic_ra.body_from]
-    jb .ra_win                                 ; below it: framing, not body
+    je .ra_win                                 ; no payload open: all window
     mov rcx, [rax + linnea_quic_ra.body_to]
     cmp r9, rcx
-    jb .ra_binside
-    ; At the payload's end exactly, carrying nothing: the peer is ENDING THE
-    ; STREAM at the limit it was granted, which inside a payload is body_to.
-    ; RFC 9000 4.1 allows a final size equal to the limit, and nothing obliges
-    ; the FIN to ride a frame that also carries data -- so this is a conforming
-    ; peer, not a violation.
-    ;
-    ; It cannot go through the window below. That window is indexed from base,
-    ; which stays pinned at the payload's START for as long as the payload is
-    ; being written to the file, so this offset reads as a whole payload past a
-    ; 32 KiB buffer and trips the bound. It closed the connection with
-    ; FLOW_CONTROL_ERROR against a peer that had done nothing wrong.
-    ;
-    ; Record the end and leave the window alone. The completion check cannot
-    ; fire yet (base + len is still the payload's start, not its end), so this
-    ; waits for the payload exactly as it should; ra_slide moves base to
-    ; body_to when the region closes, and the check fires on that pass.
-    jne .ra_win                                ; PAST the end: a real violation
-    test r10, r10
-    jnz .ra_win                                ; data past it: likewise
-    mov qword [rax + linnea_quic_ra.fin], 1
-    mov rcx, [s_soff]
-    add rcx, [s_slen]
-    mov [rax + linnea_quic_ra.final], rcx      ; an absolute stream offset
-    jmp .ra_donecheck
-.ra_binside:
+    jae .ra_win                                ; wholly past it: all window
     mov rdx, rcx
-    sub rdx, r9                                ; a frame may straddle the end
+    sub rdx, r9                                ; room to the payload's end
     cmp r10, rdx
-    jbe .ra_bplace
-    mov r10, rdx
-.ra_bplace:
+    jae .ra_bhead                              ; straddles it, or ends on it
+    mov rdx, r10                               ; wholly inside: all of it
+.ra_bhead:
+    mov [s_bhead], rdx                         ; the payload's share of this frame
     push rax
     push r9
     push r10
     push rsi
     mov rdi, rax
+    mov rcx, rdx
     mov rdx, rsi
     mov rsi, r9
-    mov rcx, r10
     call ra_body_place
     mov r8d, eax
     pop rsi
@@ -2575,13 +2570,20 @@ linnea_quic_server_datagram:
     mov [s_ra_ctx], rax
     test r8d, r8d
     js .ra_body_failed
+    mov rdx, [s_bhead]
+    add r9, rdx
+    add rsi, rdx
+    sub r10, rdx                               ; what is left is the next frame's
+    jnz .ra_win                                ; ...and it goes in the window
+    ; Nothing past the payload. The frame may still have carried the FIN, which
+    ; the window path would have recorded, so record it here instead.
     cmp qword [s_sfin], 0
-    je .ra_bwhole
+    je .ra_bcheck
     mov qword [rax + linnea_quic_ra.fin], 1
     mov rcx, [s_soff]
     add rcx, [s_slen]
-    mov [rax + linnea_quic_ra.final], rcx
-.ra_bwhole:
+    mov [rax + linnea_quic_ra.final], rcx      ; an absolute stream offset
+.ra_bcheck:
     mov rcx, [rax + linnea_quic_ra.body_hi]
     cmp rcx, [rax + linnea_quic_ra.body_to]
     jae .ra_bfull
@@ -2595,18 +2597,19 @@ linnea_quic_server_datagram:
 .ra_bfull:
     ; Whole. The walk may move past a payload it never saw: zeroing frame_rem
     ; is what .w_data reads to reach .w_frame_end and the next frame header.
+    ;
+    ; No slide here, and that is the point. base was moved to body_to when the
+    ; region OPENED, so .buf, .seen, .hi and .len already count from the
+    ; payload's end and already hold whatever of the next frame has arrived.
+    ; Sliding now would reset .len to zero over bytes the walk has never been
+    ; handed, and only an arriving frame re-walks the map -- a peer that has
+    ; already sent everything it holds has none left to send. That is the
+    ; deadlock the first attempt at this shipped.
     mov rcx, [rax + linnea_quic_ra.body_to]
     sub rcx, [rax + linnea_quic_ra.body_from]
     add [rax + linnea_quic_ra.spill_len], rcx  ; the sink writes on after it
     mov qword [rax + linnea_quic_ra.walk + linnea_h3_walk.frame_rem], 0
-    mov rcx, [rax + linnea_quic_ra.body_to]
-    sub rcx, [rax + linnea_quic_ra.base]
     mov qword [rax + linnea_quic_ra.body_to], 0
-    push rax
-    mov rdi, rax
-    mov rsi, rcx
-    call ra_slide                              ; the window resumes at its end
-    pop rax
     jmp .ra_donecheck
 .ra_body_toobig:
     ; The DECLARED payload is past max_body, which is the peer's to hear about
@@ -2630,6 +2633,9 @@ linnea_quic_server_datagram:
     mov rax, -LINNEA_H3_ERR_SINK
     jmp .ra_walk_failed
 .ra_win:
+    ; base, not the floor above: while a payload is open those differ, and the
+    ; window is indexed from base.
+    mov r11, [rax + linnea_quic_ra.base]
     sub r9, r11                                ; offset within the window
     mov r11, r9
     add r11, r10                               ; where the frame ends in it
@@ -2654,26 +2660,26 @@ linnea_quic_server_datagram:
     cmp r11, r10
     jbe .ra_advance
     mov [rax + linnea_quic_ra.hi], r11
-    mov r10, r11                               ; r10 = hi
 .ra_advance:
-    ; advance the contiguous prefix while the next byte has been seen
-    mov r8, [rax + linnea_quic_ra.len]
-    lea rdi, [rax + linnea_quic_ra.seen]
-.ra_adv_loop:
-    cmp r8, r10                                ; reached the high-water?
-    jae .ra_adv_done
-    bt [rdi], r8
-    jnc .ra_adv_done                           ; a gap: stop here
-    inc r8
-    jmp .ra_adv_loop
-.ra_adv_done:
-    mov [rax + linnea_quic_ra.len], r8
+    push rax
+    push rax                                   ; a second copy: rsp stays aligned
+    mov rdi, rax
+    call ra_prefix_advance
+    pop rax
+    pop rax
     cmp qword [s_sfin], 0
-    je .ra_donecheck
+    je .ra_after_win
     mov qword [rax + linnea_quic_ra.fin], 1
     mov r10, [s_soff]
     add r10, [s_slen]
     mov [rax + linnea_quic_ra.final], r10      ; an absolute stream offset
+.ra_after_win:
+    ; While a payload is open, what was just buffered belongs to the frame AFTER
+    ; it, and the walk must not be handed those bytes: it is mid-payload and
+    ; would read the next frame's header as body. They wait in the window, and
+    ; the feed below happens on the pass that closes the region.
+    cmp qword [rax + linnea_quic_ra.body_to], 0
+    jne .ra_bcheck
 .ra_donecheck:
     ; Hand the walk whatever the contiguous prefix has gained. It parses as far
     ; as those bytes go and keeps its place, so the stream is consumed as it
@@ -2735,7 +2741,13 @@ linnea_quic_server_datagram:
     ; a byte we could not place.
     mov rdi, [s_ra_ctx]
     cmp qword [rdi + linnea_quic_ra.body_to], 0
-    jne .ra_ceiling                            ; already in one
+    jne .ra_ceiling                            ; already in one. Nothing reaches
+                                               ; here with a region open now --
+                                               ; the arrival path diverts to the
+                                               ; completion check while one is --
+                                               ; but opening a second over a live
+                                               ; one would silently corrupt the
+                                               ; file mapping, so the guard stays
     cmp qword [rdi + linnea_quic_ra.walk + linnea_h3_walk.phase], LINNEA_H3_W_DATA
     jne .ra_ceiling
     mov rcx, [rdi + linnea_quic_ra.walk + linnea_h3_walk.frame_rem]
@@ -2766,25 +2778,56 @@ linnea_quic_server_datagram:
     call ra_body_migrate                       ; anything already buffered
     test eax, eax
     js .ra_body_failed
+    ; The window now moves to the payload's END, ahead of the payload itself.
+    ; That is what lets the ceiling be raised past the frame: .buf comes to hold
+    ; what FOLLOWS the payload, so a peer can be invited across the boundary
+    ; instead of stopping dead on it once per DATA frame. From here to the
+    ; region's close, the payload's own bytes lie below base and reach the file
+    ; through the split in the arrival path.
+    ;
+    ; ra_slide owns moving base, and it also resets .len -- so anything it
+    ; brings DOWN into the prefix's path arrives with nothing left to walk it,
+    ; because the advance runs when a frame ARRIVES and a peer that has already
+    ; sent all it holds sends no more. That is the deadlock shape this machinery
+    ; has now shipped twice, so the walk is re-entered here.
+    ;
+    ; Be honest about it: today it can find nothing. The slide is over the whole
+    ; payload, and nothing beyond the payload can be in the buffer to survive it
+    ; -- the old ceiling was base + RA_BUF, a region is only taken over when the
+    ; payload is at least RA_BUF, so every buffered byte is payload and
+    ; ra_body_migrate has just moved and unmarked all of it. The call is one
+    ; compare against the day the RA_BUF gate below moves; without it that day
+    ; produces a hung upload and no other symptom.
     mov rdi, [s_ra_ctx]
+    mov rsi, [rdi + linnea_quic_ra.body_to]
+    sub rsi, [rdi + linnea_quic_ra.base]
+    call ra_slide
+    mov rdi, [s_ra_ctx]
+    call ra_prefix_advance
+    ; A payload can be whole the moment it is taken over, when the buffer was
+    ; already full of it, so the completion check owns the exit rather than the
+    ; grant: it falls through to the grant when the region is still filling.
+    mov rax, [s_ra_ctx]
+    jmp .ra_bcheck
 .ra_ceiling:
+    ; What the buffer can hold from where it now starts. Inside a payload base
+    ; IS the payload's end, so this invites the peer a whole buffer past the
+    ; frame it is sending -- across the boundary, without waiting for the grant
+    ; that used to follow the payload's last byte a round trip later.
     mov rax, [rdi + linnea_quic_ra.base]
+    add rax, LINNEA_QUIC_RA_BUF
     cmp qword [rdi + linnea_quic_ra.body_to], 0
-    je .ra_ceil_buf
-    ; Inside a payload: RA_WINDOW ahead of what has actually LANDED, never
-    ; past the frame. Measured from body_hi rather than base, because base
-    ; does not move until the whole region is in — so a window measured from
-    ; it is fixed for the payload's lifetime and anything longer than
-    ; RA_WINDOW can never finish.
-    mov rax, [rdi + linnea_quic_ra.body_hi]
-    add rax, LINNEA_QUIC_RA_WINDOW
-    mov rcx, [rdi + linnea_quic_ra.body_to]
-    cmp rax, rcx
-    jbe .ra_ceil_have
+    je .ra_ceil_have
+    ; The payload's own bytes go to the file and the buffer does not bound them,
+    ; but how many may be in flight at once still is: RA_WINDOW ahead of what
+    ; has actually LANDED. Measured from body_hi rather than base, because a
+    ; window measured from a base that does not move would be fixed for the
+    ; payload's lifetime and anything longer than RA_WINDOW could never finish.
+    mov rcx, [rdi + linnea_quic_ra.body_hi]
+    add rcx, LINNEA_QUIC_RA_WINDOW
+    cmp rcx, rax
+    jae .ra_ceil_have
     mov rax, rcx
-    jmp .ra_ceil_have
-.ra_ceil_buf:
-    add rax, LINNEA_QUIC_RA_BUF                ; the ceiling it may now reach
 .ra_ceil_have:
     cmp rax, [rdi + linnea_quic_ra.fc_adv]
     jbe .ra_fed_none                           ; never renege: a lower ceiling
@@ -2796,23 +2839,30 @@ linnea_quic_server_datagram:
     jae .ra_grant
     ; A step smaller than RA_GRANT is normally not worth a packet: the ceiling
     ; will move again shortly and one grant can carry both. Inside a payload it
-    ; will NOT, because there the ceiling is capped at the payload's end -- so
-    ; the last step up to that cap is whatever is left over, frequently only a
-    ; few bytes, and suppressing it strands the peer that many bytes short of a
-    ; body whose length it has already been told. It waits for credit, we wait
-    ; for the bytes, and neither side ever speaks again.
+    ; will NOT, because there the ceiling is capped -- so the last step up to
+    ; that cap is whatever is left over, frequently only a few bytes, and
+    ; suppressing it strands the peer that many bytes short of a body whose
+    ; length it has already been told. It waits for credit, we wait for the
+    ; bytes, and neither side ever speaks again.
     ;
     ; This is what hung an h3 upload, and it was never about being large: the
-    ; leftover is just body_to modulo how far body_hi happened to jump between
+    ; leftover is just the cap modulo how far body_hi happened to jump between
     ; evaluations. 8 MB completed three times and then hung on the same binary,
     ; which read as a mysterious size threshold and sent a bisect chasing one.
     ; A 40000-byte upload hangs every time and a 60000-byte one never does.
+    ;
+    ; The cap is base + RA_BUF, which is the payload's end plus a buffer, not
+    ; the payload's end -- so a suppressed last step would now cost the peer its
+    ; runway across the boundary rather than the tail of the body. Less than a
+    ; deadlock, and still the whole point of the runway, so it fires either way.
     ;
     ; Firing here costs one extra packet per payload at most: the ceiling is at
     ; its cap afterwards, so every later evaluation stops at the renege guard.
     cmp qword [rdi + linnea_quic_ra.body_to], 0
     je .ra_fed_none                            ; buffer path: base keeps moving
-    cmp rax, [rdi + linnea_quic_ra.body_to]
+    mov rcx, [rdi + linnea_quic_ra.base]
+    add rcx, LINNEA_QUIC_RA_BUF
+    cmp rax, rcx
     jne .ra_fed_none                           ; not the cap: a bigger step comes
 .ra_grant:
     mov [rdi + linnea_quic_ra.fc_adv], rax
@@ -2839,13 +2889,20 @@ linnea_quic_server_datagram:
     ; the grant lives only on the feed's tail, so leaving here directly meant
     ; never sending one.
     ;
-    ; That deadlocked a body split across SEVERAL DATA frames. Closing a
-    ; payload region slides base to its end and comes straight here, and on
-    ; that pass len == fed and no FIN has arrived: the ceiling the peer holds
-    ; is the payload's end, which is now exactly base, so it has no credit for
-    ; the next frame's header and cannot send the byte that would let us grant
-    ; more. Both sides then wait for ever. The trace reads adv == base with a
-    ; whole body already captured.
+    ; That deadlocked a body split across SEVERAL DATA frames. Closing a payload
+    ; region left base at its end and came straight here, and on that pass len
+    ; == fed and no FIN has arrived: the ceiling the peer held was the payload's
+    ; end, which was now exactly base, so it had no credit for the next frame's
+    ; header and could not send the byte that would let us grant more. Both
+    ; sides then waited for ever. The trace read adv == base with a whole body
+    ; already captured.
+    ;
+    ; The peer now carries a buffer's worth of credit PAST the payload's end
+    ; before it gets there, so it has the header's credit in hand and that exact
+    ; deadlock can no longer form. This stays because it is not the only way to
+    ; arrive owed credit -- a frame trimmed wholly below the floor reaches here
+    ; too -- and because the grant belongs on every path out, not on the one
+    ; that happened to need it first.
     ;
     ; A single-frame body hides it completely: there the FIN arrives with the
     ; payload's last bytes, so this pass completes the request instead of
@@ -2889,12 +2946,13 @@ linnea_quic_server_datagram:
     mov rdi, rax
     call ra_release                             ; abandon the over-long stream
     pop rax
-    ; The peer sent past the window it was given. OUTSIDE a DATA payload that
-    ; window is still the reassembly buffer — the handshake advertises
-    ; initial_max_stream_data_bidi_remote = RA_BUF, and it is only raised past
-    ; it once a payload's extent makes every further byte placeable — so this
-    ; remains a flow-control violation, and the connection closes for it
-    ; (RFC 9000 4.1: FLOW_CONTROL_ERROR = 0x03).
+    ; The peer sent past the window it was given. What reaches the buffer is
+    ; always bounded by RA_BUF from base — the handshake advertises
+    ; initial_max_stream_data_bidi_remote = RA_BUF, and the ceiling only ever
+    ; runs further ahead over a DATA payload, whose bytes are split off above
+    ; and written to the file instead — so this remains a flow-control
+    ; violation, and the connection closes for it (RFC 9000 4.1:
+    ; FLOW_CONTROL_ERROR = 0x03).
     mov edi, 0x03                               ; FLOW_CONTROL_ERROR
     mov esi, 0x08                               ; a STREAM frame triggered it
     jmp .transport_close
@@ -7574,6 +7632,34 @@ ra_body_sink:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ra_prefix_advance(rdi = context) — walk the arrived-bytes map forward from the
+; contiguous prefix, as far as the bits allow.
+;
+; A function rather than the inline loop it replaced, because there are two
+; callers and only one of them is a frame arriving. A SLIDE also moves bytes
+; that arrived earlier down into the prefix's path, without any frame arriving
+; to notice — and .len is reset by the slide, so unless the walk is re-entered
+; those bytes are never handed on: the context sits holding exactly what the
+; stream is waiting for. That is the deadlock a first attempt at inviting a peer
+; past a DATA payload shipped, and it reproduced only in the multi-frame case
+; while a single-frame 16 MB upload stayed byte-exact.
+;
+; rax/rcx/rdx only, so a caller mid-frame keeps its registers.
+ra_prefix_advance:
+    mov rax, [rdi + linnea_quic_ra.len]
+    mov rdx, [rdi + linnea_quic_ra.hi]
+    lea rcx, [rdi + linnea_quic_ra.seen]
+.pa_loop:
+    cmp rax, rdx                      ; reached the high-water?
+    jae .pa_done
+    bt [rcx], rax
+    jnc .pa_done                      ; a gap: stop here
+    inc rax
+    jmp .pa_loop
+.pa_done:
+    mov [rdi + linnea_quic_ra.len], rax
     ret
 
 ; ra_release(rdi = context) — give up a context, closing any capture file with

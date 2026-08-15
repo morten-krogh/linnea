@@ -2658,10 +2658,18 @@ check "the upload capture file is created under spill_dir ($out)" $?
 # binary, and a bisect read that as a tidy "2 x RA_WINDOW" threshold that never
 # existed. Sizes inside the band above are deterministic; sizes outside it are
 # not evidence of anything.
-for n in 40000 16000000; do
-    out2=$(timeout 120 python3 test/quic/h3_upload_big.py localhost $n ${P61498} 2>&1)
+# Three sizes, one per ingest path, and each one SAYS which path it took rather
+# than being trusted to take it: 40000 stays in RAM (the control), 200000 opens
+# a capture-file region, 16000000 opens one longer than RA_WINDOW and so is the
+# only one that reaches the grant loop where the suppressed-last-step deadlock
+# lived. 40000 used to be the capture-file case and silently stopped being one
+# when RA_BUF went 32768 -> 131072, leaving that path with no byte-exact check
+# under 16 MB at all.
+for spec in "40000 ram" "200000 file" "16000000 file"; do
+    set -- $spec
+    out2=$(timeout 120 python3 test/quic/h3_upload_big.py localhost $1 ${P61498} --path $2 2>&1)
     case "$out2" in ok*) true ;; *) false ;; esac
-    check "h3 upload of $n bytes goes to the capture file and echoes back ($out2)" $?
+    check "h3 upload of $1 bytes echoes back byte-exact ($out2)" $?
 done
 # A stream ENDED at exactly the flow-control limit, in an empty frame of its
 # own, while a gap remains in the payload. Inside a payload the limit we grant
@@ -2712,17 +2720,25 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # stopped working again, whatever the box is doing.
     # A browser-shaped upload: several LARGE DATA frames, which is what a Chrome
     # netlog showed (three of 371,712 bytes for 1 MB). The stall lives at the
-    # frame BOUNDARY -- inside a payload the ceiling runs body_hi + RA_WINDOW, so
-    # every other upload check here is single-frame and blind to it. Between
-    # frames the ceiling is base + RA_BUF, and that step IS the credit a client
-    # crosses the boundary on: under its bandwidth x RTT it blocks, once per
-    # frame. Chrome did, five times, for ~390 ms of a 3.1 s upload, on a link
-    # whose BDP was 37 KB against 32 KiB of runway.
+    # frame BOUNDARY -- inside a payload the ceiling runs ahead of what has
+    # landed, so every other upload check here is single-frame and blind to it.
+    # Chrome blocked five times on it, for ~390 ms of a 3.1 s upload.
     #
-    # The floor asserts the step, not a time (loopback grants instantly) and not
-    # the grant count (identical at both sizes -- they coalesce here).
+    # WHAT IS ASSERTED IS WHERE THE CEILING STOPS, not a time: no grant may land
+    # on a payload's end, because a peer holding one of those cannot start the
+    # next frame until this one is whole and a further grant has come back. That
+    # is exact and needs no round trip, which matters because loopback grants
+    # instantly and no timing bound here separates the builds (the test's own
+    # header records the measurements that showed it, and why).
     out10=$(timeout 180 python3 test/quic/h3_upload_frames.py localhost ${P61498} 3 371712 --max-blocked 0 --rtt-ms 20 2>&1)
-    check "h3 a browser-shaped multi-frame upload never blocks on our window ($out10)" $?
+    check "h3 a browser-shaped multi-frame upload is invited past every frame ($out10)" $?
+    # ...and the same shape driven at ~19 MB/s, which is what it takes to make a
+    # boundary cost anything on loopback: the congestion window and the pacer
+    # both lifted, so the server's window is the only brake and every boundary
+    # is crossed by a STREAM frame straddling the payload's end. That split is
+    # the new code; this is what runs it at rate.
+    out11=$(timeout 180 python3 test/quic/h3_upload_frames.py localhost ${P61498} 10 400000 --max-blocked 0 --rtt-ms 40 --fast-client 2>&1)
+    check "h3 ...and the same at 19 MB/s, every boundary a straddling frame ($out11)" $?
     out8=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 1 --max-ms 400 2>&1)
     check "h3 a lost final response is recovered from a MEASURED rtt ($out8)" $?
     out9=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 0 --max-ms 400 2>&1)

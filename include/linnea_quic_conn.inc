@@ -168,11 +168,11 @@ LINNEA_QUIC_PU_PEND equ 8
 ; would drop all but one (the packet is already acknowledged, so the dropped
 ; request is never retransmitted — it is lost, and the page stalls). Requests
 ; larger than the buffer, or a burst deeper than the contexts, are still dropped.
-; It is also the RUNWAY a client gets at every DATA frame boundary, and that is
-; what sets its size. Between frames the ceiling is base + RA_BUF (a gap there
-; might hide the next frame header, so we cannot invite past it -- see the
-; upload window below), so a client must cross each boundary on RA_BUF of credit
-; while a fresh grant makes a round trip. Under bandwidth x RTT, it stalls.
+; It is also the RUNWAY a client gets across every DATA frame boundary, and that
+; is what sets its size. The ceiling is base + RA_BUF, and a gap past it might
+; hide the next frame header, so it is genuinely all we can invite -- a client
+; whose bandwidth x RTT exceeds it stalls there while a fresh grant makes a
+; round trip.
 ;
 ; 32 KiB was under it for an ordinary browser on an ordinary link. Measured from
 ; a Chrome netlog of one 1 MB upload: THREE DATA frames of 371,712 bytes -- 11x
@@ -186,6 +186,13 @@ LINNEA_QUIC_PU_PEND equ 8
 ; on touch -- but state it plainly: RA_CTXS(6) * (buf + its arrival bitmap) is
 ; 864 KB per connection, so 226 MB per worker in the pathological case where all
 ; 256 connections run six concurrent uploads each. It was 57 MB at 32 KiB.
+;
+; It buys a round trip per boundary rather than all of them. A peer used to pay
+; TWO at each one -- base did not move to the payload's end until the payload was
+; whole, so the runway did not even begin until then -- and now the window is
+; there in advance and it pays one. Buying that last one means RA_BUF exceeding
+; bandwidth x RTT, which is the memory above against somebody's link, so it is
+; not a constant that can be chosen once and be right.
 LINNEA_QUIC_RA_BUF      equ 131072  ; reassembly capacity for one request stream,
                                     ; and the credit a client crosses a frame
                                     ; boundary on
@@ -216,10 +223,20 @@ LINNEA_QUIC_RA_GRANT    equ LINNEA_QUIC_RA_BUF / 2
 ; known file offset and can be pwritten straight there, in order or not. The
 ; file is sparse; a hole costs nothing and a later write fills it.
 ;
-; What makes this safe is that the grant is bounded by the frame extent: we
-; never invite a byte we could not place. Beyond the payload we are back to
-; RA_BUF, because a gap there might hide the next frame header and we would
-; not know whether a byte is body or framing.
+; What makes this safe is that every invited byte has somewhere to go. Inside
+; the payload that is the file, bounded only by how much we are willing to have
+; in flight at once (this constant, measured from what has LANDED). Past the
+; payload it is the buffer, so the ceiling runs one RA_BUF beyond the frame and
+; no further: a gap out there might hide the next frame header, and we would not
+; know whether a byte is body or framing.
+;
+; That last RA_BUF is not a detail. The window used to stop dead at the payload's
+; end, because .base stayed at the payload's START while it was being written and
+; nothing past the payload could be placed at all -- so a peer ran out of credit
+; on the boundary itself, once per DATA frame, and waited for the grant that only
+; went out after the payload's last byte landed. .base moves to the payload's END
+; when the region opens instead, which puts the buffer where the NEXT frame is
+; and leaves the payload below it, reached through a split in the arrival path.
 LINNEA_QUIC_RA_WINDOW   equ 0x400000   ; 4 MiB: most we invite in flight on one
                                        ; request stream, matching h2's window
 ; Out-of-order arrivals to track while filling a payload. Real reordering

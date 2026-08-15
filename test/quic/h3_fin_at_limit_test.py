@@ -4,34 +4,50 @@
 #
 # Both halves are things a conforming peer may do. RFC 9000 4.1 lets a sender
 # end a stream at a final size equal to the limit it was granted, and nothing
-# obliges it to carry the FIN on a frame that also carries data. Inside a DATA
-# payload the limit we grant IS the payload's end, so "ended at the limit"
-# means an empty frame at that offset -- and a reassembly base pinned at the
-# payload's start makes that offset look like it lands a whole payload past the
-# window. It closed the connection with FLOW_CONTROL_ERROR against a peer that
-# had done nothing wrong.
+# obliges it to carry the FIN on a frame that also carries data. So a bare FIN
+# at the payload's end must be accepted -- and it was not: a reassembly base
+# pinned at the payload's START made that offset look like it landed a whole
+# payload past the window, and the connection closed with FLOW_CONTROL_ERROR
+# against a peer that had done nothing wrong.
 #
-# Both cases below put a frame at exactly that offset while the payload is
-# still incomplete, and they differ only in whether it carries bytes. That is
-# the whole distinction the server has to draw:
+# Both cases below put a frame past the payload while it is still incomplete,
+# and they differ only in how far past. That is the whole distinction the server
+# has to draw:
 #
-#   fin   an empty frame ending the stream    -> must be ACCEPTED, request completes
-#   data  64 bytes past the payload's end     -> must still be REFUSED, 0x03
+#   fin   an empty frame ending the stream at the payload's end -> ACCEPTED
+#   data  bytes past the CEILING THE SERVER GRANTED             -> REFUSED, 0x3
 #
 # The second is here so the fix cannot be "stop checking the bound". A test for
 # the accepted case alone would pass just as well against a server that let
 # anything through.
 #
-# The ordering is forced, not hoped for. Two things make it deterministic:
+# WHERE THAT BOUND SITS IS NOT A CONSTANT AND MUST NOT BE WRITTEN AS ONE. It
+# used to be the payload's end, because nothing beyond the payload had anywhere
+# to go while the region was open. Now base moves to the payload's END when the
+# region opens, so the buffer holds what FOLLOWS the payload and the peer is
+# invited a whole RA_BUF past the frame -- which is what stops a browser
+# stalling at every DATA frame boundary. Bytes 64 past the payload's end became
+# perfectly legal, and this check duly went red saying "the bound is not being
+# enforced" against a server enforcing it exactly one buffer higher up.
 #
-#   - the datagrams held back are the LAST ones, so there are no packets sent
-#     after them and aioquic's ACK-based loss detection (which needs a later
-#     packet to be acknowledged) can never declare them lost. Only a PTO timer
-#     could fill the gap, and the frame under test goes out microseconds after
-#     the payload is framed, with no network wait in between;
+# So the data case asks the connection what it was actually granted and steps
+# over THAT. It needs no edit the next time the window moves.
+#
+# The ordering is forced, not hoped for. Three things make it deterministic:
+#
 #   - nothing leaves this process unless the test asks for it, so "hold" really
 #     means held. Two earlier probe designs let aioquic's own pacing run and
-#     both filled the gap before the FIN landed, which reads as a pass.
+#     both filled the gap before the FIN landed, which reads as a pass;
+#   - the fin case sends nothing after the held datagrams, so aioquic's
+#     ACK-based loss detection (which needs a LATER packet acknowledged) can
+#     never declare them lost, and its frame goes out microseconds after the
+#     payload is framed with no network wait in between;
+#   - the data case DOES send after them, a whole window of it, and so supplies
+#     exactly the condition that lets loss detection fire. It therefore makes
+#     the body unretransmittable up front (see Upload.__init__). Without that
+#     the gap closed behind the overrun, the payload completed, and the server
+#     answered H3_FRAME_UNEXPECTED -- correct for what it was sent, and nothing
+#     to do with the bound under test.
 #
 # Which is why the fin case refuses to pass without evidence its own setup
 # worked: it waits with the gap still open, and a request that COMPLETES there
@@ -44,19 +60,18 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.h3.connection import H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived
+from aioquic.quic.packet_builder import QuicDeliveryState
 
 PORT = int(sys.argv[1])
 ADDR = ("127.0.0.1", PORT)
-# N MUST EXCEED LINNEA_QUIC_RA_BUF, so the body takes the direct-to-file path
-# and the payload's end sits more than a window above the pinned base -- which is
-# what turns the offset into an apparent violation. Under that, the whole payload
-# plus the 64 bytes past it fits inside base + RA_BUF, accepting them is correct,
-# and the data case below tests nothing.
+# N MUST EXCEED LINNEA_QUIC_RA_BUF, or there is no payload region to test: a
+# DATA frame the reassembly window already covers deliberately stays on the RAM
+# path, and none of the body-mode offsets below then exist. Keep this comfortably
+# above RA_BUF, and if that constant moves again, this number moves with it.
 #
-# It broke exactly that way when RA_BUF went 32768 -> 131072 and N was 40000: the
-# check reported "the bound is not being enforced" against a server enforcing it
-# perfectly at a higher offset. Keep this comfortably above RA_BUF, and if that
-# constant moves again, this number moves with it.
+# It went red exactly that way once when RA_BUF went 32768 -> 131072 and N was
+# 40000. Only this line depends on the constant now; the data case derives its
+# offset from the ceiling the server grants.
 N = 200000
 BODY = bytes((i * 37 + 11) & 0xFF for i in range(N))
 HOLD = 2
@@ -92,9 +107,27 @@ class Upload:
                              [(b":method", b"POST"), (b":scheme", b"https"),
                               (b":authority", b"localhost"), (b":path", b"/api/echo"),
                               (b"content-length", str(N).encode())], end_stream=False)
+        # THE GAP HAS TO STAY OPEN, and holding datagrams back is only half of
+        # that: aioquic's loss detection declares a packet lost once later ones
+        # are acknowledged, and retransmits it. The data case sends a whole
+        # window after the held packets, so it supplies exactly that condition
+        # -- the gap closed behind it, the payload completed, and the server
+        # then read the overrun as a frame header and said H3_FRAME_UNEXPECTED.
+        # A true answer to what it was actually sent, and nothing about the
+        # bound under test.
+        #
+        # So the body is made unretransmittable. It has to be done HERE, before
+        # a byte of it is queued: the delivery handler is captured into each
+        # packet as that packet is BUILT, so patching the sender afterwards
+        # leaves every packet already on the wire holding the original.
+        sender = self.conn._streams[self.sid].sender
+        deliver = sender.on_data_delivery
+        sender.on_data_delivery = (
+            lambda delivery, start, stop, fin:
+            deliver(delivery, start, stop, fin)
+            if delivery == QuicDeliveryState.ACKED else None)
         self.h3.send_data(self.sid, BODY, end_stream=False)   # payload; no FIN yet
 
-        sender = self.conn._streams[self.sid].sender
         target = sender._buffer_stop                          # the request's final size
         dl = time.time() + 20
         while sender.next_offset < target and time.time() < dl:
@@ -149,12 +182,29 @@ class Upload:
         for d in self.held:
             self.sock.sendto(d, ADDR)
 
-    def wait(self, seconds, until=lambda u: False):
+    def wait(self, seconds, until=lambda u: False, sending=False):
+        """Wait for the server to close, or for `until`. With sending=True the
+        connection's own outbound queue is drained as it goes -- needed whenever
+        what is under test is more than one datagram's worth, because congestion
+        control hands it over a burst at a time and a wait that never sends
+        leaves the rest of it sitting in the client. The HELD datagrams are not
+        touched either way: only release() lets those go."""
         closed, dl = None, time.time() + seconds
         while time.time() < dl and closed is None and not until(self):
+            if sending:
+                self.emit()
             self.recv()
             closed = self.events()
         return closed
+
+
+def why(closed):
+    """Format a (code, frame_type, reason) close. frame_type is None for an
+    APPLICATION close, and a bare 0x%x on it raises TypeError -- which replaces
+    the failure being reported with a traceback about formatting it."""
+    return ("error 0x%x frame %s %r"
+            % (closed[0], "application" if closed[1] is None else hex(closed[1]),
+               closed[2]))
 
 
 def case_fin():
@@ -177,7 +227,7 @@ def case_fin():
     closed = u.wait(0.4)
     if closed:
         return ("the server closed the connection on a FIN at the limit: "
-                "error 0x%x frame 0x%x %r" % closed)
+                + why(closed))
     if u.ended or u.status is not None:
         return ("setup: the request completed with %d datagram(s) still held, so "
                 "no gap was ever open and this tested nothing" % len(u.held))
@@ -188,7 +238,7 @@ def case_fin():
         closed = u.wait(0.2, until=lambda x: x.ended)
         if closed:
             return ("the server closed the connection after the gap was filled: "
-                    "error 0x%x frame 0x%x %r" % closed)
+                    + why(closed))
         u.emit()
     u.sock.close()
     if u.status != "200":
@@ -200,24 +250,39 @@ def case_fin():
 
 
 def case_data():
-    """64 bytes PAST the payload's end: must still be a flow-control violation.
-    aioquic is conformant and would never send them, so its send-side limits are
-    lifted the way h3_flow_violation_test.py lifts them."""
+    """Bytes past the ceiling the server granted: must still be a flow-control
+    violation. aioquic is conformant and would never send them, so its send-side
+    limits are lifted the way h3_flow_violation_test.py lifts them."""
     u = Upload()
-    u.conn.send_stream_data(u.sid, b"\x01" * 64, end_stream=True)
-    u.conn._remote_max_data = 100_000_000
+    stream = u.conn._streams[u.sid]
+    # What the server has actually invited, read off its MAX_STREAM_DATA rather
+    # than recomputed from a constant here -- the point is to run past the
+    # server's own bound, wherever the server currently puts it.
+    ceiling = stream.max_stream_data_remote
+    over = ceiling - stream.sender._buffer_stop + 64
+    if over <= 0:
+        return ("setup: the ceiling (%d) is already behind what has been queued "
+                "(%d), so nothing here would be past it"
+                % (ceiling, stream.sender._buffer_stop))
+    u.conn.send_stream_data(u.sid, b"\x01" * over, end_stream=True)
+    u.conn._remote_max_data = 1_000_000_000
     u.conn._remote_max_data_used = 0
-    u.conn._streams[u.sid].max_stream_data_remote = 100_000_000
+    stream.max_stream_data_remote = 1_000_000_000
     u.send_now()
 
-    closed = u.wait(8.0)
+    # sending=True: the overrun is a whole window wide now, not the 64 bytes it
+    # was when the ceiling stopped at the payload's end, so it does not leave in
+    # one burst. Waiting without sending left most of it queued in the client and
+    # read as "the bound is not being enforced" against a server that had simply
+    # never been sent the offending byte.
+    closed = u.wait(15.0, sending=True)
     u.sock.close()
     if closed is None:
-        return ("64 bytes past the payload's end drew no CONNECTION_CLOSE "
-                "(status %s) -- the bound is not being enforced" % u.status)
+        return ("%d bytes, ending 64 past the granted ceiling %d, drew no "
+                "CONNECTION_CLOSE (status %s) -- the bound is not being enforced"
+                % (over, ceiling, u.status))
     if closed[0] != FLOW_CONTROL_ERROR:
-        return ("closed with error 0x%x frame 0x%x %r, want FLOW_CONTROL_ERROR 0x3"
-                % closed)
+        return "closed with " + why(closed) + ", want FLOW_CONTROL_ERROR 0x3"
     return None
 
 
@@ -229,5 +294,5 @@ bad = case_data()
 if bad:
     print("data: " + bad)
     sys.exit(1)
-print("ok (%d bytes: a bare FIN at the limit completes byte-exact, "
-      "64 bytes past it is still 0x3)" % N)
+print("ok (%d bytes: a bare FIN at the payload's end completes byte-exact, "
+      "and running past the granted ceiling is still 0x3)" % N)
