@@ -557,18 +557,45 @@ linnea_h2_handle:
     ; max_body. h2_fd_len, not rax: the spill arm returns h2p_capture's status
     ; in rax, and the wire cost is what the deadline is denominated in anyway.
     ; No clock READ here — rcx and r11 hold live frame state (see .fd_done).
-    push r8
-    mov r8d, [h2_fd_len]
+    ; r8 and r9 are dead here: .fd_collect's copies of len and the new total are
+    ; finished with, and everything below reloads what it needs.
+    mov r9d, [h2_fd_len]             ; this frame's wire cost, kept for credit
+    mov r8, r9
     imul r8, r8, LINNEA_BODY_NS_PER_BYTE
     add [rdi + linnea_h2p.rq_start], r8
-    pop r8
     ; The payload is consumed — buffered in the slot or written to the capture
-    ; file — so the STREAM window can be given back now, not only the
-    ; connection window. Crediting stream 0 alone was enough while a collected
-    ; body could not exceed 8 KiB; with the cap lifted to max_body the client
-    ; ran out of stream window at exactly SETTINGS_INITIAL_WINDOW_SIZE and
-    ; waited for ever. Measured before the fix: 4 MiB sent, 0 bytes of stream
-    ; credit returned, 8.4 MB of connection credit returned.
+    ; file — so the STREAM window can be given back, not only the connection
+    ; window. Crediting stream 0 alone was enough while a collected body could
+    ; not exceed 8 KiB; with the cap lifted to max_body the client ran out of
+    ; stream window at exactly SETTINGS_INITIAL_WINDOW_SIZE and waited for
+    ; ever. Measured before the fix: 4 MiB sent, 0 bytes of stream credit
+    ; returned, 8.4 MB of connection credit returned.
+    ;
+    ; BATCHED, at LINNEA_H2P_GRANT_MIN, which is the whole reason that constant
+    ; exists. Crediting every frame is what a path carrying only 8 KiB could
+    ; afford; once every upload came through here it meant two WINDOW_UPDATE
+    ; frames per DATA frame, and each batch of them is a send, a TLS record and
+    ; a packet on a worker that also owns other connections. Measured on one
+    ; 20 MB upload: 2443 frames in 1224 sends, against 157 in 81 for the
+    ; streaming path this replaced — 15x the chatter, charged to every
+    ; connection that worker holds, which is how an h2 upload came to slow down
+    ; h3 requests and a WebSocket that had nothing to do with it.
+    ;
+    ; Withholding cannot stall the client: GRANT_MIN is smaller than the window
+    ; it tops up (asserted where they are defined), so there is always room left
+    ; to send into, and END_STREAM below flushes whatever is left over.
+    add [rdi + linnea_h2p.rq_credit], r9
+    mov r8, [rdi + linnea_h2p.rq_credit]
+    cmp r8, LINNEA_H2P_GRANT_MIN
+    jae .fd_credit_now
+    test r10b, LINNEA_H2_FLAG_END_STREAM
+    jnz .fd_credit_now               ; last frame: nothing more will trip it
+    mov dword [h2_fd_credit], 0      ; held back, and owed on the slot
+    jmp .fd_end_stream_check
+.fd_credit_now:
+    mov [h2_fd_len], r8d             ; the batch, not this frame
+    mov qword [rdi + linnea_h2p.rq_credit], 0
+.fd_end_stream_check:
     mov eax, [rdi + linnea_h2p.sid]
     mov [h2_fd_sid], eax
     test r10b, LINNEA_H2_FLAG_END_STREAM
@@ -3081,17 +3108,21 @@ h2p_free_slot:
     call h2p_capture_release
     mov rsi, [rbx + linnea_h2p.flags]            ; read BEFORE the scrub
     mov qword [rbx + linnea_h2p.flags], 0        ; see h2p_release
-    ; a CAPTURED body owes nothing: its bytes were credited as they were
-    ; written to the file, and counting the unsent remainder here would credit
-    ; them a second time and overflow the peer's connection window
-    test rsi, LINNEA_H2P_F_REQ_FILE
-    jnz .fsl_owed_done
-    mov rcx, [rbx + linnea_h2p.rq_credit]        ; still owed on stream 0
-    mov rdx, [rbx + linnea_h2p.rq_wr]
-    sub rdx, [rbx + linnea_h2p.rq_rd]
-    add rcx, rdx
+    ; Whatever credit was held back short of a full GRANT_MIN step goes back on
+    ; stream 0: the stream is gone, so that is the only window left to put it
+    ; on, and left unreturned it is gone for good — a connection doing upload
+    ; after upload would starve its own window a remainder at a time.
+    ;
+    ; rq_credit ALONE. This used to add the unsent FIFO remainder (rq_wr minus
+    ; rq_rd) with it, and skip captured bodies entirely to avoid double-crediting
+    ; bytes the capture had already paid for. Both halves are wrong now: nothing
+    ; streams, so those cursors index a MAPPING rather than a FIFO and their
+    ; difference is body still to go upstream, which was credited when it was
+    ; captured; and a captured body can now owe, because credit is batched.
+    ; Skipping F_REQ_FILE would leak up to GRANT_MIN of connection window per
+    ; aborted upload.
+    mov rcx, [rbx + linnea_h2p.rq_credit]
     add [rbx + linnea_h2p.rq_owed], rcx
-.fsl_owed_done:
     mov qword [rbx + linnea_h2p.rq_rd], 0
     mov qword [rbx + linnea_h2p.rq_wr], 0
     mov qword [rbx + linnea_h2p.rq_credit], 0
@@ -3185,38 +3216,15 @@ linnea_h2p_service:
     mov qword [r12 + linnea_h2p.state], LINNEA_H2P_FAILED
     mov qword [r12 + linnea_h2p.status], 408
 .sv_no_clock:
-    ; request-body bytes that have gone upstream are owed back to the client
-    ; as flow-control credit — on the stream and on the connection — or it
-    ; stops sending after one window
-    mov r14, [r12 + linnea_h2p.rq_credit]
-    test r14, r14
-    jz .sv_no_credit
-    ; Batched, not per frame: a grant is worth a round trip only once it is
-    ; big enough to matter. This ran on every 16 KiB DATA frame, which is why
-    ; an upload advanced 16 KiB per RTT however fast the link was. Holding a
-    ; part-grant back cannot stall the client, because GRANT_MIN is smaller
-    ; than the window it is topping up (asserted where they are defined), so
-    ; there is always room left to send into.
-    cmp r14, LINNEA_H2P_GRANT_MIN
-    jae .sv_grant
-    ; ...unless the body has all arrived. Nothing more is coming to trip the
-    ; threshold, and this is CONNECTION credit as well as stream credit: left
-    ; unreturned it is gone for good, and a connection doing upload after
-    ; upload would starve its own window a remainder at a time.
-    cmp qword [r12 + linnea_h2p.rq_rem], 0
-    jne .sv_no_credit
-.sv_grant:
-    mov qword [r12 + linnea_h2p.rq_credit], 0
-    mov rdi, r15
-    mov rsi, [r12 + linnea_h2p.sid]
-    mov edx, r14d
-    call h2p_emit_window
-    add r15, rax
-    mov rdi, r15
-    xor esi, esi                     ; stream 0: the connection window
-    mov edx, r14d
-    call h2p_emit_window
-    add r15, rax
+    ; Request-body credit is emitted where the bytes are CONSUMED, in the DATA
+    ; handler, batched at LINNEA_H2P_GRANT_MIN. It used to be emitted here
+    ; instead, because the streaming path owed it only once the bytes had gone
+    ; upstream and this pass was the first place that was known. Nothing streams
+    ; now, and a slot's rq_credit is both accumulated and flushed in one place —
+    ; so a second emitter reading the same field would hand the client the same
+    ; window twice and overflow it, which is a connection error to the peer.
+    ; What still belongs to this pass is rq_owed above: credit that outlived its
+    ; STREAM and can only go back on stream 0.
 .sv_no_credit:
     test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_REAP
     jnz .sv_reap

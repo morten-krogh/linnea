@@ -3970,6 +3970,14 @@ rm -f $RUNDIR/upload6.bin $RUNDIR/upload6_echo.bin
 # regardless and both builds would pass. See the header of the script.
 out=$(timeout 120 python3 test/h2_upload_blocking.py ${P61443} 4000000 1500000 2>&1)
 check "http2: a proxied GET is answered while an upload is still arriving ($out)" $?
+# ...and how many times the upload had to STOP to be given more window. A
+# ROUND-TRIP COUNT, because it is the half of this that loopback can see: the
+# frame handler cannot run while a client send is in flight, so every batch of
+# WINDOW_UPDATEs is a pause in reading the body -- free here, one RTT each on a
+# real link. Crediting per DATA frame instead of per GRANT_MIN took a real
+# client from 4.4 MB/s to 1.4 MB/s with every loopback check in this file green.
+out=$(timeout 120 python3 test/h2_upload_grants.py ${P61443} 8000000 2>&1)
+check "http2: an upload's window grants stay batched ($out)" $?
 # ...and one PAST the advertised stream window. This size is the point: a
 # collected body is credited back as it is consumed, and crediting only the
 # CONNECTION window was enough while such a body could not exceed 8 KiB. With
