@@ -108,6 +108,11 @@ LINNEA_QUIC_CLOSING_MS   equ 3000   ; >= 3x the initial PTO (RFC 9000 10.2)
 ; in the in-flight table below; this ring only holds the handshake completion,
 ; control-stream setup and small inline responses, which are few.
 LINNEA_QUIC_RTX_SLOTS   equ 8       ; outstanding small-reply packets per conn
+; Recent 1-RTT packet numbers kept purely for round-trip measurement. The peer's
+; largest acknowledged is by nature one of the last packets we sent, so a short
+; ring covers it; anything older falls back to no sample, which is what the
+; whole path did before.
+LINNEA_QUIC_PNRING_SLOTS equ 16
 LINNEA_QUIC_RTX_PAYLOAD equ 1500    ; frame bytes kept per packet
 LINNEA_QUIC_ACK_MAXR    equ 16      ; ACK ranges decoded from one incoming frame
 
@@ -562,6 +567,21 @@ struc linnea_quic_conn
     .srtt:       resq 1              ; smoothed_rtt
     .rttvar:     resq 1              ; rttvar
     .min_rtt:    resq 1              ; the smallest round trip seen
+    ; Send times for recent 1-RTT packets, so an ACK naming ANY of them can be
+    ; turned into a round trip. Before this the only send times kept were those
+    ; of packets we might RETRANSMIT -- small replies and response chunks -- and
+    ; the packet a peer names as its largest acknowledged is almost always the
+    ; most recent one we sent, which is usually a standalone ACK. Those are
+    ; emitted untracked, so the lookup missed, the sample was discarded, and
+    ; rtt_have stayed 0 for the life of every connection. Measured: zero samples
+    ; across a handshake, three requests and an upload.
+    .pn_ring:    resb LINNEA_QUIC_PNRING_SLOTS * 16   ; {pn, sent_ms} pairs
+    .pn_ring_at: resq 1              ; next slot to overwrite
+    ; largest acknowledged + 1 (0 = none yet). RFC 9002 5.1 takes a sample only
+    ; when the largest is NEWLY acknowledged; the old code got that for free
+    ; because an acked packet was freed from its table, and a ring that never
+    ; frees has to say so explicitly or every duplicate ACK resamples.
+    .largest_ack_p1: resq 1
     ; request-stream reassembly: LINNEA_QUIC_RA_CTXS streams reassemble at once
     ; Stream ids the peer has cancelled (RESET_STREAM / STOP_SENDING), as a
     ; small ring. A cancel can arrive before the request that produced it has

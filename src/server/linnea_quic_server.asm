@@ -409,6 +409,7 @@ s_hs_type:   resq 1                   ; long-header Handshake type bits for this
 s_zrtt_type: resq 1                   ; ...and the 0-RTT and Initial ones, likewise
 s_ini_type:  resq 1                   ; per-version (RFC 9369 shifts them all by one)
 s_cc_acked:  resq 1                   ; response-stream bytes one incoming ACK freed
+s_rtx_freed: resq 1                   ; ...and buffered packets it released (5.1)
 ; Persistent congestion (RFC 9002 7.6), measured across one loss detection pass:
 ; when the oldest chunk declared lost FIRST went out, and how many were lost.
 s_pc_first:  resq 1
@@ -2121,67 +2122,16 @@ linnea_quic_server_datagram:
     mov rcx, [rcx + linnea_quic_conn.pn_1rtt]
     cmp [ack_ranges + 8], rcx
     jae .ack_violation
-    ; --- round-trip measurement (RFC 9002 5.1), before anything is freed ---
-    ; A sample comes only from a newly acknowledged largest: if we are still
-    ; holding that packet number it has not been acknowledged before, and since a
-    ; retransmission always goes out under a fresh number the measurement is
-    ; unambiguous. Nothing was measured here at all until now — the probe timeout
-    ; was a flat 250 ms, so any path slower than that retransmitted everything
-    ; spuriously and halved its congestion window on each pass.
-    push rax                          ; pair count
-    push rbx                          ; ...and a second qword, so rsp stays
-                                      ; 16-aligned across the calls below
-    mov rdi, [cur_conn]
-    mov rsi, [ack_ranges + 8]         ; largest acknowledged
-    call linnea_quic_rtx_sent_ms      ; rax = when it went out, or 0
-    test rax, rax
-    jz .rtt_done                      ; already acked, or never ours
-    mov rbx, rax
-    call now_ms
-    sub rax, rbx                      ; latest_rtt
-    js .rtt_done                      ; a clock that went backwards: no sample
-    ; The peer's Ack Delay is in units of 2^ack_delay_exponent microseconds, and
-    ; RFC 9000 19.3 takes that exponent from whoever SENT the ACK — the client's
-    ; advertised value, not ours (ours describes the ACKs we send). Assuming our
-    ; own default 3 was right only when the client happened to default too.
-    ; Subtract it only while that leaves the sample at or above the minimum seen,
-    ; per RFC 9002 5.3 — a delay big enough to push it below is not credible.
-    push rax                          ; latest_rtt, across the scaling call
-    push rax
-    mov rdi, [linnea_quic_ack_delay]
-    mov rbx, [cur_conn]
-    mov rsi, [rbx + linnea_quic_conn.ack_exp_peer]
-    call linnea_quic_ack_delay_ms     ; rax = the peer's delay in ms
-    mov rcx, rax
-    pop rax
-    pop rax
-    mov rbx, [cur_conn]
-    mov rdx, [rbx + linnea_quic_conn.max_ack_peer]
-    cmp rcx, rdx
-    jbe .rtt_delay_ok
-    mov rcx, rdx                      ; 5.3: never more than the peer said it may delay
-.rtt_delay_ok:
-    mov rdi, [cur_conn]
-    mov rdx, rax
-    sub rdx, rcx
-    js .rtt_sample                    ; would go negative: use the raw sample
-    cmp rdx, [rdi + linnea_quic_conn.min_rtt]
-    jb .rtt_sample
-    mov rax, rdx                      ; adjusted sample
-.rtt_sample:
-    mov rsi, rax
-    call linnea_quic_rtt_sample
-.rtt_done:
-    pop rbx
-    pop rax                           ; pair count
     lea rbx, [ack_ranges]
     mov rbp, rax                     ; pair count
     mov qword [s_cc_acked], 0        ; response-stream bytes this ACK releases
+    mov qword [s_rtx_freed], 0       ; ...and buffered packets it releases
 .ack_free:
     mov rdi, [cur_conn]
     mov rsi, [rbx]                   ; smallest
     mov rdx, [rbx + 8]               ; largest
     call linnea_quic_rtx_ack_range   ; the small-reply / control loss ring
+    add [s_rtx_freed], rax
     mov rdi, [cur_conn]
     mov rsi, [rbx]
     mov rdx, [rbx + 8]
@@ -2190,6 +2140,11 @@ linnea_quic_server_datagram:
     add rbx, 16
     dec rbp
     jnz .ack_free
+    ; The round trip, now that the pass has said whether anything ack-eliciting
+    ; was in it. This used to run BEFORE the free pass, because the send time
+    ; lived in the tables the pass empties; it lives in the send-time ring now,
+    ; which frees the ordering and lets 5.1's second condition be checked at all.
+    call ack_rtt_sample
     ; grow the congestion window by the response-stream bytes just acknowledged
     mov rdi, [s_cc_acked]
     test rdi, rdi
@@ -5447,6 +5402,96 @@ emit_1rtt:
     mov rbx, [cur_conn]
     mov rax, [rbx + linnea_quic_conn.pn_1rtt]   ; the number just used
     inc qword [rbx + linnea_quic_conn.pn_1rtt]
+    ; Remember when it went out. EVERY 1-RTT packet, not just the ones we could
+    ; retransmit: the peer names its largest acknowledged without caring whether
+    ; we kept the payload, and that is usually a bare ACK of ours. Recorded here
+    ; rather than at the twelve call sites so no future emitter can forget.
+    push rax
+    push rax                          ; ...twice, to keep rsp 16-aligned
+    call now_ms                       ; rax = ms; clobbers caller-saved only
+    mov rcx, rax
+    pop rax
+    pop rax
+    mov rdx, [rbx + linnea_quic_conn.pn_ring_at]
+    lea rsi, [rbx + linnea_quic_conn.pn_ring]
+    mov [rsi + rdx * 8], rax          ; pn
+    mov [rsi + rdx * 8 + 8], rcx      ; sent_ms
+    add rdx, 2                        ; two qwords per slot
+    cmp rdx, LINNEA_QUIC_PNRING_SLOTS * 2
+    jb .er_wrapped
+    xor edx, edx
+.er_wrapped:
+    mov [rbx + linnea_quic_conn.pn_ring_at], rdx
+    pop rbx
+    ret
+
+; ack_rtt_sample() — turn the ACK just parsed into a round-trip sample
+; (RFC 9002 5.1). cur_conn is the connection, ack_ranges holds the decoded
+; ranges with the largest first, and s_rtx_freed / s_cc_acked say what the free
+; pass released.
+;
+; 5.1 has two conditions and the old code could only honour one. It required the
+; largest acknowledged to be findable in a RETRANSMISSION table, which is a
+; different question from "is it newly acknowledged", and it excluded the packet
+; a peer most often names — a bare ACK of ours, emitted untracked. The result was
+; that no connection ever took a sample: rtt_have stayed 0, every probe timeout
+; was the 1022 ms kInitialRtt guess, and persistent-congestion detection (gated
+; on rtt_have) never ran. Measured at zero samples across a handshake, three
+; requests and an upload.
+;
+; Now: the send time comes from the ring, which holds every recent packet;
+; "newly acknowledged" is answered by largest_ack_p1; and "at least one newly
+; acknowledged packet was ack-eliciting" is answered by what the pass released.
+ack_rtt_sample:
+    push rbx
+    push r12
+    mov rax, [s_rtx_freed]
+    or rax, [s_cc_acked]
+    jz .ars_done                      ; only our own ACKs: 5.1 forbids a sample
+    mov rbx, [cur_conn]
+    mov rax, [ack_ranges + 8]         ; largest acknowledged
+    lea rcx, [rax + 1]
+    cmp rcx, [rbx + linnea_quic_conn.largest_ack_p1]
+    jbe .ars_done                     ; not newly the largest: a duplicate ACK
+    mov [rbx + linnea_quic_conn.largest_ack_p1], rcx
+    mov rdi, rbx
+    mov rsi, rax
+    call linnea_quic_rtx_sent_ms      ; rax = when it went out, or 0
+    test rax, rax
+    jz .ars_done                      ; older than the ring: no sample, as before
+    mov r12, rax
+    call now_ms
+    sub rax, r12                      ; latest_rtt
+    js .ars_done                      ; a clock that went backwards
+    ; The peer's Ack Delay is in units of 2^ack_delay_exponent microseconds, and
+    ; RFC 9000 19.3 takes that exponent from whoever SENT the ACK. Subtract it
+    ; only while that leaves the sample at or above the minimum seen (RFC 9002
+    ; 5.3) — a delay big enough to push it below is not credible.
+    push rax
+    push rax                          ; a second qword keeps rsp 16-aligned
+    mov rdi, [linnea_quic_ack_delay]
+    mov rsi, [rbx + linnea_quic_conn.ack_exp_peer]
+    call linnea_quic_ack_delay_ms     ; rax = the peer's delay in ms
+    mov rcx, rax
+    pop rax
+    pop rax
+    mov rdx, [rbx + linnea_quic_conn.max_ack_peer]
+    cmp rcx, rdx
+    jbe .ars_delay_ok
+    mov rcx, rdx                      ; never more than the peer said it may delay
+.ars_delay_ok:
+    mov rdx, rax
+    sub rdx, rcx
+    js .ars_take                      ; would go negative: use the raw sample
+    cmp rdx, [rbx + linnea_quic_conn.min_rtt]
+    jb .ars_take
+    mov rax, rdx                      ; adjusted sample
+.ars_take:
+    mov rdi, rbx
+    mov rsi, rax
+    call linnea_quic_rtt_sample
+.ars_done:
+    pop r12
     pop rbx
     ret
 

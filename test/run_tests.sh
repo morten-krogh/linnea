@@ -2701,6 +2701,19 @@ check "h3 a body in several DATA frames keeps its credit ($out5)" $?
 # what makes a limit of six acceptable, because the client is told it may
 # retry. A stream ending in NEITHER a response nor a reset is the regression.
 if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    # The LAST packet of an exchange can only be recovered by the probe timer:
+    # tx_detect_loss needs LINNEA_QUIC_LOSS_THRESH later packets acknowledged and
+    # there are none after the last one. So the timer's value IS the tail latency,
+    # and it was the 1022 ms kInitialRtt guess on every connection because no RTT
+    # sample was ever taken -- the largest acknowledged packet is usually one of
+    # our own bare ACKs, which were emitted with no send time recorded, so the
+    # lookup missed and the sample was discarded. Measured 1035 ms before, 33 ms
+    # after. The bound is generous: anything near a second means the sampling has
+    # stopped working again, whatever the box is doing.
+    out8=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 1 --max-ms 400 2>&1)
+    check "h3 a lost final response is recovered from a MEASURED rtt ($out8)" $?
+    out9=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 0 --max-ms 400 2>&1)
+    check "h3 ...and the same exchange with nothing dropped ($out9)" $?
     out7=$(timeout 200 python3 test/quic/h3_concurrent_uploads_test.py ${P61498} 2>&1 | tail -1)
     case "$out7" in ok*) true ;; *) false ;; esac
     check "h3 six concurrent uploads on one connection ($out7)" $?

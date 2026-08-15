@@ -168,9 +168,15 @@ linnea_quic_rtx_record:
 .done:
     ret
 
-; linnea_quic_rtx_ack_range(rdi=conn, rsi=lo, rdx=hi) — release every buffered
-; packet whose number is in [lo, hi]. Called once per range of an incoming ACK.
+; linnea_quic_rtx_ack_range(rdi=conn, rsi=lo, rdx=hi) -> rax = how many buffered
+; packets this range released. Called once per range of an incoming ACK.
+;
+; The count is what tells the RTT sampler whether anything ACK-ELICITING was
+; newly acknowledged, which RFC 9002 5.1 requires before a sample may be taken:
+; a peer is under no obligation to acknowledge our bare ACKs promptly, so a
+; round trip measured from one of those alone could be arbitrarily inflated.
 linnea_quic_rtx_ack_range:
+    xor r9d, r9d                      ; how many this range released
     lea rax, [rdi + linnea_quic_conn.sent]
     mov ecx, LINNEA_QUIC_RTX_SLOTS
 .scan:
@@ -182,10 +188,12 @@ linnea_quic_rtx_ack_range:
     cmp r8, rdx
     ja .next                          ; above the range
     mov qword [rax + linnea_quic_sent.in_use], 0
+    inc r9
 .next:
     add rax, linnea_quic_sent_size
     dec ecx
     jnz .scan
+    mov rax, r9                       ; ack-eliciting packets newly acknowledged
     ret
 
 ; linnea_quic_rtx_sent_ms(rdi=conn, rsi=pn) -> rax = the CLOCK_MONOTONIC ms at
@@ -203,6 +211,22 @@ linnea_quic_rtx_ack_range:
 ; avoid cannot arise. Matching .pn0 would reintroduce it, so it is deliberately
 ; not consulted here even though txchunk_ack must consult it for freeing.
 linnea_quic_rtx_sent_ms:
+    ; The send-time ring first. It holds EVERY recent 1-RTT packet, including
+    ; the bare ACKs that neither table below keeps, and those are what a peer
+    ; usually names as its largest acknowledged.
+    lea rax, [rdi + linnea_quic_conn.pn_ring]
+    mov ecx, LINNEA_QUIC_PNRING_SLOTS
+.rs_ring:
+    cmp [rax], rsi
+    jne .rs_ring_next
+    mov rax, [rax + 8]
+    test rax, rax
+    jz .rs_ring_next                  ; an empty slot: pn 0 with no time
+    ret
+.rs_ring_next:
+    add rax, 16
+    dec ecx
+    jnz .rs_ring
     lea rax, [rdi + linnea_quic_conn.sent]
     mov ecx, LINNEA_QUIC_RTX_SLOTS
 .rs_scan:
