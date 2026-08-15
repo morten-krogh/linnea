@@ -2770,6 +2770,15 @@ linnea_quic_server_datagram:
                                                ; file mapping, so the guard stays
     cmp qword [rdi + linnea_quic_ra.walk + linnea_h3_walk.phase], LINNEA_H3_W_DATA
     jne .ra_ceiling
+    ; A BODY IS ARRIVING, so take the big buffer -- on the phase alone, never on
+    ; this frame's size. The window IS the buffer, and keying the borrow on a
+    ; frame being bigger than the inline one held every small-framed client to
+    ; 16 KiB for its whole upload: 40 MB took 91 s in Firefox against 13.6 s in
+    ; Chrome, same link, same server, same file. A peer's framing is its own
+    ; business and browsers disagree about it wildly.
+    call ra_buf_borrow                         ; may decline; the stream is then
+                                               ; simply slower, never wrong
+    mov rdi, [s_ra_ctx]
     mov rcx, [rdi + linnea_quic_ra.walk + linnea_h3_walk.frame_rem]
     cmp rcx, [rdi + linnea_quic_ra.cap]
     jb .ra_ceiling                             ; a payload the window already
@@ -2822,15 +2831,6 @@ linnea_quic_server_datagram:
     mov rsi, [rdi + linnea_quic_ra.body_to]
     sub rsi, [rdi + linnea_quic_ra.base]
     call ra_slide
-    ; The window is empty exactly here, which is the one moment a bigger buffer
-    ; can be swapped in for nothing: .len and .hi are zero and there is not a
-    ; byte to carry across. This is also the moment the extra room starts being
-    ; worth something -- from here the capacity IS the runway the peer crosses
-    ; each DATA frame boundary on, and its stall there is
-    ; max(0, rtt - capacity/rate). If the pool is empty the stream keeps its
-    ; inline buffer: slower across a boundary, correct everywhere.
-    mov rdi, [s_ra_ctx]
-    call ra_buf_borrow
     mov rdi, [s_ra_ctx]
     call ra_prefix_advance
     ; A payload can be whole the moment it is taken over, when the buffer was
@@ -7688,17 +7688,27 @@ ra_buf_inline:
 
 ; ra_buf_borrow(rdi = context) -> rax = 0 borrowed, -1 none free.
 ;
-; Called when a body region opens, which is the only time the extra capacity is
-; worth anything: it IS the runway a peer crosses a DATA frame boundary on, and
-; the stall there is max(0, rtt - capacity/rate).
+; Called the moment a BODY starts arriving -- the walk reaching a DATA frame,
+; whatever that frame's size. Not "a frame bigger than the inline buffer", which
+; is what it was and what made a 40 MB upload take 91 seconds: the window IS the
+; buffer, so a client that frames its body small never triggered a borrow and
+; was held to the inline 16 KiB for the whole upload, where before this it had
+; had 128 KiB. Firefox frames small and Chrome frames large, so the same server
+; gave one of them 2.9 MB/s and the other 440 kB/s.
 ;
-; ONLY EVER CALLED WITH THE WINDOW EMPTY -- the region's slide has just reset
-; .len and .hi to zero -- so there is nothing to carry across and the swap is
-; three stores. Borrowing anywhere else would have to move the buffered bytes
-; and their map with it.
+; Which is the same trap as the frame-boundary stall one commit earlier, arrived
+; at from the other side: A CLIENT'S FRAMING IS ITS OWN BUSINESS AND VARIES
+; WILDLY BETWEEN BROWSERS, so anything keyed on a frame's size is a rule that
+; treats two conforming peers differently. Key it on "is there a body" instead.
 ;
-; Failure is not an error. The stream keeps its inline buffer and a 16 KiB
-; runway, which is slower across a boundary and correct everywhere.
+; The live window comes across, so this can be called at any moment rather than
+; only when the buffer is empty. That copy is bounded by the INLINE size however
+; large the borrowed buffer is -- at most 16 KiB of bytes and 2 KB of bits --
+; because the inline buffer is the only thing it can be copying from.
+;
+; Failure is not an error. The stream keeps its inline buffer, which is slower
+; and correct, and the pool is sized for concurrent uploads rather than
+; connections.
 ra_buf_borrow:
     cmp qword [rdi + linnea_quic_ra.pool_slot], 0
     jne .bb_have                      ; already holding one
@@ -7713,35 +7723,54 @@ ra_buf_borrow:
     mov eax, -1                       ; every buffer is lent out
     ret
 .bb_take:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
     mov byte [rcx + rax], 1
     lea rcx, [rax + 1]
-    mov [rdi + linnea_quic_ra.pool_slot], rcx
-    push rdx
+    mov [rbx + linnea_quic_ra.pool_slot], rcx
     mov rdx, LINNEA_QUIC_RA_BIG
-    mul rdx                           ; rax = slot * BIG (rdx:rax, high half zero)
+    mul rdx                           ; rax = slot * BIG (high half zero)
     lea rcx, [ra_pool_buf]
-    add rax, rcx
-    mov [rdi + linnea_quic_ra.bufp], rax
-    mov rax, [rdi + linnea_quic_ra.pool_slot]
+    lea r12, [rcx + rax]              ; the buffer it is lending us
+    mov rax, [rbx + linnea_quic_ra.pool_slot]
     dec rax
     mov rdx, (LINNEA_QUIC_RA_BIG + 7) / 8
     mul rdx
     lea rcx, [ra_pool_seen]
-    add rax, rcx
-    mov [rdi + linnea_quic_ra.seenp], rax
-    pop rdx
-    mov qword [rdi + linnea_quic_ra.cap], LINNEA_QUIC_RA_BIG
+    lea r13, [rcx + rax]              ; ...and its arrival map
     ; The map MUST start clean, and its previous borrower left it anything but.
     ; A frame landing at a non-zero offset raises .hi over bits nothing has
     ; written this time round, and the prefix walk reads every bit below .hi --
     ; so a stale one there is an arrival that never happened, and the walk is
     ; handed bytes the buffer does not hold.
-    push rdi
-    mov rdi, [rdi + linnea_quic_ra.seenp]
+    mov rdi, r13
     xor eax, eax
     mov ecx, (LINNEA_QUIC_RA_BIG + 7) / 8
     rep stosb
-    pop rdi
+    ; Carry whatever the window already holds across, bytes and bits alike.
+    ; .hi is the extent of the arrival map, not .len: bytes past the contiguous
+    ; prefix are exactly the out-of-order ones nothing else would ever re-send.
+    mov rcx, [rbx + linnea_quic_ra.hi]
+    test rcx, rcx
+    jz .bb_install
+    mov rdi, r12
+    mov rsi, [rbx + linnea_quic_ra.bufp]
+    rep movsb
+    mov rcx, [rbx + linnea_quic_ra.hi]
+    add rcx, 7
+    shr rcx, 3                        ; whole bytes of the map, rounded up
+    mov rdi, r13
+    mov rsi, [rbx + linnea_quic_ra.seenp]
+    rep movsb
+.bb_install:
+    mov [rbx + linnea_quic_ra.bufp], r12
+    mov [rbx + linnea_quic_ra.seenp], r13
+    mov qword [rbx + linnea_quic_ra.cap], LINNEA_QUIC_RA_BIG
+    pop r13
+    pop r12
+    pop rbx
 .bb_have:
     xor eax, eax
     ret

@@ -56,7 +56,7 @@
 # The timing is worth printing and is not worth asserting.
 #
 # Usage: h3_upload_frames.py <host> <port> <frames> <frame-bytes>
-#            [--max-blocked N] [--rtt-ms N] [--fast-client]
+#            [--max-blocked N] [--rtt-ms N] [--fast-client] [--expect-borrow]
 import socket, ssl, sys, time
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
@@ -72,6 +72,7 @@ argv = sys.argv[5:]
 MAXG = int(argv[argv.index("--max-blocked") + 1]) if "--max-blocked" in argv else -1
 RTT = float(argv[argv.index("--rtt-ms") + 1]) / 1000.0 if "--rtt-ms" in argv else 0.0
 FAST = "--fast-client" in argv
+BORROW = "--expect-borrow" in argv
 ADDR = ("127.0.0.1", port)
 body = bytes((i * 37 + 11) & 0xFF for i in range(FSIZE))
 
@@ -200,7 +201,7 @@ def upload(nframes, fsize):
     # it stays on the RAM path, where there is no boundary of the kind under
     # test -- so a test run below it would measure nothing and say so.
     window = conn._remote_max_stream_data_bidi_remote
-    if fsize <= window:
+    if fsize <= window and not BORROW:
         raise SystemExit("frame size %d does not exceed the server's stream window "
                          "%d, so no payload region opens and this tests nothing"
                          % (fsize, window))
@@ -244,7 +245,8 @@ def upload(nframes, fsize):
                 if "blocked" in str(f.get("frame_type", "")):
                     blocked += 1
     return {"dt": dt, "status": status[0], "grants": grants[0], "blocked": blocked,
-            "ceilings": ceilings, "ends": ends, "bytes": nframes * fsize}
+            "ceilings": ceilings, "ends": ends, "bytes": nframes * fsize,
+            "window": window}
 
 
 r = upload(NFRAMES, FSIZE)
@@ -267,7 +269,24 @@ if stopped:
                 "next grant" % (len(stopped), ", ".join(str(x) for x in stopped)))
     sys.exit(1)
 
-# 2. The browser-visible symptom.
+# 2. A body must be given a REAL window however the peer chopped it up. The
+#    server lends a big buffer for the duration of a body and grants half of
+#    whatever buffer a stream holds, so a ceiling step wider than the advertised
+#    initial window is proof the lend happened. A client whose frames are all
+#    smaller than that window used to miss it entirely and be held to 16 KiB for
+#    the whole upload -- 40 MB took 91 s in Firefox against 13.6 s in Chrome.
+if BORROW:
+    seq = sorted(set(r["ceilings"]))
+    steps = [b - a for a, b in zip(seq, seq[1:])]
+    widest = max(steps) if steps else 0
+    msg += ", widest ceiling step %d against an advertised window of %d" % (
+        widest, r["window"])
+    if widest <= r["window"]:
+        print(msg + "  -- the stream never got more than the window it started "
+                    "with, so no buffer was lent to it")
+        sys.exit(1)
+
+# 3. The browser-visible symptom.
 if MAXG >= 0 and r["blocked"] > MAXG:
     print(msg + "  -- over the %d blocked-frame bound" % MAXG)
     sys.exit(1)

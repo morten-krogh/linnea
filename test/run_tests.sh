@@ -2743,6 +2743,19 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # the new code; this is what runs it at rate.
     out11=$(timeout 180 python3 test/quic/h3_upload_frames.py localhost ${P61498} 10 400000 --max-blocked 0 --rtt-ms 40 --fast-client 2>&1)
     check "h3 ...and the same at 19 MB/s, every boundary a straddling frame ($out11)" $?
+    # THE OTHER BROWSER'S SHAPE, and the one every other upload check here misses:
+    # frames SMALLER than the advertised window. Firefox frames a body that way
+    # and Chrome does not, so a rule keyed on a frame's size treats them
+    # differently -- which is exactly how a build that gave Chrome 2.9 MB/s and
+    # Firefox 440 kB/s on the same 40 MB file passed this suite 693/0.
+    #
+    # What it asserts is the window the peer ends up with, not a time: the server
+    # lends a big buffer for the duration of a body and grants half of whatever
+    # buffer a stream holds, so a ceiling step wider than the advertised window
+    # is proof the lend happened. Measured 525344 against 8945 on the build that
+    # shipped the fault.
+    out12=$(timeout 180 python3 test/quic/h3_upload_frames.py localhost ${P61498} 500 8192 --rtt-ms 20 --expect-borrow 2>&1)
+    check "h3 a body framed SMALL still gets a real window ($out12)" $?
     out8=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 1 --max-ms 400 2>&1)
     check "h3 a lost final response is recovered from a MEASURED rtt ($out8)" $?
     out9=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 0 --max-ms 400 2>&1)

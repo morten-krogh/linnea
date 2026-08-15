@@ -120,15 +120,32 @@ class Upload:
         # a byte of it is queued: the delivery handler is captured into each
         # packet as that packet is BUILT, so patching the sender afterwards
         # leaves every packet already on the wire holding the original.
+        #
+        # ONLY THE BODY. Suppressing every retransmit on the stream was enough
+        # while the overrun was 64 bytes, and stopped being enough the moment
+        # the server's window grew: the data case now has to push most of a
+        # megabyte past a 1 MiB ceiling, and a burst that size drops packets on
+        # loopback. With nothing able to resend them the offending byte simply
+        # never arrived, and the check reported "the bound is not being
+        # enforced" against a server enforcing it perfectly. The body keeps its
+        # hole; everything past it retransmits normally.
         sender = self.conn._streams[self.sid].sender
         deliver = sender.on_data_delivery
-        sender.on_data_delivery = (
-            lambda delivery, start, stop, fin:
-            deliver(delivery, start, stop, fin)
-            if delivery == QuicDeliveryState.ACKED else None)
+        body_end = [None]                                     # set once the body is queued
+
+        def hold_the_gap(delivery, start, stop, fin):
+            if delivery != QuicDeliveryState.ACKED and body_end[0] is not None:
+                if stop <= body_end[0]:
+                    return                                    # wholly body: let it stay lost
+                if start < body_end[0]:
+                    start = body_end[0]                       # resend only the part past it
+            return deliver(delivery, start, stop, fin)
+
+        sender.on_data_delivery = hold_the_gap
         self.h3.send_data(self.sid, BODY, end_stream=False)   # payload; no FIN yet
 
         target = sender._buffer_stop                          # the request's final size
+        body_end[0] = target
         dl = time.time() + 20
         while sender.next_offset < target and time.time() < dl:
             self.emit(hold=True)
@@ -255,11 +272,22 @@ def case_data():
     limits are lifted the way h3_flow_violation_test.py lifts them."""
     u = Upload()
     stream = u.conn._streams[u.sid]
+    body_end = stream.sender._buffer_stop
     # What the server has actually invited, read off its MAX_STREAM_DATA rather
     # than recomputed from a constant here -- the point is to run past the
     # server's own bound, wherever the server currently puts it.
     ceiling = stream.max_stream_data_remote
-    over = ceiling - stream.sender._buffer_stop + 64
+    # THE CEILING MOVES WHILE WE SEND, so overshooting the one we can see is not
+    # enough. The server grants base + capacity, and base slides as it consumes
+    # the body -- so by the time these bytes land it has granted more than it had
+    # when this line ran. Reading it once and adding 64 put the last byte inside
+    # the window the server had grown into, and the check called that "the bound
+    # is not being enforced" against a server behaving correctly.
+    #
+    # base cannot pass the gap, and the gap cannot be later than the body's end,
+    # so the ceiling can never rise by more than one body length. Overshoot by
+    # that and the last byte is past it whatever the server has granted.
+    over = ceiling + body_end + 64 - stream.sender._buffer_stop
     if over <= 0:
         return ("setup: the ceiling (%d) is already behind what has been queued "
                 "(%d), so nothing here would be past it"
