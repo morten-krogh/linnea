@@ -5,8 +5,13 @@ linnea-api had no tests at all until this — it is the one production component
 that shipped without any, which is how the faults below survived a read of it:
 a Content-Length that is not a number taken as zero, a filename escaped but not
 bounded, an unchecked getrandom, and a peer that says nothing stopping the whole
-server for ever, since it serves one connection at a time and blocked with no
+server for ever, since it served one connection at a time and blocked with no
 deadline.
+
+It forks per connection since 2026-08-15, so the last of those is bounded by
+concurrency rather than only by the deadline — which is why the deadline now
+has a check of its own. A fix that makes an older check pass for a NEW reason
+leaves that check testing nothing; see the bottom of this file.
 
 Usage: api_backend_test.py <port>
 """
@@ -17,6 +22,7 @@ import sys
 import time
 
 PORT = int(sys.argv[1])
+IO_TIMEOUT_SEC = 10        # must match linnea_api.asm
 bad = []
 
 
@@ -91,21 +97,58 @@ except Exception as e:
 want("a filename of 300 quotes does not corrupt the answer", ok,
      "%s %d bytes" % (st.decode(), len(body)))
 
-# --- one silent peer no longer wedges the server for ever --------------
-# It still costs everyone behind it IO_TIMEOUT_SEC, which is the point of the
-# deadline rather than a shortcoming of it: the server is deliberately serial,
-# so the fix bounds the damage instead of removing it. What must not happen is
-# what happened before, which is that the wait never ended.
-stuck = socket.create_connection(("127.0.0.1", PORT), timeout=30)
+# --- one silent peer costs only its own child --------------------------
+# The server forks per connection now, so a silent peer holds one child and
+# nothing else. Everything behind it is answered at once rather than after
+# IO_TIMEOUT_SEC.
+stuck = socket.create_connection(("127.0.0.1", PORT), timeout=60)
 t0 = time.time()
 try:
     st, _ = req(b"GET /api/random HTTP/1.1\r\nHost: x\r\n\r\n", timeout=25)
     dt = time.time() - t0
-    want("a silent peer no longer wedges the server for ever",
-         st == b"HTTP/1.1 200 OK" and dt < 20, "%s after %.0fs" % (st.decode(), dt))
+    want("a silent peer does not delay anyone behind it",
+         st == b"HTTP/1.1 200 OK" and dt < 2, "%s after %.1fs" % (st.decode(), dt))
 except socket.timeout:
-    want("a silent peer no longer wedges the server for ever", False,
+    want("a silent peer does not delay anyone behind it", False,
          "still wedged after %.0fs" % (time.time() - t0))
+
+# ...and the DEADLINE still has to arm, which the check above can no longer
+# tell you. It passes in 0.0s whether or not IO_TIMEOUT_SEC exists, because
+# concurrency alone answers the second request — the check stopped testing the
+# thing it was written for the moment the server stopped being serial. What the
+# deadline bounds now is how long a silent peer's own child lives, and without
+# it those children accumulate against MAX_CHILDREN until the ceiling becomes
+# the outage the deadline was there to prevent. So assert it where it is still
+# observable: on the silent connection itself.
+stuck.settimeout(IO_TIMEOUT_SEC * 3)
+t0 = time.time()
+got = b""
+try:
+    while True:
+        c = stuck.recv(4096)
+        if not c:
+            break
+        got += c
+    ended = True
+except socket.timeout:
+    ended = False
+except OSError:
+    ended = True
+dt = time.time() - t0
+want("a silent peer's own connection ends at the deadline",
+     ended and dt >= IO_TIMEOUT_SEC * 0.5,
+     "ended=%s after %.1fs (deadline %ds)" % (ended, dt, IO_TIMEOUT_SEC))
+
+# And it must be given NOTHING. read_head signalled failure with `mov eax, -1`,
+# which is positive in rax, so the caller's `js` never fired and a head that
+# never arrived was parsed anyway — out of a headbuf still holding the PREVIOUS
+# request's head. A bare TCP connection that sent not one byte was answered
+# `HTTP/1.1 200 OK {"value":829}`: the last caller's route, re-run on its
+# behalf. Forking hides this (a child's .bss is a fresh zero page, so the
+# fall-through reaches 400 instead of a stale route), which is exactly why the
+# assertion is that NOTHING comes back rather than that a 400 does.
+want("a silent peer is served nothing at all", got == b"",
+     "got %r" % got[:60] if got else "no response, connection closed")
 stuck.close()
 
 print()

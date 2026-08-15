@@ -15,10 +15,30 @@
 ;   GET  /api/random   {"value":N}, 1 <= N <= 1000, from getrandom(2).
 ;
 ; One request per connection: linnea proxies with Connection: close, so there
-; is nothing to gain from keeping it. Blocking syscalls and one connection at a
-; time — this is a test backend for the site's upload demo, not a server. That
-; is why both socket deadlines are set: with no concurrency, one peer that says
-; nothing is the whole service, and a blocking read has no other way back.
+; is nothing to gain from keeping it.
+;
+; A connection is served in its own forked child, up to MAX_CHILDREN of them.
+; The syscalls are still blocking and each child still does one thing at a time
+; — that is the point of the shape: every buffer here is a single global, and
+; fork gives each connection a private copy of all of them for free, where an
+; event loop would want the lot rehomed into a per-connection struct first. The
+; upload has no shared state to fight over either, because it never names a
+; file: the body goes to an O_TMPFILE and the descriptor IS the handle.
+;
+; It served ONE connection at a time until 2026-08-15, and that was not merely
+; slow. A 40 MB upload arriving over a 4 MB/s uplink held this server for the
+; nine seconds it took, and every other request queued in the backlog behind it
+; — measured at 0.003s idle against 3.303s behind an upload. linnea used to
+; make that worse by streaming h2 bodies upstream as they arrived, so the hold
+; lasted as long as the CLIENT took; it captures them now and connects only
+; once the body is in, which shortens the hold to the backend's own work. Both
+; halves were worth fixing: the proxy no longer hands over a connection it will
+; dribble into, and this no longer has just the one to hand over.
+;
+; The socket deadlines predate that and still earn their place. They no longer
+; protect the service — one wedged peer now costs one child — but they bound
+; how long that child lives, which is what stops wedged peers accumulating
+; against MAX_CHILDREN until the ceiling itself becomes the outage.
 ;
 ; Usage: linnea-api [port] [scratch-dir]   (default 7700 on 127.0.0.1, /tmp)
 
@@ -36,7 +56,41 @@ extern linnea_print_stdout
 extern linnea_print_u64_stdout
 
 LINNEA_EINTR    equ 4
+LINNEA_ECHILD   equ 10
 LINNEA_EAGAIN   equ 11
+LINNEA_WNOHANG  equ 1             ; wait4(2): report and return, do not block
+
+; Connections served at once, each in its own forked child. Matched to the
+; DEFAULT of linnea's max_upstream (256, docs/config.md), which is the most
+; connections linnea will open to a backend: below it this server would be the
+; narrower of the two and would decide the concurrency for both, which is the
+; shape of limit that goes unnoticed until someone measures the wrong thing.
+;
+; Raising max_upstream past this does not break anything — the surplus waits in
+; the listen backlog, which is what a backlog is for — it just means the queue
+; forms here rather than there. Each child touches its own headbuf and iobuf as
+; it runs, so the ceiling is worth roughly 80 KiB apiece and nothing until then:
+; the .bss is copy-on-write and an idle child writes to none of it.
+MAX_CHILDREN    equ 256
+
+; SIGCHLD exists here for ONE reason: to interrupt accept(2).
+;
+; Reaping at the top of the accept loop is enough to bound the zombies, but not
+; to avoid them: the parent goes back to blocking in accept and the child of the
+; LAST request exits behind it, so an idle server sits with a permanent
+; `linnea-api <defunct>` in ps until somebody connects again. Measured at
+; exactly one, indefinitely. That is harmless and it looks like a bug, which on
+; a box someone else operates is its own kind of cost.
+;
+; A handler that does nothing still ends the accept with EINTR, and the loop
+; already treats EINTR as "go round again" -- which reaps. Installed WITHOUT
+; SA_RESTART deliberately: SA_RESTART is what would make the kernel resume the
+; accept instead of returning, and resuming is precisely what must not happen.
+; Only the parent ever has children, so only the parent is ever interrupted; a
+; child inherits the handler and never receives the signal.
+SIG_CHLD        equ 17
+SA_RESTORER     equ 0x04000000
+SYS_RT_SIGRETURN equ 15
 
 DEFAULT_PORT    equ 7700
 HEAD_BUF        equ 8192          ; request head, plus whatever body rode with it
@@ -60,16 +114,17 @@ NAME_MAX        equ 255           ; decoded filename bytes we will repeat back
 ; than an immediate: past 2^31 this no longer fits one, and a raise would
 ; otherwise truncate with only a warning to say so.
 MAX_UPLOAD      equ 67108864
-; This server handles one connection at a time and blocks while it does, so a
-; peer that connects and then says nothing stops every other request until it
-; goes away — measured at exactly that, indefinitely, before this existed.
+; A child blocks while it serves, so a peer that connects and then says nothing
+; would hold its child for ever without this — measured at exactly that,
+; indefinitely, before the deadline existed, back when it held the whole server.
 ;
-; The deadline does not make the server concurrent; it bounds the damage. One
-; stuck peer costs everyone behind it this long instead of for ever, so the
-; number wants to be as small as it can be without ever firing in anger. Only
-; linnea reaches this port, over loopback, having already buffered the whole
-; request before it opens the leg — a read that takes ten seconds is not a slow
-; client, it is a linnea that is no longer there.
+; What it bounds changed with the fork; that it is needed did not. One stuck
+; peer now costs one child rather than the service, but MAX_CHILDREN of them
+; would cost the service, and a child with no deadline never leaves to be
+; reaped. The number wants to be as small as it can be without ever firing in
+; anger. Only linnea reaches this port, over loopback, having already buffered
+; the whole request before it opens the leg — a read that takes ten seconds is
+; not a slow client, it is a linnea that is no longer there.
 IO_TIMEOUT_SEC  equ 10
 
 section .rodata
@@ -171,11 +226,25 @@ hexdigits:      db "0123456789abcdef"
 default_name:   db "upload"
 default_name_len equ $ - default_name
 
+section .data
+
+align 8
+; struct kernel_sigaction: handler, flags, restorer, mask. The pointers are
+; filled in at install time -- position-independent code cannot put a
+; relocation here. NO SA_RESTART in the flags, on purpose: see SIG_CHLD.
+sa_chld:    dq 0
+            dq SA_RESTORER
+            dq 0
+            dq 0
+
 section .bss
 
 listen_fd:      resq 1
 conn_fd:        resq 1
 port:           resq 1
+; Children currently serving a connection. The parent's copy is the only one
+; that means anything — a child inherits the value and never looks at it again.
+children:       resq 1
 sockaddr:       resb 16
 headbuf:        resb HEAD_BUF
 head_len:       resq 1            ; bytes up to and including the blank line
@@ -223,6 +292,7 @@ _start:
     mov [tmp_dir_ptr], rax
 .have_dir:
     call setup_listener
+    call install_sigchld
     lea rdi, [msg_listen]
     mov esi, msg_listen_len
     call linnea_print_stdout
@@ -233,6 +303,13 @@ _start:
     call linnea_print_stdout
 
 .accept_loop:
+    ; Collect whatever has finished since the last connection. Non-blocking, so
+    ; an idle server simply finds nothing; the exits are not reaped the instant
+    ; they happen, which costs at most MAX_CHILDREN zombies while nobody is
+    ; calling. Doing it here rather than from a SIGCHLD handler keeps the whole
+    ; server free of signal handlers and of anything that can interrupt a
+    ; blocking read halfway.
+    call reap_finished
     mov eax, LINNEA_SYS_ACCEPT
     mov rdi, [listen_fd]
     xor esi, esi
@@ -241,18 +318,129 @@ _start:
     test rax, rax
     js .accept_loop                ; EINTR and friends: just go round again
     mov [conn_fd], rax
-    ; Deadlines, before a single byte is read. Both directions: a peer that
-    ; never speaks and a peer that never reads wedge this server identically,
-    ; since it serves one connection at a time and blocks in both.
+    ; Deadlines, before a single byte is read, and before the fork so that the
+    ; child and the serve-it-here fallback below both inherit them. Both
+    ; directions: a peer that never speaks and a peer that never reads wedge a
+    ; handler identically, and it blocks in both.
     mov edx, LINNEA_SO_RCVTIMEO
     call set_timeout
     mov edx, LINNEA_SO_SNDTIMEO
     call set_timeout
+    ; At the ceiling: wait for one to leave before adding another. This is the
+    ; back pressure — connections queue in the listen backlog, which is what a
+    ; backlog is for, instead of the process table growing without bound.
+    cmp qword [children], MAX_CHILDREN
+    jb .have_room
+    call reap_one
+.have_room:
+    mov eax, LINNEA_SYS_FORK
+    syscall
+    test rax, rax
+    js .serve_here                 ; no process to be had: serve it ourselves
+    jnz .parent
+    ; --- child: this connection and nothing else ---
+    ; The listening socket goes first. A child holding it would keep the port
+    ; bound after the parent died, so a restart would fail to bind against
+    ; children of a server that is already gone.
+    mov eax, LINNEA_SYS_CLOSE
+    mov rdi, [listen_fd]
+    syscall
+    call handle_conn
+    mov eax, LINNEA_SYS_CLOSE
+    mov rdi, [conn_fd]
+    syscall
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+.parent:
+    inc qword [children]
+    mov eax, LINNEA_SYS_CLOSE      ; the child owns it now
+    mov rdi, [conn_fd]
+    syscall
+    jmp .accept_loop
+.serve_here:
+    ; fork failed — the process table is full, or a limit says no. Answering it
+    ; on this thread costs the concurrency for one request; refusing it, or
+    ; looping to try again, costs the client a request that would have worked.
     call handle_conn
     mov eax, LINNEA_SYS_CLOSE
     mov rdi, [conn_fd]
     syscall
     jmp .accept_loop
+
+
+; install_sigchld() — arm the interrupt described where SIG_CHLD is defined.
+; A failure is not worth refusing to start over: the result is the previous
+; behaviour, one lingering zombie while the server is idle.
+install_sigchld:
+    lea rax, [sigchld_noop]
+    mov [sa_chld], rax
+    lea rax, [sigchld_restorer]
+    mov [sa_chld + 16], rax
+    mov eax, LINNEA_SYS_RT_SIGACTION
+    mov edi, SIG_CHLD
+    lea rsi, [sa_chld]
+    xor edx, edx                   ; no old action wanted
+    mov r10d, 8                    ; sizeof(sigset_t)
+    syscall
+    ret
+
+; The handler runs, does nothing, and returns; the syscall it interrupted ends
+; with EINTR, which is the entire product. x86-64 needs the restorer stub or the
+; return from a handler goes nowhere.
+sigchld_noop:
+    ret
+sigchld_restorer:
+    mov eax, SYS_RT_SIGRETURN
+    syscall
+
+
+; reap_finished() — collect every child that has already exited, without
+; blocking. Clobbers rax, rdi, rsi, rdx, r10.
+reap_finished:
+    cmp qword [children], 0
+    je .rf_done                    ; nothing outstanding: skip the syscall
+.rf_loop:
+    mov eax, LINNEA_SYS_WAIT4
+    mov rdi, -1                    ; any child
+    xor esi, esi                   ; no status wanted
+    mov edx, LINNEA_WNOHANG
+    xor r10d, r10d                 ; no rusage
+    syscall
+    cmp rax, 0
+    jle .rf_done                   ; 0 = none ready, negative = none left
+    dec qword [children]
+    jmp .rf_loop
+.rf_done:
+    ret
+
+
+; reap_one() — block until one child leaves. Only called at the ceiling, where
+; waiting IS the back pressure. Clobbers rax, rdi, rsi, rdx, r10.
+reap_one:
+    mov eax, LINNEA_SYS_WAIT4
+    mov rdi, -1
+    xor esi, esi
+    xor edx, edx                   ; blocking
+    xor r10d, r10d
+    syscall
+    cmp rax, 0
+    jg .r1_got
+    ; ECHILD means the count is wrong and there is nothing to wait for; do not
+    ; spin on it. EINTR lands here too — the SIGCHLD that interrupts accept can
+    ; interrupt this as well, and returning without having reaped lets the fork
+    ; below put the count one OVER the ceiling. That is deliberate and it is
+    ; bounded: at most one per accept, and reap_finished at the top of the next
+    ; turn takes it straight back. Looping here instead would trade a ceiling
+    ; that can be exceeded by one for a wait that can be entered for ever.
+    cmp rax, -LINNEA_ECHILD
+    jne .r1_done
+    mov qword [children], 0        ; resynchronise rather than wedge for ever
+    ret
+.r1_got:
+    dec qword [children]
+.r1_done:
+    ret
 
 
 ; set_timeout(edx = SO_RCVTIMEO or SO_SNDTIMEO) — arm one deadline on conn_fd.
@@ -576,7 +764,14 @@ absorb:
     pop rbx
     ret
 .fail:
-    mov eax, -1
+    ; rax, NOT eax — the same sign-extension trap as read_head's, and with the
+    ; same consequence: both call sites test `test rax, rax / js .fail_file`,
+    ; which 0x00000000ffffffff can never satisfy, so a failed write to the
+    ; capture file was ignored and the upload carried on to answer 200. The
+    ; checksum still came out right (absorb hashes from the buffer, not from the
+    ; file), which is what made it invisible — a scratch filesystem that was
+    ; FULL reported every upload as a success.
+    mov rax, -1
     pop r13
     pop r12
     pop rbx
@@ -876,7 +1071,19 @@ read_head:
     pop rbx
     ret
 .fail:
-    mov eax, -1
+    ; rax, NOT eax. `mov eax, -1` writes 0x00000000ffffffff, which is POSITIVE
+    ; as a 64-bit value, so the caller's `test rax, rax / js .done` could never
+    ; fire and every failed head fell through to be parsed anyway. headbuf still
+    ; held the PREVIOUS request's head at that point, so a peer that connected
+    ; and said nothing at all was answered with the previous connection's route
+    ; re-run on its behalf: demonstrated as a bare TCP connection receiving
+    ; `HTTP/1.1 200 OK {"value":829}` ten seconds after saying nothing.
+    ;
+    ; Forking hides it — a child's .bss is a fresh copy-on-write zero page, so
+    ; there is no stale head to find and the fall-through lands on 400 instead —
+    ; which is exactly why it is fixed HERE rather than left to the new process
+    ; model to cover up.
+    mov rax, -1
     pop rbx
     ret
 
