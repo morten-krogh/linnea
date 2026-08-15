@@ -189,27 +189,60 @@ LINNEA_QUIC_PU_PEND equ 8
 ;
 ; It buys a round trip per boundary rather than all of them. A peer used to pay
 ; TWO at each one -- base did not move to the payload's end until the payload was
-; whole, so the runway did not even begin until then -- and now the window is
-; there in advance and it pays one. Buying that last one means RA_BUF exceeding
-; bandwidth x RTT, which is the memory above against somebody's link, so it is
-; not a constant that can be chosen once and be right.
-LINNEA_QUIC_RA_BUF      equ 131072  ; reassembly capacity for one request stream,
-                                    ; and the credit a client crosses a frame
-                                    ; boundary on
+; whole, so the runway did not even begin until then -- and now it pays one.
+;
+; THE LAST ONE CANNOT BE ENGINEERED AWAY, ONLY BOUGHT, and it is worth writing
+; down why so the next attempt does not start where mine did. The server cannot
+; place a byte until it knows whether that byte is framing or body, and it learns
+; that only by parsing the stream IN ORDER. A peer sends in order too, so the
+; next frame's header is the bytes immediately after this frame's payload: it
+; cannot arrive any earlier than the payload's last byte, whatever the server
+; does with it afterwards. Pipelining the next region ahead was designed and
+; discarded for exactly this -- it changes where the ceiling sits AFTER the
+; grant, not when the header arrives. So credit past the parsed point must be
+; backed by RAM, the runway IS the buffer, and the stall is
+;
+;     max(0, rtt - buffer / rate)
+;
+; measured at 36.7 ms against a predicted 33 ms (128 KiB, 19 MB/s, 40 ms rtt).
+; The only lever is the buffer against somebody's bandwidth-delay product.
+;
+; Which is why the buffer is no longer one size. A request that carries no body
+; -- almost all of them -- needs enough to reassemble a header block and nothing
+; more, and it is the six-per-connection copies of the LARGE one that made the
+; size a fight in the first place. So: a small one inline in every context, and a
+; big one borrowed from a per-worker pool for as long as a body is arriving.
+LINNEA_QUIC_RA_SMALL    equ 16384    ; inline per context: what a request with no
+                                     ; body ever needs, and the window advertised
+                                     ; in initial_max_stream_data_bidi_remote
+LINNEA_QUIC_RA_BIG      equ 1048576  ; borrowed while a body arrives, and so the
+                                     ; credit a client crosses a frame boundary
+                                     ; on: 1 MiB covers 8 MB/s at 120 ms
+LINNEA_QUIC_RA_POOL     equ 32       ; big buffers per worker. Concurrent UPLOADS,
+                                     ; not connections -- a stream that cannot get
+                                     ; one falls back to its inline buffer and is
+                                     ; slower, never wrong
+; RA_CTXS(6) * (small + its bitmap) is 108 KB per connection, against 864 KB when
+; every context carried 128 KiB, so the common case got 8x cheaper as this got
+; bigger. The pool is 32 * (big + its bitmap) = 36 MB per worker, .bss and so
+; faulted on touch, and it is a per-worker total rather than a per-connection
+; multiplier -- which is the whole point: 226 MB of pathological address space
+; became a number that does not move with the connection count.
 ; Receive-side connection flow control (quic-9). We advertise INITIAL_MAX_DATA and
 ; keep the ceiling FC_WINDOW ahead of what the peer has sent, re-granting via
 ; MAX_DATA whenever a fresh grant would advance the ceiling by >= FC_GRANT_MIN.
-; Over-granting is safe: a stream is still capped at RA_BUF, so no extra is buffered.
+; Over-granting is safe: a stream is still capped at its own buffer, so no extra
+; is buffered.
 LINNEA_QUIC_INITIAL_MAX_DATA equ 1048576   ; must match initial_max_data in the TP
 LINNEA_QUIC_FC_WINDOW        equ 0x400000   ; 4 MiB ahead of received
 LINNEA_QUIC_FC_GRANT_MIN     equ 0x40000    ; 256 KiB minimum grant step
 LINNEA_QUIC_CTRL_RO     equ 512     ; reordered control-stream bytes held (h3-6)
 LINNEA_QUIC_RA_CTXS     equ 6       ; requests that can reassemble concurrently
 LINNEA_QUIC_RA_WALK     equ 8288    ; room for one linnea_h3_walk (asserted)
-; How far the request-stream window may slide before the peer is told. Half the
-; buffer: grant sooner and it is a packet per datagram, later and the client
-; stalls waiting on credit it has already earned.
-LINNEA_QUIC_RA_GRANT    equ LINNEA_QUIC_RA_BUF / 2
+; How far the request-stream window may slide before the peer is told: half of
+; whatever buffer that stream currently holds, so it is computed rather than a
+; constant now. Grant sooner and it is a packet per datagram, later and the
+; client stalls waiting on credit it has already earned.
 ; --- direct-to-file body (the upload window) -------------------------------
 ; RA_BUF bounds how much UNCONSUMED stream we can hold, and because the window
 ; we advertise had to equal it, it also bounded the upload RATE: a client may
@@ -431,11 +464,24 @@ struc linnea_quic_ra
     .body_hi:   resq 1              ; contiguous bytes placed from .body_from
     .body_nr:   resq 1              ; ranges in use
     .body_rng:  resq LINNEA_QUIC_RA_RANGES * 2   ; [start, end) absolute pairs
-    .buf:      resb LINNEA_QUIC_RA_BUF
+    ; The live buffer and its arrival map, reached through POINTERS because they
+    ; are not always the inline pair below: a stream that starts taking a body
+    ; borrows a big one from the worker's pool and points here at that instead.
+    ; Everything that touches the window goes through these three, so the only
+    ; code that knows which buffer is in hand is the borrow and the give-back.
+    .bufp:     resq 1
+    .seenp:    resq 1
+    .cap:      resq 1                ; bytes .bufp holds, and so the window
+    ; Borrowed pool slot as index + 1, so that ZERO means "none" and a context in
+    ; freshly zeroed memory is already correct. ra_release is called on every
+    ; context of a dying connection whether or not it ever ran, and reading a
+    ; plain index out of that would have handed slot 0 back once per context.
+    .pool_slot: resq 1
+    .buf:      resb LINNEA_QUIC_RA_SMALL
     ; bit i = 1 once stream byte i has arrived. A bit, not a byte: at one byte
     ; per byte this array alone was half the size of a connection, and there
     ; are LINNEA_QUIC_RA_CTXS of them in every one.
-    .seen:     resb (LINNEA_QUIC_RA_BUF + 7) / 8
+    .seen:     resb (LINNEA_QUIC_RA_SMALL + 7) / 8
 endstruc
 
 struc linnea_quic_sent

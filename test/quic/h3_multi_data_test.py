@@ -30,14 +30,16 @@ from aioquic.h3.events import DataReceived, HeadersReceived
 
 PORT = int(sys.argv[1])
 ADDR = ("127.0.0.1", PORT)
-# Only sizes the two cases; which path each one actually took is asserted from
-# the window the SERVER advertises, so a stale value here cannot silently turn
-# the file-path case into a second RAM-path one the way it once did.
-RA_BUF = 131072
+# The two cases are sized as MULTIPLES of the window the server advertises,
+# learned from the connection after the handshake, so neither one can drift out
+# of the path it is for. It used to be a constant copied from the server, and
+# when the server's moved the file-path case quietly became a second RAM-path
+# case with its label intact -- and then moved again when the buffer became a
+# small inline one plus a big borrowed one.
 SECOND = bytes((i * 11 + 37) & 0xFF for i in range(20000))
 
 
-def echo(first_len, label, want_file_path, drain_between=True):
+def echo(size_of, label, want_file_path, drain_between=True):
     """POST first_len bytes then SECOND, as two DATA frames. -> None, or why not.
 
     want_file_path says which of the two ingest paths the first frame is meant
@@ -56,8 +58,6 @@ def echo(first_len, label, want_file_path, drain_between=True):
     anything failing loudly. Draining between the frames -- which is all this
     test used to do -- never produces one.
     """
-    part1 = bytes((i * 37 + 11) & 0xFF for i in range(first_len))
-    body = part1 + SECOND
 
     cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
     cfg.verify_mode = ssl.CERT_NONE
@@ -95,6 +95,9 @@ def echo(first_len, label, want_file_path, drain_between=True):
     # deliberately; only one larger than it opens a payload region written
     # straight to the capture file.
     window = conn._remote_max_stream_data_bidi_remote
+    first_len = size_of(window)
+    part1 = bytes((i * 37 + 11) & 0xFF for i in range(first_len))
+    body = part1 + SECOND
     if want_file_path and first_len <= window:
         return ("%s: a first frame of %d does not exceed the server's stream "
                 "window %d, so it takes the RAM path and this case is a "
@@ -149,15 +152,16 @@ def echo(first_len, label, want_file_path, drain_between=True):
     return None
 
 
-bad = echo(RA_BUF // 2, "small first frame (control, RAM path)", False)
+bad = echo(lambda w: w // 2, "small first frame (control, RAM path)", False)
 if bad:
     print(bad)
     sys.exit(1)
-bad = echo(RA_BUF * 3, "large first frame (capture-file path)", True)
+bad = echo(lambda w: w * 3, "large first frame (capture-file path)", True)
 if bad:
     print(bad)
     sys.exit(1)
-bad = echo(RA_BUF * 3, "large first frame, both queued at once (straddling frame)",
+bad = echo(lambda w: w * 3,
+           "large first frame, both queued at once (straddling frame)",
            True, drain_between=False)
 if bad:
     print(bad)

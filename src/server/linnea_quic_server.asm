@@ -302,6 +302,16 @@ cap_errno_end: db ")", 10
 cap_errno_end_len equ $ - cap_errno_end
 
 section .bss
+; --- the big reassembly buffers ---------------------------------------------
+; One per CONCURRENT UPLOAD rather than one per context per connection, which is
+; what lets a single one be 1 MiB. .bss, so it costs address space until touched
+; and a worker that never sees a body never faults a page of it in.
+;
+; Per worker, not per connection: the fork gives each worker its own copy on
+; write, and nothing here is shared between them.
+ra_pool_buf:  resb LINNEA_QUIC_RA_POOL * LINNEA_QUIC_RA_BIG
+ra_pool_seen: resb LINNEA_QUIC_RA_POOL * ((LINNEA_QUIC_RA_BIG + 7) / 8)
+ra_pool_used: resb LINNEA_QUIC_RA_POOL      ; 1 = lent out
 ; 1 = print the CFIN-OK marker on a completed handshake. Only
 ; bin/linnea-quichs sets it; the server leaves it 0.
 linnea_quic_cfin_echo: resq 1
@@ -2448,14 +2458,24 @@ linnea_quic_server_datagram:
     mov [rax + linnea_quic_ra.sid], rdx
     mov qword [rax + linnea_quic_ra.len], 0
     mov qword [rax + linnea_quic_ra.fin], 0
-    ; clear the seen-map up to the previous run's high-water, then reset it
-    ; (one bit per stream byte, so round the high-water up to whole bytes)
-    mov rcx, [rax + linnea_quic_ra.hi]
-    add rcx, 7
-    shr rcx, 3
+    ; A stream begins on the context's own small buffer, handing back any big one
+    ; the last stream through here borrowed. Doing it at the START as well as at
+    ; release is belt and braces on a resource whose leak is permanent: a slot
+    ; never given back is gone for the life of the worker, and the symptom is
+    ; uploads quietly getting slower as the pool drains.
+    push rax
+    mov rdi, rax
+    call ra_buf_inline
+    pop rax
+    ; Clear the whole inline map rather than up to the previous run's high-water.
+    ; That high-water may have been reached in a BORROWED buffer and so be far
+    ; larger than this array -- 1 MiB of bits against 2 KB of room -- and the
+    ; rounding-up version of this line would have run 128 KB of zeroes through
+    ; the rest of the connection.
     lea rdi, [rax + linnea_quic_ra.seen]
     push rax                                   ; xor al clobbers rax's low byte
     xor al, al
+    mov ecx, (LINNEA_QUIC_RA_SMALL + 7) / 8
     rep stosb
     pop rax
     mov qword [rax + linnea_quic_ra.hi], 0
@@ -2479,7 +2499,7 @@ linnea_quic_server_datagram:
     mov qword [rax + linnea_quic_ra.body_file], 0
     mov qword [rax + linnea_quic_ra.body_hi], 0
     mov qword [rax + linnea_quic_ra.body_nr], 0
-    mov qword [rax + linnea_quic_ra.fc_adv], LINNEA_QUIC_RA_BUF
+    mov qword [rax + linnea_quic_ra.fc_adv], LINNEA_QUIC_RA_SMALL
     mov [rax + linnea_quic_ra.walk + linnea_h3_walk.sink_ctx], rax
     push rax
     lea rax, [ra_body_sink]
@@ -2639,15 +2659,15 @@ linnea_quic_server_datagram:
     sub r9, r11                                ; offset within the window
     mov r11, r9
     add r11, r10                               ; where the frame ends in it
-    cmp r11, LINNEA_QUIC_RA_BUF
+    cmp r11, [rax + linnea_quic_ra.cap]
     ja .ra_drop                                ; past the window we advertised
     test r10, r10
     jz .ra_hi_upd                              ; empty frame (e.g. a lone FIN)
-    lea rdi, [rax + linnea_quic_ra.buf]
+    mov rdi, [rax + linnea_quic_ra.bufp]
     add rdi, r9                                ; dest = buf + the relative offset
     mov rcx, r10
     rep movsb                                  ; copy the frame's bytes (rax intact)
-    lea rdi, [rax + linnea_quic_ra.seen]       ; mark those bytes seen. bts takes
+    mov rdi, [rax + linnea_quic_ra.seenp]      ; mark those bytes seen. bts takes
     mov rsi, r9                                ; a bit offset that may run past the
     mov rcx, r10                               ; operand, so it addresses the whole
 .ra_mark:                                      ; map from one base
@@ -2705,7 +2725,7 @@ linnea_quic_server_datagram:
                                                ; below need to find its context
     push rax
     lea rdi, [rax + linnea_quic_ra.walk]
-    lea rsi, [rax + linnea_quic_ra.buf]
+    mov rsi, [rax + linnea_quic_ra.bufp]
     add rsi, [rax + linnea_quic_ra.fed]
     mov rdx, r10
     sub rdx, [rax + linnea_quic_ra.fed]
@@ -2751,7 +2771,7 @@ linnea_quic_server_datagram:
     cmp qword [rdi + linnea_quic_ra.walk + linnea_h3_walk.phase], LINNEA_H3_W_DATA
     jne .ra_ceiling
     mov rcx, [rdi + linnea_quic_ra.walk + linnea_h3_walk.frame_rem]
-    cmp rcx, LINNEA_QUIC_RA_BUF
+    cmp rcx, [rdi + linnea_quic_ra.cap]
     jb .ra_ceiling                             ; a payload the window already
                                                ; covers: leave it on the RAM
                                                ; path, which is cheaper and is
@@ -2793,15 +2813,24 @@ linnea_quic_server_datagram:
     ;
     ; Be honest about it: today it can find nothing. The slide is over the whole
     ; payload, and nothing beyond the payload can be in the buffer to survive it
-    ; -- the old ceiling was base + RA_BUF, a region is only taken over when the
-    ; payload is at least RA_BUF, so every buffered byte is payload and
+    ; -- the ceiling was base + the buffer, a region is only taken over when the
+    ; payload is at least that, so every buffered byte is payload and
     ; ra_body_migrate has just moved and unmarked all of it. The call is one
-    ; compare against the day the RA_BUF gate below moves; without it that day
+    ; compare against the day the capacity gate above moves; without it that day
     ; produces a hung upload and no other symptom.
     mov rdi, [s_ra_ctx]
     mov rsi, [rdi + linnea_quic_ra.body_to]
     sub rsi, [rdi + linnea_quic_ra.base]
     call ra_slide
+    ; The window is empty exactly here, which is the one moment a bigger buffer
+    ; can be swapped in for nothing: .len and .hi are zero and there is not a
+    ; byte to carry across. This is also the moment the extra room starts being
+    ; worth something -- from here the capacity IS the runway the peer crosses
+    ; each DATA frame boundary on, and its stall there is
+    ; max(0, rtt - capacity/rate). If the pool is empty the stream keeps its
+    ; inline buffer: slower across a boundary, correct everywhere.
+    mov rdi, [s_ra_ctx]
+    call ra_buf_borrow
     mov rdi, [s_ra_ctx]
     call ra_prefix_advance
     ; A payload can be whole the moment it is taken over, when the buffer was
@@ -2815,7 +2844,7 @@ linnea_quic_server_datagram:
     ; frame it is sending -- across the boundary, without waiting for the grant
     ; that used to follow the payload's last byte a round trip later.
     mov rax, [rdi + linnea_quic_ra.base]
-    add rax, LINNEA_QUIC_RA_BUF
+    add rax, [rdi + linnea_quic_ra.cap]
     cmp qword [rdi + linnea_quic_ra.body_to], 0
     je .ra_ceil_have
     ; The payload's own bytes go to the file and the buffer does not bound them,
@@ -2835,7 +2864,11 @@ linnea_quic_server_datagram:
                                                ; below into a huge "grant"
     mov rcx, rax
     sub rcx, [rdi + linnea_quic_ra.fc_adv]
-    cmp rcx, LINNEA_QUIC_RA_GRANT
+    push rdx
+    mov rdx, [rdi + linnea_quic_ra.cap]
+    shr rdx, 1                                 ; half the buffer in hand
+    cmp rcx, rdx
+    pop rdx
     jae .ra_grant
     ; A step smaller than RA_GRANT is normally not worth a packet: the ceiling
     ; will move again shortly and one grant can carry both. Inside a payload it
@@ -2861,7 +2894,7 @@ linnea_quic_server_datagram:
     cmp qword [rdi + linnea_quic_ra.body_to], 0
     je .ra_fed_none                            ; buffer path: base keeps moving
     mov rcx, [rdi + linnea_quic_ra.base]
-    add rcx, LINNEA_QUIC_RA_BUF
+    add rcx, [rdi + linnea_quic_ra.cap]
     cmp rax, rcx
     jne .ra_fed_none                           ; not the cap: a bigger step comes
 .ra_grant:
@@ -7392,7 +7425,7 @@ ra_body_migrate:
 .mg_scan:
     cmp r15, r14
     jae .mg_clear
-    lea rdx, [rbx + linnea_quic_ra.seen]
+    mov rdx, [rbx + linnea_quic_ra.seenp]
     bt [rdx], r15
     jnc .mg_next
     mov r12, r15                                ; run start
@@ -7400,14 +7433,14 @@ ra_body_migrate:
     inc r15
     cmp r15, r14
     jae .mg_place
-    lea rdx, [rbx + linnea_quic_ra.seen]
+    mov rdx, [rbx + linnea_quic_ra.seenp]
     bt [rdx], r15
     jc .mg_run
 .mg_place:
     mov rdi, rbx
     mov rsi, [rbx + linnea_quic_ra.body_from]
     add rsi, r12
-    lea rdx, [rbx + linnea_quic_ra.buf]
+    mov rdx, [rbx + linnea_quic_ra.bufp]
     add rdx, r12
     mov rcx, r15
     sub rcx, r12
@@ -7424,7 +7457,7 @@ ra_body_migrate:
 .mg_clr_loop:
     cmp r15, r14
     jae .mg_ok
-    lea rdx, [rbx + linnea_quic_ra.seen]
+    mov rdx, [rbx + linnea_quic_ra.seenp]
     btr [rdx], r15
     inc r15
     jmp .mg_clr_loop
@@ -7634,6 +7667,85 @@ ra_body_sink:
     pop rbx
     ret
 
+; ra_buf_inline(rdi = context) — point the window at this context's own small
+; buffer, giving back a borrowed one if it holds it. Safe on a context that never
+; ran: .pool_slot is index + 1, so zeroed memory reads as "none".
+ra_buf_inline:
+    mov rax, [rdi + linnea_quic_ra.pool_slot]
+    test rax, rax
+    jz .bi_set
+    dec rax
+    lea rcx, [ra_pool_used]
+    mov byte [rcx + rax], 0
+    mov qword [rdi + linnea_quic_ra.pool_slot], 0
+.bi_set:
+    lea rax, [rdi + linnea_quic_ra.buf]
+    mov [rdi + linnea_quic_ra.bufp], rax
+    lea rax, [rdi + linnea_quic_ra.seen]
+    mov [rdi + linnea_quic_ra.seenp], rax
+    mov qword [rdi + linnea_quic_ra.cap], LINNEA_QUIC_RA_SMALL
+    ret
+
+; ra_buf_borrow(rdi = context) -> rax = 0 borrowed, -1 none free.
+;
+; Called when a body region opens, which is the only time the extra capacity is
+; worth anything: it IS the runway a peer crosses a DATA frame boundary on, and
+; the stall there is max(0, rtt - capacity/rate).
+;
+; ONLY EVER CALLED WITH THE WINDOW EMPTY -- the region's slide has just reset
+; .len and .hi to zero -- so there is nothing to carry across and the swap is
+; three stores. Borrowing anywhere else would have to move the buffered bytes
+; and their map with it.
+;
+; Failure is not an error. The stream keeps its inline buffer and a 16 KiB
+; runway, which is slower across a boundary and correct everywhere.
+ra_buf_borrow:
+    cmp qword [rdi + linnea_quic_ra.pool_slot], 0
+    jne .bb_have                      ; already holding one
+    lea rcx, [ra_pool_used]
+    xor eax, eax
+.bb_scan:
+    cmp byte [rcx + rax], 0
+    je .bb_take
+    inc eax
+    cmp eax, LINNEA_QUIC_RA_POOL
+    jb .bb_scan
+    mov eax, -1                       ; every buffer is lent out
+    ret
+.bb_take:
+    mov byte [rcx + rax], 1
+    lea rcx, [rax + 1]
+    mov [rdi + linnea_quic_ra.pool_slot], rcx
+    push rdx
+    mov rdx, LINNEA_QUIC_RA_BIG
+    mul rdx                           ; rax = slot * BIG (rdx:rax, high half zero)
+    lea rcx, [ra_pool_buf]
+    add rax, rcx
+    mov [rdi + linnea_quic_ra.bufp], rax
+    mov rax, [rdi + linnea_quic_ra.pool_slot]
+    dec rax
+    mov rdx, (LINNEA_QUIC_RA_BIG + 7) / 8
+    mul rdx
+    lea rcx, [ra_pool_seen]
+    add rax, rcx
+    mov [rdi + linnea_quic_ra.seenp], rax
+    pop rdx
+    mov qword [rdi + linnea_quic_ra.cap], LINNEA_QUIC_RA_BIG
+    ; The map MUST start clean, and its previous borrower left it anything but.
+    ; A frame landing at a non-zero offset raises .hi over bits nothing has
+    ; written this time round, and the prefix walk reads every bit below .hi --
+    ; so a stale one there is an arrival that never happened, and the walk is
+    ; handed bytes the buffer does not hold.
+    push rdi
+    mov rdi, [rdi + linnea_quic_ra.seenp]
+    xor eax, eax
+    mov ecx, (LINNEA_QUIC_RA_BIG + 7) / 8
+    rep stosb
+    pop rdi
+.bb_have:
+    xor eax, eax
+    ret
+
 ; ra_prefix_advance(rdi = context) — walk the arrived-bytes map forward from the
 ; contiguous prefix, as far as the bits allow.
 ;
@@ -7650,7 +7762,7 @@ ra_body_sink:
 ra_prefix_advance:
     mov rax, [rdi + linnea_quic_ra.len]
     mov rdx, [rdi + linnea_quic_ra.hi]
-    lea rcx, [rdi + linnea_quic_ra.seen]
+    mov rcx, [rdi + linnea_quic_ra.seenp]
 .pa_loop:
     cmp rax, rdx                      ; reached the high-water?
     jae .pa_done
@@ -7679,7 +7791,12 @@ ra_release:
     mov qword [rdi + linnea_quic_ra.spill_fd], -1
 .rr_none:
     mov qword [rdi + linnea_quic_ra.spill_len], 0
-    ret
+    ; ...and the big buffer, if this stream borrowed one. Same reasoning as the
+    ; descriptor above and the same unconditional call: a slot never handed back
+    ; is gone for the life of the worker. The connection teardown calls this for
+    ; every context whether or not it ever ran, which is exactly why .pool_slot
+    ; is index + 1 -- zeroed memory means "none", not "slot 0".
+    jmp ra_buf_inline                 ; tail call: it returns for us
 
 ; ra_slide(rdi = context, rsi = bytes the walk has consumed) — move the window
 ; forward over them. buf[0] becomes the first byte the walk has not read, and
@@ -7703,13 +7820,13 @@ ra_slide:
     mov qword [rbx + linnea_quic_ra.len], 0
     mov qword [rbx + linnea_quic_ra.fed], 0
     mov r13, [rbx + linnea_quic_ra.hi]
-    lea rdi, [rbx + linnea_quic_ra.seen]
+    mov rdi, [rbx + linnea_quic_ra.seenp]
     cmp r13, r12
     jbe .sl_clear                     ; nothing was buffered past what was read
     mov r14, r13
     sub r14, r12                      ; bytes that survive the slide
     push rdi
-    lea rdi, [rbx + linnea_quic_ra.buf]
+    mov rdi, [rbx + linnea_quic_ra.bufp]
     lea rsi, [rdi + r12]
     mov rcx, r14
     rep movsb                         ; forward copy: the destination is below

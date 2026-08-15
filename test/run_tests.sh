@@ -2659,13 +2659,17 @@ check "the upload capture file is created under spill_dir ($out)" $?
 # existed. Sizes inside the band above are deterministic; sizes outside it are
 # not evidence of anything.
 # Three sizes, one per ingest path, and each one SAYS which path it took rather
-# than being trusted to take it: 40000 stays in RAM (the control), 200000 opens
-# a capture-file region, 16000000 opens one longer than RA_WINDOW and so is the
+# than being trusted to take it: 8000 stays in RAM (the control), 200000 opens a
+# capture-file region, 16000000 opens one longer than RA_WINDOW and so is the
 # only one that reaches the grant loop where the suppressed-last-step deadlock
-# lived. 40000 used to be the capture-file case and silently stopped being one
-# when RA_BUF went 32768 -> 131072, leaving that path with no byte-exact check
-# under 16 MB at all.
-for spec in "40000 ram" "200000 file" "16000000 file"; do
+# lived.
+#
+# The RAM case has had to move twice for the same reason -- it was 40000, which
+# stopped being a RAM case when the window went 32768 -> 131072 and became one
+# again when the inline buffer dropped to 16 KiB. It is under the SMALLEST
+# window the server ever advertises now, and the test refuses the run rather
+# than mislabelling it if that ever stops being true.
+for spec in "8000 ram" "200000 file" "16000000 file"; do
     set -- $spec
     out2=$(timeout 120 python3 test/quic/h3_upload_big.py localhost $1 ${P61498} --path $2 2>&1)
     case "$out2" in ok*) true ;; *) false ;; esac

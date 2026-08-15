@@ -6,7 +6,7 @@ default rel
 
 %include "linnea_quic.inc"
 %include "linnea_aesgcm.inc"
-%include "linnea_quic_conn.inc"   ; for LINNEA_QUIC_RA_BUF (transport-param bound)
+%include "linnea_quic_conn.inc"   ; for LINNEA_QUIC_RA_SMALL (transport-param bound)
 
 global linnea_quic_varint_decode
 global linnea_quic_varint_encode
@@ -1869,7 +1869,13 @@ linnea_quic_build_transport_params:
     ; the buffer size and the advertised window overflows reassembly, is dropped
     ; WITHOUT an ack, and the client retransmits it forever (a permanent stall). Bind
     ; it to the buffer so the client is flow-controlled to what we can actually take.
-    mov edx, LINNEA_QUIC_RA_BUF
+    ;
+    ; The SMALL one, because that is what a stream holds before it has asked for
+    ; anything: a big buffer is borrowed from the worker's pool only once a body
+    ; starts arriving, and the MAX_STREAM_DATA that follows is what tells the peer
+    ; about it. Advertising the big size here would promise every stream on every
+    ; connection room the pool cannot give them all at once.
+    mov edx, LINNEA_QUIC_RA_SMALL
     call tp_int
     mov r12, rax
     mov rdi, r12                     ; initial_max_stream_data_uni (0x07)
