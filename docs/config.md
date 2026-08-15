@@ -129,19 +129,21 @@ every other global has a working default.
 > half-written line. If it cannot be written the server stops, with the errno —
 > silently starting would leave whoever is waiting on the file to time out.
 >
-> **`spill_dir` decides whether an upload costs RAM or disk.** An HTTP/1.1 or
-> HTTP/3 upload is captured whole before it goes upstream, so the capture is as
-> large as the body — up to `max_body`. The default, `/tmp`, is tmpfs on most
-> systems and *always* is under systemd's `PrivateTmp`, which makes that
-> capture plain anonymous memory: nothing is written back, nothing can be
-> reclaimed, and enough concurrent uploads exhaust RAM rather than disk. Point
-> it at a directory on a local disk. The startup line names the directory and
-> appends `(tmpfs: uploads are held in RAM, not written back)` when it is not
-> one, so you can tell at a glance which you have.
+> **`spill_dir` decides whether an upload costs RAM or disk.** An upload is
+> captured whole before it goes upstream — on HTTP/1.1, HTTP/2 and HTTP/3 alike
+> — so the capture is as large as the body, up to `max_body`. The default,
+> `/tmp`, is tmpfs on most systems and *always* is under systemd's
+> `PrivateTmp`, which makes that capture plain anonymous memory: nothing is
+> written back, nothing can be reclaimed, and enough concurrent uploads exhaust
+> RAM rather than disk. Point it at a directory on a local disk. The startup
+> line names the directory and appends `(tmpfs: uploads are held in RAM, not
+> written back)` when it is not one, so you can tell at a glance which you have.
 >
-> HTTP/2 is the exception: it streams the body upstream as it arrives and
-> captures nothing, so an h2 upload costs its flow-control window rather than
-> its size.
+> HTTP/2 used to be the exception, streaming the body upstream as it arrived
+> and capturing nothing, so an h2 upload cost its flow-control window rather
+> than its size. It no longer is: streaming held a backend connection open for
+> as long as the client took to upload, which on a slow uplink queued every
+> other request to that backend behind it.
 
 ---
 
