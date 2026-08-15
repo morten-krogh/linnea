@@ -140,16 +140,29 @@ def upload(nframes, fsize):
 
     conn.connect(ADDR, now=time.time())
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if FAST:
+        # An unpaced client outruns its OWN receive queue. At ~19 MB/s the
+        # default 208 KB buffer overflows while this process is busy in the send
+        # loop, and what it drops includes the server's response -- and then the
+        # retransmits of it, for the same reason, so the upload hangs for ever
+        # with the server's log already showing "200". That is a client fault
+        # start to finish and it cost an hour of hunting it in the server, where
+        # an independent client (curl/ngtcp2) had no trouble at all.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 << 20)
     s.settimeout(0.002)
     inflight, status, done, h3 = [], [None], [False], [None]
 
     def pump():
         """One turn: collect, release what is due, drain events, send."""
+        # Drain the socket, always. Taking one datagram per turn was enough when
+        # the client was paced, and hangs outright once it is not: at ~19 MB/s
+        # the server's acks and grants arrive faster than one per turn, the
+        # receive queue overflows, and the client stalls on losses it caused
+        # itself. --fast-client alone hung here for 100s while --fast-client with
+        # --rtt-ms finished in 0.6s, purely because the rtt path already drained.
         try:
             while True:
                 inflight.append((time.time() + RTT, s.recvfrom(4096)[0]))
-                if not RTT:
-                    break
         except (socket.timeout, BlockingIOError):
             pass
         now = time.time()
