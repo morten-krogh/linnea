@@ -78,6 +78,7 @@ global linnea_quic_server_goaway_all
 global linnea_quic_server_drain_sweep
 global linnea_quic_server_close_all
 global linnea_quic_rxbuf
+global linnea_quic_rxbatch
 global linnea_quic_altsvc_set
 global linnea_h3_altsvc
 global linnea_h3_altsvc_len
@@ -320,6 +321,11 @@ ra_fail_errno:      resq 1
 sa:          resb 28
 salen:       resq 1
 linnea_quic_rxbuf: resb LINNEA_QUIC_RXBUF_SIZE
+; What the socket actually reads into. UDP_GRO may fill it with a run of
+; datagrams from one flow; the receive path copies each down to rxbuf, which
+; keeps all 43 readers of that buffer -- and the bound the h3 proxy rests on --
+; exactly as they were. One per worker, not per connection.
+linnea_quic_rxbatch: resb LINNEA_QUIC_RXBATCH_SIZE
 plaintext:   resb 2048
 cur_conn:    resq 1                   ; connection this datagram belongs to
 expfin:      resb 64                  ; expected client Finished message

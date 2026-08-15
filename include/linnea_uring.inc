@@ -71,7 +71,7 @@ LINNEA_CMSG_LEN         equ 0
 LINNEA_CMSG_LEVEL       equ 8
 LINNEA_CMSG_TYPE        equ 12
 LINNEA_CMSG_DATA        equ 16
-LINNEA_QRECV_CMSG_SIZE  equ 32
+LINNEA_QRECV_CMSG_SIZE  equ 64   ; SO_RXQ_OVFL and UDP_GRO, each 16 + 4 padded to 8
 LINNEA_IOVEC_BASE       equ 0
 LINNEA_IOVEC_LEN        equ 8
 LINNEA_IOVEC_SIZE       equ 16

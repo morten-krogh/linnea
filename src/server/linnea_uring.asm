@@ -131,6 +131,7 @@ extern linnea_quic_server_close_all
 extern linnea_quic_conn_active
 extern linnea_quic_draining
 extern linnea_quic_rxbuf
+extern linnea_quic_rxbatch
 extern linnea_bpf_map_fd
 extern linnea_bpf_prog_fd
 extern linnea_bpf_map_add
@@ -307,6 +308,14 @@ qrecv_msg:  resb LINNEA_MSGHDR_SIZE
 qrecv_iov:  resb LINNEA_IOVEC_SIZE
 ; control buffer for the SO_RXQ_OVFL cmsg: cmsghdr(16) + u32, rounded up
 qrecv_cmsg: resb LINNEA_QRECV_CMSG_SIZE
+; The GRO segment size the kernel reported for the run just received, or 0 when
+; it reported none -- an old kernel, a refused sockopt, or simply nothing to
+; coalesce. Zero means "the read is one datagram", which is what it always was.
+qrecv_gso:    resd 1
+qrecv_left:   resd 1               ; bytes of the run not yet handed over
+qrecv_seglen: resd 1               ; this segment's length on the wire
+qrecv_copied: resd 1               ; ...clamped to one datagram's buffer
+qrecv_off:    resq 1               ; where this segment starts in the batch
 qrecv_drops: resq 1        ; last overflow count seen, to report only the delta
 ring_ovf_seen: resq 1      ; likewise for the completion ring's backlog count
 cqe_tag:       resd 1      ; the completing op's tag, kept past the shift
@@ -687,12 +696,52 @@ linnea_uring_run:
 .on_qrecv:
     test r15d, r15d
     jle .qrecv_rearm
-    call qrecv_check_drops
-    mov edi, r15d
+    call qrecv_check_drops             ; ...and reads UDP_GRO's segment size
+    mov [qrecv_left], r15d
+    ; One completion can now carry a run of datagrams from one flow. They are
+    ; handed over one at a time, each copied down to linnea_quic_rxbuf, because
+    ; forty-three places in the QUIC server read that buffer by name and the h3
+    ; proxy's unchecked copy is bounded by its size. A ~1200-byte copy is a
+    ; fraction of the completion it saves.
+    ; The peer address applies to every segment: GRO only ever coalesces one
+    ; flow, which is exactly why it can hand back a single msg_name.
+.qrecv_seg:
+    mov eax, [qrecv_left]
+    test eax, eax
+    jz .qrecv_rearm
+    mov ecx, [qrecv_gso]
+    test ecx, ecx
+    jz .qrecv_tail                     ; no coalescing: the read is one datagram
+    cmp eax, ecx
+    ja .qrecv_have
+.qrecv_tail:
+    mov ecx, eax                       ; the last segment of a run is short
+.qrecv_have:
+    mov [qrecv_seglen], ecx
+    ; Clamp to one datagram's buffer. Nothing should exceed it — a GRO segment
+    ; is a path-MTU datagram — but the old iov was 2048 and the kernel enforced
+    ; it by truncating, so an oversized one is truncated here rather than
+    ; written past the end of rxbuf.
+    cmp ecx, LINNEA_QUIC_RXBUF_SIZE
+    jbe .qrecv_fits
+    mov ecx, LINNEA_QUIC_RXBUF_SIZE
+.qrecv_fits:
+    mov [qrecv_copied], ecx
+    lea rsi, [linnea_quic_rxbatch]
+    add rsi, [qrecv_off]
+    lea rdi, [linnea_quic_rxbuf]
+    rep movsb
+    ; advance BEFORE handing over: the handler clobbers everything and may
+    ; re-enter this file
+    mov eax, [qrecv_seglen]
+    add [qrecv_off], rax
+    sub [qrecv_left], eax
+    mov edi, [qrecv_copied]
     lea rsi, [qrecv_peer]
     mov edx, [qrecv_msg + LINNEA_MSGHDR_NAMELEN]   ; kernel-updated length
     mov ecx, [quic_fd]
     call linnea_quic_server_datagram
+    jmp .qrecv_seg
 .qrecv_rearm:
     ; the recv stays armed while draining — the in-flight responses the drain
     ; waits on need the peer's ACKs and flow-control credit to finish, and a
@@ -3540,13 +3589,13 @@ linnea_uring_arm_qrecv:
     lea rcx, [qrecv_iov]
     mov [qrecv_msg + LINNEA_MSGHDR_IOV], rcx
     mov qword [qrecv_msg + LINNEA_MSGHDR_IOVLEN], 1
-    lea rcx, [qrecv_cmsg]      ; room for the SO_RXQ_OVFL counter
+    lea rcx, [qrecv_cmsg]      ; SO_RXQ_OVFL, and UDP_GRO's segment size
     mov [qrecv_msg + LINNEA_MSGHDR_CONTROL], rcx
     mov qword [qrecv_msg + LINNEA_MSGHDR_CONTROLLEN], LINNEA_QRECV_CMSG_SIZE
     mov dword [qrecv_msg + LINNEA_MSGHDR_FLAGS], 0
-    lea rcx, [linnea_quic_rxbuf]
+    lea rcx, [linnea_quic_rxbatch]     ; a GRO run, not one datagram
     mov [qrecv_iov + LINNEA_IOVEC_BASE], rcx
-    mov qword [qrecv_iov + LINNEA_IOVEC_LEN], LINNEA_QUIC_RXBUF_SIZE
+    mov qword [qrecv_iov + LINNEA_IOVEC_LEN], LINNEA_QUIC_RXBATCH_SIZE
     call linnea_uring_get_sqe_zeroed
     mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECVMSG
     mov ecx, [quic_fd]
@@ -3589,15 +3638,31 @@ ring_check_overflow:
     ret
 
 qrecv_check_drops:
-    cmp qword [qrecv_msg + LINNEA_MSGHDR_CONTROLLEN], LINNEA_CMSG_DATA + 4
-    jb .qcd_done                       ; no control data: the option is not on
-    cmp dword [qrecv_cmsg + LINNEA_CMSG_LEVEL], LINNEA_SOL_SOCKET
-    jne .qcd_done
-    cmp dword [qrecv_cmsg + LINNEA_CMSG_TYPE], LINNEA_SO_RXQ_OVFL
-    jne .qcd_done
-    mov eax, [qrecv_cmsg + LINNEA_CMSG_DATA]     ; the socket's running total
+    mov qword [qrecv_off], 0
+    mov dword [qrecv_gso], 0
+    push rbx
+    push r12
+    lea rbx, [qrecv_cmsg]
+    mov r12, [qrecv_msg + LINNEA_MSGHDR_CONTROLLEN]
+.qcd_walk:
+    ; A WALK, not a look at the first one. There are two control messages now
+    ; and the kernel picks the order; reading offset zero and stopping was
+    ; correct only while SO_RXQ_OVFL was the sole option asked for, and would
+    ; silently stop reporting drops the moment UDP_GRO landed in front of it.
+    cmp r12, LINNEA_CMSG_DATA
+    jb .qcd_done                       ; no room for another header
+    mov rcx, [rbx + LINNEA_CMSG_LEN]
+    cmp rcx, LINNEA_CMSG_DATA + 4
+    jb .qcd_done                       ; malformed, or carries no payload
+    cmp rcx, r12
+    ja .qcd_done                       ; claims to run past the buffer
+    cmp dword [rbx + LINNEA_CMSG_LEVEL], LINNEA_SOL_SOCKET
+    jne .qcd_try_udp
+    cmp dword [rbx + LINNEA_CMSG_TYPE], LINNEA_SO_RXQ_OVFL
+    jne .qcd_next
+    mov eax, [rbx + LINNEA_CMSG_DATA]  ; the socket's running total
     cmp rax, [qrecv_drops]
-    jbe .qcd_done                      ; unchanged (or wrapped): nothing to say
+    jbe .qcd_next                      ; unchanged (or wrapped): nothing to say
     mov rcx, rax
     sub rcx, [qrecv_drops]             ; how many since the last report
     mov [qrecv_drops], rax
@@ -3611,7 +3676,26 @@ qrecv_check_drops:
     lea rdi, [log_qdrop_end]
     mov esi, log_qdrop_end_len
     call linnea_log_write
+    mov rcx, [rbx + LINNEA_CMSG_LEN]   ; the logging clobbered it
+    jmp .qcd_next
+.qcd_try_udp:
+    cmp dword [rbx + LINNEA_CMSG_LEVEL], LINNEA_SOL_UDP
+    jne .qcd_next
+    cmp dword [rbx + LINNEA_CMSG_TYPE], LINNEA_UDP_GRO
+    jne .qcd_next
+    mov eax, [rbx + LINNEA_CMSG_DATA]  ; bytes per segment in this run
+    mov [qrecv_gso], eax
+.qcd_next:
+    add rcx, 7                         ; CMSG_ALIGN
+    and rcx, -8
+    cmp rcx, r12
+    jae .qcd_done
+    add rbx, rcx
+    sub r12, rcx
+    jmp .qcd_walk
 .qcd_done:
+    pop r12
+    pop rbx
     ret
 
 ; linnea_uring_arm_accept_retry(rdi = listener index) — queue a one-shot

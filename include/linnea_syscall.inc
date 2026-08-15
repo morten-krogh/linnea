@@ -123,6 +123,13 @@ LINNEA_SO_REUSEADDR  equ 2
 LINNEA_SO_REUSEPORT  equ 15
 LINNEA_SO_RCVBUF     equ 8
 LINNEA_SO_RXQ_OVFL   equ 40    ; ask for the per-socket drop count as a cmsg
+; UDP generic receive offload. With it on, the kernel hands back several
+; datagrams from one flow in a single recvmsg and reports the segment size as a
+; SOL_UDP/UDP_GRO control message; without it, one datagram costs one completion
+; however small it is. QUIC is the only thing here that speaks UDP, and an
+; upload arrives as tens of thousands of ~1200-byte datagrams.
+LINNEA_SOL_UDP       equ 17
+LINNEA_UDP_GRO       equ 104
 ; Deadlines for a blocking socket, which is the only thing standing between a
 ; serial server and one peer that says nothing (linnea-api). Both take a struct
 ; timeval, and a expiry surfaces as EAGAIN — distinguishable from EINTR, which

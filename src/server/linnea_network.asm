@@ -463,6 +463,21 @@ linnea_network_quic_listener:
     lea r10, [sockopt_rcvbuf]
     mov r8d, 4
     syscall
+    ; Ask the kernel to coalesce. With UDP_GRO a run of same-sized datagrams
+    ; from one flow arrives in a single recvmsg, with the segment size attached
+    ; as a control message, instead of one completion apiece. An h3 upload is
+    ; exactly that shape -- measured at 31,772 datagrams of ~630 bytes for
+    ; 20 MB, against 1,310 reads for the same bytes over TCP, where the kernel
+    ; had already coalesced for us. It is a request: an old kernel refuses it,
+    ; the cmsg then never appears, and the receive path handles its absence by
+    ; treating the read as the single datagram it used to be.
+    mov eax, LINNEA_SYS_SETSOCKOPT
+    mov rdi, r12
+    mov esi, LINNEA_SOL_UDP
+    mov edx, LINNEA_UDP_GRO
+    lea r10, [sockopt_one]
+    mov r8d, 4
+    syscall
     ; and count what is dropped anyway: SO_RXQ_OVFL attaches the socket's
     ; running overflow counter to each recvmsg as a control message. Without it
     ; the loss is completely invisible — the datagrams simply never arrive.

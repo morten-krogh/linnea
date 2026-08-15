@@ -24,7 +24,19 @@
 ; A browser holds one QUIC connection open for a whole page load, so this is
 ; the ceiling on concurrent h3 clients per worker.
 LINNEA_QUIC_MAX_CONNS equ 256       ; connections per worker
-LINNEA_QUIC_RXBUF_SIZE equ 2048     ; linnea_quic_rxbuf, the datagram we read into
+LINNEA_QUIC_RXBUF_SIZE equ 2048     ; linnea_quic_rxbuf, ONE datagram
+; The socket reads into linnea_quic_rxbatch, not into rxbuf, and UDP_GRO may
+; fill it with many datagrams from one flow; each is copied down to rxbuf and
+; processed there.
+;
+; The two are deliberately NOT one constant. RXBUF_SIZE is the bound the h3
+; proxy's unchecked .up_append rests on -- "a datagram is at most
+; LINNEA_QUIC_RXBUF_SIZE", arithmetic that comment calls out as written down
+; nowhere and the only thing between that copy and the next connection in the
+; pool. Growing it to fit a GRO batch would have quietly multiplied that bound
+; by 32 while every test still passed, so the batch got its own name instead and
+; the per-datagram bound never moved. The copy out of the batch is clamped to it.
+LINNEA_QUIC_RXBATCH_SIZE equ 65536
 ; strm_pay: one 1-RTT packet's payload — ACK, the STREAM header, and an inline
 ; HTTP/3 response. Named so the serve path can check against it rather than
 ; against a literal that drifts from the buffer it is meant to describe.
