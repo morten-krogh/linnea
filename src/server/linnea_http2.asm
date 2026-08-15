@@ -125,7 +125,6 @@ linnea_h2_init:
     mov qword [rdi + linnea_connection.h2_last_stream], 0
     mov qword [rdi + linnea_connection.h2_rst_count], 0
     mov qword [rdi + linnea_connection.h2_done_count], 0
-    mov qword [rdi + linnea_connection.h2_upload], 0
     mov qword [rdi + linnea_connection.h2_init_swnd], LINNEA_H2_INIT_WINDOW
     ; zero the stream pool: every slot free (id 0)
     push rdi
@@ -173,7 +172,7 @@ linnea_h2_init:
     ; 65535 and an upload advanced one frame per round trip.
     mov byte [rax + 27], 0
     mov byte [rax + 28], LINNEA_H2_SETTINGS_INITIAL_WINDOW_SIZE
-    mov dword [rax + 29], LINNEA_H2_BE32(LINNEA_H2P_UPLOAD_BUF)
+    mov dword [rax + 29], LINNEA_H2_BE32(LINNEA_H2_INITIAL_WINDOW)
     ; ...and the connection window, which SETTINGS cannot carry: RFC 9113
     ; 6.9.2 fixes it at 65535 until a WINDOW_UPDATE moves it. Without this the
     ; stream window above would be advertised and then never reachable.
@@ -502,41 +501,7 @@ linnea_h2_handle:
     pop rax
     test rdi, rdi
     jz .fd_done                      ; nobody is collecting: dropped
-    test qword [rdi + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
-    jz .fd_collect
-    ; --- streaming: append to the FIFO; the loop sends it upstream ---
-    mov r8, [rdi + linnea_h2p.rq_wr]
-    lea r9, [r8 + rax]
-    cmp r9, LINNEA_H2P_UPLOAD_BUF
-    ja .fd_toobig                    ; past a full receive window: impossible
-    cmp rax, [rdi + linnea_h2p.rq_rem]
-    ja .fd_toobig                    ; more body than Content-Length declared
-    mov dword [h2_fd_credit], 0      ; credited once it has gone upstream
-    push rdi
-    push r10
-    push r11
-    mov rdx, [rdi + linnea_h2p.rq_buf]
-    add rdx, r8
-    mov rsi, rcx
-    mov rdi, rdx
-    mov rcx, rax
-    rep movsb
-    pop r11
-    pop r10
-    pop rdi
-    mov [rdi + linnea_h2p.rq_wr], r9
-    sub [rdi + linnea_h2p.rq_rem], rax
-    ; pay the body clock forward for these bytes; the deadline test itself runs
-    ; in the service pass (no clock read here — rcx/r11 hold live frame state)
-    mov r8, rax
-    imul r8, r8, LINNEA_BODY_NS_PER_BYTE
-    add [rdi + linnea_h2p.rq_start], r8
-    or qword [rdi + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
-    test r10b, LINNEA_H2_FLAG_END_STREAM
-    jz .fd_done                      ; more body to come
-    cmp qword [rdi + linnea_h2p.rq_rem], 0
-    jne .fd_short                    ; ended early: fewer bytes than declared
-    jmp .fd_done
+    jmp .fd_collect                  ; over .fd_short, which only jumps reach
 .fd_short:
     ; RFC 9113 8.1.1: content-length that does not equal the sum of the DATA
     ; payloads is malformed. END_STREAM was not looked at here at all, so a body
@@ -583,6 +548,20 @@ linnea_h2_handle:
     pop r10
     pop rdi
 .fd_end_check:
+    ; Pay the body clock forward for these bytes. h2p_service ages a collecting
+    ; slot against rq_start and fails it 408 once it falls further behind than
+    ; the head deadline, so a client trickling a declared body cannot hold a
+    ; slot for ever. The streaming path did this and the collect path did not,
+    ; because collecting used to be the bounded 8 KiB fallback where no clock
+    ; was worth keeping; it is now the only path, and carries the whole of
+    ; max_body. h2_fd_len, not rax: the spill arm returns h2p_capture's status
+    ; in rax, and the wire cost is what the deadline is denominated in anyway.
+    ; No clock READ here — rcx and r11 hold live frame state (see .fd_done).
+    push r8
+    mov r8d, [h2_fd_len]
+    imul r8, r8, LINNEA_BODY_NS_PER_BYTE
+    add [rdi + linnea_h2p.rq_start], r8
+    pop r8
     ; The payload is consumed — buffered in the slot or written to the capture
     ; file — so the STREAM window can be given back now, not only the
     ; connection window. Crediting stream 0 alone was enough while a collected
@@ -1206,8 +1185,23 @@ h2_build_request:
     call h2p_find_collect
     test rax, rax
     jz .trailer_ret
-    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
-    jnz .trailer_ret                 ; a streamed upload ends on its own clock
+    ; A trailer section ends the body, so a declared length is reconciled here
+    ; too — the same RFC 9113 8.1.1 check the last DATA frame makes. This path
+    ; never had to do it before: a body carrying a Content-Length always
+    ; STREAMED, and a streamed upload left through its own completion rather
+    ; than through here, so the only bodies that arrived were the ones with
+    ; nothing to reconcile. Every body collects now, and without this a short
+    ; body followed by trailers would be forwarded with our own measured count
+    ; quietly substituted for the count the client declared.
+    mov rdx, [rax + linnea_h2p.rq_declared]
+    cmp rdx, -1
+    je .trailer_fin                  ; no content-length: nothing to reconcile
+    cmp rdx, [rax + linnea_h2p.len]
+    je .trailer_fin
+    mov qword [rax + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [rax + linnea_h2p.status], 400
+    jmp .trailer_ret
+.trailer_fin:
     mov rdi, rax
     call h2p_finalize
 .trailer_ret:
@@ -1916,6 +1910,17 @@ h2_serve:
     ; claim and fill the upstream slot
     mov qword [r13 + linnea_h2p.state], LINNEA_H2P_COLLECT
     mov dword [r13 + linnea_h2p.fd], -1
+    ; The body clock starts with the slot, not with the Content-Length, and it
+    ; is written HERE because a slot is reused: the release path never scrubbed
+    ; rq_start, which was harmless only while the field was read exclusively by
+    ; the streaming path that had just set it. Reading it for every COLLECT slot
+    ; made the leftover live, and an upload landing in a slot some earlier
+    ; request had used was aged against THAT request's start — instantly past
+    ; the deadline, answered 408 with nothing wrong with it. Setting it at the
+    ; claim also covers a body with no Content-Length, which the streaming path
+    ; could never bound at all.
+    call linnea_uring_now            ; eats rdi/rsi; r13 and rbx survive
+    mov [r13 + linnea_h2p.rq_start], rax
     mov rcx, [rsp + S_SID]
     mov [r13 + linnea_h2p.sid], rcx
     mov rcx, [rbx + linnea_connection.gen]
@@ -2035,32 +2040,20 @@ h2_serve:
     ja .proxy_toolarge
     test rax, rax
     jz .proxy_nobody
-    ; Claim the connection's upload buffer; without it — a GENUINELY
-    ; concurrent second upload — fall back to collecting a bounded body.
-    ; h2_upload_owner first drops a claim whose owner has already finished,
-    ; which is what made the ordinary case (two uploads one after another on
-    ; the same connection) fail with 413. Testing the raw field here was the
-    ; bug.
-    push rax                         ; the declared length, wanted below
-    mov rdi, rbx
-    call h2_upload_owner
-    test rax, rax
-    pop rax                          ; pop leaves the flags alone
-    jnz .proxy_done                  ; someone really is streaming: collect
-    lea rcx, [r14 + 1]
-    mov [rbx + linnea_connection.h2_upload], rcx
-    mov rcx, [rbx + linnea_connection.index]
-    imul rcx, rcx, LINNEA_H2P_UPLOAD_BUF
-    add rcx, [h2_upload_pool]
-    mov [r13 + linnea_h2p.rq_buf], rcx
-    mov [r13 + linnea_h2p.rq_rem], rax
-    or qword [r13 + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
-    call linnea_uring_now            ; the body clock starts with the claim
-    mov [r13 + linnea_h2p.rq_start], rax
-    mov rdi, r13
-    mov rsi, [r12 + linnea_h2_req.cl_ptr]
-    mov rdx, [r12 + linnea_h2_req.cl_len]
-    call h2p_finalize_stream         ; head + Content-Length, then connect
+    ; A body is COLLECTED, never streamed: the upstream socket is not opened
+    ; until the last DATA frame is in, which is what h1 and h3 have always
+    ; done. Streaming connected here, before a single body byte had arrived,
+    ; and then fed the backend at the CLIENT's pace — so one 40 MB upload over
+    ; a 4 MB/s uplink held a backend connection for nine seconds, and every
+    ; other request to that backend queued behind it. h3 did not, purely
+    ; because it forwards a body it already has, which is how the asymmetry
+    ; was found. Capturing costs a late discovery that the backend is down;
+    ; it buys back the ability to retry at all, which streaming gives up the
+    ; moment the first body byte goes out (nginx documents exactly this
+    ; trade under proxy_request_buffering, and defaults to buffering).
+    ;
+    ; Nothing to do here but let the DATA path have it: the body clock was
+    ; started with the slot, and END_STREAM is what connects.
     jmp .proxy_done
 .proxy_nobody:
     mov rdi, r13
@@ -2435,11 +2428,6 @@ linnea_h2p_init:
     imul rdi, rdi, linnea_hpack_dyn_size
     call linnea_memory_map
     mov [h2_dyn_pool], rax
-    ; and one streaming-upload buffer per connection
-    mov rdi, rbx
-    imul rdi, rdi, LINNEA_H2P_UPLOAD_BUF
-    call linnea_memory_map
-    mov [h2_upload_pool], rax
     ; and the header-block assembly + decode scratch, one area per connection
     mov rdi, rbx
     imul rdi, rdi, LINNEA_H2_HB_AREA
@@ -2493,10 +2481,12 @@ h2p_alloc:
     ret
 
 ; h2p_find_collect(rdi = conn, esi = stream id) -> rax = slot* still taking
-; that stream's request body, or 0. Either it is buffering the body whole
-; (COLLECT), or it is streaming one — in which case it has already moved on
-; to connecting and sending, and keeps taking DATA until the declared length
-; is in.
+; that stream's request body, or 0. COLLECT is now the whole answer: a slot
+; taking a body has not connected yet, and one that has connected is no longer
+; taking one. It used to have to admit a second, overlapping case — a STREAMING
+; slot, which had already moved on to connecting and sending and went on
+; accepting DATA behind that — and with it the FREE and ZOMBIE exclusions that
+; only mattered because a stale flag could otherwise answer for a dead slot.
 h2p_find_collect:
     mov rax, [rdi + linnea_connection.index]
     imul rax, rax, LINNEA_H2P_SLOTS
@@ -2508,14 +2498,6 @@ h2p_find_collect:
     jne .fc_next
     cmp qword [rax + linnea_h2p.state], LINNEA_H2P_COLLECT
     je .fc_hit
-    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
-    jz .fc_next
-    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
-    je .fc_next
-    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_ZOMBIE
-    je .fc_next
-    cmp qword [rax + linnea_h2p.rq_rem], 0
-    jne .fc_hit
 .fc_next:
     add rax, linnea_h2p_size
     dec ecx
@@ -2622,7 +2604,6 @@ h2p_release:
 linnea_h2p_conn_close:
     push rbx
     push r12
-    mov qword [rdi + linnea_connection.h2_upload], 0
     mov rax, [rdi + linnea_connection.index]
     imul rax, rax, LINNEA_H2P_SLOTS
     imul rax, rax, linnea_h2p_size
@@ -2922,46 +2903,6 @@ h2p_open_upstream:
     pop rbx
     ret
 
-; h2p_finalize_stream(rdi = slot*, rsi = content-length text, rdx = its
-; length) — the request head is complete and its body will follow through the
-; FIFO: declare the length the client gave us (verbatim, so we forward what it
-; promised), terminate the head, and open the upstream socket. The body is not
-; part of req_len — it is sent from the FIFO as it arrives.
-h2p_finalize_stream:
-    push rbx
-    push r12
-    push r13
-    mov rbx, rdi
-    mov r12, rsi
-    mov r13, rdx
-    lea rdi, [rbx + linnea_h2p.buf]
-    add rdi, [rbx + linnea_h2p.req_len]
-    lea rsi, [h2p_clen]              ; "Content-Length: "
-    mov ecx, h2p_clen_len
-    rep movsb
-    mov rsi, r12                     ; the value as the client wrote it
-    mov rcx, r13
-    rep movsb
-    mov word [rdi], 0x0a0d
-    add rdi, 2
-    lea rsi, [h2p_via]               ; RFC 9110 7.6.3: name this hop
-    mov ecx, h2p_via_len
-    rep movsb
-    lea rsi, [h2p_conn_close]        ; "Connection: close" CRLF CRLF
-    mov ecx, h2p_conn_close_len
-    rep movsb
-    lea rax, [rbx + linnea_h2p.buf]
-    sub rdi, rax
-    mov [rbx + linnea_h2p.req_len], rdi
-    mov qword [rbx + linnea_h2p.rd], 0
-    mov qword [rbx + linnea_h2p.len], 0    ; buf doubles as the response buffer
-    mov rdi, rbx
-    call h2p_open_upstream
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
 ; linnea_h2p_event(rdi = conn, rsi = slot index, edx = op tag, ecx = result)
 ;   -> rax = 1 when the connection has frames to flush (out_ptr/out_rem set),
 ;      else 0. The io_uring loop's upstream-completion hook: advance the
@@ -3042,8 +2983,6 @@ linnea_h2p_event:
     js .ev_send_err
     test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_REQ_FILE
     jnz .ev_send_file
-    test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
-    jnz .ev_send_stream
     add [rbx + linnea_h2p.sent], r14d
     mov rax, [rbx + linnea_h2p.sent]
     cmp rax, [rbx + linnea_h2p.req_len]
@@ -3075,57 +3014,6 @@ linnea_h2p_event:
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
     jmp .ev_service
 
-.ev_send_stream:
-    ; a streamed request: the head goes out first, then FIFO body bytes.
-    ; Body bytes that have left are owed back to the client as flow-control
-    ; credit, and the FIFO slides down so the next window can land in it.
-    mov rax, [rbx + linnea_h2p.sent]
-    cmp rax, [rbx + linnea_h2p.req_len]
-    jae .ev_sent_body
-    add [rbx + linnea_h2p.sent], r14d          ; still the head
-    jmp .ev_stream_next
-.ev_sent_body:
-    mov eax, r14d
-    add [rbx + linnea_h2p.rq_rd], rax
-    add [rbx + linnea_h2p.rq_credit], rax      ; owed back as WINDOW_UPDATE
-    ; Reclaim what has been sent. Fully drained, the FIFO simply restarts;
-    ; partly drained, the remainder slides down — a body of any size then
-    ; flows through a buffer the size of one receive window. This is the one
-    ; safe moment to move those bytes: the send that was reading them has
-    ; just completed and the next is armed after we return.
-    mov rax, [rbx + linnea_h2p.rq_rd]
-    cmp rax, [rbx + linnea_h2p.rq_wr]
-    jb .ev_stream_slide
-    mov qword [rbx + linnea_h2p.rq_rd], 0      ; FIFO drained: start over
-    mov qword [rbx + linnea_h2p.rq_wr], 0
-    jmp .ev_stream_next
-.ev_stream_slide:
-    push rsi
-    push rdi
-    mov rsi, [rbx + linnea_h2p.rq_buf]
-    mov rdi, rsi
-    add rsi, rax                               ; the unsent remainder
-    mov rcx, [rbx + linnea_h2p.rq_wr]
-    sub rcx, rax
-    mov [rbx + linnea_h2p.rq_wr], rcx
-    mov qword [rbx + linnea_h2p.rq_rd], 0
-    rep movsb
-    pop rdi
-    pop rsi
-.ev_stream_next:
-    ; more to send? Otherwise, if the body is complete, read the response
-    mov rax, [rbx + linnea_h2p.sent]
-    cmp rax, [rbx + linnea_h2p.req_len]
-    jb .ev_send_more                           ; head not fully out
-    mov rax, [rbx + linnea_h2p.rq_rd]
-    cmp rax, [rbx + linnea_h2p.rq_wr]
-    jb .ev_send_more                           ; FIFO has bytes
-    cmp qword [rbx + linnea_h2p.rq_rem], 0
-    jne .ev_service                            ; waiting on more DATA
-    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_REQ_DONE
-    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_HEAD
-    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
-    jmp .ev_service
 .ev_send_more:
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
     jmp .ev_service
@@ -3212,41 +3100,6 @@ h2p_free_slot:
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FREE
     ret
 
-; h2_upload_owner(rdi = conn) -> rax = the slot still streaming into this
-; connection's upload buffer, or 0 — dropping the claim when its owner has
-; finished. Clobbers rax, rcx, rdx; a leaf, and touches no SSE.
-;
-; The claim test and the release used to disagree about when a claim ends.
-; It was released only by h2p_service's unclaim pass, but tested whenever a
-; request head was parsed — so a SECOND upload arriving before the next
-; service pass saw a claim whose owner was long gone, fell back to the
-; bounded collect path, and was refused 413 at LINNEA_H2P_BODY_MAX (8 KiB)
-; however large max_body was. Reproduced dead on: three uploads over one
-; connection gave 200, 413, 200. Deciding it where it is USED makes it
-; self-healing, and both callers now go through here rather than keeping two
-; copies of what "still streaming" means.
-h2_upload_owner:
-    mov rcx, [rdi + linnea_connection.h2_upload]
-    test rcx, rcx
-    jz .none
-    dec rcx                          ; stored as slot index + 1
-    imul rax, rcx, linnea_h2p_size
-    mov rdx, [rdi + linnea_connection.index]
-    imul rdx, rdx, LINNEA_H2P_SLOTS
-    imul rdx, rdx, linnea_h2p_size
-    add rax, rdx
-    add rax, [h2p_pool]
-    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM
-    jz .stale
-    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
-    je .stale
-    ret
-.stale:
-    mov qword [rdi + linnea_connection.h2_upload], 0
-.none:
-    xor eax, eax
-    ret
-
 ; linnea_h2p_service(rdi = conn) -> rax = 1 when out_ptr/out_rem now hold
 ; frames to send, else 0. Emits whatever the slots have made ready: a
 ; translated response HEADERS, an error response, or a RST_STREAM. Body DATA
@@ -3259,35 +3112,14 @@ linnea_h2p_service:
     push r14
     push r15
     mov rbx, rdi                     ; conn
-    ; the upload buffer belongs to one streaming request at a time: hand it
-    ; back as soon as that slot is done, so the next upload can have it
-    mov rdi, rbx
-    call h2_upload_owner             ; releases it too, if the owner is done
-    test rax, rax
-    jz .sv_claim_ok
-    ; Still streaming: the body clock. Every received byte paid it forward
-    ; (LINNEA_BODY_NS_PER_BYTE, the DATA path); a client trickling — or gone
-    ; silent, with the recv timeout driving this pass — falls behind by more
-    ; than the head deadline and the exchange fails 408, releasing the
-    ; upstream slot it was holding. The failed slot is emitted by the walk
-    ; below in this same pass.
-    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FAILED
-    je .sv_claim_ok                  ; already failed: the walk below emits it
-    cmp qword [rax + linnea_h2p.rq_rem], 0
-    je .sv_claim_ok                  ; body fully received: nothing to bound
-    mov r12, rax                     ; (the walk below reassigns r12)
-    call linnea_uring_now
-    mov rcx, [r12 + linnea_h2p.rq_start]
-    cmp rcx, rax
-    jbe .sv_body_age
-    mov [r12 + linnea_h2p.rq_start], rax   ; no credit banked ahead of now
-    jmp .sv_claim_ok
-.sv_body_age:
-    sub rax, rcx
-    cmp rax, [head_timeout_ns]
-    jbe .sv_claim_ok
-    mov qword [r12 + linnea_h2p.state], LINNEA_H2P_FAILED
-    mov qword [r12 + linnea_h2p.status], 408
+    ; The body clock, read ONCE for the whole pass and aged per slot in the
+    ; walk below. It used to hang off the single streaming upload the
+    ; connection could have; every request now collects its body, so there is
+    ; no one slot to hang it on and up to LINNEA_H2P_SLOTS of them can be
+    ; taking a body at the same time. Reading the clock once rather than per
+    ; slot also keeps every slot in a pass judged against the same instant.
+    call linnea_uring_now             ; eats rdi/rsi; rbx is already the conn
+    mov [h2_sv_now], rax
 .sv_claim_ok:
     cmp qword [rbx + linnea_connection.h2_tx_busy], 0
     jne .sv_none                     ; out_buf is in flight; retry on drain
@@ -3329,6 +3161,30 @@ linnea_h2p_service:
     ; would emit frames for a stranger's stream once the slot's index is reused
     cmp qword [r12 + linnea_h2p.state], LINNEA_H2P_ZOMBIE
     je .sv_next
+    ; The body clock. A slot still COLLECTing has to keep up with the pace every
+    ; received byte paid forward (LINNEA_BODY_NS_PER_BYTE, in the DATA path); a
+    ; client trickling — or gone silent, with the recv timeout driving this pass
+    ; — falls further behind than the head deadline and the exchange fails 408.
+    ; Nothing upstream is held any more (the socket is not opened until the body
+    ; is in), but the slot and its capture file are, and there are only
+    ; LINNEA_H2P_SLOTS of them per connection.
+    cmp qword [r12 + linnea_h2p.state], LINNEA_H2P_COLLECT
+    jne .sv_no_clock
+    mov rcx, [r12 + linnea_h2p.rq_start]
+    test rcx, rcx
+    jz .sv_no_clock                  ; unstarted clock: never age against zero
+    mov rax, [h2_sv_now]
+    cmp rcx, rax
+    jbe .sv_body_age
+    mov [r12 + linnea_h2p.rq_start], rax   ; no credit banked ahead of now
+    jmp .sv_no_clock
+.sv_body_age:
+    sub rax, rcx
+    cmp rax, [head_timeout_ns]
+    jbe .sv_no_clock
+    mov qword [r12 + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [r12 + linnea_h2p.status], 408
+.sv_no_clock:
     ; request-body bytes that have gone upstream are owed back to the client
     ; as flow-control credit — on the stream and on the connection — or it
     ; stops sending after one window
@@ -5551,17 +5407,20 @@ h2_req_es:    resd 1                 ; END_STREAM was set on the HEADERS frame
 h2_req_trail: resq 1                 ; ...and that HEADERS was a trailer section
 h2p_pool:     resq 1                 ; the upstream slot array (one mmap)
 h2_dyn_pool:  resq 1                 ; per-connection HPACK dynamic tables
-h2_upload_pool: resq 1               ; per-connection streaming-upload buffers
 h2_hb_pool:    resq 1                ; per-connection header-block assembly +
                                      ; HPACK decode scratch (LINNEA_H2_HB_AREA)
 h2_cur_srv:   resq 1                 ; vhost whose response is being built
 h2_fd_len:    resd 1                 ; a DATA frame's flow-control cost
 h2_fd_credit: resd 1                 ; and whether it is owed back now
 ; The stream to credit alongside the connection, or 0. Only a slot that
-; CONSUMED the payload outright sets it — a dropped frame or a body being
-; streamed upstream must not, because a WINDOW_UPDATE on a stream that is idle
-; or already reset is a connection error to the peer.
+; CONSUMED the payload outright sets it — a dropped frame must not, because a
+; WINDOW_UPDATE on a stream that is idle or already reset is a connection error
+; to the peer.
 h2_fd_sid:    resd 1
+; One clock read per h2p_service pass, so every slot in a pass is aged against
+; the same instant. Per worker, like everything else here: the loop is
+; single-threaded and the value does not outlive the pass that wrote it.
+h2_sv_now:    resq 1
 h2p_numbuf:   resb 24
 h2p_stbuf:    resb 4                 ; a status as three ASCII digits
 h2p_nmbuf:    resb 64                ; a response field name, lowercased

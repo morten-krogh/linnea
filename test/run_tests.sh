@@ -2989,8 +2989,12 @@ check "cli: -h is the same as --help" $?
 # the map create is refused; on a box with CAP_BPF it succeeds instead, and both
 # shapes are accepted — what is asserted is that the message carries a cause.
 out=$($BIN --bpf-probe 2>&1)
+# the last line goes into a variable first: a command substitution inside the
+# check's message argument would overwrite the $? being reported (see the
+# no-Content-Length upload check for what that hides)
+bpf_last=$(printf '%s' "$out" | tail -1)
 printf '%s' "$out" | grep -Eq "ok prog fd=[0-9]+|FAILED at [a-zA-Z_ ]+: errno=[0-9]+|FAILED: loaded and attached, but a datagram did not steer"
-check "cli: --bpf-probe names its outcome ($(printf '%s' "$out" | tail -1))" $?
+check "cli: --bpf-probe names its outcome ($bpf_last)" $?
 
 # "port": 0 — the kernel picks the port and port_file reports it. This is the
 # one fixture that needs no port of its own, so it cannot collide with another
@@ -3918,12 +3922,13 @@ timeout 60 curl -s --http2 --cacert $CA --resolve localhost:${P61443}:127.0.0.1 
     --data-binary @$WWW/upload2.bin "https://localhost:${P61443}/api/echo" \
     > $RUNDIR/upload2_echo.bin
 [ "$(md5sum < $RUNDIR/upload2_echo.bin | cut -d' ' -f1)" = "$uwant" ]
-check "http2 streams a 300000-byte request body (byte-exact)" $?
+check "http2 captures a 300000-byte counted request body (byte-exact)" $?
 rm -f $RUNDIR/upload2_echo.bin
-# The bodies that do NOT get the streaming buffer: one with no usable
+# Two bodies that used to miss the streaming buffer and fall to a collecting
+# path capped at 8 KiB whatever max_body said: one with no usable
 # Content-Length, and the second of two uploads running at the same time on one
-# connection. Both fall to the collecting path, which was capped at 8 KiB
-# whatever max_body said; they are captured to a file now, like h1 and h3.
+# connection. Every body is captured now, so neither is a special case any
+# more -- they stay because they are still the two shapes most likely to break.
 #
 # curl cannot express the concurrent case at all -- --parallel opens a second
 # connection, so it measures two independent uploads and proves nothing --
@@ -3932,18 +3937,46 @@ rm -f $RUNDIR/upload2_echo.bin
 timeout 60 curl -s --http2 --cacert $CA --resolve localhost:${P61443}:127.0.0.1 \
     -o /dev/null -w '%{http_code}' -X POST -T - \
     "https://localhost:${P61443}/api/echo" < $WWW/upload2.bin > $RUNDIR/upl_nocl.txt
-[ "$(cat $RUNDIR/upl_nocl.txt)" = "200" ]
-check "http2 captures a 300000-byte body with no Content-Length ($(cat $RUNDIR/upl_nocl.txt))" $?
+# NB: the status is read into a variable BEFORE the test. Writing it as
+# `check "... ($(cat f))" $?` reads correctly and is broken: bash expands the
+# command substitution before calling check, and that expansion overwrites the
+# $? the test just set, so the check reported whether CAT succeeded. It passed
+# unconditionally, and it hid a real 408 here for as long as it took to notice
+# the number printed inside a line that said PASS.
+upl_nocl=$(cat $RUNDIR/upl_nocl.txt)
+[ "$upl_nocl" = "200" ]
+check "http2 captures a 300000-byte body with no Content-Length ($upl_nocl)" $?
 rm -f $RUNDIR/upl_nocl.txt
 out=$(timeout 90 python3 test/h2_concurrent_upload.py ${P61443} 200000 2>&1)
 check "http2: two 200000-byte uploads at once on one connection ($out)" $?
+# A body with a Content-Length, byte-exact, PAST the advertised window. Every
+# other counted-body check here is 300000 bytes, which fits inside one slot
+# plus a little spill and is nowhere near the 4 MiB window; the one case that
+# does go past it sends no Content-Length, so it was always on the capture path
+# and cannot speak for the path that a counted body now takes.
+dd if=/dev/urandom of=$RUNDIR/upload6.bin bs=1M count=6 2>/dev/null
+u6=$(md5sum < $RUNDIR/upload6.bin | cut -d' ' -f1)
+timeout 120 curl -s --http2 --max-time 110 --cacert $CA \
+    --resolve localhost:${P61443}:127.0.0.1 \
+    --data-binary @$RUNDIR/upload6.bin "https://localhost:${P61443}/api/echo" \
+    > $RUNDIR/upload6_echo.bin
+[ "$(md5sum < $RUNDIR/upload6_echo.bin | cut -d' ' -f1)" = "$u6" ]
+check "http2: a 6 MiB counted body past the stream window is byte-exact" $?
+rm -f $RUNDIR/upload6.bin $RUNDIR/upload6_echo.bin
+# ...and the point of capturing it at all: the backend is not touched until the
+# body is in, so a request on another stream of the same connection is answered
+# while the upload is still arriving. The backend for this one is SERIAL (the
+# test brings its own), because a threaded backend answers the second request
+# regardless and both builds would pass. See the header of the script.
+out=$(timeout 120 python3 test/h2_upload_blocking.py ${P61443} 4000000 1500000 2>&1)
+check "http2: a proxied GET is answered while an upload is still arriving ($out)" $?
 # ...and one PAST the advertised stream window. This size is the point: a
 # collected body is credited back as it is consumed, and crediting only the
 # CONNECTION window was enough while such a body could not exceed 8 KiB. With
 # the cap lifted, an upload stalled for ever at exactly
 # SETTINGS_INITIAL_WINDOW_SIZE (4 MiB) with the stream window at zero and the
 # connection window wide open. Every other upload check here is under that, so
-# none of them can catch it — keep this one above LINNEA_H2P_UPLOAD_BUF.
+# none of them can catch it — keep this one above LINNEA_H2_INITIAL_WINDOW.
 dd if=/dev/urandom of=$RUNDIR/upload5.bin bs=1M count=5 2>/dev/null
 u5=$(md5sum < $RUNDIR/upload5.bin | cut -d' ' -f1)
 timeout 90 curl -s --http2 --max-time 80 --cacert $CA \
@@ -3957,7 +3990,7 @@ timeout 60 curl -s --http1.1 --cacert $CA --resolve localhost:${P61443}:127.0.0.
     --data-binary @$WWW/upload2.bin "https://localhost:${P61443}/api/echo" \
     > $RUNDIR/upload3_echo.bin
 [ "$(md5sum < $RUNDIR/upload3_echo.bin | cut -d' ' -f1)" = "$uwant" ]
-check "tls http1.1 streams a 300000-byte request body (byte-exact)" $?
+check "tls http1.1 relays a 300000-byte request body (byte-exact)" $?
 rm -f $RUNDIR/upload3_echo.bin
 
     # A streamed upload must leave the connection consistent: the request
@@ -4633,7 +4666,7 @@ open('$WWW/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in range(
     curl -s --http2 --max-time 30 --cacert $CA --data-binary @$WWW/h2upload.bin \
         $U/api/echo > $RUNDIR/h2upload_echo.bin
     [ "$(md5sum < $RUNDIR/h2upload_echo.bin | cut -d' ' -f1)" = "$want" ]
-    check "http2 streams a 300000-byte request body past the flow-control window" $?
+    check "http2 carries a 300000-byte request body past the flow-control window" $?
     rm -f $RUNDIR/h2upload_echo.bin $WWW/h2upload.bin
 
     # ...and what that check structurally cannot see: how many ROUND TRIPS the
@@ -4652,6 +4685,9 @@ open('$WWW/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in range(
     # refused 413 at LINNEA_H2P_BODY_MAX — 8 KiB — however large max_body was.
     # Dead alternation: 200 413 200 413. Every existing upload check used a
     # fresh connection, so none of them could see it.
+    # Both the buffer and its claim are gone now (every body is captured), so
+    # this guards the shape rather than the mechanism: several uploads down one
+    # connection must all come back 200, whatever is carrying them.
     # The local_port comparison is load-bearing: if curl ever stopped reusing
     # the connection this would pass while testing nothing.
     python3 -c "open('$WWW/h2seq.bin','wb').write(b'S'*100000)"

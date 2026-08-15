@@ -6,12 +6,17 @@
 # measures two independent connections and proves nothing about the case that
 # matters. The log gives it away — two "accepted connection" lines.
 #
-# The case matters because the streaming upload buffer is per CONNECTION. The
-# first upload claims it and streams; a second one that genuinely overlaps it
-# finds the claim held and falls back to the collecting path — which used to
-# be capped at LINNEA_H2P_BODY_MAX (8 KiB) whatever max_body said, so the
-# second of two simultaneous uploads was refused 413 at 8 KiB. It is captured
-# to a file now, like h1 and h3, and runs to max_body.
+# The case mattered because the streaming upload buffer was per CONNECTION. The
+# first upload claimed it and streamed; a second one that genuinely overlapped
+# it found the claim held and fell back to the collecting path — which was
+# capped at LINNEA_H2P_BODY_MAX (8 KiB) whatever max_body said, so the second of
+# two simultaneous uploads was refused 413 at 8 KiB.
+#
+# That buffer no longer exists: every proxied body is captured to a file, so
+# there is nothing to contend for and no fallback to be the loser of. This test
+# keeps its value anyway, and gains some — two uploads on one connection is now
+# the ORDINARY path rather than an unlucky one, and it is the only test here
+# that can tell a shared per-connection resource from a per-stream one.
 #
 # Both bodies are checked byte-exact, not just for a 200: the point of the
 # capture is that what reaches the backend is what the client sent, and a

@@ -10,6 +10,7 @@
         { "prefix": "/", "root": "test/www" },
         { "prefix": "/api", "proxy": "127.0.0.1:61100" },
         { "prefix": "/down", "proxy": "127.0.0.1:61199" },
+        { "prefix": "/serial", "proxy": "127.0.0.1:61198" },
         { "prefix": "/old", "redirect": "https://example.com" }
       ]
     }

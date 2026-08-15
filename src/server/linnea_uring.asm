@@ -3443,22 +3443,22 @@ linnea_uring_arm_h2p_ops:
     mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
     mov ecx, [r12 + linnea_h2p.fd]
     mov [rax + LINNEA_SQE_FD], ecx
-    ; the head comes from the front of the buffer; once it is out, a
-    ; streamed body comes from the FIFO further in
+    ; the head comes from the front of the buffer; once it is out, the body
+    ; comes from a mapping of the file it was captured to. This used to be
+    ; either that or a FIFO the body streamed through, sharing these cursors;
+    ; nothing streams now, so a slot with no capture has nothing after the head.
     mov rcx, [r12 + linnea_h2p.sent]
     cmp rcx, [r12 + linnea_h2p.req_len]
     jb .ao_send_head
-    ; ...or, for a body captured to a file, from a mapping of it. Same cursors,
-    ; so the two share this.
-    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_REQ_STREAM | LINNEA_H2P_F_REQ_FILE
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_REQ_FILE
     jz .ao_send_head                 ; nothing left; the send is a no-op
     mov rcx, [r12 + linnea_h2p.rq_buf]
     add rcx, [r12 + linnea_h2p.rq_rd]
     mov [rax + LINNEA_SQE_ADDR], rcx
     mov rcx, [r12 + linnea_h2p.rq_wr]
     sub rcx, [r12 + linnea_h2p.rq_rd]
-    CLAMP_IO_LEN rcx                 ; a CAPTURED body is a mapping of up to
-    mov [rax + LINNEA_SQE_LEN], ecx  ; max_body, not the bounded upload FIFO
+    CLAMP_IO_LEN rcx                 ; a captured body is a mapping of up to
+    mov [rax + LINNEA_SQE_LEN], ecx  ; max_body, well past one io_uring send
     mov edx, LINNEA_UD_H2UP_SEND
     jmp .ao_finish
 .ao_send_head:

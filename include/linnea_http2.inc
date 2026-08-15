@@ -168,12 +168,16 @@ LINNEA_H2P_HEAD_ROOM  equ 7680
 ; largest is a redirect, whose Location carries a URL prefix plus the request
 ; target (bounded at 2048 where it is built).
 LINNEA_H2_RESP_ROOM   equ 3072
-; One streaming upload per connection gets this buffer, and it IS the receive
-; window we advertise as SETTINGS_INITIAL_WINDOW_SIZE. The two are one
-; constant on purpose: the FIFO cannot overflow only because a client may not
-; send past its window, which is what makes the bound at .fd_toobig ("past a
-; full receive window: impossible") true. Advertise more than the buffer and
-; that stops being true.
+; SETTINGS_INITIAL_WINDOW_SIZE: the per-stream receive window we advertise.
+;
+; It used to be two things at once — the window AND the size of the-one-
+; streaming-upload-per-connection FIFO the body was appended to — held equal on
+; purpose, because the FIFO could not overflow only while a client was barred
+; from sending past its window. Bodies are captured to a file now, so there is
+; no FIFO to overflow and nothing left for the window to be equal TO: this is
+; a flow-control number and only that. The buffer it was married to is gone,
+; and with it max_connections * 4 MiB of address space per worker (4 GiB at the
+; default 1024) that existed solely to hold one upload per connection.
 ;
 ; 64 KiB — the RFC default, rounded up — used to be the whole upload
 ; pipeline, and credit was returned as bytes drained to the backend, one
@@ -190,36 +194,40 @@ LINNEA_H2_RESP_ROOM   equ 3072
 ; (LINNEA_QUIC_INITIAL_MAX_DATA) with a 4 MiB ceiling (FC_WINDOW), so h2 is
 ; no longer the narrower of the two whichever protocol the browser picks.
 ;
-; Cost: mapped lazily and claimed only while a streaming upload is actually
-; in flight, so nothing is resident until a client uploads. But the mapping is
-; max_connections * this, per worker — 4 GiB of address space at the default
-; 1024, and the same again in RESIDENT memory if every connection were to
-; upload at once. That ceiling is now larger than a small box's RAM, and it is
-; bounded by max_connections rather than by anything this file controls: if
-; the answer to a crowd of uploaders has to be refusal, it must come from
-; max_connections. A second concurrent upload on one connection still falls
-; back to the bounded collect path.
-LINNEA_H2P_UPLOAD_BUF equ 4194304
-%if LINNEA_H2P_UPLOAD_BUF > 0x7fffffff
+; Cost is now only what a window costs: bytes a client may have in flight
+; before we credit them back, held in the capture file rather than in RAM.
+LINNEA_H2_INITIAL_WINDOW equ 4194304
+%if LINNEA_H2_INITIAL_WINDOW > 0x7fffffff
   %error "SETTINGS_INITIAL_WINDOW_SIZE is capped at 2^31-1 (RFC 9113 6.5.2)"
 %endif
-; Credit is batched rather than returned per frame: a grant goes out once this
-; much has drained upstream, cutting the round trips by the ratio between the
-; two. It cannot stall an upload while it stays below the window — withholding
-; less than a full step still leaves the client UPLOAD_BUF - GRANT_MIN of room
-; to send into — which is what the build guard below enforces. 256 KiB is the
-; step h3 already uses (LINNEA_QUIC_FC_GRANT_MIN).
+; The batching step for credit that is owed back only once bytes have drained
+; UPSTREAM. That was the streaming path's accounting, and no path takes it any
+; more: a collected body is credited where it is consumed, in the DATA handler,
+; which is both prompter and simpler. The step and the block in h2p_service
+; that uses it are kept because rq_credit is still zeroed and tested on every
+; pass, so the machinery stays coherent — it is simply never armed now. Removing
+; the accounting outright is a separate change: it is entangled with rq_owed and
+; the aborted-upload connection credit, which is not this commit's subject.
 LINNEA_H2P_GRANT_MIN  equ 262144
-%if LINNEA_H2P_GRANT_MIN >= LINNEA_H2P_UPLOAD_BUF
+%if LINNEA_H2P_GRANT_MIN >= LINNEA_H2_INITIAL_WINDOW
   %error "the h2 upload grant step must stay below the window, or a body smaller than one step can stall"
 %endif
 ; SETTINGS_INITIAL_WINDOW_SIZE governs STREAM windows only. The CONNECTION
 ; window starts at 65535 by RFC 9113 6.9.2 and moves only on a WINDOW_UPDATE,
 ; so bring-up sends one; without it the connection window is the binding
-; constraint and a bigger stream window buys nothing at all. One streaming
-; upload plus the bounded collect bodies is everything a connection can have
-; in flight at once, so that is what we grant on top of the default.
-LINNEA_H2_CONN_WINDOW_INC equ LINNEA_H2P_UPLOAD_BUF + LINNEA_H2P_SLOTS * LINNEA_H2P_BODY_MAX
+; constraint and a bigger stream window buys nothing at all.
+;
+; The VALUE is unchanged, but what it is derived from no longer describes
+; anything: it used to be "one streaming upload plus the bounded collect
+; bodies", which was every body a connection could hold at once. Now every body
+; collects and any of the LINNEA_H2P_SLOTS can be doing it. This stays the
+; opening grant rather than the ceiling — the DATA handler credits the
+; connection window back for every payload it consumes, so sustained throughput
+; comes from that replenishment and not from this number. Whether a burst grant
+; sized for one upload is still the right opening move for eight concurrent
+; ones is a flow-control question worth MEASURING, and deliberately not
+; answered by changing the arithmetic here unmeasured.
+LINNEA_H2_CONN_WINDOW_INC equ LINNEA_H2_INITIAL_WINDOW + LINNEA_H2P_SLOTS * LINNEA_H2P_BODY_MAX
 ; The request-body clock (h1 streaming relay and h2 uploads): the head deadline
 ; keeps running through the body, and every received byte buys this much more
 ; time. 2 ms/byte = a 500 B/s floor — any real uploader outruns it thousands of
@@ -253,18 +261,20 @@ LINNEA_H2P_F_RST       equ 1024   ; failure after HEAD_SENT: emit RST_STREAM
 LINNEA_H2P_F_REAP      equ 2048   ; fully framed: free once no send is reading
                                   ; the slot buffer (the last DATA frame sends
                                   ; straight out of it)
-LINNEA_H2P_F_REQ_STREAM equ 4096  ; the request body streams upstream as it
-                                  ; arrives instead of being collected whole
+; 4096 was LINNEA_H2P_F_REQ_STREAM — the request body streams upstream as it
+; arrives instead of being collected whole. Nothing streams a request body any
+; more; the bit is left unallocated rather than reused, so that a stale flags
+; word from an older build cannot mean something new.
 LINNEA_H2P_F_REQ_DONE  equ 8192   ; every request-body byte has been forwarded
 ; The request body was captured to a file and is sent upstream from a mapping
-; of it, the way h1 and h3 already do. The collecting path buffers into the
-; slot up to LINNEA_H2P_BODY_MAX and spills past that, so a body with no
-; usable Content-Length — or a second concurrent upload on one connection —
-; runs to max_body instead of being refused at 8 KiB. Shares the send path
-; with F_REQ_STREAM: head from the slot buffer, then body from rq_buf. It
-; differs in two ways, and both matter: the mapping must not be slid down
-; (there is no window to make room in), and its bytes were credited back to
-; the client as they were captured, not as they go upstream.
+; of it, the way h1 and h3 already do — and, since uploads stopped streaming,
+; the way EVERY proxied h2 body with more than LINNEA_H2P_BODY_MAX in it goes.
+; The collecting path buffers into the slot up to that and spills past it, so
+; any body runs to max_body instead of being refused at 8 KiB. Head from the
+; slot buffer, then body from rq_buf. Two things about the mapping matter: it
+; must not be slid down (there is no window to make room in), and its bytes
+; were credited back to the client as they were captured, not as they go
+; upstream.
 LINNEA_H2P_F_REQ_FILE  equ 16384
 
 struc linnea_h2p
@@ -286,14 +296,11 @@ struc linnea_h2p
     .chunk_rem: resq 1            ; data bytes left in the current chunk
     .status:    resq 1            ; upstream status (or our 502/504)
     .flags:     resq 1            ; LINNEA_H2P_F_*
-    ; Streaming request body: a FIFO in the connection's upload buffer, whose
-    ; size IS the window we advertise (LINNEA_H2P_UPLOAD_BUF). It has to hold
-    ; a full receive window, and both ways round: a client that has not yet
-    ; processed our SETTINGS may have the protocol default of 65535 in flight,
-    ; and one that has may have the whole advertised window — the buffer
-    ; covers the larger of the two by construction. The window is credited
-    ; back only as bytes go upstream, which paces everything after that.
-    .rq_buf:    resq 1            ; the FIFO (0 = collecting, not streaming)
+    ; The request body on its way upstream: a mapping of the file it was
+    ; captured to, walked by rq_rd/rq_wr. These three were the streaming
+    ; FIFO's cursors, which is why they read like a ring buffer's; the capture
+    ; path took them over unchanged, and is all that is left using them.
+    .rq_buf:    resq 1            ; the mapping (0 = nothing captured)
     .rq_rd:     resq 1            ; next body byte to send upstream
     .rq_wr:     resq 1            ; append point
     .rq_rem:    resq 1            ; body bytes still expected from the client

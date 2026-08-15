@@ -227,7 +227,6 @@ struc linnea_connection
     .h2_init_swnd:   resq 1        ; peer's SETTINGS_INITIAL_WINDOW_SIZE
     .h2_tx_busy:     resq 1        ; a client send is in flight: out_buf is
                                    ; owned by it, defer frame building
-    .h2_upload:      resq 1        ; slot index + 1 owning the upload buffer
     .h2_rx_busy:     resq 1        ; a client recv is in flight. Upstream
                                    ; completions can reach the client side at
                                    ; any time, so both directions are tracked
