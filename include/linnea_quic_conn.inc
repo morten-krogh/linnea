@@ -222,6 +222,35 @@ LINNEA_QUIC_RA_POOL     equ 32       ; big buffers per worker. Concurrent UPLOAD
                                      ; not connections -- a stream that cannot get
                                      ; one falls back to its inline buffer and is
                                      ; slower, never wrong
+; The smallest DATA payload taken over into the capture file. A payload the
+; buffer cannot hold is taken over whatever this says -- there the region is the
+; only way to receive it at all -- so this only decides the payloads that had a
+; CHOICE, and it is a cost question rather than a correctness one. Overridable
+; at build time (-D) so the crossover can be measured rather than argued.
+;
+; It used to BE the buffer, which meant 1 MiB once a body had borrowed, so no
+; browser ever reached the file path: Chrome frames 371 KB and Firefox smaller.
+; That was backwards. The file path writes each arrival straight through and
+; keeps arrivals as ranges; the buffer path copies every byte into .buf and
+; maintains a bit per byte on top of the same file write, so the CHEAPER path
+; was the one nothing took. Measured on both builds at once, 32 MiB per point,
+; worker cpu from schedstat (ns/byte, lower is better):
+;
+;     frame     buffer   file
+;      2 KiB      8.15   8.27     a wash: the region's fixed cost eats it
+;      4 KiB      8.24   7.54
+;      8 KiB      7.79   6.67
+;     32 KiB      7.85   6.50
+;    371 KiB      7.92   6.57     Chrome's framing
+;      2 MiB      6.18   6.23     control: both take a region, both agree
+;
+; 4096 rather than lower because the gate sees what REMAINS of a payload after
+; the walk consumed what had arrived, so a threshold of T catches frames
+; comfortably above T, not frames of T -- and below ~4 KiB there is nothing left
+; to win. See docs/upload-window.md.
+%ifndef LINNEA_QUIC_RA_REGION_MIN
+LINNEA_QUIC_RA_REGION_MIN equ 4096
+%endif
 ; RA_CTXS(6) * (small + its bitmap) is 108 KB per connection, against 864 KB when
 ; every context carried 128 KiB, so the common case got 8x cheaper as this got
 ; bigger. The pool is 32 * (big + its bitmap) = 36 MB per worker, .bss and so

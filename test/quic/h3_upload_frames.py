@@ -70,6 +70,7 @@ host, port = sys.argv[1], int(sys.argv[2])
 NFRAMES, FSIZE = int(sys.argv[3]), int(sys.argv[4])
 argv = sys.argv[5:]
 MAXG = int(argv[argv.index("--max-blocked") + 1]) if "--max-blocked" in argv else -1
+MAXGRANTS = int(argv[argv.index("--max-grants") + 1]) if "--max-grants" in argv else -1
 RTT = float(argv[argv.index("--rtt-ms") + 1]) / 1000.0 if "--rtt-ms" in argv else 0.0
 FAST = "--fast-client" in argv
 BORROW = "--expect-borrow" in argv
@@ -289,6 +290,25 @@ if BORROW:
 # 3. The browser-visible symptom.
 if MAXG >= 0 and r["blocked"] > MAXG:
     print(msg + "  -- over the %d blocked-frame bound" % MAXG)
+    sys.exit(1)
+
+# 4. ...and it must not be bought with a packet per frame. Credit is granted in
+#    steps of half the stream's buffer, so a 32 MiB upload costs ~66 grants
+#    however it is framed -- EXCEPT that a payload written straight to the
+#    capture file also fires the "last step up to the cap" exception, which
+#    exists for a peer that would otherwise be stranded a few bytes short. Once
+#    a region is opened per DATA frame rather than per megabyte, that exception
+#    is reached on the first evaluation of every region, and the grant count
+#    goes to one per frame -- measured at 500 against 8 on this check's own
+#    framing, and 4120 against 68 over a 32 MiB body framed at 8 KiB. A peer
+#    already holding this payload's end plus half a buffer beyond it is not
+#    stranded, so that step is suppressed and this bounds what the suppression
+#    is worth. Pass a bound near the frame COUNT: the fault's shape is one
+#    grant per frame, and a per-run number would just track the body size.
+if MAXGRANTS >= 0 and r["grants"] > MAXGRANTS:
+    print(msg + "  -- %d grants for %d frames, over the bound of %d: credit is "
+                "being handed out per DATA frame rather than per buffer"
+          % (r["grants"], NFRAMES, MAXGRANTS))
     sys.exit(1)
 
 print(msg)

@@ -2818,11 +2818,14 @@ linnea_quic_server_datagram:
     mov rdi, [s_ra_ctx]
     mov rcx, [rdi + linnea_quic_ra.walk + linnea_h3_walk.frame_rem]
     cmp rcx, [rdi + linnea_quic_ra.cap]
-    jb .ra_ceiling                             ; a payload the window already
-                                               ; covers: leave it on the RAM
-                                               ; path, which is cheaper and is
-                                               ; what a body split into many
-                                               ; small DATA frames looks like
+    jae .ra_region                             ; the buffer cannot hold it: the
+                                               ; region is the only way to
+                                               ; receive it, cost regardless
+    cmp rcx, LINNEA_QUIC_RA_REGION_MIN
+    jb .ra_ceiling                             ; small enough that the region's
+                                               ; fixed cost is not worth paying;
+                                               ; leave it on the RAM path
+.ra_region:
     ; max_body bounds it up front, on the length the frame DECLARES, so the
     ; bytes never land — the same rule the h1 and h2 paths apply to
     ; Content-Length.
@@ -2930,6 +2933,20 @@ linnea_quic_server_datagram:
     ; its cap afterwards, so every later evaluation stops at the renege guard.
     cmp qword [rdi + linnea_quic_ra.body_to], 0
     je .ra_fed_none                            ; buffer path: base keeps moving
+    ; ...and not when the peer is already holding this payload's end plus half a
+    ; buffer of runway beyond it. The stranding above is about a peer that lacks
+    ; credit; one with that much has nothing to gain from a step of a few KiB,
+    ; and once a region is opened per DATA FRAME rather than per megabyte, the
+    ; test below is true on the first evaluation of every region -- measured at
+    ; ONE MAX_STREAM_DATA per frame, 4120 of them in a 32 MiB upload framed at
+    ; 8 KiB, where the same upload on the buffer path sent 66. It also drags the
+    ; widest ceiling STEP down to one frame, which is what a peer held to its
+    ; initial window looks like from the outside.
+    mov rcx, [rdi + linnea_quic_ra.cap]
+    shr rcx, 1
+    add rcx, [rdi + linnea_quic_ra.body_to]
+    cmp [rdi + linnea_quic_ra.fc_adv], rcx
+    jae .ra_fed_none
     mov rcx, [rdi + linnea_quic_ra.base]
     add rcx, [rdi + linnea_quic_ra.cap]
     cmp rax, rcx

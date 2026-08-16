@@ -2659,17 +2659,20 @@ check "the upload capture file is created under spill_dir ($out)" $?
 # existed. Sizes inside the band above are deterministic; sizes outside it are
 # not evidence of anything.
 # Three sizes, one per ingest path, and each one SAYS which path it took rather
-# than being trusted to take it: 8000 stays in RAM (the control), 200000 opens a
+# than being trusted to take it: 3000 stays in RAM (the control), 200000 opens a
 # capture-file region, 16000000 opens one longer than RA_WINDOW and so is the
 # only one that reaches the grant loop where the suppressed-last-step deadlock
 # lived.
 #
-# The RAM case has had to move twice for the same reason -- it was 40000, which
-# stopped being a RAM case when the window went 32768 -> 131072 and became one
-# again when the inline buffer dropped to 16 KiB. It is under the SMALLEST
-# window the server ever advertises now, and the test refuses the run rather
-# than mislabelling it if that ever stops being true.
-for spec in "8000 ram" "200000 file" "16000000 file"; do
+# The RAM case has now had to move three times, and the third time is the one
+# worth reading. It was 40000, then 8000 when the inline buffer dropped to 16
+# KiB -- both times because the number here had to follow a constant. This time
+# the derivation itself was wrong: the gate stopped being the advertised window
+# when a body started BORROWING its buffer, so 8000 and 200000 were BOTH on the
+# RAM path and the middle case had been testing the control's path while saying
+# "capture-file". h3_upload_big.py now reads the gate out of the header, and
+# 3000 is under it (LINNEA_QUIC_RA_REGION_MIN, 4096).
+for spec in "3000 ram" "200000 file" "16000000 file"; do
     set -- $spec
     out2=$(timeout 120 python3 test/quic/h3_upload_big.py localhost $1 ${P61498} --path $2 2>&1)
     case "$out2" in ok*) true ;; *) false ;; esac
@@ -2754,8 +2757,16 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # buffer a stream holds, so a ceiling step wider than the advertised window
     # is proof the lend happened. Measured 525344 against 8945 on the build that
     # shipped the fault.
-    out12=$(timeout 180 python3 test/quic/h3_upload_frames.py localhost ${P61498} 500 8192 --rtt-ms 20 --expect-borrow 2>&1)
-    check "h3 a body framed SMALL still gets a real window ($out12)" $?
+    #
+    # --max-grants rides along on the same run because this is the framing that
+    # provokes it: 500 frames of 8 KiB each open a capture-file region, and a
+    # region fires the "last step up to the cap" grant on its first evaluation.
+    # Measured on this exact check: 500 grants against 8, and the widest ceiling
+    # STEP falls from 524480 to 8195 with it -- so the peer is re-granted a
+    # frame at a time, and the borrow assertion above reads that as no buffer
+    # having been lent at all. The bound of 150 sits between the two.
+    out12=$(timeout 180 python3 test/quic/h3_upload_frames.py localhost ${P61498} 500 8192 --rtt-ms 20 --expect-borrow --max-grants 150 2>&1)
+    check "h3 a body framed SMALL still gets a real window, and not a grant per frame ($out12)" $?
     out8=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 1 --max-ms 400 2>&1)
     check "h3 a lost final response is recovered from a MEASURED rtt ($out8)" $?
     out9=$(timeout 120 python3 test/quic/h3_tail_loss.py localhost ${P61498} /api/simple --drop 0 --max-ms 400 2>&1)

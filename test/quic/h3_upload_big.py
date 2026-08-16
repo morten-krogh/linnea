@@ -19,18 +19,27 @@
 # The size therefore decides WHICH fault this exercises, and neither one is
 # about volume. See the sizes run in test/run_tests.sh.
 #
-# Which path a size takes is DERIVED FROM THE SERVER and printed, never assumed
-# from a number written here. When RA_BUF went 32768 -> 131072 the 40000-byte
-# case stopped reaching the capture file altogether, and the suite went on
-# reporting "goes to the capture file and echoes back" for a body that never
-# left RAM. The second fault's band -- a payload just over RA_BUF, where the
-# last grant step up to the cap fell under RA_GRANT and was suppressed -- also
-# moved, and then closed: a payload shorter than RA_WINDOW now has its whole
-# ceiling granted in one step at take-over, so only a payload past RA_WINDOW
-# reaches the grant loop that fault lived in at all.
+# Which path a size takes is DERIVED FROM THE GATE THE SERVER ACTUALLY USES and
+# printed, never assumed from a number written here. When RA_BUF went 32768 ->
+# 131072 the 40000-byte case stopped reaching the capture file altogether, and
+# the suite went on reporting "goes to the capture file and echoes back" for a
+# body that never left RAM. The second fault's band -- a payload just over
+# RA_BUF, where the last grant step up to the cap fell under RA_GRANT and was
+# suppressed -- also moved, and then closed: a payload shorter than RA_WINDOW
+# now has its whole ceiling granted in one step at take-over, so only a payload
+# past RA_WINDOW reaches the grant loop that fault lived in at all.
+#
+# AND IT WENT STALE ANYWAY, which is why the derivation below reads the header
+# rather than the handshake. This test decided the path from
+# initial_max_stream_data_bidi_remote, on the reasoning that the advertised
+# window IS the reassembly buffer -- true until the buffer became something a
+# body BORROWS. After that the gate compared against the borrowed 1 MiB while
+# this file went on comparing against the advertised 16 KiB, so "200000 bytes,
+# capture-file path" was printed for two weeks about a body that never left RAM.
+# A derivation is a claim about the server and goes stale exactly like a comment.
 #
 # Usage: h3_upload_big.py <host> <bytes> [port] [--path ram|file]
-import hashlib, socket, ssl, sys, time
+import hashlib, os, re, socket, ssl, sys, time
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.h3.connection import H3Connection
@@ -69,15 +78,36 @@ if not conn._handshake_confirmed:
     print("handshake failed")
     sys.exit(1)
 
-# Which ingest path this size takes, decided by the window the SERVER advertises
-# (initial_max_stream_data_bidi_remote, which is RA_BUF): a DATA payload the
-# window already covers stays in RAM, a larger one opens a region written
-# straight to the capture file.
+# Which ingest path this size takes. The gate is a DATA payload's REMAINING
+# length against LINNEA_QUIC_RA_REGION_MIN, evaluated after the walk has already
+# consumed whatever had arrived, so a size near the threshold can go either way
+# and this refuses to label it. What bounds the ambiguity is that the walk can
+# only have consumed what the buffer held, and at the first evaluation of a
+# body's first DATA frame that buffer is still the inline one:
+#
+#     n <  REGION_MIN               -> RAM, always
+#     n >= REGION_MIN + RA_SMALL    -> a region, always
+#     between                       -> depends on arrival; not a test case
 window = conn._remote_max_stream_data_bidi_remote
-path = "capture-file" if n > window else "RAM"
+INC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                   "..", "..", "include", "linnea_quic_conn.inc")
+def _equ(name):
+    m = re.search(r"^%s\s+equ\s+(\S+)" % name, open(INC).read(), re.M)
+    if not m:
+        print("no %s in %s" % (name, INC))
+        sys.exit(1)
+    return int(m.group(1), 0)
+REGION_MIN, RA_SMALL = _equ("LINNEA_QUIC_RA_REGION_MIN"), _equ("LINNEA_QUIC_RA_SMALL")
+if n < REGION_MIN:
+    path = "RAM"
+elif n >= REGION_MIN + RA_SMALL:
+    path = "capture-file"
+else:
+    path = "either"
 if WANT_PATH and path != {"ram": "RAM", "file": "capture-file"}[WANT_PATH]:
-    print("%d bytes takes the %s path against the server's %d-byte stream window, "
-          "not the %s path this case is for" % (n, path, window, WANT_PATH))
+    print("%d bytes takes the %s path against a region gate of %d and an inline "
+          "buffer of %d, not the %s path this case is for"
+          % (n, path, REGION_MIN, RA_SMALL, WANT_PATH))
     sys.exit(1)
 
 h3 = H3Connection(conn)
