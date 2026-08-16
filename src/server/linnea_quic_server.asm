@@ -312,6 +312,23 @@ section .bss
 ra_pool_buf:  resb LINNEA_QUIC_RA_POOL * LINNEA_QUIC_RA_BIG
 ra_pool_seen: resb LINNEA_QUIC_RA_POOL * ((LINNEA_QUIC_RA_BIG + 7) / 8)
 ra_pool_used: resb LINNEA_QUIC_RA_POOL      ; 1 = lent out
+; --- the capture stage ------------------------------------------------------
+; A payload written straight to its capture file arrives one QUIC packet at a
+; time, and each arrival used to be a pwrite of its own: 32,934 of them for a
+; 33,554,432-byte body, mean 1019 bytes, measured with strace. The syscall costs
+; more than the copy does, so contiguous runs are gathered here and written when
+; the run breaks, when this fills, or when the region closes.
+;
+; ONE per worker, not one per context, and that is safe for a reason worth
+; stating: a region is only ever filled from the arrival path, and while one is
+; open the walk is never fed -- so the sink and the stage cannot both hold bytes
+; for the same file. Two uploads in flight simply alternate, and the second's
+; first arrival flushes the first's.
+cap_stage:     resb LINNEA_QUIC_CAP_STAGE
+cap_stage_ctx: resq 1      ; context the staged bytes belong to, 0 = none staged
+cap_stage_fd:  resq 1      ; ...and its descriptor, so a flush needs no context
+cap_stage_off: resq 1      ; file offset of cap_stage[0]
+cap_stage_len: resq 1
 ; 1 = print the CFIN-OK marker on a completed handshake. Only
 ; bin/linnea-quichs sets it; the server leaves it 0.
 linnea_quic_cfin_echo: resq 1
@@ -2625,6 +2642,16 @@ linnea_quic_server_datagram:
     ; handed, and only an arriving frame re-walks the map -- a peer that has
     ; already sent everything it holds has none left to send. That is the
     ; deadlock the first attempt at this shipped.
+    ;
+    ; THE REGION'S LAST BYTES ARE STILL IN THE STAGE. This is the exit that
+    ; matters: from here the walk resumes, and it can finish the request and
+    ; hand the descriptor to the upstream leg without ever coming back. Nothing
+    ; after this point knows the span exists.
+    push rax
+    call cap_flush
+    test eax, eax
+    pop rax                                    ; does not touch the flags
+    js .ra_body_failed
     mov rcx, [rax + linnea_quic_ra.body_to]
     sub rcx, [rax + linnea_quic_ra.body_from]
     add [rax + linnea_quic_ra.spill_len], rcx  ; the sink writes on after it
@@ -7366,6 +7393,69 @@ ra_fail_note:
     mov [ra_fail_errno], rdx
     ret
 
+; cap_flush() -> rax = 0 ok, -1 fail. Write out whatever the capture stage
+; holds and empty it. Does nothing when nothing is staged, so every exit that
+; might be the last one for a region can call it unconditionally.
+;
+; Five pushes, like ra_body_place's, so rsp is 16-aligned at the calls below.
+cap_flush:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r14, [cap_stage_len]
+    test r14, r14
+    jz .cf_ok
+    lea r13, [cap_stage]
+    mov r15, [cap_stage_off]
+.cf_write:
+    mov edi, [cap_stage_fd]
+    mov rsi, r13
+    mov rdx, r14
+    mov r10, r15
+    mov eax, LINNEA_SYS_PWRITE64
+    syscall
+    cmp rax, -4095
+    jae .cf_wfail
+    test rax, rax
+    jz .cf_nospace                     ; no progress: a full filesystem
+    add r13, rax
+    add r15, rax
+    sub r14, rax
+    jnz .cf_write
+.cf_ok:
+    xor eax, eax
+    jmp .cf_done
+.cf_wfail:
+    cmp rax, -LINNEA_EINTR
+    je .cf_write
+    neg rax
+    mov rdx, rax                       ; the errno, kept: this is the same
+    lea rdi, [cap_write]               ; failure ra_body_place reports, only
+    mov esi, cap_write_len             ; deferred to where the bytes go out
+    call ra_fail_note
+    jmp .cf_fail
+.cf_nospace:
+    lea rdi, [cap_full]
+    mov esi, cap_full_len
+    xor edx, edx
+    call ra_fail_note
+.cf_fail:
+    mov eax, -1
+.cf_done:
+    ; Emptied either way. A failed capture fails its whole request, and leaving
+    ; the span behind would offer it to the NEXT one -- the descriptor is about
+    ; to be closed and its number handed out again.
+    mov qword [cap_stage_len], 0
+    mov qword [cap_stage_ctx], 0
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ra_body_place:
     push rbx
     push r12
@@ -7386,6 +7476,50 @@ ra_body_place:
     sub rax, [rbx + linnea_quic_ra.body_from]
     add rax, [rbx + linnea_quic_ra.body_file]
     mov r15, rax                       ; file offset
+    ; A run already worth its own syscall takes one. Only ra_body_migrate hands
+    ; over runs this size; an arrival is one packet's payload, ~1165 bytes.
+    cmp r14, LINNEA_QUIC_CAP_STAGE / 2
+    jae .bp_direct
+    cmp qword [cap_stage_len], 0
+    je .bp_stage_open
+    ; Staged bytes can only grow by a run that continues them, in the same file.
+    ; Both ways of failing that are ordinary: two uploads on one connection
+    ; alternate contexts, and a reordered datagram leaves a hole.
+    cmp [cap_stage_ctx], rbx
+    jne .bp_stage_break
+    mov rax, [cap_stage_off]
+    add rax, [cap_stage_len]
+    cmp rax, r15
+    jne .bp_stage_break
+    mov rax, [cap_stage_len]
+    add rax, r14
+    cmp rax, LINNEA_QUIC_CAP_STAGE
+    jbe .bp_stage_copy
+.bp_stage_break:
+    call cap_flush
+    test eax, eax
+    js .bp_fail
+.bp_stage_open:
+    mov [cap_stage_ctx], rbx
+    mov rax, [rbx + linnea_quic_ra.spill_fd]
+    mov [cap_stage_fd], rax
+    mov [cap_stage_off], r15
+.bp_stage_copy:
+    lea rdi, [cap_stage]
+    add rdi, [cap_stage_len]
+    mov rsi, r13
+    mov rcx, r14
+    rep movsb
+    add [cap_stage_len], r14
+    add r15, r14                       ; placed in full, as if written
+    jmp .bp_placed
+.bp_direct:
+    ; What is staged sits BELOW this run in the same file. pwrite does not care
+    ; about order, but the stage has to be out of the way before the region can
+    ; close, and this is the cheapest place to notice.
+    call cap_flush
+    test eax, eax
+    js .bp_fail
 .bp_write:
     mov edi, [rbx + linnea_quic_ra.spill_fd]
     mov rsi, r13
@@ -7401,7 +7535,12 @@ ra_body_place:
     add r15, rax
     sub r14, rax
     jnz .bp_write
+.bp_placed:
     ; --- record what arrived -------------------------------------------
+    ; Staged or written, the run is PLACED: the range list is what decides when
+    ; a region is whole, and holding a run back from it until the stage drained
+    ; would stall a completed upload behind a buffer that only fills when more
+    ; arrives -- which, for the last run of a body, never happens.
     mov rsi, r12                       ; start
     mov rdx, r15                       ; the file cursor advanced by the whole
     sub rdx, [rbx + linnea_quic_ra.body_file]
@@ -7880,6 +8019,19 @@ ra_prefix_advance:
 ; how a body reaches an upstream leg.
 ra_release:
     mov qword [rdi + linnea_quic_ra.active], 0
+    ; A context can only still own staged bytes if it is being given up with a
+    ; region open -- an abandoned upload, whose file is about to go. Writing
+    ; them costs one syscall on a request that failed anyway, and it is the
+    ; deliberate choice over dropping them: if the flush at the region's close
+    ; is ever missed, this writes the bytes rather than quietly losing them,
+    ; and it must happen BEFORE the close, or the span would land in whatever
+    ; connection is handed this descriptor number next.
+    cmp [cap_stage_ctx], rdi
+    jne .rr_unstaged
+    push rdi
+    call cap_flush
+    pop rdi
+.rr_unstaged:
     mov rax, [rdi + linnea_quic_ra.spill_fd]
     cmp rax, -1
     je .rr_none

@@ -306,6 +306,11 @@ LINNEA_QUIC_RA_WINDOW   equ 0x400000   ; 4 MiB: most we invite in flight on one
 ; more than this has its stream refused rather than being allowed to cost
 ; unbounded bookkeeping. Duplicates are free -- the same bytes rewritten at
 ; the same offset -- so this only has to answer "is the region whole yet".
+; What the capture stage gathers before it writes. Big enough that the syscall
+; stops mattering (32 MiB goes from ~32900 writes to ~512) and small enough to
+; be one page-cache-friendly write; past this the return diminishes, since the
+; copy that replaces the syscall costs the same per byte at any size.
+LINNEA_QUIC_CAP_STAGE   equ 65536
 LINNEA_QUIC_RA_RANGES   equ 32
 ; How long a request stream may go without a single frame before its context is
 ; considered abandoned and may be taken from it (see linnea_quic_ra.act_ms). An
