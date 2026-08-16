@@ -2671,10 +2671,47 @@ linnea_quic_server_datagram:
     mov rsi, r9                                ; a bit offset that may run past the
     mov rcx, r10                               ; operand, so it addresses the whole
 .ra_mark:                                      ; map from one base
+    ; WHOLE BYTES OF THE MAP AT A TIME. One bts per received byte measured
+    ; 3.5 ns/byte -- 37% of this path's CPU, and the difference between 107 and
+    ; 168 MB/s on one core, which at gigabit is the difference between coping
+    ; and not. bts against memory with a variable bit index is a
+    ; read-modify-write, ~10 cycles, and a frame's bytes are contiguous: the
+    ; middle of any run is whole 0xFF bytes and only the two ends need bits.
+    test rcx, rcx
+    jz .ra_hi_upd
+.ra_mk_head:                                   ; bits up to a byte boundary
+    test sil, 7
+    jz .ra_mk_bulk
     bts [rdi], rsi
     inc rsi
     dec rcx
-    jnz .ra_mark
+    jnz .ra_mk_head
+    jmp .ra_hi_upd
+.ra_mk_bulk:
+    mov rdx, rcx
+    shr rdx, 3                                 ; whole map bytes to fill
+    jz .ra_mk_tail
+    push rax                                   ; the context, and al holds the fill
+    push rdi
+    mov r8, rsi
+    shr r8, 3
+    add rdi, r8                                ; &seen[rsi / 8]
+    mov r8, rcx                                ; the count survives rep stosb
+    mov rcx, rdx
+    mov al, 0xFF
+    rep stosb
+    mov rcx, r8
+    pop rdi
+    pop rax
+    shl rdx, 3                                 ; bits just covered
+    add rsi, rdx
+    sub rcx, rdx
+    jz .ra_hi_upd
+.ra_mk_tail:                                   ; and the ragged end
+    bts [rdi], rsi
+    inc rsi
+    dec rcx
+    jnz .ra_mk_tail
 .ra_hi_upd:
     mov r10, [rax + linnea_quic_ra.hi]
     cmp r11, r10
@@ -7787,7 +7824,8 @@ ra_buf_borrow:
 ; past a DATA payload shipped, and it reproduced only in the multi-frame case
 ; while a single-frame 16 MB upload stayed byte-exact.
 ;
-; rax/rcx/rdx only, so a caller mid-frame keeps its registers.
+; rax/rcx/rdx/r8 only, so a caller mid-frame keeps what it needs (both call
+; sites treat r8 as dead: the frame path reloads it, the take-over uses none).
 ra_prefix_advance:
     mov rax, [rdi + linnea_quic_ra.len]
     mov rdx, [rdi + linnea_quic_ra.hi]
@@ -7795,6 +7833,22 @@ ra_prefix_advance:
 .pa_loop:
     cmp rax, rdx                      ; reached the high-water?
     jae .pa_done
+    ; Eight at a time while the prefix is byte-aligned and a whole byte of the
+    ; map is set, for the same reason .ra_mark fills whole bytes: this walks
+    ; every byte of an in-order stream and a bt per byte is ~10 cycles of it.
+    test al, 7
+    jnz .pa_bit
+    mov r8, rax
+    add r8, 8
+    cmp r8, rdx                       ; a whole byte still inside the map?
+    ja .pa_bit
+    mov r8, rax
+    shr r8, 3
+    cmp byte [rcx + r8], 0xFF         ; all eight arrived?
+    jne .pa_bit
+    add rax, 8
+    jmp .pa_loop
+.pa_bit:
     bt [rcx], rax
     jnc .pa_done                      ; a gap: stop here
     inc rax
