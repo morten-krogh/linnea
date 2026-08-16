@@ -185,6 +185,9 @@ extern linnea_quic_tp_iscid
 extern linnea_quic_tp_iscid_len
 extern linnea_quic_flow_scan
 extern linnea_quic_flow_blocked
+extern linnea_quic_stream_blocked
+extern linnea_log_acc_win
+extern linnea_log_acc_blocked
 extern linnea_quic_parse_priority
 extern linnea_quic_reset_scan
 extern linnea_quic_path_seen
@@ -2284,6 +2287,7 @@ linnea_quic_server_datagram:
     mov qword [fc_scan], 0
     mov qword [fc_scan + 8], 0
     mov byte [linnea_quic_flow_blocked], 0
+    mov byte [linnea_quic_stream_blocked], 0
     lea rdi, [plaintext]
     mov rsi, r14
     mov rdx, -1                       ; matches no stream id: MAX_STREAM_DATA is left
@@ -2302,6 +2306,26 @@ linnea_quic_server_datagram:
     mov rcx, [cur_conn]
     mov qword [rcx + linnea_quic_conn.fc_pending], 1
 .no_blocked:
+    ; ...and the per-stream half, which is recorded rather than acted on. The
+    ; frame names a stream, but this scan runs over a whole packet and the id is
+    ; not carried out of it, so the count goes on every context this connection
+    ; has open. A browser uploading has exactly one, which is the case this is
+    ; here to measure; with several in flight the number reads as "this
+    ; connection was blocked", which is still the fact worth knowing.
+    cmp byte [linnea_quic_stream_blocked], 0
+    je .no_sblocked
+    mov rcx, [cur_conn]
+    lea rcx, [rcx + linnea_quic_conn.ra_ctx]
+    mov rdx, LINNEA_QUIC_RA_CTXS
+.sb_mark:
+    cmp qword [rcx + linnea_quic_ra.active], 0
+    je .sb_next
+    inc qword [rcx + linnea_quic_ra.blocked_n]
+.sb_next:
+    add rcx, linnea_quic_ra_size
+    dec rdx
+    jnz .sb_mark
+.no_sblocked:
     mov rcx, [cur_conn]
     mov rdx, [fc_scan]                ; largest MAX_DATA in this packet
     test rdx, rdx
@@ -2475,6 +2499,9 @@ linnea_quic_server_datagram:
     mov [rax + linnea_quic_ra.sid], rdx
     mov qword [rax + linnea_quic_ra.len], 0
     mov qword [rax + linnea_quic_ra.fin], 0
+    ; Per REQUEST, not per connection: a slot is reused, and a count left behind
+    ; by the last stream through it would be read as this one's.
+    mov qword [rax + linnea_quic_ra.blocked_n], 0
     ; A stream begins on the context's own small buffer, handing back any big one
     ; the last stream through here borrowed. Doing it at the START as well as at
     ; release is belt and braces on a resource whose leak is permanent: a slot
@@ -2921,6 +2948,14 @@ linnea_quic_server_datagram:
     jae .ra_ceil_have
     mov rax, rcx
 .ra_ceil_have:
+    ; The headroom the peer has at this instant: what it has been granted, less
+    ; how far it has actually got. Its MINIMUM over the request is the honest
+    ; companion to blocked_n -- a peer that eases off just short of the limit
+    ; sends no STREAM_DATA_BLOCKED, so a zero count with the headroom grazing
+    ; zero means the window bound it without it ever saying so.
+    ;
+    ; Measured against fc_adv, the ceiling already SENT, not the one about to
+    ; be: the peer cannot spend credit it has not been told about.
     cmp rax, [rdi + linnea_quic_ra.fc_adv]
     jbe .ra_fed_none                           ; never renege: a lower ceiling
                                                ; wraps the unsigned subtraction
@@ -3249,6 +3284,14 @@ linnea_quic_server_datagram:
     mov [linnea_h3_body_fd], r10
     xor r8d, r8d
     mov r9, [rcx + linnea_quic_ra.spill_len]
+    ; ...and what the peer thought of the window while it sent that body. Only
+    ; a reassembled request has either, which is exactly the set of requests
+    ; the question is about: a single-packet GET was never window-bound.
+    push rax
+    mov rax, [rcx + linnea_quic_ra.blocked_n]
+    mov [linnea_log_acc_blocked], rax
+    mov qword [linnea_log_acc_win], 1
+    pop rax
 .parse_done:
     test rax, rax
     jz .req_ok

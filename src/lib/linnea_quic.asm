@@ -48,6 +48,7 @@ global linnea_quic_tp_cid_lim
 global linnea_quic_tp_error
 global linnea_quic_flow_scan
 global linnea_quic_flow_blocked
+global linnea_quic_stream_blocked
 global linnea_quic_parse_priority
 global linnea_quic_reset_scan
 global linnea_quic_path_seen
@@ -2262,7 +2263,7 @@ linnea_quic_flow_scan:
     cmp bl, 0x05                     ; STOP_SENDING (2 varints)
     je .fw_v2
     cmp bl, 0x15                     ; STREAM_DATA_BLOCKED (2 varints)
-    je .fw_v2
+    je .fw_sblocked
     cmp bl, 0x12                     ; MAX_STREAMS bidi (1 varint)
     je .fw_v1
     cmp bl, 0x13                     ; MAX_STREAMS uni (1 varint)
@@ -2311,6 +2312,18 @@ linnea_quic_flow_scan:
     jz .fw_done
     add rdi, rdx
     jmp .fw_scan
+.fw_sblocked:
+    ; The peer stating that it has stream data to send and our window will not
+    ; take it. Unlike DATA_BLOCKED above there is nothing to repair here -- the
+    ; per-stream ceiling is re-sent whenever it moves -- so this only RECORDS
+    ; that it happened, which is the one thing nothing did with it before: the
+    ; frame was stepped over by its length in every scanner, so no upload from
+    ; any browser has ever reported whether the window bound it.
+    ;
+    ; Falls through to .fw_v2 on purpose, the way .fw_blocked falls into
+    ; .fw_v1: noting the frame does not consume it, and its two varints still
+    ; have to be stepped over.
+    mov byte [linnea_quic_stream_blocked], 1
 .fw_v2:
     inc rdi
     call linnea_quic_varint_decode
@@ -3708,6 +3721,9 @@ section .bss
 ; Set by linnea_quic_flow_scan when the packet carried a DATA_BLOCKED. The
 ; caller clears it before the scan and acts on it after.
 linnea_quic_flow_blocked: resb 1
+; 1 when a STREAM_DATA_BLOCKED was seen in the packet just scanned. Cleared by
+; the caller before each scan, like the flag above.
+linnea_quic_stream_blocked: resb 1
 ; retry_source_connection_id (RFC 9000 7.3): the id a Retry issued for this
 ; handshake, which the client verifies. Zero length = no Retry, parameter omitted.
 linnea_quic_retry_scid:     resb LINNEA_QUIC_MAX_CID

@@ -215,9 +215,22 @@ LINNEA_QUIC_PU_PEND equ 8
 LINNEA_QUIC_RA_SMALL    equ 16384    ; inline per context: what a request with no
                                      ; body ever needs, and the window advertised
                                      ; in initial_max_stream_data_bidi_remote
-LINNEA_QUIC_RA_BIG      equ 1048576  ; borrowed while a body arrives, and so the
-                                     ; credit a client crosses a frame boundary
-                                     ; on: 1 MiB covers 8 MB/s at 120 ms
+; Borrowed while a body arrives, and so the credit a client is given to spend
+; between grants. MEASURED 2026-08-16 and raised on the measurement, not on a
+; feeling: with the per-request STREAM_DATA_BLOCKED count on the access line,
+; a 39,973,359-byte upload from Safari, Chrome and Firefox alike reported
+; blocked=68..74 -- and 39,973,359 / (1 MiB / 2) is 76. Every one of them
+; consumed its whole grant and stalled, once per grant, the entire way up.
+;
+; That count is a property of THIS number and not of the client, which is why
+; all three browsers landed on it. Safari moved the file in 1.49 s = one
+; 512 KiB step per 19.5 ms cycle, and 512 KiB at 26.9 MB/s IS 19.5 ms of data:
+; the achieved rate was exactly one grant step per round trip. The fastest
+; browser on the box was window-bound for essentially every byte.
+LINNEA_QUIC_RA_BIG      equ 4194304  ; 4 MiB: a 2 MiB grant step, 78 ms of
+                                     ; runway at 26.9 MB/s. The pool below is
+                                     ; 4x with it -- 144 MB per worker of .bss,
+                                     ; faulted on touch, on a 15 GB box.
 LINNEA_QUIC_RA_POOL     equ 32       ; big buffers per worker. Concurrent UPLOADS,
                                      ; not connections -- a stream that cannot get
                                      ; one falls back to its inline buffer and is
@@ -263,7 +276,12 @@ LINNEA_QUIC_RA_REGION_MIN equ 4096
 ; Over-granting is safe: a stream is still capped at its own buffer, so no extra
 ; is buffered.
 LINNEA_QUIC_INITIAL_MAX_DATA equ 1048576   ; must match initial_max_data in the TP
-LINNEA_QUIC_FC_WINDOW        equ 0x400000   ; 4 MiB ahead of received
+; These two move WITH RA_BIG or the stall simply relocates. The connection
+; window has to stay clear of the per-stream one, or a peer freed from
+; STREAM_DATA_BLOCKED starts sending DATA_BLOCKED instead -- and the count on
+; the access line only sees the former, so the fix would have looked like a
+; success while the peer went on stalling one frame type further out.
+LINNEA_QUIC_FC_WINDOW        equ 0x1000000  ; 16 MiB ahead of received
 LINNEA_QUIC_FC_GRANT_MIN     equ 0x40000    ; 256 KiB minimum grant step
 LINNEA_QUIC_CTRL_RO     equ 512     ; reordered control-stream bytes held (h3-6)
 LINNEA_QUIC_RA_CTXS     equ 6       ; requests that can reassemble concurrently
@@ -299,7 +317,7 @@ LINNEA_QUIC_RA_WALK     equ 8288    ; room for one linnea_h3_walk (asserted)
 ; went out after the payload's last byte landed. .base moves to the payload's END
 ; when the region opens instead, which puts the buffer where the NEXT frame is
 ; and leaves the payload below it, reached through a split in the arrival path.
-LINNEA_QUIC_RA_WINDOW   equ 0x400000   ; 4 MiB: most we invite in flight on one
+LINNEA_QUIC_RA_WINDOW   equ 0x1000000  ; 16 MiB: most we invite in flight on one
                                        ; request stream, matching h2's window
 ; Out-of-order arrivals to track while filling a payload. Real reordering
 ; makes a handful of large ranges; a peer that deliberately fragments into
@@ -511,6 +529,20 @@ struc linnea_quic_ra
     ; context of a dying connection whether or not it ever ran, and reading a
     ; plain index out of that would have handed slot 0 back once per context.
     .pool_slot: resq 1
+    ; --- what the peer says about the window we gave it ------------------------
+    ; STREAM_DATA_BLOCKED (0x15) is the peer stating that it has body to send and
+    ; our stream window will not let it -- the only unambiguous evidence that we
+    ; are the constraint. It was parsed for its length and discarded everywhere,
+    ; so no browser has ever told us whether it was blocked.
+    ;
+    ; .blocked_n counts them for this request. There WAS a .min_head beside it --
+    ; the smallest gap between the ceiling granted and the offset reached -- and
+    ; it is gone because it could not observe its own subject: it sampled when a
+    ; STREAM frame arrived, which is precisely when the peer is NOT blocked, so
+    ; it read ~523 KB of "minimum headroom" on streams that had announced being
+    ; blocked 74 times. A number that is wrong in a knowable direction is worse
+    ; in a log than no number, because the next reader has no reason to doubt it.
+    .blocked_n: resq 1
     .buf:      resb LINNEA_QUIC_RA_SMALL
     ; bit i = 1 once stream byte i has arrived. A bit, not a byte: at one byte
     ; per byte this array alone was half the size of a connection, and there

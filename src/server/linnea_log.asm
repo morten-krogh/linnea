@@ -28,6 +28,8 @@ global linnea_log_acc_proto
 global linnea_log_acc_proto_len
 global linnea_log_acc_status
 global linnea_log_acc_bytes
+global linnea_log_acc_win
+global linnea_log_acc_blocked
 
 extern linnea_print_fd
 extern linnea_string_from_u64
@@ -49,6 +51,8 @@ acc_endq:       db '" '
 fatal_pfx:      db "fatal: "
 fatal_pfx_len   equ $ - fatal_pfx
 acc_dash:       db "-"
+acc_blocked:    db " blocked="
+acc_blocked_len equ $ - acc_blocked
 acc_sp:         db " "
 acc_nl:         db 10
 
@@ -93,6 +97,10 @@ linnea_log_acc_proto:    resq 1     ; "HTTP/1.1" / "HTTP/2" / "HTTP/3"
 linnea_log_acc_proto_len: resq 1
 linnea_log_acc_status:   resq 1
 linnea_log_acc_bytes:    resq 1
+; 1 = the two fields below are meaningful for this line. Zeroed after
+; every line, so a request that sets nothing cannot inherit the last one's.
+linnea_log_acc_win:      resq 1
+linnea_log_acc_blocked:  resq 1
 
 section .text
 
@@ -430,6 +438,20 @@ linnea_log_access:
     call linnea_log_write
     mov rdi, [linnea_log_acc_bytes]
     call linnea_log_u64
+    ; What the peer said about the window it was given: blocked= counts the
+    ; STREAM_DATA_BLOCKED frames it sent for this request -- the peer stating
+    ; that our window, not its link, was the constraint. Written only when the
+    ; server set it, so every line that is not a reassembled h3 request looks
+    ; exactly as it did.
+    cmp qword [linnea_log_acc_win], 0
+    je .acc_nowin
+    lea rdi, [acc_blocked]
+    mov esi, acc_blocked_len
+    call linnea_log_write
+    mov rdi, [linnea_log_acc_blocked]
+    call linnea_log_u64
+.acc_nowin:
+    mov qword [linnea_log_acc_win], 0
     lea rdi, [acc_nl]
     mov esi, 1
     call linnea_log_write      ; the newline flushes it and clears the mark
