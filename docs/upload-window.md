@@ -109,39 +109,87 @@ simply goes slower and nothing says why.
 `2b08e76` took the first 28% by keeping the arrival bitmap a byte at a time
 instead of a bit.
 
-## Push more traffic onto the capture-file path
+## Push more traffic onto the capture-file path — DONE
 
-**The file path is cheaper than buffering in RAM** — 5.9 against 7.2 ns/byte —
-which inverts the usual intuition and is the clearest remaining win. It tracks
-arrivals as ranges rather than a bitmap and writes straight through, so it does
-no per-byte work at all; the RAM path copies (`rep movsb` into `.buf`) and
-maintains a bit per byte on top of the same file write.
+**The file path is cheaper than buffering in RAM**, which inverts the usual
+intuition and was the clearest remaining win. It tracks arrivals as ranges
+rather than a bitmap and writes straight through, so it does no per-byte work at
+all; the RAM path copies (`rep movsb` into `.buf`) and maintains a bit per byte
+on top of the same file write.
 
-Today a payload takes the file path only when `frame_rem >= .cap`, and `.cap` is
-1 MiB once a body has borrowed. So essentially all browser traffic — Chrome's
-371 KB frames, Firefox's small ones — stays on the *more expensive* path. The
-threshold is backwards for the workload it meets.
+A payload used to take the file path only when `frame_rem >= .cap`, and `.cap`
+is 1 MiB once a body has borrowed. So essentially all browser traffic — Chrome's
+371 KB frames, Firefox's small ones — stayed on the *more expensive* path. The
+threshold was backwards for the workload it meets, and is now
+`LINNEA_QUIC_RA_REGION_MIN`, 4096, independent of the borrowed buffer's size.
 
-Proposal: open a region for any DATA payload above a small fixed threshold,
-independent of the borrowed buffer's size. Points to settle by measurement, not
-argument:
+### What was measured
 
-- **Where the crossover actually is.** A region costs a `ra_body_migrate`, a
-  slide and a range-list entry; below some frame size that exceeds what the
-  bitmap would have cost. Measure ns/byte across frame sizes to find it rather
-  than picking a number.
-- **`LINNEA_QUIC_RA_RANGES` is 32.** Out-of-order arrival within a region is
-  tracked as ranges and a peer that fragments past that has its stream refused.
-  More, smaller regions means more streams meeting that bound.
-- **This does not remove the need for window headroom.** The boundary runway is
+Both builds up at once on separate ports, differing only in the gate; 32 MiB per
+point; worker CPU from `/proc/PID/schedstat` (nanoseconds — `utime`/`stime`
+quantise at 10 ms against a ~250 ms signal). ns/byte, lower is better:
+
+| frame | buffer path | file path | | frame | buffer path | file path |
+|---|---|---|---|---|---|---|
+| 2 KiB | 8.15 | 8.27 | | 262 KiB | 7.86 | 6.32 |
+| 4 KiB | 8.24 | 7.54 | | 371 KiB | 7.92 | 6.57 |
+| 8 KiB | 7.79 | 6.67 | | 1 MiB | 7.89 | 6.28 |
+| 32 KiB | 7.85 | 6.50 | | **2 MiB** | **6.18** | **6.23** |
+| 64 KiB | 7.91 | 6.49 | | **4 MiB** | **6.48** | **6.14** |
+
+The last two rows are the control: past ~2 MiB *both* builds open a region, so
+they must agree, and they do within 1%. That row is what makes the rest of the
+table evidence rather than two numbers that happen to differ — and it had to be
+put there deliberately, because the first attempt at a control used 1 MiB frames
+and did not fire. **The gate tests what REMAINS of a payload after the walk has
+consumed what already arrived**, so a 1 MiB frame reaches it with less than
+1 MiB left and stays on the buffer path. The same arithmetic is why the
+threshold is 4096 and not lower: a threshold of T catches frames comfortably
+above T, not frames of T, and by 2 KiB there is nothing left to win.
+
+### Found underneath: a grant per DATA frame
+
+Opening a region per frame rather than per megabyte reaches the "last step up to
+the cap" exception on the first evaluation of every region. Credit is normally
+handed out in steps of half the stream's buffer — ~66 grants for a 32 MiB body
+however it is framed — and it became **one MAX_STREAM_DATA per frame: 4120 of
+them, and the widest ceiling step collapsed from 524480 to 8195.**
+
+Nothing stalled, because the ceiling each grant carries is still a whole buffer
+past the payload. But a peer re-granted a frame at a time is the exact shape the
+borrow assertion in `h3_upload_frames.py` reads as *no buffer was lent at all*,
+so lowering the gate alone turns that check red — and on a real network it is a
+packet per frame on the reverse path.
+
+The exception exists for a peer stranded a few bytes short of a body whose
+length it has already declared. **A peer already holding this payload's end plus
+half a buffer beyond it is not that peer**, and the step is now suppressed for
+it. Measured at 8 KiB framing: 6.67 → 6.38 ns/byte, 4120 grants → 68. At 371 KB
+framing it is neutral (6.27 → 6.25), which is what it should be — there is one
+region per 371 KB either way. `--max-grants` on the suite's small-framed upload
+holds it.
+
+### What this does not do
+
+- **It does not remove the need for window headroom.** The boundary runway is
   still `base + .cap`; the file path changes what the *payload* costs, not what
-  crossing a frame boundary costs. The two changes are complementary and neither
-  substitutes for the other.
+  crossing a frame boundary costs. The two are complementary.
+- **`LINNEA_QUIC_RA_RANGES` is 32.** Out-of-order arrival inside a region is
+  tracked as ranges and a peer that fragments past that has its stream refused.
+  More, smaller regions means more streams meeting that bound; nothing in the
+  reorder checks moved, but the margin is thinner than it was.
+- **The region's fixed cost is not the grant.** Suppressing the grant bought
+  0.29 ns/byte of the ~1.3 the region costs at 8 KiB framing. The rest is the
+  migrate, the slide, and one `pwrite` per arrival where the buffer path
+  accumulates and writes a contiguous run. **Coalescing those writes is the next
+  thing to measure** and would move the crossover lower again.
 
 ## Order of work
 
-1. Measure the region/RAM crossover and lower the threshold accordingly.
-2. Any further per-byte cost in the RAM path that survives (the copy is next).
+1. ~~Measure the region/RAM crossover and lower the threshold accordingly.~~
+   Done: `LINNEA_QUIC_RA_REGION_MIN` = 4096, plus the grant suppression above.
+2. Any further per-byte cost that survives — the `rep movsb` into `.buf` on the
+   buffer path, and the per-arrival `pwrite` on the file path.
 3. Then auto-tuning and the two config keys, with the ceiling raised to match.
 
-Raising windows before (1) and (2) buys a stall the peer cannot report.
+Raising windows before (2) buys a stall the peer cannot report.
