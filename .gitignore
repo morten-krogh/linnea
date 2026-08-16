@@ -82,3 +82,4 @@ linnea-qdbg
 __pycache__/
 *.pyc
 test/run-*/
+test/shard-out/

@@ -111,6 +111,31 @@ esac
 skipped=0
 # Used as: if extensive; then <the slow thing>; check "..." $?; else skip "..."; fi
 extensive() { [ "$SUITE" = full ]; }
+
+# --- shards ------------------------------------------------------------------
+# LINNEA_SHARD=i/N runs region i of N, so `test/run_shards.sh` can put the
+# regions on the box at once. They are separate processes with separate port
+# bases and RUNDIRs, which the suite has supported since 455efb8.
+#
+# There are three regions and they are NOT arbitrary line ranges: each is a
+# stretch that starts its own fixtures, uses them and stops them, measured at
+# 160 s (quic/h3), 319 s (h1/proxy/ws/upload) and 371 s (tls/h2) of a full
+# run's 858. A shard therefore cannot be faster than its largest region --
+# there is no point splitting into more than three until one of them is broken
+# up. Everything outside the three (config parsing, the crypto vectors, the
+# EMFILE check) is seconds, and runs in EVERY shard rather than being tracked.
+#
+# The regions are bracketed with a bare `if ...; then` / `fi` and their bodies
+# are deliberately NOT re-indented: bash does not care, and an 1800-line
+# whitespace diff would bury the two lines that actually changed.
+SHARD=""; SHARDS=1
+case "${LINNEA_SHARD:-}" in
+    "") ;;
+    [0-9]*/[0-9]*) SHARD=${LINNEA_SHARD%%/*}; SHARDS=${LINNEA_SHARD##*/} ;;
+    *) echo "FATAL: LINNEA_SHARD must be i/N, not '$LINNEA_SHARD'" >&2; exit 1 ;;
+esac
+# With no LINNEA_SHARD every region runs, which is the ordinary serial suite.
+region() { [ -z "$SHARD" ] || [ "$(( $1 % SHARDS ))" -eq "$SHARD" ]; }
 skip() {
     echo "SKIP: $1"
     skipped=$((skipped + 1))
@@ -698,6 +723,9 @@ fi
 
 # HTTP/3 response building: linnea frames a HEADERS (QPACK-encoded status,
 # content-type, content-length) + DATA response that pylsqpack decodes.
+# --- region 0: quic and h3, every block below starts and stops its own
+# server. Not re-indented; see the region() comment near the top.
+if region 0; then
 if python3 -c 'import pylsqpack' 2>/dev/null && [ -x ./bin/linnea-h3resp ]; then
     python3 test/quic/h3resp_test.py >/dev/null 2>&1
     check "h3: response HEADERS+DATA built and QPACK-decodes (status/ct/cl)" $?
@@ -1546,6 +1574,8 @@ else
     check "quic connection-pool test (skipped: deps unavailable)" 0
 fi
 
+fi   # end region 0
+
 # --- HTTP tests against a running server ---
 rm -f "$LOG"
 # A file spanning several pages: every other fixture fits in one, which is
@@ -1609,7 +1639,12 @@ start_server $CFG/listen.json
 server_pid=$SRV_PID
 sleep 0.3
 
-# check_http <name> <grep-pattern> <response-text>
+# --- helpers hoisted out of region 1 -----------------------------------------
+# These are called from region 2 as well, and a region that does not run in
+# this shard must still leave its FUNCTIONS behind. Gating region 1 off without
+# this produced `check_http: command not found` six times in shard 2 -- bash
+# reports it on stderr and carries on, so the checks did not fail, they simply
+# never happened. The union check in run_shards.sh is what noticed.
 check_http() {
     local name=$1 pattern=$2 resp=$3
     if printf '%s' "$resp" | grep -qF "$pattern"; then
@@ -1622,8 +1657,6 @@ check_http() {
     fi
 }
 
-# raw_http <request> — send bytes, print the full response.
-# The request carries literal \r\n escapes; raw_http.py expands them.
 raw_http() {
     # See test/raw_http.py: the bash /dev/tcp one-liner this replaces gave the
     # connect, the write and the read a single two-second budget, and `cat` only
@@ -1633,6 +1666,42 @@ raw_http() {
     # three separate runs and reproduced on none of them in isolation.
     python3 test/raw_http.py "$1"
 }
+
+enc_of() {
+    curl -si --max-time 2 -H "Accept-Encoding: $1" http://127.0.0.1:${P61080}/enc.txt \
+        | grep -a -io '^content-encoding: .*' | tr -d '\r' | cut -d' ' -f2
+}
+
+body_of() {
+    curl -s --max-time 2 -H "Accept-Encoding: $1" http://127.0.0.1:${P61080}/enc.txt
+}
+
+mime_probe() {                 # mime_probe <ext> <expected type>
+    printf 'x' > "$WWW/probe.$1"
+    resp=$(raw_http "GET /probe.$1 HTTP/1.1\r\nHost: one.test\r\n\r\n")
+    check_http "mime: .$1 is $2" "Content-Type: $2" "$resp"
+    rm -f "$WWW/probe.$1"
+}
+
+rl_burst() {   # $1 = label, rest = the curl that prints a status
+    local lbl=$1; shift
+    local ok=0 ref=0 i c
+    sleep 1.3                       # let the bucket refill before each protocol
+    for i in $(seq 1 12); do
+        c=$("$@" 2>/dev/null)
+        [ "$c" = "200" ] && ok=$((ok+1))
+        [ "$c" = "429" ] && ref=$((ref+1))
+    done
+    [ "$ok" -ge 1 ] && [ "$ref" -ge 1 ]
+    check "rate_limit meters $lbl ($ok served, $ref refused of 12)" $?
+}
+
+if region 1; then   # h1, proxy, websockets, uploads
+
+# check_http <name> <grep-pattern> <response-text>
+
+# raw_http <request> — send bytes, print the full response.
+# The request carries literal \r\n escapes; raw_http.py expands them.
 
 # --- log file ---
 grep -q "listening on 127.0.0.1:${P61080} (one.test)" "$LOG"
@@ -1763,13 +1832,6 @@ check "request log 304" $?
 # --- pre-compressed variants: enc.txt has both a .br and a .gz beside it ---
 # enc_of <accept-encoding> — the Content-Encoding linnea picked, if any.
 # grep -a: the gzip variant's body is binary.
-enc_of() {
-    curl -si --max-time 2 -H "Accept-Encoding: $1" http://127.0.0.1:${P61080}/enc.txt \
-        | grep -a -io '^content-encoding: .*' | tr -d '\r' | cut -d' ' -f2
-}
-body_of() {
-    curl -s --max-time 2 -H "Accept-Encoding: $1" http://127.0.0.1:${P61080}/enc.txt
-}
 [ "$(enc_of 'gzip, br')" = "br" ]
 check "br preferred over gzip" $?
 [ "$(body_of 'gzip, br')" = "br payload" ]
@@ -2037,12 +2099,6 @@ check_http "mime: .mp4 is video/mp4" "Content-Type: video/mp4" "$resp"
 # under the nosniff we send, and a .htm answered as octet-stream downloads
 # instead of rendering. Both tables are checked, since h1 and h2/h3 keep
 # separate ones and a type added to only one is the likely mistake.
-mime_probe() {                 # mime_probe <ext> <expected type>
-    printf 'x' > "$WWW/probe.$1"
-    resp=$(raw_http "GET /probe.$1 HTTP/1.1\r\nHost: one.test\r\n\r\n")
-    check_http "mime: .$1 is $2" "Content-Type: $2" "$resp"
-    rm -f "$WWW/probe.$1"
-}
 mime_probe wasm        application/wasm
 mime_probe mjs         text/javascript
 mime_probe htm         text/html
@@ -2488,18 +2544,6 @@ wait $elog_pid 2>/dev/null
 rm -f $RUNDIR/linnea-rl.log
 start_server $CFG/rate-limit.json
 rl_pid=$SRV_PID
-rl_burst() {   # $1 = label, rest = the curl that prints a status
-    local lbl=$1; shift
-    local ok=0 ref=0 i c
-    sleep 1.3                       # let the bucket refill before each protocol
-    for i in $(seq 1 12); do
-        c=$("$@" 2>/dev/null)
-        [ "$c" = "200" ] && ok=$((ok+1))
-        [ "$c" = "429" ] && ref=$((ref+1))
-    done
-    [ "$ok" -ge 1 ] && [ "$ref" -ge 1 ]
-    check "rate_limit meters $lbl ($ok served, $ref refused of 12)" $?
-}
 rl_burst "h1" curl -sS -o /dev/null -w '%{http_code}' --max-time 5 --http1.1 \
     --cacert $CA --resolve localhost:${P61468}:127.0.0.1 https://localhost:${P61468}/hello.txt
 rl_burst "h2" curl -sS -o /dev/null -w '%{http_code}' --max-time 5 --http2 \
@@ -3035,6 +3079,8 @@ check "a reset does not log an errno line" $?
 grep -qF ': idle timeout' "$LOG"
 check "termination idle timeout" $?
 
+fi   # end region 1, part one
+
 kill $server_pid $backend_pid $ws_direct_pid $ws_proxy_pid 2>/dev/null
 # the next block binds 61100 again, so let this one's listener go first
 for _ in $(seq 1 60); do
@@ -3045,6 +3091,9 @@ wait $server_pid 2>/dev/null
 wait $backend_pid 2>/dev/null
 wait $ws_direct_pid $ws_proxy_pid 2>/dev/null
 rm -f "$LOG" $WWW/big.txt $WWW/upload.bin $WWW/upload2.bin $WWW/h2range.bin $WWW/huge.bin $WWW/enc.txt $WWW/enc.txt.gz $WWW/enc.txt.br
+if region 1; then   # ...and part two, past the teardown above, which
+                    # has to run in EVERY shard: the TLS region rebinds
+                    # 61100 and this is what releases it
 
 # --- connection limits: slow-head deadline and the per-address cap ---
 # One host must not be able to hold the server open. The idle timeout cannot stop
@@ -3416,8 +3465,11 @@ if [ $burst_rc -ne 0 ]; then
 fi
 check "upgrade under load loses no connection ($burst_out)" $burst_rc
 rm -f "$LOG"
+fi   # end region 1
+
 
 # --- TLS 1.3: the standalone echo server against real clients ---
+if region 2; then   # tls, http2, and the h3 proxy battery
 # Needs the openssl CLI (cert generation + s_client) and python3 ssl,
 # both already test-only dependencies. Skips cleanly if either is absent.
 TLSBIN=./bin/linnea-tlstest
@@ -5038,6 +5090,8 @@ open(sys.argv[1],'wb').write(bytes(random.getrandbits(8) for _ in range(300000))
     wait $tls_server_pid 2>/dev/null
     wait $tls_backend_pid 2>/dev/null
     rm -f "$LOG" $WWW/big.txt
+fi   # end region 2
+
 
     # --- SNI: two TLS vhosts share 127.0.0.1:61444, each with its own cert
     start_server $CFG/tls-sni.json
