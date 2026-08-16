@@ -36,6 +36,20 @@ if [ "$N" -gt 4 ]; then
     exit 1
 fi
 
+# Build every binary the suite builds, ONCE, before any shard starts. The suite
+# builds its unit-test binaries itself rather than trusting what is on disk --
+# which is right for one run and a race for three: they share a source tree, so
+# three makes relink the same file while one of them is executing it. Measured,
+# not imagined: "crypto selftest" failed in two shards of three with
+# "Segmentation fault (core dumped)" on a binary that passes standing alone.
+# With everything already up to date the in-suite makes do nothing.
+#
+# The union check cannot see this one. It compares which checks RAN, and these
+# ran -- they just ran against a half-written binary.
+echo "pre-building what the shards would otherwise race on..."
+make -s bin/linnea-selftest bin/linnea-quictest bin/linnea-rtxtest \
+        bin/linnea-ws-fast tlstest >/dev/null 2>&1
+
 echo "running $N shards of the $SUITE suite, port bases $BASE..$((BASE + (N-1)*1000))"
 start=$(date +%s)
 pids=""
