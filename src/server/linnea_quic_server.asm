@@ -2643,15 +2643,11 @@ linnea_quic_server_datagram:
     ; already sent everything it holds has none left to send. That is the
     ; deadlock the first attempt at this shipped.
     ;
-    ; THE REGION'S LAST BYTES ARE STILL IN THE STAGE. This is the exit that
-    ; matters: from here the walk resumes, and it can finish the request and
-    ; hand the descriptor to the upstream leg without ever coming back. Nothing
-    ; after this point knows the span exists.
-    push rax
-    call cap_flush
-    test eax, eax
-    pop rax                                    ; does not touch the flags
-    js .ra_body_failed
+    ; NOTHING IS FLUSHED HERE, and that is deliberate. A region's last bytes and
+    ; the next frame's sink bytes are adjacent in the file, so emptying the
+    ; stage at every region close would cut a span that is about to continue --
+    ; two writes per DATA frame where one will do. The file is not read until
+    ; .ra_complete, which is where the stage is emptied.
     mov rcx, [rax + linnea_quic_ra.body_to]
     sub rcx, [rax + linnea_quic_ra.body_from]
     add [rax + linnea_quic_ra.spill_len], rcx  ; the sink writes on after it
@@ -3033,6 +3029,15 @@ linnea_quic_server_datagram:
     ; and the serve is about to be handed it. The close comes after — and
     ; s_ra_hold is what makes sure "after" arrives down every exit and not just
     ; the one that serves.
+    ;
+    ; Which is exactly why the stage is emptied here, and why this is the only
+    ; place it has to be: from the next instruction the file IS the body, and
+    ; every writer into it — the sink and a payload's region alike — has been
+    ; gathering into a buffer that nothing downstream knows about. Every other
+    ; exit from a walk reaches ra_release, which empties it too.
+    call cap_flush
+    test eax, eax
+    js .ra_body_failed
     mov rax, [s_ra_ctx]
     mov qword [rax + linnea_quic_ra.active], 0
     mov [s_ra_hold], rax
@@ -7797,6 +7802,51 @@ ra_body_sink:
     mov rax, [rax + linnea_config.max_body]
     cmp r14, rax
     ja .bs_toobig                                ; the cap, not a failure: -2
+    test r13, r13
+    jz .bs_done
+    ; Staged like a payload's run, and into the SAME stage, which is the point:
+    ; the walk consumes the bytes that arrive alongside a DATA frame header and
+    ; a region takes the rest, so the two writers produce one contiguous span
+    ; per frame. Kept apart they were two writes each; together they are one per
+    ; 64 KiB. They cannot both hold bytes at once -- the walk is not fed while a
+    ; region is open -- so the span simply passes between them.
+    cmp r13, LINNEA_QUIC_CAP_STAGE / 2
+    jae .bs_direct                               ; worth its own syscall
+    mov r14, [rbx + linnea_quic_ra.spill_len]    ; where this run goes
+    cmp qword [cap_stage_len], 0
+    je .bs_stage_open
+    cmp [cap_stage_ctx], rbx
+    jne .bs_stage_break
+    mov rax, [cap_stage_off]
+    add rax, [cap_stage_len]
+    cmp rax, r14
+    jne .bs_stage_break
+    mov rax, [cap_stage_len]
+    add rax, r13
+    cmp rax, LINNEA_QUIC_CAP_STAGE
+    jbe .bs_stage_copy
+.bs_stage_break:
+    call cap_flush
+    test eax, eax
+    js .bs_fail
+.bs_stage_open:
+    mov [cap_stage_ctx], rbx
+    mov rax, [rbx + linnea_quic_ra.spill_fd]
+    mov [cap_stage_fd], rax
+    mov [cap_stage_off], r14
+.bs_stage_copy:
+    lea rdi, [cap_stage]
+    add rdi, [cap_stage_len]
+    mov rsi, r12
+    mov rcx, r13
+    rep movsb
+    add [cap_stage_len], r13
+    add [rbx + linnea_quic_ra.spill_len], r13    ; placed, as if written
+    jmp .bs_done
+.bs_direct:
+    call cap_flush
+    test eax, eax
+    js .bs_fail
 .bs_write:
     test r13, r13
     jz .bs_done
