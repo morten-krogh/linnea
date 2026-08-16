@@ -556,6 +556,14 @@ struc linnea_quic_ra
     ; blocked 74 times. A number that is wrong in a knowable direction is worse
     ; in a log than no number, because the next reader has no reason to doubt it.
     .blocked_n: resq 1
+    ; ...and what those blocks COST. The count alone turned out not to measure
+    ; harm: Firefox reported 19 on a fast link and 19 on a slow one, because the
+    ; peer runs to the edge of its credit and waits whatever rate it sends at.
+    ; What matters is how long it waited there, so .stall_at stamps the arrival
+    ; of a STREAM_DATA_BLOCKED and the next STREAM frame on this stream closes
+    ; the interval into .stalled_ms. 0 in .stall_at means "not stalling".
+    .stall_at:  resq 1
+    .stalled_ms: resq 1
     .buf:      resb LINNEA_QUIC_RA_SMALL
     ; bit i = 1 once stream byte i has arrived. A bit, not a byte: at one byte
     ; per byte this array alone was half the size of a connection, and there

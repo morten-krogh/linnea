@@ -30,6 +30,7 @@ global linnea_log_acc_status
 global linnea_log_acc_bytes
 global linnea_log_acc_win
 global linnea_log_acc_blocked
+global linnea_log_acc_stalled
 
 extern linnea_print_fd
 extern linnea_string_from_u64
@@ -51,6 +52,8 @@ acc_endq:       db '" '
 fatal_pfx:      db "fatal: "
 fatal_pfx_len   equ $ - fatal_pfx
 acc_dash:       db "-"
+acc_stalled:    db " stalled_ms="
+acc_stalled_len equ $ - acc_stalled
 acc_blocked:    db " blocked="
 acc_blocked_len equ $ - acc_blocked
 acc_sp:         db " "
@@ -101,6 +104,7 @@ linnea_log_acc_bytes:    resq 1
 ; every line, so a request that sets nothing cannot inherit the last one's.
 linnea_log_acc_win:      resq 1
 linnea_log_acc_blocked:  resq 1
+linnea_log_acc_stalled:  resq 1
 
 section .text
 
@@ -449,6 +453,14 @@ linnea_log_access:
     mov esi, acc_blocked_len
     call linnea_log_write
     mov rdi, [linnea_log_acc_blocked]
+    call linnea_log_u64
+    ; ...and what the blocks cost, which is the number that decides whether any
+    ; of this is worth more memory. A count without a duration says only that
+    ; the peer touched the limit.
+    lea rdi, [acc_stalled]
+    mov esi, acc_stalled_len
+    call linnea_log_write
+    mov rdi, [linnea_log_acc_stalled]
     call linnea_log_u64
 .acc_nowin:
     mov qword [linnea_log_acc_win], 0

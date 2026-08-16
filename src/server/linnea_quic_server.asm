@@ -188,6 +188,7 @@ extern linnea_quic_flow_blocked
 extern linnea_quic_stream_blocked
 extern linnea_log_acc_win
 extern linnea_log_acc_blocked
+extern linnea_log_acc_stalled
 extern linnea_quic_parse_priority
 extern linnea_quic_reset_scan
 extern linnea_quic_path_seen
@@ -2321,6 +2322,17 @@ linnea_quic_server_datagram:
     cmp qword [rcx + linnea_quic_ra.active], 0
     je .sb_next
     inc qword [rcx + linnea_quic_ra.blocked_n]
+    ; Stamp the start of the wait, unless one is already open -- a peer may send
+    ; several blocked frames while it waits, and only the first is the moment it
+    ; stopped being able to send.
+    cmp qword [rcx + linnea_quic_ra.stall_at], 0
+    jne .sb_next
+    push rcx
+    push rdx
+    call now_ms
+    pop rdx
+    pop rcx
+    mov [rcx + linnea_quic_ra.stall_at], rax
 .sb_next:
     add rcx, linnea_quic_ra_size
     dec rdx
@@ -2502,6 +2514,8 @@ linnea_quic_server_datagram:
     ; Per REQUEST, not per connection: a slot is reused, and a count left behind
     ; by the last stream through it would be read as this one's.
     mov qword [rax + linnea_quic_ra.blocked_n], 0
+    mov qword [rax + linnea_quic_ra.stall_at], 0
+    mov qword [rax + linnea_quic_ra.stalled_ms], 0
     ; A stream begins on the context's own small buffer, handing back any big one
     ; the last stream through here borrowed. Doing it at the START as well as at
     ; release is belt and braces on a resource whose leak is permanent: a slot
@@ -2565,6 +2579,19 @@ linnea_quic_server_datagram:
     mov r9, [s_rx_ms]
 .ra_stamp:
     mov [rax + linnea_quic_ra.act_ms], r9
+    ; The peer is sending again, so any wait it reported is over. r9 is this
+    ; packet's receive time, which is the moment the wait ended.
+    cmp qword [rax + linnea_quic_ra.stall_at], 0
+    je .ra_nostall
+    push rcx
+    mov rcx, r9
+    sub rcx, [rax + linnea_quic_ra.stall_at]
+    jc .ra_stall_done                          ; clock went backwards: drop it
+    add [rax + linnea_quic_ra.stalled_ms], rcx
+.ra_stall_done:
+    mov qword [rax + linnea_quic_ra.stall_at], 0
+    pop rcx
+.ra_nostall:
     ; place the frame at its offset (out-of-order frames are buffered, not
     ; dropped) and record the bytes as seen; the contiguous prefix advances below.
     ; rax is this stream's reassembly context throughout.
@@ -3292,6 +3319,8 @@ linnea_quic_server_datagram:
     push rax
     mov rax, [rcx + linnea_quic_ra.blocked_n]
     mov [linnea_log_acc_blocked], rax
+    mov rax, [rcx + linnea_quic_ra.stalled_ms]
+    mov [linnea_log_acc_stalled], rax
     mov qword [linnea_log_acc_win], 1
     pop rax
 .parse_done:
