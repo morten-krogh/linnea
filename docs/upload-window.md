@@ -181,15 +181,58 @@ holds it.
 - **The region's fixed cost is not the grant.** Suppressing the grant bought
   0.29 ns/byte of the ~1.3 the region costs at 8 KiB framing. The rest is the
   migrate, the slide, and one `pwrite` per arrival where the buffer path
-  accumulates and writes a contiguous run. **Coalescing those writes is the next
-  thing to measure** and would move the crossover lower again.
+  accumulates and writes a contiguous run. That last one is now done, below.
+
+## The capture stage — DONE
+
+Writing each arrival straight through meant **one `pwrite` per QUIC packet**:
+32,934 of them for a 33,554,432-byte body, mean 1019 bytes, counted with
+`strace` rather than reasoned about. The syscall costs more than a copy of the
+same bytes, so contiguous runs are now gathered in a 64 KiB per-worker stage
+(`LINNEA_QUIC_CAP_STAGE`) and written when the run breaks, when the stage fills,
+or when the region closes.
+
+    frame      before   after
+     8 KiB       6.82    5.66      ns/byte, worker cpu, 32 MiB per point
+    64 KiB       6.31    5.20
+    371 KiB      6.45    5.06      Chrome's framing
+      4 MiB      6.21    4.96
+
+17-21% at every framing, and **with the gate change ahead of it, Chrome's
+framing went 7.92 -> 5.06 ns/byte: 126 -> 198 MB/s per core.**
+
+**One stage per worker is safe for a specific reason**, not by luck: a region is
+only ever filled from the arrival path, and *the walk is never fed while a
+region is open* — so the sink and the stage can never hold bytes for the same
+file at once. Two uploads in flight simply alternate, and each one's first
+arrival flushes the other's span.
+
+The flush points are the whole correctness surface, and there are three: the
+region's close (the one that matters — from there the walk can finish the
+request and hand the descriptor upstream without ever coming back), a run that
+does not continue the staged span, and `ra_release`. The last one writes rather
+than discards, deliberately: if the close ever stops flushing, that turns a
+silent truncation into a slow one.
+
+**It did not reach one write per body**, and the remainder says where the next
+one is. 8193 writes remain for 4096 frames — one per region, which is optimal,
+plus **one per frame from the SINK**: the walk consumes the ~1100 bytes that
+arrive alongside each DATA frame header before the gate is even evaluated, and
+those go out on their own. Staging them too would need a flush at the request
+handoff instead of at the region's close, which widens the surface to every
+request rather than every region, and is worth about 3%.
 
 ## Order of work
 
 1. ~~Measure the region/RAM crossover and lower the threshold accordingly.~~
    Done: `LINNEA_QUIC_RA_REGION_MIN` = 4096, plus the grant suppression above.
-2. Any further per-byte cost that survives — the `rep movsb` into `.buf` on the
-   buffer path, and the per-arrival `pwrite` on the file path.
+2. Any further per-byte cost that survives. ~~The per-arrival `pwrite` on the
+   file path~~ done, above. What is left: the `rep movsb` into `.buf` on the
+   buffer path, and the sink's write per DATA frame.
 3. Then auto-tuning and the two config keys, with the ceiling raised to match.
 
-Raising windows before (2) buys a stall the peer cannot report.
+Raising windows before (2) buys a stall the peer cannot report. **That argument
+is now weaker than it was** — the receive path went from ~100 MB/s per core to
+~198 at Chrome's framing, so a gigabit client no longer saturates a worker on
+receive alone, and step 3 has more room than the numbers at the top of this file
+suggest. Re-measure the ceiling before sizing anything against it.
