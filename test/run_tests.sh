@@ -78,11 +78,43 @@ P61671=$((PORTBASE + 671))
 P61701=$((PORTBASE + 701))
 P61702=$((PORTBASE + 702))
 P61703=$((PORTBASE + 703))
+P61704=$((PORTBASE + 704))   # the fast suite's short-interval websocket backend
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 pass=0
 fail=0
 rm -f "$LOG"
+
+# --- fast and extensive runs -------------------------------------------------
+# Measured 2026-08-16, timestamping every result line of a full run: 675 checks
+# and 834 seconds, of which THIRTEEN checks are 452 s. The other 433 checks
+# under a tenth of a second each come to 5.4 s TOTAL. The suite is not slow
+# because it is broad; it is slow because a handful of checks wait out a real
+# deadline (a 30 s ping and its 15 s grace), soak a path for a fixed span, or
+# sweep every size in a range.
+#
+# So the split is by COST, not by area: LINNEA_SUITE=fast (the default) skips
+# the two dozen most expensive checks and keeps the rest, which is ~96% of the
+# checks in under a third of the time. LINNEA_SUITE=full runs everything.
+#
+# WHAT IS GUARDED IS THE CHECK, NEVER THE FIXTURE. Every server still starts,
+# is used and is stopped in exactly the order it always was, because the time
+# is in the tests and not in the setup -- and because this script is linear and
+# stateful, so a skipped start_server would leave a later block reading a
+# $SRV_PORT belonging to a server that was never started. That failure does not
+# announce itself: the block would quietly test the previous fixture and pass.
+SUITE=${LINNEA_SUITE:-fast}
+case "$SUITE" in
+    fast|full) ;;
+    *) echo "FATAL: LINNEA_SUITE must be 'fast' or 'full', not '$SUITE'" >&2; exit 1 ;;
+esac
+skipped=0
+# Used as: if extensive; then <the slow thing>; check "..." $?; else skip "..."; fi
+extensive() { [ "$SUITE" = full ]; }
+skip() {
+    echo "SKIP: $1"
+    skipped=$((skipped + 1))
+}
 
 # run_test <name> <expected-exit> <stdout|stderr> <grep-pattern> <cmd...>
 run_test() {
@@ -778,8 +810,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # (RFC 9000 10.1), so a client that will forget us in a second must not hold
     # a pool slot for our 30; the paired control keeps that from being any
     # connection simply going idle
-    timeout 60 python3 test/quic/h3_idle_tp_test.py ${P61452} >/dev/null 2>&1
-    check "h3 (io_uring): the client's max_idle_timeout is honoured (and only it)" $?
+    if extensive; then
+        timeout 60 python3 test/quic/h3_idle_tp_test.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): the client's max_idle_timeout is honoured (and only it)" $?
+    else
+        skip "h3 (io_uring): the client's max_idle_timeout is honoured -- 16s, it waits out a real idle timeout"
+    fi
     # several workers each bind the QUIC port with SO_REUSEPORT; the kernel
     # steers by 4-tuple so a connection always reaches the worker holding it
     python3 test/quic/h3_workers_test.py ${P61452} 8 >/dev/null 2>&1
@@ -807,8 +843,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # bytes: DATA/HEADERS/PUSH_PROMISE, the reserved HTTP/2 types and a second
     # SETTINGS end the connection, GREASE and the control frames are skipped by
     # length, and a header split across STREAM frames still parses
-    timeout 180 python3 test/quic/h3_ctrl_frames_test.py ${P61452} >/dev/null 2>&1
-    check "h3 (io_uring): control-stream frames walked and validated" $?
+    if extensive; then
+        timeout 180 python3 test/quic/h3_ctrl_frames_test.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): control-stream frames walked and validated" $?
+    else
+        skip "h3 (io_uring): control-stream frames walked and validated -- 5s"
+    fi
 
     # request bodies: POST is a 405 now, but the body must still be reassembled
     # whole and the stream answered, with its flow-control credit settled
@@ -917,8 +957,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # a spoofed packet from a different source, carrying a valid connection id but
     # no valid AEAD tag, must NOT redirect the server's sends (RFC 9000 9.3): the
     # peer address is adopted only from an authenticated packet.
-    python3 test/quic/h3_migration_spoof_test.py ${P61452} >/dev/null 2>&1
-    check "h3 (io_uring): unauthenticated source does not redirect the connection" $?
+    if extensive; then
+        python3 test/quic/h3_migration_spoof_test.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): unauthenticated source does not redirect the connection" $?
+    else
+        skip "h3 (io_uring): unauthenticated source does not redirect -- 8s"
+    fi
 
     # and the replayed half: a captured 1-RTT datagram resent from another source
     # carries a VALID tag, so authenticity alone cannot gate the address change.
@@ -950,8 +994,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # The server must not name a protocol the client never offered (RFC 7301
     # 3.2): build_ee wrote "h3" into EncryptedExtensions without ever reading
     # the client's list, so a doq or hq-interop client was told it had h3.
-    python3 test/quic/h3_alpn_test.py ${P61452} >/dev/null 2>&1
-    check "h3 (io_uring): ALPN is checked, not assumed" $?
+    if extensive; then
+        python3 test/quic/h3_alpn_test.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): ALPN is checked, not assumed" $?
+    else
+        skip "h3 (io_uring): ALPN is checked, not assumed -- 12s"
+    fi
 
     # ...and a refusal must SAY SO (RFC 9001 4.8): the TLS alert becomes a QUIC
     # error of 0x0100+description in a CONNECTION_CLOSE. Every handshake-space
@@ -972,8 +1020,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # truncated last frame is a connection error (7.1), a stream that never
     # carried HEADERS is H3_REQUEST_INCOMPLETE so the client may retry (4.1),
     # and only a request that decodes and then breaks a rule is MESSAGE_ERROR.
-    python3 test/quic/h3_stream_codes_test.py ${P61452} >/dev/null 2>&1
-    check "h3 (io_uring): a failed request stream names its fault" $?
+    if extensive; then
+        python3 test/quic/h3_stream_codes_test.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): a failed request stream names its fault" $?
+    else
+        skip "h3 (io_uring): a failed request stream names its fault -- 6s"
+    fi
 
     # ...and the same preconditions over h3, so the answer does not depend on
     # which protocol carried the request (RFC 9110 13.1.1, 13.1.4, 13.2.2).
@@ -983,16 +1035,24 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # RFC 9114 6.2: a critical stream must not be closed BY ANY MEANS. Only a
     # FIN was noticed, so a peer could RESET_STREAM its control stream and the
     # connection carried on as though it still had one.
-    python3 test/quic/h3_critical_reset_test.py ${P61452} >/dev/null 2>&1
-    check "h3 (io_uring): resetting a critical stream is detected" $?
+    if extensive; then
+        python3 test/quic/h3_critical_reset_test.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): resetting a critical stream is detected" $?
+    else
+        skip "h3 (io_uring): resetting a critical stream is detected -- 8s"
+    fi
 
     # h3-8: the QPACK encoder stream must be read, not ignored. We advertise
     # capacity 0, so the only legal instruction is Set Dynamic Table Capacity
     # to 0; an insert or another capacity means the peer's table state and
     # ours have silently diverged — QPACK_ENCODER_STREAM_ERROR. Also: a FIN
     # on a LATER frame of a QPACK stream is a critical-stream closure too.
-    python3 test/quic/h3_qpack_enc_stream_test.py ${P61452} >/dev/null 2>&1
-    check "h3 (io_uring): QPACK encoder-stream instructions are policed" $?
+    if extensive; then
+        python3 test/quic/h3_qpack_enc_stream_test.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): QPACK encoder-stream instructions are policed" $?
+    else
+        skip "h3 (io_uring): QPACK encoder-stream instructions are policed -- 7s"
+    fi
 
     # h3-6: control-stream enforcement must survive reordering. A STREAM frame
     # delivered (and acked) ahead of the walked prefix used to be dropped, and
@@ -1070,8 +1130,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # a ClientHello too large for one Initial packet (as a browser's post-quantum
     # key share makes it) is reassembled across Initials by the client's original
     # DCID; a ClientHello with no x25519 share is refused without crashing
-    python3 test/quic/h3_bigch_test.py ${P61452} >/dev/null 2>&1
-    check "h3 (io_uring): multi-packet ClientHello reassembled; no-x25519 refused" $?
+    if extensive; then
+        python3 test/quic/h3_bigch_test.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): multi-packet ClientHello reassembled; no-x25519 refused" $?
+    else
+        skip "h3 (io_uring): multi-packet ClientHello reassembled -- 18s"
+    fi
 
     # ngtcp2/curl fragments the ClientHello into many small CRYPTO frames sent out
     # of offset order, several per packet; the reassembly must place each at its
@@ -1117,9 +1181,13 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
         P61456=$SRV_PORT
         fuzz_pid=$SRV_PID
         sleep 0.4
-        timeout 120 python3 test/quic/fuzz_quic_frames.py ${P61456} 500 "$fuzz_pid" \
-            >/dev/null 2>&1
-        check "quic transport frames: 500 malformed Initials leave it serving" $?
+        if extensive; then
+            timeout 120 python3 test/quic/fuzz_quic_frames.py ${P61456} 500 "$fuzz_pid" \
+                >/dev/null 2>&1
+            check "quic transport frames: 500 malformed Initials leave it serving" $?
+        else
+            skip "quic transport frames: 500 malformed Initials -- 11s, a fixed-size soak"
+        fi
         kill $fuzz_pid 2>/dev/null
         wait $fuzz_pid 2>/dev/null
     else
@@ -1278,8 +1346,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # Q136: frames illegal on a request stream (reserved h2 types, control/push
     # frames, DATA before HEADERS) are a connection error H3_FRAME_UNEXPECTED,
     # not silently ignored; GREASE/unknown stay ignored.
-    timeout 90 python3 test/quic/h3_frame_reject_test.py ${P61453} >/dev/null 2>&1
-    check "h3 (io_uring): illegal request-stream frames rejected (0x105)" $?
+    if extensive; then
+        timeout 90 python3 test/quic/h3_frame_reject_test.py ${P61453} >/dev/null 2>&1
+        check "h3 (io_uring): illegal request-stream frames rejected (0x105)" $?
+    else
+        skip "h3 (io_uring): illegal request-stream frames rejected -- 16s"
+    fi
     kill $tr_master 2>/dev/null
     wait $tr_master 2>/dev/null
     reap_workers $tr_workers
@@ -2164,8 +2236,12 @@ check_http "proxy forwards body" "hello body" "$resp"
 # removed before forwarding (RFC 9110 7.6.1). Only Connection and Expect were
 # dropped, so a client could mark any field hop-by-hop and have it delivered to
 # the backend anyway — the header-smuggling shape that rule exists to close.
-timeout 60 python3 test/tls/h1_proxy_hop_by_hop.py ${P61080} >/dev/null 2>&1
-check "proxy removes hop-by-hop fields, both directions" $?
+if extensive; then
+    timeout 60 python3 test/tls/h1_proxy_hop_by_hop.py ${P61080} >/dev/null 2>&1
+    check "proxy removes hop-by-hop fields, both directions" $?
+else
+    skip "proxy removes hop-by-hop fields, both directions -- 20s"
+fi
 
 # RFC 9110 7.6.3 MUST: a proxy names itself and the protocol it received on, in
 # each message it forwards. Without it a proxied request is indistinguishable
@@ -2190,8 +2266,12 @@ check "If-Match and If-Unmodified-Since are evaluated" $?
 # RFC 9112 9.1: Connection is a token LIST and `close` may sit anywhere in it.
 # Only a value that was entirely "close" counted, so `keep-alive, close` was
 # answered `Connection: keep-alive` and the socket held to the idle timeout.
-timeout 60 python3 test/tls/connection_close_token.py ${P61080} >/dev/null 2>&1
-check "Connection: close is honoured anywhere in the list" $?
+if extensive; then
+    timeout 60 python3 test/tls/connection_close_token.py ${P61080} >/dev/null 2>&1
+    check "Connection: close is honoured anywhere in the list" $?
+else
+    skip "Connection: close is honoured anywhere in the list -- 8s"
+fi
 
 # RFC 9110 6.6.1: Date on everything outside 1xx/5xx. The canned blobs are
 # assembled ahead of time, so they shipped without one while every dynamically
@@ -2212,8 +2292,12 @@ check "Expect: 100-continue is answered" $?
 # refused: curl -T -, fetch() with a ReadableStream, most libraries handed a
 # stream. The arrival-pattern cases are the ones that matter — a body comes in
 # as many reads as the network likes.
-timeout 120 python3 test/tls/h1_chunked_request.py ${P61080} >/dev/null 2>&1
-check "h1 decodes chunked request bodies" $?
+if extensive; then
+    timeout 120 python3 test/tls/h1_chunked_request.py ${P61080} >/dev/null 2>&1
+    check "h1 decodes chunked request bodies" $?
+else
+    skip "h1 decodes chunked request bodies -- 20s, a sweep of arrival patterns"
+fi
 
 # a HEAD response is head-only even though the backend sends Content-Length:
 # waiting for that body would hang until the idle timeout
@@ -2533,9 +2617,13 @@ done
 # The bound has ~24 bytes of margin over everything the rewrite adds (Via, the
 # Connection line, a Content-Length when a chunked one was dropped); this walks
 # a head across the boundary in both framings and expects only 200 or 431.
-out=$(python3 test/h1_upbuf_test.py ${P61080} 2>&1 | tail -1)
-[ "$out" = "OK" ]
-check "a proxied head at the up_buf boundary is served or refused ($out)" $?
+if extensive; then
+    out=$(python3 test/h1_upbuf_test.py ${P61080} 2>&1 | tail -1)
+    [ "$out" = "OK" ]
+    check "a proxied head at the up_buf boundary is served or refused ($out)" $?
+else
+    skip "a proxied head at the up_buf boundary -- 44s, it walks every size across the bound"
+fi
 
 # The same, counted: two captures on one connection. The bodies must DIFFER —
 # with identical ones a second upload served out of the first one's file looks
@@ -2601,9 +2689,36 @@ check_http "unrequested 101 becomes 502" "502 Bad Gateway" "$resp"
 # silence. Both halves are checked, and each is the other's control: a server
 # that never reaped, and one that dropped everyone, each pass exactly one of
 # them. ~50s, which is the price of a real 30s ping and its 15s grace.
-hb=$(timeout 120 python3 test/ws_heartbeat_test.py ${P61701} 2>&1)
-[ "$hb" = "OK" ]
-check "ws: clients that answer the ping live, silent ones are dropped ($hb)" $?
+if extensive; then
+    hb=$(timeout 120 python3 test/ws_heartbeat_test.py ${P61701} 30 15 2>&1)
+    [ "$hb" = "OK" ]
+    check "ws: clients that answer the ping live, silent ones are dropped ($hb)" $?
+else
+    # 105 s at the shipped intervals, and every second of it is waiting -- the
+    # most expensive check in the file by a factor of two. So the fast suite
+    # runs the SAME test against the SAME source built at 3 s / 1.5 s, on a
+    # backend of its own so the other ws checks keep the shipped one (a 1.5 s
+    # pong deadline would drop the tunnel clients that never answer a ping).
+    # It proves what the check is for -- an answering client lives, a silent
+    # one is dropped, and dropped inside its window -- and stops proving the
+    # interval, which is why the full run above still pays the 105 s.
+    make -s bin/linnea-ws-fast >/dev/null 2>&1
+    if [ -x bin/linnea-ws-fast ]; then
+        ./bin/linnea-ws-fast ${P61704} >/dev/null 2>&1 &
+        wsfast_pid=$!
+        for _ in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/${P61704}) >/dev/null 2>&1 && break
+            sleep 0.1
+        done
+        hb=$(timeout 60 python3 test/ws_heartbeat_test.py ${P61704} 3 1.5 2>&1)
+        [ "$hb" = "OK" ]
+        check "ws: clients that answer the ping live, silent ones are dropped, at 3s/1.5s ($hb)" $?
+        kill $wsfast_pid 2>/dev/null
+        wait $wsfast_pid 2>/dev/null
+    else
+        check "ws heartbeat (skipped: bin/linnea-ws-fast would not build)" 1
+    fi
+fi
 
 out=$(python3 test/ws_drain_test.py)
 [ "$out" = "OK" ]
@@ -2831,10 +2946,20 @@ for _ in $(seq 1 60); do
     (echo > /dev/tcp/127.0.0.1/${P61703}) >/dev/null 2>&1 && break
     sleep 0.1
 done
-api_out=$(python3 test/api/api_backend_test.py ${P61703} 2>&1)
-[ $? -eq 0 ]
-check "the /api backend" $?
-printf '%s\n' "$api_out" | grep -q "^FAIL" && printf '%s\n' "$api_out" | sed -n 's/^FAIL /  api: /p'
+if extensive; then
+    api_out=$(python3 test/api/api_backend_test.py ${P61703} 2>&1)
+    [ $? -eq 0 ]
+    check "the /api backend" $?
+    # Inside the guard, because it READS what the guard assigns. Left outside it
+    # this line met `set -u` on a fast run, and the shell it died in was the one
+    # holding the rest of the block: five later checks failed against a server
+    # that was no longer there. A skipped check is a variable that was never
+    # set, which is the same hazard as a skipped fixture wearing different
+    # clothes.
+    printf '%s\n' "$api_out" | grep -q "^FAIL" && printf '%s\n' "$api_out" | sed -n 's/^FAIL /  api: /p'
+else
+    skip "the /api backend -- 10s"
+fi
 kill $api_pid 2>/dev/null
 
 ws_direct_out=$(python3 test/api/ws_backend_test.py ${P61701} 2>&1)
@@ -2929,8 +3054,12 @@ rm -f "$LOG" $WWW/big.txt $WWW/upload.bin $WWW/upload2.bin $WWW/h2range.bin $WWW
 start_server $CFG/limits.json
 P61470=$SRV_PORT
 limits_pid=$SRV_PID
-python3 test/limits_test.py ${P61470} >/dev/null 2>&1
-check "connection limits: slow head cut off, per-address cap holds" $?
+if extensive; then
+    python3 test/limits_test.py ${P61470} >/dev/null 2>&1
+    check "connection limits: slow head cut off, per-address cap holds" $?
+else
+    skip "connection limits: slow head cut off -- 13s, it trickles a head past a deadline"
+fi
 kill $limits_pid 2>/dev/null
 wait $limits_pid 2>/dev/null
 
@@ -2941,9 +3070,13 @@ if python3 -c 'import ssl' 2>/dev/null; then
     start_server $CFG/tls-slowhead.json
     P61455=$SRV_PORT
     slowhs_pid=$SRV_PID
-    timeout 40 python3 test/tls/tls_slow_handshake.py test/tls/server.crt ${P61455} 3 \
-        >/dev/null 2>&1
-    check "tls handshake slowloris cut at the head deadline" $?
+    if extensive; then
+        timeout 40 python3 test/tls/tls_slow_handshake.py test/tls/server.crt ${P61455} 3 \
+            >/dev/null 2>&1
+        check "tls handshake slowloris cut at the head deadline" $?
+    else
+        skip "tls handshake slowloris cut at the head deadline -- 5s, it trickles a handshake"
+    fi
     kill $slowhs_pid 2>/dev/null
     wait $slowhs_pid 2>/dev/null
 fi
@@ -3569,9 +3702,13 @@ PYEOF
         # a FIN on a frame carrying no bytes, and contexts left claimed by
         # clients that walked away. Both are consequences of consuming a stream
         # as it arrives, and both were silent — the client simply waited.
-        out=$(timeout 150 python3 test/quic/h3_stream_end_test.py ${P61462} 2>&1)
-        [ "$out" = "OK" ]
-        check "h3 request streams end and are reclaimed ($out)" $?
+        if extensive; then
+            out=$(timeout 150 python3 test/quic/h3_stream_end_test.py ${P61462} 2>&1)
+            [ "$out" = "OK" ]
+            check "h3 request streams end and are reclaimed ($out)" $?
+        else
+            skip "h3 request streams end and are reclaimed -- 10s, it waits for a context reaper"
+        fi
 
         # An upload abandoned midway leaves a capture file behind. Closing that
         # descriptor is the only thing that returns the space, and PrivateTmp
@@ -3583,18 +3720,22 @@ PYEOF
         # before the fix all eight were still open minutes later, and it is the
         # count settling at the baseline that says the descriptor and its tmpfs
         # pages went back.
-        h3p_worker=$(pgrep -P "$h3p_pid" | head -1)
-        fd_deleted() { ls -l /proc/"$1"/fd 2>/dev/null | grep -c '(deleted)'; }
-        before=$(fd_deleted "$h3p_worker")
-        timeout 120 python3 test/quic/h3_abandon_upload.py ${P61462} 8 >/dev/null 2>&1
-        after=$(fd_deleted "$h3p_worker")
-        for _ in $(seq 1 75); do          # the reap runs ~30 s in; leave room
-            [ "$after" -le "$before" ] && break
-            sleep 1
+        if extensive; then
+            h3p_worker=$(pgrep -P "$h3p_pid" | head -1)
+            fd_deleted() { ls -l /proc/"$1"/fd 2>/dev/null | grep -c '(deleted)'; }
+            before=$(fd_deleted "$h3p_worker")
+            timeout 120 python3 test/quic/h3_abandon_upload.py ${P61462} 8 >/dev/null 2>&1
             after=$(fd_deleted "$h3p_worker")
-        done
-        [ "$after" -le "$before" ]
-        check "h3 abandoned uploads release their capture file (${before} -> ${after} after 8)" $?
+            for _ in $(seq 1 75); do      # the reap runs ~30 s in; leave room
+                [ "$after" -le "$before" ] && break
+                sleep 1
+                after=$(fd_deleted "$h3p_worker")
+            done
+            [ "$after" -le "$before" ]
+            check "h3 abandoned uploads release their capture file (${before} -> ${after} after 8)" $?
+        else
+            skip "h3 abandoned uploads release their capture file -- 32s, it waits out the ~30s reap"
+        fi
     else
         check "h3 proxying (skipped: aioquic/pylsqpack unavailable)" 0
         check "h3 request streams end and are reclaimed (skipped)" 0
@@ -4463,8 +4604,12 @@ PY
 
     # M18: multiplexing — concurrent streams with interleaved DATA, the
     # rapid-reset (CVE-2023-44487) defense, and stream-pool exhaustion.
-    timeout 30 python3 test/tls/h2_multiplex.py $CA ${P61446} >/dev/null 2>&1
-    check "http2 multiplexing (concurrent streams, rapid-reset, pool cap)" $?
+    if extensive; then
+        timeout 30 python3 test/tls/h2_multiplex.py $CA ${P61446} >/dev/null 2>&1
+        check "http2 multiplexing (concurrent streams, rapid-reset, pool cap)" $?
+    else
+        skip "http2 multiplexing (concurrent streams, rapid-reset, pool cap) -- 25s"
+    fi
 
     # A whole docroot over ONE connection, every body compared to the file:
     # the ordinary case a browser performs and the one no other h2 test did.
@@ -4490,8 +4635,12 @@ PY
     # early, so the client waits out its own timeout on more cases. The run is
     # slower by design — it measures ~80s — and a crash still shows as a
     # non-zero exit rather than as the timeout.
-    timeout 150 python3 test/tls/fuzz_h2.py $CA ${P61446} 120 >/dev/null 2>&1
-    check "http2 fuzz (malformed frames + HPACK survive, server serves)" $?
+    if extensive; then
+        timeout 150 python3 test/tls/fuzz_h2.py $CA ${P61446} 120 >/dev/null 2>&1
+        check "http2 fuzz (malformed frames + HPACK survive, server serves)" $?
+    else
+        skip "http2 fuzz (malformed frames + HPACK survive) -- 78s, slow BY DESIGN per its own comment"
+    fi
 
     # M20: strict stream-id validation + honouring SETTINGS_INITIAL_WINDOW_SIZE.
     # A connection error must carry the code RFC 9113 names for it. Every fault
@@ -4600,14 +4749,18 @@ PYEOF
     # RST_STREAM must crash no worker: resetting a proxied stream whose upstream
     # is live and in flight (h2p_kill closing it with a syscall), and RST on
     # stream 0 (a connection error, not a lookup that re-frees a reaped slot).
-    prst_before=$(workers_of $tls_server_pid)
-    timeout 60 python3 test/tls/h2_proxy_rst.py $CA ${P61443} >/dev/null 2>&1
-    sleep 0.5
-    resp=$(curl -si --http2 --max-time 5 --cacert $CA $U/hello.txt)
-    prst_after=$(workers_of $tls_server_pid)
-    [ -n "$prst_before" ] && [ "$prst_before" = "$prst_after" ] \
-        && printf '%s' "$resp" | grep -qF "hello from linnea"
-    check "http2 proxied-stream RST + RST-stream-0 crash no worker" $?
+    if extensive; then
+        prst_before=$(workers_of $tls_server_pid)
+        timeout 60 python3 test/tls/h2_proxy_rst.py $CA ${P61443} >/dev/null 2>&1
+        sleep 0.5
+        resp=$(curl -si --http2 --max-time 5 --cacert $CA $U/hello.txt)
+        prst_after=$(workers_of $tls_server_pid)
+        [ -n "$prst_before" ] && [ "$prst_before" = "$prst_after" ] \
+            && printf '%s' "$resp" | grep -qF "hello from linnea"
+        check "http2 proxied-stream RST + RST-stream-0 crash no worker" $?
+    else
+        skip "http2 proxied-stream RST + RST-stream-0 crash no worker -- 25s"
+    fi
 
     # Q124: the authority rules — :authority is h2's Host, and a duplicate,
     # a Host contradicting it, a misplaced pseudo-header or a missing
@@ -4635,8 +4788,12 @@ PYEOF
     # written straight at the out cursor and charged against nothing, so a peer
     # advertising a zero window was sent one anyway, and the server's idea of the
     # connection window drifted above the peer's by every error body it had sent.
-    timeout 120 python3 test/tls/h2_error_flow_control.py $CA ${P61443} >/dev/null 2>&1
-    check "http2 error bodies respect the flow-control window" $?
+    if extensive; then
+        timeout 120 python3 test/tls/h2_error_flow_control.py $CA ${P61443} >/dev/null 2>&1
+        check "http2 error bodies respect the flow-control window" $?
+    else
+        skip "http2 error bodies respect the flow-control window -- 18s"
+    fi
 
     # Request-field rules the shared HPACK/QPACK decoder enforces: :scheme must
     # be present, :path must not be empty, connection-specific fields are
@@ -4681,8 +4838,12 @@ PYEOF
     # traffic rather than dead state: this drives eviction from "drop one" to
     # "drop everything", the entry-slot ceiling, size updates down to 0 and back,
     # and reads back a marker by dynamic index after every phase.
-    timeout 400 python3 test/tls/hpack_stress.py $CA ${P61443} >/dev/null 2>&1
-    check "http2 HPACK dynamic table under sustained use" $?
+    if extensive; then
+        timeout 400 python3 test/tls/hpack_stress.py $CA ${P61443} >/dev/null 2>&1
+        check "http2 HPACK dynamic table under sustained use" $?
+    else
+        skip "http2 HPACK dynamic table under sustained use -- 34s, a soak"
+    fi
 
     # Q130: h2/h3 read a SEPARATE mime table from h1's, so the types are
     # checked here too — a type added to one table only is the easy mistake.
@@ -5035,5 +5196,13 @@ wait $emf_pid 2>/dev/null
 rm -f $emf $RUNDIR/emfile.err "$LOG"
 
 echo
-echo "$pass passed, $fail failed"
+if [ "$SUITE" = full ]; then
+    echo "$pass passed, $fail failed (full run)"
+else
+    # Said plainly and every time. A green number is the thing people quote,
+    # and "670 passed, 0 failed" reads exactly like a complete run unless the
+    # line itself says otherwise.
+    echo "$pass passed, $fail failed, $skipped SKIPPED (fast run)"
+    echo "This is NOT a full run. Before deploying: LINNEA_SUITE=full $0"
+fi
 [ "$fail" -eq 0 ]

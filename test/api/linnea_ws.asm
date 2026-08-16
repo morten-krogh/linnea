@@ -63,8 +63,17 @@ OUT_BUF         equ 1024          ; queued frames not yet written
 ; A browser answers a Ping inside the browser, below JavaScript, so this works
 ; in a backgrounded tab where a JS timer is throttled or frozen. That is the
 ; reason this belongs here and not on the page.
+; Overridable at build time (-D) so the suite can prove the MECHANISM without
+; waiting 45 seconds for it. bin/linnea-ws-fast is this file at 3000/1500, and
+; the fast suite's heartbeat check runs against that; the full suite runs the
+; shipped intervals below, because a short-interval build proves that a
+; silent client is dropped and says nothing about WHEN.
+%ifndef PING_EVERY_MS
 PING_EVERY_MS   equ 30000
+%endif
+%ifndef PONG_WITHIN_MS
 PONG_WITHIN_MS  equ 15000
+%endif
 
 ST_HANDSHAKE    equ 0
 ST_OPEN         equ 1

@@ -262,6 +262,26 @@ $(WS_BIN): $(WS_OBJS)
 
 ws: $(WS_BIN)
 
+# The same source at a 3 s ping and a 1.5 s grace, for the fast suite. The
+# heartbeat check is the most expensive in the file at 105 s, and all of it is
+# waiting out the SHIPPED intervals; against this it proves the same mechanism
+# -- a client that answers lives, one that goes silent is dropped -- in ~13 s.
+# What it stops proving is the interval itself, which is why the full suite
+# keeps running against $(WS_BIN). Its own object file: -D changes the output
+# but not the source's timestamp, so sharing linnea_ws.o would hand whichever
+# build ran last to both.
+WS_FAST_BIN     = bin/linnea-ws-fast
+WS_FAST_OBJS    = test/api/linnea_ws_fast.o src/lib/linnea_sha1.o \
+                  src/lib/linnea_base64.o src/lib/linnea_print.o src/lib/linnea_string.o
+
+test/api/linnea_ws_fast.o: test/api/linnea_ws.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -DPING_EVERY_MS=3000 -DPONG_WITHIN_MS=1500 -o $@ $<
+
+$(WS_FAST_BIN): $(WS_FAST_OBJS)
+	$(LD) -o $@ $^
+
+wsfast: $(WS_FAST_BIN)
+
 REPLAYTEST_BIN  = bin/linnea-replaytest
 REPLAYTEST_OBJS = test/quic/linnea_replaytest.o src/lib/linnea_quic_crypto.o \
                   src/lib/linnea_quic.o \
@@ -414,4 +434,4 @@ install:
 	install -m 0755 $(API_BIN) /usr/local/bin/linnea-api
 	install -m 0755 $(WS_BIN) /usr/local/bin/linnea-ws
 
-.PHONY: all clean test selftest tlstest probe api ws install
+.PHONY: all clean test selftest tlstest probe api ws wsfast install
