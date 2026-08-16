@@ -227,10 +227,15 @@ LINNEA_QUIC_RA_SMALL    equ 16384    ; inline per context: what a request with n
 ; 512 KiB step per 19.5 ms cycle, and 512 KiB at 26.9 MB/s IS 19.5 ms of data:
 ; the achieved rate was exactly one grant step per round trip. The fastest
 ; browser on the box was window-bound for essentially every byte.
+%ifndef LINNEA_QUIC_RA_BIG
 LINNEA_QUIC_RA_BIG      equ 4194304  ; 4 MiB: a 2 MiB grant step, 78 ms of
                                      ; runway at 26.9 MB/s. The pool below is
                                      ; 4x with it -- 144 MB per worker of .bss,
                                      ; faulted on touch, on a 15 GB box.
+%endif                               ; -D-able: the grant loop is measured by
+                                     ; shrinking this until a slow test client
+                                     ; can saturate it, which a real one does
+                                     ; only at 45 MB/s.
 LINNEA_QUIC_RA_POOL     equ 32       ; big buffers per worker. Concurrent UPLOADS,
                                      ; not connections -- a stream that cannot get
                                      ; one falls back to its inline buffer and is
@@ -329,6 +334,14 @@ LINNEA_QUIC_RA_WINDOW   equ 0x1000000  ; 16 MiB: most we invite in flight on one
 ; be one page-cache-friendly write; past this the return diminishes, since the
 ; copy that replaces the syscall costs the same per byte at any size.
 LINNEA_QUIC_CAP_STAGE   equ 65536
+; How much of the buffer must accumulate before a MAX_STREAM_DATA goes out:
+; 1 = half, 2 = a quarter, 3 = an eighth. Overridable at build time so the
+; grant loop can be measured rather than argued about -- the peer's credit in
+; hand after a grant is exactly this much, so it decides both how often we
+; spend a packet and how close to dry the peer runs.
+%ifndef LINNEA_QUIC_GRANT_SHIFT
+LINNEA_QUIC_GRANT_SHIFT equ 1
+%endif
 LINNEA_QUIC_RA_RANGES   equ 32
 ; How long a request stream may go without a single frame before its context is
 ; considered abandoned and may be taken from it (see linnea_quic_ra.act_ms). An

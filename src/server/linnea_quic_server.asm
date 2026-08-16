@@ -2964,7 +2964,9 @@ linnea_quic_server_datagram:
     sub rcx, [rdi + linnea_quic_ra.fc_adv]
     push rdx
     mov rdx, [rdi + linnea_quic_ra.cap]
-    shr rdx, 1                                 ; half the buffer in hand
+    shr rdx, LINNEA_QUIC_GRANT_SHIFT           ; the share of the buffer that
+                                               ; must accumulate before a grant
+                                               ; is worth its packet
     cmp rcx, rdx
     pop rdx
     jae .ra_grant
