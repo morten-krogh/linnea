@@ -93,6 +93,7 @@ linnea_connection_alloc:
     mov qword [rdx + linnea_connection.chunk_raw], 0
     mov qword [rdx + linnea_connection.capture_chunked], 0
     mov qword [rdx + linnea_connection.capture_done], 0
+    mov qword [rdx + linnea_connection.pend_len], 0
     mov qword [rdx + linnea_connection.answer_linger], 0
     mov qword [rdx + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
     mov qword [rdx + linnea_connection.h3_owner], 0   ; a client-facing slot

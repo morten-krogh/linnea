@@ -2641,7 +2641,7 @@ check "backend record control (the completed upload IS in it)" $?
 # --- chunked uploads too large to buffer: captured and decoded as they
 # arrive, then forwarded as an ordinary counted request. Before this they were
 # a 413 outright, since only the counted path could stream. ---
-for m in big head bad abort cap flood twice; do
+for m in big head bad abort cap flood twice pipeline; do
     out=$(python3 test/upload_chunked.py $m)
     [ "$out" = "OK" ]
     case $m in
@@ -2652,6 +2652,7 @@ for m in big head bad abort cap flood twice; do
       cap)   check "chunked upload past max_body is 413, not a reset ($out)" $? ;;
       flood) check "endless chunked trailers hit max_body too ($out)" $? ;;
       twice) check "two chunked captures on one kept-alive connection ($out)" $? ;;
+      pipeline) check "a GET pipelined behind a chunked upload is still served ($out)" $? ;;
     esac
 done
 
@@ -2682,6 +2683,17 @@ curl -s --max-time 30 -o $RUNDIR/up1_echo.bin --data-binary @$WWW/up1.bin http:/
 [ "$(md5sum < $RUNDIR/up2_echo.bin | cut -d' ' -f1)" = "$(md5sum < $WWW/up2.bin | cut -d' ' -f1)" ]
 check "two counted captures on one kept-alive connection" $?
 rm -f $RUNDIR/up1_echo.bin $RUNDIR/up2_echo.bin $WWW/up1.bin $WWW/up2.bin
+
+# A request pipelined in the SAME recv as a streamed body's final bytes must
+# still be answered. It used to be dropped: the capture read the whole recv into
+# out_buf and kept only the body, discarding the request behind it, so the
+# client hung. Covers counted and chunked framing with the seam forced to the
+# body's end, one byte into the next request, and mid-terminal-chunk. The
+# existing "twice" checks miss it because they read the first response before
+# sending the second request, so the two never share a recv.
+out=$(python3 test/h1_stream_pipeline.py ${P61080} 2>&1 | tail -1)
+[ "$out" = "OK" ]
+check "a request pipelined behind a streamed body is served, not dropped ($out)" $?
 
 # max_body is what stands between one client and the filesystem, so it is
 # refused on the declared length — before a byte of it is written anywhere.

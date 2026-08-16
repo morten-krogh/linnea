@@ -133,7 +133,15 @@ linnea_spill_write:
     ret
 
 ; linnea_spill_chunked(rdi=connection*, rsi=buf, rdx=len)
-;   -> rax = 0 need more, 1 body complete, -1 malformed framing, -2 past max_body
+;   -> rax = 0 need more, 1 body complete, -1 malformed framing, -2 past max_body,
+;      -3 body complete but the request pipelined behind it will not fit the stash
+;
+; On completion any bytes left in buf after the terminal chunk are the NEXT
+; request, pipelined in the same recv. They are copied to in_buf[head_len] (free
+; during a chunked capture: head_len is the pure head) and their length recorded
+; in .pend_len, so keep-alive serves them instead of dropping them. -3 is that
+; suffix being too large for the room after the head — a pathological >8 KiB head
+; pipelined behind a streamed body; the caller closes rather than lose it silently.
 ;
 ; Decodes chunked framing as it arrives and captures only the decoded bytes, so
 ; what reaches the backend is an ordinary counted request — the same shape a
@@ -188,7 +196,9 @@ linnea_spill_chunked:
     je .s_trail_lf
     cmp r14, LINNEA_CHUNK_END_LF
     je .s_end_lf
-    jmp .complete                  ; DONE: trailing bytes are not ours to read
+    jmp .complete_nostash          ; DONE: a re-entry after completion. The cursor
+                                   ; has not advanced, so there is no fresh suffix
+                                   ; to stash — just report complete again.
 
 .s_size:
     movzx eax, byte [r12]
@@ -318,7 +328,30 @@ linnea_spill_chunked:
     inc r12
     mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_DONE
 .complete:
+    ; The body is whole. Whatever remains in this buffer after the cursor (r12)
+    ; is the next request, pipelined behind the body in the same recv. Park it at
+    ; in_buf[head_len] so keep-alive picks it up; without this it was overwritten
+    ; and the pipelined request silently went unanswered.
+    mov rcx, r13
+    sub rcx, r12                   ; unconsumed suffix length
+    jz .complete_nostash           ; nothing pipelined behind the body
+    mov rdx, [rbx + linnea_connection.head_len]
+    lea rax, [rdx + rcx]
+    cmp rax, LINNEA_CONN_IN_BUF
+    ja .suffix_too_big             ; no room after the head: caller closes cleanly
+    lea rdi, [rbx + linnea_connection.in_buf]
+    add rdi, rdx                   ; dst = in_buf + head_len
+    mov rsi, r12                   ; src = the unconsumed tail. For the in-buffer
+                                   ; first pass src is in_buf+head_len+n (dst<src,
+                                   ; a forward copy is safe); for an out_buf recv
+                                   ; the two are disjoint. rep movsb serves both.
+    mov [rbx + linnea_connection.pend_len], rcx
+    rep movsb
+.complete_nostash:
     mov eax, 1
+    jmp .ret
+.suffix_too_big:
+    mov eax, -3
     jmp .ret
 .need_more:
     xor eax, eax

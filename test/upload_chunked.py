@@ -206,8 +206,66 @@ def mode_twice():
     return "OK"
 
 
+def read_framed(s, buf):
+    """Read exactly one response and return (head, body, leftover). Unlike
+    read_response above, the bytes past this response are carried out in
+    `leftover` and fed back on the next call -- REQUIRED when two responses are
+    pipelined, because the recv that finishes the first body routinely also
+    carries the head of the second, and dropping it desyncs the reader (it made
+    the first body read 79 bytes long -- the second response's own head)."""
+    while b"\r\n\r\n" not in buf:
+        d = s.recv(65536)
+        if not d:
+            return None, b"", buf
+        buf += d
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    clen = 0
+    for h in head.split(b"\r\n")[1:]:
+        if h.lower().startswith(b"content-length:"):
+            clen = int(h.split(b":")[1])
+    while len(rest) < clen:
+        d = s.recv(65536)
+        if not d:
+            break
+        rest += d
+    return head, rest[:clen], rest[clen:]
+
+
+def mode_pipeline():
+    # A GET pipelined behind a large chunked upload, both written in ONE send so
+    # the GET rides the same recv as the terminal chunk. Unlike mode_twice, the
+    # second request is NOT held back until the first response arrives -- which
+    # is exactly the case that used to drop it. Run with and without trailers,
+    # since the trailer bytes sit between the body's end and the pipelined GET.
+    for trailers in (b"", b"X-A: 1\r\nX-B: 2\r\nX-C: 3\r\n"):
+        rng = random.Random(7)
+        body = body_of(220000, 7)
+        wire = (b"POST /api/echo HTTP/1.1\r\nHost: one.test\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+                + frame(body, rng) + b"0\r\n" + trailers + b"\r\n"
+                + b"GET /api/echo HTTP/1.1\r\nHost: one.test\r\n"
+                  b"Connection: keep-alive\r\n\r\n")
+        s = socket.create_connection(("127.0.0.1", PORT), timeout=20)
+        s.settimeout(20)
+        s.sendall(wire)                               # one write: shared recv
+        buf = b""
+        head, b1, buf = read_framed(s, buf)
+        if head is None or b"200 OK" not in head:
+            return f"trailers={len(trailers)}: upload not 200: {head!r}"
+        if hashlib.md5(b1).hexdigest() != hashlib.md5(body).hexdigest():
+            return f"trailers={len(trailers)}: echo differs, got {len(b1)} bytes"
+        head2, _, buf = read_framed(s, buf)           # leftover carried over
+        s.close()
+        if head2 is None:
+            return f"trailers={len(trailers)}: pipelined GET dropped"
+        if b"200 OK" not in head2:
+            return f"trailers={len(trailers)}: pipelined GET not 200: {head2!r}"
+    return "OK"
+
+
 MODES = {"big": mode_big, "twice": mode_twice, "head": mode_head, "bad": mode_bad,
-         "abort": mode_abort, "cap": mode_cap, "flood": mode_flood}
+         "abort": mode_abort, "cap": mode_cap, "flood": mode_flood,
+         "pipeline": mode_pipeline}
 
 try:
     print(MODES[sys.argv[1]]())

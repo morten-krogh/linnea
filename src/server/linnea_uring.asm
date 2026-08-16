@@ -187,6 +187,8 @@ reason_slow_body:   db "request body too slow"
 reason_slow_body_len equ $ - reason_slow_body
 reason_spill_err:   db "cannot capture request body"
 reason_spill_err_len equ $ - reason_spill_err
+reason_pipeline_big: db "pipelined request too large to buffer"
+reason_pipeline_big_len equ $ - reason_pipeline_big
 reason_per_ip:      db "per-address connection limit"
 reason_per_ip_len   equ $ - reason_per_ip
 reason_timeout:     db "idle timeout"
@@ -1319,7 +1321,17 @@ linnea_uring_run:
     jz .capture_more
     cmp eax, -2
     je .capture_too_large
+    cmp eax, -3
+    je .capture_pipeline_big
     jmp .capture_malformed
+.capture_pipeline_big:
+    ; The body decoded cleanly, but the request pipelined behind it is larger
+    ; than the room left after the head, so it cannot be stashed. Dropping it
+    ; would desync the stream silently; close instead, and the client re-sends
+    ; it on a fresh connection. Only reachable with a pathologically large head.
+    lea r14, [reason_pipeline_big]
+    mov r15d, reason_pipeline_big_len
+    jmp .conn_close
 .capture_complete:
     ; The body is whole. Parse the same head again: this time it sees a
     ; complete counted body and rewrites the request head with the length the
@@ -1367,6 +1379,22 @@ linnea_uring_run:
     mov rdi, r12
     lea rsi, [r12 + linnea_connection.out_buf]
     mov edx, LINNEA_CONN_OUT_BUF
+    ; A COUNTED body's length is known, so read at most what is still owed:
+    ; without this cap a client that pipelines its next request behind the
+    ; body's final bytes lands both in one recv, and the suffix (out_buf past
+    ; req_body_rem) is dropped — the pipelined request goes unanswered. Capped,
+    ; the tail read stops at the body's end and the suffix stays in the kernel,
+    ; where keep-alive's fresh recv into in_buf reads it as the next request.
+    ; req_body_rem is always > 0 here (a completed body goes to .proxy_connect_now,
+    ; not here), so the clamp never asks for a zero-length read. Chunked has no
+    ; declared length to cap against and preserves its suffix in the decoder.
+    cmp qword [r12 + linnea_connection.capture_chunked], 0
+    jne .capture_more_arm
+    mov rax, [r12 + linnea_connection.req_body_rem]
+    cmp rax, rdx
+    jae .capture_more_arm
+    mov edx, eax
+.capture_more_arm:
     call linnea_uring_arm_recv_buf
     call linnea_uring_submit_now
     jmp .wait
@@ -1431,8 +1459,13 @@ linnea_uring_run:
     mov eax, r15d
     cmp rax, [r12 + linnea_connection.req_body_rem]
     jbe .req_body_have
-    mov rax, [r12 + linnea_connection.req_body_rem]   ; ignore anything past
-.req_body_have:                                       ; the declared length
+    ; Defensive now that .capture_more caps the recv at req_body_rem: a recv can
+    ; no longer return more than the body owes, so this branch is unreachable.
+    ; Kept so the write below can never run past the declared length even if
+    ; that invariant is ever weakened — but the suffix it once dropped is now
+    ; left in the kernel by the cap, not silently discarded here.
+    mov rax, [r12 + linnea_connection.req_body_rem]
+.req_body_have:
     sub [r12 + linnea_connection.req_body_rem], rax
     mov rdi, r12
     lea rsi, [r12 + linnea_connection.out_buf]    ; the chunk landed here
@@ -1658,6 +1691,19 @@ linnea_uring_run:
 .keep_alive_continue:
     mov rdi, r12               ; whatever this request captured is finished
     call linnea_spill_reset    ; with; the next one starts from nothing
+    ; A streamed body's capture may have parked the next request at
+    ; in_buf[head_len] (it arrived in the same recv as the body's tail, so it
+    ; could not stay in the kernel the way a counted body's suffix does). Make
+    ; in_len span it, so the slide below carries it down like any pipelined
+    ; bytes. spill_reset does not touch pend_len, so this reads it intact.
+    mov rcx, [r12 + linnea_connection.pend_len]
+    test rcx, rcx
+    jz .ka_no_pend
+    mov rax, [r12 + linnea_connection.head_len]
+    add rax, rcx
+    mov [r12 + linnea_connection.in_len], rax
+    mov qword [r12 + linnea_connection.pend_len], 0
+.ka_no_pend:
     ; keep-alive: drop the consumed head, keep any pipelined bytes. The
     ; subtraction is guarded: an in_len below head_len would wrap into a
     ; gigabyte-scale rep movsb that walks off the end of the pool, and a

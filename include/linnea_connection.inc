@@ -135,6 +135,14 @@ struc linnea_connection
     .capture_done:  resq 1         ; 1 = the captured body is complete, and the
                                    ; parser's second pass serves it from the
                                    ; mapping rather than from in_buf
+    .pend_len:      resq 1         ; pipelined suffix bytes stashed at
+                                   ; in_buf[head_len] because the NEXT request
+                                   ; arrived in the same recv as a streamed
+                                   ; body's tail. keep-alive folds them back
+                                   ; into in_len; 0 = nothing pending. Only the
+                                   ; chunked capture path stashes here — the
+                                   ; counted one caps its recv so the suffix is
+                                   ; never pulled out of the kernel to begin with.
     .answer_linger: resq 1         ; 1 = this response was written while the
                                    ; client was still sending its body, so the
                                    ; close has to linger: close(2) with unread
