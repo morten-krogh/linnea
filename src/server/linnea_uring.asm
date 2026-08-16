@@ -915,6 +915,23 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .drained_exit:
+    ; THIS is the exit a reload takes, and it was the black hole. An idle QUIC
+    ; connection does not hold a drain open -- drain_all_done counts work in
+    ; flight, and a browser sitting on an established connection has none -- so
+    ; the old worker declares itself drained AT ONCE and leaves, with every h3
+    ; peer still pointed at it and nothing said. The peer then meets silence,
+    ; which is how a browser decides an origin's h3 is unreliable.
+    ;
+    ; Found by probing all three exits rather than the one that looked likely:
+    ; the deadline below had the same hole and is the one the symptom named, but
+    ; locally it never fires at all -- "worker drained" is logged in the same
+    ; second as the upgrade. Fixing only that would have changed nothing and
+    ; looked right.
+    cmp dword [quic_fd], 0
+    jl .drained_go
+    mov edi, [quic_fd]
+    call linnea_quic_server_close_all
+.drained_go:
     call linnea_log_stamp
     lea rdi, [log_drained]
     mov esi, log_drained_len
@@ -948,11 +965,30 @@ linnea_uring_run:
 
 ; The hot upgrade's drain ran out of time: whatever is still open is not
 ; going to finish on its own. Go, rather than stay for ever holding it.
+;
+; ...but SAY SO FIRST, exactly as the stop path above does. The reasoning is
+; already written out over linnea_quic_server_close_all: a QUIC connection that
+; simply stops answering is how a browser decides an origin's h3 is unreliable
+; and quietly stops offering it. It was applied to the stop and not to this
+; exit, which is the same defect shape as always -- one of several ways out,
+; and the one nobody was looking at.
+;
+; It is this exit that a browser actually meets. A stop happens when someone
+; stops the service; this fires on every RELOAD, ten seconds after it, for any
+; peer still holding a connection -- which is every browser that has the site
+; open, because an idle browser connection never "finishes" and so always runs
+; the deadline out. Measured on the live site: two reloads, two deadline lines,
+; and Safari left h3 for h2 and stayed there.
 .on_drain_deadline:
     call linnea_log_stamp
     lea rdi, [log_drain_late]
     mov esi, log_drain_late_len
     call linnea_log_write
+    cmp dword [quic_fd], 0
+    jl .drain_late_go
+    mov edi, [quic_fd]
+    call linnea_quic_server_close_all
+.drain_late_go:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall
