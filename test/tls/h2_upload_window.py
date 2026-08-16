@@ -15,7 +15,21 @@
 # server's flow-control policy alone and is identical at any RTT. That is what
 # this asserts, along with the two grants the policy is built from.
 #
-# Usage: h2_upload_window.py <cafile> <port> [bytes]
+# FRAME SIZE IS THE SECOND THING THIS ASSERTS, and it is here because h3 shipped
+# the fault it guards against. A client picks its own DATA frame sizes -- Chrome
+# frames a body in 371 KB pieces and Firefox in small ones -- so any server rule
+# keyed on a FRAME's size treats two conforming peers differently, and looks
+# perfectly correct against whichever browser you tested with. h3 keyed a buffer
+# on exactly that and gave Chrome 2.9 MB/s and Firefox 440 kB/s on one file.
+#
+# h2's two thresholds are both cumulative (the spill gate is the running body
+# total, the credit gate is accumulated bytes), so grant count must track BYTES
+# and be flat against framing. Run at 16384 and at 256 with the SAME --max-grants
+# bound: if credit ever goes back to per-frame, the small-frame run misses by 64x.
+# Loopback cannot see this as a stall -- credit returns before a 4 MiB window can
+# be exhausted, so round trips are 0 at every size -- but the COUNT discriminates.
+#
+# Usage: h2_upload_window.py <cafile> <port> [bytes] [frame] [--max-grants N]
 import hashlib
 import socket
 import ssl
@@ -24,6 +38,8 @@ import sys
 
 ca, port = sys.argv[1], int(sys.argv[2])
 total = int(sys.argv[3]) if len(sys.argv) > 3 else 4 << 20
+FRAME = int(sys.argv[4]) if len(sys.argv) > 4 and not sys.argv[4].startswith("--") else 16384
+MAXG = int(sys.argv[sys.argv.index("--max-grants") + 1]) if "--max-grants" in sys.argv else -1
 
 # Bytes of body per credit round trip. The old policy managed 16384 (one DATA
 # frame); the current one clears 500 KB. 128 KiB sits far enough above the
@@ -67,9 +83,10 @@ s.sendall(fr(1, 0x04, 1,
 # it, so a server that raises only the stream window has raised nothing.
 conn_win = 65535
 strm_win = 65535
-max_frame = 16384
+max_frame = FRAME
 init_window = None
 conn_grant = 0
+wu_count = [0, 0]                # WINDOW_UPDATEs seen: [stream, connection]
 saw_settings = False
 # The bring-up grant is the stream-0 credit that arrives before any is being
 # returned for body bytes. Credit grants always come as a stream/connection
@@ -111,6 +128,7 @@ def drain(block, timeout=30):
         pay = buf[9:9 + ln]
         buf = buf[9 + ln:]
         if typ == 0x08:                                     # WINDOW_UPDATE
+            wu_count[0 if sid else 1] += 1
             inc = int.from_bytes(pay[:4], "big") & 0x7fffffff
             if sid == 0:
                 conn_win += inc
@@ -204,8 +222,20 @@ if per_rt < MIN_BYTES_PER_RT:
     bad.append("%d bytes over %d credit round trips = %d B/RT, want >= %d"
                % (total, stalls, per_rt, MIN_BYTES_PER_RT))
 
+# 5. ...and the credit must cost the same whatever the peer's framing. Grants
+#    track BYTES: 16 MB against a 256 KiB batch is 64 of them whether that came
+#    as 1024 frames or 65536. A bound blown by the small-frame run and not the
+#    large one means credit has gone back to being per-frame.
+grants = wu_count[0] + wu_count[1]
+if MAXG >= 0 and grants > MAXG:
+    bad.append("%d WINDOW_UPDATEs for %d bytes in %d frames of %d, over the bound of "
+               "%d -- credit is tracking FRAMES, not bytes, so a peer that frames "
+               "small pays for it"
+               % (grants, total, -(-total // FRAME), FRAME, MAXG))
+
 if bad:
     print("; ".join(bad))
     sys.exit(1)
-print("ok (%d bytes, window %d, conn +%d, %d round trips, %d B/RT)"
-      % (total, init_window, conn_grant, stalls, per_rt))
+print("ok (%d bytes as %d frames of %d, window %d, conn +%d, %d round trips, %d B/RT, %d grants)"
+      % (total, -(-total // FRAME), FRAME, init_window, conn_grant, stalls,
+         per_rt, grants))

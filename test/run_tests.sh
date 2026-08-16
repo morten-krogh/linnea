@@ -4744,6 +4744,21 @@ open('$WWW/h2upload.bin','wb').write(bytes(random.getrandbits(8) for _ in range(
     # same here as it would over a real network.
     timeout 90 python3 test/tls/h2_upload_window.py $CA ${P61443} >/dev/null 2>&1
     check "http2 upload: window advertised, credit batched, round trips bounded" $?
+    # THE PEER'S FRAMING MUST NOT CHANGE WHAT ITS UPLOAD COSTS. The same 16 MB at
+    # two frame sizes 64x apart, against the SAME grant bound: h2's thresholds are
+    # both cumulative (the spill gate is the running body total, the credit gate
+    # accumulated bytes), so 64 stream grants is 16 MB / 256 KiB either way. If
+    # credit ever goes back to per-frame the 256-byte run misses by 64x while the
+    # 16 KiB one still passes, which is the shape of the fault h3 shipped: a rule
+    # keyed on a FRAME's size gave Chrome 2.9 MB/s and Firefox 440 kB/s.
+    #
+    # Loopback sees no stall at either size (credit returns before a 4 MiB window
+    # can be spent), so the round-trip metric above is blind to this and the grant
+    # COUNT is what discriminates. Bound 200 against 129 measured.
+    for h2f in 16384 256; do
+        out=$(timeout 120 python3 test/tls/h2_upload_window.py $CA ${P61443} 16777216 $h2f --max-grants 200 2>&1)
+        check "http2 upload: credit cost is flat at ${h2f}-byte frames ($out)" $?
+    done
 
     # Uploads one after another on ONE connection. The streaming buffer's
     # claim (conn.h2_upload) was released by the service pass but TESTED when
