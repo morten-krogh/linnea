@@ -90,6 +90,31 @@ check_http "upload past max_body is 413" "413 Content Too Large" "$resp"
 ! grep -q ' /api/toobig ' "$SEEN"
 check "the refused upload never reached the backend" $?
 
+# ...and it applies to a body that FITS the request buffer, not only one large
+# enough to stream (Finding 3): the cap check used to live only on the streaming
+# path, so a max_body below the ~17 KiB in_buf was bypassed by any smaller body.
+# A dedicated server with max_body=64 proxies to the same backend; a 64-byte
+# body must be served and 65 must be 413, counted and chunked alike.
+mbs=$CFG/max-body-small.json
+# absolute paths: start_server runs the server with CWD=$RUNDIR, so a relative
+# log/spill path would resolve under the run dir a second time and fail to open.
+cat > "$mbs" <<EOF
+{ "log": "$PWD/$RUNDIR/max-body-small.log", "timeout": 5, "max_connections": 64,
+  "max_body": 64, "workers": 1, "spill_dir": "$PWD/$RUNDIR",
+  "servers": [ { "host": "127.0.0.1", "port": ${P61498}, "hostname": "one.test",
+    "locations": [ { "prefix": "/api", "proxy": "127.0.0.1:${P61100}" } ] } ] }
+EOF
+start_server "$mbs"
+mbs_pid=$SRV_PID
+out=$(python3 test/max_body_small.py ${P61498} 64 2>&1 | tail -1)
+[ "$out" = "OK" ]
+check "max_body is honoured for a buffered body, not only a streamed one ($out)" $?
+! grep -q ' /api/echo 65 ' "$SEEN"
+check "the over-limit buffered body never reached the backend" $?
+kill $mbs_pid 2>/dev/null
+wait $mbs_pid 2>/dev/null
+rm -f "$mbs"
+
 # --- proxied request log lines: upstream status, relayed byte count ---
 grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /api/simple HTTP/1\.1" 200 12' "$LOG"
 check "proxy log 200" $?

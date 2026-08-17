@@ -3533,6 +3533,17 @@ linnea_quic_server_datagram:
     call .send_1rtt
     jmp .stream_scan
 .req_ok:
+    ; max_body applies to a single-frame body too (Finding 19). The reassembly
+    ; paths cap spill_len as the bytes land, but a request whose whole body rides
+    ; one offset-0-plus-FIN STREAM frame reaches here copy-free, never having
+    ; passed either reassembly check -- so a max_body set below one packet's worth
+    ; was ignored on exactly that shape, the h3 twin of Finding 3. r9 is the body
+    ; length for both the single-frame and reassembled paths (see the note at the
+    ; rate-limit save below); cap it here, before routing, as the one
+    ; authoritative check. .req_body_toolarge answers 413 on the stream.
+    lea rax, [linnea_config_instance]
+    cmp r9, [rax + linnea_config.max_body]
+    ja .req_body_toolarge
     ; One decoded request is one request, and h3 multiplexes as freely as h2 —
     ; 100 streams on a connection, so max_per_ip bounds the request rate hardly
     ; at all. Checked before the drain and authority gates below because it is

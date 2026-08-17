@@ -177,6 +177,36 @@ if [ "$ktls" = 1 ]; then
     kill $h3p_pid 2>/dev/null
     wait $h3p_pid 2>/dev/null
 
+    # Finding 19: max_body must bound a body carried by ONE offset-zero STREAM
+    # frame with FIN. That copy-free single-frame path reaches routing without
+    # either reassembly cap check, so a max_body below one packet's worth was
+    # ignored on exactly that shape -- the h3 twin of Finding 3. curl cannot show
+    # it (it flushes HEADERS and DATA as separate frames, taking the reassembly
+    # path that was already capped), so the aioquic driver puts the whole request
+    # in one frame. A dedicated max_body=64 server: 64 bytes served, 65 refused.
+    if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+        sfb=$CFG/h3-smallbody.json
+        # absolute paths: start_server runs with CWD=$RUNDIR (see the h1 twin).
+        cat > "$sfb" <<EOF
+{ "log": "$PWD/$RUNDIR/h3-smallbody.log", "timeout": 5, "workers": 1, "max_body": 64,
+  "spill_dir": "$PWD/$RUNDIR",
+  "servers": [ { "host": "127.0.0.1", "port": ${P61470}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/api", "proxy": "127.0.0.1:${P61100}" },
+                   { "prefix": "/", "root": "$PWD/$WWW" } ] } ] }
+EOF
+        start_server "$sfb"
+        sfb_pid=$SRV_PID
+        out=$(timeout 30 python3 test/quic/h3_single_frame_maxbody.py ${P61470} 64 2>&1 | tail -1)
+        [ "$out" = "OK" ]
+        check "h3 max_body bounds a single-frame body too ($out)" $?
+        kill $sfb_pid 2>/dev/null
+        wait $sfb_pid 2>/dev/null
+        rm -f "$sfb"
+    else
+        check "h3 single-frame max_body (skipped: aioquic unavailable)" 0
+    fi
+
     # A canned h3 error must describe ITSELF. The QPACK encoder reads
     # content-encoding, the validators, content-range, location and
     # cache-control out of .bss globals that only linnea_h3_serve clears — and

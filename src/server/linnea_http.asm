@@ -1604,6 +1604,19 @@ linnea_http_handle:
     mov rax, [rbx + linnea_connection.in_len]
     jmp .body_ready
 .not_chunked:
+    ; max_body applies to EVERY counted body, not only one too large to buffer
+    ; (Finding 3). The cap check used to live in .body_stream alone, which is
+    ; reached only when head+body overflows in_buf; a body that FIT in in_buf
+    ; slipped past a max_body set below the buffer size, so the documented limit
+    ; behaved differently for small and large bodies and a proxy forwarded a
+    ; body the config said it would refuse. Checked here on the declared (or, for
+    ; a chunked body decoded in place, the decoded) length, before the
+    ; buffered/streamed split, so both paths honour it. [rsp+128] is the body
+    ; length; 0 (no body) never exceeds a nonzero max_body.
+    lea rax, [linnea_config_instance]
+    mov rax, [rax + linnea_config.max_body]
+    cmp [rsp + 128], rax
+    ja .body_toolarge
     mov rax, [rbx + linnea_connection.head_len]
     add rax, [rsp + 128]
     cmp rax, LINNEA_CONN_IN_BUF
@@ -1617,18 +1630,14 @@ linnea_http_handle:
 .body_wait:
     mov eax, LINNEA_HTTP_NEED_MORE
     jmp .ret
-.body_stream:
-    ; Too large to hold with the head, so it will be captured on disk — but
-    ; only up to max_body. Refused here, on the declared length, rather than
-    ; after writing it: the point of the cap is that the bytes never land.
-    lea rax, [linnea_config_instance]
-    mov rax, [rax + linnea_config.max_body]
-    cmp [rsp + 128], rax
-    jbe .body_capture_ok
+.body_toolarge:
     ; the client has not been told to hold back (no 100-continue was answered),
     ; so it is about to send a body nobody will read: linger over the refusal
     mov qword [rbx + linnea_connection.answer_linger], 1
     jmp .resp_413
+.body_stream:
+    ; Too large to hold with the head, so it will be captured on disk. max_body
+    ; was already applied above on the declared length, so the bytes never land.
 .body_capture_ok:
     ; keep the head consumed and hand the routing whatever body bytes have
     ; already arrived; the rest is captured as it comes
