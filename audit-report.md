@@ -14,7 +14,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 5. **Medium: HTTP/2 silently drops stream frames whose IDs have no live slot.** `DATA` on idle or closed streams and `WINDOW_UPDATE`/`RST_STREAM` on idle streams are consumed without the required state-specific error; dropped `DATA` replenishes only the connection window. **— FIXED (idle-stream case): DATA/WINDOW_UPDATE/RST_STREAM on an idle stream (even id, or above the highest opened) now draw a connection PROTOCOL_ERROR instead of being silently ignored; closed-stream frames keep the RFC-permitted lenient handling. A/B-verified.**
 6. **Medium: QUIC connection-level receive credit counts duplicate stream bytes.** Retransmissions under fresh packet numbers increment `fc_recv` even when stream reassembly recognizes every byte as already received, causing premature `MAX_DATA` grants. **— FIXED: connection credit now advances from per-stream receive high-water growth, so fresh-packet-number retransmissions and overlaps do not trigger extra `MAX_DATA`; covered by `test/quic/h3_fc_dedup_test.py`.**
 7. **Medium: coalesced QUIC 0-RTT processing stops after the first early packet.** Later 0-RTT packets in the same datagram are neither decrypted nor acknowledged, so multi-packet early requests fall back to retransmission or remain incomplete. **— FIXED: the early walk now advances by each protected packet length, decrypts and acknowledges every valid 0-RTT packet, and replays the combined frame stream through normal reassembly; covered by `test/quic/h3_0rtt_coalesced_test.py`.**
-8. **Low: HTTP/3 SETTINGS validation is bounded and partially discarded.** SETTINGS payloads larger than the local capture buffer are skipped without validation, and duplicate detection stops after 32 identifiers; the peer's maximum response field-section size is also not retained. **— OPEN (audit-only pass; no source changes made).**
+8. **Low: HTTP/3 SETTINGS validation is bounded and partially discarded.** SETTINGS payloads larger than the local capture buffer are skipped without validation, and duplicate detection stops after 32 identifiers; the peer's maximum response field-section size is also not retained. **— FIXED (all three: a SETTINGS is validated to a 256-byte policy limit — truncated -> H3_FRAME_ERROR, oversized -> H3_EXCESSIVE_LOAD; the duplicate list holds all 128 possible pairs; and `MAX_FIELD_SECTION_SIZE` is retained in `conn.max_fss_peer` and applied, resetting the stream H3_INTERNAL_ERROR when a response would exceed it; `test/quic/h3_settings_validation.py`, A/B-verified).**
 9. **Low: HTTP/3 critical-stream closure can be missed when closure arrives before stream typing.** Reordered FIN/RESET/STOP_SENDING state is not retained for an as-yet-untyped control or QPACK stream. **— FIXED (a client uni stream closed while untyped is remembered in `conn.uni_closed_sid` and reconciled at typing -> `H3_CLOSED_CRITICAL_STREAM`; `test/quic/h3_critical_reorder.py`, A/B-verified. STOP_SENDING on a client uni stream is already a STREAM_STATE_ERROR, caught earlier).**
 10. **Low: HTTP/3 accepts duplicate QPACK encoder or decoder streams.** Unlike the control stream, the QPACK stream handlers overwrite the saved ID instead of raising a stream-creation error. **— FIXED: a second QPACK encoder/decoder stream now draws H3_STREAM_CREATION_ERROR like a second control stream, instead of overwriting the saved id; A/B-verified.**
 11. **High: a completed HTTP/3 request stream can be dispatched again.** Duplicate suppression lasts only while a response slot or refusal entry is active; a fresh-packet-number retransmission can reach the application again after an inline reply, or after a response slot is reaped. **— FIXED (`05f0194`): a per-connection watermark plus a small completed-stream ring records every dispatched request for the life of the connection, so a retransmission after an inline reply or a slot reap is acknowledged, not re-routed; A/B-verified (4→1 dispatches).**
@@ -635,7 +635,26 @@ numbers.
 
 Severity: Low (P3 protocol-conformance gap)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — all three parts. (a) A SETTINGS payload is now captured and
+validated up to a policy limit (`LINNEA_QUIC_SETTINGS_MAX` = 256, the `.ctrl_pu`
+buffer sized to hold it): one past the old 64-byte buffer with a truncated tail is
+`H3_FRAME_ERROR`, and one beyond the limit — its framing read — is
+`H3_EXCESSIVE_LOAD` (0x0107), rather than skipped unvalidated. (b) The
+duplicate-identifier list is sized for the most pairs a bounded frame can hold
+(128), so a repeat past the 32nd identifier is now caught as `H3_SETTINGS_ERROR`
+instead of slipping through. (c) The peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` is
+retained in `conn.max_fss_peer` and applied: `linnea_h3_build_headers` flags a
+response whose field section exceeds it (compared against the encoded length — a
+lower bound on the uncompressed size §4.2.2 governs, so never a false reject) and
+the serve path resets the request stream `H3_INTERNAL_ERROR` (0x0102) rather than
+sending an oversized section; a generous or absent limit serves normally. A/B-
+verified against a pre-fix binary on a parallel port with
+`test/quic/h3_settings_validation.py`: the truncated, oversized and
+duplicate-after-33 SETTINGS drew no close before and close with their codes now,
+and a tiny field-section limit was ignored before and resets the stream now — four
+discriminating checks that all failed pre-fix and pass now. Proxied response heads
+(relayed, not built here) are out of scope; grease-padded SETTINGS under 256 bytes
+still validate and pass.
 
 ### Evidence
 

@@ -36,6 +36,8 @@ global linnea_qpack_cenc
 global linnea_qpack_hsts_ptr
 global linnea_qpack_hsts_len
 global linnea_qpack_nosniff
+global linnea_qpack_max_fss
+global linnea_qpack_fss_over
 
 extern hpack_int
 extern hpack_str
@@ -142,6 +144,12 @@ linnea_qpack_cenc: resq 1
 linnea_qpack_hsts_ptr: resq 1
 linnea_qpack_hsts_len: resq 1
 linnea_qpack_nosniff:  resq 1
+; The peer's SETTINGS_MAX_FIELD_SECTION_SIZE (0 = none advertised), set per request
+; by the QUIC server from the connection, and a flag the response builder raises
+; when a response would exceed it — the serve path then resets the stream rather
+; than sending an oversized field section (Finding 8).
+linnea_qpack_max_fss:  resq 1
+linnea_qpack_fss_over: resq 1
 ; scratch for relaying an upstream response head: one field name, lowercased,
 ; and the re-derived content-length as digits
 qp_nmbuf:  resb 64

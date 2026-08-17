@@ -72,6 +72,19 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
         skip "h3 (io_uring): control-stream frames walked and validated -- 5s"
     fi
 
+    # Finding 8: the SETTINGS payload itself, not just the frame sequence. A frame
+    # past the capture buffer with a truncated tail is H3_FRAME_ERROR and one past
+    # the policy limit H3_EXCESSIVE_LOAD (both were skipped unvalidated); a repeat
+    # after 33 identifiers is H3_SETTINGS_ERROR (detection stopped at 32); and a
+    # tiny SETTINGS_MAX_FIELD_SECTION_SIZE resets the response stream rather than
+    # sending an oversized field section, while a generous one serves.
+    if extensive; then
+        timeout 90 python3 test/quic/h3_settings_validation.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): SETTINGS payload validated, field-section limit applied (Finding 8)" $?
+    else
+        skip "h3 (io_uring): SETTINGS payload / field-section limit -- 8s"
+    fi
+
     # request bodies: POST is a 405 now, but the body must still be reassembled
     # whole and the stream answered, with its flow-control credit settled
     python3 test/quic/h3_body_test.py ${P61452} >/dev/null 2>&1

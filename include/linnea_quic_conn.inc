@@ -155,6 +155,13 @@ LINNEA_QUIC_LOSS_THRESH equ 3
 ; the buffer is generous and anything past it is treated as not a priority frame.
 ; PU_PEND is how many updates for not-yet-open response streams are remembered.
 LINNEA_QUIC_PU_BUF  equ 64
+; The largest SETTINGS payload we capture and fully validate (Finding 8). A
+; conforming SETTINGS is a handful of pairs — tens of bytes even padded with
+; grease — so this is generous; a frame larger than this cannot be validated
+; against a fixed buffer and is refused H3_EXCESSIVE_LOAD after its framing is
+; read, rather than skipped whole as before. The capture buffer (.ctrl_pu, shared
+; with the much smaller PRIORITY_UPDATE) is sized to hold it.
+LINNEA_QUIC_SETTINGS_MAX equ 256
 LINNEA_QUIC_PU_PEND equ 8
 
 ; A request whose frames span several packets is reassembled in a per-connection
@@ -635,6 +642,11 @@ struc linnea_quic_conn
     .ctrl_skip:  resq 1
     .ctrl_hlen:  resq 1
     .ctrl_settings: resq 1
+    ; The peer's SETTINGS_MAX_FIELD_SECTION_SIZE, 0 until seen and 0 meaning "none
+    ; advertised" — the RFC 9114 4.2.2 default is unlimited (Finding 8). A response
+    ; whose uncompressed field section would exceed a nonzero value is failed at the
+    ; stream rather than sent for the client to reject.
+    .max_fss_peer: resq 1
     .ctrl_hdr:   resb 16
     ; PRIORITY_UPDATE is the one control-stream frame whose payload we read
     ; rather than skip, so it alone is captured as it streams past: .ctrl_pucap
@@ -643,7 +655,7 @@ struc linnea_quic_conn
     ; value is a few bytes ("u=1, i"), so anything near this size is not one.
     .ctrl_pucap: resq 1
     .ctrl_pulen: resq 1
-    .ctrl_pu:    resb LINNEA_QUIC_PU_BUF
+    .ctrl_pu:    resb LINNEA_QUIC_SETTINGS_MAX
     ; Control-stream bytes that arrived ahead of the contiguous prefix. The
     ; walk consumes only in-order bytes, but a reordered datagram is delivered
     ; (and acked) exactly once — dropping its bytes left a permanent hole, and

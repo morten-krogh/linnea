@@ -128,6 +128,8 @@ extern linnea_qpack_ccontrol_len
 extern linnea_qpack_hsts_ptr
 extern linnea_qpack_hsts_len
 extern linnea_qpack_nosniff
+extern linnea_qpack_max_fss
+extern linnea_qpack_fss_over
 extern linnea_quic_initial_dcid
 extern linnea_quic_initial_secrets
 extern linnea_quic_ch_parse
@@ -4044,6 +4046,12 @@ linnea_quic_server_datagram:
     mov [linnea_qpack_hsts_ptr], r11
     mov r10, [rax + linnea_quic_vhost.nosniff]
     mov [linnea_qpack_nosniff], r10
+    ; the peer's field-section limit for this response, and clear last time's
+    ; over-limit flag (Finding 8)
+    mov r10, [cur_conn]
+    mov r10, [r10 + linnea_quic_conn.max_fss_peer]
+    mov [linnea_qpack_max_fss], r10
+    mov qword [linnea_qpack_fss_over], 0
     mov r8, [s_body_ptr]             ; the request body, for a POST echo
     mov r9, [s_body_len]
     ; may we start a chunked response? Yes while any of the LINNEA_QUIC_TXSTREAMS
@@ -4098,6 +4106,12 @@ linnea_quic_server_datagram:
                                      ; rax = -1: proxied, and parked
     cmp rax, -1
     je .serve_parked
+    ; Finding 8: the built response's field section exceeds the peer's advertised
+    ; SETTINGS_MAX_FIELD_SECTION_SIZE. Sending it would only draw a client-side
+    ; rejection, so fail the stream cleanly (H3_INTERNAL_ERROR) instead — releasing
+    ; the file mapping first if this was to be a streamed response.
+    cmp qword [linnea_qpack_fss_over], 0
+    jne .serve_fss_over
     test r9, r9
     jnz .serve_large
     ; An inline response rides one packet, assembled in strm_pay behind the ACK
@@ -4184,6 +4198,19 @@ linnea_quic_server_datagram:
     lea rdx, [rax + rbx]
     lea rsi, [strm_pay]
     call .send_1rtt
+    jmp .stream_scan
+.serve_fss_over:
+    test r9, r9
+    jz .serve_fss_reset               ; inline head: no file mapping to release
+    mov rdi, r8
+    mov rsi, r9
+    mov eax, LINNEA_SYS_MUNMAP
+    syscall
+.serve_fss_reset:
+    mov rdi, [s_sid]
+    xor esi, esi                      ; nothing of the response was sent
+    mov edx, LINNEA_H3_ERR_INTERNAL
+    call tx_reset_stream_code
     jmp .stream_scan
 .serve_toolong:
     ; Unreachable today, and it stays a backstop rather than a policy: the
@@ -4713,9 +4740,13 @@ linnea_quic_server_datagram:
     mov rcx, [rbx + linnea_quic_conn.ctrl_skip]
     test rcx, rcx
     jz .cw_loop                       ; an empty SETTINGS frame is perfectly legal
-    cmp rcx, LINNEA_QUIC_PU_BUF
-    ja .cw_loop                       ; more than we buffer: skip it, as the walk
-                                      ; does with anything it cannot hold
+    ; Finding 8: capture the whole payload and validate it, up to a generous policy
+    ; limit. A SETTINGS larger than that cannot be checked against a fixed buffer,
+    ; so — its framing (the length varint) already read — it is refused
+    ; H3_EXCESSIVE_LOAD rather than skipped unvalidated as it was before, which let
+    ; a reserved or repeated identifier past 64 bytes through unremarked.
+    cmp rcx, LINNEA_QUIC_SETTINGS_MAX
+    ja .cw_settings_toobig
     mov qword [rbx + linnea_quic_conn.ctrl_pucap], LINNEA_H3_FRAME_SETTINGS
     mov qword [rbx + linnea_quic_conn.ctrl_pulen], 0
     jmp .cw_loop
@@ -4774,6 +4805,9 @@ linnea_quic_server_datagram:
     jmp .cw_loop
 .cw_frame_err:
     mov eax, LINNEA_H3_ERR_FRAME
+    jmp .cw_ret
+.cw_settings_toobig:
+    mov eax, LINNEA_H3_ERR_EXCESSIVE_LOAD   ; a SETTINGS too large to validate (Finding 8)
     jmp .cw_ret
 .cw_prio:
     mov rcx, [rbx + linnea_quic_conn.ctrl_skip]      ; the declared payload length
@@ -5040,14 +5074,18 @@ linnea_quic_server_datagram:
 ; limit a client actually advertises, so there is nothing to enforce yet and a
 ; stored-but-unused field would only mislead.
 ;
-; Five pushes plus the 256-byte seen-list keeps rsp 16-aligned for the calls.
+; Five pushes plus the 1024-byte seen-list keeps rsp 16-aligned for the calls.
 .settings_apply:
     push rbx
     push r12
     push r13
     push r14
     push rbp
-    sub rsp, 256                      ; up to 32 identifiers already seen
+    ; The payload is bounded to LINNEA_QUIC_SETTINGS_MAX (256) at the header, so it
+    ; holds at most 128 (identifier, value) pairs — a seen-list of 128 entries can
+    ; therefore record EVERY identifier and catch every duplicate (Finding 8). It
+    ; stopped at 32 before, so a repeat past the 32nd unique id slipped through.
+    sub rsp, LINNEA_QUIC_SETTINGS_MAX * 4   ; 128 qwords
     mov rbx, [cur_conn]
     mov qword [rbx + linnea_quic_conn.ctrl_pucap], 0   ; capture consumed
     lea r12, [rbx + linnea_quic_conn.ctrl_pu]
@@ -5068,10 +5106,17 @@ linnea_quic_server_datagram:
     jae .sa_frame_err                 ; an identifier with no value at all
     mov rdi, r12
     mov rsi, r13
-    call linnea_quic_varint_decode    ; rax = value (read, not acted on)
+    call linnea_quic_varint_decode    ; rax = value, rdx = bytes used
     test rdx, rdx
     jz .sa_frame_err
     add r12, rdx
+    ; MAX_FIELD_SECTION_SIZE (0x06): the largest response field section, uncompressed
+    ; (sum of name+value+32 per field, RFC 9114 4.2.2), the peer will accept. Retain
+    ; it so response building can stay within it (Finding 8); 0 = none advertised.
+    cmp rbp, 0x06
+    jne .sa_not_fss
+    mov [rbx + linnea_quic_conn.max_fss_peer], rax
+.sa_not_fss:
     ; the HTTP/2 identifiers HTTP/3 reserves (7.2.4.1). 0x01 and 0x06 are real
     ; HTTP/3 settings (QPACK capacity, max field section size), so the reserved
     ; run is exactly 0x02 through 0x05.
@@ -5090,8 +5135,8 @@ linnea_quic_server_datagram:
     inc rcx
     jmp .sa_seen_loop
 .sa_seen_add:
-    cmp r14, 32
-    jae .sa_loop                      ; the list is full: stop recording, keep walking
+    cmp r14, LINNEA_QUIC_SETTINGS_MAX / 2   ; 128, the most pairs the frame can hold
+    jae .sa_settings_err              ; unreachable for a bounded frame; reject if hit
     mov [rsp + r14 * 8], rbp
     inc r14
     jmp .sa_loop
@@ -5104,7 +5149,7 @@ linnea_quic_server_datagram:
 .sa_ok:
     xor eax, eax
 .sa_ret:
-    add rsp, 256
+    add rsp, LINNEA_QUIC_SETTINGS_MAX * 4
     pop rbp
     pop r14
     pop r13

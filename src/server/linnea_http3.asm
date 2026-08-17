@@ -55,6 +55,8 @@ extern linnea_qpack_send_validators
 extern linnea_qpack_crange_ptr
 extern linnea_qpack_location_ptr
 extern linnea_qpack_location_len
+extern linnea_qpack_max_fss
+extern linnea_qpack_fss_over
 extern linnea_qpack_crange_len
 extern linnea_qpack_cenc
 extern linnea_qpack_ccontrol_ptr
@@ -752,6 +754,19 @@ linnea_h3_build_headers:
     call linnea_qpack_encode_response
 .encoded:
     mov rbp, rax                     ; field-section length
+    ; The peer's SETTINGS_MAX_FIELD_SECTION_SIZE (Finding 8): a response whose field
+    ; section exceeds it may be rejected by the client, so flag it and let the serve
+    ; path reset the stream instead of sending. The encoded length is compared — a
+    ; lower bound on the uncompressed size RFC 9114 4.2.2 governs (QPACK only ever
+    ; shrinks) — so this never falsely rejects, and it catches every response that
+    ; definitely exceeds the limit. 0 = no limit advertised.
+    mov rax, [linnea_qpack_max_fss]
+    test rax, rax
+    jz .no_fss_limit
+    cmp rbp, rax
+    jbe .no_fss_limit
+    mov qword [linnea_qpack_fss_over], 1
+.no_fss_limit:
     ; HEADERS frame: type 0x01, length varint, field section
     mov byte [r14], LINNEA_H3_FRAME_HEADERS
     inc r14
