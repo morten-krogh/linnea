@@ -103,6 +103,8 @@ key_hsts:               db "hsts"
 key_hsts_len            equ $ - key_hsts
 key_nosniff:            db "nosniff"
 key_nosniff_len         equ $ - key_nosniff
+key_v6only:             db "v6only"
+key_v6only_len          equ $ - key_v6only
 
 msg_eof:                db "unexpected end of file"
 msg_eof_len             equ $ - msg_eof
@@ -178,6 +180,8 @@ msg_hsts_type:          db "hsts takes the header VALUE as a string, e.g. "
 msg_hsts_type_len       equ $ - msg_hsts_type
 msg_nosniff:            db "nosniff must be 0 or 1"
 msg_nosniff_len         equ $ - msg_nosniff
+msg_v6only:             db "v6only must be 0 or 1"
+msg_v6only_len          equ $ - msg_v6only
 msg_cc_long:            db "cache_control too long"
 msg_cc_long_len         equ $ - msg_cc_long
 msg_path_long:          db "cert/key path too long"
@@ -766,6 +770,7 @@ linnea_parse_server:
     mov qword [rbx + linnea_config_server.key_path_len], 0
     mov qword [rbx + linnea_config_server.hsts_len], 0
     mov qword [rbx + linnea_config_server.nosniff], 0
+    mov qword [rbx + linnea_config_server.v6only], 0
     mov edi, '{'
     call linnea_parse_expect
 .member_loop:
@@ -832,6 +837,13 @@ linnea_parse_server:
     call linnea_string_equal
     test eax, eax
     jnz .key_nosniff
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_v6only]
+    mov ecx, key_v6only_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_v6only
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -946,6 +958,20 @@ linnea_parse_server:
 .nosniff_range:
     lea rdi, [msg_nosniff]
     mov esi, msg_nosniff_len
+    jmp linnea_parse_fail
+
+.key_v6only:
+    test r12d, 256
+    jnz .dup
+    or r12d, 256
+    call linnea_parse_u64
+    cmp rax, 1
+    ja .v6only_range
+    mov [rbx + linnea_config_server.v6only], rax
+    jmp .member_sep
+.v6only_range:
+    lea rdi, [msg_v6only]
+    mov esi, msg_v6only_len
     jmp linnea_parse_fail
 
 .key_locations:

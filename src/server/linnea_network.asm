@@ -18,6 +18,7 @@ global linnea_network_peer_format
 global linnea_network_addr_format
 global linnea_network_peer_addr
 global linnea_network_parse_ipv4
+global linnea_network_parse_ipv6
 global linnea_network_fill_sockaddr6
 global linnea_network_quic_listener
 
@@ -352,7 +353,11 @@ linnea_network_probe_owner:
     mov rdi, r12
     mov esi, LINNEA_IPPROTO_IPV6
     mov edx, LINNEA_IPV6_V6ONLY
-    lea r10, [sockopt_zero]
+    lea r10, [sockopt_zero]                 ; dual-stack by default...
+    cmp qword [rbx + linnea_config_server.v6only], 0
+    je .v6only_done
+    lea r10, [sockopt_one]                  ; ...or IPv6-only when the server asked
+.v6only_done:
     mov r8d, 4
     syscall
     mov eax, LINNEA_SYS_SETSOCKOPT
@@ -423,7 +428,11 @@ linnea_network_quic_listener:
     mov rdi, r12
     mov esi, LINNEA_IPPROTO_IPV6
     mov edx, LINNEA_IPV6_V6ONLY
-    lea r10, [sockopt_zero]
+    lea r10, [sockopt_zero]                 ; dual-stack by default...
+    cmp qword [rbx + linnea_config_server.v6only], 0
+    je .v6only_done
+    lea r10, [sockopt_one]                  ; ...or IPv6-only when the server asked
+.v6only_done:
     mov r8d, 4
     syscall
     mov eax, LINNEA_SYS_SETSOCKOPT
@@ -532,7 +541,11 @@ linnea_network_listener_create:
     mov rdi, r12
     mov esi, LINNEA_IPPROTO_IPV6
     mov edx, LINNEA_IPV6_V6ONLY
-    lea r10, [sockopt_zero]
+    lea r10, [sockopt_zero]                 ; dual-stack by default...
+    cmp qword [rbx + linnea_config_server.v6only], 0
+    je .v6only_done
+    lea r10, [sockopt_one]                  ; ...or IPv6-only when the server asked
+.v6only_done:
     mov r8d, 4
     syscall
     mov eax, LINNEA_SYS_SETSOCKOPT
@@ -908,11 +921,20 @@ linnea_network_fill_sockaddr6:
     mov [rbx + 20], eax
     jmp .ok
 .maybe_v6any:
-    ; the only non-IPv4 host we accept is the literal "::" (unspecified)
+    ; "::" (unspecified) is the dual-stack wildcard; any other valid IPv6 literal
+    ; binds that specific address (v6-only for it, since a v4 client arrives as a
+    ; different ::ffff:x address). parse_ipv6 preserves rbx (our sockaddr).
     cmp qword [rdi + linnea_config_server.host_len], 2
-    jne .bad
+    jne .try_v6literal
     cmp word [rdi + linnea_config_server.host], 0x3a3a   ; "::"
-    jne .bad
+    je .anyaddr
+.try_v6literal:
+    lea rdi, [rdi + linnea_config_server.host]
+    lea rsi, [rbx + 8]                                   ; sin6_addr
+    call linnea_network_parse_ipv6
+    cmp rax, -1
+    je .bad
+    jmp .ok
 .anyaddr:
     ; unspecified address :: — the 16 addr bytes are already zero
 .ok:
@@ -969,6 +991,173 @@ linnea_network_parse_ipv4:
     ret
 .fail:
     mov rax, -1
+    ret
+
+
+; linnea_network_parse_ipv6(rdi = NUL-terminated string, rsi = out 16 bytes)
+;   -> rax = 0 on success (out holds the address in network order), else -1.
+;
+; inet_pton(AF_INET6): up to eight colon-separated groups of 1-4 hex digits, at
+; most one "::" standing for a run of zero groups, and an optional trailing IPv4
+; dotted-quad occupying the low 32 bits (parsed by linnea_network_parse_ipv4,
+; which reuses the same NUL-terminated string). A zone id ("%eth0") is not
+; accepted -- '%' is not a hex digit, so it simply fails the group parse.
+;
+; State: r12 = out, r13 = cursor, r14 = w (bytes written 0..16), r15 = colonp
+; (the byte offset the "::" marks, or -1), ebp = the group value so far, ebx =
+; its digit count, [rsp] = curtok (the token start, for a dotted-quad).
+linnea_network_parse_ipv6:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 8                     ; [rsp] = curtok
+    mov r12, rsi                   ; out base
+    xor eax, eax
+    mov [r12], rax                 ; zero all 16 output bytes
+    mov [r12 + 8], rax
+    mov r13, rdi                   ; cursor
+    xor r14d, r14d                 ; w = 0
+    mov r15, -1                    ; colonp = none
+    xor ebp, ebp                   ; group value
+    xor ebx, ebx                   ; group digits
+    mov [rsp], r13                 ; curtok = start
+    ; a leading ':' is legal only as the first colon of "::"
+    cmp byte [r13], ':'
+    jne .p6_loop
+    inc r13
+    cmp byte [r13], ':'
+    jne .p6_bad                    ; ":x..." — a lone leading colon
+    mov [rsp], r13                 ; curtok; the loop sees the second ':' as "::"
+.p6_loop:
+    movzx eax, byte [r13]
+    test al, al
+    jz .p6_end
+    cmp al, ':'
+    je .p6_colon
+    cmp al, '.'
+    je .p6_dot
+    ; a hex digit, else invalid
+    movzx edx, al
+    sub edx, '0'
+    cmp edx, 9
+    jbe .p6_digit                  ; '0'-'9'
+    movzx edx, al
+    or  edx, 0x20                  ; tolower
+    sub edx, 'a'
+    cmp edx, 5
+    ja  .p6_bad                    ; not 'a'-'f' (and not ':' '.' handled above)
+    add edx, 10
+.p6_digit:
+    inc ebx
+    cmp ebx, 4
+    ja  .p6_bad                    ; more than four hex digits in a group
+    shl ebp, 4
+    or  ebp, edx
+    inc r13
+    jmp .p6_loop
+.p6_colon:
+    inc r13
+    mov [rsp], r13                 ; curtok = just past this ':'
+    test ebx, ebx
+    jnz .p6_flush                  ; a real group precedes this ':': store it
+    ; empty group -> "::"
+    cmp r15, -1
+    jne .p6_bad                    ; a second "::"
+    mov r15, r14                   ; colonp marks where the zero-run belongs
+    jmp .p6_loop
+.p6_flush:
+    lea rax, [r14 + 2]
+    cmp rax, 16
+    ja  .p6_bad
+    mov edx, ebp                   ; store the u16 big-endian
+    mov [r12 + r14 + 1], dl        ; low byte
+    shr edx, 8
+    mov [r12 + r14], dl            ; high byte
+    mov r14, rax
+    xor ebp, ebp
+    xor ebx, ebx
+    ; a ':' that separated a real group must be followed by more input; a ':' at
+    ; the very end (e.g. "1:2:") is a dangling separator, not a legal "::"
+    cmp byte [r13], 0
+    je  .p6_bad
+    jmp .p6_loop
+.p6_dot:
+    ; a dotted-quad from curtok to the string's NUL, into the low 32 bits
+    lea rax, [r14 + 4]
+    cmp rax, 16
+    ja  .p6_bad
+    mov rdi, [rsp]                 ; curtok
+    call linnea_network_parse_ipv4 ; eax = 4 bytes network-order, or -1 (preserves r12-r15/rbp/rbx)
+    cmp eax, -1
+    je  .p6_bad
+    mov [r12 + r14], eax           ; already network order
+    add r14, 4
+    xor ebx, ebx                   ; nothing left to flush; the quad ended at NUL
+    jmp .p6_end
+.p6_end:
+    ; flush a trailing hex group, if the string did not end on a ':'
+    test ebx, ebx
+    jz  .p6_gap
+    lea rax, [r14 + 2]
+    cmp rax, 16
+    ja  .p6_bad
+    mov edx, ebp
+    mov [r12 + r14 + 1], dl
+    shr edx, 8
+    mov [r12 + r14], dl
+    mov r14, rax
+.p6_gap:
+    cmp r15, -1
+    je  .p6_exact
+    ; "::" present: slide the [colonp, w) tail to the end and zero the hole.
+    ; n = w - colonp bytes move to [16-n, 16); [colonp, 16-n) becomes zero.
+    mov rcx, r14
+    sub rcx, r15                   ; n = bytes after the gap
+    test rcx, rcx
+    jz  .p6_gap_zero               ; "::" at the very end (e.g. "1::")
+    lea rdi, [r12 + 16]
+    sub rdi, rcx                   ; dst = out + 16 - n
+    lea rsi, [r12 + r15]           ; src = out + colonp
+    mov rdx, rcx                   ; copy backward (dst > src may overlap)
+.p6_gap_copy:
+    dec rdx
+    mov al, [rsi + rdx]
+    mov [rdi + rdx], al
+    test rdx, rdx
+    jnz .p6_gap_copy
+.p6_gap_zero:
+    ; zero (16 - w) bytes at colonp -- the space the moved tail vacated
+    lea rdi, [r12 + r15]
+    mov rcx, 16
+    sub rcx, r14                   ; shift = 16 - w
+    xor eax, eax
+    rep stosb
+    jmp .p6_ok
+.p6_exact:
+    cmp r14, 16
+    jne .p6_bad                    ; no "::" and not exactly eight groups
+.p6_ok:
+    add rsp, 8
+    xor eax, eax
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.p6_bad:
+    add rsp, 8
+    mov rax, -1
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 

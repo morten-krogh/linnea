@@ -100,7 +100,7 @@ msg_empty_log:          db "config log must not be empty"
 msg_empty_log_len       equ $ - msg_empty_log
 msg_cert_key:           db "server needs both cert and key, or neither"
 msg_cert_key_len        equ $ - msg_cert_key
-msg_bad_host_ip:        db 'server host must be an IPv4 literal or "::" (a name is not resolved)' 
+msg_bad_host_ip:        db 'server host must be an IPv4 or IPv6 literal (a name is not resolved)' 
 msg_bad_host_ip_len     equ $ - msg_bad_host_ip
 msg_no_root_dir:        db "location root is not an existing directory"
 msg_no_root_dir_len     equ $ - msg_no_root_dir

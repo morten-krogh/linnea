@@ -34,7 +34,7 @@ run_test "workers auto"    124 stdout "config:" \
 # included, since that is what a reader copies.
 python3 test/configs/doc_claims_test.py >/dev/null 2>&1
 check "docs/config.md still describes the parser" $?
-run_test "invalid host"    1 stderr "host must be an IPv4 literal" \
+run_test "invalid host"    1 stderr "host must be an IPv4 or IPv6 literal" \
     $BIN --config $CFG/bad-host.json
 # a hard fd limit below the configured pool is fatal: the pool could never
 # fill, and accept would fail with EMFILE while the server thought it had room

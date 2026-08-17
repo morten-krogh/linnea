@@ -1,0 +1,20 @@
+{
+  "log": "test/linnea.log",
+  "timeout": 2,
+  "workers": 1,
+  "servers": [
+    {
+      "host": "::1",
+      "port": 61469,
+      "hostname": "v6.test",
+      "locations": [ { "prefix": "/", "root": "test/www" } ]
+    },
+    {
+      "host": "::",
+      "port": 61470,
+      "hostname": "v6only.test",
+      "v6only": 1,
+      "locations": [ { "prefix": "/", "root": "test/www" } ]
+    }
+  ]
+}

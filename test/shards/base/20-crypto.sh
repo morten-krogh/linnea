@@ -6,7 +6,7 @@
 # does not produce them, and the checks below only test for existence — so a tree
 # that has been cleaned reports a failure that looks like a real one, while a
 # STALE binary is worse: it passes, silently testing code that no longer exists.
-make -s bin/linnea-selftest bin/linnea-quictest bin/linnea-rtxtest >/dev/null 2>&1
+make -s bin/linnea-selftest bin/linnea-quictest bin/linnea-rtxtest bin/linnea-nettest >/dev/null 2>&1
 if [ -x ./bin/linnea-selftest ]; then
     if ./bin/linnea-selftest >$RUNDIR/linnea_selftest.out 2>&1; then
         check "crypto selftest ($(tr '\n' ' ' <$RUNDIR/linnea_selftest.out))" 0
@@ -174,6 +174,16 @@ if [ -x ./bin/linnea-replaytest ]; then
     check "quic 0-RTT anti-replay + ticket-lifetime + ack-delay selftest ($out)" $rc
 else
     check "quic 0-RTT anti-replay selftest (skipped: binary unavailable)" 0
+fi
+
+# IP-literal parsers: the "::" zero-run compression, embedded IPv4, and every
+# reject shape for linnea_network_parse_ipv6 (the specific-IPv6 host grammar).
+if [ -x ./bin/linnea-nettest ]; then
+    out=$(./bin/linnea-nettest)
+    rc=$?
+    check "net: IPv6 literal parser known-answer vectors ($out)" $rc
+else
+    check "net IPv6-parser selftest (skipped: binary unavailable)" 0
 fi
 
 # QPACK decode: field sections encoded by pylsqpack (static + literals + Huffman,

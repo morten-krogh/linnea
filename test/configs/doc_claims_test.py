@@ -127,10 +127,19 @@ test(loc([{"prefix": "/", "redirect": "example.com"}]),
 test(loc([{"prefix": "/", "proxy": "localhost:80"}]),
      "proxy as a DNS name rejected", False, "invalid proxy address")
 test(srv(host="localhost"), "host as a name rejected", False,
-     "must be an IPv4 literal")
+     "must be an IPv4 or IPv6 literal")
 test(srv(host="::"), 'host "::" accepted (dual-stack wildcard)', True)
 test(srv(host="0.0.0.0"), 'host "0.0.0.0" accepted', True)
-test(srv(host="::1"), "host ::1 rejected (only :: is taken)", False)
+test(srv(host="::1"), "host ::1 (specific IPv6 literal) accepted", True)
+test(srv(host="2001:db8::1"), "host 2001:db8::1 accepted", True)
+test(srv(host="::ffff:1.2.3.4"), "host ::ffff:1.2.3.4 (mapped) accepted", True)
+test(srv(host="gg::"), "host gg:: (bad IPv6) rejected", False,
+     "must be an IPv4 or IPv6 literal")
+test(srv(host="fe80::1%eth0"), "host with a zone id rejected", False,
+     "must be an IPv4 or IPv6 literal")
+test(srv(host="::", v6only=1), 'host "::" v6only accepted', True)
+test(srv(host="::", v6only=2), "v6only out of range rejected", False,
+     "v6only must be 0 or 1")
 test(loc([{"prefix": "/", "root": "/nonexistent-dir"}]),
      "root that does not exist rejected by --test", False,
      "not an existing directory")

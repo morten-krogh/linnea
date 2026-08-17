@@ -112,6 +112,22 @@ $(QUICTEST_BIN): $(QUICTEST_OBJS)
 quictest: $(QUICTEST_BIN)
 	./$(QUICTEST_BIN)
 
+# --- IP-literal parser known-answer tests (own _start; parse_ipv6 vectors) ---
+NETTEST_BIN  = bin/linnea-nettest
+NETTEST_OBJS = test/net/linnea_nettest.o src/server/linnea_network.o \
+               src/server/linnea_log.o src/server/linnea_error.o src/server/linnea_time.o \
+               src/lib/linnea_string.o src/lib/linnea_print.o \
+               src/server/linnea_config.o src/server/linnea_config_parse.o
+
+test/net/linnea_nettest.o: test/net/linnea_nettest.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(NETTEST_BIN): $(NETTEST_OBJS)
+	$(LD) -o $@ $^
+
+nettest: $(NETTEST_BIN)
+	./$(NETTEST_BIN)
+
 # --- test-only standalone QUIC UDP receiver (own _start) ---
 QUICSRV_BIN  = bin/linnea-quicserver
 QUICSRV_OBJS = test/quic/linnea_quicserver.o src/lib/linnea_quic.o \

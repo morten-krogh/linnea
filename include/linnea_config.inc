@@ -80,6 +80,10 @@ struc linnea_config_server
     .listen_fd:     resd 1                        ; listening socket, set by linnea_network
     .listener_owner: resd 1                       ; 1 = this server bound the socket;
     .pad2:          resd 1                        ; 0 = shares a prior server's listener
+    ; 1 = set IPV6_V6ONLY on the listener, so a "::" host binds IPv6-only instead
+    ; of dual-stack. 0 (default) keeps the dual-stack behaviour. Meaningful only for
+    ; "::": a specific IPv6 or IPv4 literal is already single-family.
+    .v6only:        resq 1
     ; --- TLS (optional; "cert" and "key" are both-or-neither) --------
     .tls:           resd 1                        ; 1 = this server serves TLS
     .pad3:          resd 1

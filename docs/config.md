@@ -33,7 +33,7 @@ change.
 > **The one thing `--test` cannot check** is whether the port is actually
 > bindable — that needs a real bind, and something else may hold it. Everything
 > else a cold start would reject, `--test` rejects: the `host` must be an IPv4
-> literal or `"::"`, and the `root` and `log` directories must exist.
+> or IPv6 literal, and the `root` and `log` directories must exist.
 
 ---
 
@@ -150,14 +150,17 @@ every other global has a working default.
 ## Server settings
 
 Each entry of `servers` describes one virtual host: an address to bind, a port,
-and the name it answers to. Listeners are dual-stack: `"::"` and `"0.0.0.0"`
-both accept IPv6 *and* IPv4 clients (the latter as `::ffff:a.b.c.d`), and a
-specific IPv4 literal binds just that address. Several servers may share one `host`/`port` pair
-and be told apart by `hostname` (SNI on TLS, the `Host` header on plaintext).
+and the name it answers to. Listeners are dual-stack by default: `"::"` and
+`"0.0.0.0"` both accept IPv6 *and* IPv4 clients (the latter as `::ffff:a.b.c.d`).
+A specific IPv4 literal binds just that address; a specific IPv6 literal binds
+just that address (IPv6 only); and `"v6only": true` makes a `"::"` listener
+IPv6-only. Several servers may share one `host`/`port` pair and be told apart by
+`hostname` (SNI on TLS, the `Host` header on plaintext).
 
 | Key | Type | Default | Limit | What it does |
 |---|---|---|---|---|
-| `host` | string | — **required** | ≤ 63 | Bind address: **an IPv4 literal, or `"::"`**. Names are not resolved — `"localhost"` and `"::1"` are both refused. |
+| `host` | string | — **required** | ≤ 63 | Bind address: **an IPv4 or IPv6 literal**. `"0.0.0.0"` and `"::"` are the dual-stack wildcard; a specific IPv4 (`"192.0.2.1"`) or IPv6 (`"2001:db8::1"`, `"::1"`) binds that one address. Names are not resolved — `"localhost"` is refused, and a zone id (`"fe80::1%eth0"`) is not accepted. |
+| `v6only` | integer | `0` | `0` or `1` | `1` sets `IPV6_V6ONLY`, so a `"::"` host binds **IPv6-only** instead of dual-stack. Meaningful only with `"::"` — a specific IPv4 or IPv6 literal is already single-family. |
 | `port` | integer | — **required** | `0`, or 1–65535 | Bind port. **`0` means "let the kernel choose a free one"** — see below. The key itself is still required, so a random port is always something the config asked for. |
 | `hostname` | string | — **required** | ≤ 255 | The name this server answers to. Not empty. |
 | `locations` | array | — **required** | 1–8 | Path routing. At least one. |
