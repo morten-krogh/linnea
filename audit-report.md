@@ -18,7 +18,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 9. **Low: HTTP/3 critical-stream closure can be missed when closure arrives before stream typing.** Reordered FIN/RESET/STOP_SENDING state is not retained for an as-yet-untyped control or QPACK stream. **— OPEN (audit-only pass; no source changes made).**
 10. **Low: HTTP/3 accepts duplicate QPACK encoder or decoder streams.** Unlike the control stream, the QPACK stream handlers overwrite the saved ID instead of raising a stream-creation error. **— OPEN (audit-only pass; no source changes made).**
 11. **High: a completed HTTP/3 request stream can be dispatched again.** Duplicate suppression lasts only while a response slot or refusal entry is active; a fresh-packet-number retransmission can reach the application again after an inline reply, or after a response slot is reaped. **— OPEN (audit-only pass; no source changes made).**
-12. **Medium: QUIC final-size invariants are not enforced.** A later FIN silently replaces the remembered final size, and RESET_STREAM final sizes are discarded, instead of conflicting sizes or data beyond the final size closing the connection with `FINAL_SIZE_ERROR`. **— OPEN (audit-only pass; no source changes made).**
+12. **Medium: QUIC final-size invariants are not enforced.** A later FIN silently replaces the remembered final size, and RESET_STREAM final sizes are discarded, instead of conflicting sizes or data beyond the final size closing the connection with `FINAL_SIZE_ERROR`. **— FIXED (FIN side): a conflicting FIN size, a FIN below the highest byte received, or data past a fixed final size now close the connection `FINAL_SIZE_ERROR` (0x06); A/B-verified with injected packets. The RESET_STREAM cross-check is documented as scoped out (no residual transport-integrity risk).**
 13. **Medium: malformed and forbidden QUIC transport parameters are accepted.** Truncation is treated as end-of-list, duplicate parameters overwrite, integer payloads may carry trailing bytes, and several invalid or client-forbidden values never set `TRANSPORT_PARAMETER_ERROR`. **— OPEN (audit-only pass; no source changes made).**
 14. **Medium: QUIC stream direction and state are not validated.** Frames naming server-initiated or send-only streams are skipped or acted on without the required `STREAM_STATE_ERROR`. **— OPEN (audit-only pass; no source changes made).**
 15. **Medium: accepted 0-RTT bypasses normal QUIC frame and stream-limit checks.** Early packets jump directly into the STREAM scanner, so prohibited frame types and over-limit early stream IDs do not receive the errors applied to 1-RTT packets. **— OPEN (audit-only pass; no source changes made).**
@@ -811,7 +811,29 @@ cannot forget a still-retransmittable stream merely because later requests ran.
 
 Severity: Medium (P2 transport-state integrity and stream availability)  
 Confidence: High  
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED (FIN side)** — a stream's final size is now fixed once a FIN
+learns it. Both FIN-recording sites (the window path and the direct-to-file body
+path) check the size a FIN declares against any already stored: a repeat FIN
+must name the same size, and on the window path the size must be at least the
+highest byte already received (`base + .hi`). A new byte range whose absolute
+extent runs past a fixed final size is also rejected, in the `.hi` update. All
+three route to a new `.ra_final_size_error` that releases the context and closes
+the connection with transport error `0x06` (`FINAL_SIZE_ERROR`, RFC 9000 4.5),
+mirroring the existing `FLOW_CONTROL_ERROR` path. A/B-verified against a pre-fix
+binary with hand-injected 1-RTT packets (`test/quic/h3_final_size.py`): two FINs
+with a decreasing size, two FINs with an increasing size, and data past a
+declared final all silently succeeded before and now close `0x06`.
+
+**Scoped out (documented):** the RESET_STREAM final-size cross-check.
+`linnea_quic_reset_scan` still records only the stream id, and `reset_teardown`
+releases the reassembly context regardless — so a RESET_STREAM whose final size
+contradicts a prior FIN is not itself a `FINAL_SIZE_ERROR`. This leaves no
+inconsistent transport state (the stream is torn down either way, and
+`rst_remember`/`rst_known` keep a reset stream from being served or re-dispatched
+by a later frame), and fully enforcing it would require both widening the shared
+frame scanner to carry the final size and a persistent per-stream final-size
+table to catch a RESET-then-FIN after teardown — disproportionate to the
+residual risk, which is nil for transport integrity.
 
 ### Evidence
 

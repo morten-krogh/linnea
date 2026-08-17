@@ -2670,9 +2670,19 @@ linnea_quic_server_datagram:
     ; the window path would have recorded, so record it here instead.
     cmp qword [s_sfin], 0
     je .ra_bcheck
-    mov qword [rax + linnea_quic_ra.fin], 1
     mov rcx, [s_soff]
-    add rcx, [s_slen]
+    add rcx, [s_slen]                          ; the final size this FIN declares
+    ; RFC 9000 4.5 (Finding 12): fixed once learned. On this path the body is
+    ; written straight to the capture file, so .hi is not the stream's high-water;
+    ; enforce the repeat-FIN equality here and leave the received-past-final check
+    ; to the window path, where any bytes beyond the body region land.
+    cmp qword [rax + linnea_quic_ra.fin], 0
+    je .ra_body_set_final
+    cmp rcx, [rax + linnea_quic_ra.final]
+    jne .ra_final_size_error                   ; a second FIN with a different size
+    jmp .ra_bcheck
+.ra_body_set_final:
+    mov qword [rax + linnea_quic_ra.fin], 1
     mov [rax + linnea_quic_ra.final], rcx      ; an absolute stream offset
 .ra_bcheck:
     mov rcx, [rax + linnea_quic_ra.body_hi]
@@ -2793,6 +2803,15 @@ linnea_quic_server_datagram:
     mov r10, [rax + linnea_quic_ra.hi]
     cmp r11, r10
     jbe .ra_advance
+    ; data extending past a final size already fixed by a FIN is FINAL_SIZE_ERROR
+    ; (RFC 9000 4.5, Finding 12). r11 is the new extent relative to base.
+    cmp qword [rax + linnea_quic_ra.fin], 0
+    je .ra_hi_store
+    mov r10, [rax + linnea_quic_ra.base]
+    add r10, r11                               ; absolute high-water mark
+    cmp r10, [rax + linnea_quic_ra.final]
+    ja .ra_final_size_error
+.ra_hi_store:
     mov [rax + linnea_quic_ra.hi], r11
 .ra_advance:
     push rax
@@ -2803,9 +2822,22 @@ linnea_quic_server_datagram:
     pop rax
     cmp qword [s_sfin], 0
     je .ra_after_win
-    mov qword [rax + linnea_quic_ra.fin], 1
     mov r10, [s_soff]
-    add r10, [s_slen]
+    add r10, [s_slen]                          ; the final size this FIN declares
+    ; RFC 9000 4.5 (Finding 12): a stream's final size is fixed once learned. A
+    ; repeat FIN must name the same size, and the size must cover every byte
+    ; already received; a violation is FINAL_SIZE_ERROR.
+    cmp qword [rax + linnea_quic_ra.fin], 0
+    je .ra_set_final
+    cmp r10, [rax + linnea_quic_ra.final]
+    jne .ra_final_size_error                   ; a second FIN with a different size
+    jmp .ra_after_win                          ; a retransmitted FIN: same size, fine
+.ra_set_final:
+    mov r11, [rax + linnea_quic_ra.base]
+    add r11, [rax + linnea_quic_ra.hi]         ; highest offset received, absolutely
+    cmp r10, r11
+    jb .ra_final_size_error                    ; declares fewer bytes than received
+    mov qword [rax + linnea_quic_ra.fin], 1
     mov [rax + linnea_quic_ra.final], r10      ; an absolute stream offset
 .ra_after_win:
     ; While a payload is open, what was just buffered belongs to the frame AFTER
@@ -3137,6 +3169,15 @@ linnea_quic_server_datagram:
     ; violation, and the connection closes for it (RFC 9000 4.1:
     ; FLOW_CONTROL_ERROR = 0x03).
     mov edi, 0x03                               ; FLOW_CONTROL_ERROR
+    mov esi, 0x08                               ; a STREAM frame triggered it
+    jmp .transport_close
+.ra_final_size_error:
+    ; RFC 9000 4.5 (Finding 12): a FIN whose final size conflicts with one
+    ; already learned, that is below the highest byte received, or data that
+    ; extends past a fixed final size, all close the connection FINAL_SIZE_ERROR.
+    mov rdi, rax
+    call ra_release                             ; abandon the offending stream
+    mov edi, 0x06                               ; FINAL_SIZE_ERROR
     mov esi, 0x08                               ; a STREAM frame triggered it
     jmp .transport_close
 .ra_more:

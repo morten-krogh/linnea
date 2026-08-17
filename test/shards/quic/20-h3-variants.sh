@@ -113,6 +113,23 @@ else
     check "h3 stop-close test (skipped: deps unavailable)" 0
 fi
 
+# RFC 9000 4.5 (Finding 12): a stream's final size is fixed once a FIN learns
+# it. The test hand-injects 1-RTT packets that aioquic will not craft -- two
+# FINs with a decreasing then an increasing size, and data past a declared final
+# -- each of which was silently accepted before and must now close the
+# connection FINAL_SIZE_ERROR (0x06).
+if python3 -c 'import aioquic' 2>/dev/null; then
+    start_server $CFG/tls-h3-drain.json
+    fs_port=$SRV_PORT
+    fs_master=$SRV_PID
+    timeout 40 python3 test/quic/h3_final_size.py ${fs_port} >/dev/null 2>&1
+    check "h3 QUIC final-size invariants close FINAL_SIZE_ERROR (Finding 12)" $?
+    kill -9 $fs_master 2>/dev/null
+    wait $fs_master 2>/dev/null
+else
+    check "h3 final-size test (skipped: deps unavailable)" 0
+fi
+
 # Drain with an in-flight h3 response (Q117): the drain-exit test used to count
 # only TCP connections, so a worker whose work was all QUIC exited the moment
 # the drain began (and stopped re-arming the datagram recv besides) — the peer
