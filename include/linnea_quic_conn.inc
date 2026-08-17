@@ -817,6 +817,11 @@ struc linnea_quic_conn
     .cwnd:       resq 1             ; congestion window in bytes (0 = uninitialised)
     .ssthresh:   resq 1             ; slow-start threshold in bytes
     .bytes_in_flight: resq 1        ; unacknowledged stream-chunk bytes across all streams
+    ; The inline / control ack-eliciting bytes held in the loss-recovery ring
+    ; (Finding 16). Kept apart from bytes_in_flight so the sent-ring lifecycle
+    ; (record / ack / give-up) balances it without touching the pump's chunk
+    ; accounting, and both admission checks gate on the SUM of the two.
+    .inline_flight: resq 1
     .cc_recovery_pn: resq 1         ; largest pn when recovery began (loss dedup)
     .tx_rr:      resq 1             ; round-robin cursor: the slot the pump starts at
                                     ; next, so a small (loss-shrunk) window is shared

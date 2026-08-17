@@ -22,7 +22,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 13. **Medium: malformed and forbidden QUIC transport parameters are accepted.** Truncation is treated as end-of-list, duplicate parameters overwrite, integer payloads may carry trailing bytes, and several invalid or client-forbidden values never set `TRANSPORT_PARAMETER_ERROR`. **— OPEN (audit-only pass; no source changes made).**
 14. **Medium: QUIC stream direction and state are not validated.** Frames naming server-initiated or send-only streams are skipped or acted on without the required `STREAM_STATE_ERROR`. **— OPEN (audit-only pass; no source changes made).**
 15. **Medium: accepted 0-RTT bypasses normal QUIC frame and stream-limit checks.** Early packets jump directly into the STREAM scanner, so prohibited frame types and over-limit early stream IDs do not receive the errors applied to 1-RTT packets. **— OPEN (audit-only pass; no source changes made).**
-16. **Medium: inline HTTP/3 and control packets bypass QUIC congestion accounting and can fall out of loss recovery.** Only bulk response chunks are gated by `cwnd`; the eight-entry small-packet ring silently stops tracking additional replies. **— OPEN (audit-only pass; no source changes made).**
+16. **Medium: inline HTTP/3 and control packets bypass QUIC congestion accounting and can fall out of loss recovery.** Only bulk response chunks are gated by `cwnd`; the eight-entry small-packet ring silently stops tracking additional replies. **— FIXED: ack-eliciting inline/control packets are now charged to a shared in-flight total (`inline_flight` + `bytes_in_flight`), an inline response is admitted only if it fits `cwnd` and a recovery slot, and the overflow is handed to the congestion-controlled pump rather than sent untracked; quic+tls shards green, burst answered 40/40 even with the ring forced to one slot.**
 17. **Medium: HTTP/3 trailer field sections are skipped without QPACK or semantic validation.** Invalid compressed trailers and forbidden trailer pseudo-fields are accepted. **— OPEN (audit-only pass; no source changes made).**
 18. **Medium: HTTP/3 does not reconcile `content-length` with DATA bytes.** A short or long body is routed and proxied instead of being rejected as a malformed message. **— FIXED (commit 514532a).**
 19. **Medium: single-frame HTTP/3 request bodies bypass `max_body`.** The copy-free offset-zero-plus-FIN path reaches routing without either of the cap checks used by reassembly. **— FIXED (commit 13db631).**
@@ -1072,7 +1072,26 @@ limits, and the relevant reset/flow scans before dispatching STREAM data.
 
 Severity: Medium (P2 congestion-control and response reliability)  
 Confidence: High  
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — inline responses now share one congestion budget and one
+recovery discipline with the bulk pump. Every ack-eliciting inline/control
+packet is charged to a new `inline_flight` counter as it enters the recovery
+ring (`linnea_quic_rtx_record`) and un-charged when the ring frees it (on ACK in
+`linnea_quic_rtx_ack_range`, on give-up in the sweep); the counter is kept apart
+from `bytes_in_flight` so the ring's own lifecycle balances it, and both
+admission checks — the pump's and the new inline one — gate on the SUM of the
+two against `cwnd`. Before an inline response is emitted, `.inline_admit` checks
+that it fits `cwnd` AND that a recovery slot is free; if either is unavailable
+the response is handed to the congestion-controlled pump as a head-only response
+stream (its bytes become the stream head, no file body), which sends it once ACKs
+free the window — so no response is ever emitted untracked or beyond `cwnd`. A
+response too large for a slot header, or arriving when every response slot is
+busy, falls back to an inline send (a rare, bounded overshoot, documented in the
+code). Control frames (MAX_STREAMS, HANDSHAKE_DONE, …) keep their reliable
+immediate send but are now counted. Verified: the full quic and tls shards pass;
+a 40-request burst is answered in full, and — forcing the ring to a single slot
+so all but one response must traverse the deferral path — a 40-request burst is
+still answered 40/40, exercising the pump route for 39 of them. Regression test
+`test/quic/h3_inline_burst.py`.
 
 ### Evidence
 

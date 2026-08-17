@@ -130,6 +130,23 @@ else
     check "h3 final-size test (skipped: deps unavailable)" 0
 fi
 
+# Finding 16: a burst of small requests larger than the loss-recovery ring must
+# still be answered in full. Inline responses beyond the ring (or the congestion
+# window) are handed to the congestion-controlled pump instead of being emitted
+# untracked, so none is dropped.
+if python3 -c 'import aioquic' 2>/dev/null; then
+    start_server $CFG/tls-h3-drain.json
+    ib_port=$SRV_PORT
+    ib_master=$SRV_PID
+    out=$(timeout 40 python3 test/quic/h3_inline_burst.py ${ib_port} 40 2>&1)
+    case "$out" in ok*) true ;; *) false ;; esac
+    check "h3 inline-response burst is answered in full ($out) (Finding 16)" $?
+    kill -9 $ib_master 2>/dev/null
+    wait $ib_master 2>/dev/null
+else
+    check "h3 inline-burst test (skipped: deps unavailable)" 0
+fi
+
 # Drain with an in-flight h3 response (Q117): the drain-exit test used to count
 # only TCP connections, so a worker whose work was all QUIC exited the moment
 # the drain began (and stopped re-arming the datagram recv besides) — the peer

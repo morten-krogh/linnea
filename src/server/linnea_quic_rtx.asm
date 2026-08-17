@@ -157,6 +157,9 @@ linnea_quic_rtx_record:
     jnz .scan
     ret                               ; ring full: drop
 .free:
+    ; charge these ack-eliciting bytes to the connection's in-flight total for
+    ; congestion admission (Finding 16); the ack and give-up paths uncharge it
+    add [rdi + linnea_quic_conn.inline_flight], rcx
     mov qword [rax + linnea_quic_sent.in_use], 1
     mov [rax + linnea_quic_sent.pn], rsi
     mov [rax + linnea_quic_sent.sent_ms], r8
@@ -187,6 +190,8 @@ linnea_quic_rtx_ack_range:
     jb .next                          ; below the range
     cmp r8, rdx
     ja .next                          ; above the range
+    mov r8, [rax + linnea_quic_sent.len]
+    sub [rdi + linnea_quic_conn.inline_flight], r8   ; uncharge (Finding 16)
     mov qword [rax + linnea_quic_sent.in_use], 0
     inc r9
 .next:

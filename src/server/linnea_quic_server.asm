@@ -3935,6 +3935,63 @@ linnea_quic_server_datagram:
     lea rdx, [rax + rbx]             ; STREAM frame length
     cmp rdx, LINNEA_QUIC_STRM_PAY
     ja .serve_toolong
+    ; Finding 16: an inline response must share the congestion window and the
+    ; loss-recovery ring with everything else in flight. Emit it inline only if
+    ; both have room; otherwise hand it to the congestion-controlled pump as a
+    ; head-only response stream, which sends it when acks free the window.
+    push rax                          ; h3 response length
+    push rbx                          ; its offset within strm_pay
+    mov rdi, [cur_conn]
+    mov rsi, rdx                      ; the packet payload length
+    call .inline_admit                ; eax = 1 emit now, 0 defer
+    pop rbx
+    pop rax
+    test eax, eax
+    jz .serve_defer
+    lea rdx, [rax + rbx]
+    lea rsi, [strm_pay]
+    call .send_1rtt
+    jmp .stream_scan
+.serve_defer:
+    ; The whole response becomes the stream head (no file body). It must fit the
+    ; slot header and find a free slot; failing either, emit it inline -- a rare,
+    ; bounded overshoot for a large response while the window is full.
+    cmp rax, LINNEA_QUIC_TX_HDR
+    ja .serve_defer_force
+    mov rcx, [cur_conn]
+    lea rdx, [rcx + linnea_quic_conn.tx_streams]
+    mov r10d, LINNEA_QUIC_TXSTREAMS
+.sd_scan:
+    cmp qword [rdx + linnea_quic_txstream.active], 0
+    je .sd_found
+    add rdx, linnea_quic_txstream_size
+    dec r10d
+    jnz .sd_scan
+    jmp .serve_defer_force            ; every response slot busy: emit inline
+.sd_found:
+    mov qword [rdx + linnea_quic_txstream.base], 0
+    mov qword [rdx + linnea_quic_txstream.size], 0
+    mov qword [rdx + linnea_quic_txstream.foff], 0
+    mov qword [rdx + linnea_quic_txstream.flen], 0
+    mov [rdx + linnea_quic_txstream.hlen], rax     ; the response is entirely head
+    mov r10, [s_sid]
+    mov [rdx + linnea_quic_txstream.sid], r10
+    mov qword [rdx + linnea_quic_txstream.off], 0
+    mov qword [rdx + linnea_quic_txstream.inflight], 0
+    mov r10, [rcx + linnea_quic_conn.fc_stream_init]
+    mov [rdx + linnea_quic_txstream.fc_max], r10
+    mov qword [rdx + linnea_quic_txstream.urgency], 3      ; default priority
+    mov qword [rdx + linnea_quic_txstream.incremental], 0
+    mov qword [rdx + linnea_quic_txstream.pending], 0
+    mov qword [rdx + linnea_quic_txstream.active], 1
+    lea rsi, [strm_pay + rbx]         ; the response head into the slot
+    lea rdi, [rdx + linnea_quic_txstream.hdr]
+    mov rcx, rax
+    rep movsb
+    call tx_pump
+    jmp .stream_scan
+.serve_defer_force:
+    lea rdx, [rax + rbx]
     lea rsi, [strm_pay]
     call .send_1rtt
     jmp .stream_scan
@@ -5112,6 +5169,38 @@ linnea_quic_server_datagram:
     mov rcx, [s_pl_len]
     call linnea_quic_rtx_record
     pop rbx
+    ret
+
+; .inline_admit(rdi = conn, rsi = packet payload length) -> eax = 1 when this
+; inline response may be emitted now, 0 when it must be deferred (Finding 16):
+; it fits the congestion window (bytes_in_flight + inline_flight + len <= cwnd)
+; AND a loss-recovery slot is free to hold it for retransmission. cwnd is
+; lazily initialised here as the pump does, so the very first reply is admitted.
+.inline_admit:
+    mov rax, [rdi + linnea_quic_conn.cwnd]
+    test rax, rax
+    jnz .iadm_have
+    mov rax, LINNEA_QUIC_INIT_CWND
+    mov [rdi + linnea_quic_conn.cwnd], rax
+.iadm_have:
+    mov rcx, [rdi + linnea_quic_conn.bytes_in_flight]
+    add rcx, [rdi + linnea_quic_conn.inline_flight]
+    add rcx, rsi
+    cmp rcx, rax
+    ja .iadm_no                       ; window full
+    lea rax, [rdi + linnea_quic_conn.sent]
+    mov ecx, LINNEA_QUIC_RTX_SLOTS
+.iadm_scan:
+    cmp qword [rax + linnea_quic_sent.in_use], 0
+    je .iadm_yes
+    add rax, linnea_quic_sent_size
+    dec ecx
+    jnz .iadm_scan
+.iadm_no:
+    xor eax, eax
+    ret
+.iadm_yes:
+    mov eax, 1
     ret
 
 ; .send_flight — release Handshake flight chunks from conn.flight_off up to
@@ -6449,6 +6538,7 @@ tx_pump:
     cmp rcx, [rbx + linnea_quic_conn.fc_conn_max]
     ja .tp_ret
     mov rcx, [rbx + linnea_quic_conn.bytes_in_flight]
+    add rcx, [rbx + linnea_quic_conn.inline_flight]   ; inline/control share the window (Finding 16)
     add rcx, r13
     cmp rcx, [rbx + linnea_quic_conn.cwnd]
     ja .tp_ret
@@ -7285,6 +7375,8 @@ linnea_quic_server_rtx_sweep:
     jb .sw_rec_next                   ; not yet due
     cmp qword [r14 + linnea_quic_sent.tries], LINNEA_QUIC_PTO_MAX
     jb .sw_resend
+    mov rax, [r14 + linnea_quic_sent.len]
+    sub [rbx + linnea_quic_conn.inline_flight], rax   ; uncharge (Finding 16)
     mov qword [r14 + linnea_quic_sent.in_use], 0    ; a small reply given up on
     jmp .sw_rec_next
 .sw_resend:
