@@ -350,11 +350,12 @@ LINNEA_QUIC_RA_RANGES   equ 32
 ; path bad enough to have doubled its PTO several times is well inside it.
 LINNEA_QUIC_RA_STALE_MS equ 5000
 
-; 0-RTT (early data): a resuming client can send its request in a 0-RTT packet
+; 0-RTT (early data): a resuming client can send its request in 0-RTT packets
 ; coalesced with the ClientHello, before the handshake completes. The decrypted
-; early frames are buffered here and served once the 1-RTT keys are up. Small: a
-; 0-RTT request is a single GET (a large early body is neither expected nor kept).
-LINNEA_QUIC_EARLY_BUF   equ 1024
+; frame bytes from the whole early flight are buffered here and served once the
+; 1-RTT keys are up. This is deliberately bounded: requests past the cap are
+; not silently allowed to overwrite connection state.
+LINNEA_QUIC_EARLY_BUF   equ 16384
 
 ; A response too large for one packet is sent as a sequence of STREAM-frame
 ; chunks, each in its own 1-RTT packet, each datagram under the 1200-byte floor

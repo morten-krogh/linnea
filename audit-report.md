@@ -13,7 +13,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 4. **Medium: HTTP/2 accepts a trailer `HEADERS` block without `END_STREAM`.** The malformed trailer is consumed without failing the stream or completing the request, leaving the body slot collecting and allowing later `DATA` on the same stream. **— FIXED (commit 97046ff).**
 5. **Medium: HTTP/2 silently drops stream frames whose IDs have no live slot.** `DATA` on idle or closed streams and `WINDOW_UPDATE`/`RST_STREAM` on idle streams are consumed without the required state-specific error; dropped `DATA` replenishes only the connection window. **— FIXED (idle-stream case): DATA/WINDOW_UPDATE/RST_STREAM on an idle stream (even id, or above the highest opened) now draw a connection PROTOCOL_ERROR instead of being silently ignored; closed-stream frames keep the RFC-permitted lenient handling. A/B-verified.**
 6. **Medium: QUIC connection-level receive credit counts duplicate stream bytes.** Retransmissions under fresh packet numbers increment `fc_recv` even when stream reassembly recognizes every byte as already received, causing premature `MAX_DATA` grants. **— FIXED: connection credit now advances from per-stream receive high-water growth, so fresh-packet-number retransmissions and overlaps do not trigger extra `MAX_DATA`; covered by `test/quic/h3_fc_dedup_test.py`.**
-7. **Medium: coalesced QUIC 0-RTT processing stops after the first early packet.** Later 0-RTT packets in the same datagram are neither decrypted nor acknowledged, so multi-packet early requests fall back to retransmission or remain incomplete. **— OPEN (audit-only pass; no source changes made).**
+7. **Medium: coalesced QUIC 0-RTT processing stops after the first early packet.** Later 0-RTT packets in the same datagram are neither decrypted nor acknowledged, so multi-packet early requests fall back to retransmission or remain incomplete. **— FIXED: the early walk now advances by each protected packet length, decrypts and acknowledges every valid 0-RTT packet, and replays the combined frame stream through normal reassembly; covered by `test/quic/h3_0rtt_coalesced_test.py`.**
 8. **Low: HTTP/3 SETTINGS validation is bounded and partially discarded.** SETTINGS payloads larger than the local capture buffer are skipped without validation, and duplicate detection stops after 32 identifiers; the peer's maximum response field-section size is also not retained. **— OPEN (audit-only pass; no source changes made).**
 9. **Low: HTTP/3 critical-stream closure can be missed when closure arrives before stream typing.** Reordered FIN/RESET/STOP_SENDING state is not retained for an as-yet-untyped control or QPACK stream. **— OPEN (audit-only pass; no source changes made).**
 10. **Low: HTTP/3 accepts duplicate QPACK encoder or decoder streams.** Unlike the control stream, the QPACK stream handlers overwrite the saved ID instead of raising a stream-creation error. **— FIXED: a second QPACK encoder/decoder stream now draws H3_STREAM_CREATION_ERROR like a second control stream, instead of overwriting the saved id; A/B-verified.**
@@ -51,10 +51,11 @@ choice.
 
 **Fix status.** Finding 1 fixed (earlier). Findings 3, 4, 6, 18, 19, 24 fixed and
 suite-tested this pass (commits above; each reproduced pre-fix and A/B-verified).
-Finding 2 left as-is (unreachable without transferring ~18 EB). Findings 7–9,
-14–15, and 20 remain open: early-data work (7), critical-stream and SETTINGS
-gaps (8–9), stream-direction and 0-RTT checks (14–15), and negotiated UDP-size
-enforcement (20). Finding 3 is reachable with an ordinary small request whenever
+Finding 2 left as-is (unreachable without transferring ~18 EB). Finding 7 is
+now fixed and covered by a coalesced-packet regression. Findings 8–9, 14–15,
+and 20 remain open: critical-stream and SETTINGS gaps (8–9), stream-direction
+and 0-RTT checks (14–15), and negotiated UDP-size enforcement (20). Finding 3
+is reachable with an ordinary small request whenever
 an operator sets `max_body` below the
 request-buffer capacity.
 
@@ -561,7 +562,7 @@ retransmissions are deduplicated as well. A shared helper performs the
 
 Severity: Medium (P2 early-data availability and QUIC conformance)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — the early walk now processes every coalesced 0-RTT packet.
 
 ### Evidence
 
@@ -600,6 +601,21 @@ frames through the normal per-stream reassembly path. If the implementation
 keeps a bounded early-data buffer, reject or defer excess data explicitly rather
 than silently ending the walk after the first packet.
 
+### Resolution
+
+The early-data walker now decodes the protected length of each 0-RTT packet,
+advances to the next packet in the datagram, and records every successfully
+opened packet number in the shared application ACK state. Decrypted frame bytes
+are appended to a bounded 16 KiB per-connection buffer instead of replacing the
+previous packet. Once 1-RTT keys are available, the combined bytes are replayed
+directly through the ordinary stream scanner, so both independent requests and
+requests split across early packets use the existing per-stream reassembly.
+
+If the bounded capture would overflow, the walker continues acknowledging valid
+packets but marks the early flight refused; handshake completion sends an
+explicit `H3_REQUEST_REJECTED` connection close rather than silently dropping a
+prefix.
+
 ### Regression tests to add
 
 - Build a valid coalesced datagram containing two 0-RTT packets and assert both
@@ -608,6 +624,11 @@ than silently ending the walk after the first packet.
   without 1-RTT retransmission.
 - Put one request across two early packets and assert it is assembled and served
   directly from early data.
+
+`test/quic/h3_0rtt_coalesced_test.py` covers all three cases against the
+production server: two complete requests in separate coalesced packets, one
+request split across two packets, and ACK coverage for both early packet
+numbers.
 
 ## Finding 8 — HTTP/3 SETTINGS validation is bounded and partially discarded
 

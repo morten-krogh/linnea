@@ -454,6 +454,12 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_0rtt_ack_test.py ${P61452} >/dev/null 2>&1
     check "h3 (io_uring): the 0-RTT packet is acknowledged" $?
 
+    # quic-7: multiple 0-RTT packets may be coalesced with the ClientHello.
+    # They must all be decrypted, acknowledged, and fed to stream reassembly;
+    # the second packet used to be silently left in the datagram.
+    python3 test/quic/h3_0rtt_coalesced_test.py ${P61452} >/dev/null 2>&1
+    check "h3 (io_uring): processes all coalesced 0-RTT packets" $?
+
     # BPF connection-ID steering: a connection survives the client migrating to a
     # fresh source port. Needs CAP_BPF on the binary (a rebuild drops the file
     # capability), so it is skipped when the steering program could not load.

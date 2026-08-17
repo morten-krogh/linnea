@@ -525,6 +525,8 @@ s_hs_chunk:  resq 1              ; byte length of the flight chunk being framed
 s_cv_off:    resq 1              ; hsmsg offset of CertVerify while staging the tail
 s_fin_off:   resq 1              ; hsmsg offset of Finished while staging the tail
 s_walk_next: resq 1              ; next coalesced packet, so the Finished walk can go on
+s_early_next: resq 1             ; next coalesced packet in the 0-RTT walk
+s_early_len:  resq 1              ; one decrypted 0-RTT payload, across the ACK call
 linnea_h3_altsvc:     resb 48    ; Alt-Svc value, e.g. h3=":443"; ma=86400
 linnea_h3_altsvc_len: resq 1     ; 0 until a QUIC listener is bound
 linnea_h3_server:     resq 1     ; index of the server that owns that listener
@@ -1725,8 +1727,27 @@ linnea_quic_server_datagram:
     mov r15, rdi
     jmp .ew_loop
 .ew_zrtt:
-    ; a 0-RTT packet: unprotect it with the early keys (long header, no token, so
-    ; the Handshake-packet path applies) and buffer its frames for completion.
+    ; A 0-RTT packet: find its protected length before opening it so the walk can
+    ; continue to the next coalesced packet.  0-RTT has no token, so after the
+    ; source-connection-id the next varint is Length (pn + payload + tag).
+    movzx eax, byte [r15 + 5]        ; DCID length
+    lea rdi, [r15 + 6 + rax]
+    movzx eax, byte [rdi]             ; SCID length
+    lea rdi, [rdi + 1 + rax]          ; -> Length
+    lea rsi, [linnea_quic_rxbuf + r13]
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .early_done                   ; malformed tail: no safe next cursor
+    add rdi, rdx
+    add rdi, rax                     ; -> next coalesced packet
+    cmp rdi, rsi
+    ja .early_done                   ; Length ran past this datagram
+    mov [s_early_next], rdi
+
+    ; Unprotect it with the early keys (long header, no token, so the Handshake-
+    ; packet path applies) and append its frames for completion. Previously this
+    ; path fell through to .early_done after the first packet and overwrote the
+    ; one-packet buffer on every retry of this code.
     mov rdi, r15
     lea rsi, [linnea_quic_rxbuf + r13]
     sub rsi, r15
@@ -1735,7 +1756,12 @@ linnea_quic_server_datagram:
     lea rcx, [plaintext]
     call linnea_quic_unprotect_hs    ; rax = frame bytes, rdx = packet number
     test rax, rax
-    js .early_done
+    jns .ew_opened
+    cmp rax, -2                       ; authenticated reserved bits: keep the
+    je .early_done                    ; existing connection-level handling
+    jmp .ew_next                      ; bad packet: a later coalesced one may open
+.ew_opened:
+    mov [s_early_len], rax
     ; RFC 9000 13.2.1: this packet MUST be acknowledged. 0-RTT shares the
     ; Application packet number space with 1-RTT, so recording its number into
     ; rx_have is enough — the ACK rides the HANDSHAKE_DONE packet, whose ACK is
@@ -1743,19 +1769,37 @@ linnea_quic_server_datagram:
     ; client declared its early request lost and re-sent it in 1-RTT, where it
     ; was served a SECOND time (harmless for the idempotent GET/HEAD that 0-RTT
     ; carries, but a needless duplicate and a MUST unmet).
-    push rax                         ; frame count, across the record call
     mov rsi, rdx                     ; the 0-RTT packet number
     CONNLEA rdi, rx_have
     call linnea_quic_ack_record
-    pop rax
-    cmp rax, LINNEA_QUIC_EARLY_BUF
-    ja .early_done                   ; oversized early data: drop it (served fresh)
+
+    ; Append, rather than replace, the packet's frames. If the bounded early
+    ; capture is exhausted, keep walking and acknowledging the remaining valid
+    ; packets, but mark the capture refused. The completion path turns that
+    ; marker into an explicit H3 request rejection instead of pretending the
+    ; tail was never received.
     mov rbx, [cur_conn]
-    mov [rbx + linnea_quic_conn.early_len], rax
+    mov rax, [rbx + linnea_quic_conn.early_len]
+    cmp rax, -1
+    je .ew_next
+    mov rcx, [s_early_len]
+    add rcx, rax
+    jc .ew_overflow
+    cmp rcx, LINNEA_QUIC_EARLY_BUF
+    ja .ew_overflow
+    mov r10, rcx                    ; preserve the new total across the copy
     lea rdi, [rbx + linnea_quic_conn.early_buf]
+    add rdi, rax
     lea rsi, [plaintext]
-    mov rcx, rax
+    mov rcx, [s_early_len]
     rep movsb
+    mov [rbx + linnea_quic_conn.early_len], r10
+.ew_next:
+    mov r15, [s_early_next]
+    jmp .ew_loop
+.ew_overflow:
+    mov qword [rbx + linnea_quic_conn.early_len], -1
+    jmp .ew_next
 .early_done:
     ; the flight is out: leave ST_NEW so a retransmitted ClientHello is recognized
     ; as a duplicate (above) rather than rebuilding the flight with fresh keys.
@@ -1974,17 +2018,24 @@ linnea_quic_server_datagram:
     ; replay them through the ordinary stream path (the response rides 1-RTT).
     mov rbx, [cur_conn]
     mov rax, [rbx + linnea_quic_conn.early_len]
+    cmp rax, -1
+    je .early_reject
     test rax, rax
     jz .done
     mov qword [rbx + linnea_quic_conn.early_len], 0   ; serve once
-    lea rsi, [rbx + linnea_quic_conn.early_buf]
-    lea rdi, [plaintext]
-    mov rcx, rax
-    rep movsb
-    lea r15, [plaintext + rax]       ; frames end
-    lea r14, [plaintext]             ; scan cursor
+    ; Replay directly from the connection buffer. It may contain several
+    ; decrypted 0-RTT packets and is larger than the per-packet plaintext
+    ; scratch, so copying it back through `plaintext` would truncate the flight.
+    lea r14, [rbx + linnea_quic_conn.early_buf]
+    lea r15, [r14 + rax]              ; frames end
     jmp .stream_scan
     ; (.stream_scan serves the request(s) and jmps .done)
+.early_reject:
+    ; The bounded early capture could not hold the complete flight. Do not
+    ; silently serve a prefix while dropping the rest: reject the early request
+    ; explicitly and let a conforming client retry it in 1-RTT.
+    mov edi, LINNEA_H3_ERR_REQ_REJECTED
+    jmp .h3_close
 
 ; --- 1-RTT (short-header) packet: HTTP/3 requests on QUIC streams ---
 ; One packet can carry several STREAM frames (requests on different streams),
