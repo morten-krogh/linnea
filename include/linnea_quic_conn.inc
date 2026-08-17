@@ -384,6 +384,7 @@ LINNEA_QUIC_TX_CHUNK    equ 1100    ; stream bytes per 1-RTT packet
 LINNEA_QUIC_TX_HDR      equ 1024
 LINNEA_QUIC_TXSTREAMS   equ 100     ; = advertised initial_max_streams_bidi
 LINNEA_QUIC_RST_SEEN    equ 32      ; cancelled stream ids remembered per connection
+LINNEA_QUIC_SERVED_SEEN equ 32      ; out-of-order served request-stream ids (a ring)
 ; Bidi-stream flow control (RFC 9000 4.6). We advertise this many streams up front,
 ; then raise the peer's limit with MAX_STREAMS as it opens streams, so a long-lived
 ; (reused) connection never runs out — without this a browser that refreshes enough
@@ -762,6 +763,17 @@ struc linnea_quic_conn
     ; until concurrent requests are refused with a 503.
     .rst_ids:    resq LINNEA_QUIC_RST_SEEN
     .rst_cursor: resq 1
+    ; Client request streams already DISPATCHED, so a fresh-packet-number
+    ; retransmission of one whose response was inline (forgotten at once) or whose
+    ; slot was reaped after its ack is acknowledged, not served again (quic-11).
+    ; The active-slot and rst_ids checks miss exactly those: a completed stream
+    ; leaves no trace, so the retransmit re-routed -- a proxied POST twice. A
+    ; contiguous watermark (every client-bidi id below it is served) plus a small
+    ; out-of-order ring: the watermark cannot forget an old stream the way a ring
+    ; alone would when many later streams have run.
+    .req_served_lo:     resq 1        ; every client-bidi id < this is served
+    .req_served_ids:    resq LINNEA_QUIC_SERVED_SEEN   ; out-of-order tail, id+1, 0=empty
+    .req_served_cursor: resq 1
     .ra_ctx:     resb LINNEA_QUIC_RA_CTXS * linnea_quic_ra_size
     ; the open response streams (up to LINNEA_QUIC_TXSTREAMS at once): each slot
     ; holds one large response's mapping, head and progress; the pump interleaves

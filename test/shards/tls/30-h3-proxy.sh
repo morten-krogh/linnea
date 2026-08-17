@@ -207,6 +207,15 @@ EOF
         out=$(timeout 30 python3 test/quic/h3_content_length.py ${P61470} 2>&1 | tail -1)
         [ "$out" = "OK" ]
         check "h3 reconciles content-length with the DATA sent ($out)" $?
+        # Finding 11: a COMPLETED request must not be dispatched twice. Serve one,
+        # then re-inject its exact STREAM frame under a fresh packet number (aioquic
+        # PTO-probes a small completed request with a PING, so this forges the
+        # retransmission directly); the access log must show it dispatched ONCE.
+        timeout 30 python3 test/quic/h3_dup_served.py ${P61470} dedup11probe >/dev/null 2>&1
+        sleep 0.3
+        n=$(grep -c 'dedup11probe' "$RUNDIR/h3-smallbody.log")
+        [ "$n" = "1" ]
+        check "h3 does not re-dispatch a completed request on retransmission ($n dispatch)" $?
         kill $sfb_pid 2>/dev/null
         wait $sfb_pid 2>/dev/null
         rm -f "$sfb"

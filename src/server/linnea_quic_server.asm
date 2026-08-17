@@ -3267,6 +3267,21 @@ linnea_quic_server_datagram:
     inc ecx
     cmp ecx, LINNEA_QUIC_RST_SEEN
     jb .rst_seen_scan
+    ; Not refused/cancelled, and no response is open for it -- but was it already
+    ; DISPATCHED? An inline response is forgotten the instant it is sent, and a
+    ; slotted one's slot is reaped once its bytes are acked, so a completed stream
+    ; leaves no trace here (quic-11). A retransmission under a fresh packet number
+    ; then re-routes it: a proxied POST reaches the backend a second time. The
+    ; served-stream watermark/ring remembers it; a hit is acked (the packet is in
+    ; rx_have) and NOT re-served.
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    call req_served_known
+    test eax, eax
+    jnz .stream_scan                 ; already dispatched: ack covers it, do not re-serve
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    call req_served_mark             ; committing to dispatch it now (once)
     mov rdi, [s_sid]
     call linnea_quic_dbg_serve
     ; zero the request struct and point the QPACK scratch at h3scratch
@@ -6842,6 +6857,60 @@ rst_known:
     ret
 .rk_yes:
     mov eax, 1
+    ret
+
+; req_served_known(rdi = conn, rsi = client-bidi stream id) -> eax = 1 if the
+; stream has already been dispatched (quic-11). Below the contiguous watermark,
+; or in the out-of-order ring.
+req_served_known:
+    cmp rsi, [rdi + linnea_quic_conn.req_served_lo]
+    jb .rsk_yes
+    xor ecx, ecx
+    lea rdx, [rsi + 1]                ; stored as id+1
+.rsk_scan:
+    cmp [rdi + linnea_quic_conn.req_served_ids + rcx * 8], rdx
+    je .rsk_yes
+    inc ecx
+    cmp ecx, LINNEA_QUIC_SERVED_SEEN
+    jb .rsk_scan
+    xor eax, eax
+    ret
+.rsk_yes:
+    mov eax, 1
+    ret
+
+; req_served_mark(rdi = conn, rsi = client-bidi stream id) — remember it served.
+; Only ever called for a not-yet-served id (req_served_known was 0), so id is the
+; watermark or above it. id == watermark advances it (client-bidi ids step by 4)
+; and absorbs any ring entries that are now contiguous; a higher id joins the ring.
+req_served_mark:
+    cmp rsi, [rdi + linnea_quic_conn.req_served_lo]
+    jne .rsm_ring
+.rsm_advance:
+    add qword [rdi + linnea_quic_conn.req_served_lo], 4
+    mov rdx, [rdi + linnea_quic_conn.req_served_lo]
+    inc rdx                          ; the new watermark, stored as id+1
+    xor ecx, ecx
+.rsm_absorb:
+    cmp [rdi + linnea_quic_conn.req_served_ids + rcx * 8], rdx
+    je .rsm_absorb_hit
+    inc ecx
+    cmp ecx, LINNEA_QUIC_SERVED_SEEN
+    jb .rsm_absorb
+    ret                              ; watermark now points past all it can absorb
+.rsm_absorb_hit:
+    mov qword [rdi + linnea_quic_conn.req_served_ids + rcx * 8], 0
+    jmp .rsm_advance
+.rsm_ring:
+    mov rax, [rdi + linnea_quic_conn.req_served_cursor]
+    lea rcx, [rsi + 1]
+    mov [rdi + linnea_quic_conn.req_served_ids + rax * 8], rcx
+    inc rax
+    cmp rax, LINNEA_QUIC_SERVED_SEEN
+    jb .rsm_wrapped
+    xor eax, eax
+.rsm_wrapped:
+    mov [rdi + linnea_quic_conn.req_served_cursor], rax
     ret
 
 ; reset_teardown(rdi=conn, rsi=stream id) — the peer cancelled this stream
