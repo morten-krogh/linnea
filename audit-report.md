@@ -29,7 +29,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 20. **Medium: the peer's QUIC `max_udp_payload_size` is parsed but not enforced.** Large inline field sections can produce datagrams above a client's advertised receive limit. **— OPEN (audit-only pass; no source changes made).**
 21. **Medium: QUIC connection-ID retirement and peer CID rotation are ignored.** Incoming `NEW_CONNECTION_ID` and `RETIRE_CONNECTION_ID` frames are structurally skipped without updating either outbound addressing or accepted server CIDs. **— FIXED (bounded per-connection CID tables: validate reuse/`retire_prior_to`/CID-limit with transport errors, rotate `conn.dcid` to a non-retired peer CID, deactivate retired local CIDs in the lookup and announce a replacement; `test/quic/h3_cid_lifecycle.py`).**
 22. **Low: HTTP/3 unidirectional stream types are read as one byte instead of a QUIC varint.** Legal multi-byte encodings of control or QPACK stream types are classified as unknown streams. **— FIXED: the uni-stream type is decoded as a varint (its width skipped by the control walk and QPACK scan), so a non-minimal encoding like 40 00 is classified correctly instead of dropped; A/B-verified.**
-23. **Low: QUIC PTO ignores the peer's advertised `max_ack_delay`.** RTT adjustment uses the negotiated value, but the application-space probe timer always adds the local 25 ms constant. **— OPEN (audit-only pass; no source changes made).**
+23. **Low: QUIC PTO ignores the peer's advertised `max_ack_delay`.** RTT adjustment uses the negotiated value, but the application-space probe timer always adds the local 25 ms constant. **— FIXED (application-space `linnea_quic_pto_ms` adds `conn.max_ack_peer`, not the 25 ms constant; Initial/Handshake unchanged; unit-tested in `linnea_quictest.asm`/`linnea_rtxtest.asm`, A/B 41/46 vs 46/46).**
 24. **Medium: HTTP/2 does not reconcile `content-length` on HEADERS-only or non-proxy requests.** A request that ends in its initial `HEADERS` can declare a nonzero body length and still be served or forwarded as bodiless; static and local-response paths never perform the DATA-length check. **— FIXED (proxy path, commit 97046ff; the harmless static-GET-with-CL sub-case is left).**
 25. **Low: a client-sent HTTP/2 `PUSH_PROMISE` is treated as an unknown extension frame.** The server ignores a frame type clients are forbidden to send instead of closing the connection with `PROTOCOL_ERROR`. **— FIXED: an explicit PUSH_PROMISE case closes the connection PROTOCOL_ERROR; A/B-verified and covered by a new tls-shard test.**
 26. **Low: oversized HTTP/2 `CONTINUATION` frames bypass the advertised frame-size limit.** Continuations consumed inside header-block assembly are checked against the input-buffer capacity rather than the protocol's 16,384-byte default. **— FIXED: the CONTINUATION size check now uses the 16,384-byte protocol limit instead of the input-buffer size, so an oversized one is FRAME_SIZE_ERROR; A/B-verified.**
@@ -1585,7 +1585,21 @@ the completed type into the appropriate control/QPACK handler.
 
 Severity: Low (P3 loss-recovery timing and interoperability)  
 Confidence: High  
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — `linnea_quic_pto_ms` now adds `conn.max_ack_peer` (the peer's
+advertised `max_ack_delay`, in ms) on the application-space path instead of the
+compile-time `LINNEA_QUIC_MAX_ACK_DELAY` (25). The field already existed, is set
+at handshake from the parsed transport parameter — defaulting to 25 ms when the
+peer omits it — and is bounded below 2^14 by the Finding-13 check, so it cannot
+overflow the timer. Initial/Handshake PTO (`esi = 0`) is unchanged: it adds no
+ack delay. A peer advertising a legal delay above 25 ms no longer draws a
+premature probe (spurious retransmit + congestion response); one advertising 0 or
+a small value is no longer made to wait the extra 25 ms. Behaviour-neutral for a
+peer at the default of 25. Unit-tested in `test/quic/linnea_quictest.asm` (eight
+cases: default, 0, 10/100/1000 ms, the largest legal value clamped to the ceiling,
+`esi = 0` ignoring the field, and the pre-sample default-RTT path) and in the
+loss-recovery selftest `test/quic/linnea_rtxtest.asm`. A/B-verified: reverting only
+`linnea_quic.asm` fails exactly the five discriminating checks (`quic-crypto
+41/46`) and passes them fixed (`46/46`).
 
 ### Evidence
 

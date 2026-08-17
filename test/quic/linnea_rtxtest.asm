@@ -633,14 +633,23 @@ _start:
     ; so PTO = 333 + 4*166 = 997, and 1022 once the peer's max_ack_delay applies.
     ; This is deliberately slower than the flat 250 ms it replaced — the RFC
     ; would rather wait than retransmit into a path it has not measured.
+    ; max_ack_delay is the PEER's advertised value (Finding 23), 25 ms by default;
+    ; the fixture sets it explicitly since it is no longer a compile-time constant.
     mov qword [conn + linnea_quic_conn.rtt_have], 0
     mov qword [conn + linnea_quic_conn.srtt], 0
     mov qword [conn + linnea_quic_conn.rttvar], 0
     mov qword [conn + linnea_quic_conn.min_rtt], 0
+    mov qword [conn + linnea_quic_conn.max_ack_peer], 25
     PTO 0
-    EXPECT rax, 997
+    EXPECT rax, 997                     ; Initial/Handshake: no ack delay
     PTO 1
-    EXPECT rax, 1022
+    EXPECT rax, 1022                    ; application space: + the peer's 25 ms
+    ; a peer promising a longer ack deadline pushes the probe out with it, so we
+    ; do not declare loss before its promised deadline (Finding 23)
+    mov qword [conn + linnea_quic_conn.max_ack_peer], 100
+    PTO 1
+    EXPECT rax, 1097                    ; 997 + 100
+    mov qword [conn + linnea_quic_conn.max_ack_peer], 25
 
     ; the first sample is adopted outright: srtt = latest, rttvar = latest/2
     RTT 100

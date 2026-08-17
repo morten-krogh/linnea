@@ -6,6 +6,7 @@
 default rel
 
 %include "linnea_quic.inc"
+%include "linnea_quic_conn.inc"          ; conn struct offsets + PTO constants
 
 global _start
 
@@ -21,6 +22,7 @@ extern linnea_quic_protect
 extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
 extern linnea_quic_ku_next
+extern linnea_quic_pto_ms
 extern quic_v2_active
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
@@ -48,6 +50,24 @@ extern linnea_print_u64_stdout
     cmp rax, r10
     jne %%bad
     cmp rdx, %3
+    jne %%bad
+    inc r15d
+%%bad:
+%endmacro
+
+; PTOCHK srtt, rttvar, rtt_have, max_ack, esi, expected — set the RTT/ack fields
+; on a scratch conn, call linnea_quic_pto_ms, and tally rax == expected.
+%macro PTOCHK 6
+    lea rbx, [pto_conn]
+    mov qword [rbx + linnea_quic_conn.srtt], %1
+    mov qword [rbx + linnea_quic_conn.rttvar], %2
+    mov qword [rbx + linnea_quic_conn.rtt_have], %3
+    mov qword [rbx + linnea_quic_conn.max_ack_peer], %4
+    mov rdi, rbx
+    mov esi, %5
+    call linnea_quic_pto_ms
+    inc r14d
+    cmp rax, %6
     jne %%bad
     inc r15d
 %%bad:
@@ -141,6 +161,7 @@ rt_out:      resb 64
 rt_protlen:  resq 1
 ku_next_out: resb 32
 ku_keys:     resb linnea_quic_keys_size
+pto_conn:    resb linnea_quic_conn_size   ; scratch connection for the PTO checks
 
 section .text
 _start:
@@ -362,6 +383,21 @@ _start:
     CHECK ku_keys + linnea_quic_keys.key, exp_ku_v2_key, 16
     CHECK ku_keys + linnea_quic_keys.iv,  exp_ku_v2_iv,  12
     mov byte [quic_v2_active], 0     ; leave the flag as the rest of the run found it
+
+    ; --- PTO uses the PEER's advertised max_ack_delay (Finding 23, RFC 9002
+    ; 6.2.1) --- PTO = srtt + max(4*rttvar, kGranularity) + max_ack_delay, then
+    ; clamped to [FLOOR=20, CEIL=8000]. The application space (esi=1) adds
+    ; conn.max_ack_peer, NOT the fixed 25 ms it used before; Initial/Handshake
+    ; (esi=0) adds nothing. Post-sample cases use srtt=100, 4*rttvar=40.
+    PTOCHK 100, 10, 1, 25,    1, 165    ; default peer delay 25 -> unchanged (100+40+25)
+    PTOCHK 100, 10, 1, 100,   1, 240    ; peer promises a longer ack deadline: honoured
+    PTOCHK 100, 10, 1, 0,     1, 140    ; peer promises none: no needless 25 ms wait
+    PTOCHK 100, 10, 1, 1000,  1, 1140   ; a large legal delay flows straight through
+    PTOCHK 100, 10, 1, 16383, 1, 8000   ; the largest legal delay, clamped to the ceiling
+    PTOCHK 100, 10, 1, 1000,  0, 140    ; Initial/Handshake space ignores the peer value
+    ; pre-sample: kInitialRtt=333 stands in, 4*(333/2)=664, so base is 997
+    PTOCHK 0,   0,  0, 100,   1, 1097   ; peer delay added on the default-RTT path too
+    PTOCHK 0,   0,  0, 25,    1, 1022   ; default on the default-RTT path
 
     ; print "quic-crypto <pass>/<total>\n"
     lea rdi, [msg_head]

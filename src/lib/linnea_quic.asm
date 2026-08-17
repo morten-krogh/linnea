@@ -864,7 +864,13 @@ linnea_quic_pto_ms:
     add rax, rcx
     test esi, esi
     jz .pto_clamp
-    add rax, LINNEA_QUIC_MAX_ACK_DELAY
+    ; RFC 9002 6.2.1: the application-space PTO adds the PEER's advertised
+    ; max_ack_delay, not our local constant (Finding 23). conn.max_ack_peer is the
+    ; parsed value in ms, defaulting to 25 when the peer omits it and bounded below
+    ; 2^14 by the transport-parameter check (Finding 13), so it cannot overflow the
+    ; timer. A peer promising a longer ack deadline no longer draws a premature
+    ; probe; one promising a shorter one is not made to wait the full 25 ms.
+    add rax, [rdi + linnea_quic_conn.max_ack_peer]
 .pto_clamp:
     cmp rax, LINNEA_QUIC_PTO_FLOOR
     jae .pto_hi
