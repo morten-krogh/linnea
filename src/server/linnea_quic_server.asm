@@ -380,6 +380,7 @@ s_sdata:     resq 1                   ; that stream's data pointer
 s_slen:      resq 1                   ; and length
 s_soff:      resq 1                   ; and offset (0 = the stream's first bytes)
 s_sfin:      resq 1                   ; and whether its FIN bit is set
+s_uni_wid:   resq 1                   ; a uni stream's type-varint width (Finding 22)
 ; How many of an arriving frame's bytes fall inside the open DATA payload. A
 ; frame that ends past the payload carries the start of the NEXT one, and the
 ; two halves go to different places -- the file and the reassembly window -- so
@@ -4205,15 +4206,26 @@ linnea_quic_server_datagram:
     mov rsi, [s_slen]
     test rsi, rsi
     jz .stream_scan                  ; empty first frame: nothing to type yet
-    mov rax, [s_sdata]
-    movzx ecx, byte [rax]            ; the stream type (1 byte for every h3 type)
-    cmp cl, LINNEA_H3_STREAM_CONTROL
+    ; The stream type is a QUIC varint, not one byte (RFC 9114 6.2 / Finding 22):
+    ; control type 0 may legally be sent as 40 00, and the QPACK types likewise.
+    ; Decode it, and remember its width so the payload offset skips the whole
+    ; type. A type varint SPLIT across STREAM frames (rdx = 0, truncated) is not
+    ; reassembled here -- the stream is dropped, as an unknown type already was.
+    mov rdi, [s_sdata]
+    mov rsi, rdi
+    add rsi, [s_slen]
+    call linnea_quic_varint_decode   ; rax = type, rdx = width (0 = truncated)
+    test rdx, rdx
+    jz .stream_scan                  ; the type spans frames: leave it untyped
+    mov [s_uni_wid], rdx
+    mov ecx, eax                     ; cl carries the type for .uni_qpack's enc/dec
+    cmp rax, LINNEA_H3_STREAM_CONTROL
     je .uni_control
-    cmp cl, LINNEA_H3_STREAM_QPACK_ENC
+    cmp rax, LINNEA_H3_STREAM_QPACK_ENC
     je .uni_qpack
-    cmp cl, LINNEA_H3_STREAM_QPACK_DEC
+    cmp rax, LINNEA_H3_STREAM_QPACK_DEC
     je .uni_qpack
-    cmp cl, LINNEA_H3_STREAM_PUSH
+    cmp rax, LINNEA_H3_STREAM_PUSH
     je .uni_push                     ; a push stream, from a client
     call .uni_ro_drop                ; typed now, and not the control stream
     jmp .stream_scan                 ; grease/unknown: not interpreted
@@ -4331,8 +4343,10 @@ linnea_quic_server_datagram:
 .uni_ctrl_first:
     mov rax, [s_sid]
     mov [rdx + linnea_quic_conn.ctrl_id], rax
-    ; the walk starts after the stream-type byte this frame opened with
-    mov qword [rdx + linnea_quic_conn.ctrl_off], 1
+    ; the walk starts after the stream-type varint this frame opened with (its
+    ; width, not a hard-coded 1, so a non-minimal encoding is skipped whole)
+    mov rax, [s_uni_wid]
+    mov [rdx + linnea_quic_conn.ctrl_off], rax
 .uni_ctrl_walk:
     ; walk whatever frames these bytes complete. The first must be SETTINGS and
     ; no later one may be; DATA, HEADERS, PUSH_PROMISE and the types HTTP/2
@@ -4763,9 +4777,9 @@ linnea_quic_server_datagram:
 ; frame would otherwise be dropped unjudged by .uni_ro_drop.
 .qpack_enc_scan_all:
     mov rdi, [s_sdata]
-    inc rdi
+    add rdi, [s_uni_wid]             ; skip the whole type varint, not one byte
     mov rsi, [s_slen]
-    dec rsi
+    sub rsi, [s_uni_wid]             ; (Finding 22: a multi-byte type encoding)
     call .qpack_enc_scan
     test eax, eax
     jnz .qesa_done

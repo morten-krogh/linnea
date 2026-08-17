@@ -28,7 +28,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 19. **Medium: single-frame HTTP/3 request bodies bypass `max_body`.** The copy-free offset-zero-plus-FIN path reaches routing without either of the cap checks used by reassembly. **— FIXED (commit 13db631).**
 20. **Medium: the peer's QUIC `max_udp_payload_size` is parsed but not enforced.** Large inline field sections can produce datagrams above a client's advertised receive limit. **— OPEN (audit-only pass; no source changes made).**
 21. **Medium: QUIC connection-ID retirement and peer CID rotation are ignored.** Incoming `NEW_CONNECTION_ID` and `RETIRE_CONNECTION_ID` frames are structurally skipped without updating either outbound addressing or accepted server CIDs. **— OPEN (audit-only pass; no source changes made).**
-22. **Low: HTTP/3 unidirectional stream types are read as one byte instead of a QUIC varint.** Legal multi-byte encodings of control or QPACK stream types are classified as unknown streams. **— OPEN (audit-only pass; no source changes made).**
+22. **Low: HTTP/3 unidirectional stream types are read as one byte instead of a QUIC varint.** Legal multi-byte encodings of control or QPACK stream types are classified as unknown streams. **— FIXED: the uni-stream type is decoded as a varint (its width skipped by the control walk and QPACK scan), so a non-minimal encoding like 40 00 is classified correctly instead of dropped; A/B-verified.**
 23. **Low: QUIC PTO ignores the peer's advertised `max_ack_delay`.** RTT adjustment uses the negotiated value, but the application-space probe timer always adds the local 25 ms constant. **— OPEN (audit-only pass; no source changes made).**
 24. **Medium: HTTP/2 does not reconcile `content-length` on HEADERS-only or non-proxy requests.** A request that ends in its initial `HEADERS` can declare a nonzero body length and still be served or forwarded as bodiless; static and local-response paths never perform the DATA-length check. **— FIXED (proxy path, commit 97046ff; the harmless static-GET-with-CL sub-case is left).**
 25. **Low: a client-sent HTTP/2 `PUSH_PROMISE` is treated as an unknown extension frame.** The server ignores a frame type clients are forbidden to send instead of closing the connection with `PROTOCOL_ERROR`. **— FIXED: an explicit PUSH_PROMISE case closes the connection PROTOCOL_ERROR; A/B-verified and covered by a new tls-shard test.**
@@ -1480,7 +1480,17 @@ replacement within the peer's advertised limit.
 
 Severity: Low (P3 valid-client interoperability)  
 Confidence: High  
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — the uni-stream type is now decoded as a QUIC varint
+(`linnea_quic_varint_decode`), and its width is remembered (`s_uni_wid`) so the
+control-stream walk offset and the QPACK encoder scan skip the whole type rather
+than a hard-coded one byte. A control stream sent as `40 00` and QPACK streams as
+`40 02`/`40 03` are now classified correctly instead of being dropped as unknown.
+A type varint SPLIT across STREAM frames (the decode returns width 0) is not
+reassembled — the stream is left untyped, as an unknown type already was, so no
+crash or misclassification. A/B-verified: two-byte-typed control + duplicate
+QPACK encoder streams were dropped before (no error) and now decode, so the
+duplicate draws `H3_STREAM_CREATION_ERROR`. Regression test
+`test/quic/h3_uni_type.py`.
 
 ### Evidence
 

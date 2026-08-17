@@ -161,6 +161,20 @@ else
     check "h3 duplicate QPACK stream test (skipped: deps unavailable)" 0
 fi
 
+# RFC 9114 6.2 (Finding 22): a unidirectional stream type is a varint, so control
+# type 0 sent as "40 00" and the QPACK types as "40 02" must be decoded, not read
+# as one byte and discarded as unknown.
+if python3 -c 'import aioquic' 2>/dev/null; then
+    start_server $CFG/tls-h3-drain.json
+    ut_master=$SRV_PID
+    timeout 30 python3 test/quic/h3_uni_type.py $SRV_PORT >/dev/null 2>&1
+    check "h3 multi-byte unidirectional stream type is decoded (Finding 22)" $?
+    kill -9 $ut_master 2>/dev/null
+    wait $ut_master 2>/dev/null
+else
+    check "h3 uni stream-type test (skipped: deps unavailable)" 0
+fi
+
 # Drain with an in-flight h3 response (Q117): the drain-exit test used to count
 # only TCP connections, so a worker whose work was all QUIC exited the moment
 # the drain began (and stopped re-arming the datagram recv besides) — the peer
