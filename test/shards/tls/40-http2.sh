@@ -491,6 +491,13 @@ PY
     timeout 20 python3 test/tls/h2_frame_size.py $CA ${P61446} >/dev/null 2>&1
     check "http2 control-frame size validated (no PING over-read/echo)" $?
 
+    # RFC 9113 6.3/6.8/8.4/4.2 (Findings 25/26/27): a client PUSH_PROMISE, a
+    # malformed PRIORITY (wrong length or stream 0), a malformed GOAWAY (nonzero
+    # stream or short), and a CONTINUATION over the advertised frame size each
+    # draw a GOAWAY with the RFC's error code instead of being ignored/drained.
+    timeout 30 python3 test/tls/h2_frame_validation.py $CA ${P61446} >/dev/null 2>&1
+    check "http2 malformed control frames draw the right GOAWAY (Findings 25/26/27)" $?
+
     kill $h2_pid 2>/dev/null
     wait $h2_pid 2>/dev/null
     # (h2 graceful drain — GOAWAY(last-stream) then finish open streams — is

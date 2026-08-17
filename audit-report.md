@@ -31,9 +31,9 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 22. **Low: HTTP/3 unidirectional stream types are read as one byte instead of a QUIC varint.** Legal multi-byte encodings of control or QPACK stream types are classified as unknown streams. **— OPEN (audit-only pass; no source changes made).**
 23. **Low: QUIC PTO ignores the peer's advertised `max_ack_delay`.** RTT adjustment uses the negotiated value, but the application-space probe timer always adds the local 25 ms constant. **— OPEN (audit-only pass; no source changes made).**
 24. **Medium: HTTP/2 does not reconcile `content-length` on HEADERS-only or non-proxy requests.** A request that ends in its initial `HEADERS` can declare a nonzero body length and still be served or forwarded as bodiless; static and local-response paths never perform the DATA-length check. **— FIXED (proxy path, commit 97046ff; the harmless static-GET-with-CL sub-case is left).**
-25. **Low: a client-sent HTTP/2 `PUSH_PROMISE` is treated as an unknown extension frame.** The server ignores a frame type clients are forbidden to send instead of closing the connection with `PROTOCOL_ERROR`. **— OPEN (audit-only pass; no source changes made).**
-26. **Low: oversized HTTP/2 `CONTINUATION` frames bypass the advertised frame-size limit.** Continuations consumed inside header-block assembly are checked against the input-buffer capacity rather than the protocol's 16,384-byte default. **— OPEN (audit-only pass; no source changes made).**
-27. **Low: HTTP/2 skips mandatory structural validation for `PRIORITY` and `GOAWAY`.** Arbitrary-length or stream-zero `PRIORITY` frames are ignored, while short or nonzero-stream `GOAWAY` frames put the connection into graceful drain. **— OPEN (audit-only pass; no source changes made).**
+25. **Low: a client-sent HTTP/2 `PUSH_PROMISE` is treated as an unknown extension frame.** The server ignores a frame type clients are forbidden to send instead of closing the connection with `PROTOCOL_ERROR`. **— FIXED: an explicit PUSH_PROMISE case closes the connection PROTOCOL_ERROR; A/B-verified and covered by a new tls-shard test.**
+26. **Low: oversized HTTP/2 `CONTINUATION` frames bypass the advertised frame-size limit.** Continuations consumed inside header-block assembly are checked against the input-buffer capacity rather than the protocol's 16,384-byte default. **— FIXED: the CONTINUATION size check now uses the 16,384-byte protocol limit instead of the input-buffer size, so an oversized one is FRAME_SIZE_ERROR; A/B-verified.**
+27. **Low: HTTP/2 skips mandatory structural validation for `PRIORITY` and `GOAWAY`.** Arbitrary-length or stream-zero `PRIORITY` frames are ignored, while short or nonzero-stream `GOAWAY` frames put the connection into graceful drain. **— FIXED: a wrong-length or stream-0 PRIORITY and a nonzero-stream or short GOAWAY now draw FRAME_SIZE_ERROR/PROTOCOL_ERROR before being ignored or draining; A/B-verified.**
 28. **Medium: HTTP/2 CONNECT requests bypass whole-request validation.** Unsupported CONNECT is answered with 405 even when `:authority` is absent or forbidden `:scheme`/`:path` fields are present. **— OPEN (audit-only pass; no source changes made).**
 29. **Low: the HPACK decoder accepts dynamic-table size updates after header fields.** A malformed field block can mutate compression state and be served instead of causing `COMPRESSION_ERROR`. **— OPEN (audit-only pass; no source changes made).**
 30. **Medium: the HTTP/2 proxy treats an upstream informational response as final.** A `100 Continue` or `103 Early Hints` response is emitted with `END_STREAM`, and the backend's actual final response is discarded. **— FIXED: a 1xx is now relayed as an interim HEADERS block without `END_STREAM` and the final response still follows (101 is rejected 502); A/B-verified and covered by new tls-shard tests.**
@@ -1616,7 +1616,11 @@ accepted, normalize them to one decimal value before forwarding.
 
 Severity: Low (P3 protocol-state enforcement)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — the frame dispatcher now has an explicit case for type 5
+(`PUSH_PROMISE`) that ends the connection with `PROTOCOL_ERROR` (RFC 9113 8.4:
+a client MUST NOT push), rather than falling through to the discard-unknown
+path. A/B-verified: a client `PUSH_PROMISE` was accepted and ignored before and
+now draws GOAWAY(PROTOCOL_ERROR). Covered by `test/tls/h2_frame_validation.py`.
 
 ### Evidence
 
@@ -1656,7 +1660,12 @@ rule, which applies only to unknown frame types.
 
 Severity: Low (P3 framing conformance)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — the per-frame size check inside `h2_build_request` (which
+consumes CONTINUATION frames the outer loop never sees) now bounds against
+`LINNEA_H2_MAX_FRAME` (16,384) rather than the input-buffer size (~1 KiB
+larger), so a CONTINUATION between 16,385 bytes and the buffer bound now takes
+the `FRAME_SIZE_ERROR` path. A/B-verified with a 16,385-byte CONTINUATION.
+Covered by `test/tls/h2_frame_validation.py`.
 
 ### Evidence
 
@@ -1701,7 +1710,15 @@ wire-level frame-size allowance.
 
 Severity: Low (P3 malformed-control-frame handling)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — PRIORITY now routes to `.f_priority`, which rejects a length
+other than 5 (`FRAME_SIZE_ERROR`) and stream 0 (`PROTOCOL_ERROR`) before the
+frame is ignored; `.f_goaway` now rejects a nonzero stream (`PROTOCOL_ERROR`)
+and a payload shorter than the mandatory 8 bytes (`FRAME_SIZE_ERROR`) before
+entering the drain. A wrong-length PRIORITY is treated as a connection
+FRAME_SIZE_ERROR (RFC 9113 4.2 permits this) rather than a per-stream reset,
+which is simpler and safe since PRIORITY is not acted on. A/B-verified: all four
+cases were silently ignored/drained before and now draw the correct GOAWAY.
+Covered by `test/tls/h2_frame_validation.py`.
 
 ### Evidence
 

@@ -277,11 +277,13 @@ linnea_h2_handle:
     cmp r9d, LINNEA_H2_FT_RST_STREAM
     je .f_rst
     cmp r9d, LINNEA_H2_FT_PRIORITY
-    je .f_ignore
+    je .f_priority
     cmp r9d, LINNEA_H2_FT_DATA
     je .f_data                       ; a request body (proxying) or dropped
     cmp r9d, LINNEA_H2_FT_HEADERS
     je .f_headers
+    cmp r9d, LINNEA_H2_FT_PUSH_PROMISE
+    je .goaway_close                 ; RFC 9113 8.4: a client MUST NOT push
     cmp r9d, LINNEA_H2_FT_CONTINUATION
     je .goaway_close                 ; not preceded by HEADERS: a protocol error
     ; RFC 9113 4.1: an unknown or unsupported frame type MUST be discarded, not
@@ -679,6 +681,19 @@ linnea_h2_handle:
 .f_ignore:
     add r12, r11
     jmp .frames
+.f_priority:
+    ; RFC 9113 6.3: a PRIORITY frame is exactly 5 octets and never on stream 0.
+    ; We do not act on it (RFC 9218 carries priority instead), but a malformed
+    ; one is still rejected: a wrong length is a FRAME_SIZE_ERROR (4.2 permits a
+    ; connection error for it) and stream 0 is a PROTOCOL_ERROR.
+    cmp r11, 14                      ; 9-byte header + 5-byte payload
+    jne .goaway_frame_size
+    mov eax, [rsi + 5]
+    bswap eax
+    and eax, 0x7fffffff
+    test eax, eax
+    jz .goaway_close                 ; stream 0
+    jmp .f_ignore
 .f_settings:
     ; RFC 9113 6.5: "If an endpoint receives a SETTINGS frame whose Stream
     ; Identifier field is anything other than 0x00, the endpoint MUST respond
@@ -781,7 +796,18 @@ linnea_h2_handle:
     add r12, r11
     jmp .frames
 .f_goaway:
-    ; RFC 9113 6.8: GOAWAY says the peer will open no NEW streams — it does not
+    ; RFC 9113 6.8: GOAWAY is only ever on stream 0 and carries at least the
+    ; 8-byte last-stream-id + error-code. A nonzero stream is a PROTOCOL_ERROR,
+    ; a short one a FRAME_SIZE_ERROR -- otherwise a truncated or misdirected
+    ; GOAWAY silently put the connection into a graceful drain.
+    mov eax, [rsi + 5]
+    bswap eax
+    and eax, 0x7fffffff
+    test eax, eax
+    jnz .goaway_close                ; GOAWAY on a nonzero stream
+    cmp r11, 17                      ; 9-byte header + 8 mandatory payload bytes
+    jb .goaway_frame_size
+    ; GOAWAY says the peer will open no NEW streams — it does not
     ; abandon the ones already running, and "allows an endpoint to gracefully
     ; stop accepting new streams while still finishing processing of previously
     ; established streams". Closing the connection here threw away a response
@@ -964,8 +990,11 @@ h2_build_request:
     sub rax, r12
     cmp rax, rdx
     jb .more                         ; wait for the rest of the frame
-    cmp ecx, LINNEA_CONN_IN_BUF - 9
-    ja .err_size                     ; RFC 9113 4.2: over the frame size limit
+    cmp ecx, LINNEA_H2_MAX_FRAME
+    ja .err_size                     ; RFC 9113 4.2: over the frame size limit we
+                                     ; advertise (was the input buffer, ~1 KiB
+                                     ; larger, so an oversized CONTINUATION that
+                                     ; the outer loop never sees slipped through)
     movzx r9d, byte [r12 + 3]        ; type
     movzx r10d, byte [r12 + 4]       ; flags
     cmp qword [rsp + L_CONT], 0
