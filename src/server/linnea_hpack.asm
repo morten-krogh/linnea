@@ -549,6 +549,12 @@ emit_field:
     lea r9, [hdr_host]
     jmp .rb_probe
 .rb_chk_cookie:
+    ; The cookie coalescing (Finding 32) and expect:100-continue handling
+    ; (Finding 33) are HTTP/2-only: they use ck_buf and a local 100 the h2 path
+    ; emits, and the shared rebuild also runs for HTTP/3 (which never sets
+    ; ck_buf). Without this guard an h3 cookie wrote to a null ck_buf -- a crash.
+    cmp qword [rbx + linnea_h2_req.ck_buf], 0
+    je .rebuild                      ; h3: forward the field as an ordinary line
     push rsi
     push rdi
     lea r9, [hdr_cookie]
