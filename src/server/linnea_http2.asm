@@ -1203,15 +1203,26 @@ h2_build_request:
     jne .malformed_stream
     cmp qword [rsp + REQ + linnea_h2_req.auth_ptr], 0
     jne .malformed_stream
-    ; 8.1 requires END_STREAM on a trailer section, so this is where the body
-    ; ends — the same completion the last DATA frame would have performed.
-    cmp dword [h2_req_es], 0
-    je .trailer_ret
+    ; The collecting slot for this stream, needed whether the trailer completes
+    ; the body or (below) is rejected for lacking END_STREAM.
     mov rdi, rbx
     mov esi, [rsp + L_SID]
     call h2p_find_collect
     test rax, rax
-    jz .trailer_ret
+    jz .trailer_ret                  ; no body slot: nothing to end
+    ; RFC 9113 8.1 requires END_STREAM on a trailer section, so it is where the
+    ; body ends. Without it the body is NOT ended (Finding 4): the old code fell
+    ; to .trailer_ret leaving the slot COLLECTING, so a later DATA frame still
+    ; appended to it and the request hung to its 408 timeout — and the malformed
+    ; trailer earned no error at all. Fail the stream instead: h2p_find_collect
+    ; skips a FAILED slot, so no further DATA collects, and 400 is the answer. The
+    ; block was already HPACK-decoded above, so compression state stays in sync.
+    cmp dword [h2_req_es], 0
+    jne .trailer_es
+    mov qword [rax + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [rax + linnea_h2p.status], 400
+    jmp .trailer_ret
+.trailer_es:
     ; A trailer section ends the body, so a declared length is reconciled here
     ; too — the same RFC 9113 8.1.1 check the last DATA frame makes. This path
     ; never had to do it before: a body carrying a Content-Length always
@@ -2038,7 +2049,24 @@ h2_serve:
     sub rdi, rax
     mov [r13 + linnea_h2p.req_len], rdi   ; the head so far (no terminator)
     cmp dword [h2_req_es], 0
-    jne .proxy_nobody                ; END_STREAM on HEADERS: no body at all
+    je .proxy_has_body               ; not END_STREAM: a body follows
+    ; END_STREAM on HEADERS: the body is empty, so a declared content-length must
+    ; be zero (RFC 9113 8.1.1, Finding 24) or the message is malformed -- a body
+    ; announced with no DATA. The old code forwarded it bodiless, replacing the
+    ; client's contradiction with our own framing so the backend heard a request
+    ; the client never sent. Fail the stream 400 instead, like .proxy_toolarge:
+    ; the slot opens no socket, so the backend hears nothing of it.
+    mov rdi, [r12 + linnea_h2_req.cl_ptr]
+    test rdi, rdi
+    jz .proxy_nobody                 ; no content-length: an ordinary bodiless request
+    mov rsi, [r12 + linnea_h2_req.cl_len]
+    call h2p_dec_u64                 ; rax = value, or -1 (unparseable)
+    test rax, rax
+    jz .proxy_nobody                 ; content-length: 0 -- consistent with no body
+    mov qword [r13 + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [r13 + linnea_h2p.status], 400
+    jmp .proxy_done
+.proxy_has_body:
     ; A body with a declared length streams: the length is forwarded as the
     ; client gave it and the bytes follow as they arrive, so an upload is
     ; bounded by the flow-control window rather than by our buffer. Without

@@ -393,6 +393,14 @@ PY
     timeout 60 python3 test/tls/h2_content_length.py $CA ${P61443} >/dev/null 2>&1
     check "http2 content-length is reconciled with the DATA sent" $?
 
+    # RFC 9113 8.1/8.1.1: a HEADERS carrying END_STREAM ends the message, so a
+    # nonzero content-length on it is a body announced with no DATA (Finding 24);
+    # a trailer section MUST carry END_STREAM, and one that omits it does not end
+    # the body (Finding 4). The first was forwarded bodiless to the backend, the
+    # second left the collecting slot open until its 408. Both are stream errors.
+    timeout 60 python3 test/tls/h2_malformed.py $CA ${P61443} >/dev/null 2>&1
+    check "http2 rejects terminal content-length and END_STREAM-less trailers" $?
+
     timeout 20 python3 test/tls/h2_conformance.py $CA ${P61446} >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
 
