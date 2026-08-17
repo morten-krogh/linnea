@@ -279,6 +279,9 @@ LINNEA_H2P_F_REQ_FILE  equ 16384
 LINNEA_H2P_F_DEC_ERR   equ 32768   ; the response body decode hit malformed framing
                                    ; (a bad chunk); the exchange must fail, not
                                    ; complete with a clean END_STREAM
+LINNEA_H2P_F_HEAD_INTERIM equ 65536 ; the parsed head is a 1xx informational
+                                    ; response (RFC 9113 8.8.5): relay it without
+                                    ; END_STREAM and keep reading for the final head
 
 struc linnea_h2p
     .state:     resq 1

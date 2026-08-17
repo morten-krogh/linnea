@@ -412,6 +412,34 @@ PY
     [ $? -ne 0 ]
     check "http2 proxied truncated chunked body is reset, not completed clean (Finding 31)" $?
 
+    # RFC 9113 8.8.5 (Finding 30): an upstream 1xx is an interim HEADERS block
+    # that does not end the stream; the final response still follows. Before the
+    # fix the 103/100 was emitted with END_STREAM and the real response
+    # discarded, so the client saw a 103 with an empty body. /api/early sends
+    # 103 (with a Link hint) then 200: the 103 must be relayed AND the final 200
+    # body delivered. -v captures the interim status curl otherwise hides.
+    ev=$(timeout 8 curl -sk --http2 -v --max-time 6 --cacert $CA $U/api/early 2>&1)
+    printf '%s' "$ev" | grep -q "HTTP/2 103" \
+        && printf '%s' "$ev" | grep -q "HTTP/2 200" \
+        && printf '%s' "$ev" | grep -q "final-reply"
+    check "http2 proxy relays a 1xx interim then the final response (Finding 30)" $?
+
+    # the interim and the final response in one upstream write must not be
+    # treated as final, nor hang waiting for a head already buffered
+    atonce=$(timeout 8 curl -sk --http2 --max-time 6 --cacert $CA $U/api/early-atonce)
+    [ "$atonce" = "final-reply" ]
+    check "http2 proxy handles a buffered interim+final in one read (Finding 30)" $?
+
+    # several informational responses (103, 103, 100) before the final one
+    multi=$(timeout 8 curl -sk --http2 --max-time 6 --cacert $CA $U/api/multi-early)
+    [ "$multi" = "final-reply" ]
+    check "http2 proxy relays multiple 1xx responses before the final (Finding 30)" $?
+
+    # a 101 has no meaning over an h2 proxy: reject it (502), do not relay
+    code=$(timeout 8 curl -sk --http2 --max-time 6 --cacert $CA -o /dev/null -w '%{http_code}' $U/api/upgrade101)
+    [ "$code" = 502 ]
+    check "http2 proxy rejects an upstream 101 (Finding 30)" $?
+
     timeout 20 python3 test/tls/h2_conformance.py $CA ${P61446} >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
 

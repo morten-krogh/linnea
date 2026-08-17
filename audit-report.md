@@ -36,7 +36,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 27. **Low: HTTP/2 skips mandatory structural validation for `PRIORITY` and `GOAWAY`.** Arbitrary-length or stream-zero `PRIORITY` frames are ignored, while short or nonzero-stream `GOAWAY` frames put the connection into graceful drain. **— OPEN (audit-only pass; no source changes made).**
 28. **Medium: HTTP/2 CONNECT requests bypass whole-request validation.** Unsupported CONNECT is answered with 405 even when `:authority` is absent or forbidden `:scheme`/`:path` fields are present. **— OPEN (audit-only pass; no source changes made).**
 29. **Low: the HPACK decoder accepts dynamic-table size updates after header fields.** A malformed field block can mutate compression state and be served instead of causing `COMPRESSION_ERROR`. **— OPEN (audit-only pass; no source changes made).**
-30. **Medium: the HTTP/2 proxy treats an upstream informational response as final.** A `100 Continue` or `103 Early Hints` response is emitted with `END_STREAM`, and the backend's actual final response is discarded. **— OPEN (audit-only pass; no source changes made).**
+30. **Medium: the HTTP/2 proxy treats an upstream informational response as final.** A `100 Continue` or `103 Early Hints` response is emitted with `END_STREAM`, and the backend's actual final response is discarded. **— FIXED: a 1xx is now relayed as an interim HEADERS block without `END_STREAM` and the final response still follows (101 is rejected 502); A/B-verified and covered by new tls-shard tests.**
 31. **Medium: the HTTP/2 proxy cleanly completes truncated or malformed upstream bodies.** Premature EOF and chunk-decoding errors set `BODY_DONE`, causing a normal `END_STREAM` over incomplete data instead of resetting or failing the response. **— FIXED: a premature EOF or a malformed chunk now routes to the bad-gateway handler (502 before the head, RST_STREAM after); A/B-verified and covered by a new tls-shard test.**
 32. **Medium: the HTTP/2 proxy does not coalesce split `cookie` fields before HTTP/1 forwarding.** Each field becomes a separate HTTP/1 header line, which can change cookie parsing and authentication semantics at the backend. **— OPEN (audit-only pass; no source changes made).**
 33. **Medium: HTTP/2 proxied uploads do not honor `Expect: 100-continue`.** Linnea waits for the complete body before either responding or forwarding the request head, leaving a compliant waiting client stalled until its fallback timer or the server's body timeout. **— OPEN (audit-only pass; no source changes made).**
@@ -1778,7 +1778,23 @@ the RFC's constrained sequence when two beginning-of-block updates are needed.
 
 Severity: Medium (P2 proxy response correctness)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — the upstream head parser now classifies a 1xx response as an
+interim head (a new `h2p_parse_head` return of 2) rather than a bodiless final
+one, and rejects 101 (and any status below 100) as a bad gateway. The response
+scheduler's `.sv_head` gained an interim path: it relays the 1xx as an HEADERS
+block without `END_STREAM` (leaving `F_HEAD_SENT` clear so a later upstream
+failure can still answer 502), drops the interim head from the buffer, and
+resumes parsing the next head — looping over further 1xx responses and, when the
+final head is already buffered, decoding its body and emitting it in the same
+pass so a backend that writes the interim and the final response in one go
+neither hangs nor loses the final response. A/B-verified against a pre-fix
+binary: `/api/early` (103 then 200), `/api/early-atonce` (both in one write),
+and `/api/multi-early` (103, 103, 100, then 200) all delivered only the 103 with
+an empty body before the fix and now relay each interim HEADERS in order ahead
+of the final 200; `/api/upgrade101` is now 502. Regression tests added at
+[`test/shards/tls/40-http2.sh`](/home/linnea/linnea/test/shards/tls/40-http2.sh)
+with four backend routes in
+[`test/proxy_backend.py`](/home/linnea/linnea/test/proxy_backend.py).
 
 ### Evidence
 

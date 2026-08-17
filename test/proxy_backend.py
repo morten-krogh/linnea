@@ -182,6 +182,34 @@ def respond(conn, head, body, extra=b""):
         time.sleep(0.4)
         conn.sendall(b"5\r\nhello\r\n")
         time.sleep(0.4)
+    elif path.endswith(b"/early"):
+        # 103 Early Hints as a separate write (the real pattern: hints early,
+        # the final response once it is ready), then the final 200. A proxy must
+        # relay the 103 as an interim HEADERS block without END_STREAM and still
+        # deliver the 200 (audit Finding 30).
+        conn.sendall(b"HTTP/1.1 103 Early Hints\r\n"
+                     b"Link: </style.css>; rel=preload; as=style\r\n\r\n")
+        time.sleep(0.3)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nfinal-reply")
+    elif path.endswith(b"/early-atonce"):
+        # The interim and the final response in a single write, then close. The
+        # proxy must not treat the 103 as final, and must not hang waiting for a
+        # final head that is already buffered.
+        conn.sendall(b"HTTP/1.1 103 Early Hints\r\n"
+                     b"Link: </a.js>; rel=preload; as=script\r\n\r\n"
+                     b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nfinal-reply")
+    elif path.endswith(b"/multi-early"):
+        # Several informational responses before the final one, in one write.
+        conn.sendall(b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n"
+                     b"HTTP/1.1 103 Early Hints\r\nLink: </b.css>; rel=preload\r\n\r\n"
+                     b"HTTP/1.1 100 Continue\r\n\r\n"
+                     b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nfinal-reply")
+    elif path.endswith(b"/upgrade101"):
+        # 101 has no meaning over an h2 proxy; it must be rejected (502), not
+        # relayed as an HTTP/2 response.
+        conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                     b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+        time.sleep(0.3)
     elif path.endswith(b"/linger"):
         # A backend that takes long enough for the client to give up first, but
         # not so long that it trips a proxy timeout. What that leaves behind is

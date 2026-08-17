@@ -2997,10 +2997,12 @@ linnea_h2p_event:
     cmp qword [rbx + linnea_h2p.state], LINNEA_H2P_HEAD
     jne .ev_relay_data
     mov rdi, rbx
-    call h2p_parse_head              ; -> rax = 1 parsed, 0 need more, -1 bad
+    call h2p_parse_head              ; -> rax = 1 parsed, 0 need more, -1 bad, 2 interim
     test rax, rax
     js .ev_bad_gateway
     jz .ev_want_more                 ; the head is not complete yet
+    cmp rax, 2
+    je .ev_interim                   ; a 1xx head: relay it, keep reading (Finding 30)
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_RELAY
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_HEAD_RDY
 .ev_relay_data:
@@ -3093,6 +3095,14 @@ linnea_h2p_event:
     jmp .ev_bad_gateway
 .ev_want_more:
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
+    jmp .ev_service
+.ev_interim:
+    ; a 1xx informational head (Finding 30). Mark it for the scheduler, which
+    ; relays it without END_STREAM and resumes parsing the next head from the
+    ; buffer. RELAY is the "head parsed" state; F_HEAD_INTERIM tells .sv_head to
+    ; take the interim path rather than finalise the stream.
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_RELAY
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_HEAD_RDY | LINNEA_H2P_F_HEAD_INTERIM
     jmp .ev_service
 .ev_timeout:
     mov qword [rbx + linnea_h2p.status], 504
@@ -3313,6 +3323,8 @@ linnea_h2p_service:
     jmp .sv_next
 
 .sv_head:
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_HEAD_INTERIM
+    jnz .sv_head_interim
     ; emit the translated response HEADERS for this slot
     and qword [r12 + linnea_h2p.flags], ~LINNEA_H2P_F_HEAD_RDY
     or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_HEAD_SENT
@@ -3331,6 +3343,91 @@ linnea_h2p_service:
     mov rax, r12
     call h2p_release
     jmp .sv_next
+
+.sv_head_interim:
+    ; A 1xx informational head (Finding 30). Relay it without END_STREAM
+    ; (NO_BODY is clear, so h2p_emit_headers adds none) and leave F_HEAD_SENT
+    ; clear -- the final response head is still to come, and a later upstream
+    ; failure can still answer with a final 502 HEADERS rather than a reset.
+    ; Then drop the interim head from the buffer and parse the next head, which
+    ; may already be buffered (a backend that wrote the interim and the final
+    ; response in one go).
+    and qword [r12 + linnea_h2p.flags], ~(LINNEA_H2P_F_HEAD_RDY | LINNEA_H2P_F_HEAD_INTERIM)
+    mov rdi, r15
+    mov rsi, r12
+    mov rdx, rbx
+    call h2p_emit_headers
+    add r15, rax
+    ; slide buf[rd..len] down over the interim head just relayed
+    mov rcx, [r12 + linnea_h2p.rd]   ; interim head length
+    mov r14, [r12 + linnea_h2p.len]
+    sub r14, rcx                     ; bytes of the next head already buffered
+    push rsi
+    push rdi
+    lea rsi, [r12 + linnea_h2p.buf]
+    add rsi, rcx
+    lea rdi, [r12 + linnea_h2p.buf]
+    mov rcx, r14
+    rep movsb
+    pop rdi
+    pop rsi
+    mov [r12 + linnea_h2p.len], r14
+    mov qword [r12 + linnea_h2p.rd], 0
+    mov qword [r12 + linnea_h2p.wr], 0
+    mov qword [r12 + linnea_h2p.off], 0
+    ; parse the next head from what remains
+    mov rdi, r12
+    call h2p_parse_head              ; 1 final, 0 need-more, -1 bad, 2 interim
+    test rax, rax
+    js .sv_interim_bad
+    jz .sv_interim_more
+    cmp rax, 2
+    je .sv_interim_again
+    ; a final head is buffered. Decode any body already present (same
+    ; parse->decode->emit order as the normal recv path), then emit the head.
+    mov qword [r12 + linnea_h2p.state], LINNEA_H2P_RELAY
+    mov rdi, r12
+    call h2p_decode
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_DEC_ERR
+    jnz .sv_interim_bad
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
+    jnz .sv_interim_final
+    or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV   ; more body to read
+.sv_interim_final:
+    ; room for the final HEADERS in this pass? If not, re-arm HEAD_RDY (INTERIM
+    ; is clear now) and let the next pass emit it; the decoded body is retained.
+    lea rax, [rbx + linnea_connection.out_buf + LINNEA_CONN_OUT_BUF]
+    sub rax, r15
+    cmp rax, LINNEA_H2P_HEAD_ROOM
+    jb .sv_interim_defer
+    or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_HEAD_RDY
+    jmp .sv_head                     ; emit the final head (INTERIM cleared)
+.sv_interim_defer:
+    or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_HEAD_RDY
+    jmp .sv_done
+.sv_interim_again:
+    ; another interim head is buffered. Emit it too if the out buffer has room,
+    ; else defer this slot's remaining heads to the next pass.
+    lea rax, [rbx + linnea_connection.out_buf + LINNEA_CONN_OUT_BUF]
+    sub rax, r15
+    cmp rax, LINNEA_H2P_HEAD_ROOM
+    jb .sv_interim_again_defer
+    jmp .sv_head_interim
+.sv_interim_again_defer:
+    or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_HEAD_RDY | LINNEA_H2P_F_HEAD_INTERIM
+    jmp .sv_done
+.sv_interim_more:
+    ; the next head is not fully buffered: read more upstream bytes, then the
+    ; recv path parses it (state HEAD)
+    mov qword [r12 + linnea_h2p.state], LINNEA_H2P_HEAD
+    or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
+    jmp .sv_next
+.sv_interim_bad:
+    ; the next head is malformed, or its body decode failed. No final head has
+    ; reached the client (F_HEAD_SENT is clear after an interim), so 502 stands.
+    mov qword [r12 + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [r12 + linnea_h2p.status], 502
+    jmp .sv_failed
 
 .sv_failed:
     test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_RST
@@ -3761,16 +3858,27 @@ h2p_parse_head:
 .ph_close_delim:
     mov qword [rbx + linnea_h2p.body_rem], -1   ; until the upstream closes
 .ph_bodyflag:
+    mov rax, [rbx + linnea_h2p.status]
+    cmp rax, 200
+    jae .ph_final_status
+    ; a 1xx informational response (RFC 9113 8.8.5, Finding 30): the caller
+    ; relays it as an interim HEADERS block without END_STREAM and reads the
+    ; next head. 101 has no meaning over an h2 proxy, and a status below 100 is
+    ; not a valid response line -- both are a bad gateway.
+    cmp rax, 100
+    jb .ph_bad
+    cmp rax, 101
+    je .ph_bad
+    mov eax, 2
+    jmp .ph_ret
+.ph_final_status:
     ; responses that never carry a body, whatever the headers say
     test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_IS_HEAD
     jnz .ph_nobody
-    mov rax, [rbx + linnea_h2p.status]
     cmp rax, 204
     je .ph_nobody
     cmp rax, 304
     je .ph_nobody
-    cmp rax, 200
-    jb .ph_nobody                    ; 1xx: no body either
     cmp qword [rbx + linnea_h2p.body_rem], 0
     jne .ph_ok
 .ph_nobody:
