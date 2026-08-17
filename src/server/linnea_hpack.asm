@@ -62,6 +62,8 @@ hdr_pconn:      db "proxy-connection"
 hdr_tenc:       db "transfer-encoding"
 hdr_upg:        db "upgrade"
 hdr_cookie:     db "cookie"
+hdr_expect:     db "expect"
+expect_100_val: db "100-continue"
 
 section .bss
 lit_form:      resq 1
@@ -542,7 +544,7 @@ emit_field:
     call name_eq
     pop rdi
     pop rsi
-    jne .rebuild                     ; a different 6-char name: append normally
+    jne .rb_chk_expect               ; a different 6-char name: try "expect"
     ; A cookie field (RFC 9113 8.2.3, Finding 32): do not rebuild a line for it;
     ; append its value to ck_buf, joined with "; ", and let the proxy head emit
     ; one Cookie line at the end. rax=name, rdx=6, rsi=value ptr, rdi=value len.
@@ -576,6 +578,30 @@ emit_field:
 .rb_ck_over:
     mov qword [rbx + linnea_h2_req.ck_len], -1
     jmp .no_rebuild
+.rb_chk_expect:
+    push rsi
+    push rdi
+    lea r9, [hdr_expect]
+    call name_eq
+    jne .rb_expect_no                ; neither cookie nor expect: append normally
+    ; "expect": only "100-continue" is handled -- the proxy path emits a local
+    ; interim 100 and strips the field (RFC 9110 10.1.1, Finding 33). Any other
+    ; expectation is forwarded unchanged for the backend to answer (e.g. 417).
+    mov rdi, [rsp + 8]               ; value ptr
+    mov rsi, [rsp]                   ; value len
+    lea rdx, [expect_100_val]
+    mov rcx, 12
+    call linnea_string_iequal        ; eax = 1 when equal (case-insensitive)
+    pop rdi
+    pop rsi
+    test eax, eax
+    jz .rebuild                      ; a different expectation: forward it
+    mov qword [rbx + linnea_h2_req.expect_100], 1
+    jmp .no_rebuild                  ; stripped: we generate the 100 ourselves
+.rb_expect_no:
+    pop rdi
+    pop rsi
+    jmp .rebuild
 .rb_chk_upg:
     lea r9, [hdr_upg]
     jmp .rb_probe

@@ -445,6 +445,12 @@ PY
     timeout 30 python3 test/tls/h2_cookie.py $CA ${P61443} >/dev/null 2>&1
     check "http2 proxy coalesces split cookie fields (Finding 32)" $?
 
+    # RFC 9110 10.1.1 (Finding 33): the proxy buffers the body, so a request with
+    # "expect: 100-continue" must be answered with an immediate local 100 rather
+    # than stalling the client until the body timeout.
+    timeout 30 python3 test/tls/h2_expect.py $CA ${P61443} >/dev/null 2>&1
+    check "http2 proxy answers expect: 100-continue with a local 100 (Finding 33)" $?
+
     timeout 20 python3 test/tls/h2_conformance.py $CA ${P61446} >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
 

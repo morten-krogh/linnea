@@ -39,7 +39,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 30. **Medium: the HTTP/2 proxy treats an upstream informational response as final.** A `100 Continue` or `103 Early Hints` response is emitted with `END_STREAM`, and the backend's actual final response is discarded. **— FIXED: a 1xx is now relayed as an interim HEADERS block without `END_STREAM` and the final response still follows (101 is rejected 502); A/B-verified and covered by new tls-shard tests.**
 31. **Medium: the HTTP/2 proxy cleanly completes truncated or malformed upstream bodies.** Premature EOF and chunk-decoding errors set `BODY_DONE`, causing a normal `END_STREAM` over incomplete data instead of resetting or failing the response. **— FIXED: a premature EOF or a malformed chunk now routes to the bad-gateway handler (502 before the head, RST_STREAM after); A/B-verified and covered by a new tls-shard test.**
 32. **Medium: the HTTP/2 proxy does not coalesce split `cookie` fields before HTTP/1 forwarding.** Each field becomes a separate HTTP/1 header line, which can change cookie parsing and authentication semantics at the backend. **— FIXED: split cookie fields are accumulated in wire order and forwarded as one `"; "`-joined `Cookie` line; A/B-verified and covered by a new tls-shard test.**
-33. **Medium: HTTP/2 proxied uploads do not honor `Expect: 100-continue`.** Linnea waits for the complete body before either responding or forwarding the request head, leaving a compliant waiting client stalled until its fallback timer or the server's body timeout. **— OPEN (audit-only pass; no source changes made).**
+33. **Medium: HTTP/2 proxied uploads do not honor `Expect: 100-continue`.** Linnea waits for the complete body before either responding or forwarding the request head, leaving a compliant waiting client stalled until its fallback timer or the server's body timeout. **— FIXED: a proxied request carrying `expect: 100-continue` is answered with an immediate local interim `100` before the body is collected (and the field is stripped upstream); A/B-verified and covered by a new tls-shard test.**
 34. **Medium: the HTTP/2 proxy translates malformed upstream fields into malformed HTTP/2 responses.** Invalid field names and values are encoded without syntax checks, while conflicting `content-length` lines are forwarded together instead of producing 502. **— OPEN (audit-only pass; no source changes made).**
 
 **Verification pass (all findings checked against the code):** findings 3–34 were
@@ -2012,7 +2012,20 @@ boundary; keep the original fields for native HTTP/2 semantics and accounting.
 
 Severity: Medium (P2 valid-client interoperability and upload latency)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — the HPACK rebuild now recognises `expect: 100-continue`
+(a length-6 dispatch beside `cookie`), sets a per-request flag, and strips the
+field from the upstream request. When a proxied request with a body reaches the
+collect path, `.proxy_expect_100` emits one interim `100` HEADERS to the client
+locally (no `END_STREAM`, via the same `.flags` builder the conditional
+responses use) before the body is collected, then leaves the slot COLLECTing.
+This is the buffering-preserving strategy the finding recommends: no upstream
+connection is held, and because we answer the expectation ourselves the field is
+removed so a backend `100` cannot compound with Finding 30. Any other
+expectation is forwarded unchanged for the backend to answer. A/B-verified
+against a pre-fix binary: with `expect: 100-continue` and the body withheld, the
+client received no `100` and stalled before, and now receives a `100` in ~0.04 s,
+then one final `200` carrying the backend echo after it releases the body.
+Regression test `test/tls/h2_expect.py`.
 
 ### Evidence
 

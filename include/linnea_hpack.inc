@@ -119,6 +119,10 @@ struc linnea_h2_req
     ; .ck_len tracks it (0 = no cookie field seen yet; -1 = overflowed the buffer).
     .ck_buf:      resq 1
     .ck_len:      resq 1
+    ; Set when the request carried "expect: 100-continue" (RFC 9110 10.1.1,
+    ; Finding 33): the proxy path emits a local interim 100 before collecting the
+    ; body, and the field is stripped from the upstream request.
+    .expect_100:  resq 1
     .dyn:         resq 1        ; *linnea_hpack_dyn for this connection, or 0
                                 ; (QPACK passes 0: HTTP/3 has its own table
                                 ; encoding, and we advertise zero capacity)

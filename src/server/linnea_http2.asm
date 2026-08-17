@@ -2107,11 +2107,11 @@ h2_serve:
     ; are still collected and measured first.
     mov rdi, [r12 + linnea_h2_req.cl_ptr]
     test rdi, rdi
-    jz .proxy_done
+    jz .proxy_expect_100             ; no length: collect (100-continue below)
     mov rsi, [r12 + linnea_h2_req.cl_len]
     call h2p_dec_u64                 ; -> rax = the value, or -1
     cmp rax, -1
-    je .proxy_done                   ; unparseable: collect and re-derive
+    je .proxy_expect_100             ; unparseable: collect and re-derive
     mov [r13 + linnea_h2p.rq_declared], rax   ; judged at END_STREAM (8.1.1)
     ; ...and refused here if it is larger than we accept. max_body bounds a
     ; request body on h1, which refuses on the DECLARED length for the same
@@ -2142,13 +2142,31 @@ h2_serve:
     ;
     ; Nothing to do here but let the DATA path have it: the body clock was
     ; started with the slot, and END_STREAM is what connects.
-    jmp .proxy_done
+    jmp .proxy_expect_100
 .proxy_nobody:
     mov rdi, r13
     call h2p_finalize                ; terminate the head and connect
 .proxy_done:
     xor eax, eax                     ; no response bytes at the out cursor
     jmp .out
+.proxy_expect_100:
+    ; The body is buffered here before the upstream is contacted, so a client
+    ; that sent "expect: 100-continue" and is waiting would stall (Finding 33).
+    ; Answer the expectation locally: one interim 100 HEADERS (no END_STREAM),
+    ; then leave the slot COLLECTing for the DATA frames it releases.
+    cmp qword [r12 + linnea_h2_req.expect_100], 0
+    je .proxy_done                   ; no expectation: collect silently
+    mov rdi, [rsp + S_OUT]
+    add rdi, 9                        ; payload after the 9-byte frame header
+    mov r15, rdi
+    mov esi, 8                        ; :status (indexed name, literal value)
+    lea rdx, [status_100_h2]
+    mov ecx, 3
+    call h2_enc_hdr
+    mov rbp, rdi
+    sub rbp, r15                      ; payload length
+    mov r8b, LINNEA_H2_FLAG_END_HEADERS   ; interim response: no END_STREAM
+    jmp .flags
 .proxy_toolarge:
     ; NB: below .proxy_done's jmp, not above it — .proxy_nobody falls THROUGH
     ; into .proxy_done, so a label placed between them marks every bodiless
@@ -5481,6 +5499,7 @@ method_get_h2:   db "GET"
 method_head_h2:  db "HEAD"
 method_connect_h2: db "CONNECT"
 index_html_h2:   db "index.html"
+status_100_h2:   db "100"
 status_200_h2:   db "200"
 status_206_h2:   db "206"
 status_304_h2:   db "304"
