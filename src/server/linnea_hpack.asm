@@ -72,6 +72,10 @@ lit_form:      resq 1
 ; block has been read to its end. A file-scope slot for the same reason
 ; lit_form is one: one decode runs at a time.
 dec_fault:     resq 1
+; Set once a normal field representation has been decoded in this block, so a
+; dynamic-table size update that follows one can be rejected (RFC 7541 4.2:
+; updates only at the beginning of a block; Finding 29). One decode at a time.
+dec_field_seen: resq 1
 ; The req's scratch cursor as it stood before the field now being decoded. A
 ; field the walk goes on to REJECT keeps nothing — emit_field records its
 ; pointers only after the bounds pass — so its scratch is reclaimed at .fault
@@ -93,6 +97,7 @@ linnea_hpack_decode:
     mov r12, rdi                    ; cur
     lea r13, [rdi + rsi]            ; end
     mov qword [dec_fault], 0
+    mov qword [dec_field_seen], 0
 
 .next:
     cmp r12, r13
@@ -112,6 +117,7 @@ linnea_hpack_decode:
 
 ; --- 6.1 Indexed Header Field --------------------------------------------
 .indexed:
+    mov qword [dec_field_seen], 1   ; a field: any later size update is illegal (#29)
     mov rsi, r12
     mov rdi, r13
     mov ecx, 7
@@ -160,6 +166,7 @@ linnea_hpack_decode:
 .lit_noindex:
     mov ecx, 4                      ; without / never indexed: 4-bit prefix
 .literal:
+    mov qword [dec_field_seen], 1   ; a field: any later size update is illegal (#29)
     mov [lit_form], ecx             ; the form, for the store decision below
                                     ; (a file-scope slot, not the red zone:
                                     ; hpack_int/hpack_str/emit_field all push,
@@ -241,6 +248,10 @@ linnea_hpack_decode:
 
 ; --- 6.3 Dynamic Table Size Update ---------------------------------------
 .tsize:
+    ; RFC 7541 4.2 (Finding 29): a size update may only appear at the beginning
+    ; of a block, before any field. One after a field is a COMPRESSION_ERROR.
+    cmp qword [dec_field_seen], 0
+    jne .err
     mov rsi, r12
     mov rdi, r13
     mov ecx, 5

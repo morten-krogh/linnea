@@ -14,7 +14,7 @@ import sys
 
 ca, port = sys.argv[1], int(sys.argv[2])
 FT_HEADERS, FT_SETTINGS, FT_GOAWAY = 0x1, 0x4, 0x7
-PROTOCOL_ERROR, FRAME_SIZE_ERROR = 0x1, 0x6
+PROTOCOL_ERROR, FRAME_SIZE_ERROR, COMPRESSION_ERROR = 0x1, 0x6, 0x9
 
 
 def fr(t, fl, sid, p=b""):
@@ -91,6 +91,12 @@ check("short GOAWAY rejected",
 hdr = fr(FT_HEADERS, 0x0, 1, b"\x00\x00")            # no END_HEADERS
 cont = fr(0x9, 0x4, 1, b"\x00" * 16385)              # END_HEADERS, 16385 bytes
 check("oversized CONTINUATION rejected", goaway_code(hdr + cont), FRAME_SIZE_ERROR)
+
+# Finding 29: an HPACK dynamic-table size update after a field is a
+# COMPRESSION_ERROR (RFC 7541 4.2). Block = indexed :method (0x82) then a
+# size-update-to-0 (0x20).
+check("HPACK size update after a field rejected",
+      goaway_code(fr(FT_HEADERS, 0x4, 1, b"\x82\x20")), COMPRESSION_ERROR)
 
 print("ok" if fails == 0 else f"FAIL ({fails})")
 sys.exit(0 if fails == 0 else 1)
