@@ -23,6 +23,7 @@ extern linnea_quic_hs_secrets
 extern linnea_quic_app_secrets
 extern linnea_quic_ku_next
 extern linnea_quic_pto_ms
+extern linnea_u64_add_within
 extern quic_v2_active
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
@@ -50,6 +51,20 @@ extern linnea_print_u64_stdout
     cmp rax, r10
     jne %%bad
     cmp rdx, %3
+    jne %%bad
+    inc r15d
+%%bad:
+%endmacro
+
+; FITCHK current, incoming, max, expected — linnea_u64_add_within (Finding 2):
+; 1 when current+incoming <= max with no wrap, else 0.
+%macro FITCHK 4
+    mov rdi, %1
+    mov rsi, %2
+    mov rdx, %3
+    call linnea_u64_add_within
+    inc r14d
+    cmp rax, %4
     jne %%bad
     inc r15d
 %%bad:
@@ -398,6 +413,18 @@ _start:
     ; pre-sample: kInitialRtt=333 stands in, 4*(333/2)=664, so base is 997
     PTOCHK 0,   0,  0, 100,   1, 1097   ; peer delay added on the default-RTT path too
     PTOCHK 0,   0,  0, 25,    1, 1022   ; default on the default-RTT path
+
+    ; --- bounded body add: no wrap at the documented max_body = 2^64-1 (Finding 2)
+    ; -1 = 2^64-1 (the largest max_body docs/config.md accepts), -2 = 2^64-2.
+    FITCHK 0,   100,  1000, 1          ; interior: 0+100 <= 1000 fits
+    FITCHK 900, 100,  1000, 1          ; exact boundary: current+incoming == max
+    FITCHK 900, 101,  1000, 0          ; one past: rejected
+    FITCHK -1,  0,    -1,   1          ; (max, 0): already at the cap, nothing added
+    FITCHK -1,  1,    -1,   0          ; (max, 1): one byte over the cap
+    FITCHK -2,  1,    -1,   1          ; (max-1, 1): fills exactly to the cap
+    FITCHK -2,  2,    -1,   0          ; (max-1, 2): THE WRAP CASE — add-then-compare
+                                       ; would wrap 2^64-2 + 2 to 0 and pass; the
+                                       ; headroom check rejects it
 
     ; print "quic-crypto <pass>/<total>\n"
     lea rdi, [msg_head]

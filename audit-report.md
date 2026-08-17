@@ -8,7 +8,7 @@ Scope: `src/server`, `src/lib`, `include`, configuration handling, and the exist
 The tree builds cleanly and the lightweight self-tests pass. The existing integration suite is unusually thorough around HTTP/2, HTTP/3, uploads, QUIC loss, and descriptor cleanup. I found thirty-four issues worth fixing:
 
 1. **High: large streamed HTTP/1 request bodies can discard a pipelined request.** This affects both counted and chunked uploads and can make the client wait forever for a response to a request the server silently consumed. **— FIXED (see "Resolution" below).**
-2. **Medium: several cumulative body counters use add-then-compare arithmetic.** At the documented `2^64-1` configuration boundary, the counters can wrap and pass the body-size check. This is primarily a boundary/resource-accounting defect; reaching it with a real upload would require an impractically large body or disk. **— NOT changed (latent, practically unreachable; left for a later opportunistic cleanup).**
+2. **Medium: several cumulative body counters use add-then-compare arithmetic.** At the documented `2^64-1` configuration boundary, the counters can wrap and pass the body-size check. This is primarily a boundary/resource-accounting defect; reaching it with a real upload would require an impractically large body or disk. **— FIXED (subtraction-before-addition at the four admission sites — h2 `.fd_collect`, h3 `.ra_region`/`.bs_have_fd`, chunked `linnea_spill_chunked`; centralized as the unit-tested `linnea_u64_add_within`; A/B 51/53 buggy vs 53/53 fixed).**
 3. **Medium: buffered HTTP/1 request bodies bypass `max_body`.** Counted bodies are checked against the limit only when the head plus body no longer fits in `in_buf`; complete chunked bodies take the same unchecked buffered path. A proxy therefore accepts and forwards bodies larger than the configured limit as long as they fit in the request buffer. **— FIXED (commit 13db631).**
 4. **Medium: HTTP/2 accepts a trailer `HEADERS` block without `END_STREAM`.** The malformed trailer is consumed without failing the stream or completing the request, leaving the body slot collecting and allowing later `DATA` on the same stream. **— FIXED (commit 97046ff).**
 5. **Medium: HTTP/2 silently drops stream frames whose IDs have no live slot.** `DATA` on idle or closed streams and `WINDOW_UPDATE`/`RST_STREAM` on idle streams are consumed without the required state-specific error; dropped `DATA` replenishes only the connection window. **— FIXED (idle-stream case): DATA/WINDOW_UPDATE/RST_STREAM on an idle stream (even id, or above the highest opened) now draw a connection PROTOCOL_ERROR instead of being silently ignored; closed-stream frames keep the RFC-permitted lenient handling. A/B-verified.**
@@ -179,7 +179,24 @@ The fast suite runs green with them included (494 pass, 0 fail).
 
 Severity: Medium (P2 boundary/resource accounting)  
 Confidence: High for the arithmetic defect; low practical exploitability under
-ordinary disk limits
+ordinary disk limits  
+Status: **FIXED** — every add-then-compare admission site now uses subtraction-
+before-addition: it compares the incoming length against `max_body - current`
+(the headroom) instead of adding first and comparing the sum, so a length near
+`2^64` can no longer wrap a counter past a `max_body` of `2^64-1`. Fixed at the
+four sites where the wrap admitted data: h2 collected bodies (`.fd_collect`), the
+h3 QUIC region admission (`.ra_region`) and body-stage sink (`.bs_have_fd`), and
+the chunked encoded-byte accounting (`linnea_spill_chunked`). The pure-increment
+counters the audit also lists cannot wrap once these bound admission — a
+streaming body is bounded by an already-validated Content-Length, and the chunked
+decoded length is always ≤ the encoded `chunk_raw` bounded here. The arithmetic is
+centralized as `linnea_u64_add_within` (`src/lib/linnea_string.asm`), which each
+site inlines and which is unit-tested in `test/quic/linnea_quictest.asm` with the
+audit's boundary cases — `(interior)`, `(max,0)`, `(max,1)`, `(max-1,1)`,
+`(max-1,2)`. A/B-verified: a buggy add-then-compare build of the helper fails the
+two wrap cases (`quic-crypto 51/53`) while the fix passes all (`53/53`). The
+`2^64` counter state is unreachable with a real body, so the wrap is verified at
+the arithmetic level rather than on the wire.
 
 ### Evidence
 

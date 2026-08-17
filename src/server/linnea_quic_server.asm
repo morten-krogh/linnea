@@ -3109,13 +3109,14 @@ linnea_quic_server_datagram:
 .ra_region:
     ; max_body bounds it up front, on the length the frame DECLARES, so the
     ; bytes never land — the same rule the h1 and h2 paths apply to
-    ; Content-Length.
-    push rcx
-    mov rax, [rdi + linnea_quic_ra.spill_len]
-    add rax, rcx
-    lea rcx, [linnea_config_instance]
-    cmp rax, [rcx + linnea_config.max_body]
-    pop rcx
+    ; Content-Length. Subtraction-before-addition (Finding 2): rcx (the declared
+    ; length) is compared against the headroom rather than added to spill_len
+    ; first, so a length near 2^64 cannot wrap the counter past a max_body of
+    ; 2^64-1. spill_len <= max_body holds, so the subtraction does not underflow.
+    lea rax, [linnea_config_instance]
+    mov rax, [rax + linnea_config.max_body]
+    sub rax, [rdi + linnea_quic_ra.spill_len]   ; headroom = max_body - current
+    cmp rcx, rax                                ; declared length > headroom?
     ja .ra_body_toobig          ; the declared payload is past the cap: 413
     mov rax, [rdi + linnea_quic_ra.base]
     mov [rdi + linnea_quic_ra.body_from], rax
@@ -8978,13 +8979,15 @@ ra_body_sink:
     jae .bs_open_failed
     mov [rbx + linnea_quic_ra.spill_fd], rax
 .bs_have_fd:
-    ; the cap is max_body, the same one an h1 upload is held to
-    mov rax, [rbx + linnea_quic_ra.spill_len]
-    add rax, r13
-    mov r14, rax
+    ; the cap is max_body, the same one an h1 upload is held to. Subtraction-
+    ; before-addition (Finding 2): compare r13 (this run's length) against the
+    ; headroom rather than adding it to spill_len first, so a length near 2^64
+    ; cannot wrap the counter past a max_body of 2^64-1. spill_len <= max_body
+    ; holds (rejected before it exceeds), so the subtraction does not underflow.
     lea rax, [linnea_config_instance]
     mov rax, [rax + linnea_config.max_body]
-    cmp r14, rax
+    sub rax, [rbx + linnea_quic_ra.spill_len]    ; headroom = max_body - current
+    cmp r13, rax                                 ; this run's length > headroom?
     ja .bs_toobig                                ; the cap, not a failure: -2
     test r13, r13
     jz .bs_done

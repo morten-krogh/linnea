@@ -537,16 +537,20 @@ linnea_h2_handle:
     jmp .fd_done
 .fd_collect:
     mov r8, [rdi + linnea_h2p.len]
-    lea r9, [r8 + rax]
     ; max_body is the cap, and now the ONLY one. A body with no Content-Length
     ; is collected and measured here, so this is the only place its size is
-    ; ever judged.
+    ; ever judged. Subtraction-before-addition (Finding 2): compare the incoming
+    ; length against the headroom rather than adding first and comparing the sum,
+    ; so a length near 2^64 cannot wrap the counter past a max_body of 2^64-1.
+    ; r8 (current) <= max_body holds, so max_body - r8 does not underflow.
     push rcx
     lea rcx, [linnea_config_instance]
     mov rcx, [rcx + linnea_config.max_body]
-    cmp r9, rcx
+    sub rcx, r8                        ; headroom = max_body - current
+    cmp rax, rcx                       ; incoming > headroom?
     pop rcx
     ja .fd_toobig
+    lea r9, [r8 + rax]                 ; now safe from wrap: the running total
     ; Past the slot buffer the body goes to a capture file, the way h1 and h3
     ; already do, instead of being refused. It used to stop at
     ; LINNEA_H2P_BODY_MAX whatever max_body said — 8 KiB — which caught every

@@ -167,11 +167,16 @@ linnea_spill_chunked:
     ; Encoded bytes are capped as well as decoded ones. A client can send
     ; empty chunks and trailer lines forever without the decoded length ever
     ; growing, so a cap on the decoded body alone would never fire.
-    add [rbx + linnea_connection.chunk_raw], rdx
+    ; Subtraction-before-addition (Finding 2): compare the incoming encoded run
+    ; (rdx) against the headroom before adding it to chunk_raw, so a length near
+    ; 2^64 cannot wrap the counter past a max_body of 2^64-1. chunk_raw <= max_body
+    ; holds (rejected before it exceeds), so the subtraction does not underflow.
     lea rax, [linnea_config_instance]
     mov rax, [rax + linnea_config.max_body]
-    cmp [rbx + linnea_connection.chunk_raw], rax
+    sub rax, [rbx + linnea_connection.chunk_raw]   ; headroom = max_body - current
+    cmp rdx, rax                                   ; incoming encoded run > headroom?
     ja .too_large
+    add [rbx + linnea_connection.chunk_raw], rdx   ; now safe from wrap
 .step:
     cmp r12, r13
     jae .need_more

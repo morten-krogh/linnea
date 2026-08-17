@@ -9,6 +9,27 @@ global linnea_string_copy
 global linnea_string_from_u64
 global linnea_string_from_hex_u64
 global linnea_string_is_token
+global linnea_u64_add_within
+
+section .text
+
+; linnea_u64_add_within(rdi = current, rsi = incoming, rdx = max) -> rax = 1 when
+; current + incoming <= max with NO unsigned wrap, else 0. Assumes the caller's
+; invariant current <= max (every bounded counter here is rejected before it can
+; exceed max), so headroom = max - current does not underflow. Comparing incoming
+; against the headroom — rather than adding first and comparing the sum — is what
+; keeps a length near 2^64 from wrapping the counter past a max_body of 2^64-1
+; (audit Finding 2). Touches only rax.
+linnea_u64_add_within:
+    mov rax, rdx
+    sub rax, rdi                     ; headroom = max - current (>= 0 by invariant)
+    cmp rsi, rax
+    ja .over                         ; incoming > headroom: the add would wrap/exceed
+    mov eax, 1
+    ret
+.over:
+    xor eax, eax
+    ret
 
 section .rodata
 
