@@ -34,7 +34,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 25. **Low: a client-sent HTTP/2 `PUSH_PROMISE` is treated as an unknown extension frame.** The server ignores a frame type clients are forbidden to send instead of closing the connection with `PROTOCOL_ERROR`. **— FIXED: an explicit PUSH_PROMISE case closes the connection PROTOCOL_ERROR; A/B-verified and covered by a new tls-shard test.**
 26. **Low: oversized HTTP/2 `CONTINUATION` frames bypass the advertised frame-size limit.** Continuations consumed inside header-block assembly are checked against the input-buffer capacity rather than the protocol's 16,384-byte default. **— FIXED: the CONTINUATION size check now uses the 16,384-byte protocol limit instead of the input-buffer size, so an oversized one is FRAME_SIZE_ERROR; A/B-verified.**
 27. **Low: HTTP/2 skips mandatory structural validation for `PRIORITY` and `GOAWAY`.** Arbitrary-length or stream-zero `PRIORITY` frames are ignored, while short or nonzero-stream `GOAWAY` frames put the connection into graceful drain. **— FIXED: a wrong-length or stream-0 PRIORITY and a nonzero-stream or short GOAWAY now draw FRAME_SIZE_ERROR/PROTOCOL_ERROR before being ignored or draining; A/B-verified.**
-28. **Medium: HTTP/2 CONNECT requests bypass whole-request validation.** Unsupported CONNECT is answered with 405 even when `:authority` is absent or forbidden `:scheme`/`:path` fields are present. **— OPEN (audit-only pass; no source changes made).**
+28. **Medium: HTTP/2 CONNECT requests bypass whole-request validation.** Unsupported CONNECT is answered with 405 even when `:authority` is absent or forbidden `:scheme`/`:path` fields are present. **— FIXED: a CONNECT missing :authority or carrying :scheme/:path (or a contradicting Host) is now a stream reset, not a 405; well-formed CONNECT still gets 405. A/B-verified, tls-shard test.**
 29. **Low: the HPACK decoder accepts dynamic-table size updates after header fields.** A malformed field block can mutate compression state and be served instead of causing `COMPRESSION_ERROR`. **— FIXED: a dynamic-table size update after a field is now COMPRESSION_ERROR (a decode-time flag tracks whether a field preceded it); A/B-verified.**
 30. **Medium: the HTTP/2 proxy treats an upstream informational response as final.** A `100 Continue` or `103 Early Hints` response is emitted with `END_STREAM`, and the backend's actual final response is discarded. **— FIXED: a 1xx is now relayed as an interim HEADERS block without `END_STREAM` and the final response still follows (101 is rejected 502); A/B-verified and covered by new tls-shard tests.**
 31. **Medium: the HTTP/2 proxy cleanly completes truncated or malformed upstream bodies.** Premature EOF and chunk-decoding errors set `BODY_DONE`, causing a normal `END_STREAM` over incomplete data instead of resetting or failing the response. **— FIXED: a premature EOF or a malformed chunk now routes to the bad-gateway handler (502 before the head, RST_STREAM after); A/B-verified and covered by a new tls-shard test.**
@@ -1759,7 +1759,17 @@ error scope and code for each failure.
 
 Severity: Medium (P2 request-semantics validation)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — CONNECT is still answered 405 (unsupported), but it is now
+validated first: the CONNECT branch requires a non-empty `:authority`, rejects a
+present `:scheme` or `:path`, and rejects a duplicate or contradicting `Host`
+(RFC 9113 8.5). A nonconforming CONNECT takes `.malformed_stream` (a stream
+reset) instead of the 405. The shared `linnea_hpack_req_check` is still not run
+for CONNECT — it would wrongly reject the mandatory omission of `:scheme`/`:path`
+— so the CONNECT-specific rules are checked inline. A/B-verified against a
+pre-fix binary: a CONNECT with no `:authority`, an empty `:authority`, a present
+`:scheme`, or a present `:path` was answered 405 before and now draws
+RST_STREAM; a well-formed CONNECT still gets 405. Regression test
+`test/tls/h2_connect.py`.
 
 ### Evidence
 

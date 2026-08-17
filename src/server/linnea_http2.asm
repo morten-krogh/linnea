@@ -1172,7 +1172,33 @@ h2_build_request:
     mov ecx, 7
     call linnea_string_equal
     test rax, rax
-    jnz .serve
+    jz .req_validate
+    ; CONNECT is unsupported (answered 405 at .serve), but RFC 9113 8.5 still
+    ; requires it to carry :authority and to omit :scheme and :path; a Host, if
+    ; present, must agree with :authority. A nonconforming CONNECT is malformed
+    ; -- a stream error -- not an application method choice (Finding 28).
+    cmp qword [rsp + REQ + linnea_h2_req.auth_ptr], 0
+    je .malformed_stream             ; no :authority
+    cmp qword [rsp + REQ + linnea_h2_req.auth_len], 0
+    je .malformed_stream             ; empty :authority
+    cmp qword [rsp + REQ + linnea_h2_req.scheme_ptr], 0
+    jne .malformed_stream            ; :scheme is forbidden with CONNECT
+    cmp qword [rsp + REQ + linnea_h2_req.path_ptr], 0
+    jne .malformed_stream            ; :path is forbidden with CONNECT
+    cmp qword [rsp + REQ + linnea_h2_req.host_count], 1
+    ja .malformed_stream             ; more than one Host
+    cmp qword [rsp + REQ + linnea_h2_req.host_count], 0
+    je .serve                        ; no Host: :authority stands alone
+    mov rcx, [rsp + REQ + linnea_h2_req.auth_len]
+    cmp rcx, [rsp + REQ + linnea_h2_req.host_len]
+    jne .malformed_stream            ; a Host that contradicts :authority
+    test rcx, rcx
+    jz .serve
+    mov rsi, [rsp + REQ + linnea_h2_req.auth_ptr]
+    mov rdi, [rsp + REQ + linnea_h2_req.host_ptr]
+    repe cmpsb
+    jne .malformed_stream
+    jmp .serve
 .req_validate:
     ; the rules the field-by-field pass cannot see: an authority from one
     ; source or the other, agreeing and plausible
