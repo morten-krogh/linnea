@@ -200,6 +200,13 @@ EOF
         out=$(timeout 30 python3 test/quic/h3_single_frame_maxbody.py ${P61470} 64 2>&1 | tail -1)
         [ "$out" = "OK" ]
         check "h3 max_body bounds a single-frame body too ($out)" $?
+        # Finding 18: content-length must equal the DATA sum (RFC 9114 4.1.3), the
+        # check h2 makes at END_STREAM and h3 did not -- a short/long body was
+        # routed around the client's declared framing. Small bodies, so the same
+        # max_body=64 server serves them.
+        out=$(timeout 30 python3 test/quic/h3_content_length.py ${P61470} 2>&1 | tail -1)
+        [ "$out" = "OK" ]
+        check "h3 reconciles content-length with the DATA sent ($out)" $?
         kill $sfb_pid 2>/dev/null
         wait $sfb_pid 2>/dev/null
         rm -f "$sfb"

@@ -3367,6 +3367,7 @@ linnea_quic_server_datagram:
     ; connection with FLOW_CONTROL_ERROR (4.5). No response is open here — the
     ; duplicate guard above has already sent that case elsewhere — so nothing has
     ; gone out this way and the true final size is zero.
+.req_message_error:
     mov rdi, [s_sid]
     xor esi, esi                     ; nothing was sent in the direction we reset
     mov edx, LINNEA_H3_ERR_MESSAGE   ; the request decoded but breaks a rule
@@ -3544,6 +3545,37 @@ linnea_quic_server_datagram:
     lea rax, [linnea_config_instance]
     cmp r9, [rax + linnea_config.max_body]
     ja .req_body_toolarge
+    ; content-length must equal the sum of the DATA payloads (Finding 18, RFC 9114
+    ; 4.1.3). h2 reconciles this at END_STREAM; h3 did not, so a short or long body
+    ; was routed and proxied around the client's declared framing rather than
+    ; rejected. r9 is the actual body length; cl_ptr/cl_len is what the client
+    ; declared (populated by the shared proxy rebuild, for static and proxy alike).
+    ; A mismatch or a non-decimal value is a malformed message -> H3_MESSAGE_ERROR.
+    ; rax/rcx/rdx are scratch here (the rate-limit save below re-establishes them);
+    ; r8/r9 (the body) are untouched.
+    mov rdi, [req + linnea_h2_req.cl_ptr]
+    test rdi, rdi
+    jz .cl_reconciled                  ; no content-length declared: nothing to check
+    mov rsi, [req + linnea_h2_req.cl_len]
+    test rsi, rsi
+    jz .req_message_error              ; a present-but-empty content-length is malformed
+    xor eax, eax
+    xor ecx, ecx
+.cl_digit:
+    cmp rcx, rsi
+    jae .cl_check
+    movzx edx, byte [rdi + rcx]
+    sub edx, '0'
+    cmp edx, 9
+    ja .req_message_error              ; a non-digit content-length is malformed
+    imul rax, rax, 10                  ; an absurd (overflowing) length simply will
+    add rax, rdx                       ; not equal r9, so it lands as a mismatch
+    inc rcx
+    jmp .cl_digit
+.cl_check:
+    cmp rax, r9
+    jne .req_message_error             ; declared length != DATA sum
+.cl_reconciled:
     ; One decoded request is one request, and h3 multiplexes as freely as h2 —
     ; 100 streams on a connection, so max_per_ip bounds the request rate hardly
     ; at all. Checked before the drain and authority gates below because it is
