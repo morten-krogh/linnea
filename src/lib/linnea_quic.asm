@@ -20,6 +20,7 @@ global linnea_quic_close_frame
 global linnea_quic_frame_skip
 global linnea_quic_frames_check
 global linnea_quic_stream_limit
+global linnea_quic_stream_state
 global linnea_quic_early_fresh
 global linnea_quic_frames_ack_eliciting
 global linnea_quic_ack_record
@@ -3720,6 +3721,118 @@ linnea_quic_stream_limit:
 .sl_ok:
     xor eax, eax
 .sl_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_stream_state(rdi = frames, rsi = length, rdx = our opened bidi
+;   stream count, rcx = our opened uni stream count)
+;   -> rax = 0 when every stream frame names a usable stream half, or -1 with
+;      rdx = the frame type that named an impossible stream.
+;
+; The stream-limit walk above deliberately ignores our stream IDs: a peer does
+; not consume a limit we advertised for streams it cannot initiate. That is a
+; different question from whether a frame is legal on one of our streams. RFC
+; 9000 3.1/3.2 makes the initiator and direction bits authoritative for every
+; stream frame, including RESET_STREAM, STOP_SENDING, MAX_STREAM_DATA, and
+; STREAM_DATA_BLOCKED. The caller supplies the number of locally opened streams
+; because stream IDs are allocated in ordinal order; this also keeps a frame on
+; an idle server stream distinct from one on a real stream.
+;
+; For a server receiving from a client:
+;   client bidi (00): both directions exist, so every relevant frame is legal;
+;   client uni  (10): the client can send data, but cannot receive from us;
+;   server bidi (01): both directions exist only after we opened that stream;
+;   server uni  (11): the client can receive from us, but cannot send data.
+linnea_quic_stream_state:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                       ; keep the calls 16-aligned
+    mov rbx, rdi                     ; cursor
+    lea r12, [rdi + rsi]             ; end
+    mov r13, rdx                     ; locally opened bidi count
+    mov r14, rcx                     ; locally opened uni count
+.ss_loop:
+    cmp rbx, r12
+    jae .ss_ok
+    movzx eax, byte [rbx]
+    mov r15d, eax                    ; preserve the triggering type
+    mov ecx, eax
+    and ecx, 0xf8
+    cmp ecx, 0x08                    ; STREAM, all flag combinations
+    je .ss_id
+    cmp eax, 0x04                    ; RESET_STREAM
+    je .ss_id
+    cmp eax, 0x05                    ; STOP_SENDING
+    je .ss_id
+    cmp eax, 0x11                    ; MAX_STREAM_DATA
+    je .ss_id
+    cmp eax, 0x15                    ; STREAM_DATA_BLOCKED
+    je .ss_id
+.ss_next:
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_frame_skip
+    test rax, rax
+    jle .ss_ok                       ; frames_check already judged the packet
+    add rbx, rax
+    jmp .ss_loop
+.ss_id:
+    lea rdi, [rbx + 1]               ; all five shapes begin with stream id
+    mov rsi, r12
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .ss_ok                        ; unreadable: not ours to judge
+    mov rcx, rax                     ; stream id
+    mov eax, ecx
+    and eax, 3
+    jz .ss_next                      ; client-initiated bidirectional
+    cmp eax, 2
+    je .ss_client_uni                ; client-initiated unidirectional
+    cmp eax, 1
+    je .ss_server_bidi               ; server-initiated bidirectional
+    ; server-initiated unidirectional: only the peer's receive-side controls
+    ; are possible here. STREAM, RESET_STREAM, and STREAM_DATA_BLOCKED claim
+    ; that the client is sending on our send-only stream.
+    cmp r15d, 0x05
+    je .ss_server_uni_recv
+    cmp r15d, 0x11
+    jne .ss_bad
+.ss_server_uni_recv:
+    shr rcx, 2
+    inc rcx                          ; stream ordinal = (id >> 2) + 1
+    cmp rcx, r14
+    ja .ss_bad                       ; an idle server stream
+    jmp .ss_next
+.ss_server_bidi:
+    ; A server-initiated bidi has both halves only after the server opens it.
+    shr rcx, 2
+    inc rcx
+    cmp rcx, r13
+    ja .ss_bad
+    jmp .ss_next
+.ss_client_uni:
+    ; The client-initiated uni sender may use STREAM, RESET_STREAM, and
+    ; STREAM_DATA_BLOCKED, but has no server-facing send half to stop or credit.
+    cmp r15d, 0x05
+    je .ss_bad
+    cmp r15d, 0x11
+    je .ss_bad
+    jmp .ss_next
+.ss_bad:
+    mov rdx, r15
+    mov rax, -1
+    jmp .ss_ret
+.ss_ok:
+    xor eax, eax
+.ss_ret:
     add rsp, 8
     pop r15
     pop r14

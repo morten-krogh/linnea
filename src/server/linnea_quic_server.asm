@@ -161,6 +161,7 @@ extern linnea_quic_ack_record
 extern linnea_quic_ack_seen
 extern linnea_quic_frames_check
 extern linnea_quic_stream_limit
+extern linnea_quic_stream_state
 extern linnea_quic_alpn_has
 extern linnea_quic_frames_ack_eliciting
 extern linnea_quic_rtt_sample
@@ -2169,6 +2170,29 @@ linnea_quic_server_datagram:
     mov esi, edx                     ; the type we could not parse
     jmp .transport_close
 .frames_ok:
+    ; RFC 9000 3.1/3.2: a frame naming a stream must be legal for that
+    ; stream's initiator and direction. This server opens no bidirectional
+    ; streams and, when the peer permits them, exactly the three fixed HTTP/3
+    ; unidirectional streams 3, 7, and 11. Validate this before the specialized
+    ; RESET/STOP, flow-control, and STREAM walks can silently act on an
+    ; impossible stream half. Stream ordinal limits remain a separate check
+    ; below, so an over-limit peer stream is still STREAM_LIMIT_ERROR.
+    lea rdi, [plaintext]
+    mov rsi, r14
+    xor edx, edx                    ; no server-initiated bidi streams
+    xor ecx, ecx                    ; no local uni streams unless peer allowed all 3
+    mov rax, [cur_conn]
+    cmp qword [rax + linnea_quic_conn.ms_uni_peer], 3
+    jb .state_check
+    mov ecx, 3
+.state_check:
+    call linnea_quic_stream_state
+    test rax, rax
+    jz .state_ok
+    mov edi, 0x05                   ; STREAM_STATE_ERROR
+    mov esi, edx                    ; the frame that named the invalid stream
+    jmp .transport_close
+.state_ok:
     ; RFC 9000 4.6 MUST: a stream id past the limit we granted is a connection
     ; error of type STREAM_LIMIT_ERROR. Judged next to the frame walk above and
     ; for the same reason — once, on the whole packet, rather than by each of the

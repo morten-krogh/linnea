@@ -124,6 +124,8 @@ if python3 -c 'import aioquic' 2>/dev/null; then
     fs_master=$SRV_PID
     timeout 40 python3 test/quic/h3_final_size.py ${fs_port} >/dev/null 2>&1
     check "h3 QUIC final-size invariants close FINAL_SIZE_ERROR (Finding 12)" $?
+    timeout 60 python3 test/quic/h3_stream_state_test.py ${fs_port} >/dev/null 2>&1
+    check "h3 QUIC stream direction/state errors close STREAM_STATE_ERROR (Finding 14)" $?
     kill -9 $fs_master 2>/dev/null
     wait $fs_master 2>/dev/null
 else
