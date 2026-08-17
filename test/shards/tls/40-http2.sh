@@ -451,6 +451,22 @@ PY
     timeout 30 python3 test/tls/h2_expect.py $CA ${P61443} >/dev/null 2>&1
     check "http2 proxy answers expect: 100-continue with a local 100 (Finding 33)" $?
 
+    # RFC 9113 8.2.1 / RFC 9110 8.6 (Finding 34): a malformed upstream response
+    # head must not be translated into a client-facing field block. A non-token
+    # field name, a control byte in a value, a missing colon, and conflicting
+    # Content-Length all become 502; identical duplicate Content-Length is
+    # normalized to one line and still served.
+    mfok=1
+    for r in badname badvalue nocolon clconflict; do
+        code=$(timeout 8 curl -sk --http2 --max-time 6 --cacert $CA -o /dev/null -w '%{http_code}' $U/api/$r)
+        [ "$code" = 502 ] || mfok=0
+    done
+    [ "$mfok" = 1 ]
+    check "http2 proxy rejects malformed upstream response fields with 502 (Finding 34)" $?
+    body=$(timeout 8 curl -sk --http2 --max-time 6 --cacert $CA $U/api/cldupe)
+    [ "$body" = "hello" ]
+    check "http2 proxy normalizes identical duplicate Content-Length (Finding 34)" $?
+
     timeout 20 python3 test/tls/h2_conformance.py $CA ${P61446} >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
 

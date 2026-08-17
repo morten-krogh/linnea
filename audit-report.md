@@ -40,7 +40,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 31. **Medium: the HTTP/2 proxy cleanly completes truncated or malformed upstream bodies.** Premature EOF and chunk-decoding errors set `BODY_DONE`, causing a normal `END_STREAM` over incomplete data instead of resetting or failing the response. **— FIXED: a premature EOF or a malformed chunk now routes to the bad-gateway handler (502 before the head, RST_STREAM after); A/B-verified and covered by a new tls-shard test.**
 32. **Medium: the HTTP/2 proxy does not coalesce split `cookie` fields before HTTP/1 forwarding.** Each field becomes a separate HTTP/1 header line, which can change cookie parsing and authentication semantics at the backend. **— FIXED: split cookie fields are accumulated in wire order and forwarded as one `"; "`-joined `Cookie` line; A/B-verified and covered by a new tls-shard test.**
 33. **Medium: HTTP/2 proxied uploads do not honor `Expect: 100-continue`.** Linnea waits for the complete body before either responding or forwarding the request head, leaving a compliant waiting client stalled until its fallback timer or the server's body timeout. **— FIXED: a proxied request carrying `expect: 100-continue` is answered with an immediate local interim `100` before the body is collected (and the field is stripped upstream); A/B-verified and covered by a new tls-shard test.**
-34. **Medium: the HTTP/2 proxy translates malformed upstream fields into malformed HTTP/2 responses.** Invalid field names and values are encoded without syntax checks, while conflicting `content-length` lines are forwarded together instead of producing 502. **— OPEN (audit-only pass; no source changes made).**
+34. **Medium: the HTTP/2 proxy translates malformed upstream fields into malformed HTTP/2 responses.** Invalid field names and values are encoded without syntax checks, while conflicting `content-length` lines are forwarded together instead of producing 502. **— FIXED: the upstream head is validated (token names, colon present, no control bytes, no obsolete fold, agreeing Content-Length) before any translation — violations answer 502 — and identical duplicate Content-Length is normalized to one line; A/B-verified and covered by new tls-shard tests.**
 
 **Verification pass (all findings checked against the code):** findings 3–34 were
 each verified against the cited source. Every one is a real code gap — no false
@@ -2082,7 +2082,24 @@ holding an upstream connection while preserving the current buffering policy.
 
 Severity: Medium (P2 proxy response correctness and interoperability)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — a new `h2p_head_validate`, called from `h2p_parse_head` the
+moment the head is delimited (before any translation), walks every field line
+and requires a token name, a colon, and a value free of control bytes but HTAB;
+it rejects an obsolete fold (a line beginning SP/HTAB) and rejects two
+Content-Length values that disagree. Any violation makes `h2p_parse_head` return
+-1, which the receive path already turns into a 502 — so a malformed head is
+never partially translated and the old silent skip of a colon-less or over-long
+line is gone. Identical duplicate Content-Length is normalized rather than
+rejected: the response emitter now forwards only the first `content-length`, so
+the client receives one framing field. A/B-verified against a pre-fix binary
+through new backend routes: a field name with a space, a NUL in a value, a
+missing colon, and conflicting Content-Length were all relayed before (the
+client rejected the block, or the colon-less line was silently dropped) and now
+answer 502; identical duplicate Content-Length returned an empty body before and
+now serves the body under one length. Regression tests in
+[`test/shards/tls/40-http2.sh`](/home/linnea/linnea/test/shards/tls/40-http2.sh)
+with five backend routes in
+[`test/proxy_backend.py`](/home/linnea/linnea/test/proxy_backend.py).
 
 ### Evidence
 

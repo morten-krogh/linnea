@@ -169,6 +169,21 @@ def respond(conn, head, body, extra=b""):
                      b"eof delimited body")
     elif path.endswith(b"/truncated"):
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort")
+    elif path.endswith(b"/badname"):
+        # a field name containing a space is not a token (audit Finding 34)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nBad Name: x\r\n\r\nbody")
+    elif path.endswith(b"/badvalue"):
+        # a NUL (control byte) in a field value
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-Test: va\x00ue\r\n\r\nbody")
+    elif path.endswith(b"/nocolon"):
+        # a header line with no colon at all
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nNoColonHere\r\n\r\nbody")
+    elif path.endswith(b"/clconflict"):
+        # two Content-Length values that disagree -> contradictory framing
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 7\r\n\r\nhello")
+    elif path.endswith(b"/cldupe"):
+        # two Content-Length values that agree -> normalize, still serve
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello")
     elif path.endswith(b"/chunktrunc"):
         # A chunked response cut off mid-stream: the head and one full chunk are
         # flushed with a pause between each, so the proxy forwards the response
