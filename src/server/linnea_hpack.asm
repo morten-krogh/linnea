@@ -61,6 +61,7 @@ hdr_cl2:        db "content-length"
 hdr_pconn:      db "proxy-connection"
 hdr_tenc:       db "transfer-encoding"
 hdr_upg:        db "upgrade"
+hdr_cookie:     db "cookie"
 
 section .bss
 lit_form:      resq 1
@@ -515,6 +516,8 @@ emit_field:
     je .rb_chk_te
     cmp rdx, 4
     je .rb_chk_host
+    cmp rdx, 6
+    je .rb_chk_cookie
     cmp rdx, 7
     je .rb_chk_upg
     cmp rdx, 10
@@ -532,6 +535,47 @@ emit_field:
 .rb_chk_host:
     lea r9, [hdr_host]
     jmp .rb_probe
+.rb_chk_cookie:
+    push rsi
+    push rdi
+    lea r9, [hdr_cookie]
+    call name_eq
+    pop rdi
+    pop rsi
+    jne .rebuild                     ; a different 6-char name: append normally
+    ; A cookie field (RFC 9113 8.2.3, Finding 32): do not rebuild a line for it;
+    ; append its value to ck_buf, joined with "; ", and let the proxy head emit
+    ; one Cookie line at the end. rax=name, rdx=6, rsi=value ptr, rdi=value len.
+    mov r10, [rbx + linnea_h2_req.ck_len]   ; length joined so far
+    cmp r10, -1
+    je .no_rebuild                   ; already overflowed: drop (head fails 431)
+    mov r8, r10                      ; prospective new length
+    test r10, r10
+    jz .rb_ck_bound
+    add r8, 2                        ; a "; " separator precedes this value
+.rb_ck_bound:
+    add r8, rdi
+    cmp r8, 8192                     ; ck_buf capacity
+    ja .rb_ck_over
+    mov r9, [rbx + linnea_h2_req.ck_buf]
+    add r9, r10                      ; write cursor = base + current length
+    test r10, r10
+    jz .rb_ck_val
+    mov word [r9], '; '
+    add r9, 2
+.rb_ck_val:
+    push rsi
+    push rdi
+    mov rcx, rdi                     ; value length
+    mov rdi, r9                      ; dest (rsi already = value ptr)
+    rep movsb
+    pop rdi
+    pop rsi
+    mov [rbx + linnea_h2_req.ck_len], r8
+    jmp .no_rebuild
+.rb_ck_over:
+    mov qword [rbx + linnea_h2_req.ck_len], -1
+    jmp .no_rebuild
 .rb_chk_upg:
     lea r9, [hdr_upg]
     jmp .rb_probe

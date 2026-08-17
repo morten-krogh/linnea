@@ -38,7 +38,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 29. **Low: the HPACK decoder accepts dynamic-table size updates after header fields.** A malformed field block can mutate compression state and be served instead of causing `COMPRESSION_ERROR`. **— OPEN (audit-only pass; no source changes made).**
 30. **Medium: the HTTP/2 proxy treats an upstream informational response as final.** A `100 Continue` or `103 Early Hints` response is emitted with `END_STREAM`, and the backend's actual final response is discarded. **— FIXED: a 1xx is now relayed as an interim HEADERS block without `END_STREAM` and the final response still follows (101 is rejected 502); A/B-verified and covered by new tls-shard tests.**
 31. **Medium: the HTTP/2 proxy cleanly completes truncated or malformed upstream bodies.** Premature EOF and chunk-decoding errors set `BODY_DONE`, causing a normal `END_STREAM` over incomplete data instead of resetting or failing the response. **— FIXED: a premature EOF or a malformed chunk now routes to the bad-gateway handler (502 before the head, RST_STREAM after); A/B-verified and covered by a new tls-shard test.**
-32. **Medium: the HTTP/2 proxy does not coalesce split `cookie` fields before HTTP/1 forwarding.** Each field becomes a separate HTTP/1 header line, which can change cookie parsing and authentication semantics at the backend. **— OPEN (audit-only pass; no source changes made).**
+32. **Medium: the HTTP/2 proxy does not coalesce split `cookie` fields before HTTP/1 forwarding.** Each field becomes a separate HTTP/1 header line, which can change cookie parsing and authentication semantics at the backend. **— FIXED: split cookie fields are accumulated in wire order and forwarded as one `"; "`-joined `Cookie` line; A/B-verified and covered by a new tls-shard test.**
 33. **Medium: HTTP/2 proxied uploads do not honor `Expect: 100-continue`.** Linnea waits for the complete body before either responding or forwarding the request head, leaving a compliant waiting client stalled until its fallback timer or the server's body timeout. **— OPEN (audit-only pass; no source changes made).**
 34. **Medium: the HTTP/2 proxy translates malformed upstream fields into malformed HTTP/2 responses.** Invalid field names and values are encoded without syntax checks, while conflicting `content-length` lines are forwarded together instead of producing 502. **— OPEN (audit-only pass; no source changes made).**
 
@@ -1960,7 +1960,16 @@ HTTP/2 stream instead of emitting a clean `END_STREAM`.
 
 Severity: Medium (P2 proxy semantics and authentication correctness)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — the HPACK proxy rebuild no longer emits a line per `cookie`
+field. A length-6 dispatch recognises `cookie` and accumulates each value, in
+wire order, into a per-request join buffer (`ck_buf`/`ck_len`, `"; "`-separated);
+`.serve_proxy` then appends one `Cookie:` line before the head is bounded, so an
+overflowing join is answered 431 by the existing block-overflow check. Only the
+HTTP/2-to-HTTP/1 boundary is affected. A/B-verified against a pre-fix binary via
+the `/api/headers` echo backend: two and three split cookie fields arrived as two
+and three separate lines before the fix and now arrive as one `"; "`-joined line
+in order; a single cookie field is unchanged. Regression test
+`test/tls/h2_cookie.py`.
 
 ### Evidence
 

@@ -113,6 +113,12 @@ struc linnea_h2_req
     .hb_cur:      resq 1
     .cl_ptr:      resq 1        ; content-length value, 0 if absent (the
     .cl_len:      resq 1        ; proxy path forwards it and streams the body)
+    ; Split cookie fields are accumulated rather than rebuilt one line each
+    ; (RFC 9113 8.2.3, Finding 32): the joined "v1; v2; ..." value grows in the
+    ; buffer .ck_buf points at (0 = not the proxy path, no accumulation) and
+    ; .ck_len tracks it (0 = no cookie field seen yet; -1 = overflowed the buffer).
+    .ck_buf:      resq 1
+    .ck_len:      resq 1
     .dyn:         resq 1        ; *linnea_hpack_dyn for this connection, or 0
                                 ; (QPACK passes 0: HTTP/3 has its own table
                                 ; encoding, and we advertise zero capacity)

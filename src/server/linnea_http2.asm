@@ -1118,6 +1118,8 @@ h2_build_request:
     mov [rsp + REQ + linnea_h2_req.hb_cur], rax
     lea rax, [h2_hdrs_buf + 8192]
     mov [rsp + REQ + linnea_h2_req.hb_end], rax
+    lea rax, [h2_cookie_buf]         ; split cookie fields join here (Finding 32)
+    mov [rsp + REQ + linnea_h2_req.ck_buf], rax
     mov rdi, [rsp + L_ASM]           ; the reassembled block
     mov rsi, r14
     sub rsi, rdi                     ; block length
@@ -1920,6 +1922,37 @@ h2_serve:
     ; Here the request is rewritten into the slot; the loop connects, sends,
     ; reads the response head back and the pending-frame service translates
     ; it for the client (see the Q86 section below).
+    ; First, coalesce any split cookie fields into one h1 Cookie line: RFC 9113
+    ; 8.2.3 lets an h2 client split Cookie for compression but an intermediary
+    ; must join them with "; " before a non-h2 hop (Finding 32). The values were
+    ; accumulated during decode; append one line now, and let the bound check
+    ; below answer 431 if it (or the block) did not fit.
+    mov rcx, [r12 + linnea_h2_req.ck_len]
+    test rcx, rcx
+    jz .sp_cookies_done              ; no cookie field: nothing to emit
+    cmp rcx, -1
+    je .sp_cookie_over               ; the join overflowed its buffer
+    mov rdi, [r12 + linnea_h2_req.hb_cur]
+    lea rax, [rdi + rcx]
+    add rax, ck_hdr_name_len + 2     ; "cookie: " + value + CRLF
+    cmp rax, [r12 + linnea_h2_req.hb_end]
+    ja .sp_cookie_over
+    mov r8, rcx                      ; hold the value length across the copies
+    lea rsi, [ck_hdr_name]
+    mov rcx, ck_hdr_name_len
+    rep movsb
+    mov rsi, [r12 + linnea_h2_req.ck_buf]
+    mov rcx, r8
+    rep movsb
+    mov word [rdi], 0x0a0d           ; CRLF
+    add rdi, 2
+    mov [r12 + linnea_h2_req.hb_cur], rdi
+    jmp .sp_cookies_done
+.sp_cookie_over:
+    mov rax, [r12 + linnea_h2_req.hb_end]
+    inc rax                          ; overflow sentinel: the check below fails it
+    mov [r12 + linnea_h2_req.hb_cur], rax
+.sp_cookies_done:
     mov rax, [r12 + linnea_h2_req.hb_cur]
     cmp rax, [r12 + linnea_h2_req.hb_end]
     ja .resp_431                     ; rebuilt header block overflowed
@@ -5494,6 +5527,8 @@ body_413_len equ $ - body_413
 ; --- proxy-over-h2 literals ---
 h2p_http11:      db " HTTP/1.1", 13, 10, "Host: "
 h2p_http11_len   equ $ - h2p_http11
+ck_hdr_name:     db "cookie: "         ; the coalesced h1 Cookie line's name (Finding 32)
+ck_hdr_name_len  equ $ - ck_hdr_name
 h2p_clen:        db "Content-Length: "
 h2p_clen_len     equ $ - h2p_clen
 ; The request reached us over HTTP/2, so that is what our Via entry names
@@ -5564,6 +5599,7 @@ h2_numbuf:    resb 24
 h2_crbuf:     resb 80                ; "bytes first-last/size" / "bytes */size"
 h2_locbuf:    resb 2560              ; a redirect's Location value
 h2_hdrs_buf:  resb 8192              ; proxy: the rebuilt h1 header lines
+h2_cookie_buf: resb 8192             ; proxy: split cookie fields joined "; " (Finding 32)
 h2_req_es:    resd 1                 ; END_STREAM was set on the HEADERS frame
 h2_req_trail: resq 1                 ; ...and that HEADERS was a trailer section
 h2p_pool:     resq 1                 ; the upstream slot array (one mmap)

@@ -440,6 +440,11 @@ PY
     [ "$code" = 502 ]
     check "http2 proxy rejects an upstream 101 (Finding 30)" $?
 
+    # RFC 9113 8.2.3 (Finding 32): an h2 client may split Cookie into several
+    # fields; the proxy must join them, in order, with "; " for the h1 backend.
+    timeout 30 python3 test/tls/h2_cookie.py $CA ${P61443} >/dev/null 2>&1
+    check "http2 proxy coalesces split cookie fields (Finding 32)" $?
+
     timeout 20 python3 test/tls/h2_conformance.py $CA ${P61446} >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
 
