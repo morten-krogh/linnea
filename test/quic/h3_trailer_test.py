@@ -10,7 +10,7 @@ import socket, ssl, sys, time
 import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
-from aioquic.quic.events import StreamDataReceived, ConnectionTerminated
+from aioquic.quic.events import StreamDataReceived, StreamReset, ConnectionTerminated
 
 port = int(sys.argv[1])
 
@@ -19,7 +19,7 @@ def vlq(n):
     return bytes([n]) if n < 64 else (0x4000 | n).to_bytes(2, "big")
 
 
-def run(name, trailer_fields):
+def run(name, trailer_fields=None, trailer_block=None):
     cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
     cfg.verify_mode = ssl.CERT_NONE
     cfg.server_name = "localhost"
@@ -33,7 +33,7 @@ def run(name, trailer_fields):
     c.connect(("127.0.0.1", port), now=clk())
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setblocking(False)
-    st = {"data": b"", "term": None}
+    st = {"data": b"", "term": None, "reset": None}
 
     def pump(d):
         end = time.time() + d
@@ -54,6 +54,8 @@ def run(name, trailer_fields):
             while ev:
                 if isinstance(ev, StreamDataReceived) and ev.stream_id == 0:
                     st["data"] += ev.data
+                elif isinstance(ev, StreamReset) and ev.stream_id == 0:
+                    st["reset"] = ev.error_code
                 elif isinstance(ev, ConnectionTerminated):
                     st["term"] = ev.error_code
                 ev = c.next_event()
@@ -69,7 +71,9 @@ def run(name, trailer_fields):
     _, head = enc.encode(0, [(b":method", b"GET"), (b":scheme", b"https"),
                              (b":authority", b"localhost"), (b":path", b"/hello.txt")])
     body = b"\x01" + vlq(len(head)) + head
-    if trailer_fields is not None:
+    if trailer_block is not None:
+        body += b"\x01" + vlq(len(trailer_block)) + trailer_block
+    elif trailer_fields is not None:
         enc2 = pylsqpack.Encoder()
         enc2.apply_settings(max_table_capacity=0, blocked_streams=0)
         _, tr = enc2.encode(0, trailer_fields)
@@ -84,9 +88,8 @@ def run(name, trailer_fields):
         if code in blob[:80]:
             status = code.decode()
             break
-    if st["term"] is not None:
-        return None
-    return (len(blob), b"content-range" in blob)
+    return (len(blob), b"content-range" in blob,
+            st["reset"], st["term"])
 
 
 # A trailing HEADERS frame (trailers, RFC 9114 4.1) must not merge into the
@@ -95,6 +98,21 @@ def run(name, trailer_fields):
 base = run("no trailer", None)
 rng  = run("trailer range: bytes=0-4", [(b"range", b"bytes=0-4")])
 assert base is not None and rng is not None, "no response"
+assert base[2:] == (None, None) and rng[2:] == (None, None), \
+    "valid trailer unexpectedly failed the request"
 assert not rng[1], "a trailer Range produced a Content-Range: trailers still merge"
 assert rng[0] == base[0], f"trailer changed the byte count ({rng[0]} vs {base[0]})"
+
+# A decodable pseudo-field is malformed only at the HTTP/3 message layer: it
+# must reset this request stream, without taking the connection down.
+pseudo = run("pseudo-field trailer", [(b":path", b"/evil")])
+assert pseudo[2] == 0x10E and pseudo[3] is None, \
+    f"pseudo-field trailer was not a stream error: reset={pseudo[2]!r} term={pseudo[3]!r}"
+
+# An invalid QPACK reference is a connection error because the decoder cannot
+# trust its compression state for later requests. Required Insert Count 0,
+# Delta Base 0, then an indexed dynamic-table reference with index 0.
+bad_qpack = run("malformed QPACK trailer", trailer_block=b"\x00\x00\x80")
+assert bad_qpack[3] == 0x200, \
+    f"malformed QPACK trailer did not close with QPACK_DECOMPRESSION_FAILED: {bad_qpack!r}"
 print("ok")

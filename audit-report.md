@@ -23,7 +23,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 14. **Medium: QUIC stream direction and state are not validated.** Frames naming server-initiated or send-only streams are skipped or acted on without the required `STREAM_STATE_ERROR`. **— OPEN (audit-only pass; no source changes made).**
 15. **Medium: accepted 0-RTT bypasses normal QUIC frame and stream-limit checks.** Early packets jump directly into the STREAM scanner, so prohibited frame types and over-limit early stream IDs do not receive the errors applied to 1-RTT packets. **— OPEN (audit-only pass; no source changes made).**
 16. **Medium: inline HTTP/3 and control packets bypass QUIC congestion accounting and can fall out of loss recovery.** Only bulk response chunks are gated by `cwnd`; the eight-entry small-packet ring silently stops tracking additional replies. **— FIXED: ack-eliciting inline/control packets are now charged to a shared in-flight total (`inline_flight` + `bytes_in_flight`), an inline response is admitted only if it fits `cwnd` and a recovery slot, and the overflow is handed to the congestion-controlled pump rather than sent untracked; quic+tls shards green, burst answered 40/40 even with the ring forced to one slot.**
-17. **Medium: HTTP/3 trailer field sections are skipped without QPACK or semantic validation.** Invalid compressed trailers and forbidden trailer pseudo-fields are accepted. **— OPEN (audit-only pass; no source changes made).**
+17. **Medium: HTTP/3 trailer field sections are skipped without QPACK or semantic validation.** Invalid compressed trailers and forbidden trailer pseudo-fields are accepted. **— FIXED: trailer field sections are now decoded into a throwaway request/scratch pair; QPACK failures close with `QPACK_DECOMPRESSION_FAILED`, pseudo-field/semantic failures reset the request stream, and valid trailer fields cannot affect routing; verified with malformed-QPACK, pseudo-field, and valid-trailer cases.**
 18. **Medium: HTTP/3 does not reconcile `content-length` with DATA bytes.** A short or long body is routed and proxied instead of being rejected as a malformed message. **— FIXED (commit 514532a).**
 19. **Medium: single-frame HTTP/3 request bodies bypass `max_body`.** The copy-free offset-zero-plus-FIN path reaches routing without either of the cap checks used by reassembly. **— FIXED (commit 13db631).**
 20. **Medium: the peer's QUIC `max_udp_payload_size` is parsed but not enforced.** Large inline field sections can produce datagrams above a client's advertised receive limit. **— OPEN (audit-only pass; no source changes made).**
@@ -53,11 +53,12 @@ choice.
 
 **Fix status.** Finding 1 fixed (earlier). Findings 3, 4, 18, 19, 24 fixed and
 suite-tested this pass (commits above; each reproduced pre-fix and A/B-verified).
-Finding 2 left as-is (unreachable without transferring ~18 EB). Findings 5–17,
-20–23, 25–34 remain open: the request-integrity #11 (High), the h2-proxy response
-chain (30–34), the QUIC transport-state work (12–16, 20–23), and the conformance
-gaps (5, 8–10, 25–29). Finding 3 is reachable with an ordinary small request whenever
-an operator sets `max_body` below the request-buffer capacity.
+Finding 2 left as-is (unreachable without transferring ~18 EB). Findings 5–9,
+14–15, and 20 remain open: QUIC receive-accounting and early-data work (6–7),
+critical-stream and SETTINGS gaps (8–9), stream-direction and 0-RTT checks
+(14–15), and negotiated UDP-size enforcement (20). Finding 3 is reachable with
+an ordinary small request whenever an operator sets `max_body` below the
+request-buffer capacity.
 
 ## Finding 1 — streamed HTTP/1 bodies lose pipelined suffix bytes
 
@@ -1200,7 +1201,9 @@ untracked challenge responses can remain separately classified.
 
 Severity: Medium (P2 malformed-message and compression-state validation)  
 Confidence: High  
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — trailer sections are decoded into a throwaway request and
+scratch arena; malformed QPACK closes the connection and forbidden pseudo-fields
+reset only the request stream.
 
 ### Evidence
 
@@ -1254,6 +1257,20 @@ existing QPACK connection error and semantic failure to `H3_MESSAGE_ERROR`.
   `H3_MESSAGE_ERROR` and no upstream dispatch.
 - Keep the valid ignored-routing trailer test and add a valid literal trailer
   as controls.
+
+### Resolution (fixed)
+
+The trailer path now accumulates the encoded field section instead of skipping it,
+then decodes it with `linnea_qpack_decode` into a fresh request structure and
+Huffman scratch arena. The live request and its routing/proxy-header state are
+never touched. QPACK decode failures use the existing connection-level
+`QPACK_DECOMPRESSION_FAILED` path; a semantically malformed trailer, including
+any pseudo-field, returns `H3_MESSAGE_ERROR` on the request stream. Valid regular
+trailers remain consumed and ignored.
+
+`test/quic/h3_trailer_test.py` now covers a valid ignored trailer, a pseudo-field
+trailer, and an invalid dynamic-table reference in a trailer. The focused QUIC
+run passed 91 checks with 0 failures (10 skipped).
 
 ## Finding 18 — HTTP/3 does not validate Content-Length against DATA
 
@@ -2328,8 +2345,9 @@ some descriptor-leak scenarios. The following additions would improve confidence
   and forbidden/over-limit 0-RTT input (Findings 11–15).
 - Add a no-ACK burst that crosses the inline loss ring and initial congestion
   window, with packet loss around the boundary (Finding 16).
-- Add malformed QPACK trailers, trailer pseudo-fields, Content-Length/DATA
-  mismatches, and single-packet body-cap boundaries (Findings 17–19).
+- Add Content-Length/DATA mismatches and single-packet body-cap boundaries
+  (Findings 18–19); malformed QPACK trailers and trailer pseudo-fields are now
+  covered by `test/quic/h3_trailer_test.py` (Finding 17).
 - Extend transport-parameter fixtures with malformed, duplicate, forbidden, and
   boundary values; then exercise negotiated UDP limits, peer/local CID rotation,
   multi-byte unidirectional stream types, and nondefault ACK delays
@@ -2437,3 +2455,14 @@ Finding 1 fix:
 - The full long-running network matrix (`LINNEA_SUITE=full`) was not rerun; the
   change is confined to the HTTP/1 request-capture path, which the fast suite
   exercises directly.
+
+Finding 17 fix:
+
+- The audit's pre-fix observation was confirmed in the affected path: invalid
+  QPACK and pseudo-field trailers were skipped without validation, while a valid
+  `range` trailer was ignored for routing.
+- Added regression cases for a valid ignored trailer, a decodable pseudo-field
+  (expected stream reset `H3_MESSAGE_ERROR`), and a dynamic-table reference in a
+  trailer (expected connection close `QPACK_DECOMPRESSION_FAILED`).
+- The focused QUIC run passed 91 checks with 0 failures and 10 skips; the trailer
+  cases ran against the rebuilt binary.

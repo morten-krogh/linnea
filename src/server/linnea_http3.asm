@@ -166,6 +166,11 @@ linnea_h3_tx_cap: resq 1
 linnea_h3_body_off: resq 1
 linnea_h3_body_len: resq 1
 h3_crange_buf: resb 80                ; "bytes first-last/size" / "bytes */size"
+; Trailer field sections are decoded for validation, but must not overwrite the
+; request that will be routed. Keep a separate request and Huffman arena for
+; that throwaway decode: the real request's pointers may refer to h3scratch.
+h3_trailer_req:     resb linnea_h2_req_size
+h3_trailer_scratch: resb LINNEA_HPACK_MAX_LISTSIZE
 ; The one request-stream walk. One at a time is enough while the caller feeds a
 ; whole stream in a single call; driving it incrementally moves this into the
 ; per-stream context, which is what lets several uploads run at once.
@@ -280,8 +285,15 @@ linnea_h3_walk_feed:
     mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_FIELDS
     jmp .w_step
 .w_trailer:
+    ; A trailer is still a QPACK field section. Accumulate it just like the
+    ; request headers, then decode it into the throwaway target below. Decoding
+    ; matters even though the fields are discarded: a malformed section is a
+    ; QPACK connection error, and pseudo-fields are a stream-level message
+    ; error. The real request remains untouched so a trailer cannot affect
+    ; routing or proxy-header rebuild.
     mov qword [rbx + linnea_h3_walk.seq], 2
-    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_SKIP
+    mov qword [rbx + linnea_h3_walk.fs_have], 0
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_FIELDS
     jmp .w_step
 .w_data_frame:
     mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_DATA
@@ -331,6 +343,8 @@ linnea_h3_walk_feed:
     lea rdi, [rbx + linnea_h3_walk.fs]
     mov rsi, [rbx + linnea_h3_walk.fs_have]
 .w_decode:
+    cmp qword [rbx + linnea_h3_walk.seq], 2
+    je .w_decode_trailer
     mov rdx, r14
     call linnea_qpack_decode         ; 0 | -err
     test rax, rax
@@ -354,11 +368,60 @@ linnea_h3_walk_feed:
     mov qword [rbx + linnea_h3_walk.seq], 1
     mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_HEADER
     jmp .w_step
+.w_decode_trailer:
+    ; Preserve the field-section pointer/length while preparing a fresh req.
+    ; The decoder's Huffman output must also not reuse h3scratch: the original
+    ; request may have pointers into it which are needed by the serve path.
+    push rdi
+    push rsi
+    lea rdi, [h3_trailer_req]
+    xor eax, eax
+    mov ecx, linnea_h2_req_size / 8
+    rep stosq
+    lea rax, [h3_trailer_scratch]
+    mov [h3_trailer_req + linnea_h2_req.scratch], rax
+    lea rax, [h3_trailer_scratch + LINNEA_HPACK_MAX_LISTSIZE]
+    mov [h3_trailer_req + linnea_h2_req.scratch_end], rax
+    pop rsi
+    pop rdi
+    lea rdx, [h3_trailer_req]
+    call linnea_qpack_decode
+    test rax, rax
+    jns .w_trailer_decoded
+    ; emit_field marks a syntactically valid but semantically malformed field
+    ; block in the temporary request. That is a stream error; all other decode
+    ; failures mean the peer's QPACK state cannot be trusted and close the
+    ; connection, just as for the initial field section.
+    cmp qword [h3_trailer_req + linnea_h2_req.malformed], 0
+    jne .w_err
+    cmp rax, -LINNEA_HPACK_ERR_LIMIT
+    je .w_toolarge
+    jmp .w_qpack_bad
+.w_trailer_decoded:
+    ; RFC 9114 4.3: request pseudo-fields MUST NOT appear in trailers. Regular
+    ; fields were syntax-checked by emit_field and connection-specific fields
+    ; were rejected there as well; none of the decoded trailer values are
+    ; copied into the live request.
+    cmp qword [h3_trailer_req + linnea_h2_req.malformed], 0
+    jne .w_err
+    cmp qword [h3_trailer_req + linnea_h2_req.pseudo_seen], 0
+    jne .w_err
+    mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_HEADER
+    jmp .w_step
 .w_fields_held:
+    ; A deferred initial section is decoded when the request is served. A
+    ; trailer, however, must be validated now so a reassembled stream cannot
+    ; complete successfully while its trailer was never decoded.
+    cmp qword [rbx + linnea_h3_walk.seq], 2
+    je .w_held_trailer
     ; the section is whole in .fs; the caller decodes it when it serves
     mov qword [rbx + linnea_h3_walk.seq], 1
     mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_HEADER
     jmp .w_step
+.w_held_trailer:
+    lea rdi, [rbx + linnea_h3_walk.fs]
+    mov rsi, [rbx + linnea_h3_walk.fs_have]
+    jmp .w_decode
 
 ; --- a DATA payload: the body is the concatenation of every DATA frame's
 ; payload (4.1), which an encoder may split any way it likes ----------------
@@ -417,7 +480,7 @@ linnea_h3_walk_feed:
     jnz .w_step
     jmp .w_frame_end
 
-; --- a payload we do not read: grease, an unknown type, or a trailer section
+; --- a payload we do not read: grease or an unknown frame type --------------
 .w_skip:
     cmp qword [rbx + linnea_h3_walk.frame_rem], 0
     je .w_frame_end
