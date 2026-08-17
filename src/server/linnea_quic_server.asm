@@ -2452,28 +2452,24 @@ linnea_quic_server_datagram:
     mov [s_slen], rdx
     mov [s_soff], r10                ; data offset, for typing a uni stream
     mov [s_sfin], r11                ; FIN flag, for the critical-stream check
-    ; connection-level receive flow control (quic-9): count the bytes and, when a
-    ; fresh grant would advance the ceiling by at least FC_GRANT_MIN, queue a
-    ; MAX_DATA so the peer never stalls on initial_max_data. The count is loose
-    ; (a retransmit is double-counted) but that only grants sooner, which is safe.
-    mov rax, [cur_conn]
-    add [rax + linnea_quic_conn.fc_recv], rdx
-    mov rcx, [rax + linnea_quic_conn.fc_recv]
-    add rcx, LINNEA_QUIC_FC_WINDOW
-    sub rcx, [rax + linnea_quic_conn.fc_adv]
-    cmp rcx, LINNEA_QUIC_FC_GRANT_MIN
-    jb .fc_recv_done
-    mov rcx, [rax + linnea_quic_conn.fc_recv]
-    add rcx, LINNEA_QUIC_FC_WINDOW
-    mov [rax + linnea_quic_conn.fc_adv], rcx
-    mov qword [rax + linnea_quic_conn.fc_pending], 1
-.fc_recv_done:
     mov rax, r8
     and eax, 3
     jz .client_bidi                  ; client bidi stream: an HTTP/3 request
     cmp eax, 2
-    je .client_uni                   ; client uni stream: control / QPACK
-    jmp .stream_scan                 ; a server-initiated id (never from a client)
+    jne .stream_scan                  ; a server-initiated id (never from a client)
+    ; Unidirectional streams have no request reassembly context, so retain their
+    ; per-stream high-water separately before dispatching to the HTTP/3 walker.
+    ; A retransmission under a fresh packet number therefore contributes only the
+    ; portion beyond the highest offset already received.
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    mov rdx, [s_soff]
+    mov rcx, [s_slen]
+    call quic_fc_recv_uni
+    mov rsi, rax
+    mov rdi, [cur_conn]
+    call quic_fc_recv_charge
+    jmp .client_uni                   ; client uni stream: control / QPACK
 
 ; --- a client bidirectional stream: an HTTP/3 request ---
 ; A whole request in one STREAM frame (offset 0 with FIN) takes a copy-free fast
@@ -2540,6 +2536,7 @@ linnea_quic_server_datagram:
     mov qword [rax + linnea_quic_ra.blocked_n], 0
     mov qword [rax + linnea_quic_ra.stall_at], 0
     mov qword [rax + linnea_quic_ra.stalled_ms], 0
+    mov qword [rax + linnea_quic_ra.fc_hi], 0
     ; A stream begins on the context's own small buffer, handing back any big one
     ; the last stream through here borrowed. Doing it at the START as well as at
     ; release is belt and braces on a resource whose leak is permanent: a slot
@@ -2616,6 +2613,28 @@ linnea_quic_server_datagram:
     mov qword [rax + linnea_quic_ra.stall_at], 0
     pop rcx
 .ra_nostall:
+    ; Connection-level receive flow control is based on the stream's received
+    ; high-water, not the encoded length of this frame. A retransmission under a
+    ; fresh packet number can overlap the bitmap (or a body range) completely;
+    ; only an end offset beyond .fc_hi consumes new connection credit. Keep this
+    ; high-water absolute while .base/.hi slide over the request.
+    mov r9, [s_soff]
+    mov r10, [s_slen]
+    mov r11, r9
+    add r11, r10
+    cmp r11, [rax + linnea_quic_ra.fc_hi]
+    jbe .ra_fc_done
+    mov rdx, r11
+    sub rdx, [rax + linnea_quic_ra.fc_hi]
+    mov [rax + linnea_quic_ra.fc_hi], r11
+    push rax
+    push rax
+    mov rdi, [cur_conn]
+    mov rsi, rdx
+    call quic_fc_recv_charge
+    pop rax
+    pop rax
+.ra_fc_done:
     ; place the frame at its offset (out-of-order frames are buffered, not
     ; dropped) and record the bytes as seen; the contiguous prefix advances below.
     ; rax is this stream's reassembly context throughout.
@@ -3344,6 +3363,13 @@ linnea_quic_server_datagram:
     call req_served_known
     test eax, eax
     jnz .stream_scan                 ; already dispatched: ack covers it, do not re-serve
+    ; This is the copy-free offset-0-plus-FIN path, so there is no reassembly
+    ; context in which to retain the stream high-water. It is charged only after
+    ; the duplicate/cancelled-stream checks above; a fresh-PN retransmission of a
+    ; completed request therefore contributes no connection credit.
+    mov rdi, [cur_conn]
+    mov rsi, [s_slen]
+    call quic_fc_recv_charge
     mov rdi, [cur_conn]
     mov rsi, [s_sid]
     call req_served_mark             ; committing to dispatch it now (once)
@@ -5828,6 +5854,81 @@ now_ms:
     div rcx                           ; rax = ns / 1e6
     add rax, r8
     add rsp, 24
+    ret
+
+; quic_fc_recv_charge(rdi = conn, rsi = newly received stream high-water bytes)
+; Charge only bytes that advanced a stream's receive high-water. The caller has
+; already filtered retransmissions and overlapping STREAM frames; this helper
+; owns the common MAX_DATA grant calculation.
+quic_fc_recv_charge:
+    test rsi, rsi
+    jz .fcc_done
+    add [rdi + linnea_quic_conn.fc_recv], rsi
+    mov rax, [rdi + linnea_quic_conn.fc_recv]
+    add rax, LINNEA_QUIC_FC_WINDOW
+    sub rax, [rdi + linnea_quic_conn.fc_adv]
+    cmp rax, LINNEA_QUIC_FC_GRANT_MIN
+    jb .fcc_done
+    mov rcx, [rdi + linnea_quic_conn.fc_recv]
+    add rcx, LINNEA_QUIC_FC_WINDOW
+    mov [rdi + linnea_quic_conn.fc_adv], rcx
+    mov qword [rdi + linnea_quic_conn.fc_pending], 1
+.fcc_done:
+    ret
+
+; quic_fc_recv_uni(rdi = conn, rsi = stream id, rdx = offset, rcx = length)
+; -> rax = bytes by which this client-unidirectional stream's high-water grew.
+; Client uni streams have no request reassembly context, so retain one absolute
+; high-water per stream for the life of the connection. The transport parameter
+; limits the number of such streams to LINNEA_QUIC_MSU_INIT.
+quic_fc_recv_uni:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi
+    mov r12, rsi
+    mov r14, rdx
+    add r14, rcx
+    jc .fcu_none
+    xor r13d, r13d
+    lea r15, [rbx + linnea_quic_conn.fc_uni_sid]
+.fcu_scan:
+    cmp [r15 + r13 * 8], r12
+    je .fcu_found
+    cmp qword [r15 + r13 * 8], 0
+    je .fcu_new
+    inc r13
+    cmp r13, LINNEA_QUIC_MSU_INIT
+    jb .fcu_scan
+.fcu_none:
+    xor eax, eax
+    jmp .fcu_done
+.fcu_new:
+    mov [r15 + r13 * 8], r12
+    lea rdx, [rbx + linnea_quic_conn.fc_uni_hi]
+    mov [rdx + r13 * 8], r14
+    mov rax, r14
+    jmp .fcu_done
+.fcu_found:
+    lea rdx, [rbx + linnea_quic_conn.fc_uni_hi]
+    mov rax, [rdx + r13 * 8]
+    cmp r14, rax
+    jbe .fcu_zero
+    mov rcx, r14
+    sub rcx, rax
+    mov [rdx + r13 * 8], r14
+    mov rax, rcx
+    jmp .fcu_done
+.fcu_zero:
+    xor eax, eax
+.fcu_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; emit_1rtt() -> rax = the packet number the packet went out under.

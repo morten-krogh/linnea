@@ -12,7 +12,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 3. **Medium: buffered HTTP/1 request bodies bypass `max_body`.** Counted bodies are checked against the limit only when the head plus body no longer fits in `in_buf`; complete chunked bodies take the same unchecked buffered path. A proxy therefore accepts and forwards bodies larger than the configured limit as long as they fit in the request buffer. **— FIXED (commit 13db631).**
 4. **Medium: HTTP/2 accepts a trailer `HEADERS` block without `END_STREAM`.** The malformed trailer is consumed without failing the stream or completing the request, leaving the body slot collecting and allowing later `DATA` on the same stream. **— FIXED (commit 97046ff).**
 5. **Medium: HTTP/2 silently drops stream frames whose IDs have no live slot.** `DATA` on idle or closed streams and `WINDOW_UPDATE`/`RST_STREAM` on idle streams are consumed without the required state-specific error; dropped `DATA` replenishes only the connection window. **— FIXED (idle-stream case): DATA/WINDOW_UPDATE/RST_STREAM on an idle stream (even id, or above the highest opened) now draw a connection PROTOCOL_ERROR instead of being silently ignored; closed-stream frames keep the RFC-permitted lenient handling. A/B-verified.**
-6. **Medium: QUIC connection-level receive credit counts duplicate stream bytes.** Retransmissions under fresh packet numbers increment `fc_recv` even when stream reassembly recognizes every byte as already received, causing premature `MAX_DATA` grants. **— OPEN (audit-only pass; no source changes made).**
+6. **Medium: QUIC connection-level receive credit counts duplicate stream bytes.** Retransmissions under fresh packet numbers increment `fc_recv` even when stream reassembly recognizes every byte as already received, causing premature `MAX_DATA` grants. **— FIXED: connection credit now advances from per-stream receive high-water growth, so fresh-packet-number retransmissions and overlaps do not trigger extra `MAX_DATA`; covered by `test/quic/h3_fc_dedup_test.py`.**
 7. **Medium: coalesced QUIC 0-RTT processing stops after the first early packet.** Later 0-RTT packets in the same datagram are neither decrypted nor acknowledged, so multi-packet early requests fall back to retransmission or remain incomplete. **— OPEN (audit-only pass; no source changes made).**
 8. **Low: HTTP/3 SETTINGS validation is bounded and partially discarded.** SETTINGS payloads larger than the local capture buffer are skipped without validation, and duplicate detection stops after 32 identifiers; the peer's maximum response field-section size is also not retained. **— OPEN (audit-only pass; no source changes made).**
 9. **Low: HTTP/3 critical-stream closure can be missed when closure arrives before stream typing.** Reordered FIN/RESET/STOP_SENDING state is not retained for an as-yet-untyped control or QPACK stream. **— OPEN (audit-only pass; no source changes made).**
@@ -44,20 +44,18 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 
 **Verification pass (all findings checked against the code):** findings 3–34 were
 each verified against the cited source. Every one is a real code gap — no false
-positives — with two nuances: #6 (QUIC `fc_recv` double-counts retransmits) is a
-deliberate, documented design choice whose "flow-control bypass" framing overstates
-a minor looseness, and #28 (h2 CONNECT skips validation) is partly deliberate. The
+positives — with one nuance: #28 (h2 CONNECT skips validation) is partly deliberate. The
 findings split into real correctness/policy issues and a tail of conformance-strictness
 gaps where the current lenient behavior (ignore-instead-of-error) is often the safer
 choice.
 
-**Fix status.** Finding 1 fixed (earlier). Findings 3, 4, 18, 19, 24 fixed and
+**Fix status.** Finding 1 fixed (earlier). Findings 3, 4, 6, 18, 19, 24 fixed and
 suite-tested this pass (commits above; each reproduced pre-fix and A/B-verified).
-Finding 2 left as-is (unreachable without transferring ~18 EB). Findings 5–9,
-14–15, and 20 remain open: QUIC receive-accounting and early-data work (6–7),
-critical-stream and SETTINGS gaps (8–9), stream-direction and 0-RTT checks
-(14–15), and negotiated UDP-size enforcement (20). Finding 3 is reachable with
-an ordinary small request whenever an operator sets `max_body` below the
+Finding 2 left as-is (unreachable without transferring ~18 EB). Findings 7–9,
+14–15, and 20 remain open: early-data work (7), critical-stream and SETTINGS
+gaps (8–9), stream-direction and 0-RTT checks (14–15), and negotiated UDP-size
+enforcement (20). Finding 3 is reachable with an ordinary small request whenever
+an operator sets `max_body` below the
 request-buffer capacity.
 
 ## Finding 1 — streamed HTTP/1 bodies lose pipelined suffix bytes
@@ -495,12 +493,14 @@ distinguishable from an idle one.
 
 Severity: Medium (P2 flow-control/resource-accounting bypass)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — per-stream high-water accounting and a fresh-packet-number
+regression test were added in this pass.
 
 ### Evidence
 
-The QUIC receive path increments the connection-wide byte counter for every
-parsed `STREAM` frame before dispatching the frame to HTTP/3 or reassembly:
+Before the fix, the QUIC receive path incremented the connection-wide byte counter
+for every parsed `STREAM` frame before dispatching the frame to HTTP/3 or
+reassembly:
 
 - [`src/server/linnea_quic_server.asm:2431`](/home/linnea/linnea/src/server/linnea_quic_server.asm:2431)
   through [`src/server/linnea_quic_server.asm:2436`](/home/linnea/linnea/src/server/linnea_quic_server.asm:2436)
@@ -518,11 +518,11 @@ parsed `STREAM` frame before dispatching the frame to HTTP/3 or reassembly:
   onward. Thus the global counter can grow even when no new stream offset is
   accepted.
 
-The inflated counter drives a new connection-level ceiling and queues
+The inflated counter drove a new connection-level ceiling and queued
 `MAX_DATA` at [`src/server/linnea_quic_server.asm:2437`](/home/linnea/linnea/src/server/linnea_quic_server.asm:2437)
 through [`src/server/linnea_quic_server.asm:2445`](/home/linnea/linnea/src/server/linnea_quic_server.asm:2445).
-The source comment calls this “safe,” but the advertised connection credit is
-supposed to cover unique stream data, not repeated copies of the same offsets.
+The advertised connection credit is supposed to cover the stream receive
+high-water, not repeated copies of the same offsets.
 
 ### Observable behavior
 
@@ -537,22 +537,25 @@ The existing duplicate body test repeats identical datagrams, so the packet
 number filter drops those copies before this accounting path. It does not cover
 the required fresh-packet-number retransmission shape.
 
-### Recommended fix
+### Resolution
 
-Base connection-level receive accounting on newly received stream offsets. Keep
-per-stream unique-byte/high-water accounting and add only the newly accepted
-portion to a connection aggregate, or maintain an equivalent connection-wide
-range accounting scheme. Generate `MAX_DATA` only from that unique total.
+`src/server/linnea_quic_server.asm` no longer adds the raw STREAM-frame length to
+`fc_recv`. Reassembled request contexts now retain an absolute `.fc_hi`; each
+frame charges only the amount by which its end offset advances that high-water,
+which remains correct as the request window slides and as body bytes move to the
+capture file. The copy-free offset-zero-plus-FIN path charges only after its
+active, reset, and already-served checks. Client unidirectional streams use a
+bounded per-connection stream-id/high-water table, so control and QPACK
+retransmissions are deduplicated as well. A shared helper performs the
+`MAX_DATA` grant calculation for all three paths.
 
-### Regression tests to add
+### Regression coverage
 
-- Construct valid packets with the same stream offset and payload under several
-  distinct packet numbers; assert that duplicate copies do not trigger a
-  connection-level credit increase.
-- After the duplicates, send a second stream and verify the original
-  connection-level limit still applies until genuinely new bytes are accepted.
-- Keep the existing same-datagram duplicate test as coverage for packet-number
-  deduplication.
+- `test/quic/h3_fc_dedup_test.py` constructs valid packets with the same stream
+  offset and payload under enough distinct packet numbers to cross the grant
+  threshold; duplicate copies do not trigger a connection-level credit increase.
+- The existing same-datagram duplicate tests remain coverage for packet-number
+  deduplication; the new test specifically covers fresh packet numbers.
 
 ## Finding 7 — only the first coalesced 0-RTT packet is processed
 
@@ -2391,11 +2394,13 @@ Findings 4–5 audit pass:
 - No source, test, or build changes were made for these findings; the
   regression cases above remain pending.
 
-Findings 6–10 audit pass:
+Finding 6 implementation pass:
 
-- Source inspection confirmed that `fc_recv` is incremented before per-stream
-  duplicate/offset filtering, so a fresh-packet-number retransmission can
-  trigger `MAX_DATA` without adding unique stream bytes.
+- `fc_recv` now advances from per-stream high-water growth after duplicate/offset
+  filtering, and `test/quic/h3_fc_dedup_test.py` confirmed that a fresh-packet-number
+  retransmission burst does not raise `MAX_DATA`.
+
+Findings 7–10 audit pass:
 - Source inspection confirmed that the coalesced early-data loop stops at the
   first 0-RTT packet, that oversized/overfull SETTINGS validation is skipped or
   truncated, and that critical-stream FIN/reset state is not retained before

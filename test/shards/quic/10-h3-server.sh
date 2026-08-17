@@ -152,6 +152,14 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_maxdata_test.py ${P61452} 8 >/dev/null 2>&1
     check "h3 (io_uring): MAX_DATA is absorbed with no response stream open" $?
 
+    # A valid retransmission uses a fresh packet number, so packet-number
+    # duplicate suppression cannot protect connection-level receive accounting.
+    # Reinject a completed request until the old raw-frame counter would have
+    # crossed its MAX_DATA grant threshold; only the first stream high-water may
+    # consume credit.
+    python3 test/quic/h3_fc_dedup_test.py ${P61452} >/dev/null 2>&1
+    check "h3 (io_uring): fresh-PN STREAM retransmissions do not double-count MAX_DATA" $?
+
     # a request whose ack is lost is retransmitted by the client; the server must
     # ack the retransmit, not serve the stream a second time — a duplicate response
     # slot resends the whole body and pins the shared congestion window (the real-

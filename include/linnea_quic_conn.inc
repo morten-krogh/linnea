@@ -519,6 +519,7 @@ struc linnea_quic_ra
     .act_ms:    resq 1
     .len:      resq 1               ; contiguous bytes received from offset 0
     .hi:       resq 1               ; highest offset+len seen (extent of the seen set)
+    .fc_hi:    resq 1               ; highest stream offset charged to conn flow control
     .fin:      resq 1               ; the FIN has been seen
     .final:    resq 1               ; the stream's total size (valid once fin)
     ; Direct-to-file body. .body_to == 0 means not in it; while it is set, the
@@ -834,9 +835,15 @@ struc linnea_quic_conn
     .fc_conn_sent:  resq 1          ; response-stream bytes sent against fc_conn_max
     ; receive side (quic-9): the peer is flow-controlled by initial_max_data, which
     ; we must raise with MAX_DATA as it sends, or it stalls once it hits the ceiling.
-    .fc_recv:       resq 1          ; cumulative client->server STREAM bytes (loose)
+    .fc_recv:       resq 1          ; cumulative client->server STREAM high-water bytes
     .fc_adv:        resq 1          ; connection-level ceiling we have advertised
     .fc_pending:    resq 1          ; 1 = a MAX_DATA grant is queued for the next send
+    ; Client unidirectional streams have no request reassembly context, but their
+    ; stream offsets still contribute to connection flow control. The peer's
+    ; initial_max_streams_uni is bounded by LINNEA_QUIC_MSU_INIT, so one high-water
+    ; entry per possible client uni stream is enough for the life of a connection.
+    .fc_uni_sid:    resq LINNEA_QUIC_MSU_INIT
+    .fc_uni_hi:     resq LINNEA_QUIC_MSU_INIT
     ; congestion control shared by the open response streams (RFC 9002 NewReno):
     ; one packet-number space and one path, so one window over all of them.
     .cwnd:       resq 1             ; congestion window in bytes (0 = uninitialised)
