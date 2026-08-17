@@ -169,6 +169,19 @@ def respond(conn, head, body, extra=b""):
                      b"eof delimited body")
     elif path.endswith(b"/truncated"):
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort")
+    elif path.endswith(b"/chunktrunc"):
+        # A chunked response cut off mid-stream: the head and one full chunk are
+        # flushed with a pause between each, so the proxy forwards the response
+        # HEADERS to the client before the socket closes with no terminating
+        # 0-chunk. De-chunked, the client is handed a complete-looking body with
+        # no length to check -- so the proxy must be the one to notice the
+        # truncation and reset the stream (audit Finding 31). Without the pauses
+        # the proxy would see the whole (short) response in one read and fail it
+        # with a 502 before any head went out.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+        time.sleep(0.4)
+        conn.sendall(b"5\r\nhello\r\n")
+        time.sleep(0.4)
     elif path.endswith(b"/linger"):
         # A backend that takes long enough for the client to give up first, but
         # not so long that it trips a proxy timeout. What that leaves behind is

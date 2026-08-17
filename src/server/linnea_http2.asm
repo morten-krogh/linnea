@@ -3006,6 +3006,8 @@ linnea_h2p_event:
 .ev_relay_data:
     mov rdi, rbx
     call h2p_decode                  ; advance the de-chunk / length decode
+    test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_DEC_ERR
+    jnz .ev_bad_gateway              ; malformed chunk framing (Finding 31)
     test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
     jnz .ev_service
     jmp .ev_want_more
@@ -3017,6 +3019,19 @@ linnea_h2p_event:
     jne .ev_bad_gateway
     mov rdi, rbx
     call h2p_decode
+    test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
+    jnz .ev_service                  ; the decode reached the true end
+    ; Not complete at EOF (Finding 31): the old code set BODY_DONE unconditionally,
+    ; so a fixed-length body cut short or a chunked body missing its 0-size chunk
+    ; was ended with a clean END_STREAM -- the client saw a complete-but-truncated
+    ; response. Only a CLOSE-DELIMITED body (no Content-Length, not chunked:
+    ; body_rem == -1 with chunked clear) legitimately ends at EOF. A truncated body
+    ; is a bad gateway, which .ev_fail turns into a 502 before the head or an
+    ; RST_STREAM after it -- the same routing a mid-stream upstream error takes.
+    cmp qword [rbx + linnea_h2p.chunked], 0
+    jne .ev_bad_gateway              ; chunked without its terminating 0-chunk
+    cmp qword [rbx + linnea_h2p.body_rem], -1
+    jne .ev_bad_gateway              ; fixed-length, still owed bytes
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
     jmp .ev_service
 .ev_recv_err:
@@ -3911,10 +3926,12 @@ h2p_decode:
     mov qword [rbx + linnea_h2p.chunked], 1
     jmp .dec_loop
 .dec_bad:
-    ; a malformed chunked body: stop here and let the caller finish the
-    ; stream with what was decoded (the client sees a truncated body, which
-    ; RST_STREAM would also convey)
-    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
+    ; malformed chunk framing (Finding 31): the old code set BODY_DONE and let
+    ; the caller finish with a clean END_STREAM, calling a corrupt de-chunked
+    ; response complete. Flag it as a decode error too, so the caller fails the
+    ; exchange (502 before the head, RST_STREAM after) instead. BODY_DONE still
+    ; stops the loop.
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE | LINNEA_H2P_F_DEC_ERR
 .dec_save:
     mov [rbx + linnea_h2p.rd], r13
     mov [rbx + linnea_h2p.wr], r14

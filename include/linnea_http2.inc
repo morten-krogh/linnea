@@ -276,6 +276,9 @@ LINNEA_H2P_F_REQ_DONE  equ 8192   ; every request-body byte has been forwarded
 ; were credited back to the client as they were captured, not as they go
 ; upstream.
 LINNEA_H2P_F_REQ_FILE  equ 16384
+LINNEA_H2P_F_DEC_ERR   equ 32768   ; the response body decode hit malformed framing
+                                   ; (a bad chunk); the exchange must fail, not
+                                   ; complete with a clean END_STREAM
 
 struc linnea_h2p
     .state:     resq 1

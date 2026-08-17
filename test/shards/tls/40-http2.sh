@@ -401,6 +401,17 @@ PY
     timeout 60 python3 test/tls/h2_malformed.py $CA ${P61443} >/dev/null 2>&1
     check "http2 rejects terminal content-length and END_STREAM-less trailers" $?
 
+    # RFC 9113 8.1: an upstream body cut short mid-stream must not reach the
+    # client as a clean END_STREAM -- that calls a truncated body complete
+    # (Finding 31). /api/chunktrunc flushes its head and one chunk, then closes
+    # with no terminating 0-chunk; de-chunked, the client is handed a body with
+    # no length to check, so before the fix curl reported success. The head is
+    # already out, so the honest signal is RST_STREAM, which curl surfaces as a
+    # transfer error (a truncated body the client can now see).
+    timeout 8 curl -s --http2 --max-time 6 --cacert $CA -o /dev/null $U/api/chunktrunc
+    [ $? -ne 0 ]
+    check "http2 proxied truncated chunked body is reset, not completed clean (Finding 31)" $?
+
     timeout 20 python3 test/tls/h2_conformance.py $CA ${P61446} >/dev/null 2>&1
     check "http2 conformance (stream-id rules, initial window size)" $?
 

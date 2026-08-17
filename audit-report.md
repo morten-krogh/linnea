@@ -37,7 +37,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 28. **Medium: HTTP/2 CONNECT requests bypass whole-request validation.** Unsupported CONNECT is answered with 405 even when `:authority` is absent or forbidden `:scheme`/`:path` fields are present. **— OPEN (audit-only pass; no source changes made).**
 29. **Low: the HPACK decoder accepts dynamic-table size updates after header fields.** A malformed field block can mutate compression state and be served instead of causing `COMPRESSION_ERROR`. **— OPEN (audit-only pass; no source changes made).**
 30. **Medium: the HTTP/2 proxy treats an upstream informational response as final.** A `100 Continue` or `103 Early Hints` response is emitted with `END_STREAM`, and the backend's actual final response is discarded. **— OPEN (audit-only pass; no source changes made).**
-31. **Medium: the HTTP/2 proxy cleanly completes truncated or malformed upstream bodies.** Premature EOF and chunk-decoding errors set `BODY_DONE`, causing a normal `END_STREAM` over incomplete data instead of resetting or failing the response. **— OPEN (audit-only pass; no source changes made).**
+31. **Medium: the HTTP/2 proxy cleanly completes truncated or malformed upstream bodies.** Premature EOF and chunk-decoding errors set `BODY_DONE`, causing a normal `END_STREAM` over incomplete data instead of resetting or failing the response. **— FIXED: a premature EOF or a malformed chunk now routes to the bad-gateway handler (502 before the head, RST_STREAM after); A/B-verified and covered by a new tls-shard test.**
 32. **Medium: the HTTP/2 proxy does not coalesce split `cookie` fields before HTTP/1 forwarding.** Each field becomes a separate HTTP/1 header line, which can change cookie parsing and authentication semantics at the backend. **— OPEN (audit-only pass; no source changes made).**
 33. **Medium: HTTP/2 proxied uploads do not honor `Expect: 100-continue`.** Linnea waits for the complete body before either responding or forwarding the request head, leaving a compliant waiting client stalled until its fallback timer or the server's body timeout. **— OPEN (audit-only pass; no source changes made).**
 34. **Medium: the HTTP/2 proxy translates malformed upstream fields into malformed HTTP/2 responses.** Invalid field names and values are encoded without syntax checks, while conflicting `content-length` lines are forwarded together instead of producing 502. **— OPEN (audit-only pass; no source changes made).**
@@ -1825,7 +1825,30 @@ response.
 
 Severity: Medium (P2 response-integrity failure)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — the EOF path now distinguishes a legitimate close-delimited
+end from a premature one, and a malformed chunk is flagged as a decode error;
+both route to the existing bad-gateway handler, which answers 502 before the
+response head has reached the client and RST_STREAMs the stream after it. A new
+`LINNEA_H2P_F_DEC_ERR` flag carries the malformed-chunk signal out of `.dec_bad`,
+and `.ev_eof` treats a chunked body with no terminating 0-chunk, or a
+fixed-length body still owed bytes, as a bad gateway rather than a clean
+`END_STREAM`. A close-delimited body (`body_rem == -1`, not chunked) still ends
+correctly at EOF. Verified by A/B against a pre-fix binary: `/api/chunktrunc`
+(a chunked body flushed then cut short) reported success to curl before the fix
+(the de-chunked body had no length to check) and is now surfaced as a stream
+reset. Regression test added at
+[`test/shards/tls/40-http2.sh`](/home/linnea/linnea/test/shards/tls/40-http2.sh),
+backed by a new `/chunktrunc` route in
+[`test/proxy_backend.py`](/home/linnea/linnea/test/proxy_backend.py); full tls
+shard 185/0.
+
+One sub-case in the original recommendation is deliberately left lenient: the
+last-chunk path marks the body done at `0\r\n` without requiring the trailer
+section's terminating empty line. That case delivers every body byte intact —
+only a zero-content terminator is absent — and enforcing it would answer 502 to
+well-behaved backends that close immediately after `0\r\n`. The data-integrity
+cases (truncated chunk data, an entirely missing 0-chunk, and a malformed
+chunk-size line) are all closed.
 
 ### Evidence
 
