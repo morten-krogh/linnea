@@ -175,6 +175,20 @@ else
     check "h3 uni stream-type test (skipped: deps unavailable)" 0
 fi
 
+# RFC 9000 7.4/18.2 (Finding 13): a truncated, duplicate, server-only, or
+# trailing-byte transport parameter must close the handshake with
+# TRANSPORT_PARAMETER_ERROR, not complete as though the list ended cleanly.
+if python3 -c 'import aioquic' 2>/dev/null; then
+    start_server $CFG/tls-h3-drain.json
+    tp_master=$SRV_PID
+    timeout 40 python3 test/quic/tp_validation.py $SRV_PORT >/dev/null 2>&1
+    check "quic malformed transport parameters close the handshake (Finding 13)" $?
+    kill -9 $tp_master 2>/dev/null
+    wait $tp_master 2>/dev/null
+else
+    check "quic transport-parameter test (skipped: deps unavailable)" 0
+fi
+
 # Drain with an in-flight h3 response (Q117): the drain-exit test used to count
 # only TCP connections, so a worker whose work was all QUIC exited the moment
 # the drain began (and stopped re-arming the datagram recv besides) — the peer

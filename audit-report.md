@@ -19,7 +19,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 10. **Low: HTTP/3 accepts duplicate QPACK encoder or decoder streams.** Unlike the control stream, the QPACK stream handlers overwrite the saved ID instead of raising a stream-creation error. **— FIXED: a second QPACK encoder/decoder stream now draws H3_STREAM_CREATION_ERROR like a second control stream, instead of overwriting the saved id; A/B-verified.**
 11. **High: a completed HTTP/3 request stream can be dispatched again.** Duplicate suppression lasts only while a response slot or refusal entry is active; a fresh-packet-number retransmission can reach the application again after an inline reply, or after a response slot is reaped. **— FIXED (`05f0194`): a per-connection watermark plus a small completed-stream ring records every dispatched request for the life of the connection, so a retransmission after an inline reply or a slot reap is acknowledged, not re-routed; A/B-verified (4→1 dispatches).**
 12. **Medium: QUIC final-size invariants are not enforced.** A later FIN silently replaces the remembered final size, and RESET_STREAM final sizes are discarded, instead of conflicting sizes or data beyond the final size closing the connection with `FINAL_SIZE_ERROR`. **— FIXED (FIN side): a conflicting FIN size, a FIN below the highest byte received, or data past a fixed final size now close the connection `FINAL_SIZE_ERROR` (0x06); A/B-verified with injected packets. The RESET_STREAM cross-check is documented as scoped out (no residual transport-integrity risk).**
-13. **Medium: malformed and forbidden QUIC transport parameters are accepted.** Truncation is treated as end-of-list, duplicate parameters overwrite, integer payloads may carry trailing bytes, and several invalid or client-forbidden values never set `TRANSPORT_PARAMETER_ERROR`. **— OPEN (audit-only pass; no source changes made).**
+13. **Medium: malformed and forbidden QUIC transport parameters are accepted.** Truncation is treated as end-of-list, duplicate parameters overwrite, integer payloads may carry trailing bytes, and several invalid or client-forbidden values never set `TRANSPORT_PARAMETER_ERROR`. **— FIXED: truncated/duplicate/server-only/trailing-byte and out-of-range transport parameters now close the handshake TRANSPORT_PARAMETER_ERROR instead of completing; A/B-verified and covered by a new quic-shard test.**
 14. **Medium: QUIC stream direction and state are not validated.** Frames naming server-initiated or send-only streams are skipped or acted on without the required `STREAM_STATE_ERROR`. **— OPEN (audit-only pass; no source changes made).**
 15. **Medium: accepted 0-RTT bypasses normal QUIC frame and stream-limit checks.** Early packets jump directly into the STREAM scanner, so prohibited frame types and over-limit early stream IDs do not receive the errors applied to 1-RTT packets. **— OPEN (audit-only pass; no source changes made).**
 16. **Medium: inline HTTP/3 and control packets bypass QUIC congestion accounting and can fall out of loss recovery.** Only bulk response chunks are gated by `cwnd`; the eight-entry small-packet ring silently stops tracking additional replies. **— FIXED: ack-eliciting inline/control packets are now charged to a shared in-flight total (`inline_flight` + `bytes_in_flight`), an inline response is admitted only if it fits `cwnd` and a recovery slot, and the overflow is handed to the congestion-controlled pump rather than sent untracked; quic+tls shards green, burst answered 40/40 even with the ring forced to one slot.**
@@ -932,7 +932,22 @@ state after request completion so delayed frames are checked too.
 
 Severity: Medium (P2 handshake validation and protocol conformance)  
 Confidence: High  
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — `linnea_quic_tp_parse` now treats malformed structure as an
+error rather than a clean end of the list: a truncated id, length, or payload,
+and an integer value whose varint does not fill its payload exactly, all set
+`linnea_quic_tp_error` (the caller closes TRANSPORT_PARAMETER_ERROR). Every
+parameter id below 64 is tracked in a bitmap so a duplicate is rejected; the
+client-forbidden server-only parameters (`0x00`, `0x02`, `0x0d`, `0x10`) are
+rejected; `ack_delay_exponent > 20` and `max_ack_delay >= 2^14` now error rather
+than silently keeping the default or storing an illegal value; and the two
+`max_streams` parameters (`0x08`, `0x09`) are rejected above `2^60`. A latent bug
+was fixed on the way: `max_ack_delay` fell through into the
+`initial_source_connection_id` handler, treating its payload as a CID. A/B-verified
+against a pre-fix binary via a monkey-patched aioquic client that appends
+malformed parameters to its valid ones: a truncated, duplicate, server-only, and
+trailing-byte parameter each completed the handshake before and now close it
+`0x08`; a normal aioquic client is unaffected. Regression test
+`test/quic/tp_validation.py`.
 
 ### Evidence
 

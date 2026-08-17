@@ -1962,31 +1962,51 @@ linnea_quic_tp_parse:
     mov qword [linnea_quic_tp_cid_lim], 2     ; payload, and the smallest legal
     mov qword [linnea_quic_tp_error], 0       ; connection-id limit
     mov qword [linnea_quic_tp_iscid_len], -1  ; absent until seen
+    mov qword [rsp], 0                         ; seen-id bitmap for duplicate detection
 .tp_next:
     cmp rbx, r12
-    jae .tp_done
+    jae .tp_done                     ; the whole extension consumed: success
     mov rdi, rbx
     mov rsi, r12
     call linnea_quic_varint_decode   ; parameter id
     test rdx, rdx
-    jz .tp_done
+    jz .tp_bad                        ; a truncated id (RFC 9000 7.4): error
     mov r15, rax
     add rbx, rdx
     mov rdi, rbx
     mov rsi, r12
     call linnea_quic_varint_decode   ; parameter length
     test rdx, rdx
-    jz .tp_done
+    jz .tp_bad                        ; a truncated length
     add rbx, rdx
     mov rbp, rax                     ; parameter length
     mov rcx, r12
     sub rcx, rbx
     cmp rbp, rcx
-    ja .tp_done                      ; runs past the extension
+    ja .tp_bad                        ; the payload runs past the extension
+    ; every id may appear at most once (RFC 9000 7.4.1). Track the standard range
+    ; in a bitmap; ids at or above 64 (grease) are not tracked (unbounded).
+    cmp r15, 64
+    jae .tp_after_dup
+    bt [rsp], r15
+    jc .tp_bad                        ; a repeated parameter
+    bts [rsp], r15
+.tp_after_dup:
+    ; parameters only a server may send; a client sending one is an error (18.2)
+    cmp r15, 0x00                     ; original_destination_connection_id
+    je .tp_bad
+    cmp r15, 0x02                     ; stateless_reset_token
+    je .tp_bad
+    cmp r15, 0x0d                     ; preferred_address
+    je .tp_bad
+    cmp r15, 0x10                     ; retry_source_connection_id
+    je .tp_bad
     cmp r15, 0x04
     je .tp_value
     cmp r15, 0x05
     je .tp_value
+    cmp r15, 0x08
+    je .tp_value                     ; max_streams_bidi: validated, not stored
     cmp r15, 0x09
     je .tp_value
     cmp r15, 0x0a
@@ -2006,21 +2026,37 @@ linnea_quic_tp_parse:
 .tp_value:
     mov rdi, rbx
     lea rsi, [rbx + rbp]
-    call linnea_quic_varint_decode   ; the value
+    call linnea_quic_varint_decode   ; the value (rax), consumed width (rdx)
     test rdx, rdx
-    jz .tp_skip
+    jz .tp_bad                        ; a truncated / empty integer value
+    cmp rdx, rbp
+    jne .tp_bad                       ; RFC 9000 18.1: the varint must fill the payload
     cmp r15, 0x04
     jne .tp_val05
     mov r13, rax
     jmp .tp_skip
 .tp_val05:
     cmp r15, 0x05
-    jne .tp_val09
+    jne .tp_val08
     mov r14, rax
+    jmp .tp_skip
+.tp_val08:
+    cmp r15, 0x08
+    jne .tp_val09
+    ; initial_max_streams_bidi: RFC 9000 4.6 caps a stream limit at 2^60. We do
+    ; not act on it, but an out-of-range value is TRANSPORT_PARAMETER_ERROR.
+    mov rcx, 1
+    shl rcx, 60
+    cmp rax, rcx
+    ja .tp_bad
     jmp .tp_skip
 .tp_val09:
     cmp r15, 0x09
     jne .tp_val01
+    mov rcx, 1
+    shl rcx, 60
+    cmp rax, rcx
+    ja .tp_bad                        ; more than 2^60 streams (RFC 9000 4.6)
     mov r9, rax
     jmp .tp_skip
 .tp_val01:
@@ -2031,8 +2067,8 @@ linnea_quic_tp_parse:
 .tp_val0a:
     cmp r15, 0x0a
     jne .tp_val03
-    cmp rax, 20                      ; 18.2: values above 20 are invalid; keep the
-    ja .tp_skip                      ; default rather than shift by a wild amount
+    cmp rax, 20                      ; RFC 9000 18.2: values above 20 are invalid,
+    ja .tp_bad                       ; and 7.4 makes that TRANSPORT_PARAMETER_ERROR
     mov [linnea_quic_tp_ack_exp], rax
     jmp .tp_skip
 .tp_val03:
@@ -2064,7 +2100,11 @@ linnea_quic_tp_parse:
     mov qword [linnea_quic_tp_error], 1
     jmp .tp_done
 .tp_val0b_do:
+    ; max_ack_delay (0x0b): RFC 9000 18.2 -- a value of 2^14 or more is invalid.
+    cmp rax, 16384
+    jae .tp_bad
     mov [linnea_quic_tp_max_ack], rax
+    jmp .tp_skip                      ; (was falling through into .tp_iscid)
 .tp_iscid:
     ; initial_source_connection_id (RFC 9000 18.2): the connection id the peer
     ; put in the Source Connection ID field of its first Initial. Kept whole so
