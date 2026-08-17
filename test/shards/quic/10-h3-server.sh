@@ -272,6 +272,18 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
         skip "h3 (io_uring): resetting a critical stream is detected -- 8s"
     fi
 
+    # Finding 9: the same closure REORDERED ahead of the stream's offset-0 type
+    # frame. A FIN or RESET_STREAM that reached the stream while it was still
+    # untyped was taken for a teardown; the late type frame then registered a
+    # critical stream the connection believed was live. It must close
+    # H3_CLOSED_CRITICAL_STREAM (0x0104) once the type is learned.
+    if extensive; then
+        timeout 40 python3 test/quic/h3_critical_reorder.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): a critical stream closed before typing is detected (Finding 9)" $?
+    else
+        skip "h3 (io_uring): critical stream closed before typing -- 8s"
+    fi
+
     # h3-8: the QPACK encoder stream must be read, not ignored. We advertise
     # capacity 0, so the only legal instruction is Set Dynamic Table Capacity
     # to 0; an insert or another capacity means the peer's table state and

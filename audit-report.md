@@ -15,7 +15,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 6. **Medium: QUIC connection-level receive credit counts duplicate stream bytes.** Retransmissions under fresh packet numbers increment `fc_recv` even when stream reassembly recognizes every byte as already received, causing premature `MAX_DATA` grants. **— FIXED: connection credit now advances from per-stream receive high-water growth, so fresh-packet-number retransmissions and overlaps do not trigger extra `MAX_DATA`; covered by `test/quic/h3_fc_dedup_test.py`.**
 7. **Medium: coalesced QUIC 0-RTT processing stops after the first early packet.** Later 0-RTT packets in the same datagram are neither decrypted nor acknowledged, so multi-packet early requests fall back to retransmission or remain incomplete. **— FIXED: the early walk now advances by each protected packet length, decrypts and acknowledges every valid 0-RTT packet, and replays the combined frame stream through normal reassembly; covered by `test/quic/h3_0rtt_coalesced_test.py`.**
 8. **Low: HTTP/3 SETTINGS validation is bounded and partially discarded.** SETTINGS payloads larger than the local capture buffer are skipped without validation, and duplicate detection stops after 32 identifiers; the peer's maximum response field-section size is also not retained. **— OPEN (audit-only pass; no source changes made).**
-9. **Low: HTTP/3 critical-stream closure can be missed when closure arrives before stream typing.** Reordered FIN/RESET/STOP_SENDING state is not retained for an as-yet-untyped control or QPACK stream. **— OPEN (audit-only pass; no source changes made).**
+9. **Low: HTTP/3 critical-stream closure can be missed when closure arrives before stream typing.** Reordered FIN/RESET/STOP_SENDING state is not retained for an as-yet-untyped control or QPACK stream. **— FIXED (a client uni stream closed while untyped is remembered in `conn.uni_closed_sid` and reconciled at typing -> `H3_CLOSED_CRITICAL_STREAM`; `test/quic/h3_critical_reorder.py`, A/B-verified. STOP_SENDING on a client uni stream is already a STREAM_STATE_ERROR, caught earlier).**
 10. **Low: HTTP/3 accepts duplicate QPACK encoder or decoder streams.** Unlike the control stream, the QPACK stream handlers overwrite the saved ID instead of raising a stream-creation error. **— FIXED: a second QPACK encoder/decoder stream now draws H3_STREAM_CREATION_ERROR like a second control stream, instead of overwriting the saved id; A/B-verified.**
 11. **High: a completed HTTP/3 request stream can be dispatched again.** Duplicate suppression lasts only while a response slot or refusal entry is active; a fresh-packet-number retransmission can reach the application again after an inline reply, or after a response slot is reaped. **— FIXED (`05f0194`): a per-connection watermark plus a small completed-stream ring records every dispatched request for the life of the connection, so a retransmission after an inline reply or a slot reap is acknowledged, not re-routed; A/B-verified (4→1 dispatches).**
 12. **Medium: QUIC final-size invariants are not enforced.** A later FIN silently replaces the remembered final size, and RESET_STREAM final sizes are discarded, instead of conflicting sizes or data beyond the final size closing the connection with `FINAL_SIZE_ERROR`. **— FIXED (FIN side): a conflicting FIN size, a FIN below the highest byte received, or data past a fixed final size now close the connection `FINAL_SIZE_ERROR` (0x06); A/B-verified with injected packets. The RESET_STREAM cross-check is documented as scoped out (no residual transport-integrity risk).**
@@ -688,7 +688,23 @@ the peer's response field-section limit when encoding HTTP/3 response headers.
 
 Severity: Low (P3 HTTP/3 critical-stream enforcement gap)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — a client unidirectional stream (id mod 4 == 2) closed while
+still untyped is now remembered in `conn.uni_closed_sid` and reconciled when its
+type frame arrives. A FIN on an untyped continuation (`.uni_cont_untyped`) and a
+RESET_STREAM/STOP_SENDING found by the receive-side reset scan (`.reset_ok`, when
+the id is a client uni stream that matched no recorded critical stream) each record
+the id; when that stream later types as the control or a QPACK stream
+(`.uni_control` / `.uni_qpack`), the id match raises `H3_CLOSED_CRITICAL_STREAM`
+(0x0104), exactly as a closure delivered after typing already does. Harmless for a
+stream that proves to be grease — the check fires only on a critical type. One slot
+(a conforming client closes no uni stream, and the connection ends the moment the
+closed one types). Note: STOP_SENDING for a client uni stream is receive-only for
+the server, so it is already a STREAM_STATE_ERROR (RFC 9000 19.5) caught ahead of
+this logic — the closures this finding reorders are FIN and RESET_STREAM.
+A/B-verified against a pre-fix binary on a parallel port with
+`test/quic/h3_critical_reorder.py`: a FIN or RESET_STREAM injected ahead of the
+control/QPACK-enc/QPACK-dec type frame drew no close before (the connection carried
+on) and closes 0x0104 now — four cases that all failed pre-fix and pass now.
 
 ### Evidence
 

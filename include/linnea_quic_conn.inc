@@ -658,6 +658,16 @@ struc linnea_quic_conn
     .ctrl_ro_start: resq 1
     .ctrl_ro_len:   resq 1
     .ctrl_ro_buf:   resb LINNEA_QUIC_CTRL_RO
+    ; A client unidirectional stream (id mod 4 == 2) that was CLOSED — a FIN on an
+    ; untyped continuation, or a RESET_STREAM/STOP_SENDING — before its offset-0
+    ; type frame arrived (Finding 9). Reordering lets the closure precede the type,
+    ; and RFC 9114 6.2 forbids closing a critical stream by ANY means; without this
+    ; the closure was taken for an ordinary teardown and, once the late type frame
+    ; registered the stream as the control or a QPACK stream, the connection carried
+    ; on as though that critical stream were still open. Reconciled when the type
+    ; arrives. One slot (0 = none): a conforming client closes no uni stream, so a
+    ; closed one is already anomalous, and the connection ends the moment it types.
+    .uni_closed_sid: resq 1
     ; A PRIORITY_UPDATE may name a request stream whose response has not opened
     ; yet: the control stream and the request stream are separate, so the update
     ; can overtake the request that it reprioritises. RFC 9218 7 says to keep the

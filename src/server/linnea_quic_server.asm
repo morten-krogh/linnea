@@ -2373,6 +2373,17 @@ linnea_quic_server_datagram:
     cmp rax, rsi
     je .reset_critical
 .reset_ok:
+    ; A reset naming a client unidirectional stream (id mod 4 == 2) that is not a
+    ; recorded critical stream — the checks above did not match — may be closing
+    ; a critical stream whose type frame is still to come (Finding 9). Remember it
+    ; so the typing step raises H3_CLOSED_CRITICAL_STREAM; on a grease stream the
+    ; check never fires. rsi still holds the reset id, rdi = cur_conn.
+    mov rax, rsi
+    and eax, 3
+    cmp eax, 2
+    jne .reset_teardown_go
+    mov [rdi + linnea_quic_conn.uni_closed_sid], rsi
+.reset_teardown_go:
     call reset_teardown
     inc rbp
     cmp rbp, rbx
@@ -4415,6 +4426,12 @@ linnea_quic_server_datagram:
 .uni_qpack:
     cmp qword [s_sfin], 0
     jne .uni_critical_closed         ; a QPACK stream must not be closed
+    ; ...nor closed BEFORE this type frame arrived: a FIN or reset that reached an
+    ; untyped continuation was remembered against its id (Finding 9)
+    mov rax, [cur_conn]
+    mov rax, [rax + linnea_quic_conn.uni_closed_sid]
+    cmp rax, [s_sid]
+    je .uni_critical_closed
     ; Remember which stream this is, so a reset of it can be recognised later.
     ; Nothing here reads the stream's contents — our QPACK capacity is 0, so a
     ; conforming encoder sends none — but 6.2 forbids closing it by any means,
@@ -4509,6 +4526,13 @@ linnea_quic_server_datagram:
     ; closing the control stream is a critical-stream error, whatever it carries
     cmp qword [s_sfin], 0
     jne .uni_critical_closed
+    ; ...including a FIN or reset that closed it while it was still untyped, which
+    ; a reordered type frame would otherwise have registered as a live stream
+    ; (Finding 9)
+    mov rax, [cur_conn]
+    mov rax, [rax + linnea_quic_conn.uni_closed_sid]
+    cmp rax, [s_sid]
+    je .uni_critical_closed
     ; reject a second control stream on a different id
     mov rdx, [cur_conn]
     mov rax, [rdx + linnea_quic_conn.ctrl_id]
@@ -4541,6 +4565,17 @@ linnea_quic_server_datagram:
     ; them would leave the frame walk a hole nothing ever fills (h3-6): hold
     ; them until the type arrives, and release them if the stream proves to
     ; be something else.
+    ; A FIN here closes the stream while it is still untyped (Finding 9). If it
+    ; later types as the control or a QPACK stream, that is a closed critical
+    ; stream — remember the id so the typing step can raise the error. Harmless
+    ; for a stream that proves to be grease: the check only fires on a critical
+    ; type, and grease never reaches one.
+    cmp qword [s_sfin], 0
+    jz .uc_untyped_hold
+    mov rdx, [cur_conn]
+    mov rax, [s_sid]
+    mov [rdx + linnea_quic_conn.uni_closed_sid], rax
+.uc_untyped_hold:
     call .ctrl_ro_capture
     jmp .stream_scan
 .uni_critical_closed:
