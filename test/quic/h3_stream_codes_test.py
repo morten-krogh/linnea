@@ -166,16 +166,31 @@ else:
 
 # --- nothing may follow the trailer section (RFC 9114 4.1) ----------------
 # A request stream is HEADERS, then DATA, then at most ONE trailer section and
-# nothing after it. The second HEADERS was skipped as a trailer and every one
-# after it was skipped again, so a stream could carry any number — and DATA
-# after the trailers was appended to the body as though it were part of it.
+# nothing after it. A second HEADERS is a trailer, and any frame after it is an
+# invalid sequence — a connection error, not a body byte.
+#
+# The trailer here must be a LEGAL trailer (no pseudo-header fields, RFC 9114
+# 4.3): the server now decodes and validates the trailer section, so a trailer
+# carrying pseudo-headers is a stream H3_MESSAGE_ERROR in its own right and would
+# be caught before the following frame — which is a different rule, checked
+# separately below. Reusing the request headers as the trailer conflated the two.
 H3_FRAME_UNEXPECTED = 0x105
+
+
+def trailer_frame():
+    enc = pylsqpack.Encoder()
+    enc.apply_settings(max_table_capacity=0, blocked_streams=0)
+    _, block = enc.encode(0, [(b"x-checksum", b"deadbeef")])
+    return b"\x01" + (0x4000 | len(block)).to_bytes(2, "big") + block
+
+
 hdrs = headers_frame()
+trailer = trailer_frame()
 data = b"\x00" + (0x4000 | 4).to_bytes(2, "big") + b"body"
 
 for label, body in (
-        ("a third HEADERS after the trailers", hdrs + data + hdrs + hdrs),
-        ("DATA after the trailers", hdrs + data + hdrs + data)):
+        ("a third HEADERS after the trailers", hdrs + data + trailer + hdrs),
+        ("DATA after the trailers", hdrs + data + trailer + data)):
     reset, close = send_request_stream(body)
     if close == H3_FRAME_UNEXPECTED:
         print(f"ok   {label} ends the connection (0x{close:x})")
@@ -186,13 +201,27 @@ for label, body in (
               f"0x{H3_FRAME_UNEXPECTED:x}")
         fails += 1
 
-# ...and a request WITH a legitimate trailer section is still served, so the
-# check has not simply outlawed trailers
-reset, close = send_request_stream(hdrs + data + hdrs)
-if close is None:
-    print("ok   a request with one trailer section is still accepted")
+# a trailer section carrying a pseudo-header is malformed (RFC 9114 4.3): a
+# stream H3_MESSAGE_ERROR, and the connection survives
+reset, close = send_request_stream(hdrs + data + headers_frame())
+if close is None and reset and reset["error"] == H3_MESSAGE_ERROR:
+    print(f"ok   a pseudo-header in a trailer is H3_MESSAGE_ERROR (0x{reset['error']:x})")
 else:
-    print(f"FAIL a legitimate trailer section ended the connection (0x{close:x})")
+    got = f"reset 0x{reset['error']:x}" if reset else "no reset"
+    extra = f", close 0x{close:x}" if close is not None else ""
+    print(f"FAIL a pseudo-header trailer: {got}{extra}, want stream "
+          f"H3_MESSAGE_ERROR 0x{H3_MESSAGE_ERROR:x} and no close")
+    fails += 1
+
+# ...and a request WITH a legitimate trailer section is still served, so the
+# check has not simply outlawed trailers: no connection close and no stream reset
+reset, close = send_request_stream(hdrs + data + trailer)
+if close is None and reset is None:
+    print("ok   a request with one legitimate trailer section is still accepted")
+else:
+    got = f"reset 0x{reset['error']:x}" if reset else ""
+    extra = f" close 0x{close:x}" if close is not None else ""
+    print(f"FAIL a legitimate trailer section was not accepted:{got}{extra}")
     fails += 1
 
 sys.exit(1 if fails else 0)
