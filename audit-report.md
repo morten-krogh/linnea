@@ -26,7 +26,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 17. **Medium: HTTP/3 trailer field sections are skipped without QPACK or semantic validation.** Invalid compressed trailers and forbidden trailer pseudo-fields are accepted. **— FIXED: trailer field sections are now decoded into a throwaway request/scratch pair; QPACK failures close with `QPACK_DECOMPRESSION_FAILED`, pseudo-field/semantic failures reset the request stream, and valid trailer fields cannot affect routing; verified with malformed-QPACK, pseudo-field, and valid-trailer cases.**
 18. **Medium: HTTP/3 does not reconcile `content-length` with DATA bytes.** A short or long body is routed and proxied instead of being rejected as a malformed message. **— FIXED (commit 514532a).**
 19. **Medium: single-frame HTTP/3 request bodies bypass `max_body`.** The copy-free offset-zero-plus-FIN path reaches routing without either of the cap checks used by reassembly. **— FIXED (commit 13db631).**
-20. **Medium: the peer's QUIC `max_udp_payload_size` is parsed but not enforced.** Large inline field sections can produce datagrams above a client's advertised receive limit. **— OPEN (audit-only pass; no source changes made).**
+20. **Medium: the peer's QUIC `max_udp_payload_size` is parsed but not enforced.** Large inline field sections can produce datagrams above a client's advertised receive limit. **— FIXED (a large inline h3 response, e.g. a redirect Location carrying a long client path, is split across STREAM frames at `TX_CHUNK` so no datagram exceeds 1200; `emit_inline_chunked`, `test/quic/h3_redirect_datagram.py`, A/B-verified — pre-fix emitted a 2120-byte datagram the client dropped).**
 21. **Medium: QUIC connection-ID retirement and peer CID rotation are ignored.** Incoming `NEW_CONNECTION_ID` and `RETIRE_CONNECTION_ID` frames are structurally skipped without updating either outbound addressing or accepted server CIDs. **— FIXED (bounded per-connection CID tables: validate reuse/`retire_prior_to`/CID-limit with transport errors, rotate `conn.dcid` to a non-retired peer CID, deactivate retired local CIDs in the lookup and announce a replacement; `test/quic/h3_cid_lifecycle.py`).**
 22. **Low: HTTP/3 unidirectional stream types are read as one byte instead of a QUIC varint.** Legal multi-byte encodings of control or QPACK stream types are classified as unknown streams. **— FIXED: the uni-stream type is decoded as a varint (its width skipped by the control walk and QPACK scan), so a non-minimal encoding like 40 00 is classified correctly instead of dropped; A/B-verified.**
 23. **Low: QUIC PTO ignores the peer's advertised `max_ack_delay`.** RTT adjustment uses the negotiated value, but the application-space probe timer always adds the local 25 ms constant. **— FIXED (application-space `linnea_quic_pto_ms` adds `conn.max_ack_peer`, not the 25 ms constant; Initial/Handshake unchanged; unit-tested in `linnea_quictest.asm`/`linnea_rtxtest.asm`, A/B 41/46 vs 46/46).**
@@ -1436,7 +1436,31 @@ too large, but make the final common check authoritative.
 
 Severity: Medium (P2 QUIC interoperability and path reliability)  
 Confidence: High  
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — a large inline (head-only) h3 response is now split across
+STREAM frames so no 1-RTT datagram exceeds the 1200-byte floor every QUIC path
+must carry (and so a peer's `max_udp_payload_size`, which #13 rejects below 1200).
+The inline emit arm chunks the field section at `LINNEA_QUIC_TX_CHUNK` — the same
+per-packet budget the body pump already keeps every datagram under — via a new
+`emit_inline_chunked`, instead of `.send_1rtt`ing the whole section in one packet.
+Each chunk leads with the current ACK, is a STREAM frame with an explicit offset
+(FIN on the last), and is tracked for loss recovery (`linnea_quic_rtx_record`,
+which copies the frames and charges `inline_flight`, so the burst shares the
+congestion window). Reproduced and fixed empirically: a redirect location with a
+2000-byte client request target produced one **2120-byte** datagram that a peer
+enforcing its limit drops (the client never saw the 301); it now delivers a
+complete 301 with the full 2026-byte Location across datagrams each ≤ 1135 bytes.
+A/B-verified against a pre-fix binary on a parallel port with
+`test/quic/h3_redirect_datagram.py` (config `tls-h3-redirect.json`): pre-fix fails
+three checks (redirect undelivered, 2120-byte datagram), fixed passes.
+**A shipped-then-caught crash:** the first `emit_inline_chunked` left `rsp`
+8-misaligned at its call sites, so `emit_1rtt`'s AES-GCM seal faulted on an
+aligned SSE `movdqa` (SIGSEGV at the `linnea_aesgcm_seal` load) — the class
+[[linnea-probe]] records as "any function calling SSE crypto must self-align rsp".
+Caught by the readable worker-death log line; fixed with a `sub rsp, 8`.
+
+The doc comment at `src/lib/linnea_quic.asm` (the `max_udp_payload_size` check)
+claimed "every datagram we send is at most the padded Initial's 1200 bytes" —
+true for the body pump, false for this inline path, which is exactly the gap.
 
 ### Evidence
 

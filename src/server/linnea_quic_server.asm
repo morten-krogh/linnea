@@ -365,6 +365,9 @@ expfin:      resb 64                  ; expected client Finished message
 onertt_pay:  resb 512                 ; ACK + HANDSHAKE_DONE + NEW_CONNECTION_ID + uni + NST
 onertt_pkt:  resb 4096                ; the protected 1-RTT packet
 strm_pay:    resb LINNEA_QUIC_STRM_PAY ; STREAM frame carrying the h3 response
+inl_src:     resb LINNEA_QUIC_STRM_PAY ; a large inline response, copied out of
+                                       ; strm_pay so it can be rebuilt per chunk
+                                       ; (Finding 20: a long redirect Location)
 fc_grant_pay: resb 4096               ; MAX_DATA prepended to an outgoing payload (quic-9)
 req:         resb linnea_h2_req_size  ; decoded h3 request
 ; QPACK literal scratch: every Huffman-decoded header value of one request goes
@@ -4060,6 +4063,19 @@ linnea_quic_server_datagram:
     lea rdx, [rax + rbx]             ; STREAM frame length
     cmp rdx, LINNEA_QUIC_STRM_PAY
     ja .serve_toolong
+    ; A field section too large for one safe datagram (a redirect's Location can
+    ; carry a long client request target) is sent as several STREAM chunks, so no
+    ; datagram exceeds the peer's max_udp_payload_size — the arithmetic this arm
+    ; used to rest on (a redirect carries no body, so the section stays under the
+    ; packet) is a coincidence, not a bound (Finding 20). TX_CHUNK is the same
+    ; per-packet budget the body pump keeps every datagram under.
+    cmp rax, LINNEA_QUIC_TX_CHUNK
+    jbe .serve_inline_fits
+    lea rsi, [strm_pay + rbx]        ; the h3 response bytes
+    mov rdx, rax                     ; its length
+    call emit_inline_chunked
+    jmp .stream_scan
+.serve_inline_fits:
     ; Finding 16: an inline response must share the congestion window and the
     ; loss-recovery ring with everything else in flight. Emit it inline only if
     ; both have room; otherwise hand it to the congestion-controlled pump as a
@@ -7058,6 +7074,93 @@ tx_emit_chunk:
     pop r14
     pop r13
     pop rbp
+    pop rbx
+    ret
+
+; emit_inline_chunked(rsi = response bytes, rdx = length) — send an inline h3
+; response too large for one datagram as a sequence of STREAM frames, so no
+; datagram exceeds the peer's max_udp_payload_size (Finding 20, RFC 9000 18.2).
+; A redirect's Location is the configured target plus the client's raw request
+; target, so a long request to a redirect location can push the encoded field
+; section well past the 1200-byte floor every QUIC path must carry — the single
+; inline packet the .send_1rtt arm builds would be dropped by a peer enforcing its
+; limit and is prone to IP fragmentation besides. Each chunk carries at most
+; TX_CHUNK stream bytes (the same per-packet budget the body pump uses, which the
+; Finding-13 floor of 1200 on that transport parameter already admits), leads with
+; the current ACK, and is a STREAM frame with an explicit offset and no LEN (data
+; to the packet's end), FIN on the last. Every packet is tracked for loss recovery
+; (linnea_quic_rtx_record, which copies the frames and charges inline_flight, so
+; reusing strm_pay per chunk is safe and the burst shares the congestion window).
+; cur_conn = conn, r12d = socket, s_sid = the request stream id.
+emit_inline_chunked:
+    push rbx
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                        ; 4 pushes leave rsp%16==8; realign so the
+                                      ; call sites are 16-aligned (emit_1rtt ->
+                                      ; AES-GCM seal uses aligned SSE) [[linnea-probe]]
+    mov r13, rdx                      ; total length
+    lea rdi, [inl_src]                ; copy the source out of strm_pay
+    mov rcx, rdx
+    rep movsb                         ; rsi -> inl_src
+    xor r14, r14                      ; stream offset of the next chunk
+.eic_loop:
+    cmp r14, r13
+    jae .eic_done
+    mov r15, r13
+    sub r15, r14                      ; bytes remaining
+    cmp r15, LINNEA_QUIC_TX_CHUNK
+    jbe .eic_have_len
+    mov r15, LINNEA_QUIC_TX_CHUNK     ; cap this chunk at the per-packet budget
+.eic_have_len:
+    ; lead with the ACK (a STREAM frame carries no LEN, so it must come last)
+    lea rdi, [strm_pay]
+    mov rsi, [cur_conn]
+    lea rsi, [rsi + linnea_quic_conn.rx_have]
+    call linnea_quic_build_ack        ; rax = ACK length (0 = nothing to ack)
+    mov rbx, rax                      ; write cursor into strm_pay
+    ; STREAM frame type: OFF (0x0c) always; FIN (0x01) only on the final chunk
+    lea rdx, [r14 + r15]              ; stream offset after this chunk
+    mov al, 0x0c
+    cmp rdx, r13
+    jne .eic_typed
+    or al, 0x01
+.eic_typed:
+    mov [strm_pay + rbx], al
+    inc rbx
+    lea rdi, [strm_pay + rbx]         ; stream id
+    mov rsi, [s_sid]
+    call linnea_quic_varint_encode
+    add rbx, rax
+    lea rdi, [strm_pay + rbx]         ; stream offset
+    mov rsi, r14
+    call linnea_quic_varint_encode
+    add rbx, rax
+    lea rsi, [inl_src + r14]          ; the chunk's data
+    lea rdi, [strm_pay + rbx]
+    mov rcx, r15
+    rep movsb
+    add rbx, r15
+    lea rax, [strm_pay]
+    mov [s_pl_ptr], rax
+    mov [s_pl_len], rbx
+    call emit_1rtt                    ; rax = the packet number used
+    mov [s_txc_pn], rax
+    call now_ms
+    mov r8, rax
+    mov rsi, [s_txc_pn]               ; packet number
+    mov rdi, [cur_conn]
+    mov rdx, [s_pl_ptr]
+    mov rcx, [s_pl_len]
+    call linnea_quic_rtx_record       ; so a lost chunk is resent by the sweep
+    add r14, r15
+    jmp .eic_loop
+.eic_done:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
     pop rbx
     ret
 

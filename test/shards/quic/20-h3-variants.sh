@@ -207,6 +207,23 @@ else
     check "quic connection-id lifecycle test (skipped: deps unavailable)" 0
 fi
 
+# RFC 9000 18.2 (Finding 20): a redirect's Location is the configured target plus
+# the client's raw request target, so a long request to a redirect location made
+# the encoded field section exceed one datagram -- and the whole section was sent
+# in one 1-RTT packet (~2120 bytes), which a peer enforcing its max_udp_payload_
+# size drops. It is now split across STREAM frames so no datagram passes 1200,
+# while the complete 301 + full Location is still delivered.
+if python3 -c 'import aioquic, aioquic.h3.connection' 2>/dev/null; then
+    start_server $CFG/tls-h3-redirect.json
+    rd_master=$SRV_PID
+    timeout 40 python3 test/quic/h3_redirect_datagram.py $SRV_PORT >/dev/null 2>&1
+    check "quic large inline response stays within max_udp_payload_size (Finding 20)" $?
+    kill -9 $rd_master 2>/dev/null
+    wait $rd_master 2>/dev/null
+else
+    check "quic redirect-datagram test (skipped: deps unavailable)" 0
+fi
+
 # Drain with an in-flight h3 response (Q117): the drain-exit test used to count
 # only TCP connections, so a worker whose work was all QUIC exited the moment
 # the drain began (and stopped re-arming the datagram recv besides) — the peer

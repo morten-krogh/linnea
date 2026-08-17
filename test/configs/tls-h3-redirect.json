@@ -1,0 +1,18 @@
+{
+  "log": "test/linnea.log",
+  "timeout": 5,
+  "workers": 1,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 0,
+      "hostname": "localhost",
+      "cert": "test/tls/server.crt",
+      "key": "test/tls/server.key",
+      "locations": [
+        { "prefix": "/r", "redirect": "https://example.com/base" },
+        { "prefix": "/", "root": "test/www" }
+      ]
+    }
+  ]
+}
