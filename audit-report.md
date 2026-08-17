@@ -17,7 +17,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 8. **Low: HTTP/3 SETTINGS validation is bounded and partially discarded.** SETTINGS payloads larger than the local capture buffer are skipped without validation, and duplicate detection stops after 32 identifiers; the peer's maximum response field-section size is also not retained. **— OPEN (audit-only pass; no source changes made).**
 9. **Low: HTTP/3 critical-stream closure can be missed when closure arrives before stream typing.** Reordered FIN/RESET/STOP_SENDING state is not retained for an as-yet-untyped control or QPACK stream. **— OPEN (audit-only pass; no source changes made).**
 10. **Low: HTTP/3 accepts duplicate QPACK encoder or decoder streams.** Unlike the control stream, the QPACK stream handlers overwrite the saved ID instead of raising a stream-creation error. **— OPEN (audit-only pass; no source changes made).**
-11. **High: a completed HTTP/3 request stream can be dispatched again.** Duplicate suppression lasts only while a response slot or refusal entry is active; a fresh-packet-number retransmission can reach the application again after an inline reply, or after a response slot is reaped. **— OPEN (audit-only pass; no source changes made).**
+11. **High: a completed HTTP/3 request stream can be dispatched again.** Duplicate suppression lasts only while a response slot or refusal entry is active; a fresh-packet-number retransmission can reach the application again after an inline reply, or after a response slot is reaped. **— FIXED (`05f0194`): a per-connection watermark plus a small completed-stream ring records every dispatched request for the life of the connection, so a retransmission after an inline reply or a slot reap is acknowledged, not re-routed; A/B-verified (4→1 dispatches).**
 12. **Medium: QUIC final-size invariants are not enforced.** A later FIN silently replaces the remembered final size, and RESET_STREAM final sizes are discarded, instead of conflicting sizes or data beyond the final size closing the connection with `FINAL_SIZE_ERROR`. **— FIXED (FIN side): a conflicting FIN size, a FIN below the highest byte received, or data past a fixed final size now close the connection `FINAL_SIZE_ERROR` (0x06); A/B-verified with injected packets. The RESET_STREAM cross-check is documented as scoped out (no residual transport-integrity risk).**
 13. **Medium: malformed and forbidden QUIC transport parameters are accepted.** Truncation is treated as end-of-list, duplicate parameters overwrite, integer payloads may carry trailing bytes, and several invalid or client-forbidden values never set `TRANSPORT_PARAMETER_ERROR`. **— OPEN (audit-only pass; no source changes made).**
 14. **Medium: QUIC stream direction and state are not validated.** Frames naming server-initiated or send-only streams are skipped or acted on without the required `STREAM_STATE_ERROR`. **— OPEN (audit-only pass; no source changes made).**
@@ -741,7 +741,18 @@ intact on the error path so reset/closure handling cannot lose the first stream.
 
 Severity: High (P1 duplicate application execution / request integrity)  
 Confidence: High  
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** (commit `05f0194`) — receive-stream completion is now retained
+independently of response ownership. A compact per-connection watermark plus a
+small ring of out-of-order completed stream IDs (`req_served_lo`,
+`req_served_ids`, `req_served_cursor`) records every dispatched request; at
+`.serve_bidi` a stream already known served is acknowledged rather than routed
+again (`req_served_known` / `req_served_mark`), so a fresh-packet-number
+retransmission after an inline reply, or after a response slot is reaped, no
+longer reaches the application a second time. A/B-verified by hand-injecting the
+exact same STREAM frame under a fresh packet number (aioquic will not retransmit
+a small completed request): pre-fix 4 dispatches, fixed 1. Regression test
+`test/quic/h3_dup_served.py`; the existing active-large-response duplicate test
+is kept as a control.
 
 ### Evidence
 
