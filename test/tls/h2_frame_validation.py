@@ -98,5 +98,18 @@ check("oversized CONTINUATION rejected", goaway_code(hdr + cont), FRAME_SIZE_ERR
 check("HPACK size update after a field rejected",
       goaway_code(fr(FT_HEADERS, 0x4, 1, b"\x82\x20")), COMPRESSION_ERROR)
 
+# Finding 5: a frame on an idle stream (an even id, or one above the highest
+# opened -- here nothing has been opened, so any nonzero id is idle) is a
+# connection PROTOCOL_ERROR, not silently ignored (RFC 9113 5.1/5.1.1).
+FT_DATA, FT_RST, FT_WINDOW_UPDATE = 0x0, 0x3, 0x8
+check("DATA on an idle stream rejected",
+      goaway_code(fr(FT_DATA, 0, 99, b"x")), PROTOCOL_ERROR)
+check("DATA on an even stream id rejected",
+      goaway_code(fr(FT_DATA, 0, 2, b"x")), PROTOCOL_ERROR)
+check("WINDOW_UPDATE on an idle stream rejected",
+      goaway_code(fr(FT_WINDOW_UPDATE, 0, 99, b"\x00\x00\x00\x01")), PROTOCOL_ERROR)
+check("RST_STREAM on an idle stream rejected",
+      goaway_code(fr(FT_RST, 0, 99, b"\x00\x00\x00\x00")), PROTOCOL_ERROR)
+
 print("ok" if fails == 0 else f"FAIL ({fails})")
 sys.exit(0 if fails == 0 else 1)

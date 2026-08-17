@@ -11,7 +11,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 2. **Medium: several cumulative body counters use add-then-compare arithmetic.** At the documented `2^64-1` configuration boundary, the counters can wrap and pass the body-size check. This is primarily a boundary/resource-accounting defect; reaching it with a real upload would require an impractically large body or disk. **— NOT changed (latent, practically unreachable; left for a later opportunistic cleanup).**
 3. **Medium: buffered HTTP/1 request bodies bypass `max_body`.** Counted bodies are checked against the limit only when the head plus body no longer fits in `in_buf`; complete chunked bodies take the same unchecked buffered path. A proxy therefore accepts and forwards bodies larger than the configured limit as long as they fit in the request buffer. **— FIXED (commit 13db631).**
 4. **Medium: HTTP/2 accepts a trailer `HEADERS` block without `END_STREAM`.** The malformed trailer is consumed without failing the stream or completing the request, leaving the body slot collecting and allowing later `DATA` on the same stream. **— FIXED (commit 97046ff).**
-5. **Medium: HTTP/2 silently drops stream frames whose IDs have no live slot.** `DATA` on idle or closed streams and `WINDOW_UPDATE`/`RST_STREAM` on idle streams are consumed without the required state-specific error; dropped `DATA` replenishes only the connection window. **— OPEN (audit-only pass; no source changes made).**
+5. **Medium: HTTP/2 silently drops stream frames whose IDs have no live slot.** `DATA` on idle or closed streams and `WINDOW_UPDATE`/`RST_STREAM` on idle streams are consumed without the required state-specific error; dropped `DATA` replenishes only the connection window. **— FIXED (idle-stream case): DATA/WINDOW_UPDATE/RST_STREAM on an idle stream (even id, or above the highest opened) now draw a connection PROTOCOL_ERROR instead of being silently ignored; closed-stream frames keep the RFC-permitted lenient handling. A/B-verified.**
 6. **Medium: QUIC connection-level receive credit counts duplicate stream bytes.** Retransmissions under fresh packet numbers increment `fc_recv` even when stream reassembly recognizes every byte as already received, causing premature `MAX_DATA` grants. **— OPEN (audit-only pass; no source changes made).**
 7. **Medium: coalesced QUIC 0-RTT processing stops after the first early packet.** Later 0-RTT packets in the same datagram are neither decrypted nor acknowledged, so multi-packet early requests fall back to retransmission or remain incomplete. **— OPEN (audit-only pass; no source changes made).**
 8. **Low: HTTP/3 SETTINGS validation is bounded and partially discarded.** SETTINGS payloads larger than the local capture buffer are skipped without validation, and duplicate detection stops after 32 identifiers; the peer's maximum response field-section size is also not retained. **— OPEN (audit-only pass; no source changes made).**
@@ -395,7 +395,23 @@ trailers.
 
 Severity: Medium (P2 protocol-state and flow-control handling)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED (idle-stream case)** — DATA, WINDOW_UPDATE and RST_STREAM now
+check the target stream before their slot lookup: an even id, or one above the
+highest stream opened (`h2_last_stream`), is an idle stream and draws a
+connection `PROTOCOL_ERROR` (RFC 9113 5.1/5.1.1) rather than being silently
+consumed. A closed stream (an odd id at or below `h2_last_stream` with no live
+slot) keeps the existing lenient handling — DATA is dropped with its window
+credited, a late WINDOW_UPDATE or RST_STREAM is ignored — which RFC 9113 5.1
+permits for a recently closed stream. A/B-verified: DATA/WINDOW_UPDATE/RST on an
+idle or even stream were silently ignored before and now draw
+GOAWAY(PROTOCOL_ERROR); a normal POST body, a GET, and a late DATA on a closed
+stream are unaffected. Regression cases in `test/tls/h2_frame_validation.py`.
+
+Scoped out (documented): DATA on a *closed* stream is dropped rather than
+answered with a `STREAM_CLOSED` stream reset. That is bounded, non-harmful work
+(the window is credited back), and the RFC explicitly allows ignoring frames on
+a recently closed stream; a per-frame reset would add reset noise for no
+security gain.
 
 ### Evidence
 

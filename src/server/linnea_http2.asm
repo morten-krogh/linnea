@@ -359,13 +359,20 @@ linnea_h2_handle:
     add r13, 13
     jmp .f_ignore
 .f_window_stream:
+    ; WINDOW_UPDATE on an idle stream (even id, or above the highest opened) is a
+    ; connection error (RFC 9113 5.1, Finding 5); on a closed one it is ignored
+    ; (it may have been in flight before the stream closed).
+    test dl, 1
+    jz .goaway_close
+    cmp rdx, [rbx + linnea_connection.h2_last_stream]
+    ja .goaway_close
     push rax                         ; increment
     mov rdi, rbx
     mov esi, edx
     call h2_slot_find                ; -> rax = slot* or 0
     pop rcx                          ; increment
     test rax, rax
-    jz .f_ignore                     ; unknown / closed stream: ignore
+    jz .f_ignore                     ; closed stream: ignore
     mov rdx, [rax + linnea_h2_stream.swnd]
     add rdx, rcx
     cmp rdx, 0x7fffffff
@@ -407,6 +414,13 @@ linnea_h2_handle:
     ; return a freed slot and munmap its stale file_base a second time.
     test edx, edx
     jz .goaway_close
+    ; RST_STREAM on an idle stream (even id, or above the highest opened) is a
+    ; connection error (RFC 9113 5.1, Finding 5); a late RST on a closed stream
+    ; is handled below (its slot lookup simply misses).
+    test dl, 1
+    jz .goaway_close
+    cmp rdx, [rbx + linnea_connection.h2_last_stream]
+    ja .goaway_close
     add r12, r11                     ; consume the frame (munmap clobbers r11)
     mov rdi, rbx
     mov esi, edx
@@ -478,6 +492,13 @@ linnea_h2_handle:
     jz .goaway_close                 ; DATA on stream 0 (RFC 9113 6.1): there is
                                      ; no stream to carry a body, and id 0 is
                                      ; also our free-slot marker
+    ; DATA on an idle stream -- an even id, or one above the highest we have
+    ; opened -- is a connection error (RFC 9113 5.1/5.1.1, Finding 5). A closed
+    ; stream (id already opened, no live slot) is dropped below with its credit.
+    test dl, 1
+    jz .goaway_close
+    cmp rdx, [rbx + linnea_connection.h2_last_stream]
+    ja .goaway_close
     lea rcx, [rsi + 9]               ; payload, minus any padding
     test r10b, LINNEA_H2_FLAG_PADDED
     jz .fd_nopad
