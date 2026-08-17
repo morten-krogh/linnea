@@ -160,6 +160,7 @@ extern linnea_quic_close_frame
 extern linnea_quic_ack_record
 extern linnea_quic_ack_seen
 extern linnea_quic_frames_check
+extern linnea_quic_frames_0rtt_ok
 extern linnea_quic_stream_limit
 extern linnea_quic_stream_state
 extern linnea_quic_alpn_has
@@ -531,6 +532,11 @@ s_fin_off:   resq 1              ; hsmsg offset of Finished while staging the ta
 s_walk_next: resq 1              ; next coalesced packet, so the Finished walk can go on
 s_early_next: resq 1             ; next coalesced packet in the 0-RTT walk
 s_early_len:  resq 1              ; one decrypted 0-RTT payload, across the ACK call
+s_scan_buf:   resq 1              ; the frame buffer the validate+scan pipeline reads:
+                                 ; plaintext for a 1-RTT packet, early_buf for 0-RTT
+                                 ; (Finding 15 — one pipeline over both)
+s_is_early:   resq 1             ; 1 while that pipeline is validating accepted 0-RTT,
+                                 ; so the extra 0-RTT-forbidden-frame check runs
 linnea_h3_altsvc:     resb 48    ; Alt-Svc value, e.g. h3=":443"; ma=86400
 linnea_h3_altsvc_len: resq 1     ; 0 until a QUIC listener is bound
 linnea_h3_server:     resq 1     ; index of the server that owns that listener
@@ -2027,13 +2033,19 @@ linnea_quic_server_datagram:
     test rax, rax
     jz .done
     mov qword [rbx + linnea_quic_conn.early_len], 0   ; serve once
-    ; Replay directly from the connection buffer. It may contain several
-    ; decrypted 0-RTT packets and is larger than the per-packet plaintext
-    ; scratch, so copying it back through `plaintext` would truncate the flight.
-    lea r14, [rbx + linnea_quic_conn.early_buf]
-    lea r15, [r14 + rax]              ; frames end
-    jmp .stream_scan
-    ; (.stream_scan serves the request(s) and jmps .done)
+    ; Replay directly from the connection buffer. It may contain several decrypted
+    ; 0-RTT packets and is larger than the per-packet plaintext scratch, so copying
+    ; it back through `plaintext` would truncate the flight — point the pipeline's
+    ; buffer at it instead. Route through the SAME validate+scan pipeline a 1-RTT
+    ; packet takes (Finding 15) rather than jumping into the STREAM loop: an early
+    ; flight is now subject to frame-encoding, 0-RTT-forbidden-frame, stream-state
+    ; and stream-limit checks, and its legal RESET/flow/CID frames are acted on.
+    lea rcx, [rbx + linnea_quic_conn.early_buf]
+    mov [s_scan_buf], rcx
+    mov r14, rax                     ; the early flight's length
+    mov qword [s_is_early], 1
+    jmp .scan_frames
+    ; (the pipeline validates, scans, serves the request(s) and jmps .done)
 .early_reject:
     ; The bounded early capture could not hold the complete flight. Do not
     ; silently serve a prefix while dropping the rest: reject the early request
@@ -2110,6 +2122,12 @@ linnea_quic_server_datagram:
 .oi_ok:
     mov r10, rax                     ; hold the frame-byte count across the calls
     mov r11, rdx                     ; and the packet number
+    ; a 1-RTT packet: the validate+scan pipeline reads its frames from plaintext,
+    ; and this is not early data, so the 0-RTT-forbidden-frame check is skipped
+    lea rax, [plaintext]
+    mov [s_scan_buf], rax
+    mov qword [s_is_early], 0
+    mov rax, r10                     ; restore the frame-byte count
     ; The packet authenticated — but authentic is not the same as fresh. A 1-RTT
     ; datagram captured off the wire and replayed carries a valid AEAD tag, because
     ; it is a bit-for-bit copy of one that genuinely had one, so "only an
@@ -2164,7 +2182,11 @@ linnea_quic_server_datagram:
     ; FRAME_ENCODING_ERROR. Judged once, here, rather than by each of the six
     ; scanners below — they disagreed about what "unknown" meant, and every one
     ; of them answered it by silently abandoning the rest of the packet.
-    lea rdi, [plaintext]
+    ; Accepted 0-RTT re-enters here (Finding 15) with s_scan_buf/r14 set to its
+    ; early_buf flight and s_is_early = 1, so it runs the same validation and scans
+    ; a 1-RTT packet does rather than jumping straight into the STREAM loop.
+.scan_frames:
+    mov rdi, [s_scan_buf]
     mov rsi, r14
     call linnea_quic_frames_check
     test rax, rax
@@ -2173,6 +2195,21 @@ linnea_quic_server_datagram:
     mov esi, edx                     ; the type we could not parse
     jmp .transport_close
 .frames_ok:
+    ; RFC 9000 12.5 (Finding 15): a 0-RTT packet MUST NOT carry ACK, CRYPTO,
+    ; NEW_TOKEN, PATH_RESPONSE or HANDSHAKE_DONE; one that does is a
+    ; PROTOCOL_VIOLATION. Only accepted early data is checked — a 1-RTT packet may
+    ; carry all of these. frames_check above has already vetted the encoding.
+    cmp qword [s_is_early], 0
+    je .frames_0rtt_ok
+    mov rdi, [s_scan_buf]
+    mov rsi, r14
+    call linnea_quic_frames_0rtt_ok
+    test rax, rax
+    jz .frames_0rtt_ok
+    mov edi, 0x0a                    ; PROTOCOL_VIOLATION
+    mov esi, edx                     ; the frame type a 0-RTT packet may not carry
+    jmp .transport_close
+.frames_0rtt_ok:
     ; RFC 9000 3.1/3.2: a frame naming a stream must be legal for that
     ; stream's initiator and direction. This server opens no bidirectional
     ; streams and, when the peer permits them, exactly the three fixed HTTP/3
@@ -2180,7 +2217,7 @@ linnea_quic_server_datagram:
     ; RESET/STOP, flow-control, and STREAM walks can silently act on an
     ; impossible stream half. Stream ordinal limits remain a separate check
     ; below, so an over-limit peer stream is still STREAM_LIMIT_ERROR.
-    lea rdi, [plaintext]
+    mov rdi, [s_scan_buf]
     mov rsi, r14
     xor edx, edx                    ; no server-initiated bidi streams
     xor ecx, ecx                    ; no local uni streams unless peer allowed all 3
@@ -2202,7 +2239,7 @@ linnea_quic_server_datagram:
     ; scanners that go on to act on these frames. The bidirectional limit is the
     ; one this connection has been granted (it rises as streams open, see the
     ; MAX_STREAMS regrant), not the initial advertisement.
-    lea rdi, [plaintext]
+    mov rdi, [s_scan_buf]
     mov rsi, r14
     mov rax, [cur_conn]
     mov rdx, [rax + linnea_quic_conn.ms_bidi_max]
@@ -2218,7 +2255,7 @@ linnea_quic_server_datagram:
     ; both whether this one is, and our packet number before any of it is acted
     ; on — comparing that number at the exit is how we tell whether anything we
     ; sent in reply already carried the acknowledgement.
-    lea rdi, [plaintext]
+    mov rdi, [s_scan_buf]
     mov rsi, r14
     call linnea_quic_frames_ack_eliciting
     mov [s_ack_elicit], rax
@@ -2228,7 +2265,7 @@ linnea_quic_server_datagram:
     ; ingest the peer's ACK: release every buffered packet it acknowledges, so
     ; we stop holding (and, once the PTO timer exists, retransmitting) frames
     ; that have already arrived.
-    lea rdi, [plaintext]
+    mov rdi, [s_scan_buf]
     mov rsi, r14
     lea rdx, [ack_ranges]
     mov ecx, LINNEA_QUIC_ACK_MAXR
@@ -2293,7 +2330,7 @@ linnea_quic_server_datagram:
     ; a peer that closes cleanly gets its slot back at once instead of waiting
     ; for the idle sweep — this is what keeps rapid connection churn from
     ; filling the pool.
-    lea rdi, [plaintext]
+    mov rdi, [s_scan_buf]
     mov rsi, r14
     call linnea_quic_close_frame
     test rax, rax
@@ -2302,7 +2339,7 @@ linnea_quic_server_datagram:
     ; page's downloads on reload). Tear each one down BEFORE the pump runs, so its
     ; abandoned chunks stop holding the shared congestion window — otherwise, after
     ; enough reloads, the window fills with dead chunks and the connection stalls.
-    lea rdi, [plaintext]
+    mov rdi, [s_scan_buf]
     mov rsi, r14
     lea rdx, [reset_ids]
     mov ecx, LINNEA_QUIC_RESET_MAX
@@ -2348,7 +2385,7 @@ linnea_quic_server_datagram:
 .no_resets:
     ; Connection-ID management (Finding 21): adopt the peer's rotated CIDs and
     ; retire ours as it asks. r14 still holds the decrypted payload length.
-    lea rdi, [plaintext]
+    mov rdi, [s_scan_buf]
     mov rsi, r14
     call linnea_quic_cid_frames       ; eax = 0 ok, else a transport error (edx = frame)
     test eax, eax
@@ -2391,7 +2428,7 @@ linnea_quic_server_datagram:
     mov qword [fc_scan + 8], 0
     mov byte [linnea_quic_flow_blocked], 0
     mov byte [linnea_quic_stream_blocked], 0
-    lea rdi, [plaintext]
+    mov rdi, [s_scan_buf]
     mov rsi, r14
     mov rdx, -1                       ; matches no stream id: MAX_STREAM_DATA is left
     lea rcx, [fc_scan]                ; to the per-stream walk, which owns the slots
@@ -2476,7 +2513,7 @@ linnea_quic_server_datagram:
     mov qword [fc_scan], 0
     mov qword [fc_scan + 8], 0
     mov rdx, [rax + linnea_quic_txstream.sid]
-    lea rdi, [plaintext]
+    mov rdi, [s_scan_buf]
     mov rsi, r14
     lea rcx, [fc_scan]
     call linnea_quic_flow_scan
@@ -2506,8 +2543,9 @@ linnea_quic_server_datagram:
     ; zero is what keeps the pointer below from ever outliving what it points at.
     mov qword [s_ra_hold], 0
     mov qword [s_rx_ms], 0           ; read on demand, once, below
-    lea r15, [plaintext + r14]       ; end of the frames
-    lea r14, [plaintext]             ; scan cursor
+    mov rax, [s_scan_buf]            ; plaintext (1-RTT) or early_buf (0-RTT)
+    lea r15, [rax + r14]             ; end of the frames
+    mov r14, rax                     ; scan cursor
 .stream_scan:
     ; A capture file the last stream's serve was handed, if its exit did not
     ; already close it. One choke point rather than a release at each of the

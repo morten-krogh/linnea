@@ -19,6 +19,7 @@ global linnea_quic_stream_frame
 global linnea_quic_close_frame
 global linnea_quic_frame_skip
 global linnea_quic_frames_check
+global linnea_quic_frames_0rtt_ok
 global linnea_quic_stream_limit
 global linnea_quic_stream_state
 global linnea_quic_early_fresh
@@ -3608,6 +3609,55 @@ linnea_quic_frames_check:
     pop rbx
     ret
 .fc_bad:
+    mov rax, -1
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_frames_0rtt_ok(rdi = frames, rsi = length) -> rax = 0 when every
+; frame is one a 0-RTT packet may carry, or -1 with rdx = the offending type.
+;
+; RFC 9000 12.5 / Table 3 (Finding 15): a 0-RTT packet MUST NOT carry ACK, CRYPTO,
+; NEW_TOKEN, PATH_RESPONSE or HANDSHAKE_DONE, and 12.4 makes receipt of a frame in
+; a packet type that does not permit it a connection error of type
+; PROTOCOL_VIOLATION. Called only for accepted early data, AFTER frames_check has
+; already rejected unknown and truncated frames — so frame_skip here always
+; returns a real length and the walk cannot run off the end.
+linnea_quic_frames_0rtt_ok:
+    push rbx
+    push r12
+    lea r12, [rdi + rsi]             ; end
+    mov rbx, rdi
+.zo_loop:
+    cmp rbx, r12
+    jae .zo_ok
+    movzx eax, byte [rbx]            ; frame type
+    cmp al, 0x02
+    je .zo_bad                       ; ACK
+    cmp al, 0x03
+    je .zo_bad                       ; ACK with ECN counts
+    cmp al, 0x06
+    je .zo_bad                       ; CRYPTO
+    cmp al, 0x07
+    je .zo_bad                       ; NEW_TOKEN
+    cmp al, 0x1b
+    je .zo_bad                       ; PATH_RESPONSE
+    cmp al, 0x1e
+    je .zo_bad                       ; HANDSHAKE_DONE
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_frame_skip      ; rax = length (frames_check already vetted it)
+    test rax, rax
+    jle .zo_ok                       ; defensive: a truncated/unknown frame is not ours
+    add rbx, rax
+    jmp .zo_loop
+.zo_ok:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+.zo_bad:
+    movzx edx, al                    ; the offending type, for the CONNECTION_CLOSE
     mov rax, -1
     pop r12
     pop rbx

@@ -21,7 +21,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 12. **Medium: QUIC final-size invariants are not enforced.** A later FIN silently replaces the remembered final size, and RESET_STREAM final sizes are discarded, instead of conflicting sizes or data beyond the final size closing the connection with `FINAL_SIZE_ERROR`. **— FIXED (FIN side): a conflicting FIN size, a FIN below the highest byte received, or data past a fixed final size now close the connection `FINAL_SIZE_ERROR` (0x06); A/B-verified with injected packets. The RESET_STREAM cross-check is documented as scoped out (no residual transport-integrity risk).**
 13. **Medium: malformed and forbidden QUIC transport parameters are accepted.** Truncation is treated as end-of-list, duplicate parameters overwrite, integer payloads may carry trailing bytes, and several invalid or client-forbidden values never set `TRANSPORT_PARAMETER_ERROR`. **— FIXED: truncated/duplicate/server-only/trailing-byte and out-of-range transport parameters now close the handshake TRANSPORT_PARAMETER_ERROR instead of completing; A/B-verified and covered by a new quic-shard test.**
 14. **Medium: QUIC stream direction and state are not validated.** Frames naming server-initiated or send-only streams are skipped or acted on without the required `STREAM_STATE_ERROR`. **— FIXED: a pre-dispatch validator now enforces initiator, direction, and local stream-opening state for all stream-scoped transport frames; covered by `test/quic/h3_stream_state_test.py`.**
-15. **Medium: accepted 0-RTT bypasses normal QUIC frame and stream-limit checks.** Early packets jump directly into the STREAM scanner, so prohibited frame types and over-limit early stream IDs do not receive the errors applied to 1-RTT packets. **— OPEN (audit-only pass; no source changes made).**
+15. **Medium: accepted 0-RTT bypasses normal QUIC frame and stream-limit checks.** Early packets jump directly into the STREAM scanner, so prohibited frame types and over-limit early stream IDs do not receive the errors applied to 1-RTT packets. **— FIXED (early data runs the same validate+scan pipeline as 1-RTT via a buffer pointer `s_scan_buf`, plus a new `frames_0rtt_ok` for RFC 9000 12.5 forbidden frames; forbidden ACK/CRYPTO -> PROTOCOL_VIOLATION, over-limit stream -> STREAM_LIMIT_ERROR; `test/quic/h3_0rtt_validation.py`, A/B-verified).**
 16. **Medium: inline HTTP/3 and control packets bypass QUIC congestion accounting and can fall out of loss recovery.** Only bulk response chunks are gated by `cwnd`; the eight-entry small-packet ring silently stops tracking additional replies. **— FIXED: ack-eliciting inline/control packets are now charged to a shared in-flight total (`inline_flight` + `bytes_in_flight`), an inline response is admitted only if it fits `cwnd` and a recovery slot, and the overflow is handed to the congestion-controlled pump rather than sent untracked; quic+tls shards green, burst answered 40/40 even with the ring forced to one slot.**
 17. **Medium: HTTP/3 trailer field sections are skipped without QPACK or semantic validation.** Invalid compressed trailers and forbidden trailer pseudo-fields are accepted. **— FIXED: trailer field sections are now decoded into a throwaway request/scratch pair; QPACK failures close with `QPACK_DECOMPRESSION_FAILED`, pseudo-field/semantic failures reset the request stream, and valid trailer fields cannot affect routing; verified with malformed-QPACK, pseudo-field, and valid-trailer cases.**
 18. **Medium: HTTP/3 does not reconcile `content-length` with DATA bytes.** A short or long body is routed and proxied instead of being rejected as a malformed message. **— FIXED (commit 514532a).**
@@ -1110,7 +1110,25 @@ STREAM_DATA_BLOCKED cases and requires transport error `0x05`.
 
 Severity: Medium (P2 early-data protocol and resource-limit bypass)  
 Confidence: High  
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — accepted early data now runs the SAME validate+scan pipeline a
+1-RTT packet does, instead of jumping straight into the STREAM scanner. The
+pipeline's frame buffer became a pointer (`s_scan_buf`): `plaintext` for a 1-RTT
+packet, the connection's `early_buf` for 0-RTT, so the one block validates and
+scans either. An `s_is_early` flag adds one 0-RTT-specific step — a new
+`linnea_quic_frames_0rtt_ok` that rejects the frames RFC 9000 12.5 forbids in a
+0-RTT packet (ACK, CRYPTO, NEW_TOKEN, PATH_RESPONSE, HANDSHAKE_DONE) with
+PROTOCOL_VIOLATION. Early data is therefore now subject to frame-encoding
+(`frames_check`), 0-RTT-forbidden-frame, stream-state (`stream_state`) and
+stream-limit (`stream_limit`) checks, and its legal RESET_STREAM/flow-control/CID
+frames are acted on by the same scans. No behaviour change for a normal early GET
+(the added scans are no-ops on it); the existing 0-RTT, coalesced-0-RTT and
+0-RTT-ack tests still pass, including a multi-packet flight larger than
+`plaintext`. A/B-verified against a pre-fix binary on a parallel port with
+`test/quic/h3_0rtt_validation.py`, which crafts the early packet by hand and
+encrypts it with aioquic's own 0-RTT keys: an ACK or CRYPTO ahead of a valid early
+GET now closes PROTOCOL_VIOLATION (was served, no close), and an early STREAM above
+the granted limit closes STREAM_LIMIT_ERROR (was served) — three checks that all
+failed pre-fix and pass now.
 
 ### Evidence
 

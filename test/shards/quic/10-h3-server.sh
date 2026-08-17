@@ -460,6 +460,14 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_0rtt_coalesced_test.py ${P61452} >/dev/null 2>&1
     check "h3 (io_uring): processes all coalesced 0-RTT packets" $?
 
+    # Finding 15: accepted 0-RTT ran the SAME validate+scan pipeline a 1-RTT
+    # packet does. A frame a 0-RTT packet may not carry (ACK, CRYPTO, ...) is a
+    # PROTOCOL_VIOLATION, and an early STREAM above the granted limit is a
+    # STREAM_LIMIT_ERROR -- both were silently stepped over before. The early
+    # packet is hand-built and encrypted with aioquic's own 0-RTT keys.
+    python3 test/quic/h3_0rtt_validation.py ${P61452} >/dev/null 2>&1
+    check "h3 (io_uring): 0-RTT runs frame and stream-limit validation (Finding 15)" $?
+
     # BPF connection-ID steering: a connection survives the client migrating to a
     # fresh source port. Needs CAP_BPF on the binary (a rebuild drops the file
     # capability), so it is skipped when the steering program could not load.
