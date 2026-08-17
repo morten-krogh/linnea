@@ -16,7 +16,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 7. **Medium: coalesced QUIC 0-RTT processing stops after the first early packet.** Later 0-RTT packets in the same datagram are neither decrypted nor acknowledged, so multi-packet early requests fall back to retransmission or remain incomplete. **— OPEN (audit-only pass; no source changes made).**
 8. **Low: HTTP/3 SETTINGS validation is bounded and partially discarded.** SETTINGS payloads larger than the local capture buffer are skipped without validation, and duplicate detection stops after 32 identifiers; the peer's maximum response field-section size is also not retained. **— OPEN (audit-only pass; no source changes made).**
 9. **Low: HTTP/3 critical-stream closure can be missed when closure arrives before stream typing.** Reordered FIN/RESET/STOP_SENDING state is not retained for an as-yet-untyped control or QPACK stream. **— OPEN (audit-only pass; no source changes made).**
-10. **Low: HTTP/3 accepts duplicate QPACK encoder or decoder streams.** Unlike the control stream, the QPACK stream handlers overwrite the saved ID instead of raising a stream-creation error. **— OPEN (audit-only pass; no source changes made).**
+10. **Low: HTTP/3 accepts duplicate QPACK encoder or decoder streams.** Unlike the control stream, the QPACK stream handlers overwrite the saved ID instead of raising a stream-creation error. **— FIXED: a second QPACK encoder/decoder stream now draws H3_STREAM_CREATION_ERROR like a second control stream, instead of overwriting the saved id; A/B-verified.**
 11. **High: a completed HTTP/3 request stream can be dispatched again.** Duplicate suppression lasts only while a response slot or refusal entry is active; a fresh-packet-number retransmission can reach the application again after an inline reply, or after a response slot is reaped. **— FIXED (`05f0194`): a per-connection watermark plus a small completed-stream ring records every dispatched request for the life of the connection, so a retransmission after an inline reply or a slot reap is acknowledged, not re-routed; A/B-verified (4→1 dispatches).**
 12. **Medium: QUIC final-size invariants are not enforced.** A later FIN silently replaces the remembered final size, and RESET_STREAM final sizes are discarded, instead of conflicting sizes or data beyond the final size closing the connection with `FINAL_SIZE_ERROR`. **— FIXED (FIN side): a conflicting FIN size, a FIN below the highest byte received, or data past a fixed final size now close the connection `FINAL_SIZE_ERROR` (0x06); A/B-verified with injected packets. The RESET_STREAM cross-check is documented as scoped out (no residual transport-integrity risk).**
 13. **Medium: malformed and forbidden QUIC transport parameters are accepted.** Truncation is treated as end-of-list, duplicate parameters overwrite, integer payloads may carry trailing bytes, and several invalid or client-forbidden values never set `TRANSPORT_PARAMETER_ERROR`. **— OPEN (audit-only pass; no source changes made).**
@@ -717,7 +717,14 @@ existing ordered fast path.
 
 Severity: Low (P3 HTTP/3 stream-creation conformance)
 Confidence: High
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — the QPACK encoder and decoder handlers now mirror the
+control-stream check: a stream id already recorded and different from the new
+one draws `H3_STREAM_CREATION_ERROR` (0x0103, RFC 9114 6.2.1) instead of
+overwriting the saved id; the same id again is treated as a retransmit of the
+type frame. A/B-verified against a pre-fix binary: a second client
+unidirectional stream typed `0x02` (QPACK encoder) was accepted before (the id
+was silently replaced) and now closes the connection `0x0103`; a normal h3
+request is unaffected. Regression test `test/quic/h3_dup_qpack.py`.
 
 ### Evidence
 

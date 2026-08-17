@@ -147,6 +147,20 @@ else
     check "h3 inline-burst test (skipped: deps unavailable)" 0
 fi
 
+# RFC 9114 6.2.1 (Finding 10): a second QPACK encoder/decoder stream is
+# H3_STREAM_CREATION_ERROR, like a second control stream -- not silently
+# accepted with the saved id overwritten.
+if python3 -c 'import aioquic' 2>/dev/null; then
+    start_server $CFG/tls-h3-drain.json
+    dq_master=$SRV_PID
+    timeout 30 python3 test/quic/h3_dup_qpack.py $SRV_PORT >/dev/null 2>&1
+    check "h3 duplicate QPACK stream is a creation error (Finding 10)" $?
+    kill -9 $dq_master 2>/dev/null
+    wait $dq_master 2>/dev/null
+else
+    check "h3 duplicate QPACK stream test (skipped: deps unavailable)" 0
+fi
+
 # Drain with an in-flight h3 response (Q117): the drain-exit test used to count
 # only TCP connections, so a worker whose work was all QUIC exited the moment
 # the drain began (and stopped re-arming the datagram recv besides) — the peer

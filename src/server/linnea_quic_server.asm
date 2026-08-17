@@ -4233,7 +4233,18 @@ linnea_quic_server_datagram:
     mov rax, [s_sid]
     cmp cl, LINNEA_H3_STREAM_QPACK_ENC
     jne .uni_qpack_dec
+    ; a SECOND QPACK encoder stream (a different id) is H3_STREAM_CREATION_ERROR,
+    ; like a second control stream (RFC 9114 6.2.1, Finding 10). The same id
+    ; again is a retransmit of the type frame and simply re-scans.
+    mov rsi, [rdx + linnea_quic_conn.qpack_enc_id]
+    test rsi, rsi
+    jz .uni_qpack_enc_set
+    cmp rsi, rax
+    jne .uni_qpack_dup
+    jmp .uni_qpack_enc_go
+.uni_qpack_enc_set:
     mov [rdx + linnea_quic_conn.qpack_enc_id], rax
+.uni_qpack_enc_go:
     ; Police what the stream carries (h3-8): the instructions were never read,
     ; so an encoder inserting into — or sizing — the dynamic table we refused
     ; was told nothing, and its table state and ours silently diverged.
@@ -4244,9 +4255,21 @@ linnea_quic_server_datagram:
     jnz .uni_qpack_enc_bad
     jmp .stream_scan
 .uni_qpack_dec:
+    ; a second QPACK decoder stream is the same error (Finding 10)
+    mov rsi, [rdx + linnea_quic_conn.qpack_dec_id]
+    test rsi, rsi
+    jz .uni_qpack_dec_set
+    cmp rsi, rax
+    jne .uni_qpack_dup
+    jmp .uni_qpack_dec_go
+.uni_qpack_dec_set:
     mov [rdx + linnea_quic_conn.qpack_dec_id], rax
+.uni_qpack_dec_go:
     call .uni_ro_drop                ; typed now, and not the control stream
     jmp .stream_scan                 ; otherwise nothing to read (zero table)
+.uni_qpack_dup:
+    mov edi, LINNEA_H3_ERR_STREAM_CREATION
+    jmp .h3_close
 .uni_cont:
     ; a continuation: the control stream's closure and frame walk, the QPACK
     ; streams' closure and (encoder-side) instruction policing, and — when no
