@@ -189,6 +189,22 @@ else
     check "quic transport-parameter test (skipped: deps unavailable)" 0
 fi
 
+# RFC 9000 5.1 (Finding 21): NEW_CONNECTION_ID and RETIRE_CONNECTION_ID were only
+# walked past. Now a malformed one (retire_prior_to > sequence, a sequence reused
+# with a different id, more live peer CIDs than our limit, or retiring an id we
+# never issued) closes the connection, and a valid retirement of an id we issued
+# stops it routing and draws a replacement NEW_CONNECTION_ID.
+if python3 -c 'import aioquic' 2>/dev/null; then
+    start_server $CFG/tls-h3-drain.json
+    cid_master=$SRV_PID
+    timeout 60 python3 test/quic/h3_cid_lifecycle.py $SRV_PORT >/dev/null 2>&1
+    check "quic connection-id lifecycle: validate, rotate, replace (Finding 21)" $?
+    kill -9 $cid_master 2>/dev/null
+    wait $cid_master 2>/dev/null
+else
+    check "quic connection-id lifecycle test (skipped: deps unavailable)" 0
+fi
+
 # Drain with an in-flight h3 response (Q117): the drain-exit test used to count
 # only TCP connections, so a worker whose work was all QUIC exited the moment
 # the drain began (and stopped re-arming the datagram recv besides) — the peer

@@ -49,15 +49,32 @@ linnea_quic_conn_lookup:
     lea rax, [conn_pool + rax]
     cmp qword [rax + linnea_quic_conn.in_use], 0
     je .miss
-    ; the full ID must match — the random tail authenticates the slot. Either the
-    ; primary scid or an issued alternate (quic-7) routes here.
+    ; the full ID must match — the random tail authenticates the slot. The primary
+    ; scid (unless the peer retired it) or any active alternate routes here
+    ; (Finding 21: a retired local CID no longer routes).
     mov rcx, [rdi]
+    cmp qword [rax + linnea_quic_conn.scid_retired], 0
+    jne .lk_alts
     cmp rcx, [rax + linnea_quic_conn.scid]
     je .match
-    cmp qword [rax + linnea_quic_conn.cid1_active], 0
-    je .miss
-    cmp rcx, [rax + linnea_quic_conn.cid1]
-    jne .miss
+.lk_alts:
+    lea rdx, [rax + linnea_quic_conn.lalts]
+    mov r8d, LINNEA_QUIC_LOCAL_ALTS
+.lk_alt:
+    ; ACTIVE or PENDING (issued, awaiting its announce) both route; FREE/RETIRED do not
+    mov r9, [rdx + linnea_quic_lcid.state]
+    cmp r9, LINNEA_QUIC_CID_ACTIVE
+    je .lk_alt_hit
+    cmp r9, LINNEA_QUIC_CID_PENDING
+    jne .lk_alt_next
+.lk_alt_hit:
+    cmp rcx, [rdx + linnea_quic_lcid.cid]
+    je .match
+.lk_alt_next:
+    add rdx, linnea_quic_lcid_size
+    dec r8d
+    jnz .lk_alt
+    jmp .miss
 .match:
     ; a packet arrived for it, so it is not idle
     push rax
@@ -199,6 +216,13 @@ linnea_quic_conn_alloc:
     cmp rax, LINNEA_QUIC_SCID_LEN - 2
     jne .arand_fail
     mov qword [rbx + linnea_quic_conn.cid1_active], 1
+    ; mirror cid1 as our sequence-1 alternate in the local CID table, and set the
+    ; next sequence we will issue to 2 (scid is 0, cid1 is 1) (Finding 21)
+    mov qword [rbx + linnea_quic_conn.lalts + linnea_quic_lcid.state], LINNEA_QUIC_CID_ACTIVE
+    mov qword [rbx + linnea_quic_conn.lalts + linnea_quic_lcid.seq], 1
+    mov rax, [rbx + linnea_quic_conn.cid1]
+    mov [rbx + linnea_quic_conn.lalts + linnea_quic_lcid.cid], rax
+    mov qword [rbx + linnea_quic_conn.lcid_next], 2
     ; record the peer address (sockaddr_in6; IPv4 arrives as ::ffff:x)
     mov rcx, r14
     cmp rcx, 28

@@ -27,7 +27,7 @@ The tree builds cleanly and the lightweight self-tests pass. The existing integr
 18. **Medium: HTTP/3 does not reconcile `content-length` with DATA bytes.** A short or long body is routed and proxied instead of being rejected as a malformed message. **— FIXED (commit 514532a).**
 19. **Medium: single-frame HTTP/3 request bodies bypass `max_body`.** The copy-free offset-zero-plus-FIN path reaches routing without either of the cap checks used by reassembly. **— FIXED (commit 13db631).**
 20. **Medium: the peer's QUIC `max_udp_payload_size` is parsed but not enforced.** Large inline field sections can produce datagrams above a client's advertised receive limit. **— OPEN (audit-only pass; no source changes made).**
-21. **Medium: QUIC connection-ID retirement and peer CID rotation are ignored.** Incoming `NEW_CONNECTION_ID` and `RETIRE_CONNECTION_ID` frames are structurally skipped without updating either outbound addressing or accepted server CIDs. **— OPEN (audit-only pass; no source changes made).**
+21. **Medium: QUIC connection-ID retirement and peer CID rotation are ignored.** Incoming `NEW_CONNECTION_ID` and `RETIRE_CONNECTION_ID` frames are structurally skipped without updating either outbound addressing or accepted server CIDs. **— FIXED (bounded per-connection CID tables: validate reuse/`retire_prior_to`/CID-limit with transport errors, rotate `conn.dcid` to a non-retired peer CID, deactivate retired local CIDs in the lookup and announce a replacement; `test/quic/h3_cid_lifecycle.py`).**
 22. **Low: HTTP/3 unidirectional stream types are read as one byte instead of a QUIC varint.** Legal multi-byte encodings of control or QPACK stream types are classified as unknown streams. **— FIXED: the uni-stream type is decoded as a varint (its width skipped by the control walk and QPACK scan), so a non-minimal encoding like 40 00 is classified correctly instead of dropped; A/B-verified.**
 23. **Low: QUIC PTO ignores the peer's advertised `max_ack_delay`.** RTT adjustment uses the negotiated value, but the application-space probe timer always adds the local 25 ms constant. **— OPEN (audit-only pass; no source changes made).**
 24. **Medium: HTTP/2 does not reconcile `content-length` on HEADERS-only or non-proxy requests.** A request that ends in its initial `HEADERS` can declare a nonzero body length and still be served or forwarded as bodiless; static and local-response paths never perform the DATA-length check. **— FIXED (proxy path, commit 97046ff; the harmless static-GET-with-CL sub-case is left).**
@@ -1433,7 +1433,41 @@ size as a transport limit. Apply the same ceiling to every 1-RTT emitter.
 
 Severity: Medium (P2 migration/interoperability and CID lifecycle)  
 Confidence: High  
-Status: **OPEN** — no source or test changes were made during this audit-only pass.
+Status: **FIXED** — the receive path now keeps bounded per-connection tables of
+both sides' connection IDs keyed by sequence (`include/linnea_quic_conn.inc`:
+`linnea_quic_pcid` for peer CIDs, `linnea_quic_lcid` for the alternates we issue),
+seeded at handshake (the peer's Initial SCID becomes its sequence-0 CID; our
+`cid1` becomes local sequence 1). `linnea_quic_cid_frames` walks every 1-RTT
+packet's NEW_CONNECTION_ID / RETIRE_CONNECTION_ID frames and:
+`retire_prior_to > sequence`, a sequence reused with a different CID, and more
+live peer CIDs than our `active_connection_id_limit` (default 2) each close the
+connection (`PROTOCOL_VIOLATION` / `CONNECTION_ID_LIMIT_ERROR`); a valid
+`retire_prior_to` retires the peer CIDs below it and rotates `conn.dcid` to the
+active peer CID with the highest sequence (`cid_rotate_dcid`), so outbound packets
+follow the peer's rotation; retiring an id we never issued is `PROTOCOL_VIOLATION`;
+a valid RETIRE deactivates that local CID (the lookup at
+`linnea_quic_conn_lookup` no longer routes a retired one) and mints a replacement,
+announced as a fresh NEW_CONNECTION_ID tracked for loss recovery
+(`cid_announce_pending`). A/B-verified against a pre-fix binary on a parallel
+port: `test/quic/h3_cid_lifecycle.py` — the four malformed cases drew no close
+and the valid retirement drew no replacement before, and all five behave
+correctly now. **A shipped-then-caught crash:** the first announce loop clobbered
+`r12d` (the socket `emit_1rtt` sends on) and relied on inner calls preserving
+callee-saved registers; it respawned the worker on every valid retirement. The
+loop now keeps all state in its stack frame and leaves `r12d` alone. Detected only
+by watching the worker PID across the injection — no core (AmbientCapabilities),
+and the later request that respawned it read as green. See
+[[worker-deaths-2026-08-14]].
+
+Two conformance points are deliberately left for a follow-up, neither a stall nor
+a security issue: (1) the peer's stateless-reset token in NEW_CONNECTION_ID is
+skipped rather than stored, so a stateless reset *from* the client is not matched
+(a client resetting a server is not a path we act on); (2) when the peer raises
+`retire_prior_to`, we stop using and stop routing the affected peer CIDs but do
+not send RETIRE_CONNECTION_ID back to acknowledge the retirement (RFC 9000 5.1.2
+MUST) — the rotation still happens, the peer merely holds those ids a little
+longer. Both would add a second emission path; the crash above argued for not
+doubling that surface in one change.
 
 ### Evidence
 

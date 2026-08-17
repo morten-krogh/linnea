@@ -225,6 +225,7 @@ extern linnea_string_iequal
 extern linnea_quic_conn_free
 extern linnea_quic_varint_encode
 extern linnea_quic_varint_decode
+extern linnea_quic_frame_skip
 extern linnea_x25519
 extern linnea_sha256
 extern linnea_sha256_init
@@ -1140,6 +1141,15 @@ linnea_quic_server_datagram:
     mov [rax + linnea_quic_conn.dcid_len], rcx
     lea rdi, [rax + linnea_quic_conn.dcid]
     rep movsb                        ; copy the SCID out of dgram
+    ; record the peer's handshake CID as its sequence-0 id, the one .dcid holds
+    ; (Finding 21). Its NEW_CONNECTION_IDs extend this table.
+    mov rcx, [rax + linnea_quic_conn.dcid_len]
+    mov qword [rax + linnea_quic_conn.peer_cids + linnea_quic_pcid.state], LINNEA_QUIC_CID_ACTIVE
+    mov qword [rax + linnea_quic_conn.peer_cids + linnea_quic_pcid.seq], 0
+    mov [rax + linnea_quic_conn.peer_cids + linnea_quic_pcid.len], rcx
+    lea rdi, [rax + linnea_quic_conn.peer_cids + linnea_quic_pcid.cid]
+    lea rsi, [rax + linnea_quic_conn.dcid]
+    rep movsb
     ; A ClientHello with no usable x25519 key_share cannot key the ECDHE. Never
     ; hand a null share to x25519 (it would dereference address 0 and crash the
     ; worker). This is the one client we cannot serve — every browser and QUIC
@@ -2258,6 +2268,19 @@ linnea_quic_server_datagram:
     jmp .h3_close
 .reset_next:
 .no_resets:
+    ; Connection-ID management (Finding 21): adopt the peer's rotated CIDs and
+    ; retire ours as it asks. r14 still holds the decrypted payload length.
+    lea rdi, [plaintext]
+    mov rsi, r14
+    call linnea_quic_cid_frames       ; eax = 0 ok, else a transport error (edx = frame)
+    test eax, eax
+    jz .cid_ok
+    mov edi, eax
+    mov esi, edx
+    jmp .transport_close
+.cid_ok:
+    mov rdi, [cur_conn]
+    call cid_announce_pending
     ; PATH_CHALLENGE -> PATH_RESPONSE (RFC 9000 8.2): echo the 8 challenge bytes so a
     ; peer validating this path (e.g. after a migration) confirms our address. The
     ; peer is already committed (post-auth) to this packet's source, so it follows.
@@ -6108,6 +6131,414 @@ send_stateless_reset:
     lea r8, [sa]
     mov r9, [salen]
     syscall
+    ret
+
+; --- Connection-ID lifecycle (Finding 21, RFC 9000 5.1) ----------------------
+; The peer issues CIDs it wants us to address it with (NEW_CONNECTION_ID) and
+; retires ones we issued (RETIRE_CONNECTION_ID). Before this, both frames were
+; only walked past, so a peer that rotated its CID and stopped using the old one
+; had our packets sent to an id it no longer recognised. These handlers keep a
+; bounded table of each side's CIDs and rotate our outbound DCID as the peer asks.
+; All clobber only caller-saved registers, so the frame scanner can hold its
+; cursor in rbx/r12-r15 across the calls.
+
+; cid_apply_rpt(rdi = conn) -> rax = number of ACTIVE peer CIDs. Retires every
+; peer CID below conn.peer_rpt (RFC 9000 5.1.2), then counts those still active.
+cid_apply_rpt:
+    mov r8, [rdi + linnea_quic_conn.peer_rpt]
+    lea rcx, [rdi + linnea_quic_conn.peer_cids]
+    mov r9d, LINNEA_QUIC_PEER_CIDS
+    xor eax, eax
+.ar_one:
+    cmp qword [rcx + linnea_quic_pcid.state], LINNEA_QUIC_CID_ACTIVE
+    jne .ar_next
+    mov rdx, [rcx + linnea_quic_pcid.seq]
+    cmp rdx, r8
+    jae .ar_active
+    mov qword [rcx + linnea_quic_pcid.state], LINNEA_QUIC_CID_RETIRED
+    jmp .ar_next
+.ar_active:
+    inc rax
+.ar_next:
+    add rcx, linnea_quic_pcid_size
+    dec r9d
+    jnz .ar_one
+    ret
+
+; cid_rotate_dcid(rdi = conn) — if the peer CID we address it with (conn.dcid_seq)
+; is now retired, switch conn.dcid to the active peer CID with the highest
+; sequence. Does nothing while the current DCID is still active. Clobbers rdi.
+cid_rotate_dcid:
+    mov r8, [rdi + linnea_quic_conn.dcid_seq]
+    lea rcx, [rdi + linnea_quic_conn.peer_cids]
+    mov r9d, LINNEA_QUIC_PEER_CIDS
+.rd_cur:
+    cmp qword [rcx + linnea_quic_pcid.state], LINNEA_QUIC_CID_ACTIVE
+    jne .rd_cur_next
+    cmp [rcx + linnea_quic_pcid.seq], r8
+    je .rd_done                      ; current DCID still active: keep it
+.rd_cur_next:
+    add rcx, linnea_quic_pcid_size
+    dec r9d
+    jnz .rd_cur
+    ; retired: pick the active peer CID with the highest sequence
+    lea rcx, [rdi + linnea_quic_conn.peer_cids]
+    mov r9d, LINNEA_QUIC_PEER_CIDS
+    xor r10, r10                     ; best entry (0 = none)
+    xor r11, r11                     ; best seq
+.rd_scan:
+    cmp qword [rcx + linnea_quic_pcid.state], LINNEA_QUIC_CID_ACTIVE
+    jne .rd_scan_next
+    mov rdx, [rcx + linnea_quic_pcid.seq]
+    test r10, r10
+    jz .rd_take
+    cmp rdx, r11
+    jbe .rd_scan_next
+.rd_take:
+    mov r10, rcx
+    mov r11, rdx
+.rd_scan_next:
+    add rcx, linnea_quic_pcid_size
+    dec r9d
+    jnz .rd_scan
+    test r10, r10
+    jz .rd_done                      ; peer starved us of CIDs: keep the old DCID
+    mov rax, [r10 + linnea_quic_pcid.len]
+    mov [rdi + linnea_quic_conn.dcid_len], rax
+    mov [rdi + linnea_quic_conn.dcid_seq], r11
+    lea rsi, [r10 + linnea_quic_pcid.cid]
+    lea rdi, [rdi + linnea_quic_conn.dcid]
+    mov rcx, rax
+    rep movsb
+.rd_done:
+    ret
+
+; quic_issue_replacement(rdi = conn) — mint a fresh 8-byte alternate CID in a free
+; alt slot (worker/pool prefix so it routes here, random tail), sequence lcid_next,
+; state PENDING so the receive path announces it. No-op if the alt table is full
+; (RFC 9000 5.1.1 is a SHOULD) or getrandom fails. Preserves rdi.
+quic_issue_replacement:
+    lea rax, [rdi + linnea_quic_conn.lalts]
+    mov r9d, LINNEA_QUIC_LOCAL_ALTS
+.ir_find:
+    mov r10, [rax + linnea_quic_lcid.state]
+    cmp r10, LINNEA_QUIC_CID_FREE
+    je .ir_slot
+    cmp r10, LINNEA_QUIC_CID_RETIRED
+    je .ir_slot
+    add rax, linnea_quic_lcid_size
+    dec r9d
+    jnz .ir_find
+    ret                              ; no room: skip re-issue
+.ir_slot:
+    mov r8, rax                      ; slot ptr (getrandom clobbers rax)
+    mov cx, [rdi + linnea_quic_conn.scid]   ; worker || pool prefix
+    mov [r8 + linnea_quic_lcid.cid], cx
+    push rdi
+    push r8
+    lea rdi, [r8 + linnea_quic_lcid.cid + 2]
+    mov esi, LINNEA_QUIC_SCID_LEN - 2
+    xor edx, edx
+    mov eax, LINNEA_SYS_GETRANDOM
+    syscall
+    pop r8
+    pop rdi
+    cmp rax, LINNEA_QUIC_SCID_LEN - 2
+    jne .ir_done                     ; getrandom short: leave the slot as it was
+    mov rax, [rdi + linnea_quic_conn.lcid_next]
+    mov [r8 + linnea_quic_lcid.seq], rax
+    inc rax
+    mov [rdi + linnea_quic_conn.lcid_next], rax
+    mov qword [r8 + linnea_quic_lcid.state], LINNEA_QUIC_CID_PENDING
+.ir_done:
+    ret
+
+; quic_new_cid(rdi=conn, rsi=seq, rdx=rpt, rcx=cid ptr, r8=len) -> eax = 0 when the
+; NEW_CONNECTION_ID was accepted, else the transport error to close with. len is
+; already validated 1..20 and rpt <= seq by the scanner.
+quic_new_cid:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi                     ; conn
+    mov r12, rsi                     ; seq
+    mov r13, rdx                     ; rpt
+    mov r14, rcx                     ; cid ptr
+    mov r15, r8                      ; len
+    ; already known sequence?
+    lea rax, [rbx + linnea_quic_conn.peer_cids]
+    mov r9d, LINNEA_QUIC_PEER_CIDS
+.nc_find:
+    cmp qword [rax + linnea_quic_pcid.state], LINNEA_QUIC_CID_FREE
+    je .nc_find_next
+    cmp [rax + linnea_quic_pcid.seq], r12
+    jne .nc_find_next
+    ; RFC 9000 5.1.1: the same sequence MUST carry the same CID, else
+    ; PROTOCOL_VIOLATION. An identical repeat is a harmless retransmit.
+    cmp [rax + linnea_quic_pcid.len], r15
+    jne .nc_proto
+    lea rsi, [rax + linnea_quic_pcid.cid]
+    mov rdi, r14
+    mov rcx, r15
+    repe cmpsb
+    jne .nc_proto
+    jmp .nc_apply
+.nc_find_next:
+    add rax, linnea_quic_pcid_size
+    dec r9d
+    jnz .nc_find
+    ; new sequence: store it in a free or reclaimable (retired) slot
+    lea rax, [rbx + linnea_quic_conn.peer_cids]
+    mov r9d, LINNEA_QUIC_PEER_CIDS
+.nc_free:
+    mov r10, [rax + linnea_quic_pcid.state]
+    cmp r10, LINNEA_QUIC_CID_FREE
+    je .nc_store
+    cmp r10, LINNEA_QUIC_CID_RETIRED
+    je .nc_store
+    add rax, linnea_quic_pcid_size
+    dec r9d
+    jnz .nc_free
+    mov eax, 0x09                    ; table full: CONNECTION_ID_LIMIT_ERROR
+    jmp .nc_ret
+.nc_store:
+    mov qword [rax + linnea_quic_pcid.state], LINNEA_QUIC_CID_ACTIVE
+    mov [rax + linnea_quic_pcid.seq], r12
+    mov [rax + linnea_quic_pcid.len], r15
+    lea rdi, [rax + linnea_quic_pcid.cid]
+    mov rsi, r14
+    mov rcx, r15
+    rep movsb
+.nc_apply:
+    ; peer_rpt = max(peer_rpt, rpt)
+    mov rax, [rbx + linnea_quic_conn.peer_rpt]
+    cmp r13, rax
+    jbe .nc_rpt_set
+    mov [rbx + linnea_quic_conn.peer_rpt], r13
+.nc_rpt_set:
+    mov rdi, rbx
+    call cid_apply_rpt               ; rax = active peer CID count
+    cmp rax, LINNEA_QUIC_PEER_CID_LIMIT
+    ja .nc_limit                     ; peer keeps more live CIDs than our limit
+    mov rdi, rbx
+    call cid_rotate_dcid
+    xor eax, eax
+    jmp .nc_ret
+.nc_limit:
+    mov eax, 0x09                    ; CONNECTION_ID_LIMIT_ERROR
+    jmp .nc_ret
+.nc_proto:
+    mov eax, 0x0a                    ; PROTOCOL_VIOLATION
+.nc_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; quic_retire_cid(rdi = conn, rsi = seq) -> eax = 0 accepted, else transport error.
+; Deactivates the local CID the peer no longer wants (so it stops routing here) and
+; mints a replacement. RFC 9000 19.16: retiring a sequence we never issued is a
+; PROTOCOL_VIOLATION.
+quic_retire_cid:
+    mov rax, [rdi + linnea_quic_conn.lcid_next]
+    cmp rsi, rax
+    jae .rc_proto                    ; never issued
+    test rsi, rsi
+    jnz .rc_alt
+    ; sequence 0 = the primary scid
+    cmp qword [rdi + linnea_quic_conn.scid_retired], 0
+    jne .rc_ok                       ; idempotent
+    mov qword [rdi + linnea_quic_conn.scid_retired], 1
+    jmp .rc_replace
+.rc_alt:
+    lea rax, [rdi + linnea_quic_conn.lalts]
+    mov r9d, LINNEA_QUIC_LOCAL_ALTS
+.rc_alt_find:
+    mov r10, [rax + linnea_quic_lcid.state]
+    cmp r10, LINNEA_QUIC_CID_FREE
+    je .rc_alt_next
+    cmp r10, LINNEA_QUIC_CID_RETIRED
+    je .rc_alt_next
+    cmp [rax + linnea_quic_lcid.seq], rsi
+    jne .rc_alt_next
+    mov qword [rax + linnea_quic_lcid.state], LINNEA_QUIC_CID_RETIRED
+    jmp .rc_replace
+.rc_alt_next:
+    add rax, linnea_quic_lcid_size
+    dec r9d
+    jnz .rc_alt_find
+    jmp .rc_ok                       ; already retired/recycled: idempotent
+.rc_replace:
+    call quic_issue_replacement      ; rdi (conn) preserved
+.rc_ok:
+    xor eax, eax
+    ret
+.rc_proto:
+    mov eax, 0x0a                    ; PROTOCOL_VIOLATION
+    ret
+
+; linnea_quic_cid_frames(rdi = 1-RTT frames, rsi = len) -> eax = 0 when the CID
+; frames were valid, else the transport error to close with; edx = the frame type
+; that failed. Every other frame is stepped over by linnea_quic_frame_skip.
+linnea_quic_cid_frames:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi                     ; cursor
+    lea r12, [rdi + rsi]             ; end
+    mov r13, [cur_conn]
+.cf_scan:
+    cmp rbx, r12
+    jae .cf_ok
+    movzx eax, byte [rbx]
+    cmp al, 0x18
+    je .cf_new
+    cmp al, 0x19
+    je .cf_retire
+    mov rdi, rbx
+    mov rsi, r12
+    call linnea_quic_frame_skip      ; rax = bytes, 0 trunc, -1 unknown
+    test rax, rax
+    jle .cf_ok                       ; stop the scan; overall validity is checked elsewhere
+    add rbx, rax
+    jmp .cf_scan
+.cf_new:
+    lea rdi, [rbx + 1]               ; -> sequence
+    mov rsi, r12
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .cf_frame_err
+    mov r14, rax                     ; seq
+    add rdi, rdx                     ; -> retire_prior_to
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .cf_frame_err
+    mov r15, rax                     ; rpt
+    add rdi, rdx                     ; -> length byte
+    cmp rdi, r12
+    jae .cf_frame_err
+    movzx ecx, byte [rdi]            ; CID length
+    inc rdi                          ; -> CID bytes
+    test rcx, rcx
+    jz .cf_frame_err
+    cmp rcx, LINNEA_QUIC_MAX_CID
+    ja .cf_frame_err
+    cmp r15, r14                     ; retire_prior_to must be <= sequence
+    ja .cf_proto_err
+    lea rax, [rdi + rcx]             ; need CID + 16-byte token remaining
+    add rax, 16
+    cmp rax, r12
+    ja .cf_frame_err
+    mov rbx, rax                     ; next frame is after CID + token
+    mov r8, rcx                      ; len
+    mov rcx, rdi                     ; cid ptr
+    mov rdi, r13                     ; conn
+    mov rsi, r14                     ; seq
+    mov rdx, r15                     ; rpt
+    call quic_new_cid
+    test eax, eax
+    jnz .cf_err_new
+    jmp .cf_scan
+.cf_retire:
+    lea rdi, [rbx + 1]               ; -> sequence
+    mov rsi, r12
+    call linnea_quic_varint_decode
+    test rdx, rdx
+    jz .cf_frame_err_r
+    add rdi, rdx
+    mov rbx, rdi                     ; next frame
+    mov rsi, rax                     ; seq
+    mov rdi, r13                     ; conn
+    call quic_retire_cid
+    test eax, eax
+    jnz .cf_err_ret
+    jmp .cf_scan
+.cf_ok:
+    xor eax, eax
+    jmp .cf_pop
+.cf_frame_err:
+    mov eax, 0x07                    ; FRAME_ENCODING_ERROR
+    mov edx, 0x18
+    jmp .cf_pop
+.cf_frame_err_r:
+    mov eax, 0x07
+    mov edx, 0x19
+    jmp .cf_pop
+.cf_proto_err:
+    mov eax, 0x0a                    ; PROTOCOL_VIOLATION
+    mov edx, 0x18
+    jmp .cf_pop
+.cf_err_new:
+    mov edx, 0x18                    ; eax already the error from quic_new_cid
+    jmp .cf_pop
+.cf_err_ret:
+    mov edx, 0x19                    ; eax already the error from quic_retire_cid
+.cf_pop:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; cid_announce_pending(rdi = conn) — for every alt CID we minted but have not yet
+; announced (state PENDING), send a NEW_CONNECTION_ID carrying it and its reset
+; token, tracked for loss recovery, then mark it ACTIVE. Called from the receive
+; path after the CID scan, so r12d is the UDP socket emit_1rtt sends on (this must
+; not be clobbered) and cur_conn is set. All loop state lives in the stack frame,
+; so no inner call can corrupt it by clobbering a callee-saved register.
+;   [rsp+0]=cursor (lalts entry)  [rsp+8]=index  [rsp+16]=conn
+cid_announce_pending:
+    sub rsp, 56                      ; rsp%16==0 in the body; emit_1rtt gets %16==8
+    mov [rsp + 16], rdi
+    lea rax, [rdi + linnea_quic_conn.lalts]
+    mov [rsp], rax                   ; cursor
+    mov qword [rsp + 8], LINNEA_QUIC_LOCAL_ALTS
+.ap_one:
+    mov rax, [rsp]
+    cmp qword [rax + linnea_quic_lcid.state], LINNEA_QUIC_CID_PENDING
+    jne .ap_next
+    lea rdi, [strm_pay]
+    mov byte [rdi], 0x18             ; NEW_CONNECTION_ID
+    mov rdx, [rax + linnea_quic_lcid.seq]
+    mov [rdi + 1], dl                ; sequence (< 64 -> 1-byte varint)
+    mov byte [rdi + 2], 0x00         ; retire prior to 0
+    mov byte [rdi + 3], LINNEA_QUIC_SCID_LEN
+    lea rdi, [rdi + 4]
+    lea rsi, [rax + linnea_quic_lcid.cid]
+    mov rcx, LINNEA_QUIC_SCID_LEN
+    rep movsb                        ; the 8-byte CID
+    mov rsi, rdi                     ; -> the 16-byte reset token
+    mov rax, [rsp]
+    lea rdi, [rax + linnea_quic_lcid.cid]
+    call linnea_quic_reset_token
+    lea rax, [strm_pay]
+    mov [s_pl_ptr], rax
+    mov qword [s_pl_len], 4 + LINNEA_QUIC_SCID_LEN + 16
+    call emit_1rtt                   ; rax = packet number used (r12d = socket)
+    mov [rsp + 24], rax              ; packet number
+    call now_ms
+    mov r8, rax
+    mov rsi, [rsp + 24]              ; packet number
+    mov rdi, [rsp + 16]              ; conn
+    mov rdx, [s_pl_ptr]
+    mov rcx, [s_pl_len]
+    call linnea_quic_rtx_record      ; so a lost announce is resent by the sweep
+    mov rax, [rsp]
+    mov qword [rax + linnea_quic_lcid.state], LINNEA_QUIC_CID_ACTIVE
+.ap_next:
+    mov rax, [rsp]
+    add rax, linnea_quic_lcid_size
+    mov [rsp], rax
+    dec qword [rsp + 8]
+    jnz .ap_one
+    add rsp, 56
     ret
 
 ; send_version_negotiation — a long-header packet arrived (r13 = its length) with a

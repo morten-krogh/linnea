@@ -582,6 +582,31 @@ struc linnea_quic_sent
     .pad:      resb 4               ; round the record to a multiple of 8
 endstruc
 
+; Connection-ID lifecycle (RFC 9000 5.1, Finding 21). The peer offers us CIDs to
+; address it with (our DCID); we offer it CIDs it may retire. Both sides are
+; bounded tables keyed by sequence number. We advertise no active_connection_id_
+; limit, so the default of 2 applies both ways; the tables carry a little more.
+LINNEA_QUIC_PEER_CIDS   equ 4        ; peer CIDs we retain at once
+LINNEA_QUIC_LOCAL_ALTS  equ 4        ; alternate CIDs we issue beyond scid (seq 0)
+LINNEA_QUIC_CID_FREE    equ 0
+LINNEA_QUIC_CID_ACTIVE  equ 1
+LINNEA_QUIC_CID_RETIRED equ 2
+LINNEA_QUIC_CID_PENDING equ 3        ; a local alt issued but not yet announced
+LINNEA_QUIC_PEER_CID_LIMIT equ 2     ; our active_connection_id_limit (default)
+
+struc linnea_quic_pcid              ; a connection id the PEER issued (up to 20 bytes)
+    .state:  resq 1                 ; FREE / ACTIVE / RETIRED
+    .seq:    resq 1
+    .len:    resq 1
+    .cid:    resb 24                ; the id, padded from LINNEA_QUIC_MAX_CID (20)
+endstruc
+
+struc linnea_quic_lcid              ; an ALTERNATE id WE issued (always 8 bytes)
+    .state:  resq 1
+    .seq:    resq 1
+    .cid:    resq 1                 ; the 8-byte id, as a qword
+endstruc
+
 struc linnea_quic_conn
     .in_use:     resq 1
     .dcid_len:   resq 1              ; length of the peer's connection ID
@@ -858,6 +883,17 @@ struc linnea_quic_conn
     ; placed at its offset and its bytes marked here; the contiguous prefix
     ; (ch_len) advances as gaps fill, exactly like the request-stream reassembly.
     .ch_seen:    resb LINNEA_QUIC_CH_BUF
+    ; Connection-ID lifecycle (Finding 21). peer_cids holds the CIDs the peer has
+    ; issued (we address it with one of them, .dcid, whose sequence is dcid_seq);
+    ; peer_rpt is the highest Retire Prior To it has requested. lalts holds the
+    ; alternate CIDs WE issued beyond .scid (sequence 0); lcid_next is the next
+    ; sequence we will hand out; scid_retired marks our seq-0 id retired.
+    .peer_cids:  resb LINNEA_QUIC_PEER_CIDS * linnea_quic_pcid_size
+    .dcid_seq:   resq 1
+    .peer_rpt:   resq 1
+    .lalts:      resb LINNEA_QUIC_LOCAL_ALTS * linnea_quic_lcid_size
+    .lcid_next:  resq 1
+    .scid_retired: resq 1
     .pad:        resb 4              ; keep the size a multiple of 8
 endstruc
 
