@@ -297,7 +297,19 @@ open(sys.argv[1],'wb').write(bytes(range(256))*40)" "$WWW/maxhdr.bin"     # 1024
             --cacert $CA --resolve localhost:${P61463}:127.0.0.1 \
             https://localhost:${P61463}/api/simple 2>/dev/null)
         sleep 0.4
-        kill $f1_spid 2>/dev/null; sleep 0.2; kill -9 $f1_spid 2>/dev/null
+        # strace does NOT kill its tracee when it dies -- killing the strace pid
+        # alone would orphan a live linnea. Kill the linnea master (strace's
+        # child; pgrep -P matches by parent pid, so no cmdline self-match), then
+        # strace, then reap anything still on the port as a backstop.
+        f1_srv=$(pgrep -P $f1_spid 2>/dev/null | head -1)
+        [ -n "$f1_srv" ] && kill $f1_srv 2>/dev/null
+        kill $f1_spid 2>/dev/null
+        sleep 0.3
+        [ -n "$f1_srv" ] && kill -9 $f1_srv 2>/dev/null
+        kill -9 $f1_spid 2>/dev/null
+        for _fp in $(ss -ulnpH 2>/dev/null | grep ":${P61463}\b" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+            kill -9 "$_fp" 2>/dev/null
+        done
         [ "$f1_code" = 200 ] && ! grep -q ENETUNREACH $RUNDIR/f1sec.strace
         check "h3 proxy: secondary-address response uses its own socket (no cross-socket ENETUNREACH; code=$f1_code)" $?
     else
