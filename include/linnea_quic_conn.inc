@@ -37,6 +37,13 @@ LINNEA_QUIC_RXBUF_SIZE equ 2048     ; linnea_quic_rxbuf, ONE datagram
 ; by 32 while every test still passed, so the batch got its own name instead and
 ; the per-datagram bound never moved. The copy out of the batch is clamped to it.
 LINNEA_QUIC_RXBATCH_SIZE equ 65536
+; The most distinct host addresses that can share the one HTTP/3 port. Each gets
+; its own QUIC UDP socket and receive buffers, so h3 serves every configured
+; address on that port (not just the first). A host with more than this many
+; specific h3 addresses on one port is exotic; beyond it the extra addresses get
+; no HTTP/3 -- their TCP (h1/h2) still serves -- and the worker logs that it
+; capped them, so the loss is not silent. Raise this to bind more of them.
+LINNEA_QUIC_MAX_LISTENERS equ 4
 ; strm_pay: one 1-RTT packet's payload — ACK, the STREAM header, and an inline
 ; HTTP/3 response. Named so the serve path can check against it rather than
 ; against a literal that drifts from the buffer it is meant to describe.
@@ -924,6 +931,11 @@ struc linnea_quic_conn
     .lalts:      resb LINNEA_QUIC_LOCAL_ALTS * linnea_quic_lcid_size
     .lcid_next:  resq 1
     .scid_retired: resq 1
+    ; The UDP socket this connection's datagrams arrive on and its replies must
+    ; go out (multi-address h3): the receive path sets it from the completing
+    ; socket, and the timer-driven rtx/drain sweeps -- which run with no datagram
+    ; in hand -- reply on it rather than a single global listener fd.
+    .udp_fd:     resd 1
     .pad:        resb 4              ; keep the size a multiple of 8
 endstruc
 

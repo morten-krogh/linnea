@@ -216,6 +216,8 @@ log_drained:        db "worker drained", 10
 log_drained_len     equ $ - log_drained
 log_stopped:        db "worker stopping: connections dropped", 10
 log_stopped_len     equ $ - log_stopped
+log_h3cap:          db "http3: more distinct host addresses on the port than the QUIC listener cap; the excess serve TCP only", 10
+log_h3cap_len       equ $ - log_h3cap
 log_drain_late:     db "worker drain deadline reached, dropping what is left", 10
 log_drain_late_len  equ $ - log_drain_late
 
@@ -304,12 +306,14 @@ sig_fd:             resd 1
 drain_flag:         resd 1     ; 1 = draining: no accepts, close after serve
 accept_err_streak:  resd 1     ; consecutive failed accepts; drives the backoff
 conn_full_warned:   resd 1     ; the pool-full warning has been logged already
-quic_fd:    resd 1
-            resd 1
-qrecv_msg:  resb LINNEA_MSGHDR_SIZE
-qrecv_iov:  resb LINNEA_IOVEC_SIZE
+quic_fd:    resd 1                 ; the PRIMARY h3 socket (index 0): BPF, Alt-Svc, "is h3 on" guard
+quic_fds:   resd LINNEA_QUIC_MAX_LISTENERS   ; every h3 UDP socket on the port (index 0 == quic_fd)
+quic_nfd:   resd 1                 ; how many of quic_fds are live
+qrecv_cur_sock: resd 1            ; the socket index .on_qrecv is draining, for the re-arm
+qrecv_msg: resb LINNEA_QUIC_MAX_LISTENERS * (LINNEA_MSGHDR_SIZE)
+qrecv_iov: resb LINNEA_QUIC_MAX_LISTENERS * (LINNEA_IOVEC_SIZE)
 ; control buffer for the SO_RXQ_OVFL cmsg: cmsghdr(16) + u32, rounded up
-qrecv_cmsg: resb LINNEA_QRECV_CMSG_SIZE
+qrecv_cmsg: resb LINNEA_QUIC_MAX_LISTENERS * (LINNEA_QRECV_CMSG_SIZE)
 ; The GRO segment size the kernel reported for the run just received, or 0 when
 ; it reported none -- an old kernel, a refused sockopt, or simply nothing to
 ; coalesce. Zero means "the read is one datagram", which is what it always was.
@@ -318,11 +322,11 @@ qrecv_left:   resd 1               ; bytes of the run not yet handed over
 qrecv_seglen: resd 1               ; this segment's length on the wire
 qrecv_copied: resd 1               ; ...clamped to one datagram's buffer
 qrecv_off:    resq 1               ; where this segment starts in the batch
-qrecv_drops: resq 1        ; last overflow count seen, to report only the delta
+qrecv_drops: resq LINNEA_QUIC_MAX_LISTENERS  ; per-socket last overflow count, to report only the delta
 ring_ovf_seen: resq 1      ; likewise for the completion ring's backlog count
 cqe_tag:       resd 1      ; the completing op's tag, kept past the shift
 cqe_gen:       resd 1      ; and the connection incarnation it was armed for
-qrecv_peer: resb LINNEA_SOCKADDR_IN6_SIZE
+qrecv_peer: resb LINNEA_QUIC_MAX_LISTENERS * (LINNEA_SOCKADDR_IN6_SIZE)
 sig_buf:            resb 128   ; struct signalfd_siginfo
 ; one record's plaintext during the TLS handoff (see the assertion above)
 tls_early_scratch:  resb LINNEA_CONN_IN_BUF
@@ -444,6 +448,7 @@ linnea_uring_run:
     ; UDP socket on its own host and port. Failure is not fatal — we simply
     ; serve no HTTP/3.
     mov dword [quic_fd], -1
+    mov dword [quic_nfd], 0
     xor r12d, r12d
 .quic_scan:
     cmp r12, [rbx + linnea_config.server_count]
@@ -471,6 +476,8 @@ linnea_uring_run:
     cmp rax, -1
     je .quic_next
     mov [quic_fd], eax
+    mov [quic_fds], eax            ; the primary IS listener index 0
+    mov dword [quic_nfd], 1
     ; Register every TLS vhost sharing this listener's port so the SNI can select
     ; the right certificate, key and document root. The one that owns the socket is
     ; registered first, as the default for an absent or unknown SNI.
@@ -536,13 +543,84 @@ linnea_uring_run:
     movzx edi, word [rdx + linnea_config_server.port]
     mov [linnea_h3_server], r12      ; only this server advertises it
     call linnea_quic_altsvc_set
+
+    ; --- additional QUIC sockets: one per OTHER distinct host on this port ---
+    ; The primary listener above binds the first eligible TLS server's host. A
+    ; second server with a DIFFERENT host on the same port -- the classic case
+    ; being a wildcard 0.0.0.0 primary beside a specific IPv6 literal -- needs
+    ; its own UDP socket, or h3 simply never answers on that address (its TCP
+    ; still does, so the loss is quiet: the browser just never upgrades). One
+    ; socket per host that OWNS a listener (listener_owner!=0 dedups the SNI
+    ; vhosts that share a host:port), capped at LINNEA_QUIC_MAX_LISTENERS. The
+    ; vhost table is port-based and already registered once above, so every
+    ; socket serves the same set of certificates and roots. When there is only
+    ; one host (nfd stays 1) none of this runs and the path is the old one.
+    imul rdx, r12, linnea_config_server_size
+    lea rdx, [rbx + rdx + linnea_config.servers]
+    movzx r15d, word [rdx + linnea_config_server.port]   ; the h3 port
+    mov r14, r12                                          ; primary index, to skip
+    xor r13d, r13d
+.quic_more:
+    cmp r13, [rbx + linnea_config.server_count]
+    jae .quic_arm_all
+    cmp r13, r14
+    je .quic_more_next                                    ; the primary, already bound
+    imul rdx, r13, linnea_config_server_size
+    lea rdx, [rbx + rdx + linnea_config.servers]
+    cmp dword [rdx + linnea_config_server.tls], 0
+    je .quic_more_next
+    cmp qword [rdx + linnea_config_server.cert_list], 0
+    je .quic_more_next
+    cmp qword [rdx + linnea_config_server.location_count], 0
+    je .quic_more_next
+    cmp dword [rdx + linnea_config_server.listener_owner], 0
+    je .quic_more_next                                    ; SNI-shares another host:port
+    cmp word [rdx + linnea_config_server.port], r15w
+    jne .quic_more_next                                  ; a TLS server on another port
+    ; an eligible distinct host on the h3 port. Is there room in the array?
+    cmp dword [quic_nfd], LINNEA_QUIC_MAX_LISTENERS
+    jb .quic_more_bind
+    ; no room: this host -- and any after it -- gets no h3. Say so ONCE (the
+    ; jump ends the scan), so an over-capacity config is visible in the log
+    ; rather than silently short of a listener.
+    call linnea_log_stamp
+    lea rdi, [log_h3cap]
+    mov esi, log_h3cap_len
+    call linnea_log_write
+    jmp .quic_arm_all
+.quic_more_bind:
+    mov rdi, rdx
+    call linnea_network_quic_listener
+    cmp rax, -1
+    je .quic_more_next                                    ; could not bind: no h3 here
+    mov ecx, [quic_nfd]
+    mov [quic_fds + rcx*4], eax
+    inc dword [quic_nfd]
+.quic_more_next:
+    inc r13
+    jmp .quic_more
+
+.quic_arm_all:
+    ; one armed recvmsg per socket; each re-arms itself from its own completion
+    xor r13d, r13d
+.quic_arm_loop:
+    cmp r13d, [quic_nfd]
+    jae .quic_arm_done
+    mov edi, r13d
     call linnea_uring_arm_qrecv
-    call linnea_uring_arm_qtimer
-    ; if the BPF steering program loaded, register this worker's QUIC socket at
-    ; its index in the reuseport map and attach the program to the group, so a
-    ; connection's later packets are routed here by its id even if the client
-    ; migrates to a new address (which would otherwise re-hash to another worker).
-    ; Done last: it clobbers the scratch the QUIC setup above still needed.
+    inc r13d
+    jmp .quic_arm_loop
+.quic_arm_done:
+    call linnea_uring_arm_qtimer     ; one timer drives the rtx/drain sweeps for all
+
+    ; if the BPF steering program loaded, register this worker's PRIMARY QUIC
+    ; socket at its index in the reuseport map and attach the program to that
+    ; group, so a connection's later packets are routed here by its id even if
+    ; the client migrates to a new address (which would otherwise re-hash to
+    ; another worker). Only the primary's reuseport group is steered; a
+    ; specific-host secondary socket is its own group, left on the kernel's
+    ; 4-tuple hash -- correct for a non-migrating client, which is every browser
+    ; that reaches a literal address. Done last: it clobbers the scratch above.
     cmp qword [linnea_bpf_prog_fd], 0
     jl .quic_done
     mov edi, [linnea_worker_index]
@@ -696,8 +774,12 @@ linnea_uring_run:
 ; The handler owns the receive buffer and replies on the socket itself, so the
 ; loop only has to pass on the length and the sender, then re-arm.
 .on_qrecv:
+    mov [qrecv_cur_sock], r13d         ; which of the h3 sockets fired; the
+                                       ; handler calls below clobber r13, and the
+                                       ; re-arm at the end must bring back THIS one
     test r15d, r15d
     jle .qrecv_rearm
+    mov edi, r13d
     call qrecv_check_drops             ; ...and reads UDP_GRO's segment size
     mov [qrecv_left], r15d
     ; One completion can now carry a run of datagrams from one flow. They are
@@ -729,7 +811,9 @@ linnea_uring_run:
     mov ecx, LINNEA_QUIC_RXBUF_SIZE
 .qrecv_fits:
     mov [qrecv_copied], ecx
-    lea rsi, [linnea_quic_rxbatch]
+    mov eax, [qrecv_cur_sock]
+    imul rax, rax, LINNEA_QUIC_RXBATCH_SIZE
+    lea rsi, [linnea_quic_rxbatch + rax]
     add rsi, [qrecv_off]
     lea rdi, [linnea_quic_rxbuf]
     rep movsb
@@ -739,9 +823,12 @@ linnea_uring_run:
     add [qrecv_off], rax
     sub [qrecv_left], eax
     mov edi, [qrecv_copied]
-    lea rsi, [qrecv_peer]
-    mov edx, [qrecv_msg + LINNEA_MSGHDR_NAMELEN]   ; kernel-updated length
-    mov ecx, [quic_fd]
+    mov r8d, [qrecv_cur_sock]
+    imul rax, r8, LINNEA_SOCKADDR_IN6_SIZE
+    lea rsi, [qrecv_peer + rax]
+    imul rax, r8, LINNEA_MSGHDR_SIZE
+    mov edx, [qrecv_msg + rax + LINNEA_MSGHDR_NAMELEN]   ; kernel-updated length
+    mov ecx, [quic_fds + r8*4]         ; reply on the socket the datagram arrived on
     call linnea_quic_server_datagram
     jmp .qrecv_seg
 .qrecv_rearm:
@@ -751,6 +838,7 @@ linnea_uring_run:
     call drain_all_done
     test eax, eax
     jnz .drained_exit
+    mov edi, [qrecv_cur_sock]          ; re-arm only the socket whose recv completed
     call linnea_uring_arm_qrecv
     call linnea_uring_submit_now
     jmp .wait
@@ -3663,29 +3751,48 @@ linnea_uring_arm_signal:
 ; length it actually filled in. No linked timeout — like an accept, this op
 ; stays armed for the life of the listener.
 linnea_uring_arm_qrecv:
-    cmp dword [quic_fd], 0
-    jl .noq
-    lea rcx, [qrecv_peer]
-    mov [qrecv_msg + LINNEA_MSGHDR_NAME], rcx
-    mov dword [qrecv_msg + LINNEA_MSGHDR_NAMELEN], LINNEA_SOCKADDR_IN6_SIZE
-    lea rcx, [qrecv_iov]
-    mov [qrecv_msg + LINNEA_MSGHDR_IOV], rcx
-    mov qword [qrecv_msg + LINNEA_MSGHDR_IOVLEN], 1
-    lea rcx, [qrecv_cmsg]      ; SO_RXQ_OVFL, and UDP_GRO's segment size
-    mov [qrecv_msg + LINNEA_MSGHDR_CONTROL], rcx
-    mov qword [qrecv_msg + LINNEA_MSGHDR_CONTROLLEN], LINNEA_QRECV_CMSG_SIZE
-    mov dword [qrecv_msg + LINNEA_MSGHDR_FLAGS], 0
-    lea rcx, [linnea_quic_rxbatch]     ; a GRO run, not one datagram
-    mov [qrecv_iov + LINNEA_IOVEC_BASE], rcx
-    mov qword [qrecv_iov + LINNEA_IOVEC_LEN], LINNEA_QUIC_RXBATCH_SIZE
+    mov ecx, edi
+    cmp ecx, [quic_nfd]
+    jae .noq                   ; no such socket (index 0 with nfd 0 == no h3)
+    push rbx
+    mov ebx, edi               ; socket index, held across get_sqe_zeroed
+    ; every buffer this recv touches is the index'th slot of its per-socket
+    ; array, so N sockets never share one msghdr, iovec, control area, peer
+    ; store or receive batch. For the single-listener case (index 0) each
+    ; offset is zero and the arm is byte-for-byte the one it replaced.
+    imul rdx, rbx, LINNEA_SOCKADDR_IN6_SIZE
+    lea rcx, [qrecv_peer + rdx]
+    imul r8, rbx, LINNEA_MSGHDR_SIZE
+    mov [qrecv_msg + r8 + LINNEA_MSGHDR_NAME], rcx
+    mov dword [qrecv_msg + r8 + LINNEA_MSGHDR_NAMELEN], LINNEA_SOCKADDR_IN6_SIZE
+    imul r9, rbx, LINNEA_IOVEC_SIZE
+    lea rcx, [qrecv_iov + r9]
+    mov [qrecv_msg + r8 + LINNEA_MSGHDR_IOV], rcx
+    mov qword [qrecv_msg + r8 + LINNEA_MSGHDR_IOVLEN], 1
+    imul rdx, rbx, LINNEA_QRECV_CMSG_SIZE
+    lea rcx, [qrecv_cmsg + rdx]  ; SO_RXQ_OVFL, and UDP_GRO's segment size
+    mov [qrecv_msg + r8 + LINNEA_MSGHDR_CONTROL], rcx
+    mov qword [qrecv_msg + r8 + LINNEA_MSGHDR_CONTROLLEN], LINNEA_QRECV_CMSG_SIZE
+    mov dword [qrecv_msg + r8 + LINNEA_MSGHDR_FLAGS], 0
+    imul rdx, rbx, LINNEA_QUIC_RXBATCH_SIZE
+    lea rcx, [linnea_quic_rxbatch + rdx]   ; a GRO run, not one datagram
+    mov [qrecv_iov + r9 + LINNEA_IOVEC_BASE], rcx
+    mov qword [qrecv_iov + r9 + LINNEA_IOVEC_LEN], LINNEA_QUIC_RXBATCH_SIZE
     call linnea_uring_get_sqe_zeroed
     mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECVMSG
-    mov ecx, [quic_fd]
+    mov ecx, [quic_fds + rbx*4]
     mov [rax + LINNEA_SQE_FD], ecx
-    lea rcx, [qrecv_msg]
+    imul r8, rbx, LINNEA_MSGHDR_SIZE
+    lea rcx, [qrecv_msg + r8]
     mov [rax + LINNEA_SQE_ADDR], rcx
     mov dword [rax + LINNEA_SQE_LEN], 1
-    mov qword [rax + LINNEA_SQE_USER_DATA], LINNEA_UD_QRECV
+    ; user_data carries the socket index (index << 8 | tag), so the completion
+    ; re-arms exactly the socket that fired, not always socket 0
+    mov rcx, rbx
+    shl rcx, 8
+    or rcx, LINNEA_UD_QRECV
+    mov [rax + LINNEA_SQE_USER_DATA], rcx
+    pop rbx
 .noq:
     ret
 
@@ -3719,13 +3826,17 @@ ring_check_overflow:
 .rco_done:
     ret
 
-qrecv_check_drops:
+qrecv_check_drops:                     ; edi = socket index
     mov qword [qrecv_off], 0
     mov dword [qrecv_gso], 0
     push rbx
     push r12
-    lea rbx, [qrecv_cmsg]
-    mov r12, [qrecv_msg + LINNEA_MSGHDR_CONTROLLEN]
+    push r13
+    mov r13d, edi                      ; socket index, for the per-socket drop counter
+    imul rax, r13, LINNEA_QRECV_CMSG_SIZE
+    lea rbx, [qrecv_cmsg + rax]
+    imul rax, r13, LINNEA_MSGHDR_SIZE
+    mov r12, [qrecv_msg + rax + LINNEA_MSGHDR_CONTROLLEN]
 .qcd_walk:
     ; A WALK, not a look at the first one. There are two control messages now
     ; and the kernel picks the order; reading offset zero and stopping was
@@ -3743,11 +3854,11 @@ qrecv_check_drops:
     cmp dword [rbx + LINNEA_CMSG_TYPE], LINNEA_SO_RXQ_OVFL
     jne .qcd_next
     mov eax, [rbx + LINNEA_CMSG_DATA]  ; the socket's running total
-    cmp rax, [qrecv_drops]
+    cmp rax, [qrecv_drops + r13*8]
     jbe .qcd_next                      ; unchanged (or wrapped): nothing to say
     mov rcx, rax
-    sub rcx, [qrecv_drops]             ; how many since the last report
-    mov [qrecv_drops], rax
+    sub rcx, [qrecv_drops + r13*8]     ; how many since the last report
+    mov [qrecv_drops + r13*8], rax
     push rcx
     call linnea_log_stamp
     lea rdi, [log_qdrop]
@@ -3776,6 +3887,7 @@ qrecv_check_drops:
     sub r12, rcx
     jmp .qcd_walk
 .qcd_done:
+    pop r13
     pop r12
     pop rbx
     ret

@@ -48,6 +48,26 @@ else
     check "dual-stack IPv6 test (skipped: deps unavailable)" 0
 fi
 
+# Multi-address IPv6: TWO SEPARATE specific-host TLS listeners on ONE UDP port --
+# 127.0.0.1 (bound ::ffff:127.0.0.1) first, ::1 second. Each host is its own
+# listener and needs its own QUIC socket; a full h3 GET must complete on BOTH.
+# The server used to create ONE QUIC socket (the first eligible TLS server's) and
+# stop, so [::1]:PORT had no UDP socket and its h3 handshake never completed --
+# quietly, since ::1's TCP still answered. This is that exact shape.
+if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
+    rm -f $RUNDIR/linnea.log
+    start_server $CFG/tls-h3-multi.json
+    multi_pid=$SRV_PID
+    out=$(python3 test/quic/h3_multiaddr_test.py ${P61464} 2>&1)
+    case "$out" in ok*) true ;; *) false ;; esac
+    check "h3: a QUIC socket per distinct host -- 127.0.0.1 AND ::1 on one port ($out)" $?
+    kill $multi_pid 2>/dev/null
+    wait $multi_pid 2>/dev/null
+    rm -f $RUNDIR/linnea.log
+else
+    check "multi-address h3 test (skipped: deps unavailable)" 0
+fi
+
 # Q134: a trailing HEADERS frame (trailers) must not merge into the request
 # and change the response — a trailer "range: bytes=0-4" used to turn a
 # whole-file GET into a 206.

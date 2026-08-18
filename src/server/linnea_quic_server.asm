@@ -361,7 +361,7 @@ linnea_quic_rxbuf: resb LINNEA_QUIC_RXBUF_SIZE
 ; datagrams from one flow; the receive path copies each down to rxbuf, which
 ; keeps all 43 readers of that buffer -- and the bound the h3 proxy rests on --
 ; exactly as they were. One per worker, not per connection.
-linnea_quic_rxbatch: resb LINNEA_QUIC_RXBATCH_SIZE
+linnea_quic_rxbatch: resb LINNEA_QUIC_MAX_LISTENERS * LINNEA_QUIC_RXBATCH_SIZE
 plaintext:   resb 2048
 cur_conn:    resq 1                   ; connection this datagram belongs to
 expfin:      resb 64                  ; expected client Finished message
@@ -951,6 +951,12 @@ linnea_quic_server_datagram:
     test rax, rax
     jz .done                         ; pool exhausted: drop the datagram
     mov [cur_conn], rax
+    ; bind the connection to the socket its first datagram arrived on. Every
+    ; later reply -- the timer-driven retransmission, drain and close sweeps
+    ; included -- goes out THIS socket, not a single global listener fd, so a
+    ; connection on the specific-IPv6 secondary answers from that address and
+    ; not from the wildcard primary. With one listener r12d is that listener.
+    mov [rax + linnea_quic_conn.udp_fd], r12d
     mov qword [rax + linnea_quic_conn.ch_minpn], -1    ; sentinel: no Initial pn seen yet
     ; record the negotiated version (v2 = the only supported version that is not v1)
     mov qword [rax + linnea_quic_conn.is_v2], 0
@@ -8144,6 +8150,7 @@ linnea_quic_server_rtx_sweep:
     test rax, rax
     jz .sw_conn_next
     mov rbx, rax                      ; connection
+    mov r12d, [rbx + linnea_quic_conn.udp_fd]   ; resend on ITS socket, not a global fd
     ; a connection in the closing state (RFC 9000 10.2.1) holds its slot only
     ; until the closing period is up; then the sweep reclaims it. Nothing else
     ; below applies to it — it sends nothing but the retained close, and only in
@@ -8379,6 +8386,7 @@ linnea_quic_server_goaway_all:
     test rax, rax
     jz .ga_next
     mov rbx, rax
+    mov r12d, [rbx + linnea_quic_conn.udp_fd]   ; goodbye on ITS socket
     cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
     jne .ga_next                     ; no control stream before the handshake completes
     mov [cur_conn], rbx
@@ -8448,6 +8456,7 @@ linnea_quic_server_drain_sweep:
     test rax, rax
     jz .ds_next
     mov rbx, rax
+    mov r12d, [rbx + linnea_quic_conn.udp_fd]   ; close on ITS socket
     cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
     jne .ds_next
     cmp qword [rbx + linnea_quic_conn.bytes_in_flight], 0
@@ -8509,6 +8518,7 @@ linnea_quic_server_close_all:
     test rax, rax
     jz .ca_next
     mov rbx, rax
+    mov r12d, [rbx + linnea_quic_conn.udp_fd]   ; close on ITS socket
     cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
     jne .ca_next
     mov [cur_conn], rbx

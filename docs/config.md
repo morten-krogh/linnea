@@ -188,6 +188,12 @@ IPv6-only. Several servers may share one `host`/`port` pair and be told apart by
   index 12). They used to be kept off h3 entirely on the premise that QPACK had
   no `Location` to emit, which was never true; the cost was not the redirect
   but that one such location took the whole vhost's QUIC listener with it.
+- **HTTP/3 binds one QUIC socket per distinct host on a port**, so a specific
+  IPv6 literal beside a wildcard (or two specific hosts) each answer h3 on their
+  own address. It used to bind only the first eligible host's, leaving the
+  others with h1/h2 and no h3 -- silently, since their TCP still answered. A
+  handful of distinct hosts per port is supported; past that the excess serve
+  TCP only and the worker logs it.
 
 ---
 
