@@ -24,7 +24,7 @@ audit. Only this report was added.
 
 Severity: **Medium (P2, HTTP message integrity and downstream availability)**  
 Confidence: **High**  
-Status: **OPEN**
+Status: **FIXED** (see Resolution)
 
 ### Evidence
 
@@ -147,6 +147,68 @@ return `200` with `hello` and one canonical content length. Run the equivalent
 matrix over both HTTP/2 and HTTP/3 so future parser changes cannot reintroduce
 protocol-dependent upstream-response handling.
 
+### Resolution — FIXED (2026-08-18, `978c077`)
+
+The finding is right, and understating it. Measuring all three protocols against
+the fixtures the report names found **three** behaviours, not two — HTTP/1 was
+leaking as well:
+
+| route | h1 before | h2 before | h3 before | all three now |
+|---|---|---|---|---|
+| `badname` | **200** | 502 | **200** | 502 |
+| `badvalue` | **200** | 502 | **200** | 502 |
+| `nocolon` | **200** | 502 | **200** | 502 |
+| `clconflict` | 502 | 502 | **200** | 502 |
+| `cldupe` | **502** | 200 | 200 | 200 |
+
+HTTP/1 relayed `Bad Name: x` and `X-Test: va\0ue` to the client **verbatim**;
+HTTP/3 put both on the wire QPACK-encoded. HTTP/1 was also the odd one out in
+the other direction on `cldupe`, refusing a repeated `Content-Length` that
+agreed with itself.
+
+**The fix is the report's own recommendation.** `h2p_head_validate` became
+`linnea_http_upstream_head_valid` and moved into the HTTP/1 module — an upstream
+response head *is* an HTTP/1 message, whichever protocol relays it — and all
+three call it before framing, capture or encoding. HTTP/1's private "any repeat
+is bad" rule is gone, since the shared validator already proves repeats agree.
+The move was verified behaviour-neutral for HTTP/2 *before* the new callers were
+added, so the two halves remain separable.
+
+### Two further defects the sharing surfaced
+
+Both older than this work, both the same shape as report 5's Finding 1 — several
+copies of a small routine, most subtly wrong. RFC 9112 5 puts OWS on **both**
+sides of a field value, and of the four places that locate one, two had
+forgotten the trailing half:
+
+- **the validator itself**, so `Content-Length:   5  ` reached the number parser
+  as `"5  "` and **HTTP/2 answered 502 to a legal response**. It went unnoticed
+  because the `/api/clpad` fixture was only ever pointed at HTTP/1, which has
+  its own parser that trims both ends.
+- **HTTP/3's `.ph_find`**, the same, so HTTP/3 refused it too. HTTP/2's
+  `h2p_head_find` has trimmed both ends all along.
+
+Both now trim SP and HTAB. **Not fixed, and still a gap:** the *leading* skip in
+`h2p_head_find` and `.ph_find` handles SP only, so `Content-Length:\t5` is still
+refused — legal, vanishingly rare, and not worth widening the change for.
+
+### Verification
+
+[`test/proxy_upstream_head.py`](/home/linnea/linnea/test/proxy_upstream_head.py)
+runs the matrix over HTTP/1, HTTP/2 **and** HTTP/3 in one file, because the
+defect was never "protocol X is wrong" — it was the three disagreeing, so the
+assertion that matters is that they agree. **8 of its checks fail on a pre-fix
+binary**, and it prints the leaked bytes rather than a status mismatch:
+`h1 [b'X-Test: va\0ue']`, `h3 [b'x-test: va\0ue']`. `clpad` and `cljunk` are
+paired on purpose: the first proves trailing OWS is trimmed, the second that
+`12 34` is still refused, so the trim cannot drift into permissiveness. HTTP/3
+is skipped, loudly, when aioquic is unavailable. Full suite **762 passed, 0
+failed**.
+
+The `clpad` regression was found by the suite, not by inspection: the first run
+after the shared validator landed failed `proxy CL whitespace`, which is what
+led to both OWS defects.
+
 ## Audit notes
 
 - Report-5's shared checked decimal parser is present at every reviewed
@@ -159,7 +221,9 @@ protocol-dependent upstream-response handling.
 
 ## Conclusion
 
-HTTP/2 already rejects malformed upstream response fields before translating
-them. HTTP/3 should enforce the same boundary. Until it does, a malformed
-backend response can be silently normalized into a successful HTTP/3 reply, or
-can be re-encoded as an invalid field section for the client.
+HTTP/2 already rejected malformed upstream response fields before translating
+them; HTTP/1 and HTTP/3 now enforce the same boundary through one shared
+validator, and a cross-protocol matrix pins that they agree. The audit is
+complete — and it found more than it set out to: HTTP/1 was relaying invalid
+field names and NUL bytes to clients, and two of the four field-value lookups
+had been refusing legal responses that carried trailing whitespace.
