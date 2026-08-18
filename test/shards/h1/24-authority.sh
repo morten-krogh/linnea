@@ -30,5 +30,24 @@ check "authority: junk after IPv6 literal rejected (400)" $?
 [ "$(hc '[::1]:443')" = 200 ]
 check "authority: valid bracketed IPv6 literal served by default (200)" $?
 
+# semantic validation (audit-report-3 Finding 2): the port must be in range, the
+# host must be reg-name, and a bracket literal must be a real IPv6 address
+[ "$(hc 'beta.test:65536')" = 400 ]
+check "authority: out-of-range port 65536 rejected (400)" $?
+[ "$(hc 'beta.test:99999')" = 400 ]
+check "authority: out-of-range port 99999 rejected (400)" $?
+[ "$(hc 'beta.test/foo')" = 400 ]
+check "authority: non-reg-name char '/' rejected (400)" $?
+[ "$(hc 'beta.test?x')" = 400 ]
+check "authority: non-reg-name char '?' rejected (400)" $?
+[ "$(hc '[deadbeef]')" = 400 ]
+check "authority: bracket contents that are not IPv6 rejected (400)" $?
+[ "$(hc '[gggg::1]')" = 400 ]
+check "authority: malformed IPv6 literal rejected (400)" $?
+[ "$(hc '[::1]')" = 200 ]
+check "authority: valid IPv6 literal without a port served (200)" $?
+[ "$(hc '[::ffff:1.2.3.4]')" = 200 ]
+check "authority: valid v4-mapped IPv6 literal served (200)" $?
+
 kill $auth_pid 2>/dev/null
 wait $auth_pid 2>/dev/null

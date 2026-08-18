@@ -117,7 +117,9 @@ assert b"sub index" not in body and b"doctype" not in body, \
 # a non-numeric port, an extra port component, an unterminated bracket, or junk
 # after the IPv6 literal. Before the shared authority parser these split at the
 # first ':' and whatever followed was never looked at.
-for bad in (b"sni.test:garbage", b"sni.test:80:bad", b"[::1", b"[::1]x", b"sni.test:"):
+for bad in (b"sni.test:garbage", b"sni.test:80:bad", b"[::1", b"[::1]x", b"sni.test:",
+            b"sni.test:65536", b"sni.test:99999", b"sni.test/foo",
+            b"[deadbeef]", b"[gggg::1]"):
     body = request("sni.test", [M, S, (b":authority", bad), P])
     assert b"sub index" not in body and b"doctype" not in body and b"421" not in body, \
         f"malformed authority {bad!r} was served: {body[:60]}"

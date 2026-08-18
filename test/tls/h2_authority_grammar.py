@@ -70,7 +70,13 @@ def served(authority):
 
 
 assert served(b"localhost"), "valid :authority was not served over h2"
-for bad in (b"localhost:garbage", b"localhost:80:bad", b"[::1", b"[::1]x", b"localhost:"):
+# a valid IPv6 literal we do not host is served by the connection's own vhost
+assert served(b"[::1]"), "valid IPv6-literal :authority was not served over h2"
+# structural AND semantic malformed authorities are refused (audit-report-3 F2:
+# out-of-range port, non-reg-name char, bracket contents that are not IPv6)
+for bad in (b"localhost:garbage", b"localhost:80:bad", b"[::1", b"[::1]x",
+            b"localhost:", b"localhost:65536", b"localhost:99999",
+            b"localhost/foo", b"[deadbeef]", b"[gggg::1]"):
     if served(bad):
         print(f"FAIL: malformed :authority {bad!r} was served over h2")
         sys.exit(1)
