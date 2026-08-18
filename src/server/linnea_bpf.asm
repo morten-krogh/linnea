@@ -24,6 +24,7 @@ default rel
 
 global linnea_bpf_reuseport_setup
 global linnea_bpf_map_add
+global linnea_bpf_map_half
 global linnea_bpf_attach
 global linnea_bpf_probe
 global linnea_bpf_map_fd
@@ -37,6 +38,7 @@ extern linnea_print_u64_stderr
 %define BPF_MAP_CREATE 0
 %define BPF_MAP_UPDATE_ELEM 2
 %define BPF_PROG_LOAD  5
+%define BPF_OBJ_GET_INFO_BY_FD 15
 %define MAP_TYPE_REUSEPORT_SOCKARRAY 20
 %define PROG_TYPE_SK_REUSEPORT       21
 %define SOL_SOCKET 1
@@ -91,6 +93,9 @@ msg_errno: db ": errno="
 msg_errno_len equ $ - msg_errno
 ; and a steering mismatch is not an errno at all: everything loaded, and the
 ; packets went to the wrong sockets. The per-worker "W>R " lines above say which.
+msg_size: db "FAILED: the map does not agree with itself about its size, or an "
+          db "index past its end did not refuse -- see linnea_bpf_map_half", 10
+msg_size_len equ $ - msg_size
 msg_steer: db "FAILED: loaded and attached, but a datagram did not steer by its "
            db "worker byte", 10
 msg_steer_len equ $ - msg_steer
@@ -127,6 +132,9 @@ linnea_bpf_map_fd:  resq 1           ; the REUSEPORT_SOCKARRAY, -1 until created
 linnea_bpf_prog_fd: resq 1           ; the steering program, -1 until loaded
 mu_key:        resd 1                ; a map-update key (index)
 mu_val:        resd 1                ; a map-update value (socket fd)
+gi_fd:         resd 1                ; the fd being interrogated
+map_info_len   equ 64                ; enough of struct bpf_map_info to reach
+map_info:      resb map_info_len     ; max_entries at offset 16
 st_socks:      resd 4                ; the self-test's reuseport sockets
 st_one:        resd 1
 st_pkt:        resb 32
@@ -145,6 +153,8 @@ st_alen:       resd 1                ; socklen_t, in and out
 st_stage_ptr:  resq 1
 st_stage_len:  resq 1
 st_mismatch:   resb 1                ; steering went to the wrong socket
+st_sizebad:    resb 1                ; the map's own size, or the refusal past
+                                     ; its end, was not what we depend on
 
 section .text
 
@@ -231,6 +241,44 @@ linnea_bpf_map_add:
     syscall
     ret
 
+; linnea_bpf_map_half(edi = map fd) -> rax = the index half this map can hold
+;   (max_entries / 2), or -errno when the map cannot be interrogated.
+; A map's size is fixed when it is CREATED, and this map outlives every process
+; that uses it: a hot upgrade hands the fd to the next generation rather than
+; loading a fresh one (see the header), so the map a running service steers with
+; may have been created by a binary that is long gone. Widening
+; LINNEA_BPF_STEER_HALF therefore does NOT widen the map anybody is using, and a
+; generation stamping indices past the end of the inherited map registers
+; nothing at all -- E2BIG on every worker, and the whole generation silently
+; falls back to the kernel's 4-tuple hash, which is exactly the behaviour the
+; steering exists to replace. Ask the map how big it is rather than assume.
+linnea_bpf_map_half:
+    mov [gi_fd], edi
+    ; The info buffer starts zeroed. The kernel copies min(info_len, its own
+    ; struct) and this reads a field near the front, so a short copy on an older
+    ; kernel would otherwise be read as whatever was there before.
+    lea rdi, [map_info]
+    mov ecx, map_info_len
+    xor eax, eax
+    rep stosb
+    call zero_attr
+    mov eax, [gi_fd]
+    mov [bpf_attr], eax                       ; bpf_fd
+    mov dword [bpf_attr + 4], map_info_len    ; info_len
+    lea rax, [map_info]
+    mov [bpf_attr + 8], rax                   ; info
+    mov eax, SYS_BPF
+    mov edi, BPF_OBJ_GET_INFO_BY_FD
+    lea rsi, [bpf_attr]
+    mov edx, 16
+    syscall
+    test rax, rax
+    js .ret                                   ; -errno
+    mov eax, [map_info + 16]                  ; struct bpf_map_info.max_entries
+    shr eax, 1
+.ret:
+    ret
+
 ; linnea_bpf_attach(edi = socket fd, esi = program fd) -> rax = 0 or -errno.
 ; Attach the steering program to the reuseport group via one of its sockets.
 linnea_bpf_attach:
@@ -272,6 +320,7 @@ linnea_bpf_selftest:
     push r14
     push r15
     mov byte [st_mismatch], 0
+    mov byte [st_sizebad], 0
     call linnea_bpf_reuseport_setup
     test rax, rax
     js .st_fail
@@ -334,6 +383,35 @@ linnea_bpf_selftest:
     inc r12d
     cmp r12d, 4
     jb .st_mk
+    ; --- the map's own account of its size ------------------------------
+    ; The steering half has to come from the MAP, not from the constant. The
+    ; map outlives the binary: a hot upgrade hands its fd to the next
+    ; generation rather than loading a fresh one, so a binary that widens
+    ; LINNEA_BPF_STEER_HALF starts addressing entries an INHERITED map does not
+    ; have. Production ran a full day that way -- every other generation
+    ; registered nothing at all and fell back to the kernel's 4-tuple hash,
+    ; which is what the steering exists to replace. Neither half of this is a
+    ; steering failure, so it gets its own flag rather than borrowing one.
+    mov edi, [linnea_bpf_map_fd]
+    call linnea_bpf_map_half
+    cmp rax, LINNEA_BPF_STEER_HALF    ; the map was just created at 2 * HALF
+    je .st_half_ok
+    mov byte [st_sizebad], 1
+.st_half_ok:
+    mov edi, 2 * LINNEA_BPF_STEER_HALF    ; one past the end: E2BIG, not a
+    mov esi, [st_socks]                   ; partial or silent success
+    call linnea_bpf_map_add
+    cmp rax, -7                       ; -E2BIG, the errno production logged
+    je .st_e2big_ok
+    mov byte [st_sizebad], 1
+.st_e2big_ok:
+    mov edi, LINNEA_BPF_STEER_HALF    ; ...and the first index of the far half,
+    mov esi, [st_socks]               ; which must fit
+    call linnea_bpf_map_add
+    test rax, rax
+    jz .st_size_done
+    mov byte [st_sizebad], 1
+.st_size_done:
     STAGE stg_attach
     mov edi, [st_socks]               ; attach the program to the group
     mov esi, [linnea_bpf_prog_fd]     ; not a register: r15 is the receiver below
@@ -429,6 +507,8 @@ linnea_bpf_probe:
     call linnea_print_stderr
     test rbx, rbx
     js .fail_errno
+    cmp byte [st_sizebad], 0
+    jne .fail_size
     cmp byte [st_mismatch], 0
     jne .fail_steer
     lea rdi, [msg_ok]
@@ -440,6 +520,13 @@ linnea_bpf_probe:
     mov esi, 1
     call linnea_print_stderr
     xor eax, eax
+    pop rbx
+    ret
+.fail_size:
+    lea rdi, [msg_size]
+    mov esi, msg_size_len
+    call linnea_print_stderr
+    mov eax, -1
     pop rbx
     ret
 .fail_steer:

@@ -40,6 +40,7 @@ extern linnea_file_unmap
 extern linnea_bpf_probe
 extern linnea_bpf_reuseport_setup
 extern linnea_bpf_map_fd
+extern linnea_bpf_map_half
 extern linnea_bpf_prog_fd
 extern linnea_network_probe_owner
 extern linnea_listen_reuseport
@@ -152,6 +153,9 @@ old_pid_count:  resq 1
 ; steering to them. Each generation stamps and registers under its own half of
 ; the index space (steer_base 0 or LINNEA_BPF_STEER_HALF) so the two never collide.
 steer_base:     resq 1                   ; this generation's steering-index base
+steer_half:     resq 1                   ; and the half-width the INHERITED map
+                                         ; can hold, which is not necessarily
+                                         ; LINNEA_BPF_STEER_HALF -- see below
 adopt_bpf_map:  resq 1                   ; inherited map fd (valid if adopt_bpf_ok)
 adopt_bpf_prog: resq 1                   ; inherited program fd
 adopt_bpf_ok:   resq 1                   ; 1 = the env carried a bpf section
@@ -1027,15 +1031,41 @@ parse_upgrade_env:
     jne .no_bpf
     inc rsi
     call parse_dec             ; the half of the index space it stamped
-    xor rax, LINNEA_BPF_STEER_HALF   ; take the other half…
-    and rax, LINNEA_BPF_STEER_HALF   ; …and force a sane base whatever the env held
-    cmp qword [linnea_config_instance + linnea_config.workers], LINNEA_BPF_STEER_HALF
+    ; The half comes from the MAP, not from LINNEA_BPF_STEER_HALF. The map is
+    ; inherited, never re-created, so a service started under an older binary
+    ; keeps that binary's map for as long as it is only ever reloaded -- and a
+    ; generation stamping base 128 into a 128-entry map registers nothing
+    ; (E2BIG) and drops the whole generation back to the kernel's 4-tuple hash.
+    ; That is not a lost optimisation: during a reload both generations share
+    ; the reuseport group, so a draining connection's packets hash to whichever
+    ; member the kernel picks, and an h3 client that was mid-connection gets a
+    ; stateless reset. It ran on prod for a day, every OTHER reload, before the
+    ; log line that says so was read.
+    push rax                   ; the previous generation's base
+    mov edi, [adopt_bpf_map]
+    call linnea_bpf_map_half
+    test rax, rax
+    js .half_default           ; -errno: the map could not be interrogated
+    cmp rax, 1
+    jb .half_default           ; too small to have two halves at all
+    cmp rax, LINNEA_BPF_STEER_HALF
+    jbe .half_ok               ; a map WIDER than the one-byte index allows is
+.half_default:                 ; no use to us: the index is one byte, full stop
+    mov rax, LINNEA_BPF_STEER_HALF
+.half_ok:
+    mov [steer_half], rax
+    pop rax
+    mov rcx, [steer_half]
+    xor rax, rcx               ; take the other half…
+    and rax, rcx               ; …and force a sane base whatever the env held
+    cmp qword [linnea_config_instance + linnea_config.workers], rcx
     jbe .base_ok
-    xor eax, eax               ; more than HALF workers: the two generations
-                               ; cannot both fit the one-byte index space, so
-                               ; they share base 0 (colliding). Reload is then
-                               ; not lossless for h3 -- documented; a wider CID
-                               ; index is the only real fix and is a redesign.
+    xor eax, eax               ; more than a half's worth of workers: the two
+                               ; generations cannot both fit the one-byte index
+                               ; space, so they share base 0 (colliding). Reload
+                               ; is then not lossless for h3 -- documented; a
+                               ; wider CID index is the only real fix and is a
+                               ; redesign.
 .base_ok:
     mov [steer_base], rax
     mov qword [adopt_bpf_ok], 1
