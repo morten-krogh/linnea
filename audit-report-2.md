@@ -150,7 +150,7 @@ servers are three distinct endpoints — is affected.
 
 Severity: **Medium (P2 protocol correctness and request-routing ambiguity)**  
 Confidence: **High**  
-Status: **OPEN**
+Status: **FIXED** (see Resolution)
 
 ### Evidence
 
@@ -203,6 +203,50 @@ non-numeric, or extra port components before vhost selection. Add cross-protocol
 tests for valid bracketed IPv6 authorities, malformed ports, extra colons, and
 case-insensitive DNS host matching.
 
+### Resolution — FIXED (2026-08-18)
+
+There is now one authority parser,
+[`linnea_http_authority_host`](/home/linnea/linnea/src/server/linnea_http.asm)`(ptr, len)`,
+shared by all three protocols. It parses the RFC 3986 request-target grammar --
+`reg-name-or-IPv4 [ ":" port ]` or `"[" IPv6 "]" [ ":" port ]` -- and returns
+the host slice (offset past any `[`, length short of `]` or `:port`), or -1 when
+the authority is malformed: a port that is not one to five decimal digits, an
+extra port component, an unterminated or empty bracket, or junk after the
+literal. It is called in five places:
+
+- **validation** -- the HTTP/1.1 `Host` check
+  ([`linnea_http.asm`](/home/linnea/linnea/src/server/linnea_http.asm)) and the
+  shared HTTP/2/HTTP/3 `linnea_hpack_req_check`
+  ([`linnea_hpack.asm`](/home/linnea/linnea/src/server/linnea_hpack.asm)) --
+  where a -1 is the existing reject path: **400** on h1, a refused stream on
+  h2/h3. `three.test:garbage` and `three.test:80:bad` are no longer 200.
+- **vhost selection** -- the three selectors (`linnea_http.asm`,
+  `h2_select_vhost`, `authority_vhost`) now match on the parser's bracket-aware
+  slice, so `[::1]:443` matches on `::1`, not on the `"["` a first-colon split
+  produced.
+
+The host *character* policy is unchanged (printable, no space, no DEL; high
+bytes still tolerated) -- only the STRUCTURE is now enforced. A consequence is
+that a bare unbracketed IPv6 in an authority (`Host: ::1`) is now correctly
+malformed; a client that means the literal must bracket it, which every client
+that emits one already does.
+
+**Verification** -- A/B against a pre-fix binary (`.text` differs), one probe
+per protocol:
+
+- **HTTP/1.1**: `beta.test:garbage`, `beta.test:80:bad` and `[::1` returned
+  **200** pre-fix and **400** after; a valid `beta.test:8080` and a bracketed
+  `[::1]:443` still route.
+  [`test/shards/h1/24-authority.sh`](/home/linnea/linnea/test/shards/h1/24-authority.sh)
+  + `test/configs/authority-vhosts.json`.
+- **HTTP/2**: the pre-fix binary served `:authority: localhost:garbage`; the
+  fix refuses its stream.
+  [`test/tls/h2_authority_grammar.py`](/home/linnea/linnea/test/tls/h2_authority_grammar.py).
+- **HTTP/3**: the pre-fix binary served `:authority: sni.test:garbage`; the fix
+  refuses it, and a well-formed `[::1]:port` is served locally rather than
+  mangled. Malformed cases added to
+  [`test/quic/h3_authority_test.py`](/home/linnea/linnea/test/quic/h3_authority_test.py).
+
 ## Verification
 
 ### Build and focused audit checks
@@ -241,10 +285,11 @@ either new audit finding without a direct reproduction.
 
 ## Audit conclusion
 
-Two new issues were found and reproduced against the current server. **Finding 1
-(listener identity) is now FIXED** — see its Resolution and the 2026-08-18
-update — leaving **Finding 2 (grammar-aware authority parsing) OPEN**. The
-original audit itself made no code changes; the fixes were applied afterward.
+Two new issues were found and reproduced against the current server. **Both are
+now FIXED** — Finding 1 (canonical listener identity) and Finding 2
+(grammar-aware authority parsing), each with its own Resolution and
+cross-protocol A/B verification. The original audit itself made no code changes;
+the fixes were applied afterward.
 
 ## Update — 2026-08-18: multi-address HTTP/3 (commit `262ce73`, deployed)
 
