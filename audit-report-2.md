@@ -30,7 +30,7 @@ report is added by this audit. An unrelated pre-existing modification to
 
 Severity: **High (P1, configuration-dependent cross-vhost routing/content exposure)**  
 Confidence: **High**  
-Status: **OPEN**
+Status: **FIXED** (commit `262ce73`'s follow-up; see Resolution)
 
 ### Evidence
 
@@ -98,6 +98,53 @@ family and `v6only` mode in the listener identity, or reject conflicting
 - equivalent IPv6 spellings;
 - port `0` aliases and their port files; and
 - conflicting `v6only` values on one effective endpoint.
+
+### Resolution — FIXED (2026-08-18)
+
+Listener identity is now the **canonical socket endpoint**, computed by
+`linnea_network_fill_sockaddr6`, not the host text. One comparator,
+[`linnea_network_endpoint_cmp`](/home/linnea/linnea/src/server/linnea_network.asm)`(serverA, serverB)`,
+decides whether two servers share an effective listener: it compares the
+28-byte `sockaddr_in6` (address **and** port together) and the `v6only` option,
+returning share / different / v6only-conflict. Both listener-sharing sites call
+it — `linnea_network_listen_all`'s `.scan_prior` (fd sharing and
+`listener_owner`) and `linnea_config_validate`'s duplicate/TLS scan — so they
+can no longer disagree about which servers share a socket.
+
+Consequences:
+
+- `"::"` and `"0.0.0.0"` (both `in6addr_any`), and equivalent IPv6 spellings,
+  resolve to **one** `SO_REUSEPORT` listener with one vhost table instead of
+  several that split a hostname between them. This also removes the redundant
+  wildcard QUIC socket noted in the multi-address update above: the QUIC
+  socket loop keys on the now-canonical `listener_owner`.
+- Two servers on one canonical `address`/`port` with disagreeing `v6only` are
+  rejected at validation — *"servers on one address and port must agree on
+  v6only"* — so the option can no longer be silently taken from the first
+  textual entry.
+- Port-`0` aliases share one endpoint and therefore one kernel-chosen port.
+- The recommendation's "include the effective address family" is satisfied
+  implicitly: every listener is `AF_INET6`, and `v6only` (which decides
+  dual-stack vs IPv6-only) is part of the identity.
+
+**Verification** (A/B against a pre-fix binary, `.text` differs):
+
+- `"::"`/alpha.test and `"0.0.0.0"`/beta.test, disjoint roots, one port: the
+  pre-fix binary bound **two** listeners and split 40 `beta.test` requests
+  across the two roots (17 correct, 23 to the wrong default); the fixed binary
+  binds **one** and serves all 40 from beta's own root. Regression test
+  [`test/shards/h1/23-wildcard-alias.sh`](/home/linnea/linnea/test/shards/h1/23-wildcard-alias.sh)
+  with `test/configs/wildcard-alias.json`.
+- The same hostname on `"::"` and `"0.0.0.0"` is now a duplicate-hostname
+  error, and the `v6only` conflict is rejected — both asserted in the base
+  shard (`test/configs/wildcard-dup-hostname.json`, `bad-v6only-conflict.json`).
+
+**Scope note.** The canonical identity governs cold start and steady state. On
+the single hot upgrade *from* a pre-fix binary, an already-aliased config would
+leave the retiring generation's now-redundant second listener fd inherited but
+unused until that process exits; steady state (both generations canonical) is
+clean, and no non-aliased config — the production config included, whose three
+servers are three distinct endpoints — is affected.
 
 ## Finding 2 — authority parsing accepts malformed ports and mishandles IPv6
 
@@ -194,9 +241,10 @@ either new audit finding without a direct reproduction.
 
 ## Audit conclusion
 
-Two new issues remain open: effective listener identity is not canonicalized,
-and authority parsing is not grammar-aware. Both were reproduced against the
-current server. No code changes were made during this audit.
+Two new issues were found and reproduced against the current server. **Finding 1
+(listener identity) is now FIXED** — see its Resolution and the 2026-08-18
+update — leaving **Finding 2 (grammar-aware authority parsing) OPEN**. The
+original audit itself made no code changes; the fixes were applied afterward.
 
 ## Update — 2026-08-18: multi-address HTTP/3 (commit `262ce73`, deployed)
 
