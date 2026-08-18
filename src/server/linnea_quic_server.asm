@@ -83,6 +83,7 @@ global linnea_quic_altsvc_set
 global linnea_h3_altsvc
 global linnea_h3_altsvc_len
 global linnea_h3_server
+global s_is_early
 global linnea_h3_advert
 ; delivering a proxied HTTP/3 response, which completes long after the datagram
 ; that carried the request: the parameter block and the entry point that reads

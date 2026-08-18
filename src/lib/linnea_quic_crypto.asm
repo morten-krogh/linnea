@@ -856,8 +856,11 @@ linnea_quic_early_keys:
 ; flight. This per-worker strike register rejects a binder (a MAC over the
 ; ClientHello, so unique to the flight) seen within the replay window. It is
 ; best-effort across workers — a replay steered to another worker by a changed
-; 4-tuple is not caught — but linnea serves only idempotent GET/HEAD over 0-RTT,
-; so a replayed early request has no side effect. Fails closed when full.
+; 4-tuple is not caught. It is a second line only: the request path answers any
+; early request that is not GET or HEAD with 425 Too Early (RFC 8470, in
+; linnea_h3_serve), and 0-RTT is served only at handshake completion (which a
+; replayer cannot reach without the connection's ephemeral), so an accepted
+; early request has no replayable side effect. Fails closed when full.
 %define STRIKE_N 512                      ; entries: key(8) || expiry(8)
 linnea_quic_replay_check:
     mov rax, [rdi]                        ; key = first 8 bytes of the binder

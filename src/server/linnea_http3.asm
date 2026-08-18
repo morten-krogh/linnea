@@ -40,6 +40,7 @@ global linnea_h3_proxy_body_len
 global linnea_h3_body_fd
 
 extern linnea_hpack_req_check
+extern s_is_early
 extern linnea_quic_varint_decode
 extern linnea_quic_varint_encode
 extern linnea_log_access
@@ -93,6 +94,8 @@ body_502:      db "502 Bad Gateway", 10
 body_502_len   equ $ - body_502
 body_405:      db "405 Method Not Allowed", 10
 body_405_len   equ $ - body_405
+body_425:      db "425 Too Early", 10
+body_425_len   equ $ - body_425
 proto_h3: db "HTTP/3"
 proto_h3_len equ $ - proto_h3
 body_421: db "421 Misdirected Request", 10
@@ -982,6 +985,32 @@ linnea_h3_serve:
     jz .bad
     mov r14, rax                     ; end of the resolved path
     mov r13, r9                      ; the directory flag, across the routing
+    ; --- 0-RTT safety: early data carries only safe methods -------------
+    ; A request drawn from accepted 0-RTT (s_is_early) that is not GET or HEAD is
+    ; not replay-safe: it could be forwarded to a proxy backend as a side effect.
+    ; 0-RTT is replayable by design (RFC 9001 9.2), and the per-worker strike
+    ; register is best-effort across workers -- so the safety cannot rest on it.
+    ; Answer 425 Too Early (RFC 8470) and let the client retry the request under
+    ; 1-RTT keys. This gate is what MAKES "only safe methods over 0-RTT" true,
+    ; rather than assumed; it sits before routing so a proxy or redirect location
+    ; is covered too, not just static.
+    cmp qword [s_is_early], 0
+    je .early_ok
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    mov rcx, [rbx + linnea_h2_req.method_len]
+    cmp rcx, 3
+    jne .early_head
+    cmp word [rdi], 'GE'
+    jne .resp_425
+    cmp byte [rdi + 2], 'T'
+    je .early_ok
+    jmp .resp_425
+.early_head:
+    cmp rcx, 4
+    jne .resp_425
+    cmp dword [rdi], 0x44414548      ; "HEAD", little-endian
+    jne .resp_425
+.early_ok:
     ; --- routing ------------------------------------------------------
     ; h3 used to be handed a document root and nothing else, so every path
     ; resolved under one root and a vhost with any other kind of location was
@@ -1479,6 +1508,15 @@ linnea_h3_serve:
     mov ecx, txt_plain_len
     lea r8, [body_405]
     mov r9d, body_405_len
+    call linnea_h3_build_response
+    jmp .sret
+.resp_425:
+    mov rdi, r12
+    mov esi, 425
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_425]
+    mov r9d, body_425_len
     call linnea_h3_build_response
     jmp .sret
 .bad:
