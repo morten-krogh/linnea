@@ -22,7 +22,7 @@ Only this report was added.
 
 Severity: **Medium (P2, malformed-upstream handling and protocol consistency)**  
 Confidence: **High**  
-Status: **Open**
+Status: **Fixed** (see Resolution)
 
 ### Evidence
 
@@ -104,11 +104,23 @@ assert a 502 on H1, H2, and H3 in proxy_upstream_head.py. Pair it with the
 existing /api/http10 success case so valid upstream HTTP/1.0 translation stays
 covered.
 
+### Resolution — FIXED (2026-08-18, `f153586`)
+
+Reproduced exactly: `HTTP/x.y 200 OK` was 502 on HTTP/1 and **200 on HTTP/2 and
+HTTP/3**, body `valid`.
+
+The validator now checks the status line instead of skipping it — the version
+(1.0 or 1.1, which was already HTTP/1's upstream policy and is now shared rather
+than local), the single SP, three digits, and the delimiter after the code, so
+`HTTP/1.1 2000` is refused too. One gate, every protocol, as report 6 intended.
+All three now answer 502, and `/api/http10` is the control that a legal
+HTTP/1.0 upstream still translates on all three.
+
 ## Finding 2 — HTTP/3 interim-response buffering has only a single-head budget
 
 Severity: **Medium (P2, HTTP/3 proxy availability)**  
 Confidence: **High**  
-Status: **Open**
+Status: **Fixed** (see Resolution)
 
 ### Evidence
 
@@ -204,10 +216,53 @@ five-byte final body. The H3 assertion must require the status sequence
 103, 103, 200 plus valid; H1 and H2 should continue to require 200 plus the
 same final body.
 
+### Resolution — FIXED (2026-08-18, `f153586`)
+
+This one is mine, from `a81098e`. Retaining interim heads to re-encode them at
+delivery put the whole sequence into the one staging buffer sized for a single
+head. Reproduced: six legal `103 Early Hints` plus the final response were 200
+on HTTP/1 and HTTP/2 and **502 on HTTP/3**.
+
+Two things in fairness to the change rather than to me: it is still far better
+than what preceded it — before `a81098e` a lone `103` broke HTTP/3 for *every*
+interim response, final answer never delivered — and it failed cleanly rather
+than corrupting the buffer, because the bound is checked per frame. What it
+lacked was an **aggregate** budget.
+
+- `LINNEA_H3_PROXY_RESERVE` doubles to **16384**. It holds anything `up_buf` can
+  deliver, and it is a *hole* in a sparse capture file, so the extra costs
+  nothing until it is written to.
+- `LINNEA_H3_PROXY_IMAX` caps the chain at **8** interim responses, enforced
+  **while parsing**. Bounding raw bytes cannot bound the encoded size — every
+  head, however small, encodes to a field section carrying its own via, date and
+  server, and `up_buf` holds hundreds of minimal 1xx heads. Refusing at the head
+  also means no body is captured for a response that could never be sent, which
+  is what the report asked for.
+
+**A deliberate divergence, asserted so it stays deliberate:** HTTP/1 and HTTP/2
+relay each 1xx as it arrives and have no such cap, so nine interims serve there
+and are refused on HTTP/3. That is inherent to HTTP/3 buffering the sequence
+before it sends anything.
+
+### Verification
+
+Control on the exact fixture: **502 at reserve 8192, 200 at 16384**; and **9
+interims 502 against 6 interims 200**. Full suite **764 passed, 0 failed**.
+
+Two traps in the *test*, both mine and both worth recording. `/api/bigearly`
+first sent 8563 bytes against an 8448-byte `up_buf`, so it exercised the
+buffer-full path rather than the bound under test. And the matrix reported a
+QPACK decode error that curl-h3 does not reproduce: aioquic's decoder stops once
+a stream's field sections total more than a few KiB, which any response large
+enough to exercise this bound also exceeds. That route is therefore checked with
+curl-h3 in the shard, and the matrix *prints* why it skips it rather than
+silently omitting it.
+
 ## Conclusion
 
-The report-7 fixes handle ordinary interim sequences and HTAB framing
-correctly, but two boundary conditions remain: H2/H3 do not validate the
-upstream status-line version, and H3's new interim delivery path has no
-aggregate header budget. Both are reproducible against the current tree and
-need cross-protocol regression coverage.
+Both are fixed. The status line is now validated in the one gate every protocol
+calls, and the interim delivery path has both a larger budget and a documented,
+parse-time cap. The cross-protocol matrix covers `badversion`, `http10` and
+`bigearly`; the two checks the matrix cannot make — the long chain and the cap
+— run against curl-h3 in the shard, because the test client's own decoder is
+the limit there, not the server.
