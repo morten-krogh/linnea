@@ -18,6 +18,7 @@ extern linnea_error_duplicate_hostname
 extern linnea_string_equal
 extern linnea_string_iequal
 extern linnea_network_fill_sockaddr6
+extern linnea_network_endpoint_cmp
 
 section .rodata
 
@@ -112,6 +113,8 @@ msg_no_log_dir:         db "the log's directory does not exist"
 msg_no_log_dir_len      equ $ - msg_no_log_dir
 msg_tls_mismatch:       db "servers sharing a listener must all set TLS or none"
 msg_tls_mismatch_len    equ $ - msg_tls_mismatch
+msg_v6only_conflict:    db "servers on one address and port must agree on v6only"
+msg_v6only_conflict_len equ $ - msg_v6only_conflict
 
 dump_tls_on:            db " tls=on cert="
 dump_tls_on_len         equ $ - dump_tls_on
@@ -407,19 +410,21 @@ linnea_config_validate:
     jae .dup_next
     imul r15, r14, linnea_config_server_size
     lea r15, [rbx + r15 + linnea_config.servers]   ; server j
-    mov ax, [r13 + linnea_config_server.port]
-    cmp ax, [r15 + linnea_config_server.port]
-    jne .dup_prior_next
-    lea rdi, [r13 + linnea_config_server.host]
-    mov rsi, [r13 + linnea_config_server.host_len]
-    lea rdx, [r15 + linnea_config_server.host]
-    mov rcx, [r15 + linnea_config_server.host_len]
-    call linnea_string_equal
-    test eax, eax
-    jz .dup_prior_next
-    ; same host:port -> the two servers share a listener; their TLS-ness
-    ; must agree. SNI selects each vhost's certificate within a TLS
-    ; listener, but cannot mix TLS and plaintext on one socket.
+    ; Share detection is on the CANONICAL endpoint (fill_sockaddr6), not the
+    ; raw host text, so "::" and "0.0.0.0" (both in6addr_any) and equivalent
+    ; IPv6 spellings are recognised as one listener here exactly as they are in
+    ; linnea_network_listen_all -- the two scans call the same comparator and
+    ; cannot drift apart.
+    mov rdi, r13
+    mov rsi, r15
+    call linnea_network_endpoint_cmp
+    cmp eax, 2
+    je .v6only_conflict          ; same address:port, disagreeing v6only
+    cmp eax, 1
+    jne .dup_prior_next          ; different endpoints: not a shared listener
+    ; same effective listener -> their TLS-ness must agree. SNI selects each
+    ; vhost's certificate within a TLS listener, but cannot mix TLS and
+    ; plaintext on one socket.
     mov eax, [r13 + linnea_config_server.tls]
     cmp eax, [r15 + linnea_config_server.tls]
     jne .tls_mismatch
@@ -505,6 +510,10 @@ linnea_config_validate:
 .tls_mismatch:
     lea rdi, [msg_tls_mismatch]
     mov esi, msg_tls_mismatch_len
+    jmp linnea_error_exit
+.v6only_conflict:
+    lea rdi, [msg_v6only_conflict]
+    mov esi, msg_v6only_conflict_len
     jmp linnea_error_exit
 
 ; linnea_config_dump(rdi=config*) — human-readable dump to stdout:

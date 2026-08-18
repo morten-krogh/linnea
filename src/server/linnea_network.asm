@@ -20,6 +20,7 @@ global linnea_network_peer_addr
 global linnea_network_parse_ipv4
 global linnea_network_parse_ipv6
 global linnea_network_fill_sockaddr6
+global linnea_network_endpoint_cmp
 global linnea_network_quic_listener
 
 extern linnea_error_server
@@ -122,16 +123,18 @@ linnea_network_listen_all:
     jae .no_share
     imul r15, r13, linnea_config_server_size
     lea r15, [rbx + r15 + linnea_config.servers]   ; server j
-    mov ax, [r14 + linnea_config_server.port]
-    cmp ax, [r15 + linnea_config_server.port]
+    ; Two servers share a listener when their EFFECTIVE endpoint matches --
+    ; the canonical sockaddr fill_sockaddr6 builds, not the host TEXT -- so
+    ; "::" and "0.0.0.0" (both in6addr_any) and equivalent IPv6 spellings are
+    ; one SO_REUSEPORT listener rather than several that split a hostname
+    ; across vhost tables. v6only is part of that identity; a disagreement was
+    ; rejected at config validation, so anything but an exact share (1) here
+    ; simply falls through to binding a fresh socket.
+    mov rdi, r14
+    mov rsi, r15
+    call linnea_network_endpoint_cmp
+    cmp eax, 1
     jne .next_prior
-    lea rdi, [r14 + linnea_config_server.host]
-    mov rsi, [r14 + linnea_config_server.host_len]
-    lea rdx, [r15 + linnea_config_server.host]
-    mov rcx, [r15 + linnea_config_server.host_len]
-    call linnea_string_equal
-    test eax, eax
-    jz .next_prior
     mov eax, [r15 + linnea_config_server.listen_fd]
     mov [r14 + linnea_config_server.listen_fd], eax
     mov dword [r14 + linnea_config_server.listener_owner], 0
@@ -943,6 +946,67 @@ linnea_network_fill_sockaddr6:
     ret
 .bad:
     mov rax, -1
+    pop rbx
+    ret
+
+; linnea_network_endpoint_cmp(rdi=serverA*, rsi=serverB*) -> rax:
+;   0  different effective endpoints (address or port differ)
+;   1  same endpoint AND same v6only -> the two share one listener
+;   2  same endpoint but v6only differs -> a conflict the caller must reject
+; The comparison is on the canonical sockaddr_in6 that fill_sockaddr6 derives,
+; NOT on the configured host text, so "::" and "0.0.0.0" (both the unspecified
+; address) and equivalent IPv6 spellings resolve to one endpoint. The port is
+; carried in the sockaddr, so one set of compares settles address and port
+; together. This is the single definition of listener identity; both the
+; listener-sharing scan and config validation call it, so they cannot disagree
+; about which servers share a socket.
+linnea_network_endpoint_cmp:
+    push rbx
+    push r12
+    sub rsp, 72                        ; two sockaddr_in6 buffers, 16-aligned
+    mov rbx, rdi                       ; server A
+    mov r12, rsi                       ; server B
+    mov rdi, rbx
+    lea rsi, [rsp]                     ; canon(A) -> [rsp .. rsp+27]
+    call linnea_network_fill_sockaddr6
+    cmp rax, -1
+    je .ec_diff                        ; no valid literal (already rejected at
+                                       ; validate): treat as different
+    mov rdi, r12
+    lea rsi, [rsp + 32]                ; canon(B) -> [rsp+32 .. +59]
+    call linnea_network_fill_sockaddr6
+    cmp rax, -1
+    je .ec_diff
+    ; compare the 28 canonical bytes: family+port+flowinfo (qword 0),
+    ; addr[0..7] (qword 8), addr[8..15] (qword 16), scope_id (dword 24).
+    ; family is always AF_INET6 and flowinfo/scope_id are always zero, so only
+    ; the port and the 16 address bytes actually distinguish two endpoints.
+    mov rax, [rsp]
+    cmp rax, [rsp + 32]
+    jne .ec_diff
+    mov rax, [rsp + 8]
+    cmp rax, [rsp + 40]
+    jne .ec_diff
+    mov rax, [rsp + 16]
+    cmp rax, [rsp + 48]
+    jne .ec_diff
+    mov eax, [rsp + 24]
+    cmp eax, [rsp + 56]
+    jne .ec_diff
+    ; same endpoint; now the v6only socket option must also agree to share
+    mov rax, [rbx + linnea_config_server.v6only]
+    cmp rax, [r12 + linnea_config_server.v6only]
+    jne .ec_conflict
+    mov eax, 1
+    jmp .ec_out
+.ec_conflict:
+    mov eax, 2
+    jmp .ec_out
+.ec_diff:
+    xor eax, eax
+.ec_out:
+    add rsp, 72
+    pop r12
     pop rbx
     ret
 

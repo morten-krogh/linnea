@@ -157,6 +157,12 @@ just that address (IPv6 only); and `"v6only": true` makes a `"::"` listener
 IPv6-only. Several servers may share one `host`/`port` pair and be told apart by
 `hostname` (SNI on TLS, the `Host` header on plaintext).
 
+Servers share a listener by their **effective endpoint**, not the host text:
+`"::"` and `"0.0.0.0"` (both `in6addr_any`), and equivalent IPv6 spellings,
+name one listener with one vhost table — not two that would split a hostname
+between them. Two servers on one effective `address`/`port` must agree on
+`v6only`, or the config is rejected.
+
 | Key | Type | Default | Limit | What it does |
 |---|---|---|---|---|
 | `host` | string | — **required** | ≤ 63 | Bind address: **an IPv4 or IPv6 literal**. `"0.0.0.0"` and `"::"` are the dual-stack wildcard; a specific IPv4 (`"192.0.2.1"`) or IPv6 (`"2001:db8::1"`, `"::1"`) binds that one address. Names are not resolved — `"localhost"` is refused, and a zone id (`"fe80::1%eth0"`) is not accepted. |

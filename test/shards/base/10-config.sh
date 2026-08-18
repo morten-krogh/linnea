@@ -97,3 +97,12 @@ run_test "tls cert without key" 1 stderr "server needs both cert and key, or nei
 run_test "tls listener mismatch" 1 stderr "servers sharing a listener must all set TLS or none" \
     $BIN --config $CFG/bad-tls-mismatch.json
 
+# Listener identity is the CANONICAL endpoint, not the host text (audit-report-2
+# Finding 1). "::" and "0.0.0.0" are one in6addr_any endpoint, so the same
+# hostname on both is a duplicate on the shared listener...
+run_test "wildcard alias duplicate hostname" 1 stderr "duplicate hostname same.test" \
+    $BIN --config $CFG/wildcard-dup-hostname.json
+# ...and one endpoint cannot carry two different v6only settings
+run_test "v6only conflict" 1 stderr "servers on one address and port must agree on v6only" \
+    $BIN --config $CFG/bad-v6only-conflict.json
+
