@@ -54,6 +54,7 @@ extern linnea_upstream_count
 extern linnea_upstream_limit
 extern linnea_config_instance
 extern linnea_string_from_u64
+extern linnea_string_to_u64
 extern linnea_string_iequal
 extern linnea_spill_open
 extern linnea_spill_write
@@ -616,9 +617,14 @@ linnea_h3_proxy_head:
     jz .ph_close_delim
     mov rdi, rax
     mov rsi, rdx
-    call .ph_dec_u64                 ; -> rax = value, or -1
+    call linnea_string_to_u64        ; -> rax = value, edx = 0 ok / 1 / 2
+    test edx, edx
+    jnz .ph_bad
     cmp rax, -1
-    je .ph_bad
+    je .ph_bad                       ; body_rem's -1 means "until the upstream
+                                     ; closes"; a backend declaring exactly
+                                     ; 2^64-1 bytes would turn a counted body
+                                     ; into a close-delimited one
     mov [rbx + linnea_connection.body_rem], rax
     jmp .ph_nobody_chk
 .ph_close_delim:
@@ -835,33 +841,6 @@ linnea_h3_proxy_head:
     pop r13
     pop r12
     pop rbx
-    ret
-
-; .ph_dec_u64(rdi = digits, rsi = len) -> rax = value, or -1 when the text is
-; not a plain decimal number or would overflow.
-.ph_dec_u64:
-    xor eax, eax
-    test rsi, rsi
-    jz .du_bad
-    xor ecx, ecx
-.du_loop:
-    cmp rcx, rsi
-    jae .du_ret
-    movzx edx, byte [rdi + rcx]
-    sub edx, '0'
-    cmp edx, 9
-    ja .du_bad
-    mov r8, rax
-    shl rax, 3
-    lea rax, [rax + r8 * 2]          ; value * 10
-    jc .du_bad
-    add rax, rdx
-    jc .du_bad
-    inc rcx
-    jmp .du_loop
-.du_bad:
-    mov rax, -1
-.du_ret:
     ret
 
 ; linnea_h3_proxy_body(rdi = leg, rsi = bytes, rdx = count)

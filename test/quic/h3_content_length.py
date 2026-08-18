@@ -69,12 +69,19 @@ clock[0] = 0.4
 
 def post(declared, body):
     """POST /api/echo with content-length=declared and `body` bytes of DATA.
-    Returns the :status string, or 'RESET' if the stream was reset."""
+
+    `declared` is one value, a list of them for a repeated field, or None to
+    omit the field. Returns the :status string, or 'RESET' if the stream was
+    reset."""
     enc = pylsqpack.Encoder()
     enc.apply_settings(max_table_capacity=0, blocked_streams=0)
+    if declared is None:
+        declared = []
+    elif not isinstance(declared, (list, tuple)):
+        declared = [declared]
     _, fields = enc.encode(0, [(b":method", b"POST"), (b":path", b"/api/echo"),
-                               (b":scheme", b"https"), (b":authority", b"localhost"),
-                               (b"content-length", str(declared).encode())])
+                               (b":scheme", b"https"), (b":authority", b"localhost")]
+                              + [(b"content-length", str(d).encode()) for d in declared])
     data = vlq(0) + vlq(len(body)) + body
     stream = vlq(1) + vlq(len(fields)) + fields + data
     bidi = conn.get_next_available_stream_id()
@@ -125,5 +132,60 @@ if st == "200":
 st = post(5, b"a" * 10)
 if st == "200":
     print(f"content-length:5 with 10 DATA bytes was served (200) -- not reconciled")
+    sys.exit(1)
+
+# --- audit-report-5 Finding 1 -------------------------------------------------
+#
+# The reconciliation above only works if the DECLARATION was parsed. This loop
+# re-parsed the digits with no overflow check whatever, on the theory (written
+# into its own comment) that an absurd length "simply will not equal" the DATA
+# sum. That is exactly backwards: 2^64 wraps to zero, and zero is the DATA sum
+# of a request that sends no body at all, so the one value the comment named as
+# harmless was the one that matched. The request was served, and on this proxy
+# location it reached the backend as a normal empty POST.
+#
+# 18446744073709551615 is the other boundary: a legal content-length that a
+# parser reporting failure as -1 cannot tell from a fault. It must be refused
+# here for disagreeing with the 5 bytes sent, not accepted as "no length given".
+for name, declared, body in [
+        ("2^64 with no DATA", 18446744073709551616, b""),
+        ("2^64 + 5 with 5 DATA bytes", 18446744073709551621, b"a" * 5),
+        ("2^64 + 1 with no DATA", 18446744073709551617, b""),
+        ("forty digits with no DATA", "1" * 40, b""),
+        ("10^20 with no DATA", 10 ** 20, b""),
+        ("UINT64_MAX with 5 DATA bytes", 18446744073709551615, b"a" * 5)]:
+    st = post(declared, body)
+    if st == "200":
+        print(f"content-length {name} was served (200) -- the value was not "
+              f"range-checked before it was compared with the DATA sum")
+        sys.exit(1)
+
+# Two content-lengths cannot both equal the body. The shared collector kept the
+# LAST one and dropped the earlier without comparing, so "0 then 1" resolved
+# the client's own contradiction in its favour; HTTP/1 has refused a repeat
+# since it was written. Both orders, and the identical pair.
+for name, declared, body in [
+        ("0 then 1", ["0", "1"], b"a"),
+        ("1 then 0", ["1", "0"], b"a"),
+        ("5 then 5 (identical)", ["5", "5"], b"a" * 5)]:
+    st = post(declared, body)
+    if st == "200":
+        print(f"a repeated content-length ({name}) was served (200) -- one of "
+              f"the two declarations was silently dropped")
+        sys.exit(1)
+
+# A present-but-empty content-length is not a number either.
+if post("", b"") == "200":
+    print("an empty content-length was served (200)")
+    sys.exit(1)
+
+# Controls, so none of the above can pass on a server that refuses everything.
+st = post(5, b"a" * 5)
+if st != "200":
+    print(f"control: one honest content-length with a matching body was not 200: {st}")
+    sys.exit(1)
+st = post(None, b"a" * 5)
+if st != "200":
+    print(f"control: a body with no content-length at all was not 200: {st}")
     sys.exit(1)
 print("OK")

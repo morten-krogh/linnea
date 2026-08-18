@@ -6,7 +6,14 @@
 # does not produce them, and the checks below only test for existence — so a tree
 # that has been cleaned reports a failure that looks like a real one, while a
 # STALE binary is worse: it passes, silently testing code that no longer exists.
-make -s bin/linnea-selftest bin/linnea-quictest bin/linnea-rtxtest bin/linnea-nettest >/dev/null 2>&1
+# Both had happened: linnea-qpacktest and linnea-h3test had stopped linking and
+# were skipping silently, and linnea-h3resp (used by the `quic` shard, which
+# always runs after this one) was passing on a binary from before its break.
+# Built here rather than in that shard because a `make` inside a concurrently
+# running job is the race run_shards.sh's own comment describes.
+make -s bin/linnea-selftest bin/linnea-quictest bin/linnea-rtxtest bin/linnea-nettest \
+     bin/linnea-strtest bin/linnea-qpacktest bin/linnea-h3test bin/linnea-h3resp \
+     >/dev/null 2>&1
 if [ -x ./bin/linnea-selftest ]; then
     if ./bin/linnea-selftest >$RUNDIR/linnea_selftest.out 2>&1; then
         check "crypto selftest ($(tr '\n' ' ' <$RUNDIR/linnea_selftest.out))" 0
@@ -184,6 +191,19 @@ if [ -x ./bin/linnea-nettest ]; then
     check "net: IPv6 literal parser known-answer vectors ($out)" $rc
 else
     check "net IPv6-parser selftest (skipped: binary unavailable)" 0
+fi
+
+# The one decimal parser every Content-Length goes through, on the boundaries
+# that five hand-rolled copies each got wrong somewhere else (audit-report-5
+# Finding 1): 2^64 must be OUT OF RANGE rather than wrapping to zero, 2^62*10
+# must be caught even though it wraps UPWARD, and 18446744073709551615 must
+# PARSE -- it is a legal Content-Length, not a way of saying "bad".
+if [ -x ./bin/linnea-strtest ]; then
+    out=$(./bin/linnea-strtest)
+    rc=$?
+    check "str: decimal parser boundary vectors ($out)" $rc
+else
+    check "str decimal-parser selftest (skipped: binary unavailable)" 0
 fi
 
 # QPACK decode: field sections encoded by pylsqpack (static + literals + Huffman,

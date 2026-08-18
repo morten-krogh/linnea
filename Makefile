@@ -128,6 +128,21 @@ $(NETTEST_BIN): $(NETTEST_OBJS)
 nettest: $(NETTEST_BIN)
 	./$(NETTEST_BIN)
 
+# --- decimal-parser known-answer tests (own _start; linnea_string_to_u64) ---
+# The one parser every Content-Length now goes through, so the boundary it gets
+# wrong is the boundary every protocol gets wrong (audit-report-5 Finding 1).
+STRTEST_BIN  = bin/linnea-strtest
+STRTEST_OBJS = test/str/linnea_strtest.o src/lib/linnea_string.o src/lib/linnea_print.o
+
+test/str/linnea_strtest.o: test/str/linnea_strtest.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(STRTEST_BIN): $(STRTEST_OBJS)
+	$(LD) -o $@ $^
+
+strtest: $(STRTEST_BIN)
+	./$(STRTEST_BIN)
+
 # --- test-only standalone QUIC UDP receiver (own _start) ---
 QUICSRV_BIN  = bin/linnea-quicserver
 QUICSRV_OBJS = test/quic/linnea_quicserver.o src/lib/linnea_quic.o \
@@ -345,7 +360,10 @@ ringtest: $(RINGTEST_BIN)
 # --- test-only: QPACK decoder (reads a field section on stdin) ---
 QPACKTEST_BIN  = bin/linnea-qpacktest
 QPACKTEST_OBJS = test/quic/linnea_qpacktest.o src/server/linnea_qpack.o src/server/linnea_hpack.o \
-                 src/server/linnea_static.o src/lib/linnea_string.o src/server/linnea_time.o
+                 src/server/linnea_static.o src/lib/linnea_string.o src/server/linnea_time.o \
+                 src/server/linnea_network.o src/server/linnea_config.o \
+                 src/server/linnea_config_parse.o src/server/linnea_log.o \
+                 src/server/linnea_error.o src/lib/linnea_print.o
 
 test/quic/linnea_qpacktest.o: test/quic/linnea_qpacktest.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -363,7 +381,10 @@ H3TEST_OBJS = test/quic/linnea_h3test.o src/server/linnea_http3.o src/server/lin
               src/lib/linnea_x25519.o src/lib/linnea_fe25519.o src/server/linnea_static.o \
               src/lib/linnea_string.o src/server/linnea_time.o src/server/linnea_log.o \
               src/lib/linnea_print.o src/server/linnea_error.o src/server/linnea_config.o \
-              src/server/linnea_config_parse.o src/server/linnea_network.o $(QUICP256)
+              src/server/linnea_config_parse.o src/server/linnea_network.o \
+              src/server/linnea_quic_server.o src/server/linnea_quic_conn.o \
+              src/server/linnea_quic_rtx.o src/server/linnea_quic_debug.o \
+              src/server/linnea_ratelimit.o $(QUICP256)
 
 test/quic/linnea_h3test.o: test/quic/linnea_h3test.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -381,7 +402,10 @@ H3RESP_OBJS = test/quic/linnea_h3resp.o src/server/linnea_http3.o src/server/lin
               src/lib/linnea_x25519.o src/lib/linnea_fe25519.o src/server/linnea_static.o \
               src/lib/linnea_string.o src/server/linnea_time.o src/server/linnea_log.o \
               src/lib/linnea_print.o src/server/linnea_error.o src/server/linnea_config.o \
-              src/server/linnea_config_parse.o src/server/linnea_network.o $(QUICP256)
+              src/server/linnea_config_parse.o src/server/linnea_network.o \
+              src/server/linnea_quic_server.o src/server/linnea_quic_conn.o \
+              src/server/linnea_quic_rtx.o src/server/linnea_quic_debug.o \
+              src/server/linnea_ratelimit.o $(QUICP256)
 
 test/quic/linnea_h3resp.o: test/quic/linnea_h3resp.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -420,7 +444,7 @@ test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
       bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs $(QPACKTEST_BIN) \
       $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN) $(RTXTEST_BIN) $(REPLAYTEST_BIN) \
-      $(RINGTEST_BIN) $(WS_BIN)
+      $(RINGTEST_BIN) $(WS_BIN) $(NETTEST_BIN) $(STRTEST_BIN)
 	./test/run_tests.sh
 
 # Install all four products to /usr/local/bin: bin_t under SELinux, so systemd

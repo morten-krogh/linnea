@@ -52,6 +52,7 @@ extern linnea_time_parse_http_date
 extern linnea_time_http_now
 extern linnea_config_instance
 extern linnea_string_from_u64
+extern linnea_string_to_u64
 extern linnea_string_iequal
 extern linnea_string_equal
 extern linnea_string_is_token
@@ -632,9 +633,9 @@ linnea_h2_handle:
     ; ...and what arrived must be what was declared, when a length was given.
     ; This path measures the body and forwards its own count, so a mismatch used
     ; to be silently rewritten rather than refused.
+    test qword [rdi + linnea_h2p.flags], LINNEA_H2P_F_HAS_CL
+    jz .fd_finalize                  ; no content-length: nothing to reconcile
     mov r8, [rdi + linnea_h2p.rq_declared]
-    cmp r8, -1
-    je .fd_finalize                  ; no content-length: nothing to reconcile
     cmp r8, [rdi + linnea_h2p.len]
     jne .fd_short
 .fd_finalize:
@@ -971,8 +972,8 @@ linnea_h2_handle:
 %define L_OUT    linnea_h2_req_size + 24
 %define L_BIG    linnea_h2_req_size + 32
 %define L_ASM    linnea_h2_req_size + 40
-%if L_ASM + 8 > 392
-  %error "h2_build_request stack frame (sub rsp,392) too small for req + locals"
+%if L_ASM + 8 > 408
+  %error "h2_build_request stack frame (sub rsp,408) too small for req + locals"
 %endif
 h2_build_request:
     push rbx
@@ -981,11 +982,13 @@ h2_build_request:
     push r14
     push r15
     push rbp
-    ; 392, not a round 384: six pushes leave rsp 8 past a 16-byte boundary, so an
+    ; 408, not a round 400: six pushes leave rsp 8 past a 16-byte boundary, so an
     ; even frame would hand every callee a misaligned stack. Nothing under here
     ; uses an aligned SSE load today, so this was a trap rather than a crash — but
     ; it is one movaps away from being a crash, and the AES paths are close by.
-    sub rsp, 392
+    ; It grew from 392 when the request struct took a .cl_val; the %error above
+    ; is what says so, rather than a local being silently overwritten.
+    sub rsp, 408
     mov rbx, rdi                     ; conn
     mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
@@ -1315,9 +1318,9 @@ h2_build_request:
     ; nothing to reconcile. Every body collects now, and without this a short
     ; body followed by trailers would be forwarded with our own measured count
     ; quietly substituted for the count the client declared.
+    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_HAS_CL
+    jz .trailer_fin                  ; no content-length: nothing to reconcile
     mov rdx, [rax + linnea_h2p.rq_declared]
-    cmp rdx, -1
-    je .trailer_fin                  ; no content-length: nothing to reconcile
     cmp rdx, [rax + linnea_h2p.len]
     je .trailer_fin
     mov qword [rax + linnea_h2p.state], LINNEA_H2P_FAILED
@@ -1408,7 +1411,7 @@ h2_build_request:
     mov dword [h2_goaway_code], LINNEA_H2_COMPRESSION_ERR
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
-    add rsp, 392
+    add rsp, 408
     pop rbp
     pop r15
     pop r14
@@ -2171,13 +2174,16 @@ h2_serve:
     ; client's contradiction with our own framing so the backend heard a request
     ; the client never sent. Fail the stream 400 instead, like .proxy_toolarge:
     ; the slot opens no socket, so the backend hears nothing of it.
-    mov rdi, [r12 + linnea_h2_req.cl_ptr]
-    test rdi, rdi
-    jz .proxy_nobody                 ; no content-length: an ordinary bodiless request
-    mov rsi, [r12 + linnea_h2_req.cl_len]
-    call h2p_dec_u64                 ; rax = value, or -1 (unparseable)
-    test rax, rax
-    jz .proxy_nobody                 ; content-length: 0 -- consistent with no body
+    cmp qword [r12 + linnea_h2_req.cl_ptr], 0
+    je .proxy_nobody                 ; no content-length: an ordinary bodiless request
+    ; .cl_val was parsed and range-checked while the field section decoded
+    ; (audit-report-5 Finding 1). Re-parsing it here is what let 2^64 through:
+    ; the old parser guarded the multiply by asking whether the product had got
+    ; SMALLER and never looked at the digit's carry, so the last digit of
+    ; 18446744073709551616 wrapped the value to zero -- and zero is what this
+    ; very test accepts as "no body announced".
+    cmp qword [r12 + linnea_h2_req.cl_val], 0
+    je .proxy_nobody                 ; content-length: 0 -- consistent with no body
     mov qword [r13 + linnea_h2p.state], LINNEA_H2P_FAILED
     mov qword [r13 + linnea_h2p.status], 400
     jmp .proxy_done
@@ -2187,14 +2193,17 @@ h2_serve:
     ; bounded by the flow-control window rather than by our buffer. Without
     ; a length there is nothing to declare upstream, so those (rare) bodies
     ; are still collected and measured first.
-    mov rdi, [r12 + linnea_h2_req.cl_ptr]
-    test rdi, rdi
-    jz .proxy_expect_100             ; no length: collect (100-continue below)
-    mov rsi, [r12 + linnea_h2_req.cl_len]
-    call h2p_dec_u64                 ; -> rax = the value, or -1
-    cmp rax, -1
-    je .proxy_expect_100             ; unparseable: collect and re-derive
+    cmp qword [r12 + linnea_h2_req.cl_ptr], 0
+    je .proxy_expect_100             ; no length: collect (100-continue below)
+    mov rax, [r12 + linnea_h2_req.cl_val]     ; checked at decode: see above
     mov [r13 + linnea_h2p.rq_declared], rax   ; judged at END_STREAM (8.1.1)
+    or qword [r13 + linnea_h2p.flags], LINNEA_H2P_F_HAS_CL
+    ; rq_declared's -1 means "none was declared", which 18446744073709551615
+    ; also is -- and a client may legally declare it. The old parser reported
+    ; its own faults as -1 too, so a body declaring UINT64_MAX took the
+    ; "unparseable, collect and re-derive" branch and was forwarded with OUR
+    ; measured count in place of the client's: the exact rewrite the
+    ; reconciliation exists to stop. The flag says which of the two it is.
     ; ...and refused here if it is larger than we accept. max_body bounds a
     ; request body on h1, which refuses on the DECLARED length for the same
     ; reason: the point of the cap is that the bytes never land. h2 never
@@ -3990,9 +3999,9 @@ h2p_head_validate:
     sub rcx, r14                      ; value length
     lea rdi, [r12 + r14]
     mov rsi, rcx
-    call h2p_dec_u64                  ; -> rax = value, or -1 if not all digits
-    cmp rax, -1
-    je .hv_bad                        ; a malformed Content-Length
+    call linnea_string_to_u64         ; -> rax = value, edx = 0 ok / 1 / 2
+    test edx, edx
+    jnz .hv_bad                       ; a malformed or unrepresentable length
     cmp qword [rsp], 0
     je .hv_cl_first
     cmp rax, [rsp + 8]
@@ -4147,9 +4156,14 @@ h2p_parse_head:
     jz .ph_close_delim
     mov rdi, rax
     mov rsi, rdx
-    call h2p_dec_u64                 ; -> rax = value, or -1
+    call linnea_string_to_u64        ; -> rax = value, edx = 0 ok / 1 / 2
+    test edx, edx
+    jnz .ph_bad
     cmp rax, -1
-    je .ph_bad
+    je .ph_bad                       ; body_rem's -1 means "until the upstream
+                                     ; closes"; a backend declaring exactly
+                                     ; 2^64-1 bytes would turn a counted body
+                                     ; into a close-delimited one
     mov [rbx + linnea_h2p.body_rem], rax
     jmp .ph_bodyflag
 .ph_close_delim:
@@ -4515,33 +4529,6 @@ h2p_val_has:
     pop r13
     pop r12
     pop rbx
-    ret
-
-; h2p_dec_u64(rdi = ptr, rsi = len) -> rax = value, or -1 when not all digits
-; (or absurdly long: a Content-Length we cannot honour is a bad gateway).
-h2p_dec_u64:
-    xor eax, eax
-    xor ecx, ecx
-    test rsi, rsi
-    jz .du_bad
-.du_loop:
-    cmp rcx, rsi
-    jae .du_ret
-    movzx edx, byte [rdi + rcx]
-    sub edx, '0'
-    cmp edx, 9
-    ja .du_bad
-    mov r8, rax
-    imul rax, rax, 10
-    cmp rax, r8                      ; overflow guard (cheap monotonicity)
-    jb .du_bad
-    add rax, rdx
-    inc rcx
-    jmp .du_loop
-.du_ret:
-    ret
-.du_bad:
-    mov rax, -1
     ret
 
 ; h2p_emit_headers(rdi = out, rsi = slot*, rdx = conn) -> rax = bytes written.

@@ -37,6 +37,7 @@ global emit_field
 global linnea_hpack_req_check
 global hpack_dyn_reset
 
+extern linnea_string_to_u64
 extern linnea_string_is_token
 extern linnea_string_iequal
 
@@ -639,9 +640,52 @@ emit_field:
     pop rdi
     pop rsi
     jne .rebuild
+    ; Content-Length is not rebuilt as a line -- the proxy head declares the
+    ; body we actually collected -- but its VALUE is the message's own framing,
+    ; and this is the one place h2 and h3 both hand it over. So it is checked
+    ; here, once, instead of at each protocol's reconciliation (audit-report-5
+    ; Finding 1): h2 parsed it with a broken overflow guard and h3 with none at
+    ; all, so "18446744073709551616" wrapped to zero on both and an empty POST
+    ; declaring 2^64 bytes was served -- and proxied -- as a well-formed one.
+    ; A non-digit, an empty value, or a number past 2^64-1 is a malformed
+    ; message (RFC 9110 8.6): .ef_malformed fails the STREAM, which is what
+    ; RFC 9113 8.1.1 and RFC 9114 4.1.2 ask for, and leaves the connection and
+    ; the compression context alone.
+    ;
+    ; This runs inside the rebuild block, so it needs .hb_start set -- which the
+    ; h2 and h3 request paths both do unconditionally, for every request and not
+    ; only a proxied one (linnea_http2.asm arms it beside the scratch region,
+    ; linnea_quic_server.asm beside h3_hdrs_buf). .cl_ptr has always been
+    ; collected under exactly that condition; the check simply joins it.
+    push rax                          ; the name and its length: .no_rebuild
+    push rdx                          ; below still matches pseudo-headers on
+    push rsi                          ; them, in rax/rdx, the way name_eq wants
+    push rdi
+    mov rax, rdi                      ; value length
+    mov rdi, rsi                      ; value pointer
+    mov rsi, rax
+    call linnea_string_to_u64         ; -> rax = value, edx = 0 ok / 1 / 2
+    test edx, edx
+    jnz .rb_cl_bad                    ; empty, not a number, or past 2^64-1
+    cmp qword [rbx + linnea_h2_req.cl_ptr], 0
+    jne .rb_cl_bad                    ; a SECOND content-length. Keeping the
+                                      ; last silently resolved "0 then 1" in
+                                      ; the client's favour and dropped the
+                                      ; contradiction; h1 has refused a repeat
+                                      ; since it was written, and two lengths
+                                      ; cannot both equal the body whether or
+                                      ; not they agree with each other
+    mov [rbx + linnea_h2_req.cl_val], rax
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rax
     mov [rbx + linnea_h2_req.cl_ptr], rsi    ; kept: the proxy path forwards
     mov [rbx + linnea_h2_req.cl_len], rdi    ; it and streams the body
     jmp .no_rebuild
+.rb_cl_bad:
+    add rsp, 32                       ; the four saved above; emit_field itself
+    jmp .ef_malformed                 ; keeps nothing on the stack
 .rb_chk_pconn:
     lea r9, [hdr_pconn]
     jmp .rb_probe

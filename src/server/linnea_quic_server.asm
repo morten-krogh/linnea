@@ -3791,31 +3791,23 @@ linnea_quic_server_datagram:
     ; content-length must equal the sum of the DATA payloads (Finding 18, RFC 9114
     ; 4.1.3). h2 reconciles this at END_STREAM; h3 did not, so a short or long body
     ; was routed and proxied around the client's declared framing rather than
-    ; rejected. r9 is the actual body length; cl_ptr/cl_len is what the client
-    ; declared (populated by the shared proxy rebuild, for static and proxy alike).
-    ; A mismatch or a non-decimal value is a malformed message -> H3_MESSAGE_ERROR.
-    ; rax/rcx/rdx are scratch here (the rate-limit save below re-establishes them);
-    ; r8/r9 (the body) are untouched.
-    mov rdi, [req + linnea_h2_req.cl_ptr]
-    test rdi, rdi
-    jz .cl_reconciled                  ; no content-length declared: nothing to check
-    mov rsi, [req + linnea_h2_req.cl_len]
-    test rsi, rsi
-    jz .req_message_error              ; a present-but-empty content-length is malformed
-    xor eax, eax
-    xor ecx, ecx
-.cl_digit:
-    cmp rcx, rsi
-    jae .cl_check
-    movzx edx, byte [rdi + rcx]
-    sub edx, '0'
-    cmp edx, 9
-    ja .req_message_error              ; a non-digit content-length is malformed
-    imul rax, rax, 10                  ; an absurd (overflowing) length simply will
-    add rax, rdx                       ; not equal r9, so it lands as a mismatch
-    inc rcx
-    jmp .cl_digit
-.cl_check:
+    ; rejected. r9 is the actual body length; cl_val is what the client declared,
+    ; already parsed and range-checked by linnea_string_to_u64 as the field
+    ; section decoded (cl_ptr nonzero means one was declared, for static and
+    ; proxy alike). An empty, non-decimal, out-of-range or repeated
+    ; content-length never reaches here: emit_field marked the request malformed
+    ; and .parse_done answered it. So all that is left is the comparison.
+    ;
+    ; This used to re-parse the digits with no overflow check at all, on the
+    ; theory in its own comment that "an absurd length simply will not equal r9"
+    ; -- which is exactly backwards (audit-report-5 Finding 1). 2^64 wraps to
+    ; zero, and zero is precisely the DATA sum of a request that sends no body,
+    ; so the one value the theory named as harmless was the one that matched.
+    ; rax is scratch here (the rate-limit save below re-establishes it); r8/r9
+    ; (the body) are untouched.
+    cmp qword [req + linnea_h2_req.cl_ptr], 0
+    je .cl_reconciled                  ; no content-length declared: nothing to check
+    mov rax, [req + linnea_h2_req.cl_val]
     cmp rax, r9
     jne .req_message_error             ; declared length != DATA sum
 .cl_reconciled:

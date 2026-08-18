@@ -100,6 +100,7 @@ LINNEA_HTTP_PATH_BUF    equ 2560
 extern linnea_config_instance
 extern linnea_config_match_location
 extern linnea_string_from_u64
+extern linnea_string_to_u64
 extern linnea_string_from_hex_u64
 extern linnea_string_equal
 extern linnea_string_is_token
@@ -1402,34 +1403,25 @@ linnea_http_handle:
     test qword [rsp + 136], 1
     jnz .resp_400              ; duplicate Content-Length
     or qword [rsp + 136], 1
-    mov rsi, [rsp + 72]        ; value must be all digits
-    mov rcx, [rsp + 80]
-    test rcx, rcx
-    jz .resp_400
     ; The guard here is against OVERFLOW, not against size. It used to stop at
     ; 1 << 32, which made 4 GiB a hard ceiling on h1 no matter what max_body
     ; said — a 6 GiB upload was refused instantly with 413 while the same body
-    ; went through h2 at full speed, because h2's parser guards the multiply
+    ; went through h2 at full speed, because h2's parser guarded the multiply
     ; instead of capping the value. What may be accepted is max_body's decision
     ; and is made below; all this has to do is not wrap.
-    mov r9, 1844674407370955161      ; (2^64-1)/10
-    xor eax, eax
-    xor edx, edx
-.cl_digits:
-    cmp rdx, rcx
-    jae .cl_done
-    movzx r8d, byte [rsi + rdx]
-    sub r8d, '0'
-    cmp r8d, 9
-    ja .resp_400
-    cmp rax, r9                      ; would the multiply wrap?
-    ja .resp_413
-    imul rax, rax, 10
-    add rax, r8
-    jc .resp_413                     ; ...and the digit can still carry
-    inc rdx
-    jmp .cl_digits
-.cl_done:
+    ;
+    ; This was one of only two of the five hand-rolled decimal parsers here
+    ; that got the bound right, and it is now the shared one they all call
+    ; (audit-report-5 Finding 1). h1 keeps its own split of the verdict: "not a
+    ; number" is a bad request, "more than 2^64-1" is a body we could never
+    ; accept whatever max_body says, which is what 413 means.
+    mov rdi, [rsp + 72]        ; value must be all digits
+    mov rsi, [rsp + 80]
+    call linnea_string_to_u64  ; -> rax = value, edx = 0 ok / 1 syntax / 2 range
+    cmp edx, 1
+    je .resp_400
+    cmp edx, 2
+    je .resp_413
     mov [rsp + 128], rax
     jmp .header_next
 .te_header:
@@ -3526,28 +3518,43 @@ linnea_http_proxy_head:
     inc rcx
     jmp .cl_ows
 .cl_digits:
-    xor r8d, r8d               ; value
-    xor r9d, r9d               ; digit count
-.cl_loop:
+    mov r8, rcx                ; first byte of the value, past the leading OWS
+.cl_scan:
     cmp rcx, rdx
-    jae .cl_done
+    jae .cl_parse
     movzx eax, byte [r14 + rcx]
     cmp al, ' '
-    je .cl_trail
+    je .cl_parse
     cmp al, 9
-    je .cl_trail
-    sub eax, '0'
-    cmp eax, 9
-    ja .bad
-    mov r10, 1844674407370955161     ; (2^64-1)/10: guard the wrap, not the size
-    cmp r8, r10
-    ja .bad
-    imul r8, r8, 10
-    add r8, rax
-    jc .bad
-    inc r9d
+    je .cl_parse
     inc rcx
-    jmp .cl_loop
+    jmp .cl_scan
+.cl_parse:
+    ; [r8, rcx) is the value with its optional surrounding whitespace trimmed.
+    ; The shared parser (audit-report-5 Finding 1) refuses an empty run, a byte
+    ; that is not a digit, and a number past 2^64-1 -- all of them a bad gateway
+    ; here, so the verdict it splits does not need splitting again. This loop
+    ; had the bound right; it is converted anyway, because the point of the
+    ; finding is that five copies of six instructions drifted apart and three
+    ; ended up wrong. rcx and rdx are the line cursor and its end and the parser
+    ; uses both, so they ride the stack across the call.
+    push rcx
+    push rdx
+    lea rdi, [r14 + r8]
+    mov rsi, rcx
+    sub rsi, r8
+    call linnea_string_to_u64
+    mov r9d, edx               ; the verdict, BEFORE the pop puts the line end
+    pop rdx                    ; back into rdx and takes edx with it
+    pop rcx
+    test r9d, r9d
+    jnz .bad
+    cmp rax, -1
+    je .bad                    ; body_rem's -1 means "read until the upstream
+                               ; closes"; a backend declaring exactly 2^64-1
+                               ; bytes would turn a counted body into a
+                               ; close-delimited one, as h2 and h3 also refuse
+    mov [rsp + 8], rax
 .cl_trail:
     ; only trailing whitespace may follow the digits: a value like
     ; "12 34" would frame the body as 12 while the client reads the
@@ -3562,10 +3569,7 @@ linnea_http_proxy_head:
 .cl_trail_next:
     inc rcx
     jmp .cl_trail
-.cl_done:
-    test r9d, r9d
-    jz .bad                    ; empty value
-    mov [rsp + 8], r8
+.cl_done:                      ; the value is already parsed and stored
 .copy_line:
     mov rcx, [rsp + 24]
     mov rdx, [rsp + 32]

@@ -283,6 +283,12 @@ LINNEA_H2P_F_DEC_ERR   equ 32768   ; the response body decode hit malformed fram
 LINNEA_H2P_F_HEAD_INTERIM equ 65536 ; the parsed head is a 1xx informational
                                     ; response (RFC 9113 8.8.5): relay it without
                                     ; END_STREAM and keep reading for the final head
+; The client declared a Content-Length, so .rq_declared is a length and not the
+; "none given" sentinel (audit-report-5 Finding 1). Needed because -1 is BOTH
+; that sentinel and a legal declaration of 18446744073709551615 bytes, which
+; would otherwise skip the RFC 9113 8.1.1 reconciliation entirely and let the
+; measured body be forwarded under the client's own contradicted framing.
+LINNEA_H2P_F_HAS_CL    equ 131072
 
 struc linnea_h2p
     .state:     resq 1

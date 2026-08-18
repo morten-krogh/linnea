@@ -7,6 +7,7 @@ global linnea_string_equal
 global linnea_string_iequal
 global linnea_string_copy
 global linnea_string_from_u64
+global linnea_string_to_u64
 global linnea_string_from_hex_u64
 global linnea_string_is_token
 global linnea_u64_add_within
@@ -173,6 +174,68 @@ linnea_string_from_hex_u64:
     mov rdi, rsi               ; dst = start of buf
     mov rsi, r9                ; src = first digit
     rep movsb
+    ret
+
+; linnea_string_to_u64(rdi = ptr, rsi = len) -> rax = value, edx = verdict:
+;   edx = 0  every byte is a digit and the number fits in 64 bits; rax is it
+;   edx = 1  the text is empty, or carries a byte that is not an ASCII digit
+;   edx = 2  the text is all digits, but the number is past 2^64-1
+; rax is 0 for either fault, so a caller that ignores edx cannot use a partial
+; value. Touches rax, rcx, rdx, r8 and r9 only.
+;
+; The one decimal parser for a Content-Length arriving on ANY protocol
+; (audit-report-5 Finding 1). There were five hand-rolled copies -- HTTP/1's
+; request and response heads, HTTP/2's, HTTP/3's request, HTTP/3's proxy
+; response -- and three were wrong, each differently:
+;
+;   * The bound belongs BEFORE the multiply. "value*10 came out SMALLER, so it
+;     wrapped" is not an overflow test — (2^61+1)*10 wraps to 2^62+10, which is
+;     larger. HTTP/2's parser tested exactly that and had no carry check on the
+;     digit at all, so 18446744073709551616 parsed as 0: a POST declaring 2^64
+;     bytes and sending none was a well-formed empty request, and reached the
+;     proxy backend as one. HTTP/3 re-parsed the field with no check whatever.
+;   * HTTP/3's proxy tested `jc` after an `lea` — which sets no flags at all, so
+;     the carry it read was the one the preceding `shl rax, 3` left, i.e. bit 61
+;     of the value and nothing about the *2 or the add.
+;   * The verdict must come back APART from the value: 18446744073709551615 is
+;     a legal Content-Length, and a parser that says "bad" by returning -1
+;     cannot tell it from a fault. HTTP/2 could not, and treated a body
+;     declaring UINT64_MAX as having no usable length -- it collected the body
+;     and forwarded its own count, which is the very substitution the
+;     reconciliation exists to prevent.
+;
+; Splitting a range fault from a syntax fault is what lets HTTP/1 keep
+; answering 413 for "more than we could ever accept" and 400 for "not a number".
+linnea_string_to_u64:
+    xor eax, eax
+    xor ecx, ecx
+    test rsi, rsi
+    jz .tu_syntax                    ; an empty value is not a number
+    mov r9, 1844674407370955161      ; (2^64-1)/10
+.tu_digit:
+    cmp rcx, rsi
+    jae .tu_ok
+    movzx r8d, byte [rdi + rcx]
+    sub r8d, '0'
+    cmp r8d, 9
+    ja .tu_syntax
+    cmp rax, r9                      ; would the multiply wrap?
+    ja .tu_range
+    imul rax, rax, 10
+    add rax, r8                      ; ...and the digit can still carry
+    jc .tu_range
+    inc rcx
+    jmp .tu_digit
+.tu_ok:
+    xor edx, edx
+    ret
+.tu_syntax:
+    xor eax, eax
+    mov edx, 1
+    ret
+.tu_range:
+    xor eax, eax
+    mov edx, 2
     ret
 
 ; linnea_string_from_u64(rdi=value, rsi=buf) -> rax=len

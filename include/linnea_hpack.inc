@@ -113,6 +113,13 @@ struc linnea_h2_req
     .hb_cur:      resq 1
     .cl_ptr:      resq 1        ; content-length value, 0 if absent (the
     .cl_len:      resq 1        ; proxy path forwards it and streams the body)
+    ; ...and what those bytes mean, parsed ONCE by linnea_string_to_u64 while
+    ; the field section decodes (audit-report-5 Finding 1). Meaningful only when
+    ; .cl_ptr is nonzero: a value that is not a plain in-range decimal number,
+    ; or a SECOND content-length line, never gets here at all -- emit_field
+    ; marks the request .malformed instead, so h2 and h3 both fail the stream
+    ; before routing rather than each re-parsing the text their own way.
+    .cl_val:      resq 1
     ; Split cookie fields are accumulated rather than rebuilt one line each
     ; (RFC 9113 8.2.3, Finding 32): the joined "v1; v2; ..." value grows in the
     ; buffer .ck_buf points at (0 = not the proxy path, no accumulation) and
