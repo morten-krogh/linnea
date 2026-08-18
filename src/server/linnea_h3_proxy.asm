@@ -55,6 +55,7 @@ extern linnea_upstream_limit
 extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_to_u64
+extern linnea_http_upstream_head_valid
 extern linnea_string_iequal
 extern linnea_spill_open
 extern linnea_spill_write
@@ -571,6 +572,24 @@ linnea_h3_proxy_head:
     cmp rcx, LINNEA_H3_PROXY_RHEAD_MAX
     ja .ph_bad                       ; the same head h2 refuses to relay
     mov [rbx + linnea_connection.h3_hlen], rcx
+    ; ...and the same head h2 refuses to VALIDATE (audit-report-6 Finding 1).
+    ; Before this, h3 went straight from finding the CRLF CRLF to choosing a
+    ; body framing, so nothing ever checked the field section: a name with a
+    ; space and a NUL in a value were QPACK-encoded onto the wire for the
+    ; client, a colonless line was silently dropped, and two disagreeing
+    ; Content-Lengths became a clean 200 carrying the first one's worth of body
+    ; -- the contradiction erased rather than refused, because delivery
+    ; re-derives its own length from what it captured. It has to happen HERE,
+    ; ahead of the framing choice below, since the framing is picked from the
+    ; very fields being validated. rcx is the head length and r12 the buffer;
+    ; the validator preserves rbx/r12/r13 but not rcx, so the length is read
+    ; back from h3_hlen.
+    mov rdi, r12
+    mov rsi, rcx
+    call linnea_http_upstream_head_valid
+    test eax, eax
+    jz .ph_bad                       ; malformed upstream head: 502, not relayed
+    mov rcx, [rbx + linnea_connection.h3_hlen]
     ; --- body framing: Transfer-Encoding: chunked wins over Content-Length,
     ; and a response that carries no body at all overrides both.
     mov qword [rbx + linnea_connection.capture_chunked], 0
@@ -751,7 +770,23 @@ linnea_h3_proxy_head:
     lea rax, [rbx + rcx]
     mov rdx, rbp
     sub rdx, rcx
-    jmp .pf_ret
+    ; ...and trim the TRAILING OWS too. RFC 9112 5 puts OWS on both sides of a
+    ; field value; the leading half is skipped just above, and the trailing half
+    ; was not -- so "Content-Length:   5  " reached the number parser as "5  "
+    ; and h3 answered 502 to a response h1 and h2 both served. h2's own
+    ; h2p_head_find has trimmed both ends all along (.hf_trail); this is the
+    ; third copy of the same field-value lookup and the one that drifted.
+    ; No scratch register: the compare reads through rax/rdx directly.
+.pf_trail:
+    test rdx, rdx
+    jz .pf_ret
+    cmp byte [rax + rdx - 1], ' '
+    je .pf_untrim
+    cmp byte [rax + rdx - 1], 9      ; HTAB is OWS as well
+    jne .pf_ret
+.pf_untrim:
+    dec rdx
+    jmp .pf_trail
 .pf_next:
     lea r15, [rbp + 2]
     jmp .pf_line

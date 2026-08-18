@@ -4,6 +4,18 @@ if [ "$ktls" = 1 ]; then
     start_server $CFG/tls-h3-proxy.json
     P61462=$SRV_PORT
     h3p_pid=$SRV_PID
+    # audit-report-6 Finding 1: a malformed upstream response head must be
+    # refused the same way whichever protocol relays it. It was not: h2 had
+    # validated since Finding 34, h1 relayed a non-token field name and a NUL in
+    # a value to the client VERBATIM, and h3 QPACK-encoded both onto the wire --
+    # while a pair of disagreeing Content-Lengths was 502 on h1 and h2 and a
+    # clean 200 on h3, the contradiction erased by re-deriving the length from
+    # what was captured. One matrix over all three protocols, because the defect
+    # was never "protocol X is wrong", it was the three disagreeing. Runs
+    # without aioquic too, checking h1 and h2 and saying h3 was skipped.
+    timeout 120 python3 test/proxy_upstream_head.py $CA ${P61462} >/dev/null 2>&1
+    check "proxy: h1/h2/h3 agree on refusing a malformed upstream head" $?
+
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
         out=$(timeout 120 python3 test/quic/h3_proxy_test.py ${P61462} 2>&1)
         [ "$out" = "OK" ]

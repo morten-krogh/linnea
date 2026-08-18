@@ -86,6 +86,7 @@ extern linnea_h3_advert
 global linnea_http_handle
 global linnea_http_proxy_error
 global linnea_http_request_timeout
+global linnea_http_upstream_head_valid
 global linnea_http_proxy_head
 extern linnea_http_authority_host
 global linnea_http_proxy_log
@@ -3411,6 +3412,191 @@ linnea_http_proxy_log:
     mov rdx, [rdi + linnea_connection.relayed]
     jmp linnea_http_log_conn
 
+; linnea_http_upstream_head_valid(rdi = head buf, rsi = head length)
+;   -> eax = 1 valid, 0 not.
+; One gate on an upstream HTTP/1 response head, for every protocol that relays
+; one (audit-report-6 Finding 1). The head must not carry anything the
+; downstream message cannot legally hold (RFC 9110 5.5/5.6.2, RFC 9112 5, RFC
+; 9110 8.6): every field line needs a token name and a colon, its value may hold
+; no control byte but HTAB, no line may be an obsolete fold, and a repeated
+; Content-Length must name the same length. The status line is skipped.
+;
+; It began as h2p_head_validate with HTTP/2 as its only caller, and the other
+; two protocols each answered these responses differently -- which is how the
+; audit found it. A backend line "Bad Name: x" was 502 on h2, relayed VERBATIM
+; to the client on h1, and QPACK-encoded onto the wire as a field name
+; containing a SPACE on h3. "Content-Length: 5" then "Content-Length: 7" was 502
+; on h1 and h2, but h3 took the first value, captured five bytes and re-issued
+; the contradiction as a clean 200. It lives in the HTTP/1 module because an
+; upstream response head IS an HTTP/1 message, whichever protocol relays it.
+linnea_http_upstream_head_valid:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 24                       ; [rsp]=cl seen flag, [rsp+8]=cl value
+    mov r12, rdi                      ; head buf
+    mov r13, rsi                      ; head length
+    mov qword [rsp], 0                ; no Content-Length seen yet
+    xor rcx, rcx                      ; cursor
+.hv_status:                           ; skip the status line to its CR
+    cmp rcx, r13
+    jae .hv_ok
+    cmp byte [r12 + rcx], 13
+    je .hv_status_eol
+    inc rcx
+    jmp .hv_status
+.hv_status_eol:
+    add rcx, 2                        ; past CRLF
+.hv_line:
+    cmp rcx, r13
+    jae .hv_ok
+    cmp byte [r12 + rcx], 13
+    je .hv_ok                         ; the terminating empty line: done
+    movzx eax, byte [r12 + rcx]
+    cmp al, ' '
+    je .hv_bad                        ; a line beginning with SP/HTAB is an
+    cmp al, 9                         ; obsolete fold -- reject, do not relay
+    je .hv_bad
+    mov r14, rcx                      ; field name start
+.hv_name:
+    cmp rcx, r13
+    jae .hv_bad
+    movzx eax, byte [r12 + rcx]
+    cmp al, ':'
+    je .hv_name_done
+    cmp al, 13
+    je .hv_bad                        ; CR before any colon: no name/value split
+    inc rcx
+    jmp .hv_name
+.hv_name_done:
+    mov r15, rcx                      ; colon offset
+    mov rbp, rcx
+    sub rbp, r14                      ; name length
+    jz .hv_bad                        ; empty name (colon at line start)
+    lea rdi, [r12 + r14]
+    mov rsi, rbp
+    call linnea_string_is_token       ; token name?
+    test eax, eax
+    jz .hv_bad
+    ; the value: skip the colon and any OWS, then run to the CR
+    lea rcx, [r15 + 1]
+.hv_ows:
+    cmp rcx, r13
+    jae .hv_bad
+    movzx eax, byte [r12 + rcx]
+    cmp al, ' '
+    je .hv_ows_next
+    cmp al, 9
+    je .hv_ows_next
+    jmp .hv_valstart
+.hv_ows_next:
+    inc rcx
+    jmp .hv_ows
+.hv_valstart:
+    mov r14, rcx                      ; value start (name start no longer needed)
+.hv_value:
+    cmp rcx, r13
+    jae .hv_bad
+    movzx eax, byte [r12 + rcx]
+    cmp al, 13
+    je .hv_value_end
+    cmp al, 9
+    je .hv_value_next                 ; HTAB is allowed
+    cmp al, 0x20
+    jb .hv_bad                        ; a control byte in the value
+    cmp al, 0x7F
+    je .hv_bad                        ; DEL
+    ja .hv_value_next                 ; 0x80-0xFF obs-text is tolerated
+.hv_value_next:
+    inc rcx
+    jmp .hv_value
+.hv_value_end:
+    ; a Content-Length line: its value must agree with any earlier one
+    cmp rbp, 14
+    jne .hv_next_line
+    lea rdi, [r12 + r15]
+    sub rdi, rbp                      ; name start = colon - name length
+    mov rsi, rbp
+    lea rdx, [hn_content_len]
+    mov rcx, 14
+    call linnea_string_iequal
+    test eax, eax
+    jz .hv_next_line                  ; some other 14-char name
+    ; the value is [r14, CR); re-find its CR to measure it
+    mov rcx, r14
+.hv_cl_scan:
+    cmp byte [r12 + rcx], 13
+    je .hv_cl_have
+    inc rcx
+    jmp .hv_cl_scan
+.hv_cl_have:
+    sub rcx, r14                      ; value length, TRAILING OWS included
+    lea rdi, [r12 + r14]              ; value start (past the leading OWS)
+    ; RFC 9112 5 puts OWS on BOTH sides of a field value. The leading half is
+    ; skipped where the value starts, above; the trailing half was not, so
+    ; "Content-Length:   5  " reached the number parser as "5  " and was refused
+    ; as a non-number -- a 502 for a response that is perfectly legal. It went
+    ; unnoticed while HTTP/2 was the only caller, because nothing pointed the
+    ; /api/clpad fixture at h2; HTTP/1 had its own parser that trimmed both
+    ; sides and served it, so sharing this validator is what surfaced it.
+.hv_cl_trim:
+    test rcx, rcx
+    jz .hv_cl_measured                ; all whitespace: let the parser call it
+    movzx eax, byte [rdi + rcx - 1]
+    cmp al, ' '
+    je .hv_cl_untrim
+    cmp al, 9                         ; HTAB
+    jne .hv_cl_measured
+.hv_cl_untrim:
+    dec rcx
+    jmp .hv_cl_trim
+.hv_cl_measured:
+    mov rsi, rcx
+    call linnea_string_to_u64         ; -> rax = value, edx = 0 ok / 1 / 2
+    test edx, edx
+    jnz .hv_bad                       ; a malformed or unrepresentable length
+    cmp qword [rsp], 0
+    je .hv_cl_first
+    cmp rax, [rsp + 8]
+    jne .hv_bad                       ; two Content-Lengths that disagree
+    jmp .hv_next_line
+.hv_cl_first:
+    mov qword [rsp], 1
+    mov [rsp + 8], rax
+.hv_next_line:
+    ; rcx is not the line cursor any more; re-find the CR from the value start
+    mov rcx, r14
+.hv_eol_scan:
+    cmp byte [r12 + rcx], 13
+    je .hv_eol_have
+    inc rcx
+    jmp .hv_eol_scan
+.hv_eol_have:
+    lea rax, [rcx + 2]
+    cmp rax, r13
+    ja .hv_bad
+    cmp byte [r12 + rcx + 1], 10
+    jne .hv_bad
+    add rcx, 2
+    jmp .hv_line
+.hv_ok:
+    mov eax, 1
+    jmp .hv_ret
+.hv_bad:
+    xor eax, eax
+.hv_ret:
+    add rsp, 24
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; linnea_http_proxy_head(rdi=conn*) -> rax
 ;   LINNEA_HTTP_HEAD_MORE  (0): the head is not complete yet
 ;   LINNEA_HTTP_HEAD_READY (1): out_buf holds the rewritten head, the send
@@ -3452,6 +3638,20 @@ linnea_http_proxy_head:
     mov [rsp], rax             ; head end
     add r13, 2
     mov [rsp + 40], r13        ; header lines end before the empty line's CRLF
+    ; The whole field section is checked before any of it is rewritten toward
+    ; the client (audit-report-6 Finding 1). h1 used to check only what it
+    ; happened to parse for framing, so a backend line whose NAME was not a
+    ; token -- "Bad Name: x" -- was relayed to the client verbatim, and a NUL
+    ; in a value went with it. h2 had refused both since Finding 34; this is
+    ; the same gate, now shared. r14 is the head buffer and [rsp] its length;
+    ; the validator preserves r12/r13/r14 and the frame.
+    push r13
+    mov rdi, r14
+    mov rsi, [rsp + 8]         ; head end (the push above moved the frame by 8)
+    call linnea_http_upstream_head_valid
+    pop r13
+    test eax, eax
+    jz .bad
 
     ; --- status line: "HTTP/1.x SSS ..." ----------------------------
     cmp qword [rsp], 13        ; "HTTP/1.1 200" + CRLF at the very least
@@ -3575,8 +3775,14 @@ linnea_http_proxy_head:
     or qword [rsp + 16], 2     ; chunked: the framing is the upstream's
     jmp .copy_line
 .content_len:
-    test qword [rsp + 16], 1
-    jnz .bad                   ; duplicate Content-Length
+    ; A REPEATED Content-Length is no longer refused here. The shared validator
+    ; at .found has already parsed every occurrence and rejected the head unless
+    ; they all name the same length (RFC 9110 8.6), so by this point a repeat is
+    ; a repeat of the same number and re-reading it is harmless. Refusing it
+    ; here as well made h1 answer 502 where h2 and h3 answered 200 for the very
+    ; same backend response -- the /api/cldupe fixture, which h2 has a test
+    ; asserting is served (audit-report-6 Finding 1). The bit is still SET,
+    ; because .header_done reads it as "a Content-Length was present at all".
     or qword [rsp + 16], 1
     ; value = [colon+1, CR), OWS-trimmed, digits only
     lea rcx, [r13 + 1]

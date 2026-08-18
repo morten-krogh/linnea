@@ -53,6 +53,7 @@ extern linnea_time_http_now
 extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_to_u64
+extern linnea_http_upstream_head_valid
 extern linnea_string_iequal
 extern linnea_string_equal
 extern linnea_string_is_token
@@ -3908,160 +3909,6 @@ h2p_compact:
     pop rbx
     ret
 
-; h2p_head_validate(rdi = head buf, rsi = head length) -> eax = 1 valid, 0 not.
-; The upstream head is translated into an HTTP/2 field block and must not carry
-; anything that block cannot legally hold (Finding 34, RFC 9110 5.5/5.6.2, RFC
-; 9112 5, RFC 9110 8.6): every field line needs a token name and a colon, its
-; value may hold no control byte but HTAB, no line may be an obsolete fold, and a
-; repeated Content-Length must name the same length. The status line is skipped.
-h2p_head_validate:
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    push rbp
-    sub rsp, 24                       ; [rsp]=cl seen flag, [rsp+8]=cl value
-    mov r12, rdi                      ; head buf
-    mov r13, rsi                      ; head length
-    mov qword [rsp], 0                ; no Content-Length seen yet
-    xor rcx, rcx                      ; cursor
-.hv_status:                           ; skip the status line to its CR
-    cmp rcx, r13
-    jae .hv_ok
-    cmp byte [r12 + rcx], 13
-    je .hv_status_eol
-    inc rcx
-    jmp .hv_status
-.hv_status_eol:
-    add rcx, 2                        ; past CRLF
-.hv_line:
-    cmp rcx, r13
-    jae .hv_ok
-    cmp byte [r12 + rcx], 13
-    je .hv_ok                         ; the terminating empty line: done
-    movzx eax, byte [r12 + rcx]
-    cmp al, ' '
-    je .hv_bad                        ; a line beginning with SP/HTAB is an
-    cmp al, 9                         ; obsolete fold -- reject, do not relay
-    je .hv_bad
-    mov r14, rcx                      ; field name start
-.hv_name:
-    cmp rcx, r13
-    jae .hv_bad
-    movzx eax, byte [r12 + rcx]
-    cmp al, ':'
-    je .hv_name_done
-    cmp al, 13
-    je .hv_bad                        ; CR before any colon: no name/value split
-    inc rcx
-    jmp .hv_name
-.hv_name_done:
-    mov r15, rcx                      ; colon offset
-    mov rbp, rcx
-    sub rbp, r14                      ; name length
-    jz .hv_bad                        ; empty name (colon at line start)
-    lea rdi, [r12 + r14]
-    mov rsi, rbp
-    call linnea_string_is_token       ; token name?
-    test eax, eax
-    jz .hv_bad
-    ; the value: skip the colon and any OWS, then run to the CR
-    lea rcx, [r15 + 1]
-.hv_ows:
-    cmp rcx, r13
-    jae .hv_bad
-    movzx eax, byte [r12 + rcx]
-    cmp al, ' '
-    je .hv_ows_next
-    cmp al, 9
-    je .hv_ows_next
-    jmp .hv_valstart
-.hv_ows_next:
-    inc rcx
-    jmp .hv_ows
-.hv_valstart:
-    mov r14, rcx                      ; value start (name start no longer needed)
-.hv_value:
-    cmp rcx, r13
-    jae .hv_bad
-    movzx eax, byte [r12 + rcx]
-    cmp al, 13
-    je .hv_value_end
-    cmp al, 9
-    je .hv_value_next                 ; HTAB is allowed
-    cmp al, 0x20
-    jb .hv_bad                        ; a control byte in the value
-    cmp al, 0x7F
-    je .hv_bad                        ; DEL
-    ja .hv_value_next                 ; 0x80-0xFF obs-text is tolerated
-.hv_value_next:
-    inc rcx
-    jmp .hv_value
-.hv_value_end:
-    ; a Content-Length line: its value must agree with any earlier one
-    cmp rbp, h2p_hn_cl_len
-    jne .hv_next_line
-    lea rdi, [r12 + r15]
-    sub rdi, rbp                      ; name start = colon - name length
-    mov rsi, rbp
-    lea rdx, [h2p_hn_cl]
-    mov rcx, h2p_hn_cl_len
-    call linnea_string_iequal
-    test eax, eax
-    jz .hv_next_line                  ; some other 14-char name
-    ; the value is [r14, CR); re-find its CR to measure it
-    mov rcx, r14
-.hv_cl_scan:
-    cmp byte [r12 + rcx], 13
-    je .hv_cl_have
-    inc rcx
-    jmp .hv_cl_scan
-.hv_cl_have:
-    sub rcx, r14                      ; value length
-    lea rdi, [r12 + r14]
-    mov rsi, rcx
-    call linnea_string_to_u64         ; -> rax = value, edx = 0 ok / 1 / 2
-    test edx, edx
-    jnz .hv_bad                       ; a malformed or unrepresentable length
-    cmp qword [rsp], 0
-    je .hv_cl_first
-    cmp rax, [rsp + 8]
-    jne .hv_bad                       ; two Content-Lengths that disagree
-    jmp .hv_next_line
-.hv_cl_first:
-    mov qword [rsp], 1
-    mov [rsp + 8], rax
-.hv_next_line:
-    ; rcx is not the line cursor any more; re-find the CR from the value start
-    mov rcx, r14
-.hv_eol_scan:
-    cmp byte [r12 + rcx], 13
-    je .hv_eol_have
-    inc rcx
-    jmp .hv_eol_scan
-.hv_eol_have:
-    lea rax, [rcx + 2]
-    cmp rax, r13
-    ja .hv_bad
-    cmp byte [r12 + rcx + 1], 10
-    jne .hv_bad
-    add rcx, 2
-    jmp .hv_line
-.hv_ok:
-    mov eax, 1
-    jmp .hv_ret
-.hv_bad:
-    xor eax, eax
-.hv_ret:
-    add rsp, 24
-    pop rbp
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
 
 ; h2p_parse_head(rdi = slot*) -> rax = 1 parsed, 0 need more bytes, -1 bad.
 ; Finds the CRLF CRLF, reads the status line and the framing headers
@@ -4129,7 +3976,7 @@ h2p_parse_head:
     push rcx
     mov rdi, r12
     mov rsi, rcx
-    call h2p_head_validate
+    call linnea_http_upstream_head_valid
     pop rcx
     test eax, eax
     jz .ph_bad
