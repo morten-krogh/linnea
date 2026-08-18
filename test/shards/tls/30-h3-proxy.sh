@@ -39,10 +39,11 @@ if [ "$ktls" = 1 ]; then
         check "h3 relays a long interim chain and the final response ($be)" $?
 
         # ...and the documented end of that rope. h3 buffers the whole interim
-        # sequence before it sends anything, so unlike h1 and h2 -- which relay
-        # each 1xx as it arrives and have no such limit -- it needs a cap, or a
-        # chain of minimal 1xx heads encodes to an unbounded number of field
-        # sections each carrying its own via, date and server. The cap is
+        # sequence before it sends anything, so unlike h2 -- which relays each
+        # 1xx as it arrives and needs no cap -- and h1, whose chain is bounded
+        # by the head buffer it is parsed out of, it needs one, or a chain of
+        # minimal 1xx heads encodes to an unbounded number of field sections
+        # each carrying its own via, date and server. The cap is
         # LINNEA_H3_PROXY_IMAX (8), enforced while PARSING so an over-long chain
         # is refused before a body is captured for a response that could never
         # be sent. /api/manyearly sends nine. This is a deliberate divergence
@@ -50,9 +51,22 @@ if [ "$ktls" = 1 ]; then
         many=$("$CURLH3" --http3-only -sk -o /dev/null -w '%{http_code}'                --max-time 20 --resolve localhost:${P61462}:127.0.0.1                https://localhost:${P61462}/api/manyearly 2>/dev/null)
         [ "$many" = "502" ]
         check "h3 refuses an interim chain past the documented cap ($many)" $?
+
+        # /api/204 sends the Content-Length RFC 9110 8.6 forbids on a 204. The
+        # cross-protocol matrix judges the FIELD; this judges whether the
+        # response can be received at all, which is the half aioquic could not
+        # see -- it decoded the relayed version happily, while curl's h3 leg
+        # answered it with "ngtcp2_conn_writev_stream returned error:
+        # ERR_CLOSING" and returned nothing (audit-report-9 Finding 2). So the
+        # exit status is the assertion here, not the body.
+        "$CURLH3" --http3-only -sk -o /dev/null --max-time 20 \
+            --resolve localhost:${P61462}:127.0.0.1 \
+            https://localhost:${P61462}/api/204 >/dev/null 2>&1
+        check "h3 completes a 204 whose upstream sent a forbidden length" $?
     else
         check "h3 long interim chain (skipped: curl-h3 unavailable)" 0
         check "h3 interim cap (skipped: curl-h3 unavailable)" 0
+        check "h3 204 completion (skipped: curl-h3 unavailable)" 0
     fi
 
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then

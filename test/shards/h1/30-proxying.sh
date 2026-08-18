@@ -95,6 +95,13 @@ check_http "proxy HEAD length"   "Content-Length: 12" "$resp"
 check_http "proxy HEAD no hang"  "200 OK" "$resp"
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/api/204)
 check_http "proxy 204 no body"   "204 No Content" "$resp"
+# The backend sends "Content-Length: 12" on that 204, which RFC 9110 8.6 forbids
+# outright, and the proxy relayed it on every protocol. It is not a cosmetic
+# field: curl's HTTP/3 leg answered the relayed version with ERR_CLOSING and
+# never completed the response (audit-report-9 Finding 2). Dropped, not
+# rewritten to 0 -- "no length" and "a length of zero" are different answers.
+check_http "proxy 204 drops the forbidden length" "none" \
+    "$(printf '%s' "$resp" | grep -i '^content-length:' || echo none)"
 
 # chunked and close-delimited bodies have no length we can pass on, so the
 # client connection has to close to delimit them

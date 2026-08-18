@@ -87,6 +87,7 @@ global linnea_http_handle
 global linnea_http_proxy_error
 global linnea_http_request_timeout
 global linnea_http_upstream_head_valid
+global linnea_http_status_no_clen
 global linnea_http_proxy_head
 extern linnea_http_authority_host
 global linnea_http_proxy_log
@@ -3412,6 +3413,29 @@ linnea_http_proxy_log:
     mov rdx, [rdi + linnea_connection.relayed]
     jmp linnea_http_log_conn
 
+; linnea_http_status_no_clen(edi = status) -> eax = 1 when a response with
+; this status must not carry Content-Length.
+; RFC 9110 8.6: a server MUST NOT send Content-Length on a 1xx or a 204. On
+; those two the field is not merely surplus, it is a framing lie -- an interim
+; head has no body at all, so a client that believes the length reads the next
+; response's first bytes as this one's content. The HEAD and 304 cases named in
+; the same section are the opposite: there the length describes a representation
+; the client is not being sent, and it must survive. The rule lives here, once,
+; because the three translators that emit a response head have each already
+; drifted apart on questions this small.
+linnea_http_status_no_clen:
+    xor eax, eax
+    cmp edi, 100
+    jb .nc_ret
+    cmp edi, 199
+    jbe .nc_yes
+    cmp edi, 204
+    jne .nc_ret
+.nc_yes:
+    mov eax, 1
+.nc_ret:
+    ret
+
 ; linnea_http_upstream_head_valid(rdi = head buf, rsi = head length)
 ;   -> eax = 1 valid, 0 not.
 ; One gate on an upstream HTTP/1 response head, for every protocol that relays
@@ -3419,7 +3443,9 @@ linnea_http_proxy_log:
 ; downstream message cannot legally hold (RFC 9110 5.5/5.6.2, RFC 9112 5, RFC
 ; 9110 8.6): every field line needs a token name and a colon, its value may hold
 ; no control byte but HTAB, no line may be an obsolete fold, and a repeated
-; Content-Length must name the same length. The status line is skipped.
+; Content-Length must name the same length. The status line is checked here
+; too: version, three-digit code, reason-phrase bytes and the CRLF that ends
+; it (audit-report-8 Finding 1, audit-report-9 Finding 1).
 ;
 ; It began as h2p_head_validate with HTTP/2 as its only caller, and the other
 ; two protocols each answered these responses differently -- which is how the
@@ -3482,14 +3508,37 @@ linnea_http_upstream_head_valid:
     cmp al, ' '
     jne .hv_bad
     xor rcx, rcx
-.hv_status:                           ; skip the status line to its CR
+.hv_status:                           ; the reason phrase, to its CRLF
     cmp rcx, r13
-    jae .hv_ok
-    cmp byte [r12 + rcx], 13
+    jae .hv_bad                       ; a status line with no CRLF is not one
+    movzx eax, byte [r12 + rcx]
+    cmp al, 13
     je .hv_status_eol
+    ; reason-phrase = 1*( HTAB / SP / VCHAR / obs-text ), RFC 9112 4. A byte
+    ; outside that set is not a reason phrase, and HTTP/1 relays these bytes
+    ; verbatim -- which is how a NUL or a bare LF would reach the client.
+    cmp al, 9
+    je .hv_status_next
+    cmp al, 32
+    jb .hv_bad
+    cmp al, 127
+    je .hv_bad
+.hv_status_next:
     inc rcx
     jmp .hv_status
 .hv_status_eol:
+    ; A CR ends an HTTP/1 line only when an LF follows it (RFC 9112 2.2). This
+    ; used to step over the CR unconditionally, so the byte behind a BARE one
+    ; became the first byte of a "field name": "HTTP/1.1 200\rX-Fold: accepted"
+    ; walked straight through this gate and was normalised into an ordinary 200
+    ; on all three protocols -- h1 even replacing the bare CR with a CRLF of its
+    ; own on the way out (audit-report-9 Finding 1). The field lines below have
+    ; always demanded the LF; the line naming the status now does too.
+    lea rax, [rcx + 1]
+    cmp rax, r13
+    jae .hv_bad
+    cmp byte [r12 + rax], 10
+    jne .hv_bad
     add rcx, 2                        ; past CRLF
 .hv_line:
     cmp rcx, r13
@@ -3655,12 +3704,21 @@ linnea_http_proxy_head:
     push r13
     push r14
     push r15
-    sub rsp, 48
+    sub rsp, 64
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.up_buf]
     mov r12, [rbx + linnea_connection.up_len]
+    lea r15, [rbx + linnea_connection.out_buf]   ; out cursor, across every head
+.head_start:
+    ; r14 points at THIS head's first byte and r12 counts the bytes behind it.
+    ; An interim head is relayed and stepped over, and the loop comes back here
+    ; with both moved on. Every call re-parses from the very beginning, which is
+    ; what lets an incomplete head return MORE and be handed the same bytes
+    ; again without emitting the interim heads twice.
     mov qword [rsp + 8], 0
     mov qword [rsp + 16], 0
+    mov qword [rsp + 48], 0    ; not an interim head until proven one
+    mov qword [rsp + 56], 0    ; ...and nothing yet forbids a Content-Length
     ; the head ends at the first CRLF CRLF
     xor r13d, r13d
 .scan:
@@ -3721,9 +3779,24 @@ linnea_http_proxy_head:
     inc ecx
     jmp .status_loop
 .status_done:
-    mov [rbx + linnea_connection.up_status], rax
+    ; A 1xx head is interim: forward it and keep reading for the response that
+    ; matters -- RFC 9110 15.2 requires a proxy to forward 1xx. 101 is 1xx by
+    ; number only; it ends HTTP on this connection and has its own path below.
+    mov [rsp + 56], rax        ; the status, across the call
+    mov edi, eax
+    call linnea_http_status_no_clen
+    mov rdx, [rsp + 56]
+    mov [rsp + 56], rax        ; [56] now answers "must this carry no length?"
+    cmp rdx, 199
+    ja .head_final
+    cmp rdx, 101
+    je .head_final
+    mov qword [rsp + 48], 1
+    jmp .status_emit
+.head_final:
+    mov [rbx + linnea_connection.up_status], rdx
+.status_emit:
     ; rewrite the version, then pass the rest of the line through
-    lea r15, [rbx + linnea_connection.out_buf]
     lea rdi, [version_11_sp]
     mov esi, version_11_sp_len
     call .append
@@ -3891,7 +3964,14 @@ linnea_http_proxy_head:
 .cl_trail_next:
     inc rcx
     jmp .cl_trail
-.cl_done:                      ; the value is already parsed and stored
+.cl_done:
+    ; The value is parsed and stored either way -- a 204 naming a length that is
+    ; not a number is still a bad gateway -- but on the two statuses where HTTP
+    ; forbids the field it stops here instead of being copied out (RFC 9110 8.6,
+    ; audit-report-9 Finding 2). It is dropped, not rewritten to 0: "no length"
+    ; and "a length of zero" are different answers, and 204 means the first.
+    cmp qword [rsp + 56], 0
+    jne .next_line
 .copy_line:
     mov rcx, [rsp + 24]
     mov rdx, [rsp + 32]
@@ -3906,8 +3986,32 @@ linnea_http_proxy_head:
     mov [rsp + 24], rdx
     jmp .header_loop
 
+    ; --- an interim head: relay it, then go round for the next --------
+    ; A 1xx is a complete message that frames no body, so it ends at its own
+    ; blank line. h2 has relayed interim heads since Finding 30 and h3 since
+    ; report 7; h1 did not, and took the first head it saw as THE response. A
+    ; backend answering "103 Early Hints" with a Content-Length therefore had
+    ; that length believed: the client got the interim as its final answer, with
+    ; the first bytes of the real response consumed as the interim's body
+    ; (audit-report-9 Finding 2). Nothing is appended per interim head beyond
+    ; what the upstream sent, so out_buf's 64 bytes of slack over up_buf still
+    ; covers the Via and Connection added to the final head, however many
+    ; interim heads come before it.
+.interim_done:
+    test qword [rsp + 16], 2
+    jnz .bad                   ; Transfer-Encoding on a bodiless head: refuse
+    lea rdi, [crlf]
+    mov esi, 2
+    call .append               ; the blank line that ends it
+    mov rax, [rsp]             ; this head's length
+    add r14, rax               ; the next head begins where this one ended
+    sub r12, rax
+    jmp .head_start
+
     ; --- body framing and our own Connection header -------------------
 .header_done:
+    cmp qword [rsp + 48], 0
+    jne .interim_done
     cmp qword [rbx + linnea_connection.up_status], 101
     je .upgrade_head
     ; Transfer-Encoding and Content-Length together contradict each other
@@ -3950,8 +4054,10 @@ linnea_http_proxy_head:
 .emit_conn:
     call .append
 
-    ; body bytes that arrived with the head go out behind it
-    mov rax, [rbx + linnea_connection.up_len]
+    ; body bytes that arrived with the head go out behind it. r12 counts from
+    ; r14, so this is what followed THIS head -- not what followed any interim
+    ; head already relayed.
+    mov rax, r12
     sub rax, [rsp]             ; leftover
     mov rcx, [rbx + linnea_connection.body_rem]
     cmp rcx, -1
@@ -3993,7 +4099,7 @@ linnea_http_proxy_head:
     call .append
     mov qword [rbx + linnea_connection.keep_alive], 0
     mov qword [rbx + linnea_connection.body_rem], 0
-    mov rax, [rbx + linnea_connection.up_len]
+    mov rax, r12
     sub rax, [rsp]             ; leftover tunnel bytes, relayed verbatim
     mov [rbx + linnea_connection.file_rem], rax
     add [rbx + linnea_connection.relayed], rax
@@ -4011,7 +4117,7 @@ linnea_http_proxy_head:
 .bad:
     mov eax, LINNEA_HTTP_HEAD_BAD
 .ret:
-    add rsp, 48
+    add rsp, 64
     pop r15
     pop r14
     pop r13

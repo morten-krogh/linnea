@@ -54,6 +54,7 @@ extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_to_u64
 extern linnea_http_upstream_head_valid
+extern linnea_http_status_no_clen
 extern linnea_string_iequal
 extern linnea_string_equal
 extern linnea_string_is_token
@@ -4441,10 +4442,18 @@ h2p_emit_headers:
     mov [rsp], rdi                   ; frame start
     mov rbx, rsi                     ; slot
     mov [rsp + 8], rdx               ; conn
-    mov qword [rsp + 40], 0          ; no content-length forwarded yet (Finding 34)
     mov rax, [rbx + linnea_h2p.srv]  ; the vhost this request selected
     mov [h2_cur_srv], rax
     lea r15, [rdi + 9]               ; payload cursor
+    ; [rsp+40] is "a content-length must not go out from here". It starts set
+    ; when the status is one HTTP forbids a Content-Length on -- 1xx and 204,
+    ; RFC 9110 8.6 -- and is set again by the first one that does go out, since
+    ; a repeat would hand the client two (Finding 34). Both are the same
+    ; question, so they share the one flag (audit-report-9 Finding 2). rdi is
+    ; the frame start until r15 is taken off it, so the call waits until here.
+    mov edi, [rbx + linnea_h2p.status]
+    call linnea_http_status_no_clen
+    mov [rsp + 40], rax
     ; :status — literal with the static name index (8), value as 3 digits
     mov rax, [rbx + linnea_h2p.status]
     lea rdi, [h2p_stbuf]
@@ -4538,9 +4547,10 @@ h2p_emit_headers:
     call h2p_name_dropped            ; -> eax = 1 when it must not be forwarded
     test eax, eax
     jnz .eh_next
-    ; forward only the FIRST content-length (RFC 9110 8.6, Finding 34). A repeat
-    ; one was validated to name the same length; emitting both would hand the
-    ; client two content-length fields, which it may reject.
+    ; forward only the FIRST content-length (RFC 9110 8.6, Finding 34), and none
+    ; at all on a status that forbids the field. A repeated one was validated to
+    ; name the same length; emitting both would hand the client two
+    ; content-length fields, which it may reject.
     cmp qword [rsp + 24], h2p_hn_cl_len
     jne .eh_forward
     lea rdi, [h2p_nmbuf]             ; already lowercased
@@ -4551,7 +4561,7 @@ h2p_emit_headers:
     test eax, eax
     jz .eh_forward                   ; a different 14-char name
     cmp qword [rsp + 40], 0
-    jne .eh_next                     ; a content-length already went out: drop
+    jne .eh_next                     ; forbidden here, or one already went out
     mov qword [rsp + 40], 1
 .eh_forward:
     ; the value, spaces trimmed

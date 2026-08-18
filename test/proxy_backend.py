@@ -277,8 +277,29 @@ def respond(conn, head, body, extra=b""):
         conn.sendall(b"HTTP/1.1 301 Moved Permanently\r\n"
                      b"Location: /elsewhere\r\nContent-Length: 0\r\n\r\n")
     elif path.endswith(b"/204"):
-        # No body despite the Content-Length, as 204 requires.
+        # No body despite the Content-Length, as 204 requires. RFC 9110 8.6 also
+        # says a server MUST NOT send Content-Length on a 204 at all, so this is
+        # a forbidden field the proxy must drop rather than relay
+        # (audit-report-9 Finding 2).
         conn.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 12\r\n\r\n")
+    elif path.endswith(b"/204clean"):
+        # ...and the same 204 without it: the control that separates "the proxy
+        # relays a forbidden field" from "h3 cannot do bodiless responses".
+        conn.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
+    elif path.endswith(b"/earlycl"):
+        # A 103 carrying Content-Length -- forbidden on 1xx by the same rule --
+        # then the real response. The interim relay must strip it and still
+        # deliver the 200.
+        conn.sendall(b"HTTP/1.1 103 Early Hints\r\nContent-Length: 7\r\n"
+                     b"Link: </a.css>; rel=preload\r\n\r\n"
+                     b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nvalid")
+    elif path.endswith(b"/badstatuscr"):
+        # A bare CR ends nothing in HTTP/1: a CR only ends a line when an LF
+        # follows (RFC 9112 2.2). "HTTP/1.1 200\rX-Fold: ..." is not a status
+        # line, and lenient parsing here is a response-splitting primitive
+        # (audit-report-9 Finding 1).
+        conn.sendall(b"HTTP/1.1 200\rX-Fold: accepted\r\n"
+                     b"Content-Length: 5\r\n\r\nvalid")
     elif path.endswith(b"/http10"):
         conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nold hi")
     elif path.endswith(b"/badversion"):

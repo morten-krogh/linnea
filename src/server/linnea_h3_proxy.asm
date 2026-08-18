@@ -56,6 +56,7 @@ extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_to_u64
 extern linnea_http_upstream_head_valid
+extern linnea_http_status_no_clen
 extern linnea_string_iequal
 extern linnea_spill_open
 extern linnea_spill_write
@@ -1022,7 +1023,8 @@ linnea_h3_proxy_deliver:
     ; up_buf; content-length is re-derived from what we actually captured, so
     ; a de-chunked body is described by the length it really has. A response
     ; that carries no body keeps whatever length the upstream stated (RFC 9110
-    ; 9.3.2: a HEAD's content-length is the GET's, not the zero bytes we hold).
+    ; 9.3.2: a HEAD's content-length is the GET's, not the zero bytes we hold)
+    ; -- except on the statuses where the field is forbidden outright.
     ;
     ; Interim (1xx) responses come first, each as its own HEADERS frame, in the
     ; order the upstream sent them (audit-report-7 Finding 1). They are all
@@ -1075,7 +1077,10 @@ linnea_h3_proxy_deliver:
     lea rdi, [h3p_fs]
     mov rdx, [rsp]                   ; head ptr (pushed second, so on top)
     mov rcx, [rsp + 8]               ; head length
-    mov r8, -1                       ; an interim carries no content-length
+    mov r8, -2                       ; an interim head frames no body, so it
+                                     ; carries no Content-Length: not one of
+                                     ; ours, and not the upstream's either
+                                     ; (RFC 9110 8.6, audit-report-9 Finding 2)
     mov r9, [rbx + linnea_connection.vhost]
     call linnea_qpack_encode_proxy
     pop rsi
@@ -1091,16 +1096,29 @@ linnea_h3_proxy_deliver:
     mov [rsp + 8], rax
     jmp .dl_interim
 .dl_final:
+    ; The length decision first, while rdi is still free: it is an argument to
+    ; the encoder below, and taking it as a scratch register for the status is
+    ; how this crashed the worker on its first 204 -- the field section was
+    ; encoded to address 204.
+    mov r8, r14
+    cmp qword [rbx + linnea_connection.h3_nobody], 0
+    je .dl_clen
+    ; A bodiless answer states no length of its own. On HEAD and 304 the
+    ; upstream's Content-Length describes the representation the client is not
+    ; being sent and must survive; on 204 the field is forbidden and must not
+    ; (RFC 9110 8.6, audit-report-9 Finding 2).
+    mov edi, [rbx + linnea_connection.up_status]
+    call linnea_http_status_no_clen
+    mov r8, -1                       ; forward the upstream's own, if it had one
+    test eax, eax
+    jz .dl_clen
+    mov r8, -2                       ; ...unless the status forbids one
+.dl_clen:
     lea rdi, [h3p_fs]
     mov esi, [rbx + linnea_connection.up_status]
     lea rdx, [rbx + linnea_connection.up_buf]
     add rdx, [rbx + linnea_connection.h3_hoff]        ; past any interim heads
     mov rcx, [rbx + linnea_connection.h3_hlen]
-    mov r8, r14
-    cmp qword [rbx + linnea_connection.h3_nobody], 0
-    je .dl_clen
-    mov r8, -1                       ; forward the upstream's own, if it had one
-.dl_clen:
     mov r9, [rbx + linnea_connection.vhost]
     call linnea_qpack_encode_proxy   ; rax = field-section length, or -1 when it
     cmp rax, -1                      ; would not fit the reserve

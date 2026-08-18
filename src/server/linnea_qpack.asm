@@ -743,8 +743,8 @@ qenc_lit:
     jmp qenc_str
 
 ; linnea_qpack_encode_proxy(rdi=out, esi=status, rdx=head ptr, rcx=head len,
-;   r8=content-length to state (-1 = state none and forward the upstream's),
-;   r9=vhost server* or 0)
+;   r8=content-length to state (-1 = state none and forward the upstream's,
+;   -2 = state none and drop the upstream's too), r9=vhost server* or 0)
 ;   -> rax = field-section length, or -1 when it would not fit the reserve.
 ; Translates an upstream HTTP/1.1 response head into an HTTP/3 field section:
 ; the status as :status, then every field except the hop-by-hop ones and the
@@ -783,6 +783,10 @@ linnea_qpack_encode_proxy:
     mov rax, [rsp + 8]
     cmp rax, -1
     je .ep_walk
+    cmp rax, -2
+    je .ep_walk                      ; the status forbids one: state none, and
+                                     ; .ep_classify drops the upstream's below,
+                                     ; since -2 is "not -1" to the test there
     mov rdi, rax
     lea rsi, [qp_numbuf]
     call linnea_string_from_u64      ; rax = digits written
@@ -859,7 +863,9 @@ linnea_qpack_encode_proxy:
     ; note the ones we would otherwise duplicate, and drop what must not travel
     lea rdi, [qp_nmbuf]
     mov rsi, [rsp + 32]
-    xor edx, edx                     ; is content-length ours to state?
+    ; "ours" here means "not the upstream's to send": either we restate it from
+    ; the captured body, or the status forbids the field entirely (-2).
+    xor edx, edx
     cmp qword [rsp + 8], -1
     setne dl
     call .ep_classify                ; eax = 1 to drop, rdx = the seen bit

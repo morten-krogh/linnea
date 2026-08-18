@@ -18,6 +18,12 @@ differently (audit-report-6 Finding 1):
     cldupe        502 !       200         200   -- h1 refused a repeat that
                                                    AGREED with itself
 
+Report 9 added two more of the same shape: a status line ended by a BARE CR was
+normalised into a 200 on all three (Finding 1), and Content-Length was relayed on
+the two statuses HTTP forbids it on -- where h1 also turned out never to have
+relayed an interim head at all, taking the 103 for the final response (Finding
+2).
+
 h1 relayed "Bad Name: x" to the client verbatim; h3 put it on the wire
 QPACK-encoded, which a compliant peer may treat as a malformed field section and
 answer by killing the QUIC connection -- so the leniency was not merely
@@ -80,6 +86,19 @@ CASES = [
     # interim frames share, so h3 answered 502 to an exchange h1 and h2 served
     # (audit-report-8 Finding 2).
     ("bigearly",      200, b"valid"),
+    # RFC 9112 2.2: a CR ends an HTTP/1 line only when an LF follows it. The
+    # shared gate located the status line's first CR and stepped over two bytes
+    # without looking at the second, so "HTTP/1.1 200\rX-Fold: accepted" was
+    # read as a status line plus a field named "-Fold" -- and normalised into an
+    # ordinary 200 on all three protocols, h1 even writing a real CRLF where the
+    # bare CR had been (audit-report-9 Finding 1).
+    ("badstatuscr",   502, None),
+    # RFC 9110 8.6 forbids Content-Length on 1xx and 204. Upstreams send it
+    # anyway; the proxy relayed it. These three are judged by NO_CLEN below as
+    # well as by status and body (audit-report-9 Finding 2).
+    ("204",           204, b""),        # 204 whose upstream sent one
+    ("204clean",      204, b""),        # ...and the control that did not
+    ("earlycl",       200, b"valid"),   # a 103 carrying one, then the real 200
     ("simple",     200, b"backend body"),
 ]
 
@@ -97,6 +116,7 @@ H3_SKIP = {
 # right body while quietly violating RFC 9110 15.2.
 INTERIM_SEQ = {
     "early":        ["103", "200"],
+    "earlycl":      ["103", "200"],
     "early-atonce": ["103", "200"],
     "multi-early":  ["103", "103", "100", "200"],
     "simple":       ["200"],
@@ -133,25 +153,92 @@ def h1(route):
         pass
     s.close()
     if not buf:
-        return None, b"", []
-    # Skip interim responses, as any HTTP/1 client must: a 1xx is a complete
-    # head followed by the real response (RFC 9110 15.2). Without this the
-    # helper reads the 103's head as the answer and calls the rest "the body",
-    # which is a bug in the CLIENT -- curl gets these right -- and would have
-    # been reported here as a server fault.
+        return None, b"", [], []
+    # Step over interim responses, as any HTTP/1 client must: a 1xx is a
+    # complete head followed by the real response (RFC 9110 15.2). Without this
+    # the helper reads the 103's head as the answer and calls the rest "the
+    # body", which is a bug in the CLIENT -- curl gets these right -- and would
+    # have been reported here as a server fault. Each head is kept, so what the
+    # interim ones carried can be judged too.
+    sections = []
     while True:
         head, sep, rest = buf.partition(b"\r\n\r\n")
         if not sep:
-            return None, b"", []
+            return None, b"", [], sections
         lines = head.split(b"\r\n")
-        st = int(lines[0].split(b" ")[1])
+        parts = lines[0].split(b" ")
+        st = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        sections.append((str(st), lines[1:]))
         if 100 <= st < 200:
             buf = rest
             continue
-        return st, rest, lines[1:]
+        return st, rest, lines[1:], sections
 
 
 # ------------------------------------------------------------------ HTTP/2 --
+# linnea never inserts into the HPACK dynamic table and never Huffman-encodes a
+# response: every field goes out as "literal without indexing" with the name
+# either a static index or a literal. A stateless decoder is therefore exact.
+# Anything outside that shape is surfaced rather than skipped, since it would
+# mean the encoder changed under a test that had quietly stopped reading it.
+HPACK_STATIC = [b""] + (
+    ":authority :method :method :path :path :scheme :scheme :status :status "
+    ":status :status :status :status :status accept-charset accept-encoding "
+    "accept-language accept-ranges accept access-control-allow-origin age "
+    "allow authorization cache-control content-disposition content-encoding "
+    "content-language content-length content-location content-range "
+    "content-type cookie date etag expect expires from host if-match "
+    "if-modified-since if-none-match if-range if-unmodified-since last-modified "
+    "link location max-forwards proxy-authenticate proxy-authorization range "
+    "referer refresh retry-after server set-cookie strict-transport-security "
+    "transfer-encoding user-agent vary via www-authenticate"
+).encode().split()
+
+
+def hpack_int(b, i, prefix):
+    mask = (1 << prefix) - 1
+    v = b[i] & mask
+    i += 1
+    if v < mask:
+        return v, i
+    shift = 0
+    while True:
+        v += (b[i] & 0x7F) << shift
+        shift += 7
+        more = b[i] & 0x80
+        i += 1
+        if not more:
+            return v, i
+
+
+def hpack_str(b, i):
+    huffman = b[i] & 0x80
+    n, i = hpack_int(b, i, 7)
+    return (b"<huffman>" if huffman else b[i:i + n]), i + n
+
+
+def hpack_decode(blk):
+    out, i = [], 0
+    while i < len(blk):
+        c = blk[i]
+        if c & 0x80:                       # indexed field, name and value both
+            idx, i = hpack_int(blk, i, 7)
+            out.append((HPACK_STATIC[idx] if idx < len(HPACK_STATIC)
+                        else b"<dynamic>", b"<indexed>"))
+            continue
+        if c & 0xE0 == 0x20:               # dynamic table size update
+            _, i = hpack_int(blk, i, 5)
+            continue
+        idx, i = hpack_int(blk, i, 6 if c & 0x40 else 4)
+        if idx:
+            name = HPACK_STATIC[idx] if idx < len(HPACK_STATIC) else b"<dynamic>"
+        else:
+            name, i = hpack_str(blk, i)
+        val, i = hpack_str(blk, i)
+        out.append((name.lower(), val))
+    return out
+
+
 def h2(route):
     def fr(t, fl, sid, p=b""):
         return struct.pack(">I", len(p))[1:] + bytes([t, fl]) + struct.pack(">I", sid) + p
@@ -172,7 +259,7 @@ def h2(route):
     s.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + fr(0x4, 0, 0)
               + fr(0x1, 0x4 | 0x1, 1, blk))
     s.settimeout(10)
-    buf, st, body, done = b"", None, b"", False
+    buf, st, body, done, sections = b"", None, b"", False, []
     try:
         while not done:
             d = s.recv(65536)
@@ -188,11 +275,13 @@ def h2(route):
                 if ft == 0x0:
                     body += pl
                 if ft == 0x1:
-                    for i in range(len(pl) - 2):
-                        c = pl[i:i + 3]
-                        if c.isdigit():
-                            st = int(c)
-                            break
+                    fields = hpack_decode(pl)
+                    d2 = dict(fields)
+                    code = d2.get(b":status", b"?").decode()
+                    if code.isdigit():
+                        st = int(code)
+                    sections.append((code, [b"%s: %s" % (n, v) for n, v in fields
+                                            if not n.startswith(b":")]))
                 if ft in (0x0, 0x1) and fl & 0x1:
                     done = True
                 if ft == 0x3:
@@ -200,7 +289,7 @@ def h2(route):
     except (socket.timeout, OSError):
         pass
     s.close()
-    return st, body, []
+    return st, body, sections[-1][1] if sections else [], sections
 
 
 # ------------------------------------------------------------------ HTTP/3 --
@@ -289,24 +378,28 @@ def h3_all(routes):
         if reset and not resp:
             out[route] = ("RESET", b"", [], [])
             continue
-        i, st, body, extra, seq = 0, None, b"", [], []
+        i, st, body, extra, sections = 0, None, b"", [], []
         dec = pylsqpack.Decoder(0, 0)
         while i < len(resp):
             ty, i = rvlq(resp, i)
             ln, i = rvlq(resp, i)
             if ty == 1:
                 _, h = dec.feed_header(0, resp[i:i + ln])
-                st = int(dict(h).get(b":status", b"0"))
-                seq.append(dict(h).get(b":status", b"?").decode())
+                code = dict(h).get(b":status", b"?").decode()
+                if code.isdigit():
+                    st = int(code)
                 extra = [b"%s: %s" % (n, v) for n, v in h if not n.startswith(b":")]
+                sections.append((code, extra))
             elif ty == 0:
                 body += resp[i:i + ln]
             i += ln
-        out[route] = (st, body, extra, seq)
+        out[route] = (st, body, extra, sections)
     return out
 
 
 h3 = h3_all([r for r, _, _ in CASES if r not in H3_SKIP])
+
+RESULTS = {}
 
 for route, want_status, want_body in CASES:
     got = {}
@@ -314,6 +407,7 @@ for route, want_status, want_body in CASES:
     got["h2"] = h2(route)
     if h3 is not None and route not in H3_SKIP:
         got["h3"] = h3.get(route, (None, b"", [], []))
+    RESULTS[route] = got
 
     statuses = {p: v[0] for p, v in got.items()}
     check(f"{route}: every protocol answers {want_status}",
@@ -333,12 +427,39 @@ for route, want_status, want_body in CASES:
         check(f"{route}: no part of the bad head reaches the client",
               not any(leaked.values()), f"  {leaked}" if any(leaked.values()) else "")
 
-# --- the interim frames themselves, on HTTP/3 --------------------------------
-if h3 is not None:
-    for route, want_seq in INTERIM_SEQ.items():
-        got_seq = (h3.get(route) or (None, b"", [], []))[3]
-        check(f"{route}: h3 relays the interim responses in order",
-              got_seq == want_seq, f"  got {got_seq}, want {want_seq}")
+# --- the interim heads themselves, on every protocol -------------------------
+# This used to ask HTTP/3 alone, because HTTP/3 was the protocol report 7 had
+# just fixed. h2 has relayed interim heads since Finding 30 -- but h1 had never
+# relayed one at all: it took the 103 for the final response, believed the
+# Content-Length on it, and handed the client the real response's first bytes as
+# the interim's body (audit-report-9 Finding 2). Asking all three is what turns
+# this from a check on one protocol into a check that they agree.
+for route, want_seq in INTERIM_SEQ.items():
+    seqs = {p: [st for st, _ in v[3]] for p, v in RESULTS.get(route, {}).items()}
+    check(f"{route}: every protocol relays the interim responses in order",
+          all(seq == want_seq for seq in seqs.values()), f"  {seqs}")
+
+
+# --- ...and no 1xx or 204 head carries a Content-Length ----------------------
+# RFC 9110 8.6 says MUST NOT, and on an interim head it is not a mere surplus
+# field: a client that believes the length reads the following response's bytes
+# as this one's body. Every route is examined rather than a chosen few, so a
+# fixture that later grows an interim head is covered by having been added.
+def forbids_clen(code):
+    return code.isdigit() and (100 <= int(code) <= 199 or int(code) == 204)
+
+
+for route, got in RESULTS.items():
+    if not any(forbids_clen(st) for v in got.values() for st, _ in v[3]):
+        continue
+    leaked = {}
+    for proto, v in got.items():
+        hits = [(st, f) for st, fields in v[3] if forbids_clen(st)
+                for f in fields if f.lower().startswith(b"content-length")]
+        if hits:
+            leaked[proto] = hits
+    check(f"{route}: no Content-Length on a 1xx or 204 (RFC 9110 8.6)",
+          not leaked, f"  {leaked}" if leaked else "")
 
 for route, why in H3_SKIP.items():
     print(f"note: {route} not checked over HTTP/3 here -- {why}")
