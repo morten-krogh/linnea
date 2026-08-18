@@ -281,6 +281,40 @@ def respond(conn, head, body, extra=b""):
         conn.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 12\r\n\r\n")
     elif path.endswith(b"/http10"):
         conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nold hi")
+    elif path.endswith(b"/badversion"):
+        # RFC 9112 2.3: HTTP-version is HTTP-name "/" DIGIT "." DIGIT, so
+        # "HTTP/x.y" is not a status line at all. h1 refused it; h2 and h3
+        # checked only "HTTP", the slash, the space and three digits, and
+        # manufactured a downstream 200 from the digits (audit-report-8 F1).
+        conn.sendall(b"HTTP/x.y 200 OK\r\nContent-Length: 5\r\n\r\nvalid")
+    elif path.endswith(b"/bigearly"):
+        # Two LEGAL 103 Early Hints, each head 4040 bytes -- under the 6144
+        # per-head cap -- then the final 200, all in one write. Each fits on its
+        # own; their QPACK-encoded sum plus the final head does not fit the one
+        # 8192-byte staging buffer, so h3 answered 502 to an exchange h1 and h2
+        # served (audit-report-8 F2).
+        # SIX hints of 1300 bytes, not two of 4000. What overran the old 8192
+        # reserve is the AGGREGATE (6 x ~1490 encoded = ~8900), and spreading it
+        # over more, smaller heads keeps two other bounds happy: the whole
+        # exchange still fits LINNEA_CONN_UP_BUF (8448), and no single field
+        # section is bigger than pylsqpack will decode -- a 2700-byte one is
+        # not, which made the test client fail on a response curl-h3 handles
+        # perfectly. Sizing it this way keeps the fixture about the server
+        # rather than about the test's decoder. Six is also under the
+        # LINNEA_H3_PROXY_IMAX cap of 8, so this is the buffer being tested and
+        # not the count.
+        hint = (b"HTTP/1.1 103 Early Hints\r\nX-Filler: " + b"x" * 1300
+                + b"\r\n\r\n")
+        conn.sendall(hint * 6
+                     + b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nvalid")
+    elif path.endswith(b"/manyearly"):
+        # NINE interim responses, one past LINNEA_H3_PROXY_IMAX. Tiny ones:
+        # bounding the raw bytes cannot bound the ENCODED size, because every
+        # head however small encodes to a field section carrying its own via,
+        # date and server -- which is why the cap counts heads. h3 must refuse
+        # the chain while parsing, before capturing a body it could not send.
+        conn.sendall(b"HTTP/1.1 103 Early Hints\r\n\r\n" * 9
+                     + b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nvalid")
     else:
         conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
 

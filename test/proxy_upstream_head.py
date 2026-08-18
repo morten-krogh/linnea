@@ -68,8 +68,29 @@ CASES = [
     ("early-atonce",  200, b"final-reply"),   # both in ONE upstream write
     ("multi-early",   200, b"final-reply"),   # 103, 103, 100, then 200
     ("upgrade101",    502, None),    # a 101 has no meaning here: refuse it
+    # RFC 9112 2.3: HTTP-version is HTTP-name "/" DIGIT "." DIGIT, so
+    # "HTTP/x.y 200 OK" is not a status line. The shared validator skipped the
+    # status line outright and only h1 checked it afterwards, so h2 and h3
+    # manufactured a downstream 200 from the three digits and never looked at
+    # the version (audit-report-8 Finding 1). /api/http10 is its control: a
+    # legal HTTP/1.0 upstream must still translate.
+    ("badversion",    502, None),
+    ("http10",        200, b"old hi"),
+    # Six 103 Early Hints whose ENCODED sum overran the one staging buffer the
+    # interim frames share, so h3 answered 502 to an exchange h1 and h2 served
+    # (audit-report-8 Finding 2).
+    ("bigearly",      200, b"valid"),
     ("simple",     200, b"backend body"),
 ]
+
+# Routes the HTTP/3 leg here cannot judge, and why. Listed rather than quietly
+# dropped, so a reader sees the gap instead of assuming coverage.
+H3_SKIP = {
+    "bigearly": "pylsqpack stops decoding once a stream's field sections total "
+                "more than a few KiB, which any response big enough to exercise "
+                "this bound also exceeds -- curl-h3 handles it, and the shard "
+                "checks it with curl-h3 instead",
+}
 
 # The interim responses must arrive as their own HEADERS frames, in order,
 # ahead of the final one -- not be silently dropped, which would deliver the
@@ -285,13 +306,13 @@ def h3_all(routes):
     return out
 
 
-h3 = h3_all([r for r, _, _ in CASES])
+h3 = h3_all([r for r, _, _ in CASES if r not in H3_SKIP])
 
 for route, want_status, want_body in CASES:
     got = {}
     got["h1"] = h1(route)
     got["h2"] = h2(route)
-    if h3 is not None:
+    if h3 is not None and route not in H3_SKIP:
         got["h3"] = h3.get(route, (None, b"", [], []))
 
     statuses = {p: v[0] for p, v in got.items()}
@@ -318,6 +339,9 @@ if h3 is not None:
         got_seq = (h3.get(route) or (None, b"", [], []))[3]
         check(f"{route}: h3 relays the interim responses in order",
               got_seq == want_seq, f"  got {got_seq}, want {want_seq}")
+
+for route, why in H3_SKIP.items():
+    print(f"note: {route} not checked over HTTP/3 here -- {why}")
 
 if h3 is None:
     print("note: HTTP/3 not checked (aioquic unavailable) -- h1 and h2 only")

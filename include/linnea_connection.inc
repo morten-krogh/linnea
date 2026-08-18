@@ -180,6 +180,11 @@ struc linnea_connection
     ; sending "103 Early Hints" then "200 OK" gave the client the 103 and
     ; nothing else -- the answer it asked for was never delivered.
     .h3_hoff:       resq 1
+    ; ...and how many of them there were, capped at LINNEA_H3_PROXY_IMAX
+    ; while parsing. Bounding the raw bytes alone would not bound the
+    ; ENCODED size: every head, however small, encodes to a field section
+    ; carrying its own via, date and server (audit-report-8 Finding 2).
+    .h3_inum:       resq 1
     ; The access line's who-and-what, parked when the request is forwarded. It
     ; is written long afterwards, from an upstream completion, by which time the
     ; QUIC reassembly buffer those fields pointed into has been reused — and the

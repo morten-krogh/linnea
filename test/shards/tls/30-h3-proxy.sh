@@ -16,6 +16,35 @@ if [ "$ktls" = 1 ]; then
     timeout 120 python3 test/proxy_upstream_head.py $CA ${P61462} >/dev/null 2>&1
     check "proxy: h1/h2/h3 agree on refusing a malformed upstream head" $?
 
+    # The h3 half of /api/bigearly, which that matrix cannot judge: six 103
+    # Early Hints whose ENCODED sum overran the one buffer the interim frames
+    # share, so h3 answered 502 to an exchange h1 and h2 served (audit-report-8
+    # Finding 2). aioquic's decoder gives up once a stream's field sections
+    # total more than a few KiB -- which any response large enough to exercise
+    # this bound also exceeds -- so the check needs a real h3 client. It must
+    # come back 200 with the five-byte body behind all six hints.
+    if [ -x "$CURLH3" ] && "$CURLH3" -V 2>/dev/null | grep -q HTTP3; then
+        be=$("$CURLH3" --http3-only -sk --max-time 20              --resolve localhost:${P61462}:127.0.0.1              https://localhost:${P61462}/api/bigearly 2>/dev/null)
+        [ "$be" = "valid" ]
+        check "h3 relays a long interim chain and the final response ($be)" $?
+
+        # ...and the documented end of that rope. h3 buffers the whole interim
+        # sequence before it sends anything, so unlike h1 and h2 -- which relay
+        # each 1xx as it arrives and have no such limit -- it needs a cap, or a
+        # chain of minimal 1xx heads encodes to an unbounded number of field
+        # sections each carrying its own via, date and server. The cap is
+        # LINNEA_H3_PROXY_IMAX (8), enforced while PARSING so an over-long chain
+        # is refused before a body is captured for a response that could never
+        # be sent. /api/manyearly sends nine. This is a deliberate divergence
+        # from h1/h2, which serve it: asserted here so it stays deliberate.
+        many=$("$CURLH3" --http3-only -sk -o /dev/null -w '%{http_code}'                --max-time 20 --resolve localhost:${P61462}:127.0.0.1                https://localhost:${P61462}/api/manyearly 2>/dev/null)
+        [ "$many" = "502" ]
+        check "h3 refuses an interim chain past the documented cap ($many)" $?
+    else
+        check "h3 long interim chain (skipped: curl-h3 unavailable)" 0
+        check "h3 interim cap (skipped: curl-h3 unavailable)" 0
+    fi
+
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
         out=$(timeout 120 python3 test/quic/h3_proxy_test.py ${P61462} 2>&1)
         [ "$out" = "OK" ]

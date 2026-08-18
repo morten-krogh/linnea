@@ -180,9 +180,25 @@ LINNEA_H3_PROXY_RHEAD_MAX equ 6144
 ; of the body instead: the capture starts this far into the file, leaving a
 ; hole the head is written back into once its length is known, and the slot
 ; streams head and body as one run out of the mapping (its hdr goes unused).
-; The reserve therefore bounds the encoded head, and comfortably exceeds what
-; a 6144-byte upstream head can encode to.
-LINNEA_H3_PROXY_RESERVE   equ 8192
+; The reserve therefore bounds the encoded head -- and since report 7 that head
+; is not one HEADERS frame but the whole sequence: every interim (1xx) response
+; is re-encoded ahead of the final one, into this same space. 8192 was sized for
+; a single 6144-byte head and two legal 4040-byte "103 Early Hints" plus a final
+; response overran it, so h3 answered 502 to an exchange h1 and h2 served
+; (audit-report-8 Finding 2). 16384 holds anything up_buf can deliver: the raw
+; heads together cannot exceed LINNEA_CONN_UP_BUF (8448), and the encoder adds
+; roughly 150 bytes of via/date/server per head, bounded by the interim cap
+; below. The reserve is a HOLE in a sparse capture file, so the extra costs
+; nothing until it is written to.
+LINNEA_H3_PROXY_RESERVE   equ 16384
+; How many interim responses one exchange may carry. Without a cap the encoded
+; size is not bounded by up_buf at all: a chain of minimal 18-byte 1xx heads
+; fits there hundreds of times over, and each still encodes to a field section
+; carrying its own via, date and server. Enforced while PARSING, so an
+; over-long chain is refused at the head rather than after a whole body has
+; been captured for a response that could never be sent. Real use is one or two
+; Early Hints.
+LINNEA_H3_PROXY_IMAX      equ 8
 ; Where a parked request's access-line text sits in the leg's in_buf, and how
 ; much of each is kept. Long enough for any real method, target or host; a
 ; longer one is truncated, since this is a log line and not a decision.

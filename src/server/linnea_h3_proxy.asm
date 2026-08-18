@@ -191,6 +191,7 @@ linnea_h3_proxy_start:
     mov [r12 + linnea_connection.h3_sid], r15
     mov qword [r12 + linnea_connection.h3_hlen], 0
     mov qword [r12 + linnea_connection.h3_hoff], 0
+    mov qword [r12 + linnea_connection.h3_inum], 0
     mov qword [r12 + linnea_connection.h3_nobody], 0
     ; A recycled slot carries the last client's address, and the per-source
     ; connection cap counts every in_use slot whose peer_ip matches. A leg that
@@ -622,6 +623,11 @@ linnea_h3_proxy_head:
     je .ph_bad                       ; a 101 has no meaning over an h3 proxy,
                                      ; exactly as h2 refuses one
     add [rbx + linnea_connection.h3_hoff], rcx
+    inc qword [rbx + linnea_connection.h3_inum]
+    cmp qword [rbx + linnea_connection.h3_inum], LINNEA_H3_PROXY_IMAX
+    ja .ph_bad                       ; a chain longer than we will re-encode:
+                                     ; refused HERE, before a body is captured
+                                     ; for a response that could not be sent
     jmp .ph_restart
 .ph_final:
     ; --- body framing: Transfer-Encoding: chunked wins over Content-Length,

@@ -3441,6 +3441,47 @@ linnea_http_upstream_head_valid:
     mov r13, rsi                      ; head length
     mov qword [rsp], 0                ; no Content-Length seen yet
     xor rcx, rcx                      ; cursor
+    ; --- the status line itself ------------------------------------------
+    ; This used to be skipped outright, and only HTTP/1 checked it afterwards
+    ; with a policy of its own -- so "HTTP/x.y 200 OK" was a 502 there and a
+    ; perfectly ordinary 200 over h2 and h3, which manufactured a downstream
+    ; status from the three digits and never looked at the version bytes
+    ; (audit-report-8 Finding 1). RFC 9112 2.3 makes HTTP-version
+    ; HTTP-name "/" DIGIT "." DIGIT, so those bytes are part of the grammar,
+    ; not decoration; and a proxy that will only speak 1.0 or 1.1 upstream has
+    ; no business relaying a response claiming anything else. Checked here, in
+    ; the one gate every protocol already calls, rather than three times.
+    cmp r13, 13                       ; "HTTP/1.1 200" + CR at the very least
+    jb .hv_bad
+    mov rax, [r12]
+    lea rcx, [version_11]
+    cmp rax, [rcx]
+    je .hv_ver_ok
+    lea rcx, [version_10]
+    cmp rax, [rcx]
+    jne .hv_bad
+.hv_ver_ok:
+    cmp byte [r12 + 8], ' '           ; exactly one SP before the code
+    jne .hv_bad
+    xor ecx, ecx
+.hv_code:
+    cmp ecx, 3
+    jae .hv_code_done
+    movzx eax, byte [r12 + rcx + 9]
+    sub eax, '0'
+    cmp eax, 9
+    ja .hv_bad                        ; the status code is three DIGITS
+    inc ecx
+    jmp .hv_code
+.hv_code_done:
+    ; ...and the code is delimited: either the line ends, or a reason phrase
+    ; follows behind its own space. "HTTP/1.1 2000" is not a status line.
+    movzx eax, byte [r12 + 12]
+    cmp al, 13
+    je .hv_status
+    cmp al, ' '
+    jne .hv_bad
+    xor rcx, rcx
 .hv_status:                           ; skip the status line to its CR
     cmp rcx, r13
     jae .hv_ok
