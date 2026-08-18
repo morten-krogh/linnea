@@ -277,6 +277,32 @@ open(sys.argv[1],'wb').write(bytes(range(256))*40)" "$WWW/maxhdr.bin"     # 1024
     # the independent-client block below sets this too; both want it, and the
     # assignment is idempotent
     CURLH3=${LINNEA_CURL_H3:-$HOME/curl-h3/bin/curl}
+
+    # Finding 1 (audit-report-3): a proxied HTTP/3 response for a connection
+    # that arrived on a SECONDARY address must go out that connection's OWN
+    # socket, not the global primary. Config: primary "::1", secondary
+    # "127.0.0.1", one h3 port, /api proxied. Before the fix, the async upstream
+    # completion emitted the first response packet on the primary (::1) socket
+    # to the v4 peer -> sendto ENETUNREACH -> recovered only by a later
+    # retransmission on the right socket. strace the server across one proxied
+    # request through the secondary and require the request to SUCCEED (so a
+    # response really was sent) with ZERO cross-socket ENETUNREACH.
+    if command -v strace >/dev/null 2>&1 && [ -x "$CURLH3" ]; then
+        rm -f $RUNDIR/f1sec.strace $RUNDIR/linnea-h3pm.log
+        strace -f -e trace=sendto -o $RUNDIR/f1sec.strace \
+            ./bin/linnea --config $CFG/h3proxy-multi.json >/dev/null 2>&1 &
+        f1_spid=$!
+        for _ in $(seq 1 40); do ss -ulnH 2>/dev/null | grep -q ":${P61463}\b" && break; sleep 0.1; done
+        f1_code=$("$CURLH3" --http3-only -s -o /dev/null -w '%{http_code}' --max-time 15 \
+            --cacert $CA --resolve localhost:${P61463}:127.0.0.1 \
+            https://localhost:${P61463}/api/simple 2>/dev/null)
+        sleep 0.4
+        kill $f1_spid 2>/dev/null; sleep 0.2; kill -9 $f1_spid 2>/dev/null
+        [ "$f1_code" = 200 ] && ! grep -q ENETUNREACH $RUNDIR/f1sec.strace
+        check "h3 proxy: secondary-address response uses its own socket (no cross-socket ENETUNREACH; code=$f1_code)" $?
+    else
+        check "h3 proxy secondary-address fd (skipped: strace/curl-h3 unavailable)" 0
+    fi
     if [ -x "$CURLH3" ] && "$CURLH3" -V 2>/dev/null | grep -q HTTP3; then
         got=$("$CURLH3" --http3-only -s --max-time 20 --cacert $CA \
               --resolve localhost:${P61465}:127.0.0.1 \

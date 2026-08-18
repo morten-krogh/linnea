@@ -8050,6 +8050,16 @@ linnea_quic_h3_deliver:
     jne .hd_gone
     cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CLOSING
     je .hd_gone                       ; it sends nothing but its retained close
+    ; Send on the CONNECTION's own socket, not the fd the caller handed us. A
+    ; proxied response completes long after its request, on an upstream
+    ; completion that runs outside any received datagram and does not know which
+    ; of the several h3 sockets this connection lives on -- the async proxy
+    ; paths passed the global primary fd. On a connection that arrived through a
+    ; secondary address (a specific host beside the wildcard) that is the wrong
+    ; socket: the first send fails (ENETUNREACH when the primary cannot reach
+    ; the peer) and only a retransmission on the right socket recovers it, a PTO
+    ; late. The connection recorded its socket at allocation; use it.
+    mov r12d, [rbx + linnea_quic_conn.udp_fd]
     ; the slot the request parked. Gone means the peer cancelled the stream
     ; (reset_teardown freed it), which is an answer nobody wants any more.
     xor r14d, r14d

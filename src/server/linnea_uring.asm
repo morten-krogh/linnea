@@ -2119,7 +2119,8 @@ linnea_uring_run:
     jmp .wait
 .h3_proxy_fail:
     mov rdi, r12
-    mov edx, [quic_fd]
+    mov edx, [quic_fd]                ; vestigial: linnea_quic_h3_deliver replaces
+                                      ; this with the connection's own udp_fd
     call linnea_h3_proxy_fail
     call linnea_uring_submit_now
     jmp .wait
@@ -2331,7 +2332,8 @@ linnea_uring_run:
     jmp .proxy_fail
 .h3_body_done:
     mov rdi, r12
-    mov esi, [quic_fd]
+    mov esi, [quic_fd]                ; vestigial: linnea_quic_h3_deliver replaces
+                                      ; this with the connection's own udp_fd
     call linnea_h3_proxy_deliver
     call linnea_uring_submit_now
     jmp .wait
