@@ -12,7 +12,7 @@
 ; The map and program live as long as the SERVICE, not the process: a hot
 ; upgrade hands both fds to the next generation (see the upgrade env in
 ; linnea_start.asm), which registers its sockets under the other half of the
-; index space (steer_base 0 <-> 64). Loading fresh instead would detach the old
+; index space (steer_base 0 <-> LINNEA_BPF_STEER_HALF). Loading fresh instead would detach the old
 ; program from the group, and every draining worker's connection — its ids
 ; carry the old generation's indices — would steer to the new worker at that
 ; index, which has no state for it and answers with a stateless reset.
@@ -20,6 +20,7 @@
 default rel
 
 %include "linnea_syscall.inc"
+%include "linnea_config.inc"
 
 global linnea_bpf_reuseport_setup
 global linnea_bpf_map_add
@@ -168,7 +169,7 @@ linnea_bpf_reuseport_setup:
     mov dword [bpf_attr], MAP_TYPE_REUSEPORT_SOCKARRAY
     mov dword [bpf_attr + 4], 4               ; key_size = u32 index
     mov dword [bpf_attr + 8], 4               ; value_size = socket fd
-    mov dword [bpf_attr + 12], 128            ; max_entries (>= worker count)
+    mov dword [bpf_attr + 12], 2 * LINNEA_BPF_STEER_HALF   ; max_entries: the whole one-byte index range
     STAGE stg_mapcreate
     mov eax, SYS_BPF
     mov edi, BPF_MAP_CREATE

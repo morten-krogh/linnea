@@ -30,7 +30,7 @@ conn_pool: resb LINNEA_QUIC_MAX_CONNS * linnea_quic_conn_size
 linnea_quic_conn_free_hook: resq 1
 ; this worker's steering index, stamped into every connection id it issues so
 ; the BPF reuseport program can steer the connection's later packets back here.
-; The worker's slot plus its generation's steer_base (0, or 64 across a hot
+; The worker's slot plus its generation's steer_base (0, or LINNEA_BPF_STEER_HALF across a hot
 ; upgrade — the map is shared between the generations, so each stamps its own
 ; half and a draining worker's connections keep steering to it). Zero until
 ; the master sets it after fork.

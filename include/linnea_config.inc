@@ -45,6 +45,14 @@ LINNEA_DEFAULT_MAX_BODY         equ 67108864
 LINNEA_DEFAULT_MAX_CONNECTIONS  equ 1024
 LINNEA_DEFAULT_WORKERS          equ 0     ; 0 = one worker per online CPU
 LINNEA_MAX_WORKERS              equ 256
+; QUIC BPF CID-steering index space. The steering index is ONE byte of the
+; connection id (0..255), so the reuseport map holds 2 * HALF == 256 entries and
+; each hot-upgrade generation stamps from its own HALF (base 0 or HALF) -- two
+; generations of up to HALF workers each coexist without colliding. Lossless h3
+; reload therefore supports up to HALF workers; a cold start's migration steering
+; works up to 2 * HALF (the whole map). Beyond HALF the two generations cannot
+; both fit one byte -- a wider CID index would be a redesign.
+LINNEA_BPF_STEER_HALF           equ 128
 
 ; what a location routes to
 LINNEA_LOC_KIND_ROOT     equ 0       ; serve files from .root

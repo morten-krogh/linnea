@@ -166,6 +166,10 @@ log_qdrop:          db "quic receive overflow: "
 log_qdrop_len       equ $ - log_qdrop
 log_qdrop_end:      db " datagrams dropped by the kernel (socket buffer full)", 10
 log_qdrop_end_len   equ $ - log_qdrop_end
+log_bpfmap:         db "bpf steering: worker index could not be registered in the reuseport map (errno "
+log_bpfmap_len      equ $ - log_bpfmap
+log_bpfmap_end:     db "); this worker falls back to the kernel 4-tuple hash", 10
+log_bpfmap_end_len  equ $ - log_bpfmap_end
 log_closed:         db "closed connection on "
 log_closed_len      equ $ - log_closed
 log_from:           db " from "
@@ -626,6 +630,24 @@ linnea_uring_run:
     mov edi, [linnea_worker_index]
     mov esi, [quic_fd]
     call linnea_bpf_map_add
+    test rax, rax
+    jns .bpf_map_ok
+    ; the registration failed -- this worker's connections steer nowhere by id
+    ; and fall to the 4-tuple hash. With the map sized to the whole index range
+    ; this only happens on an unexpected kernel error, but ignoring it was how a
+    ; too-small map dropped steering for high worker indices in silence.
+    push rax
+    call linnea_log_stamp
+    lea rdi, [log_bpfmap]
+    mov esi, log_bpfmap_len
+    call linnea_log_write
+    pop rdi
+    neg rdi
+    call linnea_log_u64
+    lea rdi, [log_bpfmap_end]
+    mov esi, log_bpfmap_end_len
+    call linnea_log_write
+.bpf_map_ok:
     mov edi, [quic_fd]
     mov esi, [linnea_bpf_prog_fd]
     call linnea_bpf_attach

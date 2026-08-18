@@ -150,7 +150,7 @@ old_pid_count:  resq 1
 ; map and program are INHERITED across a hot upgrade: the draining workers'
 ; sockets stay registered in the map, so their connections' packets keep
 ; steering to them. Each generation stamps and registers under its own half of
-; the index space (steer_base 0 or 64) so the two never collide.
+; the index space (steer_base 0 or LINNEA_BPF_STEER_HALF) so the two never collide.
 steer_base:     resq 1                   ; this generation's steering-index base
 adopt_bpf_map:  resq 1                   ; inherited map fd (valid if adopt_bpf_ok)
 adopt_bpf_prog: resq 1                   ; inherited program fd
@@ -1027,12 +1027,15 @@ parse_upgrade_env:
     jne .no_bpf
     inc rsi
     call parse_dec             ; the half of the index space it stamped
-    xor rax, 64                ; take the other half…
-    and rax, 64                ; …and force a sane base whatever the env held
-    cmp qword [linnea_config_instance + linnea_config.workers], 64
+    xor rax, LINNEA_BPF_STEER_HALF   ; take the other half…
+    and rax, LINNEA_BPF_STEER_HALF   ; …and force a sane base whatever the env held
+    cmp qword [linnea_config_instance + linnea_config.workers], LINNEA_BPF_STEER_HALF
     jbe .base_ok
-    xor eax, eax               ; more workers than half the map holds: share
-                               ; base 0 (colliding, the pre-Q118 behaviour)
+    xor eax, eax               ; more than HALF workers: the two generations
+                               ; cannot both fit the one-byte index space, so
+                               ; they share base 0 (colliding). Reload is then
+                               ; not lossless for h3 -- documented; a wider CID
+                               ; index is the only real fix and is a redesign.
 .base_ok:
     mov [steer_base], rax
     mov qword [adopt_bpf_ok], 1

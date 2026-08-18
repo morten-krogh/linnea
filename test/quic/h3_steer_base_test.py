@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Q118: a master handed a steering section in LINNEA_UPGRADE must stamp its
 # workers' connection ids from the OTHER half of the index space (steer_base
-# 64 when the drained generation used 0), so its connections can never collide
+# 128 == LINNEA_BPF_STEER_HALF when the drained generation used 0), so its connections can never collide
 # with ones the draining workers still serve. And the inherited bpf fds are
 # best-effort: bogus ones (here: a pipe) must cost only the steering, never
 # the serving. This exercises the whole adopt path except the bpf syscalls
@@ -82,9 +82,9 @@ try:
     assert conn._handshake_confirmed, "handshake not confirmed"
 
     scid0 = conn._peer_cid.cid[0]
-    assert scid0 == 64, (
+    assert scid0 == 128, (
         f"connection id stamped {scid0}: the adopted generation must take the "
-        f"other half of the steering index space (want 64)")
+        f"other half of the steering index space (want 128 == LINNEA_BPF_STEER_HALF)")
 
     # and a request still round-trips: the pipe fds failed every bpf call,
     # which must have cost nothing but the steering
