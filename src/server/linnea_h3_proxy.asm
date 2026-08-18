@@ -321,7 +321,15 @@ linnea_h3_proxy_start:
     ; whatever framing (or none) the client used to send it.
     mov r13, [linnea_h3_proxy_body_len]
     test r13, r13
-    jz .st_nobody
+    jnz .st_clen
+    ; No bytes -- but a client that DECLARED a length has sent "a body of no
+    ; bytes", which is not the same request upstream as one with no body at
+    ; all, and only the first carries a Content-Length. Dropping it turned an
+    ; empty file upload into a POST with no framing, and a backend entitled to
+    ; require a length answered 411; h1 forwards "Content-Length: 0" here.
+    cmp qword [rbx + linnea_h2_req.cl_ptr], 0
+    je .st_nobody
+.st_clen:
     lea rdi, [hdr_clen]
     mov esi, hdr_clen_len
     call .up_append

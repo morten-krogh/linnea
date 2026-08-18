@@ -2206,7 +2206,7 @@ h2_serve:
     ; 18446744073709551616 wrapped the value to zero -- and zero is what this
     ; very test accepts as "no body announced".
     cmp qword [r12 + linnea_h2_req.cl_val], 0
-    je .proxy_nobody                 ; content-length: 0 -- consistent with no body
+    je .proxy_zerolen                ; content-length: 0 -- consistent with no body
     mov qword [r13 + linnea_h2p.state], LINNEA_H2P_FAILED
     mov qword [r13 + linnea_h2p.status], 400
     jmp .proxy_done
@@ -2281,6 +2281,18 @@ h2_serve:
     sub rbp, r15                      ; payload length
     mov r8b, LINNEA_H2_FLAG_END_HEADERS   ; interim response: no END_STREAM
     jmp .flags
+.proxy_zerolen:
+    ; "content-length: 0" is a DECLARATION, not the absence of one, and the
+    ; upstream head has to carry it forward. Falling into .proxy_nobody
+    ; unmarked sent the backend a POST with no framing at all, and a backend
+    ; entitled to require a length answered 411 -- which is what an empty file
+    ; upload did over h2 and h3, while h1 forwards "Content-Length: 0" and
+    ; worked. The flag is the one the reconciliation already uses, so
+    ; h2p_finalize can tell "no body" from "a body of no bytes".
+    ; Placed out of line here for the same reason .proxy_toolarge is: the
+    ; fall-through into .proxy_done below is load-bearing.
+    or qword [r13 + linnea_h2p.flags], LINNEA_H2P_F_HAS_CL
+    jmp .proxy_nobody
 .proxy_toolarge:
     ; NB: below .proxy_done's jmp, not above it — .proxy_nobody falls THROUGH
     ; into .proxy_done, so a label placed between them marks every bodiless
@@ -3024,7 +3036,14 @@ h2p_finalize:
     lea rdi, [rbx + linnea_h2p.buf]
     add rdi, [rbx + linnea_h2p.req_len]
     test r12, r12
+    jnz .fin_clen
+    ; No bytes -- but "no body" and "a body of no bytes" are different requests
+    ; upstream, and only the second one declares a length. h1 forwards
+    ; "Content-Length: 0" for it; h2 sent nothing at all, so a backend that
+    ; requires a length answered 411 to an empty upload.
+    test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_HAS_CL
     jz .fin_nobody
+.fin_clen:
     push rdi
     lea rsi, [h2p_clen]                    ; "Content-Length: "
     mov ecx, h2p_clen_len

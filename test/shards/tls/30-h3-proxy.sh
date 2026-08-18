@@ -16,6 +16,16 @@ if [ "$ktls" = 1 ]; then
     timeout 120 python3 test/proxy_upstream_head.py $CA ${P61462} >/dev/null 2>&1
     check "proxy: h1/h2/h3 agree on refusing a malformed upstream head" $?
 
+    # Reported from production: an EMPTY file upload came back 411 Length
+    # Required. The 411 was the backend's, correctly -- linnea had handed it a
+    # POST with no framing at all, because h2 and h3 dropped the Content-Length
+    # whenever the measured body was zero. "A body of no bytes" and "no body"
+    # are different requests upstream, and only the first declares a length;
+    # h1 forwarded "Content-Length: 0" and worked. Asserts what was SENT
+    # upstream, via the head-echo route, not just the status that came back.
+    timeout 120 python3 test/proxy_empty_body.py $CA ${P61462} >/dev/null 2>&1
+    check "proxy: an empty body forwards Content-Length: 0 on every protocol" $?
+
     # The h3 half of /api/bigearly, which that matrix cannot judge: six 103
     # Early Hints whose ENCODED sum overran the one buffer the interim frames
     # share, so h3 answered 502 to an exchange h1 and h2 served (audit-report-8
