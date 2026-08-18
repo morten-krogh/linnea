@@ -1,0 +1,9 @@
+{
+  "log": "test/linnea.log", "timeout": 2, "workers": 1,
+  "servers": [
+    { "host": "127.0.0.1", "port": 61466, "hostname": "alpha.test",
+      "locations": [ { "prefix": "/", "root": "test/www" } ] },
+    { "host": "127.0.0.1", "port": 61466, "hostname": "beta.test",
+      "locations": [ { "prefix": "/", "root": "test/www/sub" } ] }
+  ]
+}

@@ -28,6 +28,7 @@ global h2_queue_goaway_pub
 
 extern linnea_hpack_decode
 extern linnea_hpack_req_check
+extern linnea_http_authority_host
 extern hpack_dyn_reset
 extern linnea_h3_altsvc
 extern linnea_h3_altsvc_len
@@ -5331,15 +5332,17 @@ h2_select_vhost:
     test r12, r12
     jz .vdone
     mov r13, [rsi + linnea_h2_req.auth_len]
-    xor eax, eax
-.vport:
-    cmp rax, r13
-    jae .vscan
-    cmp byte [r12 + rax], ':'
-    je .vcut
-    inc rax
-    jmp .vport
-.vcut:
+    ; the host to match is the parser's slice (bracket-aware, port stripped),
+    ; not everything before the first ':'. rsp is 8-aligned here, so square it
+    ; for the call. r12/r13 survive it (the parser saves only rbx).
+    mov rdi, r12
+    mov rsi, r13
+    sub rsp, 8
+    call linnea_http_authority_host        ; rax = host len, rdx = host offset
+    add rsp, 8
+    cmp rax, -1
+    je .vdone                              ; malformed (already rejected): default
+    add r12, rdx
     mov r13, rax
 .vscan:
     test r13, r13

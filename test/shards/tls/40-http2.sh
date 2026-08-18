@@ -8,6 +8,12 @@ if [ "$ktls" = 1 ]; then
     timeout 10 python3 test/tls/h2_bringup.py $CA ${P61446} >/dev/null 2>&1
     check "http2 connection bring-up (preface, settings, ping, goaway)" $?
 
+    # Finding 2 (audit-report-2): HTTP/2 shares the one authority grammar. A
+    # malformed :authority -- a non-numeric or extra-colon port, an unterminated
+    # IPv6 bracket -- has its stream refused; a valid one is still served.
+    timeout 30 python3 test/tls/h2_authority_grammar.py $CA ${P61446} >/dev/null 2>&1
+    check "http2 authority grammar: malformed :authority refused, valid served" $?
+
     # M16/M17: a real HTTP/2 client (curl's nghttp2 — genuine HPACK with
     # Huffman + the static table) has its HEADERS decoded and the named
     # static file served back over h2. Serving the right file end to end is

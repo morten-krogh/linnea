@@ -27,6 +27,7 @@ default rel
 %include "linnea_hpack_data.inc"
 
 global linnea_hpack_decode
+extern linnea_http_authority_host
 ; shared with the QPACK decoder (same Huffman code and pseudo-header logic)
 global hpack_int
 global hpack_str
@@ -1442,19 +1443,16 @@ linnea_hpack_req_check:
     repe cmpsb
     jne .bad
 .check_value:
-    mov rsi, [rbx + linnea_h2_req.auth_ptr]
-    mov rcx, [rbx + linnea_h2_req.auth_len]
-    test rcx, rcx
+    mov rdi, [rbx + linnea_h2_req.auth_ptr]
+    mov rsi, [rbx + linnea_h2_req.auth_len]
+    test rsi, rsi
     jz .bad                          ; an empty authority names nothing
-.cv_scan:
-    movzx eax, byte [rsi]
-    cmp al, 0x20
-    jbe .bad                         ; space or control byte
-    cmp al, 0x7f
+    ; STRUCTURE, not just control-freeness: a reg-name or bracketed IPv6
+    ; literal and an optional one-to-five-digit port, the same grammar the
+    ; HTTP/1.1 Host demands. rbx (the req) survives the call.
+    call linnea_http_authority_host
+    cmp rax, -1
     je .bad
-    inc rsi
-    dec rcx
-    jnz .cv_scan
     ; :path gets the same treatment. On HTTP/1.1 the request line cannot hold a
     ; space or a control byte and survive parsing, but here the target is just
     ; another field value, where only CR/LF/NUL are refused — so an ESC or a

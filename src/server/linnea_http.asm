@@ -86,6 +86,7 @@ extern linnea_h3_advert
 global linnea_http_handle
 global linnea_http_proxy_error
 global linnea_http_proxy_head
+global linnea_http_authority_host
 global linnea_http_proxy_log
 
 LINNEA_HTTP_MAX_METHOD  equ 32
@@ -1484,16 +1485,15 @@ linnea_http_handle:
     mov rcx, [rsp + 96]
     test rcx, rcx
     jz .resp_400               ; "Host:" with no authority at all
-    mov rdx, [rsp + 88]
-.host_char:
-    movzx eax, byte [rdx]
-    cmp al, 0x20
-    jbe .resp_400              ; space or control byte inside the authority
-    cmp al, 0x7f
+    ; Validate the authority as a STRUCTURE, not just byte by byte: a reg-name
+    ; or a bracketed IPv6 literal, then an optional one-to-five-digit port and
+    ; nothing else. "three.test:garbage" and "[::1" are 400 now, exactly as a
+    ; control byte in the authority always was.
+    mov rdi, [rsp + 88]
+    mov rsi, rcx
+    call linnea_http_authority_host
+    cmp rax, -1
     je .resp_400
-    inc rdx
-    dec rcx
-    jnz .host_char
 .host_done:
     test qword [rsp + 136], 2
     jnz .resp_501                      ; a coding we do not implement
@@ -1686,20 +1686,19 @@ linnea_http_handle:
     mov rcx, [rsp + 96]
     test rcx, rcx
     jz .server_chosen
-    mov rsi, [rsp + 88]
-    xor edx, edx
-.host_port_scan:
-    cmp rdx, rcx
-    jae .host_port_done
-    cmp byte [rsi + rdx], ':'
-    je .host_port_found
-    inc rdx
-    jmp .host_port_scan
-.host_port_found:
-    mov rcx, rdx
-.host_port_done:
-    mov [rsp + 96], rcx
-    test rcx, rcx
+    ; the host to match is the parser's host slice -- past a leading '[' and
+    ; short of the ']' or ':port' -- not "everything before the first colon",
+    ; which for "[::1]:443" was just "[". A malformed authority was already
+    ; rejected with 400 above, so -1 here only means "use the default".
+    mov rdi, [rsp + 88]
+    mov rsi, rcx
+    call linnea_http_authority_host        ; rax = host len, rdx = host offset
+    cmp rax, -1
+    je .server_chosen
+    add rdx, [rsp + 88]
+    mov [rsp + 88], rdx                     ; host ptr, past any '['
+    mov [rsp + 96], rax                     ; host len, port and brackets removed
+    test rax, rax
     jz .server_chosen
     lea rax, [linnea_config_instance]
     mov r13, [rax + linnea_config.server_count]
@@ -3173,6 +3172,131 @@ target_absolute:
     ret
 
 ; --- proxying ----------------------------------------------------------
+
+; linnea_http_authority_host(rdi = authority ptr, rsi = authority len)
+;   -> rax = host length, rdx = host offset from ptr (0, or 1 for a bracketed
+;      literal); or rax = -1 when the authority is malformed.
+;
+; The single authority parser for all three protocols. An authority is
+;   reg-name-or-IPv4 [ ":" port ]   or   "[" IPv6 "]" [ ":" port ]
+; and a bare split at the first ':' mis-handles both ends of the grammar: it
+; turned "[::1]:443" into the host "[" (the first ':' sits inside the literal),
+; and it accepted "three.test:garbage" and "three.test:80:bad" because whatever
+; followed the first ':' was never looked at. Here the bracket form is parsed to
+; its closing ']', and a port -- in either form -- is accepted only as one to
+; five decimal digits with nothing after it. The host character rule matches
+; what the h1 Host and h2/h3 :authority validators already enforced (printable,
+; no space, no DEL); it is not tightened here, only the STRUCTURE is. A well
+; formed name that is not a configured vhost still simply falls through to the
+; default -- rejecting is for malformed structure, not for unknown names.
+linnea_http_authority_host:
+    push rbx
+    test rsi, rsi
+    jz .ah_bad                        ; empty: names nothing
+    cmp byte [rdi], '['
+    je .ah_bracket
+    ; --- reg-name / IPv4 form: host up to ':', then a digits-only port ---
+    xor ecx, ecx                      ; scan index
+.ah_u_scan:
+    cmp rcx, rsi
+    jae .ah_u_hostonly                ; ran to the end with no ':' -> all host
+    movzx eax, byte [rdi + rcx]
+    cmp al, ':'
+    je .ah_u_port
+    cmp al, 0x20
+    jbe .ah_bad                       ; space or control byte
+    cmp al, 0x7f
+    je .ah_bad                        ; DEL
+    cmp al, '['
+    je .ah_bad                        ; a bracket only opens the literal form
+    cmp al, ']'
+    je .ah_bad
+    inc rcx
+    jmp .ah_u_scan
+.ah_u_hostonly:
+    test rcx, rcx
+    jz .ah_bad                        ; empty host
+    mov rax, rcx                      ; host_len
+    xor edx, edx                      ; host_off = 0
+    pop rbx
+    ret
+.ah_u_port:
+    test rcx, rcx
+    jz .ah_bad                        ; ":port" with no host
+    mov rbx, rcx                      ; host_len
+    inc rcx                           ; first port byte
+    call .ah_port_tail                ; validate rcx..rsi as 1..5 digits
+    jc .ah_bad
+    mov rax, rbx
+    xor edx, edx
+    pop rbx
+    ret
+    ; --- "[" IPv6 "]" [ ":" port ] ------------------------------------
+.ah_bracket:
+    mov rcx, 1                        ; first byte inside the brackets
+.ah_b_scan:
+    cmp rcx, rsi
+    jae .ah_bad                       ; no closing ']'
+    movzx eax, byte [rdi + rcx]
+    cmp al, ']'
+    je .ah_b_close
+    cmp al, 0x20
+    jbe .ah_bad
+    cmp al, 0x7f
+    je .ah_bad
+    cmp al, '['
+    je .ah_bad                        ; no nested '['
+    inc rcx
+    jmp .ah_b_scan
+.ah_b_close:
+    cmp rcx, 1
+    jbe .ah_bad                       ; "[]" : empty literal
+    mov rbx, rcx                      ; index of ']'  (host is bytes 1..rbx-1)
+    inc rcx                           ; byte after ']'
+    cmp rcx, rsi
+    jae .ah_b_ok                      ; nothing after ']' : the bare literal
+    movzx eax, byte [rdi + rcx]
+    cmp al, ':'
+    jne .ah_bad                       ; "[::1]x" : junk after the literal
+    inc rcx
+    call .ah_port_tail
+    jc .ah_bad
+.ah_b_ok:
+    lea rax, [rbx - 1]                ; host_len = ']' index - 1
+    mov edx, 1                        ; host_off = 1 (past the '[')
+    pop rbx
+    ret
+.ah_bad:
+    mov rax, -1
+    pop rbx
+    ret
+
+; .ah_port_tail(rcx = first port index, rsi = authority len, rdi = ptr)
+; CF clear iff rcx..rsi is 1..5 decimal digits and nothing else. Internal to
+; linnea_http_authority_host; clobbers rax, rcx (not rbx/rdx).
+.ah_port_tail:
+    cmp rcx, rsi
+    jae .pt_bad                       ; a ':' with no port at all
+    mov rax, rsi
+    sub rax, rcx
+    cmp rax, 5
+    ja .pt_bad                        ; more digits than any port has
+.pt_scan:
+    cmp rcx, rsi
+    jae .pt_ok
+    movzx eax, byte [rdi + rcx]
+    cmp al, '0'
+    jb .pt_bad
+    cmp al, '9'
+    ja .pt_bad
+    inc rcx
+    jmp .pt_scan
+.pt_ok:
+    clc
+    ret
+.pt_bad:
+    stc
+    ret
 
 ; linnea_http_log_conn(rdi=conn*, rsi=status, rdx=bytes)
 ; The access log line for a proxied request, emitted once the exchange is

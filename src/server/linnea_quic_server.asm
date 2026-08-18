@@ -99,6 +99,7 @@ global linnea_h3d_foff
 global linnea_h3d_flen
 global linnea_h3_cancel_hook
 
+extern linnea_http_authority_host
 extern linnea_error_exit
 extern linnea_h3_build_431
 extern linnea_h3_build_429
@@ -673,15 +674,14 @@ authority_vhost:
     push r15
     mov r12, rdi
     mov r13, rsi
-    xor eax, eax
-.av_port:
-    cmp rax, r13
-    jae .av_scan
-    cmp byte [r12 + rax], ':'
-    je .av_cut
-    inc rax
-    jmp .av_port
-.av_cut:
+    ; host to match = the parser's bracket-aware, port-stripped slice, not the
+    ; text before the first ':'. rsp is 16-aligned here (5 pushes above), and
+    ; r12/r13 survive the call. A malformed authority was already rejected by
+    ; linnea_hpack_req_check, so -1 only means "no vhost".
+    call linnea_http_authority_host        ; rdi/rsi already = ptr/len
+    cmp rax, -1
+    je .av_none
+    add r12, rdx
     mov r13, rax
 .av_scan:
     test r13, r13

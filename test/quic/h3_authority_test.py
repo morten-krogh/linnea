@@ -112,4 +112,19 @@ assert b"sub index" in body, f"unknown authority was not served locally: {body[:
 body = request("sni.test", [M, S, P])
 assert b"sub index" not in body and b"doctype" not in body, \
     "a request with no authority was served"
+
+# a structurally malformed :authority is refused on its stream, not served:
+# a non-numeric port, an extra port component, an unterminated bracket, or junk
+# after the IPv6 literal. Before the shared authority parser these split at the
+# first ':' and whatever followed was never looked at.
+for bad in (b"sni.test:garbage", b"sni.test:80:bad", b"[::1", b"[::1]x", b"sni.test:"):
+    body = request("sni.test", [M, S, (b":authority", bad), P])
+    assert b"sub index" not in body and b"doctype" not in body and b"421" not in body, \
+        f"malformed authority {bad!r} was served: {body[:60]}"
+
+# a WELL-formed bracketed IPv6 literal we do not host is served locally, like
+# any other unknown name -- and is not mis-parsed to the host "[" (which is how
+# the first-colon split mangled it)
+body = request("sni.test", [M, S, (b":authority", b"[::1]:%d" % port), P])
+assert b"sub index" in body, f"bracketed authority not served locally: {body[:60]}"
 print("ok")
