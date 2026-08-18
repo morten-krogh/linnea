@@ -1072,6 +1072,20 @@ linnea_h3_serve:
     cmp dword [rdi], 0x44414548      ; "HEAD", little-endian
     jne .resp_405
 .join:
+    ; A static location serves a file: it has no use for request content, and
+    ; content on GET or HEAD has no defined semantics anyway (RFC 9110 9.3.1).
+    ; Serving the file regardless means silently discarding bytes the client
+    ; announced -- the request-smuggling shape 9.3.1 names -- so refuse instead.
+    ; [rsp+48] is the reassembled body length, whether it came inline or through
+    ; a capture file, and h3 has the whole request here, which is why it is the
+    ; one protocol that can decide this on the CONTENT rather than on the
+    ; declaration. A declared length that disagreed with it never reaches this
+    ; function: linnea_quic_server reconciles the two first.
+    ;
+    ; After the method gate, not before it: a POST to a static path is a method
+    ; fault (405), and answering 400 for it would be reporting the wrong thing.
+    cmp qword [rsp + 48], 0
+    jne .bad
     ; the root goes immediately in front of the path, ending where it begins
     lea rdi, [h3_path_buf + LINNEA_H3_PATH_ROOT]
     sub rdi, rdx

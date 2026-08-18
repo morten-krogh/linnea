@@ -85,6 +85,7 @@ extern linnea_h3_advert
 
 global linnea_http_handle
 global linnea_http_proxy_error
+global linnea_http_request_timeout
 global linnea_http_proxy_head
 extern linnea_http_authority_host
 global linnea_http_proxy_log
@@ -184,6 +185,15 @@ resp_414:       db "HTTP/1.1 414 URI Too Long", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_414_len    equ $ - resp_414
+; RFC 9110 15.5.9: the client did not finish the request in time. Sent where
+; the connection used to be dropped in silence -- a client whose body stalled
+; got no status at all and could not tell a server that gave up from a network
+; that ate the connection. "Connection: close" is the SHOULD in 15.5.9.
+resp_408:       db "HTTP/1.1 408 Request Timeout", 13, 10
+                db "Server: linnea", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_408_len    equ $ - resp_408
 ; RFC 6585 4. Connection: close on purpose — a client being metered should not
 ; hold the connection open waiting to spend the next bucket on it.
 resp_429:       db "HTTP/1.1 429 Too Many Requests", 13, 10
@@ -1858,6 +1868,18 @@ linnea_http_handle:
     je .resp_501               ; a method we do not recognise at all (15.6.2)
     cmp qword [rsp], -1
     je .resp_405               ; a method we know, but files are GET/HEAD only
+    ; A static location serves a file: it has no use for request content, and
+    ; content on GET or HEAD has no defined semantics anyway (RFC 9110 9.3.1).
+    ; Serving the file regardless means silently discarding bytes the client
+    ; announced -- the request-smuggling shape 9.3.1 names. h1 already refused
+    ; the half of this it happened to notice: a body too big to sit in in_buf
+    ; streams, and .resp_413 four lines up turns that into a refusal. A body
+    ; that FIT was ignored and the file served, so the same request was refused
+    ; or served depending on how it compared with a buffer size nobody
+    ; configured -- the shape Finding 3 had on max_body. [rsp+128] is the body
+    ; length (declared, or decoded for a chunked one), so both are refused now.
+    cmp qword [rsp + 128], 0
+    jne .resp_400
     mov rdi, r15               ; path end, from the match above
     mov r9, [rsp + 168]        ; directory flag
     test r9d, r9d
@@ -3224,9 +3246,25 @@ linnea_http_log_conn:
     mov [rsp + 24], r15        ; target len
     add r13, r14               ; target ptr
     call linnea_log_access_begin   ; marks the stream AND writes "request "
+    ; The vhost can be ABSENT. Every caller here until now logged a request that
+    ; had routed, so the name was always there and this read was unguarded -- and
+    ; the first caller that logs a request which never routed (the 408 for a body
+    ; that stalled: h1 waits for a declared body BEFORE choosing a vhost) took a
+    ; SIGSEGV on a null dereference at +0x148, killing the worker. Guarded here
+    ; rather than at that one call site, because "which vhost served this" is a
+    ; question a request can legitimately fail to have an answer to, and the next
+    ; caller to log one would find the same hole. "-" is the access-log
+    ; convention for a field with no value.
     mov rax, [rbx + linnea_connection.vhost]
+    test rax, rax
+    jz .lc_no_vhost
     lea rdi, [rax + linnea_config_server.hostname]
     mov rsi, [rax + linnea_config_server.hostname_len]
+    jmp .lc_name
+.lc_no_vhost:
+    lea rdi, [log_dash]
+    mov esi, 1
+.lc_name:
     call linnea_log_write
     lea rdi, [log_from]
     mov esi, log_from_len
@@ -3326,6 +3364,43 @@ linnea_http_proxy_error:
     call linnea_http_log_conn
     add rsp, 8
     pop r12
+    pop rbx
+    ret
+
+; linnea_http_request_timeout(rdi=conn*) — answer 408 and stop keeping the
+; connection alive (RFC 9110 15.5.9). Called from the io_uring loop when the
+; idle clock fires on an HTTP/1 connection with a request PARTLY received: a
+; head that stopped mid-line, or -- the case that made this visible -- a body
+; that declared N bytes and sent fewer. h1 waits for a declared body before it
+; routes, and a short body is indistinguishable from a slow one on a byte
+; stream, so waiting is right and the timeout is the only possible answer. What
+; was wrong is that there was no answer: the connection was closed with the log
+; line "idle timeout" and nothing went to the client at all.
+;
+; Only for a request in progress. req_start is zero between requests, so an
+; idle keep-alive connection -- legitimate, and possibly long -- still closes in
+; silence rather than being told it timed out.
+;
+; The caller must set answer_linger before arming the send, as the capture
+; refusals do: the client is still sending, and closing on top of the answer
+; would RST away the very bytes that explain the refusal.
+linnea_http_request_timeout:
+    push rbx
+    sub rsp, 8
+    mov rbx, rdi
+    lea rsi, [resp_408]
+    mov edx, resp_408_len
+    mov rcx, [rbx + linnea_connection.vhost]   ; its security headers ride this
+    call http_error_blob                       ; -> rax = ptr, rdx = length
+    mov [rbx + linnea_connection.out_ptr], rax
+    mov [rbx + linnea_connection.out_rem], rdx
+    mov qword [rbx + linnea_connection.keep_alive], 0
+    mov qword [rbx + linnea_connection.file_rem], 0   ; drop any queued body
+    mov rdi, rbx
+    mov esi, 408
+    xor edx, edx
+    call linnea_http_log_conn
+    add rsp, 8
     pop rbx
     ret
 

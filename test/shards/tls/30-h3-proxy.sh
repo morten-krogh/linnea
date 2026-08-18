@@ -207,6 +207,14 @@ EOF
         out=$(timeout 30 python3 test/quic/h3_content_length.py ${P61470} 2>&1 | tail -1)
         [ "$out" = "OK" ]
         check "h3 reconciles content-length with the DATA sent ($out)" $?
+        # ...and a STATIC location takes no request content at all (RFC 9110
+        # 9.3.1), the same rule h1 and h2 now apply. h3 decides it on the
+        # CONTENT rather than the declaration -- it has the whole request before
+        # routing -- so a length that DISAGREES is still the stream error RFC
+        # 9114 4.1.2 requires, raised before routing, while content that
+        # actually arrived earns a 400.
+        timeout 60 python3 test/quic/h3_static_body.py ${P61470} >/dev/null 2>&1
+        check "h3 static locations take no request content" $?
         # Finding 11: a COMPLETED request must not be dispatched twice. Serve one,
         # then re-inject its exact STREAM frame under a fresh packet number (aioquic
         # PTO-probes a small completed request with a PING, so this forges the

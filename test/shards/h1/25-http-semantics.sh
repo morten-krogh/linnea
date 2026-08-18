@@ -106,10 +106,18 @@ check_http "dotdot to dir"  "linnea index page" "$(raw_http 'GET /sub/.. HTTP/1.
 check_http "above root"     "400 Bad Request" "$(raw_http 'GET /a/../../x HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
 
 # --- request bodies ---
-resp=$(raw_http 'GET /hello.txt HTTP/1.1\r\nHost: one.test\r\nContent-Length: 5\r\n\r\nXXXXXGET /hello.txt HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')
-n=$(printf '%s' "$resp" | grep -c "200 OK")
-[ "$n" -eq 2 ]
-check "body discarded, keep-alive" $?
+# A static location does not accept request content (RFC 9110 9.3.1): it never
+# reads it, so serving the file regardless discards bytes the client announced,
+# which is the smuggling shape 9.3.1 names. This check used to assert the
+# opposite -- the body was discarded and the connection kept alive, so the
+# request pipelined behind it came back as a SECOND 200 -- and h1 refused only
+# the half it happened to notice, a body too big to sit in in_buf. The
+# expectation moves with the behaviour, the way the chunked one below already
+# had to. The script also covers the other half: a request that stops short is
+# now answered 408 instead of being dropped in silence, and an idle keep-alive
+# connection is still owed that silence.
+timeout 60 python3 test/h1_static_body.py ${P61080} >/dev/null 2>&1
+check "static locations take no request content; a short one gets 408" $?
 # Chunked bodies used to be 501 and this test asserted it. Receiving and
 # decoding the coding is a MUST (RFC 9112 7.1), so the expectation moves with
 # the behaviour: a complete chunked body is served, and a coding we genuinely do

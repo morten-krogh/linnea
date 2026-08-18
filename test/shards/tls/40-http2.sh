@@ -399,6 +399,16 @@ PY
     timeout 60 python3 test/tls/h2_content_length.py $CA ${P61443} >/dev/null 2>&1
     check "http2 content-length is reconciled with the DATA sent" $?
 
+    # ...and on a STATIC location there is nothing to reconcile it against: h2
+    # drops a DATA frame no proxy slot is collecting, so it answered at the
+    # HEADERS frame and never counted what followed -- the one protocol here
+    # that served a file for a request whose framing it had not checked.
+    # Content on a static location is refused instead (RFC 9110 9.3.1), on the
+    # declaration AND on the framing, since testing only the content-length
+    # would be bypassed by sending DATA without declaring one.
+    timeout 60 python3 test/tls/h2_static_body.py $CA ${P61443} >/dev/null 2>&1
+    check "http2 static locations take no request content" $?
+
     # RFC 9113 8.1/8.1.1: a HEADERS carrying END_STREAM ends the message, so a
     # nonzero content-length on it is a body announced with no DATA (Finding 24);
     # a trailer section MUST carry END_STREAM, and one that omits it does not end

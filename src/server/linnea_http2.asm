@@ -1588,6 +1588,28 @@ h2_serve:
     test rax, rax
     jz .resp_405
 .static_go:
+    ; A static location serves a file: it has no use for request content, and
+    ; content on GET or HEAD has no defined semantics anyway (RFC 9110 9.3.1).
+    ; h2 does not read it -- a DATA frame on a stream no proxy slot is
+    ; collecting is credited and DROPPED -- so serving the file regardless means
+    ; silently discarding bytes the client announced, the request-smuggling
+    ; shape 9.3.1 names. It also left h2 the one protocol here that never
+    ; noticed a content-length disagreeing with its body: h3 reconciles the two
+    ; before routing and h1 waits for the whole declared body, but h2 answers at
+    ; the HEADERS frame and never counts what follows.
+    ;
+    ; So the test is on the DECLARATION and the framing, both known here:
+    ; a nonzero content-length, or a HEADERS frame that does not end the message
+    ; (content -- or a trailer section, which implies content -- is still to
+    ; come). Testing only the content-length would be trivially bypassed by
+    ; sending DATA without declaring one.
+    ;
+    ; After the method gate, not before it: a POST to a static path is a method
+    ; fault (405), and answering 400 for it would be reporting the wrong thing.
+    cmp qword [r12 + linnea_h2_req.cl_val], 0
+    jne .resp_400
+    cmp dword [h2_req_es], 0
+    je .resp_400
     mov rax, [rsp + S_LOC]
     ; join: copy the root just ahead of the path start, in place
     mov rcx, [rax + linnea_config_location.root_len]

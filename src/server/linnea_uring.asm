@@ -74,6 +74,7 @@ extern linnea_connection_at
 extern linnea_connection_active
 extern linnea_http_handle
 extern linnea_http_proxy_error
+extern linnea_http_request_timeout
 extern linnea_http_proxy_head
 ; an upstream leg owned by an HTTP/3 stream: the same completions, diverted
 extern linnea_h3_proxy_start
@@ -1271,6 +1272,48 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .recv_timeout_close:
+    ; An HTTP/1 connection with a request PARTLY received is owed an answer
+    ; (RFC 9110 15.5.9). It used to get none: a client whose declared body
+    ; stalled had the connection dropped in silence, so it could not tell a
+    ; server that gave up from a network that ate the connection. h1 waits for a
+    ; declared body BEFORE it routes, and a body that stops short is
+    ; indistinguishable from a slow one on a byte stream, so this timeout is the
+    ; only answer h1 can ever give -- it just has to be given.
+    ;
+    ; in_len is what says a request is PARTLY received: the keep-alive path
+    ; above leaves it holding exactly the pipelined bytes a response did not
+    ; consume, so it is zero on a connection sitting idle between requests --
+    ; legitimate, possibly for a long time, and owed silence rather than a
+    ; complaint. It is req_start that cannot answer this question, though the
+    ; head clock uses it: the handshake's own sends zero it, so a TLS
+    ; connection reaches its first request with req_start already 0 (the same
+    ; hole .req_body_recv documents from the other side).
+    ;
+    ; h2 is excluded: it answers an overrun body deadline itself with a 408 on
+    ; the stream (see the service pass above), and writing a bare HTTP/1
+    ; response onto an h2 connection would be a framing error. So is anything
+    ; mid-proxy -- a response may be in flight from the upstream, and a 408
+    ; spliced into it is the framing error we refuse everywhere else. (A
+    ; stalled handshake and a stalled capture never reach here at all: .on_recv
+    ; dispatches both before the -ECANCELED test.)
+    cmp qword [r12 + linnea_connection.is_h2], 0
+    jne .recv_timeout_silent
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    jne .recv_timeout_silent
+    cmp qword [r12 + linnea_connection.in_len], 0
+    je .recv_timeout_silent
+    ; Nothing has gone to the client yet, so the exchange can still be answered
+    ; honestly -- but the client is mid-send and does not know it is over, so
+    ; the close has to linger or the RST discards the answer just written. Same
+    ; shape as .capture_answer.
+    mov qword [r12 + linnea_connection.answer_linger], 1
+    mov rdi, r12
+    call linnea_http_request_timeout
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.recv_timeout_silent:
     lea r14, [reason_timeout]
     mov r15d, reason_timeout_len
     jmp .conn_close
