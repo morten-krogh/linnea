@@ -4300,7 +4300,10 @@ h2p_head_find:
     cmp rax, rbp
     jae .hf_valdone
     cmp byte [rbx + rax], ' '
-    jne .hf_valdone
+    je .hf_lead_skip
+    cmp byte [rbx + rax], 9          ; HTAB is OWS too (RFC 9110 5.6.3), and
+    jne .hf_valdone                  ; skipping only SP made "Content-Length:
+.hf_lead_skip:                       ; <TAB>5" a 502 on h2 while h1 served it
     inc rax
     jmp .hf_lead
 .hf_valdone:
@@ -4312,7 +4315,10 @@ h2p_head_find:
     mov rcx, rax
     add rcx, rdx
     cmp byte [rbx + rcx - 1], ' '
+    je .hf_trail_cut
+    cmp byte [rbx + rcx - 1], 9      ; ...and the trailing half, likewise
     jne .hf_val_ret
+.hf_trail_cut:
     dec rdx
     jmp .hf_trail
 .hf_val_ret:

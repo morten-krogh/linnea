@@ -53,8 +53,33 @@ CASES = [
     # NOT OWS, and "12 34" must still be refused.
     ("clpad",      200, b"valid"),
     ("cljunk",     502, None),       # "Content-Length: 12 34" -- not a number
+    # HTAB is OWS too, and the two framing lookups trimmed only SP -- so h2 and
+    # h3 answered 502 to these while h1 served them (audit-report-7 Finding 2).
+    ("cltab",      200, b"valid"),   # HTAB either side
+    ("cltablead",  200, b"valid"),   # leading only
+    ("cltabtrail", 200, b"valid"),   # trailing only
+    # An upstream 1xx is an INTERIM response: the final one still follows
+    # (RFC 9114 4.1, and RFC 9110 15.2 makes forwarding it a MUST). h3 used to
+    # classify any status under 200 as a bodiless FINAL response, deliver the
+    # 103 and tear the leg down, so the answer never arrived at all
+    # (audit-report-7 Finding 1). The status checked here is the FINAL one; the
+    # interim sequence itself is checked below.
+    ("early",         200, b"final-reply"),   # 103, then 200 in a later write
+    ("early-atonce",  200, b"final-reply"),   # both in ONE upstream write
+    ("multi-early",   200, b"final-reply"),   # 103, 103, 100, then 200
+    ("upgrade101",    502, None),    # a 101 has no meaning here: refuse it
     ("simple",     200, b"backend body"),
 ]
+
+# The interim responses must arrive as their own HEADERS frames, in order,
+# ahead of the final one -- not be silently dropped, which would deliver the
+# right body while quietly violating RFC 9110 15.2.
+INTERIM_SEQ = {
+    "early":        ["103", "200"],
+    "early-atonce": ["103", "200"],
+    "multi-early":  ["103", "103", "100", "200"],
+    "simple":       ["200"],
+}
 
 fails = 0
 
@@ -88,10 +113,21 @@ def h1(route):
     s.close()
     if not buf:
         return None, b"", []
-    head, _, body = buf.partition(b"\r\n\r\n")
-    lines = head.split(b"\r\n")
-    st = int(lines[0].split(b" ")[1])
-    return st, body, lines[1:]
+    # Skip interim responses, as any HTTP/1 client must: a 1xx is a complete
+    # head followed by the real response (RFC 9110 15.2). Without this the
+    # helper reads the 103's head as the answer and calls the rest "the body",
+    # which is a bug in the CLIENT -- curl gets these right -- and would have
+    # been reported here as a server fault.
+    while True:
+        head, sep, rest = buf.partition(b"\r\n\r\n")
+        if not sep:
+            return None, b"", []
+        lines = head.split(b"\r\n")
+        st = int(lines[0].split(b" ")[1])
+        if 100 <= st < 200:
+            buf = rest
+            continue
+        return st, rest, lines[1:]
 
 
 # ------------------------------------------------------------------ HTTP/2 --
@@ -230,20 +266,22 @@ def h3_all(routes):
                     reset = True
                 ev = conn.next_event()
         if reset and not resp:
-            out[route] = ("RESET", b"", [])
+            out[route] = ("RESET", b"", [], [])
             continue
-        i, st, body, extra = 0, None, b"", []
+        i, st, body, extra, seq = 0, None, b"", [], []
+        dec = pylsqpack.Decoder(0, 0)
         while i < len(resp):
             ty, i = rvlq(resp, i)
             ln, i = rvlq(resp, i)
             if ty == 1:
-                _, h = pylsqpack.Decoder(0, 0).feed_header(0, resp[i:i + ln])
+                _, h = dec.feed_header(0, resp[i:i + ln])
                 st = int(dict(h).get(b":status", b"0"))
+                seq.append(dict(h).get(b":status", b"?").decode())
                 extra = [b"%s: %s" % (n, v) for n, v in h if not n.startswith(b":")]
             elif ty == 0:
                 body += resp[i:i + ln]
             i += ln
-        out[route] = (st, body, extra)
+        out[route] = (st, body, extra, seq)
     return out
 
 
@@ -254,7 +292,7 @@ for route, want_status, want_body in CASES:
     got["h1"] = h1(route)
     got["h2"] = h2(route)
     if h3 is not None:
-        got["h3"] = h3.get(route, (None, b"", []))
+        got["h3"] = h3.get(route, (None, b"", [], []))
 
     statuses = {p: v[0] for p, v in got.items()}
     check(f"{route}: every protocol answers {want_status}",
@@ -273,6 +311,13 @@ for route, want_status, want_body in CASES:
                   for p, v in got.items()}
         check(f"{route}: no part of the bad head reaches the client",
               not any(leaked.values()), f"  {leaked}" if any(leaked.values()) else "")
+
+# --- the interim frames themselves, on HTTP/3 --------------------------------
+if h3 is not None:
+    for route, want_seq in INTERIM_SEQ.items():
+        got_seq = (h3.get(route) or (None, b"", [], []))[3]
+        check(f"{route}: h3 relays the interim responses in order",
+              got_seq == want_seq, f"  got {got_seq}, want {want_seq}")
 
 if h3 is None:
     print("note: HTTP/3 not checked (aioquic unavailable) -- h1 and h2 only")

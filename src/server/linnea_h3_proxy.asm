@@ -190,6 +190,7 @@ linnea_h3_proxy_start:
     mov [r12 + linnea_connection.h3_qgen], r14
     mov [r12 + linnea_connection.h3_sid], r15
     mov qword [r12 + linnea_connection.h3_hlen], 0
+    mov qword [r12 + linnea_connection.h3_hoff], 0
     mov qword [r12 + linnea_connection.h3_nobody], 0
     ; A recycled slot carries the last client's address, and the per-source
     ; connection cap counts every in_use slot whose peer_ip matches. A leg that
@@ -531,8 +532,17 @@ linnea_h3_proxy_head:
     push r12
     push r13
     mov rbx, rdi
+.ph_restart:
+    ; Parse the head at .h3_hoff, not at the front of the buffer. They differ
+    ; once the upstream has sent an interim (1xx) response: those heads stay
+    ; where they are, and .h3_hoff steps past each one so the next parse sees
+    ; the head behind it. Nothing is shifted -- delivery re-encodes them all
+    ; from up_buf, in order (audit-report-7 Finding 1).
     lea r12, [rbx + linnea_connection.up_buf]
+    add r12, [rbx + linnea_connection.h3_hoff]
     mov r13, [rbx + linnea_connection.up_len]
+    sub r13, [rbx + linnea_connection.h3_hoff]
+    jbe .ph_more                     ; nothing of the next head has arrived
     cmp r13, 12                      ; "HTTP/1.1 200" at the very least
     jb .ph_more
     mov eax, [r12]
@@ -590,6 +600,30 @@ linnea_h3_proxy_head:
     test eax, eax
     jz .ph_bad                       ; malformed upstream head: 502, not relayed
     mov rcx, [rbx + linnea_connection.h3_hlen]
+    ; --- an interim response is not the answer ---------------------------
+    ; RFC 9114 4.1: a response stream carries zero or more interim responses
+    ; before exactly one final one, and RFC 9110 15.2 makes forwarding a 1xx a
+    ; MUST for a proxy. This used to fall through to the framing below, where
+    ; "status < 200" reads as "carries no body" -- true, but it was then
+    ; DELIVERED as the final response and the leg torn down, so the real answer
+    ; was never sent. h2 has had the distinction since Finding 30.
+    ;
+    ; Step over this head and parse the next one. It may already be buffered
+    ; (an upstream that writes the interim and the final together), which is
+    ; why this loops rather than returning to wait for a read; if it is not,
+    ; the restart falls out at .ph_more and the caller reads more into up_buf
+    ; behind what is already there.
+    mov rax, [rbx + linnea_connection.up_status]
+    cmp rax, 200
+    jae .ph_final
+    cmp rax, 100
+    jb .ph_bad                       ; below 100 is not a status at all
+    cmp rax, 101
+    je .ph_bad                       ; a 101 has no meaning over an h3 proxy,
+                                     ; exactly as h2 refuses one
+    add [rbx + linnea_connection.h3_hoff], rcx
+    jmp .ph_restart
+.ph_final:
     ; --- body framing: Transfer-Encoding: chunked wins over Content-Length,
     ; and a response that carries no body at all overrides both.
     mov qword [rbx + linnea_connection.capture_chunked], 0
@@ -763,7 +797,10 @@ linnea_h3_proxy_head:
     cmp rcx, rbp
     jae .pf_val
     cmp byte [rbx + rcx], ' '
-    jne .pf_val
+    je .pf_lead_skip
+    cmp byte [rbx + rcx], 9          ; HTAB is OWS as well (RFC 9110 5.6.3);
+    jne .pf_val                      ; the trailing trim below already takes it
+.pf_lead_skip:
     inc rcx
     jmp .pf_lead
 .pf_val:
@@ -957,19 +994,93 @@ linnea_h3_proxy_deliver:
     push r13
     push r14
     push r15
-    sub rsp, 8
-    mov rbx, rdi
+    sub rsp, 32                      ; [0] field-section length, [8] the head
+    mov rbx, rdi                     ; cursor, [16] the interim walk offset.
+                                     ; 32 not 24: five pushes leave rsp 16-byte
+                                     ; aligned, so an odd multiple of 8 here
+                                     ; hands every callee a misaligned stack --
+                                     ; which the crypto paths meet as a movdqa
+                                     ; fault that reads like a null dereference
     mov r12d, esi                    ; UDP fd
     mov r14, [rbx + linnea_connection.spill_len]      ; body bytes captured
-    ; --- the HTTP/3 response head: HEADERS frame + DATA frame header ---
+    ; --- the HTTP/3 response head: HEADERS frame(s) + DATA frame header ---
     ; The upstream's fields are re-encoded from the head still sitting in
     ; up_buf; content-length is re-derived from what we actually captured, so
     ; a de-chunked body is described by the length it really has. A response
     ; that carries no body keeps whatever length the upstream stated (RFC 9110
     ; 9.3.2: a HEAD's content-length is the GET's, not the zero bytes we hold).
+    ;
+    ; Interim (1xx) responses come first, each as its own HEADERS frame, in the
+    ; order the upstream sent them (audit-report-7 Finding 1). They are all
+    ; frames on one stream and the FIN rides the stream, not any frame, so
+    ; HEADERS(103) HEADERS(200) DATA is exactly the sequence RFC 9114 4.1
+    ; describes. NB they reach the client WITH the final response rather than
+    ; ahead of it: an h3 leg captures the whole body before it sends anything,
+    ; so 103 Early Hints is forwarded as the MUST in RFC 9110 15.2 requires but
+    ; without the head start that is its point. Delivering it early would mean
+    ; sending on the request stream before the response slot exists, which the
+    ; one-slot-per-response model does not do.
+    lea rdi, [h3p_head]
+    mov [rsp + 8], rdi               ; the cursor across every frame below
+    xor eax, eax
+    mov [rsp + 16], rax              ; walk offset: the first interim head
+.dl_interim:
+    mov rax, [rsp + 16]
+    cmp rax, [rbx + linnea_connection.h3_hoff]
+    jae .dl_final                    ; no interim heads left (usually none)
+    ; this interim head runs to its own CRLF CRLF
+    lea rsi, [rbx + linnea_connection.up_buf]
+    add rsi, rax
+    mov rcx, [rbx + linnea_connection.h3_hoff]
+    sub rcx, rax                     ; bytes remaining in the interim region
+    xor edx, edx
+.dl_iscan:
+    lea r8, [rdx + 4]
+    cmp r8, rcx
+    ja .dl_bad_head                  ; h3_hoff always ends on a CRLF CRLF
+    cmp dword [rsi + rdx], 0x0A0D0A0D
+    je .dl_ifound
+    inc rdx
+    jmp .dl_iscan
+.dl_ifound:
+    add rdx, 4                       ; this head's length
+    push rdx
+    push rsi
+    ; its status: three digits at offset 9, the shape .ph_status already checked
+    movzx eax, byte [rsi + 9]
+    sub eax, '0'
+    imul eax, eax, 100
+    movzx r8d, byte [rsi + 10]
+    sub r8d, '0'
+    imul r8d, r8d, 10
+    add eax, r8d
+    movzx r8d, byte [rsi + 11]
+    sub r8d, '0'
+    add eax, r8d
+    mov esi, eax                     ; status
+    lea rdi, [h3p_fs]
+    mov rdx, [rsp]                   ; head ptr (pushed second, so on top)
+    mov rcx, [rsp + 8]               ; head length
+    mov r8, -1                       ; an interim carries no content-length
+    mov r9, [rbx + linnea_connection.vhost]
+    call linnea_qpack_encode_proxy
+    pop rsi
+    pop rdx                          ; this head's length, back off the stack
+    cmp rax, -1
+    je .dl_bad_head
+    add [rsp + 16], rdx              ; step the walk past it
+    mov rdi, [rsp + 8]
+    mov rsi, rax                     ; the field-section length
+    call .dl_put_headers
+    test rax, rax
+    jz .dl_bad_head                  ; no room left for another HEADERS frame
+    mov [rsp + 8], rax
+    jmp .dl_interim
+.dl_final:
     lea rdi, [h3p_fs]
     mov esi, [rbx + linnea_connection.up_status]
     lea rdx, [rbx + linnea_connection.up_buf]
+    add rdx, [rbx + linnea_connection.h3_hoff]        ; past any interim heads
     mov rcx, [rbx + linnea_connection.h3_hlen]
     mov r8, r14
     cmp qword [rbx + linnea_connection.h3_nobody], 0
@@ -980,16 +1091,13 @@ linnea_h3_proxy_deliver:
     call linnea_qpack_encode_proxy   ; rax = field-section length, or -1 when it
     cmp rax, -1                      ; would not fit the reserve
     je .dl_bad_head
-    mov [rsp], rax
-    lea rdi, [h3p_head]
-    mov byte [rdi], LINNEA_H3_FRAME_HEADERS
-    inc rdi
+    mov rdi, [rsp + 8]
     mov rsi, rax
-    call linnea_quic_varint_encode
-    add rdi, rax
-    lea rsi, [h3p_fs]
-    mov rcx, [rsp]
-    rep movsb                        ; the field section behind its frame header
+    call .dl_put_headers
+    test rax, rax
+    jz .dl_bad_head
+    mov [rsp + 8], rax
+    mov rdi, rax                     ; the cursor, for the DATA frame header
     test r14, r14
     jz .dl_nodata
     mov byte [rdi], LINNEA_H3_FRAME_DATA
@@ -1000,9 +1108,12 @@ linnea_h3_proxy_deliver:
 .dl_nodata:
     lea rax, [h3p_head]
     sub rdi, rax
-    mov r15, rdi                     ; the head's length
+    mov r15, rdi                     ; the head's length, frames and all
     cmp r15, LINNEA_H3_PROXY_RESERVE
-    ja .dl_bad_head                  ; more head than the hole reserved for it
+    ja .dl_bad_head                  ; belt to .dl_put_headers' braces: that
+                                     ; refuses to write past the buffer, this
+                                     ; catches a DATA frame header that would
+                                     ; not fit behind what it wrote
     ; Write it into the hole so that it ends exactly where the body begins:
     ; head and body are then one contiguous run in the file, which is what a
     ; response-stream slot streams from. This also extends the file to at least
@@ -1072,7 +1183,7 @@ linnea_h3_proxy_deliver:
 .dl_done:
     mov rdi, rbx
     call linnea_h3_proxy_release
-    add rsp, 8
+    add rsp, 32
     pop r15
     pop r14
     pop r13
@@ -1084,13 +1195,46 @@ linnea_h3_proxy_deliver:
     mov rdi, rbx
     mov esi, 502
     mov edx, r12d
-    add rsp, 8
+    add rsp, 32
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
     jmp linnea_h3_proxy_fail
+
+; .dl_put_headers(rdi = cursor into h3p_head, rsi = field-section length, the
+;   section itself sitting in h3p_fs) -> rax = the cursor past the frame it
+;   wrote, or 0 when it would not fit.
+; The bound is checked BEFORE the copy. It used to be checked after: the field
+; section alone may be as large as the whole reserve, so type byte + length
+; varint + section could run a few bytes past h3p_head and the "is it too big"
+; test only saw it afterwards. Harmless while there was exactly one HEADERS
+; frame per response; not once interim responses can add more.
+.dl_put_headers:
+    sub rsp, 16
+    mov [rsp], rsi                   ; field-section length
+    lea rax, [h3p_head + LINNEA_H3_PROXY_RESERVE]
+    sub rax, rdi                     ; bytes left in the buffer
+    mov rcx, rsi
+    add rcx, 9                       ; 1 type byte + a varint of at most 8
+    cmp rcx, rax
+    ja .dl_ph_full
+    mov byte [rdi], LINNEA_H3_FRAME_HEADERS
+    inc rdi
+    mov rsi, [rsp]
+    call linnea_quic_varint_encode
+    add rdi, rax
+    lea rsi, [h3p_fs]
+    mov rcx, [rsp]
+    rep movsb                        ; the field section behind its frame header
+    mov rax, rdi
+    add rsp, 16
+    ret
+.dl_ph_full:
+    xor eax, eax
+    add rsp, 16
+    ret
 
 ; linnea_h3_proxy_fail(rdi = leg, esi = status, edx = UDP socket fd)
 ; The exchange failed before any response byte reached the client, so it can

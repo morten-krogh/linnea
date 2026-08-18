@@ -258,6 +258,15 @@ def respond(conn, head, body, extra=b""):
     elif path.endswith(b"/clpad"):
         # Legitimate optional whitespace around the value.
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length:   5  \r\n\r\nvalid")
+    elif path.endswith(b"/cltab"):
+        # OWS is SP *or* HTAB (RFC 9110 5.6.3), and the tab spelling is the one
+        # the framing lookups missed: they trimmed spaces only, so h2 and h3
+        # answered 502 to this while h1 served it (audit-report-7 Finding 2).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length:\t5\t\r\n\r\nvalid")
+    elif path.endswith(b"/cltablead"):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length:\t5\r\n\r\nvalid")
+    elif path.endswith(b"/cltabtrail"):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\t\r\n\r\nvalid")
     elif path.endswith(b"/expect"):
         # Answers 100 Continue if asked; linnea must never ask, since it
         # has the whole body buffered before it connects.

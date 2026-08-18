@@ -171,7 +171,15 @@ struc linnea_connection
     .h3_qidx:       resq 1         ; the QUIC connection's pool index
     .h3_qgen:       resq 1         ; its generation when the leg was started
     .h3_sid:        resq 1         ; the request stream to answer
-    .h3_hlen:       resq 1         ; response-head bytes at the front of up_buf
+    .h3_hlen:       resq 1         ; response-head bytes of the FINAL response
+    ; Where that final head starts within up_buf. Nonzero only when the upstream
+    ; sent interim (1xx) responses first: those heads are left in place ahead of
+    ; it, and delivery walks [0, .h3_hoff) to re-encode each one as its own
+    ; HEADERS frame before the final one (audit-report-7 Finding 1). h3 used to
+    ; classify any status below 200 as a bodiless FINAL response, so a backend
+    ; sending "103 Early Hints" then "200 OK" gave the client the 103 and
+    ; nothing else -- the answer it asked for was never delivered.
+    .h3_hoff:       resq 1
     ; The access line's who-and-what, parked when the request is forwarded. It
     ; is written long afterwards, from an upstream completion, by which time the
     ; QUIC reassembly buffer those fields pointed into has been reused — and the

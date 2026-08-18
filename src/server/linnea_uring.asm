@@ -2362,8 +2362,10 @@ linnea_uring_run:
     ; uses for anything else.
     mov rdi, r12
     lea rsi, [r12 + linnea_connection.up_buf]
-    add rsi, [r12 + linnea_connection.h3_hlen]
+    add rsi, [r12 + linnea_connection.h3_hoff]   ; past any interim heads...
+    add rsi, [r12 + linnea_connection.h3_hlen]   ; ...and past the final one
     mov rdx, [r12 + linnea_connection.up_len]
+    sub rdx, [r12 + linnea_connection.h3_hoff]
     sub rdx, [r12 + linnea_connection.h3_hlen]
     call linnea_h3_proxy_body
     jmp .h3_body_verdict
