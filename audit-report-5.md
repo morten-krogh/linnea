@@ -235,15 +235,74 @@ very decoder this finding is in. Both shard runners now pre-build them, as they
 already did for the other unit-test binaries. A full sweep confirms every other
 test target still links.
 
-**Remaining, reported not silently fixed.** HTTP/2's *static* path still does
-not reconcile a declared length against the body: a static `GET` carrying
-`content-length: 5` and no DATA is served 200, where HTTP/3 refuses it. The
-declaration is now parsed and range-checked on that path too, so nothing wraps,
-but the comparison is not made — h2 dispatches a static request at HEADERS time
-and drops DATA frames for a stream nothing is collecting, so there is no body
-count to compare against without new accounting. No backend is involved and the
-body is discarded, which is why it is left as a separate, lower-severity item
-rather than half-closed here.
+### Follow-up — the static path, closed (2026-08-18)
+
+The Resolution above left one thing open: HTTP/2's *static* path did not
+reconcile a declared length against the body, where HTTP/3 did. Looking at why
+showed the three protocols each held a different pair of facts, which is the
+whole reason they disagreed:
+
+| | when it routes | when it has the body |
+|---|---|---|
+| HTTP/1 | after the body is buffered | before routing — so it waits, and a *short* body is indistinguishable from a *slow* one |
+| HTTP/2 | at the HEADERS frame | never: a DATA frame no proxy slot is collecting is credited and **dropped** |
+| HTTP/3 | after full reassembly | before routing — the only one holding both at once |
+
+So HTTP/3's semantics were not reachable on HTTP/2 without deferring the static
+response until END_STREAM, and not reachable on HTTP/1 for a short body under
+any design. Neither protocol was *non-conformant*: RFC 9113 8.1 explicitly
+permits answering before the request body arrives when the response does not
+depend on it, and 8.1.1 only requires acting on malformed messages that are
+**detected**.
+
+What all three can decide, at the head, is whether the request carries content
+at all — so that is the rule now: **a static location takes no request
+content**, answered 400. Content on GET or HEAD has no defined semantics
+(RFC 9110 9.3.1), a static location never reads it, and serving the file anyway
+means discarding bytes the client announced, which is the request-smuggling
+shape 9.3.1 names. HTTP/2 tests the declaration *and* the framing (a HEADERS
+frame that does not end the message), since testing only `content-length` would
+be bypassed by sending DATA without declaring one. HTTP/3 tests the reassembled
+body, and its RFC 9114 4.1.2 reconciliation still runs first, so a declared
+length that *disagrees* remains a stream error rather than becoming a 400 —
+each protocol answering for what it actually knows.
+
+Two things fell out of it:
+
+- **HTTP/1 was already refusing half of this by accident.** A body too large to
+  sit in `in_buf` streams, and the static path turned that into a 413 — while a
+  body that *fit* was ignored and the file served. The same request was refused
+  or served depending on how it compared with a buffer size nobody configured,
+  which is the shape Finding 3 had on `max_body`.
+- **A stalled HTTP/1 request now gets 408.** h1 waits for a declared body before
+  routing, so a body that stops short can only be answered by the clock — but it
+  was answered by a silent close, leaving a client unable to tell a server that
+  gave up from a network that ate the connection (RFC 9110 15.5.9). That 408 is
+  the first access line this server ever writes for a request that never routed,
+  and `linnea_http_log_conn` dereferenced `conn.vhost` unguarded: a **SIGSEGV**
+  that killed the worker, found by the first run of the new test. Guarded in the
+  logger rather than at the call site, since "which vhost served this" is a
+  question a request can legitimately have no answer to.
+
+**Verification.** A/B against the pre-fix binary, three new regressions, each
+with controls that pass on both sides:
+[`test/h1_static_body.py`](/home/linnea/linnea/test/h1_static_body.py) (12
+checks, **6 fail** pre-fix),
+[`test/tls/h2_static_body.py`](/home/linnea/linnea/test/tls/h2_static_body.py)
+(11 checks, **6 fail**),
+[`test/quic/h3_static_body.py`](/home/linnea/linnea/test/quic/h3_static_body.py)
+(11 checks, **2 fail** — its four stream-error cases already held). Each file
+also pins that a *proxy* location still takes the same body, that a POST to a
+static path is still 405 rather than 400, and — for HTTP/1 — that the body's own
+bytes never become the pipelined request behind it. One existing check,
+`body discarded, keep-alive`, asserted the old behaviour outright; its
+expectation moves with the behaviour. Full suite **759 passed, 0 failed**.
+
+The one deliberate divergence left: HTTP/2 refuses a HEADERS frame that does not
+end the message even when the DATA that follows is empty, while HTTP/3 serves
+that shape — a zero-length DATA frame is indistinguishable from none in a
+reassembled length. Documented rather than contorted; no client frames a
+bodiless static GET that way.
 
 ## Reviewed behavior with no additional finding
 
