@@ -27,7 +27,8 @@ default rel
 %include "linnea_hpack_data.inc"
 
 global linnea_hpack_decode
-extern linnea_http_authority_host
+global linnea_http_authority_host
+extern linnea_network_parse_ipv6
 ; shared with the QPACK decoder (same Huffman code and pseudo-header logic)
 global hpack_int
 global hpack_str
@@ -40,6 +41,11 @@ extern linnea_string_is_token
 extern linnea_string_iequal
 
 section .rodata
+
+; reg-name allowlist (RFC 3986 unreserved + sub-delims; pct-encoding is not
+; supported so "%" is not set). Bit (c & 7) of byte (c >> 3) is set for an
+; allowed ASCII byte; every byte >= 0x80 is rejected outright.
+ah_regname_tab: db 0x00,0x00,0x00,0x00,0xd2,0x7f,0xff,0x2b,0xfe,0xff,0xff,0x87,0xfe,0xff,0xff,0x47
 pseudo_method:  db ":method"
 pseudo_path:    db ":path"
 pseudo_scheme:  db ":scheme"
@@ -67,6 +73,8 @@ hdr_expect:     db "expect"
 expect_100_val: db "100-continue"
 
 section .bss
+ah_ip6_lit:     resb 64      ; a bracketed authority's contents, NUL-terminated for parse_ipv6
+ah_ip6_out:     resb 16      ; parse_ipv6's 16-byte output (discarded; we only want its verdict)
 lit_form:      resq 1
 ; The first field fault of the block in progress, or 0. A bad or over-limit
 ; field does NOT stop the walk (see .fault), so the fault waits here until the
@@ -1515,4 +1523,161 @@ linnea_hpack_req_check:
     mov qword [rbx + linnea_h2_req.malformed], 1
     mov rax, -1
     pop rbx
+    ret
+
+LINNEA_MAX_IP6_LIT equ 45         ; ffff:...:255.255.255.255 -- the longest literal
+linnea_http_authority_host:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi                      ; authority ptr, held across parse_ipv6
+    mov r13, rsi                      ; authority len, likewise (rsi is clobbered)
+    test r13, r13
+    jz .ah_bad                        ; empty: names nothing
+    cmp byte [r12], '['
+    je .ah_bracket
+    ; --- reg-name / IPv4 form: host up to ':', then a bounded numeric port ---
+    xor ecx, ecx                      ; scan index
+.ah_u_scan:
+    cmp rcx, r13
+    jae .ah_u_hostonly                ; ran to the end with no ':' -> all host
+    movzx eax, byte [r12 + rcx]
+    cmp al, ':'
+    je .ah_u_port
+    call .ah_regname_ok               ; CF set if not an RFC 3986 reg-name byte
+    jc .ah_bad                        ; "/", "?", "#", "@", ... are not a host
+    inc rcx
+    jmp .ah_u_scan
+.ah_u_hostonly:
+    test rcx, rcx
+    jz .ah_bad                        ; empty host
+    mov rax, rcx                      ; host_len
+    xor edx, edx                      ; host_off = 0
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ah_u_port:
+    test rcx, rcx
+    jz .ah_bad                        ; ":port" with no host
+    mov rbx, rcx                      ; host_len
+    inc rcx                           ; first port byte
+    call .ah_port_tail                ; 1..5 digits AND <= 65535
+    jc .ah_bad
+    mov rax, rbx
+    xor edx, edx
+    pop r13
+    pop r12
+    pop rbx
+    ret
+    ; --- "[" IPv6 "]" [ ":" port ] ------------------------------------
+.ah_bracket:
+    mov rcx, 1                        ; first byte inside the brackets
+.ah_b_scan:
+    cmp rcx, r13
+    jae .ah_bad                       ; no closing ']'
+    movzx eax, byte [r12 + rcx]
+    cmp al, ']'
+    je .ah_b_close
+    cmp al, 0x20
+    jbe .ah_bad
+    cmp al, 0x7f
+    je .ah_bad
+    cmp al, '['
+    je .ah_bad                        ; no nested '['
+    inc rcx
+    jmp .ah_b_scan
+.ah_b_close:
+    cmp rcx, 1
+    jbe .ah_bad                       ; "[]" : empty literal
+    mov rbx, rcx                      ; index of ']'  (host is bytes 1..rbx-1)
+    ; the contents must be a real IPv6 address, not just non-empty printable
+    ; bytes: "[deadbeef]" is hex but not an address. Copy them NUL-terminated
+    ; and run them through the config's inet_pton-style parser.
+    lea rax, [rbx - 1]                ; content length
+    cmp rax, LINNEA_MAX_IP6_LIT
+    ja .ah_bad                        ; longer than any IPv6 literal
+    lea rsi, [r12 + 1]
+    lea rdi, [ah_ip6_lit]
+    mov rcx, rax
+    rep movsb
+    mov byte [rdi], 0
+    lea rdi, [ah_ip6_lit]
+    lea rsi, [ah_ip6_out]
+    call linnea_network_parse_ipv6    ; rsp is 16-aligned here (3 pushes above)
+    test rax, rax
+    js .ah_bad                        ; not a valid IPv6 literal
+    ; a port, if present, follows the ']'
+    lea rcx, [rbx + 1]                ; byte after ']'
+    cmp rcx, r13
+    jae .ah_b_ok                      ; nothing after ']' : the bare literal
+    movzx eax, byte [r12 + rcx]
+    cmp al, ':'
+    jne .ah_bad                       ; "[::1]x" : junk after the literal
+    inc rcx
+    call .ah_port_tail
+    jc .ah_bad
+.ah_b_ok:
+    lea rax, [rbx - 1]                ; host_len = ']' index - 1
+    mov edx, 1                        ; host_off = 1 (past the '[')
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ah_bad:
+    mov rax, -1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; .ah_regname_ok(al = byte) -> CF clear iff al is an RFC 3986 reg-name byte
+; (unreserved or a sub-delim). Bitmap lookup; every byte >= 0x80 is rejected.
+; Internal to linnea_http_authority_host; clobbers r8,r9,r10 (not rax/rbx/rcx).
+.ah_regname_ok:
+    cmp al, 0x80
+    jae .rn_no                        ; non-ASCII is not reg-name
+    movzx r8d, al
+    mov r9d, r8d
+    shr r9d, 3
+    movzx r10d, byte [ah_regname_tab + r9]
+    and r8d, 7
+    bt r10d, r8d
+    jnc .rn_no
+    clc
+    ret
+.rn_no:
+    stc
+    ret
+
+; .ah_port_tail(rcx = first port index, r13 = len, r12 = ptr)
+; CF clear iff rcx..len is one to five decimal digits AND names a value in
+; 0..65535. Internal to linnea_http_authority_host; clobbers rax, rcx, r8.
+.ah_port_tail:
+    cmp rcx, r13
+    jae .pt_bad                       ; a ':' with no port at all
+    mov rax, r13
+    sub rax, rcx
+    cmp rax, 5
+    ja .pt_bad                        ; more digits than any port has
+    xor r8d, r8d                      ; the port value
+.pt_scan:
+    cmp rcx, r13
+    jae .pt_ok
+    movzx eax, byte [r12 + rcx]
+    cmp al, '0'
+    jb .pt_bad
+    cmp al, '9'
+    ja .pt_bad
+    lea r8d, [r8d + r8d*4]            ; r8 *= 5
+    lea r8d, [eax + r8d*2 - 0x30]     ; r8 = r8*10 + (digit)
+    inc rcx
+    jmp .pt_scan
+.pt_ok:
+    cmp r8d, 65535
+    ja .pt_bad                        ; out of the 0..65535 port range
+    clc
+    ret
+.pt_bad:
+    stc
     ret

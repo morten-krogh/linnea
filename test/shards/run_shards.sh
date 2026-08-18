@@ -35,7 +35,7 @@ jobs=("base quic" "h1" "tls")
 # segfault on a binary that passes standing alone.
 echo "pre-building the unit-test binaries..."
 make -s bin/linnea-selftest bin/linnea-quictest bin/linnea-rtxtest \
-        bin/linnea-ws-fast tlstest >/dev/null 2>&1
+        bin/linnea-ws-fast bin/linnea-quichs tlstest >/dev/null 2>&1
 
 echo "running ${#jobs[@]} jobs of the $SUITE suite, port bases $BASE..$((BASE + (${#jobs[@]} - 1) * 1000))"
 start=$(date +%s)
