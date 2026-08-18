@@ -36,6 +36,16 @@ linnea_quic_conn_free_hook: resq 1
 ; the master sets it after fork.
 linnea_worker_index: resq 1
 
+section .data
+; How long a connection slot may go without a packet before the sweep reclaims
+; it, in seconds. The server sets it from the config's `timeout`; the default is
+; LINNEA_QUIC_IDLE_SECS, which is what it was fixed at before it became
+; configurable, and is what linnea-pooltest keeps -- that harness links this
+; file with no config and no src/lib/linnea_quic.o, so the value lives here
+; rather than being read across from the transport parameter beside it.
+global linnea_quic_conn_idle_secs
+linnea_quic_conn_idle_secs: dq LINNEA_QUIC_IDLE_SECS
+
 section .text
 
 ; linnea_quic_conn_lookup(rdi=dcid ptr, rsi=dcid len) -> rax = conn* or 0.
@@ -151,7 +161,7 @@ linnea_quic_conn_alloc:
     ; connections abandoned without a close cannot fill the pool for good
     call conn_now
     mov rdi, rax
-    mov esi, LINNEA_QUIC_IDLE_SECS
+    mov rsi, [linnea_quic_conn_idle_secs]
     call linnea_quic_conn_sweep
     xor r12d, r12d                   ; index
     lea rbx, [conn_pool]
@@ -171,7 +181,8 @@ linnea_quic_conn_alloc:
     mov ecx, linnea_quic_conn_size
     rep stosb
     mov qword [rbx + linnea_quic_conn.in_use], 1
-    mov qword [rbx + linnea_quic_conn.idle_secs], LINNEA_QUIC_IDLE_SECS
+    mov rax, [linnea_quic_conn_idle_secs]
+    mov [rbx + linnea_quic_conn.idle_secs], rax
     mov qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_NEW
     ; "no capture file" is -1, and the zeroing above writes 0 -- which is a
     ; PERFECTLY GOOD descriptor. The teardown releases all RA_CTXS contexts

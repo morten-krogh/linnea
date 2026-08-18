@@ -13,6 +13,14 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     python3 test/quic/h3_e2e_test.py ${P61452} >/dev/null 2>&1
     check "h3 (io_uring): real server serves static files over QUIC" $?
 
+    # QUIC's max_idle_timeout comes from the config's `timeout` (5 here), like
+    # every other protocol's idle clock. h3 used to advertise a hardcoded 30 s
+    # whatever the config said, so raising `timeout` to keep browser
+    # connections warm bought h3 nothing. The 60 s fixture in the h1 shard is
+    # the other half of this: one value cannot tell a lookup from a constant.
+    python3 test/quic/h3_idle_timeout.py ${P61452} 5 >/dev/null 2>&1
+    check "h3 advertises the configured idle timeout (5s), not a fixed one" $?
+
     python3 test/quic/h3_etag_test.py ${P61452} >/dev/null 2>&1
     check "h3 validators, date + server headers, conditional 304s" $?
 

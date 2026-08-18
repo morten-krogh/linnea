@@ -74,6 +74,8 @@ extern linnea_connection_at
 extern linnea_connection_active
 extern linnea_http_handle
 extern linnea_http_proxy_error
+extern linnea_quic_idle_ms
+extern linnea_quic_conn_idle_secs
 extern linnea_http_request_timeout
 extern linnea_http_proxy_head
 ; an upstream leg owned by an HTTP/3 stream: the same completions, diverted
@@ -390,6 +392,18 @@ linnea_uring_run:
     mov rax, [rbx + linnea_config.head_timeout]
     imul rax, rax, 1000000000
     mov [head_timeout_ns], rax
+    ; ...and the same idle clock for QUIC, which used to ignore the config
+    ; entirely and advertise a hardcoded 30 s. `timeout` is documented as the
+    ; seconds an idle CLIENT connection is held, with no protocol qualifier, so
+    ; h3 honouring it is the key doing what it says. Two variables rather than
+    ; one: src/lib/linnea_quic.o is linked by linnea-probe (no config) and
+    ; linnea_quic_conn.o by linnea-pooltest (no config, no libquic), so neither
+    ; can reach the other or the config -- each keeps its own default and the
+    ; server, which has all three, is what makes them agree.
+    mov rax, [rbx + linnea_config.timeout]
+    mov [linnea_quic_conn_idle_secs], rax        ; the pool sweep, in seconds
+    imul rax, rax, 1000                          ; ...and what we advertise, ms
+    mov [linnea_quic_idle_ms], rax
     mov rax, [rbx + linnea_config.drain_timeout]
     mov [drain_deadline], rax  ; tv_sec of the timespec; tv_nsec stays 0
     mov rax, [rbx + linnea_config.max_per_ip]

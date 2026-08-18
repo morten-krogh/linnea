@@ -32,6 +32,7 @@ global linnea_quic_ack_delay
 global linnea_quic_tp_ack_exp
 global linnea_quic_tp_max_ack
 global linnea_quic_tp_idle_ms
+global linnea_quic_idle_ms
 global linnea_quic_ack_delay_ms
 global linnea_quic_build_ack
 global linnea_quic_ack_ranges
@@ -72,6 +73,13 @@ extern linnea_hmac_sha256
 extern linnea_quic_early_ok
 extern linnea_p256_ecdsa_sign
 extern linnea_tls_hkdf_expand_label
+
+section .data
+; The idle timeout we ADVERTISE, in milliseconds (RFC 9000 18.2 max_idle_timeout).
+; The server overwrites it from the config; linnea-probe and the unit harnesses
+; link this file without a config and keep the default, which is what the value
+; was hardcoded to before it became configurable.
+linnea_quic_idle_ms: dq 30000
 
 section .rodata
 ; CertificateVerify signed content prefix (RFC 8446 4.4.3): 64 spaces, the
@@ -1852,9 +1860,19 @@ linnea_quic_build_transport_params:
     mov ecx, 16
     call tp_bytes
     mov r12, rax
-    mov rdi, r12                     ; max_idle_timeout (0x01) = 30000 ms
+    ; max_idle_timeout (0x01). Taken from linnea_quic_idle_ms, which the server
+    ; sets from the config's `timeout` at startup -- the key is documented as
+    ; "seconds an idle client connection is held" with no protocol qualifier,
+    ; and until now h3 was the one protocol it did not reach: this advertised a
+    ; hardcoded 30 s whatever the config said. RFC 9000 10.1 then makes the
+    ; effective value the minimum of ours and the peer's, so a client that
+    ; forgets us sooner still gets its own number.
+    ;
+    ; A variable rather than an extern on the config, because src/lib is linked
+    ; by linnea-probe, which has no config at all -- it keeps the default.
+    mov rdi, r12
     mov esi, 0x01
-    mov edx, 30000
+    mov rdx, [linnea_quic_idle_ms]
     call tp_int
     mov r12, rax
     mov rdi, r12                     ; max_udp_payload_size (0x03)

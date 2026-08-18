@@ -209,6 +209,15 @@ start_server $CFG/tls-h3-big.json
 P61498=$SRV_PORT
 h3big_pid=$SRV_PID
 sleep 0.3
+# The second half of the idle-timeout check in the quic shard: this fixture says
+# 60, that one says 5, and neither is the 30 h3 used to advertise regardless --
+# so together they show the value is READ rather than merely constant.
+if python3 -c 'import aioquic' 2>/dev/null; then
+    timeout 30 python3 test/quic/h3_idle_timeout.py ${P61498} 60 >/dev/null 2>&1
+    check "h3 advertises the configured idle timeout (60s here, 5s elsewhere)" $?
+else
+    check "h3 configured idle timeout (skipped: aioquic unavailable)" 0
+fi
 start_server $CFG/spill-dir.json
 P61495=$SRV_PORT
 spill_pid=$SRV_PID
