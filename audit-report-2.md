@@ -197,3 +197,64 @@ either new audit finding without a direct reproduction.
 Two new issues remain open: effective listener identity is not canonicalized,
 and authority parsing is not grammar-aware. Both were reproduced against the
 current server. No code changes were made during this audit.
+
+## Update — 2026-08-18: multi-address HTTP/3 (commit `262ce73`, deployed)
+
+After this audit, a separate but adjacent listener defect was fixed and
+deployed. It is recorded here because it lives in the same listener-setup area
+as Finding 1. It does **not** close Finding 1 or Finding 2 — both remain
+**OPEN**.
+
+### What it fixes
+
+HTTP/3 setup created exactly one QUIC UDP socket — for the *first* eligible TLS
+server on the port — and stopped. A second server with a **different specific
+host** on the same port received no HTTP/3 at all (the "mapped-v4 h3" gap: e.g.
+a specific IPv6 literal beside a wildcard, or two specific hosts). The loss was
+silent: that host's TCP listener still answered HTTP/1 and HTTP/2, so a browser
+simply never upgraded. A dual-stack `"::"`/`"0.0.0.0"` primary masked it (it
+already accepts both families); two separate specific hosts expose it.
+
+### The change
+
+In [`src/server/linnea_uring.asm`](/home/linnea/linnea/src/server/linnea_uring.asm)
+(`.quic_scan`) and
+[`src/server/linnea_quic_server.asm`](/home/linnea/linnea/src/server/linnea_quic_server.asm):
+after the primary, a QUIC socket is bound for every host that owns a listener
+among the TLS servers on the h3 port, into `quic_fds[]` (capped at
+`LINNEA_QUIC_MAX_LISTENERS = 4`, over which the excess hosts serve TCP only and
+the worker logs it). The receive buffers (`qrecv_msg/iov/cmsg/peer`, the GRO
+batch, the overflow counter) become per-socket arrays; `arm_qrecv` takes a
+socket index carried in the completion's `user_data`, so each socket re-arms
+independently. Each connection records the socket its first datagram arrived on
+(`conn.udp_fd`), and the timer-driven retransmission, drain, goaway and close
+sweeps reply on that socket per connection rather than a single global fd. The
+single-listener path (nfd = 1) is behaviourally the one it replaced.
+
+### Relationship to Finding 1
+
+The new loop selects which hosts get a socket using the same **raw-host-string
+`listener_owner` identity that Finding 1 flags**
+([`src/server/linnea_network.asm:137`](/home/linnea/linnea/src/server/linnea_network.asm:137)
+through line 153), not a canonical sockaddr. So this fix does not resolve
+Finding 1, and it inherits the alias defect on the QUIC side: two equivalent
+wildcard spellings (`"::"` and `"0.0.0.0"`) on one port are now treated as two
+distinct listener owners and bind two redundant wildcard QUIC sockets in one
+`SO_REUSEPORT` group (before this change the single-socket path bound only one).
+This is redundant rather than incorrect — each connection is pinned to its
+arrival socket via `conn.udp_fd` — but it is another symptom of the
+un-canonicalized listener identity, and the canonicalization recommended for
+Finding 1 would also dedup it. Finding 2 (authority parsing) is unrelated.
+
+### Verification
+
+A/B against a pre-fix binary (`.text` differs): with two specific hosts
+(`127.0.0.1` first, `::1` second) on one port, the pre-fix binary binds only
+`::ffff:127.0.0.1` and the `::1` handshake never completes; the fix binds both
+and serves both. New regression test
+[`test/quic/h3_multiaddr_test.py`](/home/linnea/linnea/test/quic/h3_multiaddr_test.py)
+(with `test/configs/tls-h3-multi.json`), wired into the quic shard. Full suite
+734/0; quic shard 109/0. On prod (`linnea.amberbio.com`), `ss -uln` now shows a
+dedicated `[2a04:3541:8000:1000:80a9:4aff:fe36:78dd]:443` UDP socket beside the
+`*:443` wildcard, and HTTP/3 GETs over both the IPv6 literal and IPv4 return
+`200`.
