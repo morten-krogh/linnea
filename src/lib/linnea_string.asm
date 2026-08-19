@@ -13,6 +13,7 @@ global linnea_string_is_token
 global linnea_string_trim_ows
 global linnea_string_is_tchar
 global linnea_u64_add_within
+global linnea_chunk_ext_step
 
 section .text
 
@@ -329,4 +330,209 @@ linnea_string_from_u64:
     mov rdi, rsi               ; dst = start of buf
     mov rsi, r9                ; src = first digit
     rep movsb
+    ret
+
+; linnea_chunk_ext_step(rdi = state, esi = byte) -> rax
+;   rax >= 0   the byte belongs to the chunk-ext; this is the state after it
+;   rax == -1  the byte cannot appear here: the chunk header is malformed
+;   rax == -2  the byte is the CR that legally ends the chunk-ext
+;
+; RFC 9112 7.1.1:
+;   chunk-ext      = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+;   chunk-ext-name = token
+;   chunk-ext-val  = token / quoted-string
+;
+; All three chunk decoders scanned an extension as a byte CLASS -- anything
+; printable, plus HTAB, up to the CR -- so `4;=bad` (no name), `4;` (no
+; extension at all), `4;a=` (no value), `4;a b`, `4;a,b` and `4;a="unterminated`
+; were all read as well-formed chunk headers (audit-report-23). The unterminated
+; quote is the one that matters: a parser that DOES track the quoted-string
+; carries on past the CRLF looking for the closing quote, so it and we disagree
+; about where the chunk data begins -- and that disagreement is the whole of
+; request smuggling. CR and LF are not qdtext, so refusing them inside a quote
+; is what keeps the line ending unambiguous.
+;
+; The rule is one function because it has to hold in three decoders that share
+; no code: h1's chunked_decode re-parses from the body start, h2's h2p_decode
+; re-scans the size line, and linnea_spill_chunked resumes byte by byte. Each
+; keeps the state wherever it already keeps its own -- a register, a register,
+; a connection field -- and only 0 (the start), -1 and -2 mean anything outside
+; here. It lives in linnea_string.o because that object is in every link set
+; while the three decoders are in three that no single harness links together,
+; the same reason linnea_string_is_tchar does. Touches only rax.
+CEXT_SEP    equ 0      ; between components: ';' opens one, CR ends the line
+CEXT_SEPWS  equ 1      ; BWS seen, and BWS is only BWS if a ';' follows it
+CEXT_NAME   equ 2      ; after ';': BWS, then a mandatory token name
+CEXT_NAMED  equ 3      ; inside the name
+CEXT_NAMEWS equ 4      ; BWS after a name: only '=' or ';' may follow it
+CEXT_VAL    equ 5      ; after '=': BWS, then a token or a quoted-string
+CEXT_VALTOK equ 6      ; inside a token value
+CEXT_QSTR   equ 7      ; inside a quoted-string
+CEXT_QPAIR  equ 8      ; the byte after a backslash inside one
+
+linnea_chunk_ext_step:
+    push rcx
+    push rdx
+    movzx esi, sil
+    cmp rdi, CEXT_SEP
+    je .sep
+    cmp rdi, CEXT_SEPWS
+    je .sepws
+    cmp rdi, CEXT_NAME
+    je .name
+    cmp rdi, CEXT_NAMED
+    je .named
+    cmp rdi, CEXT_NAMEWS
+    je .namews
+    cmp rdi, CEXT_VAL
+    je .val
+    cmp rdi, CEXT_VALTOK
+    je .valtok
+    cmp rdi, CEXT_QSTR
+    je .qstr
+    cmp rdi, CEXT_QPAIR
+    je .qpair
+    jmp .bad                         ; no other state exists
+.sep:
+    cmp esi, ';'
+    je .go_name
+    cmp esi, 13
+    je .eol
+    cmp esi, ' '
+    je .go_sepws
+    cmp esi, 9
+    je .go_sepws
+    jmp .bad
+.sepws:
+    cmp esi, ';'
+    je .go_name
+    cmp esi, ' '
+    je .go_sepws
+    cmp esi, 9
+    je .go_sepws
+    jmp .bad                         ; BWS with no ';' behind it is not BWS,
+                                     ; which is what keeps "4 " malformed while
+                                     ; "4 ;a=b" is not
+.name:
+    cmp esi, ' '
+    je .go_name
+    cmp esi, 9
+    je .go_name
+    call .tchar
+    jnc .bad                         ; the name is not optional
+    mov eax, CEXT_NAMED
+    jmp .ret
+.named:
+    call .tchar
+    jc .go_named
+    cmp esi, '='
+    je .go_val
+    cmp esi, ';'
+    je .go_name
+    cmp esi, 13
+    je .eol
+    cmp esi, ' '
+    je .go_namews
+    cmp esi, 9
+    je .go_namews
+    jmp .bad
+.namews:
+    cmp esi, ' '
+    je .go_namews
+    cmp esi, 9
+    je .go_namews
+    cmp esi, '='
+    je .go_val
+    cmp esi, ';'
+    je .go_name
+    jmp .bad
+.val:
+    cmp esi, ' '
+    je .go_val
+    cmp esi, 9
+    je .go_val
+    cmp esi, '"'
+    je .go_qstr
+    call .tchar
+    jnc .bad                         ; '=' with nothing that can be a value
+    mov eax, CEXT_VALTOK
+    jmp .ret
+.valtok:
+    call .tchar
+    jc .go_valtok
+    cmp esi, ';'
+    je .go_name
+    cmp esi, 13
+    je .eol
+    cmp esi, ' '
+    je .go_sepws
+    cmp esi, 9
+    je .go_sepws
+    jmp .bad
+.qstr:
+    ; qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
+    cmp esi, '"'
+    je .go_sep                       ; the value ends here
+    cmp esi, '\'
+    je .go_qpair
+    cmp esi, 9
+    je .go_qstr
+    cmp esi, 0x20
+    jb .bad
+    cmp esi, 0x7f
+    je .bad
+    jmp .go_qstr
+.qpair:
+    ; quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text ): a quote or a backslash
+    ; is an ordinary byte here, which is the point of the escape
+    cmp esi, 9
+    je .go_qstr
+    cmp esi, 0x20
+    jb .bad
+    cmp esi, 0x7f
+    je .bad
+    jmp .go_qstr
+.go_sep:
+    mov eax, CEXT_SEP
+    jmp .ret
+.go_sepws:
+    mov eax, CEXT_SEPWS
+    jmp .ret
+.go_name:
+    mov eax, CEXT_NAME
+    jmp .ret
+.go_named:
+    mov eax, CEXT_NAMED
+    jmp .ret
+.go_namews:
+    mov eax, CEXT_NAMEWS
+    jmp .ret
+.go_val:
+    mov eax, CEXT_VAL
+    jmp .ret
+.go_valtok:
+    mov eax, CEXT_VALTOK
+    jmp .ret
+.go_qstr:
+    mov eax, CEXT_QSTR
+    jmp .ret
+.go_qpair:
+    mov eax, CEXT_QPAIR
+    jmp .ret
+.eol:
+    mov rax, -2
+    jmp .ret
+.bad:
+    mov rax, -1
+.ret:
+    pop rdx
+    pop rcx
+    ret
+.tchar:                              ; CF = 1 when the byte in esi is a tchar
+    mov eax, esi
+    mov ecx, eax
+    shr ecx, 3
+    and eax, 7
+    movzx edx, byte [tchar_map + rcx]
+    bt edx, eax
     ret

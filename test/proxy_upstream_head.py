@@ -244,6 +244,14 @@ CASES = [
     ("chunksizejunk",     502, None),
     ("chunkextnul",       502, None),   # CTLs in an extension, both protocols
     ("chunktrailemptyname", 502, None), # a field line needs a name
+    # An extension is a GRAMMAR, not a byte class: a name is mandatory and a
+    # quoted-string must close. The last two are the controls -- a ';' inside
+    # quotes is data, and BWS before the ';' is in the grammar even though a
+    # bare trailing space (chunksizetrailsp above) is not (audit-report-23).
+    ("chunkextnoname",    502, None),
+    ("chunkextunterm",    502, None),
+    ("chunkextquoted",    200, b"body"),
+    ("chunkextbws",       200, b"body"),
     ("simple",     200, b"backend body"),
 ]
 
@@ -605,7 +613,7 @@ STREAMED_BODY = {"chunkspace", "chunkoverflow", "chunkbig", "chunkextlf",
                  "chunkdatalf", "chunktrailinlinelf", "chunktraillf",
                  "chunktrailnocolon", "chunktrailnul", "chunktrailbadname",
                  "chunksizetrailsp", "chunksizejunk", "chunkextnul",
-                 "chunktrailemptyname"}
+                 "chunktrailemptyname", "chunkextnoname", "chunkextunterm"}
 
 # chunktrunc is the same family but a step further, and it separates "malformed"
 # from "detectable in time". Its head and first chunk line are VALID, so h2 has

@@ -90,6 +90,7 @@ linnea_connection_alloc:
     mov qword [rdx + linnea_connection.chunk_state], LINNEA_CHUNK_SIZE
     mov qword [rdx + linnea_connection.chunk_rem], 0
     mov qword [rdx + linnea_connection.chunk_digits], 0
+    mov qword [rdx + linnea_connection.chunk_ext], LINNEA_CHUNK_EXT_START
     mov qword [rdx + linnea_connection.chunk_raw], 0
     mov qword [rdx + linnea_connection.capture_chunked], 0
     mov qword [rdx + linnea_connection.capture_done], 0

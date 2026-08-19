@@ -60,6 +60,7 @@ extern linnea_http_status_no_clen
 extern linnea_string_iequal
 extern linnea_string_trim_ows
 extern linnea_string_is_tchar
+extern linnea_chunk_ext_step
 extern linnea_string_equal
 extern linnea_string_is_token
 extern linnea_quic_parse_priority
@@ -4179,18 +4180,16 @@ h2p_decode:
     cmp rcx, [rbx + linnea_h2p.len]
     jae .dec_save                    ; incomplete: wait for more bytes
     movzx eax, byte [r12 + rcx]
-    cmp al, 13
-    je .dec_size_eol
-    cmp al, ';'
-    je .dec_size_ext
-.dec_size_digit:
     ; chunk-size is 1*HEXDIG (RFC 9112 7.1) -- there is no leading whitespace in
     ; that grammar, and this decoder alone used to skip a space before the first
     ; digit. The other two chunk decoders in this tree, linnea_spill_chunked and
-    ; the HTTP/1 request side, both refuse it (audit-report-17).
+    ; the HTTP/1 request side, both refuse it (audit-report-17). Anything that
+    ; is not a digit ends the size and opens the chunk-ext, whose grammar --
+    ; including whether a CR may stand there at all -- belongs to
+    ; linnea_chunk_ext_step and not to a test spelled out again here.
     call h2p_hexval                  ; al -> eax, -1 if not hex
     test eax, eax
-    js .dec_bad
+    js .dec_size_ext_start
     ; ...and bound the accumulator BEFORE the shift, as they also do. Without
     ; it a 17-digit size shifted the value one nybble too far and wrapped rdx to
     ; ZERO -- which .dec_size_eol then reads as the terminal chunk, so a nonzero
@@ -4214,30 +4213,35 @@ h2p_decode:
 .dec_size_next:
     inc rcx
     jmp .dec_size_scan
-.dec_size_ext:
+.dec_size_ext_start:
     ; A chunk extension is ignored as metadata, but its LINE FRAMING is not
-    ; optional: the extension runs to the CRLF, so a bare LF inside it is not a
-    ; line ending and a later CRLF does not make it one. This scan advanced over
-    ; every byte that was not CR, so an embedded LF was consumed as extension
-    ; data and the malformed line became an ordinary chunk -- accepted by h2
-    ; while linnea_spill_chunked and the HTTP/1 decoder, which both reject it
-    ; here, refused the same bytes (audit-report-19).
+    ; optional and neither is its SYNTAX. This scan took every byte that was
+    ; not CR (so an embedded LF became extension data, audit-report-19), then
+    ; every byte that was not a control (so "4;=bad" and an unterminated
+    ; quoted-string were well-formed chunk headers, audit-report-23). Both
+    ; rules now come from linnea_chunk_ext_step, which is also what the two
+    ; HTTP/1 request decoders ask -- the point being that three decoders cannot
+    ; hold one grammar by each spelling it out.
+    ;
+    ; The state is a register because this decoder re-scans the size line from
+    ; its start whenever more bytes arrive: r13 is not advanced until the whole
+    ; line is in hand, so there is nothing to carry between calls.
+    mov r10d, LINNEA_CHUNK_EXT_START
+.dec_size_ext:
     cmp rcx, [rbx + linnea_h2p.len]
     jae .dec_save
-    cmp byte [r12 + rcx], 13
-    je .dec_size_eol
-    cmp byte [r12 + rcx], 10
+    push rsi
+    push rdi                         ; live across h2p_decode, as at .dec_move
+    movzx esi, byte [r12 + rcx]
+    mov rdi, r10
+    call linnea_chunk_ext_step
+    pop rdi
+    pop rsi
+    cmp rax, -2
+    je .dec_size_eol                 ; the CR that ends the size line
+    cmp rax, -1
     je .dec_bad
-    ; ...and no other control byte either: an extension is token /
-    ; quoted-string with BWS, so HTAB is the only one that belongs. CR and LF
-    ; are tested first because both are themselves below 0x20.
-    cmp byte [r12 + rcx], 9
-    je .dec_size_ext_next
-    cmp byte [r12 + rcx], 0x20
-    jb .dec_bad
-    cmp byte [r12 + rcx], 0x7f
-    je .dec_bad
-.dec_size_ext_next:
+    mov r10, rax
     inc rcx
     jmp .dec_size_ext
 .dec_size_eol:

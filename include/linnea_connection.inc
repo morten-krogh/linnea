@@ -66,6 +66,10 @@ LINNEA_CHUNK_TRAIL_LINE equ 7      ; inside one, dropping it
 LINNEA_CHUNK_TRAIL_LF   equ 8
 LINNEA_CHUNK_END_LF     equ 9      ; the LF that ends the whole body
 LINNEA_CHUNK_TRAIL_VAL  equ 11     ; past the colon, reading the value
+; Where a chunk-ext begins, for the three decoders that hand their state to
+; linnea_chunk_ext_step. That function owns every other value; this is the
+; only one a caller may name.
+LINNEA_CHUNK_EXT_START  equ 0
 LINNEA_CHUNK_DONE       equ 10
 
 ; conn.tls_phase — a TLS connection is only special until the keys reach the
@@ -129,6 +133,12 @@ struc linnea_connection
     .chunk_rem:     resq 1         ; the size being accumulated, then the data
                                    ; bytes of that chunk still to come
     .chunk_digits:  resq 1         ; hex digits in the current size line
+    .chunk_ext:     resq 1         ; where linnea_chunk_ext_step has got to in
+                                   ; the chunk-ext, carried across recvs like
+                                   ; every other piece of this decode. Only
+                                   ; that function reads its value; 0 is "at a
+                                   ; component boundary", which is where the
+                                   ; size line's digits leave it.
     .chunk_raw:     resq 1         ; encoded bytes consumed, capped like the
                                    ; decoded ones: endless empty chunks and
                                    ; trailers must not run forever

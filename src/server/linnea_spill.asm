@@ -44,6 +44,7 @@ section .rodata
 ; the kernel could reclaim.
 
 extern linnea_string_is_tchar
+extern linnea_chunk_ext_step
 
 section .text
 
@@ -243,37 +244,28 @@ linnea_spill_chunked:
 .size_end:
     cmp qword [rbx + linnea_connection.chunk_digits], 0
     je .bad                        ; no digits: not a chunk header
-    ; chunk = chunk-size [ chunk-ext ] CRLF, so the only things that may follow
-    ; the digits are a ';' opening an extension or the CR ending the line. This
-    ; treated ANY non-hex byte as the end of the size and fell into the
-    ; extension state, so "4 ", "4g" and "4\0" were all read as a size of 4
-    ; with junk "extension" after it -- h2 refused them and h3 served them,
-    ; this time with h3 as the permissive one (proactive sweep after report 21).
-    cmp byte [r12], ';'
-    je .size_end_ok
-    cmp byte [r12], 13
-    jne .bad
-.size_end_ok:
+    ; chunk = chunk-size [ chunk-ext ] CRLF: everything from here to the CR is
+    ; the extension, and linnea_chunk_ext_step is the one place that grammar
+    ; lives. The byte that ended the size run belongs to it, so it is left for
+    ; the ext state to judge rather than tested twice here.
+    mov qword [rbx + linnea_connection.chunk_ext], LINNEA_CHUNK_EXT_START
     mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_EXT
-    jmp .step                      ; the byte itself belongs to the ext state
+    jmp .step
 
 .s_ext:
-    ; An extension is token / quoted-string with BWS, so HTAB may appear but no
-    ; other control byte may. Rejecting LF (report 19) fixed the delimiter and
-    ; left NUL, CTL and DEL accepted as extension data. CR and LF are tested
-    ; FIRST because both are themselves below 0x20 -- ordering the control-byte
-    ; check ahead of them would reject the line ending it is looking for.
-    cmp byte [r12], 13
-    je .ext_cr
-    cmp byte [r12], 10
-    je .bad                        ; a bare LF is not a line ending here
-    cmp byte [r12], 9
-    je .s_ext_next                 ; HTAB is BWS
-    cmp byte [r12], 0x20
-    jb .bad
-    cmp byte [r12], 0x7f
-    je .bad                        ; DEL
-.s_ext_next:
+    ; This scanned a byte CLASS -- anything printable, plus HTAB, up to the CR
+    ; -- which took "4 ", "4g" and "4\0" as a size of four (fixed by the sweep
+    ; after report 21) and then still took "4;=bad" and "4;a=\"unterminated" as
+    ; well-formed chunk headers (audit-report-23). The state rides in the
+    ; connection because this decoder alone resumes byte by byte.
+    movzx esi, byte [r12]
+    mov rdi, [rbx + linnea_connection.chunk_ext]
+    call linnea_chunk_ext_step
+    cmp rax, -2
+    je .ext_cr                     ; the CR that ends the size line
+    cmp rax, -1
+    je .bad
+    mov [rbx + linnea_connection.chunk_ext], rax
     inc r12
     jmp .step
 .ext_cr:
@@ -499,6 +491,7 @@ linnea_spill_reset:
     mov qword [rdi + linnea_connection.chunk_state], LINNEA_CHUNK_SIZE
     mov qword [rdi + linnea_connection.chunk_rem], 0
     mov qword [rdi + linnea_connection.chunk_digits], 0
+    mov qword [rdi + linnea_connection.chunk_ext], LINNEA_CHUNK_EXT_START
     mov qword [rdi + linnea_connection.chunk_raw], 0
     mov qword [rdi + linnea_connection.capture_chunked], 0
     mov qword [rdi + linnea_connection.capture_done], 0

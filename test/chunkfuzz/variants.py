@@ -46,6 +46,26 @@ v("ext-lf",             b"4;a\nb\r\nbody\r\n0\r\n\r\n", BAD)
 v("ext-nul",            b"4;a\x00b\r\nbody\r\n0\r\n\r\n", BAD)
 v("ext-ctl",            b"4;a\x01b\r\nbody\r\n0\r\n\r\n", BAD)
 v("ext-del",            b"4;a\x7fb\r\nbody\r\n0\r\n\r\n", BAD)
+# chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] ),
+# chunk-ext-name = token, chunk-ext-val = token / quoted-string. The rows above
+# only ever asked which BYTES may appear; these ask what SHAPE they must make
+# (audit-report-23). The valid ones are the point of the exercise: a decoder
+# that simply refused every extension would pass every malformed row here.
+v("ext-quoted",         b'4;a="q"\r\nbody\r\n0\r\n\r\n', OK)
+v("ext-quoted-escape",  b'4;a="a\\"b"\r\nbody\r\n0\r\n\r\n', OK)
+v("ext-quoted-semi",    b'4;a="x;y"\r\nbody\r\n0\r\n\r\n', OK)
+v("ext-two",            b"4;a;b=c\r\nbody\r\n0\r\n\r\n", OK)
+v("ext-bws-semi",       b"4 ;a=b\r\nbody\r\n0\r\n\r\n", OK)
+v("ext-bws-equals",     b"4;a = b\r\nbody\r\n0\r\n\r\n", OK)
+v("ext-empty",          b"4;\r\nbody\r\n0\r\n\r\n", BAD)
+v("ext-no-name",        b"4;=bad\r\nbody\r\n0\r\n\r\n", BAD)
+v("ext-no-value",       b"4;a=\r\nbody\r\n0\r\n\r\n", BAD)
+v("ext-unterminated",   b'4;a="unterminated\r\nbody\r\n0\r\n\r\n', BAD)
+v("ext-quote-in-token", b'4;a=b"c\r\nbody\r\n0\r\n\r\n', BAD)
+v("ext-after-quote",    b'4;a="q"x\r\nbody\r\n0\r\n\r\n', BAD)
+v("ext-space-in-name",  b"4;a b\r\nbody\r\n0\r\n\r\n", BAD)
+v("ext-non-token",      b"4;a,b\r\nbody\r\n0\r\n\r\n", BAD)
+v("ext-dangling-esc",   b'4;a="x\\\r\nbody\r\n0\r\n\r\n', BAD)
 
 # ---- chunk-data and its CRLF ----------------------------------------------
 v("data-short",         b"4\r\nbo\r\n0\r\n\r\n", BAD)

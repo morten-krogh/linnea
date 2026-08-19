@@ -253,6 +253,33 @@ def respond(conn, head, body, extra=b""):
         # DEL accepted as extension data by BOTH binary protocols.
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
                      b"4;a\x00b\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunkextnoname"):
+        # chunk-ext-name is a token and it is not optional. The scanners asked
+        # only which BYTES an extension may contain, never what shape they must
+        # make, so this was a well-formed chunk header (audit-report-23).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4;=bad\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunkextunterm"):
+        # An unterminated quoted-string. This is the one that matters: a parser
+        # that DOES track the quotes keeps looking for the closing one past the
+        # CRLF, so it and a scanner that stops at the CR disagree about where
+        # the chunk data begins -- and that disagreement is request smuggling.
+        # CR is not qdtext, so the quote can never swallow the line ending.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b'4;a="unterminated\r\nbody\r\n0\r\n\r\n')
+    elif path.endswith(b"/chunkextquoted"):
+        # A VALID quoted-string value carrying a semicolon: the control for the
+        # rule above, and proof that ';' inside quotes does not start a second
+        # extension.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b'4;a="x;y"\r\nbody\r\n0\r\n\r\n')
+    elif path.endswith(b"/chunkextbws"):
+        # BWS before the ';' IS in the grammar (RFC 9112 7.1.1), so this is
+        # valid -- while /api/chunksizetrailsp, a space with no ';' behind it,
+        # stays malformed. The pair is the point: "reject junk after the
+        # digits" must not become "reject the whitespace the grammar allows".
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4 ;a=b\r\nbody\r\n0\r\n\r\n")
     elif path.endswith(b"/chunktrailemptyname"):
         # A field line needs at least one name byte. Report 21 required token
         # bytes before the colon but not that there be ANY.

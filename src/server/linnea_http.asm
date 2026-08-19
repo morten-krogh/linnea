@@ -110,6 +110,7 @@ extern linnea_string_from_hex_u64
 extern linnea_string_equal
 extern linnea_string_is_token
 extern linnea_string_is_tchar
+extern linnea_chunk_ext_step
 extern linnea_string_iequal
 extern linnea_time_http_date
 extern linnea_time_parse_http_date
@@ -4581,37 +4582,25 @@ chunked_decode:
 .cd_size_done:
     test rcx, rcx
     jz .cd_bad                        ; no digits: not a chunk header
-    ; chunk = chunk-size [ chunk-ext ] CRLF, so the only bytes that may follow
-    ; the digits are a ';' opening an extension or the CR ending the line. This
-    ; took ANY byte that was not a hex digit as the end of the size and fell
-    ; into the extension state, so "4 ", "4g" and "4\0" were all read as a size
-    ; of four with junk "extension" after them. The other HTTP/1 request
-    ; decoder -- linnea_spill_chunked, which takes over as soon as the body is
-    ; too large to buffer -- already refuses them, so the SAME bytes on the
-    ; SAME listener were 200 under LINNEA_CONN_IN_BUF and 400 over it, which is
-    ; the only thing that decides which decoder reads them (audit-report-22).
-    cmp byte [r14], ';'
-    je .cd_ext
-    cmp byte [r14], 13
-    jne .cd_bad
-.cd_ext:                              ; chunk-ext runs to the CRLF, ignored
+    ; chunk = chunk-size [ chunk-ext ] CRLF, and everything between the digits
+    ; and the CR is judged by linnea_chunk_ext_step -- the one place the
+    ; extension grammar lives, because it has to hold identically in the two
+    ; decoders that split at LINNEA_CONN_IN_BUF and in h2's. This scanned a
+    ; byte CLASS instead: first anything but LF (so "4 ", "4g" and "4\0" were a
+    ; size of four, audit-report-22), then anything printable (so "4;=bad" and
+    ; "4;a=\"unterminated" were well-formed chunk headers, audit-report-23).
+    mov r9d, LINNEA_CHUNK_EXT_START   ; at a component boundary
+.cd_ext:
     cmp r14, r13
     jae .cd_more
-    ; An extension is token / quoted-string with BWS, so HTAB may appear inside
-    ; it but no other control byte may. CR and LF are tested FIRST because both
-    ; are themselves below 0x20 -- putting the control-byte check ahead of them
-    ; would reject the line ending it is looking for.
-    cmp byte [r14], 13
-    je .cd_size_crlf
-    cmp byte [r14], 10
-    je .cd_bad                        ; a bare LF is not a line ending here
-    cmp byte [r14], 9
-    je .cd_ext_next                   ; HTAB is BWS
-    cmp byte [r14], 0x20
-    jb .cd_bad
-    cmp byte [r14], 0x7f
-    je .cd_bad                        ; DEL
-.cd_ext_next:
+    movzx esi, byte [r14]
+    mov rdi, r9
+    call linnea_chunk_ext_step
+    cmp rax, -2
+    je .cd_size_crlf                  ; the CR that ends the size line
+    cmp rax, -1
+    je .cd_bad
+    mov r9, rax
     inc r14
     jmp .cd_ext
 .cd_size_crlf:

@@ -297,6 +297,28 @@ SIZE_LINES = [
     # the octets behind it became a pipelined request (see mode_smuggle).
     ("17 hex digits",  b"10000000000000000", b"400"),
     ("16 huge digits", b"1fffffffffffffff",  b"400"),
+    # ...and the extension's own grammar, RFC 9112 7.1.1:
+    #   chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+    # The rows above ask which BYTES may appear after the digits; these ask what
+    # SHAPE they must make (audit-report-23). "4 ;a=b" being valid while "4 " is
+    # not is the pair that keeps the rule honest -- BWS is BWS only when a ';'
+    # follows it -- and the unterminated quote is the one with teeth: a parser
+    # that tracks quotes reads on past the CRLF for the closing one.
+    ("quoted value",   b'4;a="q"',           b"200"),
+    ("quoted escape",  b'4;a="a\\"b"',       b"200"),
+    ("quoted semi",    b'4;a="x;y"',         b"200"),
+    ("two extensions", b"4;a;b=c",           b"200"),
+    ("BWS before ;",   b"4 ;a=b",            b"200"),
+    ("BWS around =",   b"4;a = b",           b"200"),
+    ("no extension",   b"4;",                b"400"),
+    ("no ext name",    b"4;=bad",            b"400"),
+    ("no ext value",   b"4;a=",              b"400"),
+    ("unterminated",   b'4;a="unterminated', b"400"),
+    ("quote in token", b'4;a=b"c',           b"400"),
+    ("byte past quote",b'4;a="q"x',          b"400"),
+    ("space in name",  b"4;a b",             b"400"),
+    ("non-token byte", b"4;a,b",             b"400"),
+    ("dangling escape",b'4;a="x\\',          b"400"),
 ]
 
 
