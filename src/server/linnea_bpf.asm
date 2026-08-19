@@ -38,6 +38,13 @@ extern linnea_print_u64_stderr
 %define BPF_MAP_CREATE 0
 %define BPF_MAP_UPDATE_ELEM 2
 %define BPF_PROG_LOAD  5
+; 15, checked against /usr/include/linux/bpf.h by ENUMERATING, not by counting
+; lines: `BPF_PROG_RUN = BPF_PROG_TEST_RUN` is an alias that takes a line and a
+; value's worth of text while consuming no value, so a naive count puts this
+; command at 17 and calls BPF_RAW_TRACEPOINT_OPEN instead. The struct offsets
+; below are from the same header: bpf_map_info is type/id/key_size/value_size
+; then max_entries, so max_entries is at 16; the attr for this command is
+; {u32 bpf_fd, u32 info_len, u64 info} = 16 bytes.
 %define BPF_OBJ_GET_INFO_BY_FD 15
 %define MAP_TYPE_REUSEPORT_SOCKARRAY 20
 %define PROG_TYPE_SK_REUSEPORT       21
