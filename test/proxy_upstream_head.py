@@ -128,6 +128,12 @@ CASES = [
     ("tegzip",        502, None),
     ("tegzipbare",    502, None),
     ("tepad",         200, b"plain"),   # sole chunked, with OWS and case: served
+    # Content-Encoding is a REPRESENTATION property and end-to-end;
+    # Transfer-Encoding is a property of the HTTP/1 message on ONE hop. Refusing
+    # a transfer coding we cannot remove must not disturb a content coding we
+    # were never meant to touch -- otherwise the fix above would have broken
+    # every compressed backend response.
+    ("cegzip",        200, None),
     ("simple",     200, b"backend body"),
 ]
 
@@ -140,7 +146,8 @@ NOMINATED = {
     "earlyhop":      [b"x-hint-only"],
 }
 # ...and the control that stops the fix becoming "drop everything unfamiliar".
-KEPT = {"hopnamed": b"x-kept", "hopnamedmulti": b"x-kept"}
+KEPT = {"hopnamed": b"x-kept", "hopnamedmulti": b"x-kept",
+        "cegzip": b"content-encoding"}
 
 # Routes the HTTP/3 leg here cannot judge, and why. Listed rather than quietly
 # dropped, so a reader sees the gap instead of assuming coverage.
@@ -544,6 +551,15 @@ for route, keep in KEPT.items():
                for p, v in got.items()}
     check(f"{route}: the ordinary field beside them is still relayed",
           all(present.values()), f"  {present}")
+
+# --- a body we cannot predict must still be the SAME body everywhere --------
+# gzip bytes are opaque to this test, so the assertion is agreement rather than
+# a literal: three protocols, one representation.
+for route in ("cegzip",):
+    bodies = {p: v[1] for p, v in RESULTS.get(route, {}).items()}
+    same = len(set(bodies.values())) == 1 and all(bodies.values())
+    check(f"{route}: every protocol delivers the identical representation",
+          same, f"  {[(p, len(b)) for p, b in bodies.items()]}")
 
 for route, why in H3_SKIP.items():
     print(f"note: {route} not checked over HTTP/3 here -- {why}")

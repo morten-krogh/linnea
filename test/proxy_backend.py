@@ -226,6 +226,20 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/cegzip"):
+        # The RIGHT layer for compressed bytes: Content-Encoding is a property of
+        # the REPRESENTATION and is end-to-end, so it rides through a proxy
+        # untouched and the client decompresses it. Transfer-Encoding is a
+        # property of the HTTP/1 message on ONE hop. Refusing the latter must not
+        # disturb the former (audit-report-11 Finding 2).
+        import gzip as _gz
+        # mtime pinned: gzip stamps the clock by default, and the three
+        # protocols are three separate requests, so the bytes would differ and
+        # "all three delivered the same body" could never be asserted.
+        member = _gz.compress(b"transfer-coded payload", mtime=0)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n"
+                     b"Content-Type: text/plain\r\nContent-Length: "
+                     + str(len(member)).encode() + b"\r\n\r\n" + member)
     elif path.endswith(b"/tepad"):
         # The legal spelling with OWS and case, which must still be SERVED: the
         # control that stops "refuse anything that is not exactly chunked".
