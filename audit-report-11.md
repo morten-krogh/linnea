@@ -294,15 +294,18 @@ upstream-head validator**: a `Transfer-Encoding` whose coding list is not exactl
 it cannot express downstream, and inventing a `Content-Length` for bytes it never
 decoded is worse than refusing.
 
-#### One consequence beyond the report's ask
+#### One consequence beyond the report's ask — raised, and confirmed
 
 This makes **HTTP/1 refuse where it used to relay**. The report does not ask for
-that, so it is stated rather than slipped in. The justification: RFC 9112 6.1
-forbids sending a transfer coding to a client that has not offered `TE`, and the
-report itself records curl rejecting what we relayed — so the previous behaviour
-was serving no one, and leaving it would preserve exactly the three-way
-disagreement this fix exists to end. Scoping it back to HTTP/2 and HTTP/3 is a
-one-line change if that is preferred.
+that, so it was put to the maintainer rather than slipped in, with the
+alternative (scope it to HTTP/2 and HTTP/3, a one-line change) offered.
+
+**Decision: keep the HTTP/1 refusal — all three protocols agree.** The
+justification behind it: RFC 9112 6.1 forbids sending a transfer coding to a
+client that has not offered `TE`, and the report itself records curl rejecting
+what we relayed, so the previous behaviour was serving no one — and leaving
+HTTP/1 alone would have preserved exactly the three-way disagreement this fix
+exists to end.
 
 #### The control earned its keep immediately
 
