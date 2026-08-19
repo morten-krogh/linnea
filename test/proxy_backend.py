@@ -226,6 +226,15 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/chunktrailinlinelf"):
+        # A bare LF INSIDE a trailer field line, followed by a later CRLF. This
+        # is the test /api/chunktraillf is not: an LF then EOF leaves an
+        # incremental decoder in an unfinished state and it fails on
+        # truncation, which proves nothing about the character class. Only a
+        # valid continuation after the LF exercises the scanner's rule
+        # (audit-report-20).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\nX-Trail: one\ncontinued\r\n\r\n")
     elif path.endswith(b"/chunkextlf"):
         # A chunk-extension is terminated by CRLF. A bare LF inside it is not a
         # line ending, and a later CRLF does not retroactively make it one

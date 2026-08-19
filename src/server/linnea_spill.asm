@@ -312,8 +312,17 @@ linnea_spill_chunked:
     mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_END_LF
     jmp .step
 .s_trail_line:
+    ; A trailer section is made of HTTP field LINES, so a bare LF inside one is
+    ; not a line ending -- and a later CRLF does not make it one. All three
+    ; trailer scanners advanced over every byte that was not CR, so the LF was
+    ; consumed as field data and the message completed (audit-report-20).
+    ; The distinguishing test is an LF followed by a valid CONTINUATION: an LF
+    ; then EOF only leaves an incremental decoder unfinished, which is
+    ; truncation, not a character-class rule.
     cmp byte [r12], 13
     je .trail_line_cr
+    cmp byte [r12], 10
+    je .bad
     inc r12
     jmp .step
 .trail_line_cr:

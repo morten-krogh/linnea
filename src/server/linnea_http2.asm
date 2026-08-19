@@ -4257,10 +4257,19 @@ h2p_decode:
     mov qword [rbx + linnea_h2p.chunked], 7
     jmp .dec_loop
 .dec_trail_line:
+    ; A trailer section is made of HTTP field LINES, so a bare LF inside one is
+    ; not a line ending -- and a later CRLF does not make it one. All three
+    ; trailer scanners advanced over every byte that was not CR, so the LF was
+    ; consumed as field data and the message completed (audit-report-20).
+    ; The distinguishing test is an LF followed by a valid CONTINUATION: an LF
+    ; then EOF only leaves an incremental decoder unfinished, which is
+    ; truncation, not a character-class rule.
     cmp r13, [rbx + linnea_h2p.len]
     jae .dec_save
     cmp byte [r12 + r13], 13
     je .dec_trail_cr
+    cmp byte [r12 + r13], 10
+    je .dec_bad
     inc r13
     jmp .dec_trail_line
 .dec_trail_cr:

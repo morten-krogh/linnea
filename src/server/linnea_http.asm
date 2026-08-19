@@ -4620,10 +4620,19 @@ chunked_decode:
     cmp byte [r14], 13
     je .cd_trailer_end
 .cd_trailer_line:
+    ; A trailer section is made of HTTP field LINES, so a bare LF inside one is
+    ; not a line ending -- and a later CRLF does not make it one. All three
+    ; trailer scanners advanced over every byte that was not CR, so the LF was
+    ; consumed as field data and the message completed (audit-report-20).
+    ; The distinguishing test is an LF followed by a valid CONTINUATION: an LF
+    ; then EOF only leaves an incremental decoder unfinished, which is
+    ; truncation, not a character-class rule.
     cmp r14, r13
     jae .cd_more
     cmp byte [r14], 13
     je .cd_trailer_crlf
+    cmp byte [r14], 10
+    je .cd_bad
     inc r14
     jmp .cd_trailer_line
 .cd_trailer_crlf:

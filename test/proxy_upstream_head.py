@@ -218,6 +218,13 @@ CASES = [
     ("chunkdatalf",   502, None),      # ...and where the data's CRLF belongs
     ("chunktraillf",  502, None),      # ...and where a trailer line starts
     ("chunkext",      200, b"body"),   # a VALID extension: still ignored, still served
+    # A bare LF inside a trailer FIELD LINE, followed by a valid continuation.
+    # This is the test chunktraillf is not: LF-then-EOF leaves an incremental
+    # decoder unfinished and fails on truncation, which says nothing about the
+    # character class. Only a continuation after the LF exercises the scanner
+    # (audit-report-20). All three decoders skipped it -- h3 too, unlike the
+    # h2-only findings before it.
+    ("chunktrailinlinelf", 502, None),
     ("simple",     200, b"backend body"),
 ]
 
@@ -576,7 +583,7 @@ h3 = h3_all([r for r, _, _ in CASES if r not in H3_SKIP])
 # 502 -- which is exactly why it must. Written down rather than exempted,
 # because an exemption is where a defect lives (audit-report-16).
 STREAMED_BODY = {"chunkspace", "chunkoverflow", "chunkbig", "chunkextlf",
-                 "chunkdatalf"}
+                 "chunkdatalf", "chunktrailinlinelf", "chunktraillf"}
 
 # chunktrunc is the same family but a step further, and it separates "malformed"
 # from "detectable in time". Its head and first chunk line are VALID, so h2 has
@@ -588,8 +595,7 @@ H2_RESET = {}
 # ...so its correct answer differs per protocol BY NECESSITY, and the generic
 # "all three agree" check does not apply. It is asserted on its own terms below
 # instead of being dropped from the matrix.
-PROTOCOL_SPECIFIC = {"chunktrunc", "chunknoterm", "chunkpartialtrail",
-                     "chunktraillf"}
+PROTOCOL_SPECIFIC = {"chunktrunc", "chunknoterm", "chunkpartialtrail"}
 
 RESULTS = {}
 
