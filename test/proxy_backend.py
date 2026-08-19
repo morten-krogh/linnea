@@ -264,6 +264,37 @@ def respond(conn, head, body, extra=b""):
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
         time.sleep(0.3)
         conn.sendall(b"4;=bad\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunksplitext"):
+        # The malformation STRADDLES the read boundary: "4;a" is a valid prefix
+        # and only ",b" makes it wrong, so the decoder must have carried its
+        # state from the head's read into the relay's. audit-report-25 read the
+        # relay as unvalidated; it is not, and these three are what say so.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4;a")
+        time.sleep(0.3)
+        conn.sendall(b",b\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunksplittrail"):
+        # ...the same for a trailer line: "Not" could still become a field name.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\nNot")
+        time.sleep(0.3)
+        conn.sendall(b"AField\r\n\r\n")
+    elif path.endswith(b"/chunksplitdata"):
+        # ...and for the CRLF after chunk data, where the CR has not arrived yet
+        # and the byte that does arrive is a bare LF.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody")
+        time.sleep(0.3)
+        conn.sendall(b"\n0\r\n\r\n")
+    elif path.endswith(b"/chunksplitok"):
+        # The control, and it is audit-report-25's own reproduction byte for
+        # byte: "4;a=" then "bad". Reassembled that is "4;a=bad", a token value
+        # -- VALID -- so it must arrive whole. A guard that refused every split
+        # chunk line would pass the three above and fail here.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4;a=")
+        time.sleep(0.3)
+        conn.sendall(b"bad\r\nbody\r\n0\r\n\r\n")
     elif path.endswith(b"/chunklategood"):
         # ...and the control for it, split exactly the same way: a VALID body
         # arriving after the head must still be relayed whole.

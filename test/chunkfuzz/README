@@ -53,3 +53,20 @@ upload, through both request decoders, demanding they agree. It needs only a
 plain-HTTP port whose /api is a proxy location:
 
     python3 reqdrive.py <linnea-http-port>
+
+splitdrive.py asks a third question, and it is the one HTTP/1 alone raises:
+does the answer depend on where the upstream flushed? h1 relays as it streams,
+so its validator has to carry state from the read that brought the head into
+every read after it. splitback.py serves each variant cut at a chosen byte
+offset, with a pause between the two writes -- without the pause both halves
+arrive as one read on loopback and the sweep never crosses a boundary at all.
+Every variant at every offset is 4057 requests, a few minutes:
+
+    python3 splitback.py 62950 &
+    # point a linnea vhost's /api at 127.0.0.1:62950, then
+    python3 splitdrive.py
+
+Report 25 read the relay path as unvalidated and this is the answer to it:
+4057 splits, 0 wrong. Its four sharpest cases -- a malformation straddling the
+boundary, and the valid one that must not be caught with them -- are permanent
+fixtures in test/h1_chunk_relay.py.

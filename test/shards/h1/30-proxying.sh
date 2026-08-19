@@ -116,7 +116,7 @@ check_http "proxy chunked closes" "Connection: close" "$resp"
 # all h1 can do is decline to finish the message (audit-report-24).
 out=$(timeout 30 python3 test/h1_chunk_relay.py ${P61080} 2>&1 | tail -1)
 [ "$out" = "OK" ]
-check "a chunked relay that goes wrong late does not complete ($out)" $?
+check "a chunked relay that goes wrong late or across a read does not complete ($out)" $?
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/api/eof)
 check_http "proxy eof body"      "eof delimited body" "$resp"
 check_http "proxy eof closes"    "Connection: close" "$resp"
