@@ -226,6 +226,39 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/connte"):
+        # Connection says a field is specific to THIS hop; it does not unsay
+        # what the field MEANS on this hop. RFC 9110 7.6.1 lists
+        # Transfer-Encoding among the fields an intermediary removes AFTER
+        # applying their semantics (audit-report-14 Finding 1).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: Transfer-Encoding\r\n"
+                     b"Transfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/conncl"):
+        # The same for a nominated Content-Length: it must frame this hop and
+        # must not travel onward.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: Content-Length\r\n"
+                     b"Content-Length: 4\r\n\r\nbody")
+    elif path.endswith(b"/conntecl"):
+        # Both nominated: still a framing conflict, and must be refused on every
+        # protocol rather than served by whichever one stopped noticing.
+        conn.sendall(b"HTTP/1.1 200 OK\r\n"
+                     b"Connection: Transfer-Encoding, Content-Length\r\n"
+                     b"Transfer-Encoding: chunked\r\nContent-Length: 4\r\n"
+                     b"\r\n4\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/fieldows"):
+        # HTTP/1 OWS around a field value is a field-line DELIMITER, not part of
+        # the value. RFC 9113 8.2.1: an h2 field value MUST NOT start or end
+        # with SP or HTAB (Finding 2). HTAB leading, HTAB trailing.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                     b"X-Note:\tvalue\t\r\n\r\nbody")
+    elif path.endswith(b"/fieldsptrail"):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                     b"X-Note: value \r\n\r\nbody")
+    elif path.endswith(b"/fieldinner"):
+        # Internal whitespace is part of the value and must NOT be touched: the
+        # control that keeps a trim from becoming a rewrite.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                     b"X-Note: value one\r\n\r\nbody")
     elif path.endswith(b"/status099"):
         # RFC 9110 15: a status code is a three-digit integer in 100..599.
         # Three digits alone is necessary but not sufficient, and 099 is not an

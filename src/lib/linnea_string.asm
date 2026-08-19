@@ -10,6 +10,7 @@ global linnea_string_from_u64
 global linnea_string_to_u64
 global linnea_string_from_hex_u64
 global linnea_string_is_token
+global linnea_string_trim_ows
 global linnea_u64_add_within
 
 section .text
@@ -46,6 +47,53 @@ tchar_map:      db 0x00, 0x00, 0x00, 0x00, 0xfa, 0x6c, 0xff, 0x03   ; 0x00-0x3f
                 db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00   ; 0xc0-0xff
 
 section .text
+
+
+; linnea_string_trim_ows(rdi = ptr, rsi = length)
+;   -> rax = pointer past any leading OWS, rdx = length with trailing OWS gone.
+;
+; RFC 9110 5.5: the optional whitespace around a field value belongs to the
+; FIELD LINE, not to the value. HTTP/1 may relay the line as it stands, which is
+; why this is not needed there -- but RFC 9113 8.2.1 forbids an HTTP/2 field
+; value that starts or ends with SP or HTAB, and HTTP/3 carries no field-line
+; syntax at all, so both binary emitters have to send the VALUE rather than the
+; line. They each stripped a leading SP and nothing else, so a perfectly legal
+; upstream "X-Note:\tvalue\t" became a malformed downstream field section
+; (audit-report-14 Finding 2).
+;
+; Internal whitespace is untouched: that is part of the value. An all-OWS value
+; trims to length 0, which is a legal empty field value and not an error.
+linnea_string_trim_ows:
+    mov rax, rdi
+    xor edx, edx
+    test rsi, rsi
+    jz .to_ret
+    mov rdx, rsi
+.to_lead:
+    test rdx, rdx
+    jz .to_ret
+    movzx ecx, byte [rax]
+    cmp cl, ' '
+    je .to_lead_step
+    cmp cl, 9
+    jne .to_trail
+.to_lead_step:
+    inc rax
+    dec rdx
+    jmp .to_lead
+.to_trail:
+    test rdx, rdx
+    jz .to_ret
+    movzx ecx, byte [rax + rdx - 1]
+    cmp cl, ' '
+    je .to_trail_step
+    cmp cl, 9
+    jne .to_ret
+.to_trail_step:
+    dec rdx
+    jmp .to_trail
+.to_ret:
+    ret
 
 ; linnea_string_is_token(rdi = ptr, rsi = len) -> rax = 1 when those bytes are a
 ; non-empty RFC 9110 5.6.2 token, else 0. Touches only caller-saved registers.

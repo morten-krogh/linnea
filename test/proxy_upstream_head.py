@@ -161,6 +161,20 @@ CASES = [
     # "chunked, chunked": two layers, forbidden, and not what the one layer
     # below is. Each line was checked in isolation (Finding 2).
     ("tedupe",        502, None),
+    # Connection names which fields are specific to THIS hop; it does not unsay
+    # what they mean ON this hop. h1 filtered them before reading its own
+    # framing, so a nominated Transfer-Encoding left the response
+    # close-delimited and h1 relayed the chunk syntax as content while h2/h3
+    # de-chunked properly (audit-report-14 Finding 1).
+    ("connte",        200, b"body"),
+    ("conncl",        200, b"body"),
+    ("conntecl",      502, None),      # still a framing conflict when nominated
+    # HTTP/1 OWS around a value belongs to the field LINE. RFC 9113 8.2.1
+    # forbids an h2 value that starts or ends with SP or HTAB; h2 and h3
+    # stripped a leading SP and nothing else (Finding 2).
+    ("fieldows",      200, b"body"),
+    ("fieldsptrail",  200, b"body"),
+    ("fieldinner",    200, b"body"),   # internal whitespace: must NOT be touched
     ("simple",     200, b"backend body"),
 ]
 
@@ -178,6 +192,11 @@ KEPT = {"hopnamed": b"x-kept", "hopnamedmulti": b"x-kept",
 # route -> a field name that must survive on ALL THREE, whatever its length.
 # The point is not the length but that the three agree about it.
 LONGNAME = {"name64": b"x-" + b"a" * 62, "name65": b"x-" + b"a" * 63}
+# route -> the exact value every protocol must present for x-note. The bytes
+# matter, not just the field's presence: OWS is a field-line delimiter, and
+# internal whitespace is value.
+FIELDVAL = {"fieldows": b"value", "fieldsptrail": b"value",
+            "fieldinner": b"value one"}
 
 # Routes the HTTP/3 leg here cannot judge, and why. Listed rather than quietly
 # dropped, so a reader sees the gap instead of assuming coverage.
@@ -377,7 +396,7 @@ def h2(route):
                     code = d2.get(b":status", b"?").decode()
                     if code.isdigit():
                         st = int(code)
-                    sections.append((code, [b"%s: %s" % (n, v) for n, v in fields
+                    sections.append((code, [b"%s:%s" % (n, v) for n, v in fields
                                             if not n.startswith(b":")]))
                 if ft in (0x0, 0x1) and fl & 0x1:
                     done = True
@@ -485,7 +504,7 @@ def h3_all(routes):
                 code = dict(h).get(b":status", b"?").decode()
                 if code.isdigit():
                     st = int(code)
-                extra = [b"%s: %s" % (n, v) for n, v in h if not n.startswith(b":")]
+                extra = [b"%s:%s" % (n, v) for n, v in h if not n.startswith(b":")]
                 sections.append((code, extra))
             elif ty == 0:
                 body += resp[i:i + ln]
@@ -599,6 +618,28 @@ for route, name in LONGNAME.items():
                for p, v in got.items()}
     check(f"{route}: the {len(name)}-byte field name is forwarded by every "
           f"protocol (RFC 9110 5.1)", all(present.values()), f"  {present}")
+
+# --- the value, exactly, on every protocol ----------------------------------
+for route, want in FIELDVAL.items():
+    got = {}
+    for proto, v in RESULTS.get(route, {}).items():
+        # the sections are formatted as "name: value" by the helpers above, so
+        # split on ": " -- splitting on ":" alone re-adds that separator space
+        # and every value looks OWS-padded, including the correct ones
+        # h1 sections hold RAW header lines, h2/h3 hold "name:value" with no
+        # separator of our own -- so everything after the first colon is the
+        # value exactly as that protocol carries it, OWS included.
+        vals = [f.partition(b":")[2] for _, fields in v[3] for f in fields
+                if f.lower().startswith(b"x-note:")]
+        got[proto] = vals[0] if vals else None
+    # h1 may relay the upstream line verbatim -- that is legal HTTP/1 and the
+    # value is recovered by stripping OWS, which any HTTP/1 client does. h2 and
+    # h3 carry no field-line syntax, so for them the bytes must already BE the
+    # value.
+    ok_h1 = got.get("h1") is not None and got["h1"].strip(b" \t") == want
+    ok_bin = all(got.get(p) == want for p in ("h2", "h3") if p in got)
+    check(f"{route}: x-note is exactly {want!r} on h2/h3 (h1 may keep its OWS)",
+          ok_h1 and ok_bin, f"  {got}")
 
 for route, why in H3_SKIP.items():
     print(f"note: {route} not checked over HTTP/3 here -- {why}")

@@ -58,6 +58,7 @@ extern linnea_http_head_conn_named
 extern linnea_http_status_no_content
 extern linnea_http_status_no_clen
 extern linnea_string_iequal
+extern linnea_string_trim_ows
 extern linnea_string_equal
 extern linnea_string_is_token
 extern linnea_quic_parse_priority
@@ -4586,25 +4587,28 @@ h2p_emit_headers:
     jne .eh_next                     ; forbidden here, or one already went out
     mov qword [rsp + 40], 1
 .eh_forward:
-    ; the value, spaces trimmed
+    ; The VALUE, not the field line: OWS at either end belongs to the line, and
+    ; RFC 9113 8.2.1 forbids an h2 field value that starts or ends with SP or
+    ; HTAB. This stripped a leading SP and nothing else, so a legal upstream
+    ; "X-Note:\tvalue\t" was HPACK-encoded with its delimiters attached
+    ; (audit-report-14 Finding 2). Report 7 asked for exactly this and only the
+    ; framing lookups were changed, which is why Content-Length with HTAB worked
+    ; while every other field still carried its whitespace through.
     mov rdx, [rsp + 16]
     inc rdx                          ; past the colon
-.eh_vlead:
-    cmp rdx, rbp
-    jae .eh_vdone
-    cmp byte [r12 + rdx], ' '
-    jne .eh_vdone
-    inc rdx
-    jmp .eh_vlead
+    mov [rsp + 32], rbp              ; the line's CR offset, across the calls
+    lea rdi, [r12 + rdx]
+    mov rsi, rbp
+    sub rsi, rdx                     ; the raw span between colon and CR
+    call linnea_string_trim_ows      ; -> rax = value, rdx = its length
+    mov rcx, rdx                     ; value length
+    mov rdx, rax                     ; value pointer
 .eh_vdone:
-    mov rcx, rbp
-    sub rcx, rdx                     ; value length
-    mov [rsp + 32], rbp              ; the line's CR offset, across the call
     ; emit: literal without indexing, literal name (index 0)
     mov rdi, r15
     lea rsi, [h2p_nmbuf]
     mov r8, rcx                      ; value length
-    lea rcx, [r12 + rdx]             ; value ptr
+    mov rcx, rdx                     ; value ptr (already trimmed)
     mov rdx, [rsp + 24]              ; name length
     call h2_enc_hdr_lit
     mov r15, rdi

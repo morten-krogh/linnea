@@ -47,6 +47,7 @@ extern linnea_static_etag_len
 extern linnea_static_lastmod
 extern linnea_time_http_now
 extern linnea_string_iequal
+extern linnea_string_trim_ows
 extern linnea_http_head_conn_named
 extern linnea_string_from_u64
 
@@ -892,19 +893,19 @@ linnea_qpack_encode_proxy:
     call linnea_http_head_conn_named
     test eax, eax
     jnz .ep_next
-    ; the value, leading spaces trimmed
+    ; The VALUE, not the field line. HTTP/3 carries no field-line syntax, so the
+    ; OWS around an HTTP/1 value is not something to translate -- it is a
+    ; delimiter that has no meaning here. Leading SP alone was stripped
+    ; (audit-report-14 Finding 2).
     mov rdx, [rsp + 40]
     inc rdx                          ; past the colon
-.ep_vlead:
-    cmp rdx, r15
-    jae .ep_vdone
-    cmp byte [r12 + rdx], ' '
-    jne .ep_vdone
-    inc rdx
-    jmp .ep_vlead
+    lea rdi, [r12 + rdx]
+    mov rsi, r15
+    sub rsi, rdx                     ; the raw span between colon and CR
+    call linnea_string_trim_ows      ; -> rax = value, rdx = its length
+    mov rcx, rdx                     ; value length
+    mov rdx, rax                     ; value pointer
 .ep_vdone:
-    mov rcx, r15
-    sub rcx, rdx                     ; value length
     ; room? A head that outgrows the reserve cannot be written in front of the
     ; body, so the caller answers 502 rather than send a truncated field section
     mov rax, rbx
@@ -915,7 +916,7 @@ linnea_qpack_encode_proxy:
     mov rdi, rbx
     lea rsi, [qp_nmbuf]
     mov r8, rcx                      ; value length
-    lea rcx, [r12 + rdx]             ; value pointer
+    mov rcx, rdx                     ; value pointer (already trimmed)
     mov rdx, [rsp + 32]              ; name length
     call qenc_lit
     mov rbx, rdi

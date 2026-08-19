@@ -403,6 +403,8 @@ hop_by_hop_names:
     db 18, "proxy-authenticate"
     db 19, "proxy-authorization"
     db  0
+hdr_te_chunked: db "Transfer-Encoding: chunked", 13, 10
+hdr_te_chunked_len equ $ - hdr_te_chunked
 hv_close:       db "close"
 hv_keepalive:   db "keep-alive"
 hv_chunked:     db "chunked"
@@ -4034,6 +4036,56 @@ linnea_http_proxy_head:
     jmp .colon_scan
 .colon_found:
     mov r13, r8                ; colon offset, for the value scan
+    ; --- FRAMING FIRST: what delimits the message we RECEIVED -------------
+    ; This used to come after the forwarding filters, and that ordering was a
+    ; defect with a High severity attached to it. `Connection` says which fields
+    ; are specific to this hop -- it does NOT unsay what they mean ON this hop,
+    ; and RFC 9110 7.6.1 lists Transfer-Encoding among the fields an
+    ; intermediary removes AFTER applying their semantics. So an upstream
+    ; sending
+    ;       Connection: Transfer-Encoding
+    ;       Transfer-Encoding: chunked
+    ; had the field correctly kept out of the downstream head and incorrectly
+    ; kept out of our own framing decision: no flag was set, the response became
+    ; close-delimited, and h1 relayed the chunk sizes and terminator to the
+    ; client as content while h2 and h3 de-chunked the same response properly
+    ; (audit-report-14 Finding 1).
+    ;
+    ; Removing a field from the message sent onward must happen after that field
+    ; has delimited the message received. Both fields are read here; whether
+    ; either is COPIED is decided at .fwd below, so a nominated Content-Length
+    ; still frames this hop and still does not travel.
+    mov rcx, [rsp + 24]
+    mov rax, r13
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_content_len]
+    mov ecx, 14
+    call linnea_string_iequal
+    test eax, eax
+    jnz .content_len
+    mov rcx, [rsp + 24]
+    mov rax, r13
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_transfer_enc]
+    mov ecx, 17
+    call linnea_string_iequal
+    test eax, eax
+    jz .fwd
+    ; Chunked. The flag is this hop's framing; the upstream's FIELD is never
+    ; copied onward, because Transfer-Encoding describes one hop and the hop it
+    ; describes downstream is ours. We state our own at .until_eof, exactly as
+    ; Connection is replaced rather than relayed -- which also means a
+    ; Connection-nominated Transfer-Encoding still frames this hop and still
+    ; does not travel, instead of the framing being lost with the field
+    ; (audit-report-14 Finding 1).
+    or qword [rsp + 16], 2
+    jmp .next_line
+.fwd:
+    ; --- and only now, what we FORWARD ------------------------------------
     mov rax, r8
     sub rax, rcx               ; header name length
     lea rdi, [r14 + rcx]
@@ -4090,28 +4142,11 @@ linnea_http_proxy_head:
     call linnea_http_head_conn_named
     test eax, eax
     jnz .next_line
-    mov rcx, [rsp + 24]
-    mov rax, r13
-    sub rax, rcx
-    lea rdi, [r14 + rcx]
-    mov rsi, rax
-    lea rdx, [hn_content_len]
-    mov ecx, 14
-    call linnea_string_iequal
-    test eax, eax
-    jnz .content_len
-    mov rcx, [rsp + 24]
-    mov rax, r13
-    sub rax, rcx
-    lea rdi, [r14 + rcx]
-    mov rsi, rax
-    lea rdx, [hn_transfer_enc]
-    mov ecx, 17
-    call linnea_string_iequal
-    test eax, eax
-    jz .copy_line
-    or qword [rsp + 16], 2     ; chunked: the framing is the upstream's
-    jmp .copy_line
+    jmp .copy_line             ; nothing forbade it: it travels. Without this
+                               ; jump every surviving field fell into the
+                               ; Content-Length parser below -- the framing
+                               ; block used to sit here, and moving it left the
+                               ; fall-through behind.
 .content_len:
     ; A REPEATED Content-Length is no longer refused here. The shared validator
     ; at .found has already parsed every occurrence and rejected the head unless
@@ -4196,6 +4231,7 @@ linnea_http_proxy_head:
     ; and "a length of zero" are different answers, and 204 means the first.
     cmp qword [rsp + 56], 0
     jne .next_line
+    jmp .fwd                   ; framed; whether it travels is decided there
 .copy_line:
     mov rcx, [rsp + 24]
     mov rdx, [rsp + 32]
@@ -4265,6 +4301,14 @@ linnea_http_proxy_head:
 .until_eof:
     mov qword [rbx + linnea_connection.body_rem], -1
     mov qword [rbx + linnea_connection.keep_alive], 0
+    ; ...and if what we are relaying IS chunked, say so ourselves. Only here:
+    ; a HEAD, a 304 or any other bodiless answer reaches .no_body instead and
+    ; must not claim a framing it is not sending.
+    test qword [rsp + 16], 2
+    jz .conn_hdr
+    lea rdi, [hdr_te_chunked]
+    mov esi, hdr_te_chunked_len
+    call .append
 .conn_hdr:
     lea rdi, [hdr_via_11]            ; and this one, on the way back
     mov esi, hdr_via_11_len
