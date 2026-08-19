@@ -200,6 +200,37 @@ def respond(conn, head, body, extra=b""):
     elif path.endswith(b"/205bare"):
         # No framing at all: also legal, also no content.
         conn.sendall(b"HTTP/1.1 205 Reset Content\r\n\r\n")
+    elif path.endswith(b"/upgrade200"):
+        # RFC 9110 7.8: a sender of Upgrade names it as a Connection option so
+        # intermediaries do not forward it. On a response that is NOT a protocol
+        # switch it is ordinary hop-by-hop metadata and must be dropped. Report
+        # 10's Connection walk exempted `upgrade` unconditionally so the 101
+        # tunnel could complete, which was broader than its purpose
+        # (audit-report-11 Finding 1). The client here asked for no upgrade.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                     b"Connection: Upgrade\r\n"
+                     b"Upgrade: websocket\r\n\r\nbody")
+    elif path.endswith(b"/tegzip"):
+        # RFC 9112 6.1's own example: content gzipped, THEN chunk-framed.
+        # Removing the chunk framing does not undo the gzip, so a proxy that
+        # de-chunks and then calls the result identity content is handing the
+        # client bytes that are not the response (audit-report-11 Finding 2).
+        import gzip as _gz
+        member = _gz.compress(b"transfer-coded payload")
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"
+                     + ("%x\r\n" % len(member)).encode() + member + b"\r\n0\r\n\r\n")
+    elif path.endswith(b"/tegzipbare"):
+        # ...and the same coding without chunked at all: close-delimited, so
+        # nothing even hints that a transformation is outstanding.
+        import gzip as _gz
+        member = _gz.compress(b"transfer-coded payload")
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
+        conn.close()
+    elif path.endswith(b"/tepad"):
+        # The legal spelling with OWS and case, which must still be SERVED: the
+        # control that stops "refuse anything that is not exactly chunked".
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding:  Chunked \r\n\r\n"
+                     b"5\r\nplain\r\n0\r\n\r\n")
     elif path.endswith(b"/205chunked"):
         # A 205 that frames content the other way. RFC 9110 15.3.6 does allow a
         # zero-length chunked section here, so refusing this is deliberately

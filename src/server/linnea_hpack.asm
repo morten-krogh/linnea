@@ -1572,7 +1572,6 @@ linnea_hpack_req_check:
 
 
 hcn_connection: db "connection"
-hcn_upgrade:    db "upgrade"
 
 ; linnea_http_head_conn_named(rdi = head ptr, rsi = head length,
 ;                             rdx = field name, rcx = name length)
@@ -1595,9 +1594,14 @@ hcn_upgrade:    db "upgrade"
 ; pass costs less than anywhere to keep the set would -- and repeated
 ; Connection lines, which are legal, then work without being thought about.
 ;
-; `upgrade` is never matched, exactly as on the request side: the 101 path is a
-; participant in the handshake rather than a bystander, and the tunnel only
-; completes if the backend's Upgrade field reaches the client.
+; It is GENERIC: `upgrade` is matched like any other name. It did not used to
+; be -- the exception was written here so the 101 tunnel could complete, which
+; is broader than that purpose and leaked `Upgrade: websocket` out of an
+; ordinary 200 whose upstream had scoped it to the backend hop
+; (audit-report-11 Finding 1). The tunnel's need is narrower than a global
+; field-name exception and now lives where it can be justified: the HTTP/1 101
+; path, which has already checked both the client's upgrade wish and the
+; upstream status.
 ;
 ; It lives in this file, not linnea_http.asm, because linnea_qpack.o is linked
 ; by four test harnesses that have no linnea_http.o -- the same reason
@@ -1618,15 +1622,6 @@ linnea_http_head_conn_named:
     add r13, rsi                      ; head end
     mov r14, rdx                      ; the name being asked about
     mov r15, rcx
-    cmp r15, 7                        ; the Upgrade exception, before any walk
-    jne .cx_scan
-    mov rdi, r14
-    mov rsi, r15
-    lea rdx, [hcn_upgrade]
-    mov ecx, 7
-    call linnea_string_iequal
-    test eax, eax
-    jnz .cx_no                        ; never a removal instruction
 .cx_scan:
     mov rbx, r12                      ; cursor: skip the status line
 .cx_status:

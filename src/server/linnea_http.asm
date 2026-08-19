@@ -3654,6 +3654,62 @@ linnea_http_upstream_head_valid:
     test eax, eax
     jz .hv_not_te
     mov qword [rsp + 24], 1
+    ; ...and the coding list must be exactly `chunked`. RFC 9112 6.1 makes
+    ; Transfer-Encoding the sequence of codings applied to form the HTTP/1
+    ; message body, and its own example is `gzip, chunked`: content compressed
+    ; and THEN chunk-framed. Removing the chunk framing does not undo the gzip,
+    ; so a proxy that de-chunks and calls the result identity content hands the
+    ; client bytes that are not the response. That is what HTTP/3 did with
+    ; `gzip, chunked` and what HTTP/2 did with a bare `gzip` -- and HTTP/1
+    ; relayed the coding to a client that never offered TE, which RFC 9112 6.1
+    ; forbids in as many words (audit-report-11 Finding 2).
+    ;
+    ; It is refused here, once, rather than in each translator: the audit found
+    ; THREE different wrong answers to the same upstream message, which is what
+    ; a rule kept in three places does. `chunked` is the one coding this proxy
+    ; actually removes; anything else is a transformation it cannot express
+    ; downstream, and inventing a length for bytes it did not decode is worse
+    ; than refusing.
+    ;
+    ; The value's leading OWS is already skipped; trim the trailing OWS and the
+    ; whole list must be that one token. /api/tepad ("  Chunked ") is the
+    ; control that keeps this from becoming "refuse anything unfamiliar".
+    ; rcx is not the CR any more -- linnea_string_iequal takes its length in
+    ; ecx -- so re-find it from the value start, exactly as the Content-Length
+    ; path below does. Missing this made every chunked response a 502, which
+    ; the /api/chunked control caught on the first run.
+    mov rcx, r14
+.hv_te_scan:
+    cmp byte [r12 + rcx], 13
+    je .hv_te_eol
+    inc rcx
+    jmp .hv_te_scan
+.hv_te_eol:
+    mov rdi, rcx                      ; the CR: walk back over trailing OWS
+.hv_te_trim:
+    cmp rdi, r14
+    jbe .hv_bad                       ; an empty coding list
+    movzx eax, byte [r12 + rdi - 1]
+    cmp al, ' '
+    je .hv_te_step
+    cmp al, 9
+    jne .hv_te_have
+.hv_te_step:
+    dec rdi
+    jmp .hv_te_trim
+.hv_te_have:
+    sub rdi, r14                      ; the trimmed list's length
+    cmp rdi, 7
+    jne .hv_bad
+    push rcx
+    lea rdi, [r12 + r14]
+    mov rsi, 7
+    lea rdx, [hv_chunked]
+    mov ecx, 7
+    call linnea_string_iequal
+    pop rcx
+    test eax, eax
+    jz .hv_bad                        ; a coding we do not remove
     jmp .hv_next_line
 .hv_not_te:
     ; a Content-Length line: its value must agree with any earlier one
@@ -3949,6 +4005,29 @@ linnea_http_proxy_head:
     mov rcx, r13
     sub rcx, rax               ; name length
     lea rdx, [r14 + rax]       ; name pointer
+    ; The one exception, and it is exactly as wide as its reason: on a 101 the
+    ; backend's Upgrade line has to reach the client or the tunnel never
+    ; completes -- there this proxy is a participant, not a bystander. It used
+    ; to be a global exception inside the helper, which also let an ORDINARY
+    ; 200 export Upgrade after we had replaced Connection with our own value
+    ; (audit-report-11 Finding 1). up_status is already parsed here, and an
+    ; interim head never reaches this with 101 in it.
+    cmp qword [rbx + linnea_connection.up_status], 101
+    jne .cn_ask
+    cmp rcx, 7
+    jne .cn_ask
+    push rdx
+    push rcx
+    mov rdi, rdx
+    mov rsi, rcx
+    lea rdx, [hn_upgrade]
+    mov ecx, 7
+    call linnea_string_iequal
+    pop rcx
+    pop rdx
+    test eax, eax
+    jnz .copy_line             ; the tunnel's own Upgrade: forward it
+.cn_ask:
     mov rdi, r14               ; the head it came from...
     mov rsi, [rsp]             ; ...and that head's length
     call linnea_http_head_conn_named

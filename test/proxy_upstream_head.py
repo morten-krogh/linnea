@@ -117,12 +117,24 @@ CASES = [
     ("hopnamed",      200, b"body"),
     ("hopnamedmulti", 200, b"body"),   # two lines, OWS, mixed case, plus close
     ("earlyhop",      200, b"valid"),  # ...and on an INTERIM head
+    # RFC 9110 7.8: a sender of Upgrade names it as a Connection option so
+    # intermediaries do not forward it. Report 10's Connection walk exempted
+    # `upgrade` unconditionally so the 101 tunnel could complete -- broader than
+    # its purpose, and an HTTP/1-only leak on an ordinary 200 response
+    # (audit-report-11 Finding 1). h2 and h3 drop it from their fixed tables.
+    ("upgrade200",    200, b"body"),
+    # RFC 9112 6.1's own example: gzipped THEN chunk-framed. Removing the chunk
+    # framing does not undo the gzip (audit-report-11 Finding 2).
+    ("tegzip",        502, None),
+    ("tegzipbare",    502, None),
+    ("tepad",         200, b"plain"),   # sole chunked, with OWS and case: served
     ("simple",     200, b"backend body"),
 ]
 
 # route -> field names that must not survive on ANY protocol, in ANY field
 # section: the upstream nominated them in its own Connection header.
 NOMINATED = {
+    "upgrade200":    [b"upgrade"],
     "hopnamed":      [b"x-backend-only"],
     "hopnamedmulti": [b"x-one", b"x-two", b"x-three"],
     "earlyhop":      [b"x-hint-only"],
@@ -201,6 +213,25 @@ def h1(route):
         if 100 <= st < 200:
             buf = rest
             continue
+        # h1 relays chunked framing as framing -- that is the protocol, not a
+        # defect -- so de-chunk here or a chunked route's body compares raw
+        # "5\r\nplain\r\n0\r\n\r\n" against what h2 and h3 decoded.
+        if any(l.lower().startswith(b"transfer-encoding:") and b"chunked" in l.lower()
+               for l in lines[1:]):
+            out, i = b"", 0
+            while i < len(rest):
+                j = rest.find(b"\r\n", i)
+                if j < 0:
+                    break
+                try:
+                    n = int(rest[i:j].split(b";")[0], 16)
+                except ValueError:
+                    break
+                if n == 0:
+                    break
+                out += rest[j + 2:j + 2 + n]
+                i = j + 2 + n + 2
+            rest = out
         return st, rest, lines[1:], sections
 
 
