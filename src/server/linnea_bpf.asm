@@ -103,6 +103,15 @@ msg_errno_len equ $ - msg_errno
 msg_size: db "FAILED: the map does not agree with itself about its size, or an "
           db "index past its end did not refuse -- see linnea_bpf_map_half", 10
 msg_size_len equ $ - msg_size
+msg_meas: db "map: half="
+msg_meas_len equ $ - msg_meas
+msg_m2:   db " add(2*HALF)="
+msg_m2_len equ $ - msg_m2
+msg_m3:   db " add(HALF)="
+msg_m3_len equ $ - msg_m3
+msg_want: db "  (want half=128 add(2*HALF)=-7 add(HALF)=0)", 10
+msg_want_len equ $ - msg_want
+msg_minus: db "-"
 msg_steer: db "FAILED: loaded and attached, but a datagram did not steer by its "
            db "worker byte", 10
 msg_steer_len equ $ - msg_steer
@@ -142,7 +151,9 @@ mu_val:        resd 1                ; a map-update value (socket fd)
 gi_fd:         resd 1                ; the fd being interrogated
 map_info_len   equ 64                ; enough of struct bpf_map_info to reach
 map_info:      resb map_info_len     ; max_entries at offset 16
-st_socks:      resd 4                ; the self-test's reuseport sockets
+st_socks:      resd 5                ; the self-test's reuseport sockets: four
+                                     ; for the steering check, a fifth only to
+                                     ; prove the far half is addressable
 st_one:        resd 1
 st_pkt:        resb 32
 st_rcv:        resb 64
@@ -162,6 +173,9 @@ st_stage_len:  resq 1
 st_mismatch:   resb 1                ; steering went to the wrong socket
 st_sizebad:    resb 1                ; the map's own size, or the refusal past
                                      ; its end, was not what we depend on
+st_half:       resq 1                ; ...and the three measurements behind it,
+st_e2big:      resq 1                ; kept and PRINTED, because one flag over
+st_far:        resq 1                ; three checks says "somewhere here" 
 
 section .text
 
@@ -383,12 +397,32 @@ linnea_bpf_selftest:
 .st_bound:
     STAGE stg_mapupdate
     mov edi, r12d
+    cmp r12d, 4
+    jb .st_idx_ok
+    ; The fifth socket exists only to register at the FAR half. It has to be a
+    ; socket of its own: a REUSEPORT_SOCKARRAY tracks membership on the socket,
+    ; so re-registering one already in the array is refused with EBUSY (-16) --
+    ; which is what this check first measured, and it was the test being wrong,
+    ; not the map. What it proves now is that a map created at 2 * HALF really
+    ; can address base HALF, which is exactly what prod's inherited 128-entry
+    ; map cannot do.
+    mov edi, LINNEA_BPF_STEER_HALF
+.st_idx_ok:
     mov esi, r13d
     call linnea_bpf_map_add           ; map[i] = socket
+    cmp r12d, 4
+    jae .st_far_add
     test rax, rax
     js .st_fail
+    jmp .st_next_sock
+.st_far_add:
+    mov [st_far], rax
+    test rax, rax
+    jz .st_next_sock
+    mov byte [st_sizebad], 1
+.st_next_sock:
     inc r12d
-    cmp r12d, 4
+    cmp r12d, 5
     jb .st_mk
     ; --- the map's own account of its size ------------------------------
     ; The steering half has to come from the MAP, not from the constant. The
@@ -401,6 +435,7 @@ linnea_bpf_selftest:
     ; steering failure, so it gets its own flag rather than borrowing one.
     mov edi, [linnea_bpf_map_fd]
     call linnea_bpf_map_half
+    mov [st_half], rax
     cmp rax, LINNEA_BPF_STEER_HALF    ; the map was just created at 2 * HALF
     je .st_half_ok
     mov byte [st_sizebad], 1
@@ -408,17 +443,11 @@ linnea_bpf_selftest:
     mov edi, 2 * LINNEA_BPF_STEER_HALF    ; one past the end: E2BIG, not a
     mov esi, [st_socks]                   ; partial or silent success
     call linnea_bpf_map_add
+    mov [st_e2big], rax
     cmp rax, -7                       ; -E2BIG, the errno production logged
     je .st_e2big_ok
     mov byte [st_sizebad], 1
 .st_e2big_ok:
-    mov edi, LINNEA_BPF_STEER_HALF    ; ...and the first index of the far half,
-    mov esi, [st_socks]               ; which must fit
-    call linnea_bpf_map_add
-    test rax, rax
-    jz .st_size_done
-    mov byte [st_sizebad], 1
-.st_size_done:
     STAGE stg_attach
     mov edi, [st_socks]               ; attach the program to the group
     mov esi, [linnea_bpf_prog_fd]     ; not a register: r15 is the receiver below
@@ -514,6 +543,24 @@ linnea_bpf_probe:
     call linnea_print_stderr
     test rbx, rbx
     js .fail_errno
+    lea rdi, [msg_meas]
+    mov esi, msg_meas_len
+    call linnea_print_stderr
+    mov rdi, [st_half]
+    call print_signed
+    lea rdi, [msg_m2]
+    mov esi, msg_m2_len
+    call linnea_print_stderr
+    mov rdi, [st_e2big]
+    call print_signed
+    lea rdi, [msg_m3]
+    mov esi, msg_m3_len
+    call linnea_print_stderr
+    mov rdi, [st_far]
+    call print_signed
+    lea rdi, [msg_want]
+    mov esi, msg_want_len
+    call linnea_print_stderr
     cmp byte [st_sizebad], 0
     jne .fail_size
     cmp byte [st_mismatch], 0
@@ -573,6 +620,19 @@ linnea_bpf_probe:
     mov eax, -1
     pop rbx
     ret
+
+; print_signed(rdi = value) -- a -errno prints as -N, not as 18446744073709551609.
+print_signed:
+    test rdi, rdi
+    jns .ps_pos
+    push rdi
+    lea rdi, [msg_minus]
+    mov esi, 1
+    call linnea_print_stderr
+    pop rdi
+    neg rdi
+.ps_pos:
+    jmp linnea_print_u64_stderr
 
 ; print_cstr(rdi = string, rsi = the buffer's size) — write it to stderr, up to
 ; a NUL or the buffer's end. The bound matters because the scan is over a .bss
