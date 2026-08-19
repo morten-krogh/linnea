@@ -226,6 +226,31 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/chunkspace"):
+        # RFC 9112 7.1: chunk-size is 1*HEXDIG. A space before the first digit
+        # is not a delimiter, and h2's decoder alone accepted one
+        # (audit-report-17).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b" 4\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunkoverflow"):
+        # 17 hex digits: one nybble past 64 bits. Shifted without a bound the
+        # accumulator wraps to ZERO, which the decoder then reads as the
+        # terminal chunk -- a nonzero size line becoming end-of-message, so the
+        # response completes successfully and truncated.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"10000000000000000\r\n")
+    elif path.endswith(b"/chunkbig"):
+        # The bound itself: 0fffffffffffffff is the largest the other two
+        # decoders accept, so this must fail on SIZE rather than on wrapping.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"1fffffffffffffff\r\n")
+    elif path.endswith(b"/chunktrunc"):
+        # A chunked body that simply stops: the declared 4 bytes never arrive
+        # and no terminal chunk does either. Half a response is not one that can
+        # be delivered as a success.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbo")
+        conn.close()
     elif path.endswith(b"/connsts"):
         # Connection names the ORIGIN's policy field. Report 15 makes linnea
         # replace the discarded backend field with its configured policy -- and

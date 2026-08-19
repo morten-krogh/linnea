@@ -192,6 +192,16 @@ CASES = [
     ("connsts",       200, b"body"),
     ("connclose",     200, b"body"),
     ("connfirst",     200, b"body"),   # the position that worked by accident
+    # Malformed chunk framing. h2's decoder took a leading space that
+    # RFC 9112 7.1's 1*HEXDIG does not allow, and shifted its accumulator
+    # unbounded so a 17-digit size wrapped to ZERO and read as the terminal
+    # chunk -- a truncated response completing successfully (audit-report-17).
+    # Found beside it: h3 accepted a chunked capture that simply STOPPED,
+    # delivering the bytes that had arrived as a whole 200.
+    ("chunkspace",    502, None),
+    ("chunkoverflow", 502, None),
+    ("chunkbig",      502, None),      # 16 digits: too big, but never wraps
+    ("chunktrunc",    502, None),      # the body just stops
     ("simple",     200, b"backend body"),
 ]
 
@@ -400,6 +410,7 @@ def h2(route):
               + fr(0x1, 0x4 | 0x1, 1, blk))
     s.settimeout(10)
     buf, st, body, done, sections = b"", None, b"", False, []
+    was_reset = False
     try:
         while not done:
             d = s.recv(65536)
@@ -425,10 +436,12 @@ def h2(route):
                 if ft in (0x0, 0x1) and fl & 0x1:
                     done = True
                 if ft == 0x3:
+                    was_reset = True
                     done = True
     except (socket.timeout, OSError):
         pass
     s.close()
+    H2_RESET[route] = was_reset
     return st, body, sections[-1][1] if sections else [], sections
 
 
@@ -539,6 +552,27 @@ def h3_all(routes):
 
 h3 = h3_all([r for r, _, _ in CASES if r not in H3_SKIP])
 
+# These four are judged on h2 and h3 only, and the reason is protocol, not
+# laxity: h1 relays a chunked body byte for byte and has already sent its 200
+# by the time any chunk line is read, so it can only close and let the client
+# detect the error. h2 decodes and can reset the stream after the head; h3
+# captures the WHOLE body before sending anything, so it alone can still answer
+# 502 -- which is exactly why it must. Written down rather than exempted,
+# because an exemption is where a defect lives (audit-report-16).
+STREAMED_BODY = {"chunkspace", "chunkoverflow", "chunkbig"}
+
+# chunktrunc is the same family but a step further, and it separates "malformed"
+# from "detectable in time". Its head and first chunk line are VALID, so h2 has
+# already emitted the 200 before the upstream stops; all it can do then is reset
+# the stream, which is what a client must see instead of a clean end. h3 buffers
+# the whole body first, so it alone can still answer 502 -- and must, or it
+# hands over a truncated response as a complete one, which is what it did.
+H2_RESET = {}
+# ...so its correct answer differs per protocol BY NECESSITY, and the generic
+# "all three agree" check does not apply. It is asserted on its own terms below
+# instead of being dropped from the matrix.
+PROTOCOL_SPECIFIC = {"chunktrunc"}
+
 RESULTS = {}
 
 for route, want_status, want_body in CASES:
@@ -550,9 +584,17 @@ for route, want_status, want_body in CASES:
     RESULTS[route] = got
 
     statuses = {p: v[0] for p, v in got.items()}
-    check(f"{route}: every protocol answers {want_status}",
-          all(s == want_status for s in statuses.values()),
-          f"  {statuses}")
+    if route in PROTOCOL_SPECIFIC:
+        pass                       # asserted separately: see H2_RESET
+    elif route in STREAMED_BODY:
+        binary = {p: st for p, st in statuses.items() if p != "h1"}
+        check(f"{route}: h2 and h3 refuse the malformed framing "
+              f"(h1 relays it: see STREAMED_BODY)",
+              all(s == want_status for s in binary.values()), f"  {statuses}")
+    else:
+        check(f"{route}: every protocol answers {want_status}",
+              all(s == want_status for s in statuses.values()),
+              f"  {statuses}")
 
     if want_body is not None:
         bodies = {p: v[1] for p, v in got.items()}
@@ -707,6 +749,16 @@ for route in [r for r, _, _ in CASES if r not in H3_SKIP]:
             bad[proto] = lines
     check(f"{route}: no upstream Connection line survives (h1 keeps only its "
           f"own)", not bad, f"  {bad}" if bad else "")
+
+# --- a truncated chunked body is never a complete response ------------------
+for route in ("chunktrunc",):
+    got = RESULTS.get(route, {})
+    h3_refused = got.get("h3", (None,))[0] == 502
+    h2_reset = H2_RESET.get(route, False)
+    check(f"{route}: h3 refuses it outright and h2 resets the stream rather "
+          f"than ending it cleanly",
+          h3_refused and h2_reset,
+          f"  h3={got.get('h3', (None,))[0]} h2_reset={h2_reset}")
 
 for route, why in H3_SKIP.items():
     print(f"note: {route} not checked over HTTP/3 here -- {why}")

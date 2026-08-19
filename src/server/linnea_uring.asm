@@ -2378,6 +2378,21 @@ linnea_uring_run:
     mov esi, 502
     jmp .proxy_fail
 .h3_body_eof:
+    ; A CHUNKED body ends at its terminal chunk, never at a closed socket. It
+    ; reaches here with body_rem = -1, the same as a close-delimited one, so it
+    ; used to be accepted as complete: /api/chunktrunc -- "4\r\nbo" then close --
+    ; was delivered as a 200 carrying the two bytes that had arrived, and a
+    ; chunk size larger than any body produced a clean empty 200. HTTP/3
+    ; captures the whole body before it sends anything, so unlike HTTP/2 it can
+    ; still refuse at this point, and it should (audit-report-17, found beside
+    ; Finding 1 rather than in it).
+    cmp qword [r12 + linnea_connection.capture_chunked], 0
+    je .h3_body_eof_plain
+    cmp qword [r12 + linnea_connection.chunk_state], LINNEA_CHUNK_DONE
+    je .h3_body_done
+    mov esi, 502
+    jmp .proxy_fail
+.h3_body_eof_plain:
     ; A close-delimited body ends exactly here; a counted one that is still
     ; short was cut off, and half a response is not one we can send.
     cmp qword [r12 + linnea_connection.body_rem], -1

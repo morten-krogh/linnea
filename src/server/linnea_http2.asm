@@ -4164,14 +4164,22 @@ h2p_decode:
     je .dec_size_eol
     cmp al, ';'
     je .dec_size_ext
-    test r8d, r8d
-    jnz .dec_size_digit
-    cmp al, ' '                      ; tolerate leading space
-    je .dec_size_next
 .dec_size_digit:
+    ; chunk-size is 1*HEXDIG (RFC 9112 7.1) -- there is no leading whitespace in
+    ; that grammar, and this decoder alone used to skip a space before the first
+    ; digit. The other two chunk decoders in this tree, linnea_spill_chunked and
+    ; the HTTP/1 request side, both refuse it (audit-report-17).
     call h2p_hexval                  ; al -> eax, -1 if not hex
     test eax, eax
     js .dec_bad
+    ; ...and bound the accumulator BEFORE the shift, as they also do. Without
+    ; it a 17-digit size shifted the value one nybble too far and wrapped rdx to
+    ; ZERO -- which .dec_size_eol then reads as the terminal chunk, so a nonzero
+    ; size line silently became end-of-message and the response completed,
+    ; truncated and successful.
+    mov r9, 0x0fffffffffffffff
+    cmp rdx, r9
+    ja .dec_bad                      ; a size no body could ever have
     shl rdx, 4
     or rdx, rax
     inc r8d
