@@ -4445,6 +4445,7 @@ h2p_emit_headers:
     push r15
     push rbp
     sub rsp, 56                      ; +[rsp+40] tracks a forwarded content-length
+                                     ; and [rsp+48] which policy fields SURVIVE
     mov [rsp], rdi                   ; frame start
     mov rbx, rsi                     ; slot
     mov [rsp + 8], rdx               ; conn
@@ -4460,6 +4461,7 @@ h2p_emit_headers:
     mov edi, [rbx + linnea_h2p.status]
     call linnea_http_status_no_clen
     mov [rsp + 40], rax
+    mov qword [rsp + 48], 0          ; no surviving policy field seen yet
     ; :status — literal with the static name index (8), value as 3 digits
     mov rax, [rbx + linnea_h2p.status]
     lea rdi, [h2p_stbuf]
@@ -4570,6 +4572,36 @@ h2p_emit_headers:
     call linnea_http_head_conn_named
     test eax, eax
     jnz .eh_next
+    ; It survives, so it will reach the client -- and only now does it count as
+    ; the backend having set a policy. Asking the RAW head afterwards, which is
+    ; what this used to do, meant an upstream could name its own
+    ; Strict-Transport-Security in Connection and have the field correctly
+    ; dropped AND suppress ours, so the client got neither (audit-report-15
+    ; Finding 2).
+    mov rax, [rsp + 24]              ; name length
+    cmp rax, h2p_hn_hsts_len
+    jne .eh_sec_sniff
+    lea rdi, [h2p_nmbuf]
+    mov rsi, rax
+    lea rdx, [h2p_hn_hsts]
+    mov ecx, h2p_hn_hsts_len
+    call linnea_string_iequal
+    test eax, eax
+    jz .eh_sec_done
+    or qword [rsp + 48], 1
+    jmp .eh_sec_done
+.eh_sec_sniff:
+    cmp rax, h2_nosniff_name_len
+    jne .eh_sec_done
+    lea rdi, [h2p_nmbuf]
+    mov rsi, rax
+    lea rdx, [h2_nosniff_name]
+    mov ecx, h2_nosniff_name_len
+    call linnea_string_iequal
+    test eax, eax
+    jz .eh_sec_done
+    or qword [rsp + 48], 2
+.eh_sec_done:
     ; forward only the FIRST content-length (RFC 9110 8.6, Finding 34), and none
     ; at all on a status that forbids the field. A repeated one was validated to
     ; name the same length; emitting both would hand the client two
@@ -4633,12 +4665,7 @@ h2p_emit_headers:
     jz .eh_frame
     cmp qword [r14 + linnea_config_server.hsts_len], 0
     je .eh_nosniff
-    lea rdi, [r12]                   ; the upstream head
-    mov rsi, [rbx + linnea_h2p.rd]
-    lea rdx, [h2p_hn_hsts]
-    mov ecx, h2p_hn_hsts_len
-    call h2p_head_find               ; -> rdx = length (0 = absent)
-    test rdx, rdx
+    test qword [rsp + 48], 1         ; did one actually SURVIVE to the client?
     jnz .eh_nosniff
     mov rdi, r15
     mov esi, 56                      ; strict-transport-security
@@ -4649,12 +4676,7 @@ h2p_emit_headers:
 .eh_nosniff:
     cmp qword [r14 + linnea_config_server.nosniff], 0
     je .eh_frame
-    lea rdi, [r12]
-    mov rsi, [rbx + linnea_h2p.rd]
-    lea rdx, [h2_nosniff_name]
-    mov ecx, h2_nosniff_name_len
-    call h2p_head_find
-    test rdx, rdx
+    test qword [rsp + 48], 2
     jnz .eh_frame
     mov rdi, r15
     lea rsi, [h2_nosniff_name]

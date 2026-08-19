@@ -175,6 +175,14 @@ CASES = [
     ("fieldows",      200, b"body"),
     ("fieldsptrail",  200, b"body"),
     ("fieldinner",    200, b"body"),   # internal whitespace: must NOT be touched
+    # The vhost's configured hsts/nosniff describe the ORIGIN, so they ride a
+    # proxied response on every protocol. h1 added them to static and error
+    # heads but not to a successful proxied one (audit-report-15 Finding 1), and
+    # an upstream could switch them off on h2/h3 by naming its own copies in
+    # Connection: dropped from the response, yet still counted as "the backend
+    # set a policy" (Finding 2).
+    ("sechop",        200, b"body"),
+    ("secown",        200, b"body"),
     ("simple",     200, b"backend body"),
 ]
 
@@ -197,6 +205,13 @@ LONGNAME = {"name64": b"x-" + b"a" * 62, "name65": b"x-" + b"a" * 63}
 # internal whitespace is value.
 FIELDVAL = {"fieldows": b"value", "fieldsptrail": b"value",
             "fieldinner": b"value one"}
+# route -> (expected Strict-Transport-Security value, expected nosniff value).
+# The vhost configures max-age=31536000; /api/secown sends its own max-age=99,
+# which must WIN and must not be duplicated -- that is what stops the fix from
+# becoming "always append ours".
+CONFIGURED_STS = b"max-age=31536000"
+POLICY = {"simple": CONFIGURED_STS, "sechop": CONFIGURED_STS,
+          "secown": b"max-age=99"}
 
 # Routes the HTTP/3 leg here cannot judge, and why. Listed rather than quietly
 # dropped, so a reader sees the gap instead of assuming coverage.
@@ -640,6 +655,25 @@ for route, want in FIELDVAL.items():
     ok_bin = all(got.get(p) == want for p in ("h2", "h3") if p in got)
     check(f"{route}: x-note is exactly {want!r} on h2/h3 (h1 may keep its OWS)",
           ok_h1 and ok_bin, f"  {got}")
+
+# --- the configured origin policy, on every protocol, exactly once ----------
+def _vals(v, name):
+    out = []
+    for _, fields in v[3]:
+        for f in fields:
+            if f.lower().startswith(name + b":"):
+                out.append(f.partition(b":")[2].strip(b" \t"))
+    return out
+
+
+for route, want_sts in POLICY.items():
+    got = RESULTS.get(route, {})
+    sts = {p: _vals(v, b"strict-transport-security") for p, v in got.items()}
+    xcto = {p: _vals(v, b"x-content-type-options") for p, v in got.items()}
+    ok = (all(v == [want_sts] for v in sts.values())
+          and all(v == [b"nosniff"] for v in xcto.values()))
+    check(f"{route}: every protocol sends exactly one {want_sts.decode()} "
+          f"and one nosniff", ok, f"  sts={sts} xcto={xcto}")
 
 for route, why in H3_SKIP.items():
     print(f"note: {route} not checked over HTTP/3 here -- {why}")

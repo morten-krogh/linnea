@@ -10,6 +10,7 @@
       "hostname": "localhost",
       "cert": "test/tls/server.crt",
       "key": "test/tls/server.key",
+      "hsts": "max-age=31536000", "nosniff": 1,
       "locations": [
         {
           "prefix": "/api",

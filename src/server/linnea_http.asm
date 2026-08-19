@@ -278,6 +278,18 @@ hdr_hsts:       db 13, 10, "Strict-Transport-Security: "
 hdr_hsts_len    equ $ - hdr_hsts
 hdr_nosniff:    db 13, 10, "X-Content-Type-Options: nosniff"
 hdr_nosniff_len equ $ - hdr_nosniff
+; The same two policies in the PROXY head's style. The generated-head constants
+; above lead with CRLF because that builder appends pieces before one final
+; terminator; the proxy rewriter appends complete lines. Same policy, two framing
+; conventions, so the bytes differ and the VALUE does not.
+hdr_p_hsts:     db "Strict-Transport-Security: "
+hdr_p_hsts_len  equ $ - hdr_p_hsts
+hdr_p_nosniff:  db "X-Content-Type-Options: nosniff", 13, 10
+hdr_p_nosniff_len equ $ - hdr_p_nosniff
+hn_sts:         db "strict-transport-security"
+hn_sts_len      equ $ - hn_sts
+hn_xcto:        db "x-content-type-options"
+hn_xcto_len     equ $ - hn_xcto
 hdr_date:       db 13, 10, "Date: "
 hdr_date_len    equ $ - hdr_date
 hdr_content_range: db 13, 10, "Content-Range: bytes "
@@ -4142,6 +4154,41 @@ linnea_http_proxy_head:
     call linnea_http_head_conn_named
     test eax, eax
     jnz .next_line
+    ; It travels -- so now it counts as the backend having set a policy. A
+    ; field the backend nominated in Connection was dropped above and must NOT
+    ; count, or naming your own Strict-Transport-Security silently turns the
+    ; origin's off (audit-report-15 Finding 2).
+    mov rax, [rsp + 24]
+    mov rcx, r13
+    sub rcx, rax               ; name length
+    lea rdx, [r14 + rax]       ; name pointer
+    cmp rcx, hn_sts_len
+    jne .sec_try_sniff
+    push rdx
+    push rcx
+    mov rdi, rdx
+    mov rsi, rcx
+    lea rdx, [hn_sts]
+    mov ecx, hn_sts_len
+    call linnea_string_iequal
+    pop rcx
+    pop rdx
+    test eax, eax
+    jz .sec_noted
+    or qword [rsp + 16], 4
+    jmp .sec_noted
+.sec_try_sniff:
+    cmp rcx, hn_xcto_len
+    jne .sec_noted
+    mov rdi, rdx
+    mov rsi, rcx
+    lea rdx, [hn_xcto]
+    mov ecx, hn_xcto_len
+    call linnea_string_iequal
+    test eax, eax
+    jz .sec_noted
+    or qword [rsp + 16], 8
+.sec_noted:
     jmp .copy_line             ; nothing forbade it: it travels. Without this
                                ; jump every surviving field fell into the
                                ; Content-Length parser below -- the framing
@@ -4313,6 +4360,40 @@ linnea_http_proxy_head:
     lea rdi, [hdr_via_11]            ; and this one, on the way back
     mov esi, hdr_via_11_len
     call .append
+    ; The vhost's configured policy rides a PROXIED response too: it describes
+    ; the origin, not the backend. h2 and h3 have added it to proxied responses
+    ; all along, and h1 added it to static heads and to its own error heads --
+    ; but not to a successful proxied one, so the same origin's HSTS and nosniff
+    ; were present or absent depending on which protocol the client negotiated
+    ; (audit-report-15 Finding 1). A backend field that SURVIVED filtering still
+    ; wins; one it nominated in Connection does not, because it never arrives.
+    mov r8, [rbx + linnea_connection.vhost]
+    test r8, r8
+    jz .sec_done
+    test qword [rsp + 16], 4
+    jnz .sec_sniff
+    cmp qword [r8 + linnea_config_server.hsts_len], 0
+    je .sec_sniff
+    lea rdi, [hdr_p_hsts]
+    mov esi, hdr_p_hsts_len
+    call .append
+    mov r8, [rbx + linnea_connection.vhost]
+    lea rdi, [r8 + linnea_config_server.hsts]
+    mov rsi, [r8 + linnea_config_server.hsts_len]
+    call .append
+    lea rdi, [crlf]
+    mov esi, 2
+    call .append
+    mov r8, [rbx + linnea_connection.vhost]
+.sec_sniff:
+    test qword [rsp + 16], 8
+    jnz .sec_done
+    cmp qword [r8 + linnea_config_server.nosniff], 0
+    je .sec_done
+    lea rdi, [hdr_p_nosniff]
+    mov esi, hdr_p_nosniff_len
+    call .append
+.sec_done:
     cmp qword [rbx + linnea_connection.keep_alive], 0
     je .close_hdr
     lea rdi, [hdr_up_keepalive]

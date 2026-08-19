@@ -878,7 +878,15 @@ linnea_qpack_encode_proxy:
     cmp qword [rsp + 8], -1
     setne dl
     call .ep_classify                ; eax = 1 to drop, rdx = the seen bit
-    or [rsp + 24], rdx
+    mov [rsp + 56], rdx              ; hold it: a field only counts as the
+                                     ; backend's policy once it has survived
+                                     ; EVERY filter, and the dynamic Connection
+                                     ; check below is one of them. ORing it here
+                                     ; let an upstream name its own
+                                     ; Strict-Transport-Security in Connection
+                                     ; and thereby suppress ours, leaving the
+                                     ; client with neither (audit-report-15
+                                     ; Finding 2).
     test eax, eax
     jnz .ep_next
     ; ...and the fields this head's own Connection value names (RFC 9110 7.6.1,
@@ -893,6 +901,8 @@ linnea_qpack_encode_proxy:
     call linnea_http_head_conn_named
     test eax, eax
     jnz .ep_next
+    mov rdx, [rsp + 56]              ; it travels: now it counts
+    or [rsp + 24], rdx
     ; The VALUE, not the field line. HTTP/3 carries no field-line syntax, so the
     ; OWS around an HTTP/1 value is not something to translate -- it is a
     ; delimiter that has no meaning here. Leading SP alone was stripped

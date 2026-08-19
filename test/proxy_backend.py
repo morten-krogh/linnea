@@ -226,6 +226,23 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/sechop"):
+        # The upstream NAMES its own security fields as connection-specific, so
+        # they must not reach the client -- and therefore must not count as
+        # "the backend supplied a policy" when linnea decides whether to add
+        # its configured one (audit-report-15 Finding 2).
+        conn.sendall(b"HTTP/1.1 200 OK\r\n"
+                     b"Connection: Strict-Transport-Security, X-Content-Type-Options\r\n"
+                     b"Strict-Transport-Security: max-age=0\r\n"
+                     b"X-Content-Type-Options: bogus\r\n"
+                     b"Content-Length: 4\r\n\r\nbody")
+    elif path.endswith(b"/secown"):
+        # An ordinary backend policy that DOES survive: it wins, and linnea must
+        # not add a second copy. The control for the fix.
+        conn.sendall(b"HTTP/1.1 200 OK\r\n"
+                     b"Strict-Transport-Security: max-age=99\r\n"
+                     b"X-Content-Type-Options: nosniff\r\n"
+                     b"Content-Length: 4\r\n\r\nbody")
     elif path.endswith(b"/connte"):
         # Connection says a field is specific to THIS hop; it does not unsay
         # what the field MEANS on this hop. RFC 9110 7.6.1 lists
