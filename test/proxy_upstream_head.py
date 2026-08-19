@@ -225,6 +225,14 @@ CASES = [
     # (audit-report-20). All three decoders skipped it -- h3 too, unlike the
     # h2-only findings before it.
     ("chunktrailinlinelf", 502, None),
+    # Rejecting a bare LF made the trailer DELIMITERS right without making the
+    # line a FIELD. A trailer section is a section of HTTP field lines, so a
+    # colonless line, a non-token name, or a control byte in a value is not one
+    # (audit-report-21).
+    ("chunktrailnocolon",  502, None),
+    ("chunktrailnul",      502, None),
+    ("chunktrailbadname",  502, None),
+    ("chunktrailhtab", 200, b"body"),  # HTAB and spaces ARE legal in a value
     ("simple",     200, b"backend body"),
 ]
 
@@ -583,7 +591,8 @@ h3 = h3_all([r for r, _, _ in CASES if r not in H3_SKIP])
 # 502 -- which is exactly why it must. Written down rather than exempted,
 # because an exemption is where a defect lives (audit-report-16).
 STREAMED_BODY = {"chunkspace", "chunkoverflow", "chunkbig", "chunkextlf",
-                 "chunkdatalf", "chunktrailinlinelf", "chunktraillf"}
+                 "chunkdatalf", "chunktrailinlinelf", "chunktraillf",
+                 "chunktrailnocolon", "chunktrailnul", "chunktrailbadname"}
 
 # chunktrunc is the same family but a step further, and it separates "malformed"
 # from "detectable in time". Its head and first chunk line are VALID, so h2 has

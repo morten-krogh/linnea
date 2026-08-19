@@ -11,6 +11,7 @@ global linnea_string_to_u64
 global linnea_string_from_hex_u64
 global linnea_string_is_token
 global linnea_string_trim_ows
+global linnea_string_is_tchar
 global linnea_u64_add_within
 
 section .text
@@ -93,6 +94,27 @@ linnea_string_trim_ows:
     dec rdx
     jmp .to_trail
 .to_ret:
+    ret
+
+
+; linnea_string_is_tchar(dil = byte) -> eax = 1 when it may appear in a token.
+; The same tchar_map linnea_string_is_token walks, one byte at a time, for the
+; parsers that cannot hand over a whole span: the three chunked decoders read a
+; trailer line byte by byte and have nowhere to buffer it, so they need to judge
+; each byte as it arrives (audit-report-21). One bitmap, one rule, three
+; callers -- the alternative is a fourth hand-rolled character class.
+linnea_string_is_tchar:
+    movzx eax, dil
+    mov ecx, eax
+    shr ecx, 3
+    and eax, 7
+    movzx edx, byte [tchar_map + rcx]
+    bt edx, eax
+    jc .tc_yes
+    xor eax, eax
+    ret
+.tc_yes:
+    mov eax, 1
     ret
 
 ; linnea_string_is_token(rdi = ptr, rsi = len) -> rax = 1 when those bytes are a

@@ -43,6 +43,8 @@ section .rodata
 ; captured upload was held in RAM up to max_body with no writeback and nothing
 ; the kernel could reclaim.
 
+extern linnea_string_is_tchar
+
 section .text
 
 ; linnea_spill_open_fd() -> rax = an open capture fd, or -1.
@@ -197,6 +199,8 @@ linnea_spill_chunked:
     je .s_trail
     cmp r14, LINNEA_CHUNK_TRAIL_LINE
     je .s_trail_line
+    cmp r14, LINNEA_CHUNK_TRAIL_VAL
+    je .s_trail_val
     cmp r14, LINNEA_CHUNK_TRAIL_LF
     je .s_trail_lf
     cmp r14, LINNEA_CHUNK_END_LF
@@ -312,17 +316,43 @@ linnea_spill_chunked:
     mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_END_LF
     jmp .step
 .s_trail_line:
-    ; A trailer section is made of HTTP field LINES, so a bare LF inside one is
-    ; not a line ending -- and a later CRLF does not make it one. All three
-    ; trailer scanners advanced over every byte that was not CR, so the LF was
-    ; consumed as field data and the message completed (audit-report-20).
-    ; The distinguishing test is an LF followed by a valid CONTINUATION: an LF
-    ; then EOF only leaves an incremental decoder unfinished, which is
-    ; truncation, not a character-class rule.
+    ; A trailer section is made of HTTP field LINES. Rejecting a bare LF made
+    ; the DELIMITERS right without making the line a field, so a colonless line
+    ; or a NUL in a value still completed the message (audit-report-21). The
+    ; name is judged byte by byte -- there is nowhere here to buffer the line --
+    ; against the same tchar bitmap the head validator uses.
+    cmp byte [r12], ':'
+    je .trail_colon
+    cmp byte [r12], 13
+    je .bad                        ; no colon: not a field line
+    cmp byte [r12], 10
+    je .bad
+    movzx edi, byte [r12]
+    push r12
+    push rbx
+    call linnea_string_is_tchar
+    pop rbx
+    pop r12
+    test eax, eax
+    jz .bad
+    inc r12
+    jmp .step
+.trail_colon:
+    inc r12
+    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_TRAIL_VAL
+    jmp .step
+.s_trail_val:
     cmp byte [r12], 13
     je .trail_line_cr
     cmp byte [r12], 10
     je .bad
+    cmp byte [r12], 9
+    je .trail_val_ok               ; HTAB is legal in a value
+    cmp byte [r12], 0x20
+    jb .bad                        ; any other control byte is not
+    cmp byte [r12], 0x7f
+    je .bad                        ; DEL
+.trail_val_ok:
     inc r12
     jmp .step
 .trail_line_cr:

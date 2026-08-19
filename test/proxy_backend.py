@@ -226,6 +226,25 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/chunktrailhtab"):
+        # A VALID trailer whose value contains HTAB and internal spaces: the
+        # control for the value grammar, so "reject control bytes" cannot
+        # quietly become "reject whitespace" (audit-report-21).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\nX-T: \ta b\r\n\r\n")
+    elif path.endswith(b"/chunktrailnocolon"):
+        # A trailer section is a section of HTTP FIELD LINES. This line has no
+        # colon, so it is not one (audit-report-21).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\nNot-A-Field\r\n\r\n")
+    elif path.endswith(b"/chunktrailnul"):
+        # ...and a NUL inside what is otherwise a field value.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\nX-Trail: ok\x00still\r\n\r\n")
+    elif path.endswith(b"/chunktrailbadname"):
+        # A field NAME that is not a token.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\nBad Name: x\r\n\r\n")
     elif path.endswith(b"/chunktrailinlinelf"):
         # A bare LF INSIDE a trailer field line, followed by a later CRLF. This
         # is the test /api/chunktraillf is not: an LF then EOF leaves an

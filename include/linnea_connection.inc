@@ -65,6 +65,7 @@ LINNEA_CHUNK_TRAIL      equ 6      ; at the start of a trailer line
 LINNEA_CHUNK_TRAIL_LINE equ 7      ; inside one, dropping it
 LINNEA_CHUNK_TRAIL_LF   equ 8
 LINNEA_CHUNK_END_LF     equ 9      ; the LF that ends the whole body
+LINNEA_CHUNK_TRAIL_VAL  equ 11     ; past the colon, reading the value
 LINNEA_CHUNK_DONE       equ 10
 
 ; conn.tls_phase — a TLS connection is only special until the keys reach the

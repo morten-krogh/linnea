@@ -59,6 +59,7 @@ extern linnea_http_status_no_content
 extern linnea_http_status_no_clen
 extern linnea_string_iequal
 extern linnea_string_trim_ows
+extern linnea_string_is_tchar
 extern linnea_string_equal
 extern linnea_string_is_token
 extern linnea_quic_parse_priority
@@ -4166,6 +4167,8 @@ h2p_decode:
     je .dec_trail_lf
     cmp rax, 7
     je .dec_end_lf
+    cmp rax, 9
+    je .dec_trail_value
     jmp .dec_save                    ; phase 8: done
 .dec_size:
     ; a size line ends at the first CRLF; hex digits up to ';' or CR
@@ -4257,21 +4260,45 @@ h2p_decode:
     mov qword [rbx + linnea_h2p.chunked], 7
     jmp .dec_loop
 .dec_trail_line:
-    ; A trailer section is made of HTTP field LINES, so a bare LF inside one is
-    ; not a line ending -- and a later CRLF does not make it one. All three
-    ; trailer scanners advanced over every byte that was not CR, so the LF was
-    ; consumed as field data and the message completed (audit-report-20).
-    ; The distinguishing test is an LF followed by a valid CONTINUATION: an LF
-    ; then EOF only leaves an incremental decoder unfinished, which is
-    ; truncation, not a character-class rule.
+    ; A trailer section is a section of HTTP FIELD LINES, so a line here needs a
+    ; token name and a colon -- rejecting a bare LF made the DELIMITERS right
+    ; without making the line a field (audit-report-21). Judged byte by byte
+    ; because this decoder has nowhere to buffer the line; the same grammar the
+    ; head validator applies, from the same tchar bitmap.
     cmp r13, [rbx + linnea_h2p.len]
     jae .dec_save
-    cmp byte [r12 + r13], 13
-    je .dec_trail_cr
-    cmp byte [r12 + r13], 10
+    movzx eax, byte [r12 + r13]
+    cmp al, ':'
+    je .dec_trail_colon
+    cmp al, 13
+    je .dec_bad                      ; no colon: not a field line
+    cmp al, 10
     je .dec_bad
+    mov edi, eax
+    call linnea_string_is_tchar
+    test eax, eax
+    jz .dec_bad
     inc r13
     jmp .dec_trail_line
+.dec_trail_colon:
+    inc r13
+    mov qword [rbx + linnea_h2p.chunked], 9
+    jmp .dec_loop
+.dec_trail_value:
+    cmp r13, [rbx + linnea_h2p.len]
+    jae .dec_save
+    movzx eax, byte [r12 + r13]
+    cmp al, 13
+    je .dec_trail_cr
+    cmp al, 9
+    je .dec_trail_value_next         ; HTAB is legal in a value
+    cmp al, 0x20
+    jb .dec_bad                      ; any other control byte is not
+    cmp al, 0x7f
+    je .dec_bad                      ; DEL
+.dec_trail_value_next:
+    inc r13
+    jmp .dec_trail_value
 .dec_trail_cr:
     inc r13
     mov qword [rbx + linnea_h2p.chunked], 6

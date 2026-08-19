@@ -109,6 +109,7 @@ extern linnea_string_to_u64
 extern linnea_string_from_hex_u64
 extern linnea_string_equal
 extern linnea_string_is_token
+extern linnea_string_is_tchar
 extern linnea_string_iequal
 extern linnea_time_http_date
 extern linnea_time_parse_http_date
@@ -4620,21 +4621,44 @@ chunked_decode:
     cmp byte [r14], 13
     je .cd_trailer_end
 .cd_trailer_line:
-    ; A trailer section is made of HTTP field LINES, so a bare LF inside one is
-    ; not a line ending -- and a later CRLF does not make it one. All three
-    ; trailer scanners advanced over every byte that was not CR, so the LF was
-    ; consumed as field data and the message completed (audit-report-20).
-    ; The distinguishing test is an LF followed by a valid CONTINUATION: an LF
-    ; then EOF only leaves an incremental decoder unfinished, which is
-    ; truncation, not a character-class rule.
+    ; A trailer section is made of HTTP field LINES. Rejecting a bare LF made
+    ; the DELIMITERS right without making the line a field, so a colonless line
+    ; or a NUL in a value still completed the message (audit-report-21). This
+    ; decoder re-parses from the body start on every call, so the name/value
+    ; split needs no persistent state -- unlike the h2 and h3 state machines,
+    ; which gained a state each for the same rule.
+    cmp r14, r13
+    jae .cd_more
+    cmp byte [r14], ':'
+    je .cd_trailer_val
+    cmp byte [r14], 13
+    je .cd_bad                        ; no colon: not a field line
+    cmp byte [r14], 10
+    je .cd_bad
+    movzx edi, byte [r14]
+    call linnea_string_is_tchar
+    test eax, eax
+    jz .cd_bad
+    inc r14
+    jmp .cd_trailer_line
+.cd_trailer_val:
+    inc r14
+.cd_trailer_val_scan:
     cmp r14, r13
     jae .cd_more
     cmp byte [r14], 13
     je .cd_trailer_crlf
     cmp byte [r14], 10
     je .cd_bad
+    cmp byte [r14], 9
+    je .cd_trailer_val_next           ; HTAB is legal in a value
+    cmp byte [r14], 0x20
+    jb .cd_bad                        ; any other control byte is not
+    cmp byte [r14], 0x7f
+    je .cd_bad                        ; DEL
+.cd_trailer_val_next:
     inc r14
-    jmp .cd_trailer_line
+    jmp .cd_trailer_val_scan
 .cd_trailer_crlf:
     lea rax, [r14 + 2]
     cmp rax, r13
