@@ -4203,11 +4203,19 @@ h2p_decode:
     inc rcx
     jmp .dec_size_scan
 .dec_size_ext:
-    ; chunk extension: skip to the CRLF
+    ; A chunk extension is ignored as metadata, but its LINE FRAMING is not
+    ; optional: the extension runs to the CRLF, so a bare LF inside it is not a
+    ; line ending and a later CRLF does not make it one. This scan advanced over
+    ; every byte that was not CR, so an embedded LF was consumed as extension
+    ; data and the malformed line became an ordinary chunk -- accepted by h2
+    ; while linnea_spill_chunked and the HTTP/1 decoder, which both reject it
+    ; here, refused the same bytes (audit-report-19).
     cmp rcx, [rbx + linnea_h2p.len]
     jae .dec_save
     cmp byte [r12 + rcx], 13
     je .dec_size_eol
+    cmp byte [r12 + rcx], 10
+    je .dec_bad
     inc rcx
     jmp .dec_size_ext
 .dec_size_eol:

@@ -211,6 +211,13 @@ CASES = [
     # stops at the zero-size line passes this by ignoring the bytes that make it
     # valid, so the control has to exist.
     ("chunktrailer",  200, b"body"),
+    # A chunk extension is ignored as metadata, but its line framing is not
+    # optional: a bare LF inside it is not a line ending, and h2's scan
+    # advanced over every byte that was not CR (audit-report-19).
+    ("chunkextlf",    502, None),
+    ("chunkdatalf",   502, None),      # ...and where the data's CRLF belongs
+    ("chunktraillf",  502, None),      # ...and where a trailer line starts
+    ("chunkext",      200, b"body"),   # a VALID extension: still ignored, still served
     ("simple",     200, b"backend body"),
 ]
 
@@ -568,7 +575,8 @@ h3 = h3_all([r for r, _, _ in CASES if r not in H3_SKIP])
 # captures the WHOLE body before sending anything, so it alone can still answer
 # 502 -- which is exactly why it must. Written down rather than exempted,
 # because an exemption is where a defect lives (audit-report-16).
-STREAMED_BODY = {"chunkspace", "chunkoverflow", "chunkbig"}
+STREAMED_BODY = {"chunkspace", "chunkoverflow", "chunkbig", "chunkextlf",
+                 "chunkdatalf"}
 
 # chunktrunc is the same family but a step further, and it separates "malformed"
 # from "detectable in time". Its head and first chunk line are VALID, so h2 has
@@ -580,7 +588,8 @@ H2_RESET = {}
 # ...so its correct answer differs per protocol BY NECESSITY, and the generic
 # "all three agree" check does not apply. It is asserted on its own terms below
 # instead of being dropped from the matrix.
-PROTOCOL_SPECIFIC = {"chunktrunc", "chunknoterm", "chunkpartialtrail"}
+PROTOCOL_SPECIFIC = {"chunktrunc", "chunknoterm", "chunkpartialtrail",
+                     "chunktraillf"}
 
 RESULTS = {}
 

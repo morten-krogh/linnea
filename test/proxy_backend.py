@@ -226,6 +226,25 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/chunkextlf"):
+        # A chunk-extension is terminated by CRLF. A bare LF inside it is not a
+        # line ending, and a later CRLF does not retroactively make it one
+        # (audit-report-19).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4;note\ncontinued\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunkext"):
+        # An ordinary extension, ignored as metadata but validly framed: the
+        # control that keeps the LF rule from becoming "reject extensions".
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4;note=ok\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunktraillf"):
+        # A bare LF where a trailer line should start.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\n\n")
+    elif path.endswith(b"/chunkdatalf"):
+        # A bare LF where the CRLF after chunk data should be.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\n0\r\n\r\n")
     elif path.endswith(b"/chunknoterm"):
         # "0\r\n" is the zero-size chunk LINE; it starts the trailer section and
         # does not end the message. The empty trailer line that would end it
