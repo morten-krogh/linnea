@@ -3495,7 +3495,7 @@ linnea_http_upstream_head_valid:
     push r15
     push rbp
     sub rsp, 40                       ; [rsp]=cl seen flag, [rsp+8]=cl value,
-                                      ; [rsp+16]=status, [rsp+24]=TE seen
+                                      ; [rsp+16]=status, [rsp+24]=TE line count
     mov r12, rdi                      ; head buf
     mov r13, rsi                      ; head length
     mov qword [rsp], 0                ; no Content-Length seen yet
@@ -3538,6 +3538,24 @@ linnea_http_upstream_head_valid:
     inc ecx
     jmp .hv_code
 .hv_code_done:
+    ; RFC 9110 15: a status code is a three-digit integer in 100..599. Three
+    ; DIGITS is necessary and not sufficient, and the difference is not
+    ; cosmetic: h1 classified anything at or below 199 as an interim response,
+    ; so an upstream "099" selected the interim loop -- a lifecycle decision
+    ; about when a response is complete and which fields become visible before
+    ; the real answer -- while h2 and h3 refused it, and nothing anywhere
+    ; checked the upper bound, so 600..999 was reissued downstream, including as
+    ; an HTTP/2 and HTTP/3 :status (audit-report-13 Finding 1).
+    ;
+    ; The range belongs here rather than in the translators' own lower-bound
+    ; checks: those run after the shared decision, h1 has none, and none of them
+    ; looks upward. An in-range but unregistered status such as 299 must still
+    ; be forwarded -- this is a range, not an allowlist.
+    mov rax, [rsp + 16]
+    cmp rax, 100
+    jb .hv_bad
+    cmp rax, 599
+    ja .hv_bad
     ; ...and the code is delimited: either the line ends, or a reason phrase
     ; follows behind its own space. "HTTP/1.1 2000" is not a status line.
     movzx eax, byte [r12 + 12]
@@ -3658,7 +3676,21 @@ linnea_http_upstream_head_valid:
     call linnea_string_iequal
     test eax, eax
     jz .hv_not_te
-    mov qword [rsp + 24], 1
+    ; Repeated list-valued field lines COMBINE, in order, so two of these state
+    ; "chunked, chunked" -- two chunk layers, which RFC 9112 6.1 forbids and
+    ; which one layer of chunks does not satisfy. Each line was being validated
+    ; in isolation, so both passed: h1 relayed both fields with a single-layer
+    ; body, while h2 and h3 de-chunked once and dropped the fields into an
+    ; ordinary-looking success (audit-report-13 Finding 2).
+    ;
+    ; This is NOT the duplicate Content-Length of report 6, which is reconciled
+    ; rather than refused: two identical lengths describe the same body, whereas
+    ; a second `chunked` describes a second transformation that does not exist.
+    ; A count is enough because the policy is already "exactly one chunked and
+    ; nothing else"; the value check below rejects any comma list on its own.
+    inc qword [rsp + 24]
+    cmp qword [rsp + 24], 1
+    ja .hv_bad
     ; ...and the coding list must be exactly `chunked`. RFC 9112 6.1 makes
     ; Transfer-Encoding the sequence of codings applied to form the HTTP/1
     ; message body, and its own example is `gzip, chunked`: content compressed

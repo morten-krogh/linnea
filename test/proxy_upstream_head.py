@@ -149,6 +149,18 @@ CASES = [
     ("name64",        200, b"body"),
     ("name65",        200, b"body"),
     ("namebig",       502, None),   # past the documented limit: refused everywhere
+    # RFC 9110 15: a status code is a three-digit integer in 100..599. The gate
+    # checked that there were three DIGITS and never their range, so h1 relayed
+    # 099 as an interim response -- a lifecycle decision, not just a display one
+    # -- while h2/h3 refused it, and nothing anywhere checked the upper bound
+    # (audit-report-13 Finding 1).
+    ("status099",     502, None),
+    ("status600",     502, None),
+    ("status299",     299, b"body"),   # in range, unregistered: MUST be forwarded
+    # Repeated list-valued field lines combine, so two of them state
+    # "chunked, chunked": two layers, forbidden, and not what the one layer
+    # below is. Each line was checked in isolation (Finding 2).
+    ("tedupe",        502, None),
     ("simple",     200, b"backend body"),
 ]
 

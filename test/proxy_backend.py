@@ -226,6 +226,29 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/status099"):
+        # RFC 9110 15: a status code is a three-digit integer in 100..599.
+        # Three digits alone is necessary but not sufficient, and 099 is not an
+        # informational status a proxy must forward -- it is outside the
+        # namespace. The trailing 200 exists only to make h1's unintended
+        # interim classification visible (audit-report-13 Finding 1).
+        conn.sendall(b"HTTP/1.1 099 Invalid\r\nX-Interim: should-not-pass\r\n\r\n"
+                     b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfinal")
+    elif path.endswith(b"/status600"):
+        # ...and the upper half, which no protocol checked at all.
+        conn.sendall(b"HTTP/1.1 600 Nope\r\nContent-Length: 4\r\n\r\nbody")
+    elif path.endswith(b"/status299"):
+        # In range but unregistered: MUST still be forwarded. The control that
+        # stops the range check becoming an allowlist of known statuses.
+        conn.sendall(b"HTTP/1.1 299 Extension\r\nContent-Length: 4\r\n\r\nbody")
+    elif path.endswith(b"/tedupe"):
+        # Repeated list-valued field lines combine in order, so this states
+        # "chunked, chunked" -- two chunk layers, which RFC 9112 6.1 forbids and
+        # which the single layer below does not satisfy. Distinct from the legal
+        # duplicate Content-Length of report 6, where both lines describe the
+        # same body (audit-report-13 Finding 2).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                     b"Transfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n")
     elif path.endswith(b"/204te"):
         # RFC 9112 6.1: a server MUST NOT send Transfer-Encoding in any 1xx or
         # 204 response. Distinct from report 10's 205 rule -- a 205 MAY use
