@@ -183,6 +183,15 @@ CASES = [
     # set a policy" (Finding 2).
     ("sechop",        200, b"body"),
     ("secown",        200, b"body"),
+    # An upstream Connection line is specific to the upstream hop and must not
+    # travel. Report 14's framing-first move left h1's check reading registers
+    # framing had clobbered, so it forwarded the line -- and beside report 15
+    # that is a policy bypass: the upstream names our own field, we replace the
+    # discarded backend value with the configured one, and then hand the client
+    # the instruction to discard the replacement (audit-report-16).
+    ("connsts",       200, b"body"),
+    ("connclose",     200, b"body"),
+    ("connfirst",     200, b"body"),   # the position that worked by accident
     ("simple",     200, b"backend body"),
 ]
 
@@ -597,9 +606,11 @@ for route, names in NOMINATED.items():
     got = RESULTS.get(route, {})
     leaked = {}
     for proto, v in got.items():
-        # h1 sends its OWN Connection header and must: it states this hop's
-        # keep-alive wish. Only h2 and h3, where the field is forbidden
-        # outright, are checked for it.
+        # h1 sends its OWN Connection header and must, so this cannot simply
+        # forbid the field there -- but exempting it outright is what let an
+        # upstream Connection line ride along beside ours unnoticed
+        # (audit-report-16). CONNECTION_OK below is the real rule; here only
+        # h2/h3, where the field is forbidden outright, are checked for it.
         hits = [(st, f) for st, fields in v[3] for f in fields
                 if any(f.lower().startswith(n + b":") for n in names)
                 or (proto != "h1" and f.lower().startswith(b"connection:"))]
@@ -674,6 +685,28 @@ for route, want_sts in POLICY.items():
           and all(v == [b"nosniff"] for v in xcto.values()))
     check(f"{route}: every protocol sends exactly one {want_sts.decode()} "
           f"and one nosniff", ok, f"  sts={sts} xcto={xcto}")
+
+# --- exactly one Connection line on h1, and it is OURS ----------------------
+# Checked on EVERY route rather than a chosen few: an upstream Connection value
+# reaching the client is a hop-boundary break whatever it names, and the only
+# reason it went unseen was a test that waved the field through because linnea
+# emits one of its own.
+for route in [r for r, _, _ in CASES if r not in H3_SKIP]:
+    got = RESULTS.get(route, {})
+    bad = {}
+    for proto, v in got.items():
+        lines = [f for _, fields in v[3] for f in fields
+                 if f.lower().startswith(b"connection:")]
+        if proto == "h1":
+            vals = [l.partition(b":")[2].strip(b" \t").lower() for l in lines]
+            # a 502 head is generated, not rewritten, and carries one too
+            if len(vals) > 1 or any(x not in (b"close", b"keep-alive")
+                                    for x in vals):
+                bad[proto] = lines
+        elif lines:
+            bad[proto] = lines
+    check(f"{route}: no upstream Connection line survives (h1 keeps only its "
+          f"own)", not bad, f"  {bad}" if bad else "")
 
 for route, why in H3_SKIP.items():
     print(f"note: {route} not checked over HTTP/3 here -- {why}")

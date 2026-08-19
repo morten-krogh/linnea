@@ -226,6 +226,26 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/connsts"):
+        # Connection names the ORIGIN's policy field. Report 15 makes linnea
+        # replace the discarded backend field with its configured policy -- and
+        # if the upstream Connection line is then forwarded too, a compliant
+        # client removes that replacement as hop-specific. The option must not
+        # travel (audit-report-16). An ordinary field comes FIRST, which is what
+        # moves Connection off the one offset that accidentally works.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                     b"Connection: Strict-Transport-Security\r\n"
+                     b"Strict-Transport-Security: max-age=0\r\n\r\nbody")
+    elif path.endswith(b"/connclose"):
+        # The simpler control: an upstream close instruction describes the
+        # upstream hop and must not become ours.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                     b"Connection: close\r\nX-Kept: yes\r\n\r\nbody")
+    elif path.endswith(b"/connfirst"):
+        # Connection as the FIRST field -- the position that happened to work
+        # by accident, kept so a fix cannot pass by only handling the other one.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                     b"Content-Length: 4\r\nX-Kept: yes\r\n\r\nbody")
     elif path.endswith(b"/sechop"):
         # The upstream NAMES its own security fields as connection-specific, so
         # they must not reach the client -- and therefore must not count as

@@ -4098,7 +4098,21 @@ linnea_http_proxy_head:
     jmp .next_line
 .fwd:
     ; --- and only now, what we FORWARD ------------------------------------
-    mov rax, r8
+    ; The name comes from the FRAME, not from whatever r8 and rcx happen to
+    ; hold. They used to be right because this ran first; the framing block now
+    ; runs ahead of it and leaves neither intact -- linnea_string_iequal takes
+    ; its length in ecx, and .content_len repurposes r8 as the value cursor. The
+    ; Connection field therefore stopped being recognised and was FORWARDED,
+    ; except when it happened to be the first field, where the stale ecx of 17
+    ; coincided with the offset after "HTTP/1.1 200 OK" (audit-report-16).
+    ;
+    ; Beside report 15 that is a policy bypass, not just untidiness: the
+    ; upstream names our own field in Connection, we correctly replace the
+    ; discarded backend value with the configured one, and then hand the client
+    ; the instruction to throw that replacement away. The two checks below have
+    ; always reloaded from the frame; this one now does too.
+    mov rcx, [rsp + 24]        ; this line's start
+    mov rax, r13               ; ...and its colon, saved at .colon_found
     sub rax, rcx               ; header name length
     lea rdi, [r14 + rcx]
     mov rsi, rax
