@@ -16,6 +16,12 @@ Each mode prints OK or a reason. Modes:
   twice   two captures, different bodies, on ONE kept-alive connection: the
           capture file is per REQUEST, not per connection, or the second
           upload appends to the first and is described by the wrong length
+  sizeline the chunk-size line grammar, chunk-size [ ";" chunk-ext ] CRLF, sent
+          BOTH small enough to buffer and large enough to capture -- linnea has
+          two request decoders and they must give the same verdict
+  smuggle a chunk size that overflows 64 bits must not wrap to zero: that reads
+          as the last chunk, ends the body early, and turns the bytes behind it
+          into a second request
 """
 import os
 import hashlib
@@ -263,9 +269,108 @@ def mode_pipeline():
     return "OK"
 
 
+# chunk = chunk-size [ chunk-ext ] CRLF (RFC 9112 7.1), and chunk-ext is
+# token / quoted-string with BWS -- so after the digits only ';' or CR may
+# come, and inside an extension HTAB is the only control byte that belongs.
+# Both of linnea's request decoders are asserted against the same table
+# because they used to disagree: chunked_decode buffers a body that fits in
+# in_buf while linnea_spill_chunked takes over above it, and the permissive
+# one accepted "4 ", "4g" and "4\0" as a size of four. The same bytes on the
+# same listener were 200 under the buffer bound and 400 over it
+# (audit-report-22). The valid rows are the control: a rule this strict is
+# easy to over-apply, and a decoder that refuses every extension would pass
+# the malformed rows alone.
+SIZE_LINES = [
+    ("plain",          b"4",          b"200"),
+    ("extension",      b"4;note=ok",  b"200"),
+    ("extension HTAB", b"4;a=\tb",    b"200"),
+    ("trailing space", b"4 ",         b"400"),
+    ("second letter",  b"4g",         b"400"),
+    ("NUL",            b"4\x00",      b"400"),
+    ("DEL",            b"4\x7f",      b"400"),
+    ("NUL in ext",     b"4;a\x00b",   b"400"),
+    ("DEL in ext",     b"4;a\x7fb",   b"400"),
+    ("CTL in ext",     b"4;a\x1fb",   b"400"),
+    # ...and the accumulator's bound, which is the same rule one level down.
+    # 17 digits shift the value one nybble past 64 bits: it wrapped to ZERO,
+    # which the decoder reads as the last chunk, so the body ended early and
+    # the octets behind it became a pipelined request (see mode_smuggle).
+    ("17 hex digits",  b"10000000000000000", b"400"),
+    ("16 huge digits", b"1fffffffffffffff",  b"400"),
+]
+
+
+def size_line_case(pad, size):
+    """One chunked upload whose LAST size line is `size`, preceded by `pad`
+    bytes of valid chunk. Written in a single sendall: a malformed size line
+    is refused the moment it is read, and a ragged write still trickling
+    behind that refusal draws an RST that discards the response we came to
+    read -- which cost five failures in twelve hundred connections before the
+    writes were made whole. The junk goes LAST for the same reason, so the
+    server cannot answer until every byte we sent is in its hands."""
+    lead = b"%x\r\n" % pad + b"P" * pad + b"\r\n" if pad else b""
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=20)
+    try:
+        s.sendall(b"POST /api/echo HTTP/1.1\r\nHost: one.test\r\n"
+                  b"Transfer-Encoding: chunked\r\n\r\n"
+                  + lead + size + b"\r\nbody\r\n0\r\n\r\n")
+        head, _ = read_response(s)
+    except (BrokenPipeError, ConnectionResetError, socket.timeout):
+        head = None
+    finally:
+        s.close()
+    return head
+
+
+def mode_sizeline():
+    for name, size, want in SIZE_LINES:
+        # nothing extra stays inside in_buf (17408 bytes); 40000 is past it,
+        # so the same line is read by the capture decoder instead
+        for pad, which in ((0, "buffered"), (40000, "captured")):
+            head = size_line_case(pad, size)
+            if head is None:
+                return f"{name} ({which}): no reply, wanted {want.decode()}"
+            if head.split(b" ")[1:2] != [want]:
+                status = head.split(b"\r\n")[0]
+                return f"{name} ({which}): {status!r}, wanted {want.decode()}"
+    return "OK"
+
+
+def mode_smuggle():
+    """The wrap above, stated as what it costs: a chunk size that overflows to
+    zero ends the body early, and everything after it is parsed as the next
+    request on the connection. One request line in, two responses out -- past
+    any device in front of us that read the same bytes as one message."""
+    body = (b"10000000000000000\r\n\r\n"
+            b"GET /index.html HTTP/1.1\r\nHost: one.test\r\n"
+            b"X-Smuggled: yes\r\n\r\n")
+    buf = b""
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=20)
+    try:
+        s.sendall(b"POST /api/echo HTTP/1.1\r\nHost: one.test\r\n"
+                  b"Transfer-Encoding: chunked\r\n\r\n" + body)
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            buf += d
+    except (BrokenPipeError, ConnectionResetError, socket.timeout):
+        pass
+    finally:
+        s.close()
+    n = sum(1 for l in buf.split(b"\r\n") if l.startswith(b"HTTP/1.1 "))
+    if n != 1:
+        return f"{n} responses to one request line: {buf[:120]!r}"
+    if not buf.startswith(b"HTTP/1.1 400"):
+        status = buf.split(b"\r\n")[0]
+        return f"not 400: {status!r}"
+    return "OK"
+
+
 MODES = {"big": mode_big, "twice": mode_twice, "head": mode_head, "bad": mode_bad,
          "abort": mode_abort, "cap": mode_cap, "flood": mode_flood,
-         "pipeline": mode_pipeline}
+         "pipeline": mode_pipeline, "sizeline": mode_sizeline,
+         "smuggle": mode_smuggle}
 
 try:
     print(MODES[sys.argv[1]]())

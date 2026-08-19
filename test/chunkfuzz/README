@@ -19,6 +19,14 @@ attempts: h2 refused every chunked response whose size contained a hex letter,
 because h2p_hexval clobbered AL and re-read it. Every chunk fixture in the suite
 used sizes 0-9, so nothing exercised it.
 
+It sweeps RESPONSE bodies only -- the direction all three protocols share,
+since a request may be chunked over HTTP/1 alone. The request side has two
+decoders of its own (chunked_decode below the in_buf bound, linnea_spill_chunked
+above it), and report 22 found them disagreeing about the chunk-size line
+exactly where this sweep had no reach. They are asserted against one table by
+`python3 test/upload_chunked.py sizeline`, which sends every case at both sizes;
+a finding here belongs in both places.
+
 Not part of run_tests.sh: it needs its own backend on a fixed port and takes a
 few minutes. The findings it produced are permanent fixtures in
 test/proxy_backend.py and the matrix; this is the net, not the catch. Run it by

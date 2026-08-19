@@ -336,7 +336,7 @@ version_11_sp_len equ $ - version_11_sp
 
 version_11:     db "HTTP/1.1"          ; 8 bytes, compared as one qword
 version_1x:     db "HTTP/1."           ; the 7-byte prefix, minor digit free
-                db 0                   ; (padding: the compare masks it off)
+                db 0                   ; the 8th byte of the qword read above
 version_10:     db "HTTP/1.0"          ; accepted from an upstream, rewritten
 crlf:           db 13, 10
 crlfcrlf:       db 13, 10, 13, 10
@@ -1016,8 +1016,11 @@ linnea_http_handle:
     mov rdx, rax
     mov rcx, 0x00ffffffffffffff       ; the low 7 bytes, "HTTP/1."
     and rdx, rcx
-    mov rcx, [version_1x]
-    and rcx, 0x00ffffffffffffff
+    ; ...and the stored text is masked with the copy already in rcx. Written a
+    ; second time as an immediate, the constant truncates to a sign-extended
+    ; imm32 and the mask does nothing -- it assembled with a warning. Harmless
+    ; as it stood, but only because version_1x carries an explicit zero byte.
+    and rcx, [version_1x]
     cmp rdx, rcx
     jne .version_other
     mov rcx, rax
@@ -4557,12 +4560,20 @@ chunked_decode:
 .cd_digit:
     sub al, '0'
 .cd_accum:
-    cmp rbx, 0x0fffffffffffffff
+    ; The bound goes through a register because 0x0fffffffffffffff does not fit
+    ; in the sign-extended imm32 a "cmp r64, imm" carries: nasm truncated it to
+    ; 0xff and both compares became "above 2^64-1", which nothing is. The two
+    ; other chunk decoders load it into a register and so were never affected,
+    ; which is why a 17-digit size was 400 the moment the body grew past in_buf
+    ; and accepted below it. It assembled with a warning for as long as it has
+    ; existed; `make 2>&1 | grep warning` is now silent, so the next one shows.
+    mov r8, 0x0fffffffffffffff
+    cmp rbx, r8
     ja .cd_bad                        ; a size no body could ever have
     shl rbx, 4
     movzx eax, al
     or rbx, rax
-    cmp rbx, 0x0fffffffffffffff       ; ...and after the shift too: the test
+    cmp rbx, r8                       ; ...and after the shift too: the test
     ja .cd_bad                        ; above only stops the shift overflowing
     inc rcx
     inc r14
@@ -4570,13 +4581,37 @@ chunked_decode:
 .cd_size_done:
     test rcx, rcx
     jz .cd_bad                        ; no digits: not a chunk header
+    ; chunk = chunk-size [ chunk-ext ] CRLF, so the only bytes that may follow
+    ; the digits are a ';' opening an extension or the CR ending the line. This
+    ; took ANY byte that was not a hex digit as the end of the size and fell
+    ; into the extension state, so "4 ", "4g" and "4\0" were all read as a size
+    ; of four with junk "extension" after them. The other HTTP/1 request
+    ; decoder -- linnea_spill_chunked, which takes over as soon as the body is
+    ; too large to buffer -- already refuses them, so the SAME bytes on the
+    ; SAME listener were 200 under LINNEA_CONN_IN_BUF and 400 over it, which is
+    ; the only thing that decides which decoder reads them (audit-report-22).
+    cmp byte [r14], ';'
+    je .cd_ext
+    cmp byte [r14], 13
+    jne .cd_bad
 .cd_ext:                              ; chunk-ext runs to the CRLF, ignored
     cmp r14, r13
     jae .cd_more
+    ; An extension is token / quoted-string with BWS, so HTAB may appear inside
+    ; it but no other control byte may. CR and LF are tested FIRST because both
+    ; are themselves below 0x20 -- putting the control-byte check ahead of them
+    ; would reject the line ending it is looking for.
     cmp byte [r14], 13
     je .cd_size_crlf
     cmp byte [r14], 10
     je .cd_bad                        ; a bare LF is not a line ending here
+    cmp byte [r14], 9
+    je .cd_ext_next                   ; HTAB is BWS
+    cmp byte [r14], 0x20
+    jb .cd_bad
+    cmp byte [r14], 0x7f
+    je .cd_bad                        ; DEL
+.cd_ext_next:
     inc r14
     jmp .cd_ext
 .cd_size_crlf:

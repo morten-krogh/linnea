@@ -29,7 +29,7 @@ check "backend record control (the completed upload IS in it)" $?
 # --- chunked uploads too large to buffer: captured and decoded as they
 # arrive, then forwarded as an ordinary counted request. Before this they were
 # a 413 outright, since only the counted path could stream. ---
-for m in big head bad abort cap flood twice pipeline; do
+for m in big head bad abort cap flood twice pipeline sizeline smuggle; do
     out=$(python3 test/upload_chunked.py $m)
     [ "$out" = "OK" ]
     case $m in
@@ -41,6 +41,8 @@ for m in big head bad abort cap flood twice pipeline; do
       flood) check "endless chunked trailers hit max_body too ($out)" $? ;;
       twice) check "two chunked captures on one kept-alive connection ($out)" $? ;;
       pipeline) check "a GET pipelined behind a chunked upload is still served ($out)" $? ;;
+      sizeline) check "both chunk decoders agree on the chunk-size line grammar ($out)" $? ;;
+      smuggle)  check "a chunk size that overflows 64 bits smuggles nothing ($out)" $? ;;
     esac
 done
 
