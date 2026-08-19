@@ -226,6 +226,38 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/chunkhexsize"):
+        # A chunk size using a hex LETTER. h2p_hexval clobbered AL with its own
+        # `sub eax, '0'` and then re-read it, so 'a' arrived at the letter path
+        # as 0x31 and was rejected: h2 refused EVERY chunked response whose size
+        # contained a-f -- any chunk of 10-15 bytes, and most real ones -- while
+        # h1 and h3 served it. Long-standing, and invisible because every chunk
+        # fixture in this file used sizes 0-9 (sweep after audit-report-21).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"a\r\nbodybody!!\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunkhexsizeupper"):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"A\r\nbodybody!!\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunksizetrailsp"):
+        # chunk = chunk-size [ chunk-ext ] CRLF: only ';' or CR may follow the
+        # digits. h3 treated ANY non-hex byte as ending the size and fell into
+        # its extension state, so this was a size of 4 with junk after it.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4 \r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunksizejunk"):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4g\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunkextnul"):
+        # An extension is token / quoted-string with BWS: HTAB may appear there,
+        # no other control byte may. Rejecting LF (report 19) left NUL, CTL and
+        # DEL accepted as extension data by BOTH binary protocols.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4;a\x00b\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunktrailemptyname"):
+        # A field line needs at least one name byte. Report 21 required token
+        # bytes before the colon but not that there be ANY.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\n: v\r\n\r\n")
     elif path.endswith(b"/chunktrailhtab"):
         # A VALID trailer whose value contains HTAB and internal spaces: the
         # control for the value grammar, so "reject control bytes" cannot

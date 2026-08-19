@@ -233,6 +233,17 @@ CASES = [
     ("chunktrailnul",      502, None),
     ("chunktrailbadname",  502, None),
     ("chunktrailhtab", 200, b"body"),  # HTAB and spaces ARE legal in a value
+    # Found by sweeping the chunk grammar differentially rather than by reading
+    # it, after five consecutive reports in this area. The first is the one that
+    # mattered: h2 refused every chunked response whose SIZE contained a hex
+    # letter -- any chunk of 10-15 bytes -- because h2p_hexval clobbered AL and
+    # re-read it. Every chunk fixture here had used sizes 0-9.
+    ("chunkhexsize",      200, b"bodybody!!"),
+    ("chunkhexsizeupper", 200, b"bodybody!!"),
+    ("chunksizetrailsp",  502, None),   # only ';' or CR may follow the digits
+    ("chunksizejunk",     502, None),
+    ("chunkextnul",       502, None),   # CTLs in an extension, both protocols
+    ("chunktrailemptyname", 502, None), # a field line needs a name
     ("simple",     200, b"backend body"),
 ]
 
@@ -592,7 +603,9 @@ h3 = h3_all([r for r, _, _ in CASES if r not in H3_SKIP])
 # because an exemption is where a defect lives (audit-report-16).
 STREAMED_BODY = {"chunkspace", "chunkoverflow", "chunkbig", "chunkextlf",
                  "chunkdatalf", "chunktrailinlinelf", "chunktraillf",
-                 "chunktrailnocolon", "chunktrailnul", "chunktrailbadname"}
+                 "chunktrailnocolon", "chunktrailnul", "chunktrailbadname",
+                 "chunksizetrailsp", "chunksizejunk", "chunkextnul",
+                 "chunktrailemptyname"}
 
 # chunktrunc is the same family but a step further, and it separates "malformed"
 # from "detectable in time". Its head and first chunk line are VALID, so h2 has

@@ -232,6 +232,10 @@ linnea_spill_chunked:
     shl rcx, 4
     movzx eax, al
     or rcx, rax
+    cmp rcx, rdx                   ; and AFTER the shift: the test above only
+    ja .bad                        ; stops the shift overflowing, so a 16-digit
+                                   ; value up to 0xffff... still passed a bound
+                                   ; meant to say "no body could be this large"
     mov [rbx + linnea_connection.chunk_rem], rcx
     inc qword [rbx + linnea_connection.chunk_digits]
     inc r12
@@ -239,14 +243,37 @@ linnea_spill_chunked:
 .size_end:
     cmp qword [rbx + linnea_connection.chunk_digits], 0
     je .bad                        ; no digits: not a chunk header
+    ; chunk = chunk-size [ chunk-ext ] CRLF, so the only things that may follow
+    ; the digits are a ';' opening an extension or the CR ending the line. This
+    ; treated ANY non-hex byte as the end of the size and fell into the
+    ; extension state, so "4 ", "4g" and "4\0" were all read as a size of 4
+    ; with junk "extension" after it -- h2 refused them and h3 served them,
+    ; this time with h3 as the permissive one (proactive sweep after report 21).
+    cmp byte [r12], ';'
+    je .size_end_ok
+    cmp byte [r12], 13
+    jne .bad
+.size_end_ok:
     mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_EXT
     jmp .step                      ; the byte itself belongs to the ext state
 
 .s_ext:
+    ; An extension is token / quoted-string with BWS, so HTAB may appear but no
+    ; other control byte may. Rejecting LF (report 19) fixed the delimiter and
+    ; left NUL, CTL and DEL accepted as extension data. CR and LF are tested
+    ; FIRST because both are themselves below 0x20 -- ordering the control-byte
+    ; check ahead of them would reject the line ending it is looking for.
     cmp byte [r12], 13
     je .ext_cr
     cmp byte [r12], 10
     je .bad                        ; a bare LF is not a line ending here
+    cmp byte [r12], 9
+    je .s_ext_next                 ; HTAB is BWS
+    cmp byte [r12], 0x20
+    jb .bad
+    cmp byte [r12], 0x7f
+    je .bad                        ; DEL
+.s_ext_next:
     inc r12
     jmp .step
 .ext_cr:
@@ -307,6 +334,11 @@ linnea_spill_chunked:
     jmp .step                      ; chunk_rem is 0 here: the next size accrues
 
 .s_trail:
+    ; A field line needs at least one name byte, so a line that OPENS with a
+    ; colon has an empty name. Checked here, at the start of a line, rather
+    ; than with a counter in the name state.
+    cmp byte [r12], ':'
+    je .bad
     cmp byte [r12], 13
     je .trail_end
     mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_TRAIL_LINE

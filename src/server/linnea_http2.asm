@@ -4201,6 +4201,15 @@ h2p_decode:
     ja .dec_bad                      ; a size no body could ever have
     shl rdx, 4
     or rdx, rax
+    cmp rdx, r9
+                                     ; ...and after it: the pre-shift test only
+                                     ; stops the shift OVERFLOWING, so a 16-digit
+                                     ; value up to 0xffff... still slipped past a
+                                     ; bound documented as "a size no body could
+                                     ; ever have". chunkbig passed only because
+                                     ; h2p_hexval was rejecting 'f' (sweep after
+                                     ; report 21).
+    ja .dec_bad
     inc r8d
 .dec_size_next:
     inc rcx
@@ -4219,6 +4228,16 @@ h2p_decode:
     je .dec_size_eol
     cmp byte [r12 + rcx], 10
     je .dec_bad
+    ; ...and no other control byte either: an extension is token /
+    ; quoted-string with BWS, so HTAB is the only one that belongs. CR and LF
+    ; are tested first because both are themselves below 0x20.
+    cmp byte [r12 + rcx], 9
+    je .dec_size_ext_next
+    cmp byte [r12 + rcx], 0x20
+    jb .dec_bad
+    cmp byte [r12 + rcx], 0x7f
+    je .dec_bad
+.dec_size_ext_next:
     inc rcx
     jmp .dec_size_ext
 .dec_size_eol:
@@ -4251,6 +4270,11 @@ h2p_decode:
 .dec_trail:
     cmp r13, [rbx + linnea_h2p.len]
     jae .dec_save                    ; wait for more
+    ; a field line needs at least one name byte, so one OPENING with a colon
+    ; has an empty name -- checked here rather than with a counter in the name
+    ; state below
+    cmp byte [r12 + r13], ':'
+    je .dec_bad
     cmp byte [r12 + r13], 13
     je .dec_trail_end
     mov qword [rbx + linnea_h2p.chunked], 5
@@ -4374,12 +4398,22 @@ h2p_decode:
 
 ; h2p_hexval(al = char) -> eax = 0-15, or -1.
 h2p_hexval:
+    ; `sub eax, '0'` writes AL -- it is the low byte of EAX -- so the letter
+    ; path below re-read a byte that had already been decremented: 'a' (0x61)
+    ; arrived there as 0x31 and was rejected as not-hex. h2 therefore refused
+    ; EVERY chunked response whose size contained a hex letter, which is any
+    ; chunk of 10-15 bytes and most real ones, with a 502 -- while h1 and h3
+    ; served it. Long-standing; found by sweeping the chunk grammar
+    ; differentially rather than by reading, because every chunk fixture in the
+    ; tree happened to use sizes 0-9. r11 is scratch here and unused by
+    ; h2p_decode.
     movzx eax, al
+    mov r11d, eax                    ; the byte, before the subtraction eats it
     sub eax, '0'
     cmp eax, 9
     jbe .hv_ret
-    movzx eax, al
-    or eax, 0x20
+    mov eax, r11d
+    or eax, 0x20                     ; fold A-F to a-f
     sub eax, 'a'
     cmp eax, 5
     ja .hv_bad

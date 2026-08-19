@@ -4562,6 +4562,8 @@ chunked_decode:
     shl rbx, 4
     movzx eax, al
     or rbx, rax
+    cmp rbx, 0x0fffffffffffffff       ; ...and after the shift too: the test
+    ja .cd_bad                        ; above only stops the shift overflowing
     inc rcx
     inc r14
     jmp .cd_size
@@ -4618,6 +4620,8 @@ chunked_decode:
 .cd_trailer:
     cmp r14, r13
     jae .cd_more
+    cmp byte [r14], ':'
+    je .cd_bad                        ; a field line with an empty name
     cmp byte [r14], 13
     je .cd_trailer_end
 .cd_trailer_line:
