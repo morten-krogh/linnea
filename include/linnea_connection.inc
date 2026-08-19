@@ -142,6 +142,21 @@ struc linnea_connection
     .chunk_raw:     resq 1         ; encoded bytes consumed, capped like the
                                    ; decoded ones: endless empty chunks and
                                    ; trailers must not run forever
+    ; The SECOND block of the same five, for the other direction. An HTTP/1
+    ; upstream response is relayed byte for byte rather than captured, so its
+    ; chunked framing used to reach the client exactly as the upstream wrote it
+    ; -- a malformed extension or trailer arriving as a clean, complete 200
+    ; while h2 and h3 answered 502 to the same upstream bytes
+    ; (audit-report-24). The relay now runs the same decoder over what it is
+    ; about to forward, in a mode that judges and copies nothing, and it needs
+    ; its own state to do that: the capture's block belongs to the REQUEST and
+    ; is live for a chunked upload on the same connection.
+    .resp_chunk_state:  resq 1
+    .resp_chunk_rem:    resq 1
+    .resp_chunk_digits: resq 1
+    .resp_chunk_ext:    resq 1
+    .resp_chunk_raw:    resq 1
+    .resp_chunked:      resq 1     ; 1 = the response being relayed is chunked
     .capture_chunked: resq 1       ; 1 = the capture is decoding chunked framing
     .capture_done:  resq 1         ; 1 = the captured body is complete, and the
                                    ; parser's second pass serves it from the
@@ -327,3 +342,45 @@ struc linnea_connection
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF
 endstruc
+
+; The two blocks above are addressed through a base pointer by
+; linnea_spill_chunked, which is what lets one decoder serve the request
+; capture and the response relay. Their layout is therefore part of the
+; contract, and the assembler is made to say so rather than a comment.
+struc linnea_chunk
+    .state:   resq 1
+    .rem:     resq 1
+    .digits:  resq 1
+    .ext:     resq 1
+    .raw:     resq 1
+endstruc
+
+%if (linnea_connection.chunk_rem - linnea_connection.chunk_state) != linnea_chunk.rem
+  %error "linnea_connection.chunk_* has drifted from struc linnea_chunk"
+%endif
+%if (linnea_connection.chunk_digits - linnea_connection.chunk_state) != linnea_chunk.digits
+  %error "linnea_connection.chunk_* has drifted from struc linnea_chunk"
+%endif
+%if (linnea_connection.chunk_ext - linnea_connection.chunk_state) != linnea_chunk.ext
+  %error "linnea_connection.chunk_* has drifted from struc linnea_chunk"
+%endif
+%if (linnea_connection.chunk_raw - linnea_connection.chunk_state) != linnea_chunk.raw
+  %error "linnea_connection.chunk_* has drifted from struc linnea_chunk"
+%endif
+%if (linnea_connection.resp_chunk_rem - linnea_connection.resp_chunk_state) != linnea_chunk.rem
+  %error "linnea_connection.resp_chunk_* has drifted from struc linnea_chunk"
+%endif
+%if (linnea_connection.resp_chunk_digits - linnea_connection.resp_chunk_state) != linnea_chunk.digits
+  %error "linnea_connection.resp_chunk_* has drifted from struc linnea_chunk"
+%endif
+%if (linnea_connection.resp_chunk_ext - linnea_connection.resp_chunk_state) != linnea_chunk.ext
+  %error "linnea_connection.resp_chunk_* has drifted from struc linnea_chunk"
+%endif
+%if (linnea_connection.resp_chunk_raw - linnea_connection.resp_chunk_state) != linnea_chunk.raw
+  %error "linnea_connection.resp_chunk_* has drifted from struc linnea_chunk"
+%endif
+
+; linnea_spill_chunked's two modes: capture writes the decoded body to the
+; spill file and stashes anything pipelined behind it; validate only judges.
+LINNEA_CHUNK_CAPTURE  equ 0
+LINNEA_CHUNK_VALIDATE equ 1

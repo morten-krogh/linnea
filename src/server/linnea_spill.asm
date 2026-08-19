@@ -135,9 +135,18 @@ linnea_spill_write:
     pop rbx
     ret
 
-; linnea_spill_chunked(rdi=connection*, rsi=buf, rdx=len)
+; linnea_spill_chunked(rdi=connection*, rsi=buf, rdx=len, rcx=state, r8d=mode)
 ;   -> rax = 0 need more, 1 body complete, -1 malformed framing, -2 past max_body,
 ;      -3 body complete but the request pipelined behind it will not fit the stash
+;
+; rcx is a struc linnea_chunk the caller owns; the connection carries two, one
+; for the request capture and one for the HTTP/1 response relay, because a
+; chunked upload and a chunked response can be in flight on the same connection.
+; r8d is LINNEA_CHUNK_CAPTURE or LINNEA_CHUNK_VALIDATE. Validate mode judges and
+; nothing else: no spill file, no max_body (that bounds a request, not a relayed
+; response), and no pipelined-suffix stash. It exists so the HTTP/1 relay can
+; apply THIS grammar to the bytes it is about to forward instead of a second
+; transcription of it -- one decoder, two directions (audit-report-24).
 ;
 ; On completion any bytes left in buf after the terminal chunk are the NEXT
 ; request, pipelined in the same recv. They are copied to in_buf[head_len] (free
@@ -164,9 +173,15 @@ linnea_spill_chunked:
     push r12
     push r13
     push r14
+    push r15
+    push rbp
     mov rbx, rdi
     mov r12, rsi                   ; read cursor
     lea r13, [rsi + rdx]           ; end of what arrived
+    mov r15, rcx                   ; the decode state, struc linnea_chunk
+    mov ebp, r8d                   ; LINNEA_CHUNK_CAPTURE or _VALIDATE
+    cmp ebp, LINNEA_CHUNK_VALIDATE
+    je .step                       ; judging only: no sink, and no cap either
     ; Encoded bytes are capped as well as decoded ones. A client can send
     ; empty chunks and trailer lines forever without the decoded length ever
     ; growing, so a cap on the decoded body alone would never fire.
@@ -174,16 +189,20 @@ linnea_spill_chunked:
     ; (rdx) against the headroom before adding it to chunk_raw, so a length near
     ; 2^64 cannot wrap the counter past a max_body of 2^64-1. chunk_raw <= max_body
     ; holds (rejected before it exceeds), so the subtraction does not underflow.
+    ;
+    ; max_body bounds a REQUEST, so it is applied in capture mode alone: a
+    ; relayed response is not a body we are holding, and capping it here would
+    ; have turned every download past max_body into a dropped connection.
     lea rax, [linnea_config_instance]
     mov rax, [rax + linnea_config.max_body]
-    sub rax, [rbx + linnea_connection.chunk_raw]   ; headroom = max_body - current
+    sub rax, [r15 + linnea_chunk.raw]   ; headroom = max_body - current
     cmp rdx, rax                                   ; incoming encoded run > headroom?
     ja .too_large
-    add [rbx + linnea_connection.chunk_raw], rdx   ; now safe from wrap
+    add [r15 + linnea_chunk.raw], rdx   ; now safe from wrap
 .step:
     cmp r12, r13
     jae .need_more
-    mov r14, [rbx + linnea_connection.chunk_state]
+    mov r14, [r15 + linnea_chunk.state]
     cmp r14, LINNEA_CHUNK_SIZE
     je .s_size
     cmp r14, LINNEA_CHUNK_EXT
@@ -226,7 +245,7 @@ linnea_spill_chunked:
 .size_digit:
     sub al, '0'
 .size_accum:
-    mov rcx, [rbx + linnea_connection.chunk_rem]
+    mov rcx, [r15 + linnea_chunk.rem]
     mov rdx, 0x0fffffffffffffff
     cmp rcx, rdx
     ja .bad                        ; a size no body could ever have
@@ -237,19 +256,19 @@ linnea_spill_chunked:
     ja .bad                        ; stops the shift overflowing, so a 16-digit
                                    ; value up to 0xffff... still passed a bound
                                    ; meant to say "no body could be this large"
-    mov [rbx + linnea_connection.chunk_rem], rcx
-    inc qword [rbx + linnea_connection.chunk_digits]
+    mov [r15 + linnea_chunk.rem], rcx
+    inc qword [r15 + linnea_chunk.digits]
     inc r12
     jmp .step
 .size_end:
-    cmp qword [rbx + linnea_connection.chunk_digits], 0
+    cmp qword [r15 + linnea_chunk.digits], 0
     je .bad                        ; no digits: not a chunk header
     ; chunk = chunk-size [ chunk-ext ] CRLF: everything from here to the CR is
     ; the extension, and linnea_chunk_ext_step is the one place that grammar
     ; lives. The byte that ended the size run belongs to it, so it is left for
     ; the ext state to judge rather than tested twice here.
-    mov qword [rbx + linnea_connection.chunk_ext], LINNEA_CHUNK_EXT_START
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_EXT
+    mov qword [r15 + linnea_chunk.ext], LINNEA_CHUNK_EXT_START
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_EXT
     jmp .step
 
 .s_ext:
@@ -259,41 +278,43 @@ linnea_spill_chunked:
     ; well-formed chunk headers (audit-report-23). The state rides in the
     ; connection because this decoder alone resumes byte by byte.
     movzx esi, byte [r12]
-    mov rdi, [rbx + linnea_connection.chunk_ext]
+    mov rdi, [r15 + linnea_chunk.ext]
     call linnea_chunk_ext_step
     cmp rax, -2
     je .ext_cr                     ; the CR that ends the size line
     cmp rax, -1
     je .bad
-    mov [rbx + linnea_connection.chunk_ext], rax
+    mov [r15 + linnea_chunk.ext], rax
     inc r12
     jmp .step
 .ext_cr:
     inc r12
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_SIZE_LF
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_SIZE_LF
     jmp .step
 
 .s_size_lf:
     cmp byte [r12], 10
     jne .bad
     inc r12
-    mov qword [rbx + linnea_connection.chunk_digits], 0
-    cmp qword [rbx + linnea_connection.chunk_rem], 0
+    mov qword [r15 + linnea_chunk.digits], 0
+    cmp qword [r15 + linnea_chunk.rem], 0
     je .size_zero                  ; a zero-size chunk ends the body
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_DATA
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_DATA
     jmp .step
 .size_zero:
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_TRAIL
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_TRAIL
     jmp .step
 
 .s_data:
     mov rax, r13
     sub rax, r12                   ; bytes in hand
-    mov rcx, [rbx + linnea_connection.chunk_rem]
+    mov rcx, [r15 + linnea_chunk.rem]
     cmp rcx, rax
     jbe .data_take                 ; the rest of the chunk is here
     mov rcx, rax                   ; take what there is
 .data_take:
+    cmp ebp, LINNEA_CHUNK_VALIDATE
+    je .data_skip                  ; judging only: the bytes go nowhere here
     push rcx
     mov rdi, rbx
     mov rsi, r12
@@ -306,23 +327,24 @@ linnea_spill_chunked:
     mov rax, [rax + linnea_config.max_body]
     cmp [rbx + linnea_connection.spill_len], rax
     ja .too_large
+.data_skip:
     add r12, rcx
-    sub [rbx + linnea_connection.chunk_rem], rcx
+    sub [r15 + linnea_chunk.rem], rcx
     jnz .step                      ; more of this chunk still to come
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_DATA_CR
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_DATA_CR
     jmp .step
 
 .s_data_cr:
     cmp byte [r12], 13
     jne .bad
     inc r12
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_DATA_LF
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_DATA_LF
     jmp .step
 .s_data_lf:
     cmp byte [r12], 10
     jne .bad
     inc r12
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_SIZE
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_SIZE
     jmp .step                      ; chunk_rem is 0 here: the next size accrues
 
 .s_trail:
@@ -333,11 +355,11 @@ linnea_spill_chunked:
     je .bad
     cmp byte [r12], 13
     je .trail_end
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_TRAIL_LINE
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_TRAIL_LINE
     jmp .step
 .trail_end:
     inc r12
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_END_LF
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_END_LF
     jmp .step
 .s_trail_line:
     ; A trailer section is made of HTTP field LINES. Rejecting a bare LF made
@@ -363,7 +385,7 @@ linnea_spill_chunked:
     jmp .step
 .trail_colon:
     inc r12
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_TRAIL_VAL
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_TRAIL_VAL
     jmp .step
 .s_trail_val:
     cmp byte [r12], 13
@@ -381,21 +403,25 @@ linnea_spill_chunked:
     jmp .step
 .trail_line_cr:
     inc r12
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_TRAIL_LF
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_TRAIL_LF
     jmp .step
 .s_trail_lf:
     cmp byte [r12], 10
     jne .bad
     inc r12
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_TRAIL
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_TRAIL
     jmp .step
 
 .s_end_lf:
     cmp byte [r12], 10
     jne .bad
     inc r12
-    mov qword [rbx + linnea_connection.chunk_state], LINNEA_CHUNK_DONE
+    mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_DONE
 .complete:
+    cmp ebp, LINNEA_CHUNK_VALIDATE
+    je .complete_nostash           ; a relayed response has nothing pipelined
+                                   ; behind it: the caller forwards the bytes
+                                   ; itself and owns whatever follows
     ; The body is whole. Whatever remains in this buffer after the cursor (r12)
     ; is the next request, pipelined behind the body in the same recv. Park it at
     ; in_buf[head_len] so keep-alive picks it up; without this it was overwritten
@@ -433,6 +459,8 @@ linnea_spill_chunked:
 .too_large:
     mov eax, -2
 .ret:
+    pop rbp
+    pop r15
     pop r14
     pop r13
     pop r12

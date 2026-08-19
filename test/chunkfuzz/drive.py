@@ -21,8 +21,14 @@ bad_serve, disagree = [], []
 for n, (name, body, verdict) in enumerate(V):
     r = {p: run(p, n) for p in ("http1.1", "http2", "h3")}
     h2, h3 = r["http2"], r["h3"]
-    # a malformed body must not be delivered as a clean, complete 200
-    for proto in ("http2", "h3"):
+    # A malformed body must not be delivered as a clean, complete 200 -- on ANY
+    # protocol. h1 was excluded here for as long as it relayed the upstream's
+    # chunk framing byte for byte: it has already sent its head, so it cannot
+    # answer 502 once the body is under way. It now judges what it forwards, so
+    # a malformed chunk is a 502 when it arrives with the head and a closed,
+    # unterminated message when it arrives later -- either way not a clean 200,
+    # which is the rule this line has always been asserting (audit-report-24).
+    for proto in ("http1.1", "http2", "h3"):
         code, size, rc = r[proto]
         if verdict == "bad" and code == "200" and rc == 0:
             bad_serve.append((name, proto, code, size, rc))

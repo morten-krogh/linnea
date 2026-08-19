@@ -111,6 +111,7 @@ extern linnea_string_equal
 extern linnea_string_is_token
 extern linnea_string_is_tchar
 extern linnea_chunk_ext_step
+extern linnea_spill_chunked
 extern linnea_string_iequal
 extern linnea_time_http_date
 extern linnea_time_parse_http_date
@@ -3916,6 +3917,10 @@ linnea_http_proxy_head:
     lea r14, [rbx + linnea_connection.up_buf]
     mov r12, [rbx + linnea_connection.up_len]
     lea r15, [rbx + linnea_connection.out_buf]   ; out cursor, across every head
+    ; Nothing is being relayed as chunked until this head says so. Cleared on
+    ; every call, including the ones that return MORE, so a keep-alive
+    ; connection cannot inherit the last response's answer.
+    mov qword [rbx + linnea_connection.resp_chunked], 0
 .head_start:
     ; r14 points at THIS head's first byte and r12 counts the bytes behind it.
     ; An interim head is relayed and stepped over, and the loop comes back here
@@ -4375,6 +4380,19 @@ linnea_http_proxy_head:
     lea rdi, [hdr_te_chunked]
     mov esi, hdr_te_chunked_len
     call .append
+    ; ...and the relay is told, so it can run the chunk grammar over the bytes
+    ; it forwards. HTTP/1 relays this body verbatim -- it has already sent this
+    ; head -- so it cannot answer 502 the way h2 and h3 do. What it can do is
+    ; refuse to finish: a malformed extension or trailer used to reach the
+    ; client as a clean, complete 200 while the same upstream bytes were 502 on
+    ; both binary protocols (audit-report-24). The state block is opened here,
+    ; on the response whose framing it describes.
+    mov qword [rbx + linnea_connection.resp_chunked], 1
+    mov qword [rbx + linnea_connection.resp_chunk_state], LINNEA_CHUNK_SIZE
+    mov qword [rbx + linnea_connection.resp_chunk_rem], 0
+    mov qword [rbx + linnea_connection.resp_chunk_digits], 0
+    mov qword [rbx + linnea_connection.resp_chunk_ext], LINNEA_CHUNK_EXT_START
+    mov qword [rbx + linnea_connection.resp_chunk_raw], 0
 .conn_hdr:
     lea rdi, [hdr_via_11]            ; and this one, on the way back
     mov esi, hdr_via_11_len
@@ -4443,6 +4461,27 @@ linnea_http_proxy_head:
     mov rcx, [rsp]
     lea rdx, [r14 + rcx]
     mov [rbx + linnea_connection.file_ptr], rdx
+    ; A chunked body is judged before it is forwarded, and this first piece is
+    ; judged while the head is still sitting unsent in out_buf -- so a backend
+    ; that writes its head and body in one go (which is most of them) gets the
+    ; same 502 from HTTP/1 that h2 and h3 give. Only a malformation that arrives
+    ; in a LATER read cannot be answered, and the relay closes on that one
+    ; instead (audit-report-24). Read back from the connection rather than kept
+    ; in registers: linnea_spill_chunked preserves the callee-saved ones this
+    ; function is using, and nothing else here is worth carrying across a call.
+    cmp qword [rbx + linnea_connection.resp_chunked], 0
+    je .leftover_ok
+    mov rdx, [rbx + linnea_connection.file_rem]
+    test rdx, rdx
+    jz .leftover_ok
+    mov rdi, rbx
+    mov rsi, [rbx + linnea_connection.file_ptr]
+    lea rcx, [rbx + linnea_connection.resp_chunk_state]
+    mov r8d, LINNEA_CHUNK_VALIDATE
+    call linnea_spill_chunked
+    cmp eax, -1
+    je .bad                    ; malformed framing: 502, head not yet sent
+.leftover_ok:
     lea rax, [rbx + linnea_connection.out_buf]
     mov [rbx + linnea_connection.out_ptr], rax
     mov rcx, r15

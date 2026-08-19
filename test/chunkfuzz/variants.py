@@ -4,8 +4,11 @@ Each entry is (name, body_bytes, verdict) where verdict is:
     "ok"  -- a VALID chunked body; every protocol must serve it, body "body"
     "bad" -- malformed; h2 and h3 must not deliver it as a clean complete 200
 
-h1 is recorded but not asserted: it relays a chunked body byte for byte and has
-already sent its head, so it can only close and let the client object.
+All three are asserted. h1 relays a chunked body byte for byte and has already
+sent its head, so it cannot answer 502 once the body is under way -- but it
+decodes what it forwards, so a malformed chunk is a 502 when it arrives with the
+head and a closed, unterminated message when it arrives later. Neither is a
+clean 200, which is what "bad" means here (audit-report-24).
 """
 OK, BAD = "ok", "bad"
 

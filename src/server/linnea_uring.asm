@@ -214,6 +214,10 @@ reason_up_early:    db "upstream closed early"
 reason_up_early_len equ $ - reason_up_early
 reason_up_timeout:  db "upstream timeout"
 reason_up_timeout_len equ $ - reason_up_timeout
+reason_up_chunk:    db "upstream chunked framing"
+reason_up_chunk_len equ $ - reason_up_chunk
+reason_up_chunk_early: db "upstream chunked body ended early"
+reason_up_chunk_early_len equ $ - reason_up_chunk_early
 reason_drain:       db "draining"
 reason_drain_len    equ $ - reason_drain
 
@@ -1478,6 +1482,8 @@ linnea_uring_run:
     jae .cap_ch_have
     xor edx, edx
 .cap_ch_have:
+    lea rcx, [r12 + linnea_connection.chunk_state]   ; the capture's own state
+    mov r8d, LINNEA_CHUNK_CAPTURE
     call linnea_spill_chunked
     mov rcx, [r12 + linnea_connection.head_len]
     mov [r12 + linnea_connection.in_len], rcx
@@ -1620,6 +1626,8 @@ linnea_uring_run:
     mov rdi, r12
     lea rsi, [r12 + linnea_connection.out_buf]
     mov edx, r15d
+    lea rcx, [r12 + linnea_connection.chunk_state]   ; the capture's own state
+    mov r8d, LINNEA_CHUNK_CAPTURE
     call linnea_spill_chunked
     jmp .capture_verdict
 .req_body_counted:
@@ -2448,15 +2456,54 @@ linnea_uring_run:
     lea r14, [reason_up_timeout]
     mov r15d, reason_up_timeout_len
     jmp .conn_close
+.relay_chunk_bad:
+    lea r14, [reason_up_chunk]
+    mov r15d, reason_up_chunk_len
+    jmp .conn_close
 .relay_eof:
     cmp qword [r12 + linnea_connection.body_rem], 0
     je .proxy_finish           ; a counted body ended exactly here
     cmp qword [r12 + linnea_connection.body_rem], -1
-    je .proxy_finish           ; close-delimited: the close is the end
+    jne .relay_short
+    ; body_rem's -1 means two things: close-delimited, where the close IS the
+    ; end, and chunked, where it is not -- the terminal chunk is. Now that the
+    ; relay decodes as it forwards, the two can be told apart: a chunked
+    ; response that stops before LINNEA_CHUNK_DONE ended early, and saying so
+    ; is the difference between a truncated relay and a completed one in the
+    ; log (audit-report-24). The client sees the same FIN either way, since a
+    ; chunked relay never keeps the connection alive.
+    cmp qword [r12 + linnea_connection.resp_chunked], 0
+    je .proxy_finish
+    cmp qword [r12 + linnea_connection.resp_chunk_state], LINNEA_CHUNK_DONE
+    je .proxy_finish
+    lea r14, [reason_up_chunk_early]
+    mov r15d, reason_up_chunk_early_len
+    jmp .conn_close
+.relay_short:
     lea r14, [reason_up_early]  ; short of the promised Content-Length
     mov r15d, reason_up_early_len
     jmp .conn_close
 .relay_data:
+    ; A chunked upstream response is relayed byte for byte, so the client -- and
+    ; anything caching for it -- reads the upstream's own framing. Judge it
+    ; first, with the decoder h3's capture path uses, over the exact bytes about
+    ; to go out. h2 and h3 answer 502 to a malformed chunk; h1 has already sent
+    ; this head and cannot, but it can decline to finish: closing here leaves
+    ; the client an unterminated chunked message rather than a clean, complete
+    ; 200 carrying framing another parser may read differently (audit-report-24).
+    cmp qword [r12 + linnea_connection.resp_chunked], 0
+    je .relay_framed
+    push r15                   ; the completion's byte count
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.up_buf]
+    mov edx, r15d
+    lea rcx, [r12 + linnea_connection.resp_chunk_state]
+    mov r8d, LINNEA_CHUNK_VALIDATE
+    call linnea_spill_chunked
+    pop r15
+    cmp eax, -1
+    je .relay_chunk_bad
+.relay_framed:
     mov eax, r15d              ; bytes read
     mov rcx, [r12 + linnea_connection.body_rem]
     cmp rcx, -1

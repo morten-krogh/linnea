@@ -602,18 +602,22 @@ def h3_all(routes):
 
 h3 = h3_all([r for r, _, _ in CASES if r not in H3_SKIP])
 
-# These four are judged on h2 and h3 only, and the reason is protocol, not
-# laxity: h1 relays a chunked body byte for byte and has already sent its 200
-# by the time any chunk line is read, so it can only close and let the client
-# detect the error. h2 decodes and can reset the stream after the head; h3
-# captures the WHOLE body before sending anything, so it alone can still answer
-# 502 -- which is exactly why it must. Written down rather than exempted,
-# because an exemption is where a defect lives (audit-report-16).
-STREAMED_BODY = {"chunkspace", "chunkoverflow", "chunkbig", "chunkextlf",
-                 "chunkdatalf", "chunktrailinlinelf", "chunktraillf",
-                 "chunktrailnocolon", "chunktrailnul", "chunktrailbadname",
-                 "chunksizetrailsp", "chunksizejunk", "chunkextnul",
-                 "chunktrailemptyname", "chunkextnoname", "chunkextunterm"}
+# This set was h1's exemption from the chunk-framing rows, and it is now empty.
+# The reason it existed was real: h1 relays a chunked body byte for byte and has
+# already sent its 200 by the time any chunk line is read, so it cannot answer
+# 502 once the body is under way -- and it was written down rather than
+# exempted, because an exemption is where a defect lives (audit-report-16).
+# What it never justified was FORWARDING the malformed framing, which is what
+# h1 did: 23 of the sweep's malformed bodies arrived at the client as clean,
+# complete 200s while h2 and h3 answered 502 to the same upstream bytes
+# (audit-report-24). h1 now runs the same decoder over what it is about to
+# forward. These backends write their head and body in one go, so the judgement
+# lands while the head is still unsent and h1 answers 502 with the others; a
+# malformation that arrives in a later read closes the connection instead,
+# which chunkfuzz's split-write backend covers. Kept as an empty set, and as
+# this note, so the next reader knows the exemption was retired rather than
+# forgotten.
+STREAMED_BODY = set()
 
 # chunktrunc is the same family but a step further, and it separates "malformed"
 # from "detectable in time". Its head and first chunk line are VALID, so h2 has

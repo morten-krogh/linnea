@@ -253,6 +253,23 @@ def respond(conn, head, body, extra=b""):
         # DEL accepted as extension data by BOTH binary protocols.
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
                      b"4;a\x00b\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunklatebad"):
+        # The head first, then -- after the relay has certainly forwarded it --
+        # a malformed chunk. HTTP/1 cannot answer 502 by then, so this is the
+        # other half of the rule: it must decline to FINISH. The client is left
+        # a 200 whose chunked body never terminates, rather than the malformed
+        # framing relayed verbatim inside a clean, complete message
+        # (audit-report-24). Every other chunk route here writes head and body
+        # together, which lands the same judgement while the head is unsent.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+        time.sleep(0.3)
+        conn.sendall(b"4;=bad\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunklategood"):
+        # ...and the control for it, split exactly the same way: a VALID body
+        # arriving after the head must still be relayed whole.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+        time.sleep(0.3)
+        conn.sendall(b"4\r\nbody\r\n0\r\n\r\n")
     elif path.endswith(b"/chunkextnoname"):
         # chunk-ext-name is a token and it is not optional. The scanners asked
         # only which BYTES an extension may contain, never what shape they must

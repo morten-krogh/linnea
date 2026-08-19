@@ -92,6 +92,12 @@ linnea_connection_alloc:
     mov qword [rdx + linnea_connection.chunk_digits], 0
     mov qword [rdx + linnea_connection.chunk_ext], LINNEA_CHUNK_EXT_START
     mov qword [rdx + linnea_connection.chunk_raw], 0
+    mov qword [rdx + linnea_connection.resp_chunk_state], LINNEA_CHUNK_SIZE
+    mov qword [rdx + linnea_connection.resp_chunk_rem], 0
+    mov qword [rdx + linnea_connection.resp_chunk_digits], 0
+    mov qword [rdx + linnea_connection.resp_chunk_ext], LINNEA_CHUNK_EXT_START
+    mov qword [rdx + linnea_connection.resp_chunk_raw], 0
+    mov qword [rdx + linnea_connection.resp_chunked], 0
     mov qword [rdx + linnea_connection.capture_chunked], 0
     mov qword [rdx + linnea_connection.capture_done], 0
     mov qword [rdx + linnea_connection.pend_len], 0
