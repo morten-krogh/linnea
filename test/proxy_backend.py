@@ -226,6 +226,24 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/chunknoterm"):
+        # "0\r\n" is the zero-size chunk LINE; it starts the trailer section and
+        # does not end the message. The empty trailer line that would end it
+        # never arrives (audit-report-18).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\n")
+        conn.close()
+    elif path.endswith(b"/chunktrailer"):
+        # A COMPLETE chunked message that carries a trailer field. The control:
+        # a decoder that stops at the zero-size line passes this by ignoring the
+        # very bytes that make it valid, so it has to be here.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\nX-Trail: a\r\n\r\n")
+    elif path.endswith(b"/chunkpartialtrail"):
+        # ...and the same trailer section cut off before its terminator.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\nX-Trail: a\r\n")
+        conn.close()
     elif path.endswith(b"/chunkspace"):
         # RFC 9112 7.1: chunk-size is 1*HEXDIG. A space before the first digit
         # is not a delimiter, and h2's decoder alone accepted one

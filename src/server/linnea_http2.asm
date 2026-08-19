@@ -4139,7 +4139,15 @@ h2p_decode:
     jmp .dec_ret
 .dec_chunked:
     ; phase 1 = expecting a size line, 2 = copying chunk data, 3 = the CRLF
-    ; after a chunk, 4 = trailers/end
+    ; after a chunk, then the TRAILER section: 4 = at the start of a trailer
+    ; line, 5 = inside one, 6 = the LF after it, 7 = the LF that ends the whole
+    ; body, 8 = done. Phase 4 used to mean "done", which collapsed two different
+    ; boundaries: "0\r\n" is the zero-size chunk LINE and it OPENS the trailer
+    ; section -- the empty line after it is what ends the message. Stopping at
+    ; the first meant an upstream could close after "0\r\n" and h2 emitted a
+    ; clean completed response while h3 refused the same bytes
+    ; (audit-report-18). These states mirror linnea_spill_chunked's, which is
+    ; the decoder h3 uses and the one that was right.
     mov r13, [rbx + linnea_h2p.rd]   ; raw cursor
     mov r14, [rbx + linnea_h2p.wr]   ; decoded write cursor
 .dec_loop:
@@ -4150,7 +4158,15 @@ h2p_decode:
     je .dec_data
     cmp rax, 3
     je .dec_crlf
-    jmp .dec_save                    ; phase 4: done
+    cmp rax, 4
+    je .dec_trail
+    cmp rax, 5
+    je .dec_trail_line
+    cmp rax, 6
+    je .dec_trail_lf
+    cmp rax, 7
+    je .dec_end_lf
+    jmp .dec_save                    ; phase 8: done
 .dec_size:
     ; a size line ends at the first CRLF; hex digits up to ';' or CR
     mov rcx, r13
@@ -4209,7 +4225,55 @@ h2p_decode:
     mov qword [rbx + linnea_h2p.chunked], 2
     jmp .dec_loop
 .dec_last:
+    ; the zero-size line OPENS the trailer section; it does not end the message
     mov qword [rbx + linnea_h2p.chunked], 4
+    mov r13, rax
+    jmp .dec_loop
+
+    ; --- the trailer section ---------------------------------------------
+    ; An empty line here ends the whole body. Anything else is a trailer field
+    ; line, dropped: h2 carries trailers as their own field section and this
+    ; proxy does not translate them, which is the behaviour that was already in
+    ; place -- what was missing is CONSUMING them before declaring the message
+    ; complete. EOF in any unfinished state below leaves `chunked` non-zero, and
+    ; the EOF path turns that into a bad gateway rather than a clean end.
+.dec_trail:
+    cmp r13, [rbx + linnea_h2p.len]
+    jae .dec_save                    ; wait for more
+    cmp byte [r12 + r13], 13
+    je .dec_trail_end
+    mov qword [rbx + linnea_h2p.chunked], 5
+    jmp .dec_loop
+.dec_trail_end:
+    inc r13
+    mov qword [rbx + linnea_h2p.chunked], 7
+    jmp .dec_loop
+.dec_trail_line:
+    cmp r13, [rbx + linnea_h2p.len]
+    jae .dec_save
+    cmp byte [r12 + r13], 13
+    je .dec_trail_cr
+    inc r13
+    jmp .dec_trail_line
+.dec_trail_cr:
+    inc r13
+    mov qword [rbx + linnea_h2p.chunked], 6
+    jmp .dec_loop
+.dec_trail_lf:
+    cmp r13, [rbx + linnea_h2p.len]
+    jae .dec_save
+    cmp byte [r12 + r13], 10
+    jne .dec_bad                     ; a bare CR is not a line ending
+    inc r13
+    mov qword [rbx + linnea_h2p.chunked], 4   ; another trailer line, or the end
+    jmp .dec_loop
+.dec_end_lf:
+    cmp r13, [rbx + linnea_h2p.len]
+    jae .dec_save
+    cmp byte [r12 + r13], 10
+    jne .dec_bad
+    inc r13
+    mov qword [rbx + linnea_h2p.chunked], 8
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
     jmp .dec_save
 .dec_data:

@@ -202,6 +202,15 @@ CASES = [
     ("chunkoverflow", 502, None),
     ("chunkbig",      502, None),      # 16 digits: too big, but never wraps
     ("chunktrunc",    502, None),      # the body just stops
+    # "0\r\n" opens the TRAILER section; the empty line after it ends the
+    # message. h2 collapsed those two boundaries and completed at the first, so
+    # an upstream closing after "0\r\n" produced a clean 200 (audit-report-18).
+    ("chunknoterm",       502, None),
+    ("chunkpartialtrail", 502, None),
+    # ...and a COMPLETE message that carries a trailer field. A decoder that
+    # stops at the zero-size line passes this by ignoring the bytes that make it
+    # valid, so the control has to exist.
+    ("chunktrailer",  200, b"body"),
     ("simple",     200, b"backend body"),
 ]
 
@@ -571,7 +580,7 @@ H2_RESET = {}
 # ...so its correct answer differs per protocol BY NECESSITY, and the generic
 # "all three agree" check does not apply. It is asserted on its own terms below
 # instead of being dropped from the matrix.
-PROTOCOL_SPECIFIC = {"chunktrunc"}
+PROTOCOL_SPECIFIC = {"chunktrunc", "chunknoterm", "chunkpartialtrail"}
 
 RESULTS = {}
 
@@ -751,7 +760,7 @@ for route in [r for r, _, _ in CASES if r not in H3_SKIP]:
           f"own)", not bad, f"  {bad}" if bad else "")
 
 # --- a truncated chunked body is never a complete response ------------------
-for route in ("chunktrunc",):
+for route in sorted(PROTOCOL_SPECIFIC):
     got = RESULTS.get(route, {})
     h3_refused = got.get("h3", (None,))[0] == 502
     h2_reset = H2_RESET.get(route, False)
