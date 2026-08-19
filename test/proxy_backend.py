@@ -160,6 +160,54 @@ def respond(conn, head, body, extra=b""):
                      b"Proxy-Connection: keep-alive\r\n"
                      b"Proxy-Authenticate: Basic realm=\"backend\"\r\n"
                      b"X-Kept: yes\r\n\r\nbody")
+    elif path.endswith(b"/hopnamed"):
+        # RFC 9110 7.6.1: Connection is the EXTENSIBILITY mechanism -- an
+        # intermediary must drop every field the peer NAMES there, not only the
+        # names it happens to know. /hopresp above proves the fixed list and
+        # cannot prove this one, because the field it preserves is never
+        # nominated (audit-report-10 Finding 2). X-Kept is the control: an
+        # ordinary field that must still arrive.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                     b"Connection: X-Backend-Only\r\n"
+                     b"X-Backend-Only: leaked\r\n"
+                     b"X-Kept: yes\r\n\r\nbody")
+    elif path.endswith(b"/hopnamedmulti"):
+        # Two Connection lines, several tokens, OWS and mixed case -- the shape
+        # the token walk has to survive. close is a token too and is not a field.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                     b"Connection:  x-one ,\tX-Two\r\n"
+                     b"Connection: close, X-Three\r\n"
+                     b"X-One: a\r\nX-Two: b\r\nX-Three: c\r\n"
+                     b"X-Kept: yes\r\n\r\nbody")
+    elif path.endswith(b"/earlyhop"):
+        # ...and the same rule on an INTERIM head, which has its own rewriter on
+        # every protocol and so is exactly where a rule drifts.
+        conn.sendall(b"HTTP/1.1 103 Early Hints\r\n"
+                     b"Connection: X-Hint-Only\r\n"
+                     b"X-Hint-Only: leaked\r\n"
+                     b"Link: </a.css>; rel=preload\r\n\r\n"
+                     b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nvalid")
+    elif path.endswith(b"/205body"):
+        # RFC 9110 15.3.6: a server MUST NOT generate content in a 205. Unlike
+        # 204, a 205 MAY carry Content-Length -- but only to say zero, so a
+        # nonzero one is a contradiction the proxy must not relay
+        # (audit-report-10 Finding 1).
+        conn.sendall(b"HTTP/1.1 205 Reset Content\r\nContent-Length: 4\r\n\r\nbody")
+    elif path.endswith(b"/205zero"):
+        # The legal spelling, and the control that stops the fix from becoming
+        # "refuse every 205".
+        conn.sendall(b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n")
+    elif path.endswith(b"/205bare"):
+        # No framing at all: also legal, also no content.
+        conn.sendall(b"HTTP/1.1 205 Reset Content\r\n\r\n")
+    elif path.endswith(b"/205chunked"):
+        # A 205 that frames content the other way. RFC 9110 15.3.6 does allow a
+        # zero-length chunked section here, so refusing this is deliberately
+        # stricter than the letter: the proxy cannot know the section is empty
+        # without reading it, and the alternative is relaying content on a
+        # status that must have none. Documented, not accidental.
+        conn.sendall(b"HTTP/1.1 205 Reset Content\r\nTransfer-Encoding: chunked\r\n"
+                     b"\r\n4\r\nbody\r\n0\r\n\r\n")
     elif path.endswith(b"/chunked"):
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
                      b"7\r\nchunked\r\n5\r\n body\r\n0\r\n\r\n")

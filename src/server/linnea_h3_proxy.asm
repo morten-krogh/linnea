@@ -56,6 +56,7 @@ extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_to_u64
 extern linnea_http_upstream_head_valid
+extern linnea_http_status_no_content
 extern linnea_http_status_no_clen
 extern linnea_string_iequal
 extern linnea_spill_open
@@ -704,13 +705,13 @@ linnea_h3_proxy_head:
     ; how a proxy invents a body.
     cmp qword [rbx + linnea_connection.is_head], 0
     jne .ph_nobody
-    mov rax, [rbx + linnea_connection.up_status]
-    cmp rax, 204
-    je .ph_nobody
-    cmp rax, 304
-    je .ph_nobody
-    cmp rax, 200
-    jb .ph_nobody
+    ; 1xx, 204, 205 and 304 carry no content, whatever the head says. 205 was
+    ; missing from all three of these lists (audit-report-10 Finding 1); the
+    ; rule is one predicate now so they cannot disagree again.
+    mov edi, [rbx + linnea_connection.up_status]
+    call linnea_http_status_no_content
+    test eax, eax
+    jnz .ph_nobody
     jmp .ph_ready
 .ph_nobody:
     mov qword [rbx + linnea_connection.body_rem], 0

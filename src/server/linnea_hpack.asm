@@ -28,6 +28,7 @@ default rel
 
 global linnea_hpack_decode
 global linnea_http_authority_host
+global linnea_http_head_conn_named
 extern linnea_network_parse_ipv6
 ; shared with the QPACK decoder (same Huffman code and pseudo-header logic)
 global hpack_int
@@ -1566,6 +1567,170 @@ linnea_hpack_req_check:
 .bad:
     mov qword [rbx + linnea_h2_req.malformed], 1
     mov rax, -1
+    pop rbx
+    ret
+
+
+hcn_connection: db "connection"
+hcn_upgrade:    db "upgrade"
+
+; linnea_http_head_conn_named(rdi = head ptr, rsi = head length,
+;                             rdx = field name, rcx = name length)
+;   -> eax = 1 when a Connection field in this upstream head names that field.
+;
+; RFC 9110 7.6.1 MUST: an intermediary parses Connection, removes every field
+; its value names, then removes Connection itself. That value is the
+; EXTENSIBILITY mechanism -- how a peer marks a field connection-specific that
+; no implementation has heard of -- so a fixed table cannot implement the rule,
+; only the half of it that was known when the table was written. The request
+; direction has had the real rule since http_conn_option_named; the response
+; direction had only the table, so an upstream sending
+;     Connection: X-Backend-Only
+;     X-Backend-Only: leaked
+; delivered X-Backend-Only to the client on all three protocols
+; (audit-report-10 Finding 2).
+;
+; The head is re-walked once per field rather than a token set being built
+; ahead of time. A head is a few KiB with a handful of fields, so the second
+; pass costs less than anywhere to keep the set would -- and repeated
+; Connection lines, which are legal, then work without being thought about.
+;
+; `upgrade` is never matched, exactly as on the request side: the 101 path is a
+; participant in the handshake rather than a bystander, and the tunnel only
+; completes if the backend's Upgrade field reaches the client.
+;
+; It lives in this file, not linnea_http.asm, because linnea_qpack.o is linked
+; by four test harnesses that have no linnea_http.o -- the same reason
+; linnea_http_authority_host is here.
+linnea_http_head_conn_named:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                        ; six pushes leave rsp 8 past aligned
+    xor eax, eax
+    test rcx, rcx
+    jz .cx_out                        ; an empty name names nothing
+    mov r12, rdi                      ; head
+    mov r13, rdi
+    add r13, rsi                      ; head end
+    mov r14, rdx                      ; the name being asked about
+    mov r15, rcx
+    cmp r15, 7                        ; the Upgrade exception, before any walk
+    jne .cx_scan
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [hcn_upgrade]
+    mov ecx, 7
+    call linnea_string_iequal
+    test eax, eax
+    jnz .cx_no                        ; never a removal instruction
+.cx_scan:
+    mov rbx, r12                      ; cursor: skip the status line
+.cx_status:
+    cmp rbx, r13
+    jae .cx_no
+    cmp byte [rbx], 13
+    je .cx_status_end
+    inc rbx
+    jmp .cx_status
+.cx_status_end:
+    add rbx, 2
+.cx_line:
+    cmp rbx, r13
+    jae .cx_no
+    cmp byte [rbx], 13
+    je .cx_no                         ; the empty line ends the head
+    mov rbp, rbx                      ; find this line's CR
+.cx_eol:
+    cmp rbp, r13
+    jae .cx_no
+    cmp byte [rbp], 13
+    je .cx_have
+    inc rbp
+    jmp .cx_eol
+.cx_have:
+    mov rdi, rbx                      ; is this line's name "connection"?
+.cx_colon:
+    cmp rdi, rbp
+    jae .cx_next                      ; no colon: not a field line
+    cmp byte [rdi], ':'
+    je .cx_colon_found
+    inc rdi
+    jmp .cx_colon
+.cx_colon_found:
+    mov rax, rdi
+    sub rax, rbx                      ; name length
+    cmp rax, 10
+    jne .cx_next
+    push rdi                          ; the colon, across the call
+    mov rdi, rbx
+    mov rsi, 10
+    lea rdx, [hcn_connection]
+    mov ecx, 10
+    call linnea_string_iequal
+    pop rdi
+    test eax, eax
+    jz .cx_next
+    inc rdi                           ; the value: a comma-separated token list
+.cx_tok:
+    cmp rdi, rbp
+    jae .cx_next
+    movzx eax, byte [rdi]
+    cmp al, ','
+    je .cx_tok_step
+    cmp al, ' '
+    je .cx_tok_step
+    cmp al, 9
+    je .cx_tok_step
+    mov rsi, rdi                      ; token start
+.cx_tok_end:
+    cmp rsi, rbp
+    jae .cx_tok_cmp
+    movzx eax, byte [rsi]
+    cmp al, ','
+    je .cx_tok_cmp
+    cmp al, ' '
+    je .cx_tok_cmp
+    cmp al, 9
+    je .cx_tok_cmp
+    inc rsi
+    jmp .cx_tok_end
+.cx_tok_cmp:
+    push rdi
+    push rsi
+    mov rax, rsi
+    sub rax, rdi                      ; token length
+    mov rsi, rax
+    mov rdx, r14
+    mov rcx, r15
+    call linnea_string_iequal         ; rdi is already the token start
+    pop rsi
+    pop rdi
+    test eax, eax
+    jnz .cx_yes
+    mov rdi, rsi                      ; past this token
+    jmp .cx_tok
+.cx_tok_step:
+    inc rdi
+    jmp .cx_tok
+.cx_next:
+    lea rbx, [rbp + 2]                ; past this line's CRLF
+    jmp .cx_line
+.cx_yes:
+    mov eax, 1
+    jmp .cx_out
+.cx_no:
+    xor eax, eax
+.cx_out:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
     pop rbx
     ret
 

@@ -54,6 +54,8 @@ extern linnea_config_instance
 extern linnea_string_from_u64
 extern linnea_string_to_u64
 extern linnea_http_upstream_head_valid
+extern linnea_http_head_conn_named
+extern linnea_http_status_no_content
 extern linnea_http_status_no_clen
 extern linnea_string_iequal
 extern linnea_string_equal
@@ -4075,10 +4077,13 @@ h2p_parse_head:
     ; responses that never carry a body, whatever the headers say
     test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_IS_HEAD
     jnz .ph_nobody
-    cmp rax, 204
-    je .ph_nobody
-    cmp rax, 304
-    je .ph_nobody
+    ; 1xx, 204, 205 and 304 carry no content, whatever the head says. 205 was
+    ; missing from all three of these lists (audit-report-10 Finding 1); the
+    ; rule is one predicate now so they cannot disagree again.
+    mov edi, eax
+    call linnea_http_status_no_content
+    test eax, eax
+    jnz .ph_nobody
     cmp qword [rbx + linnea_h2p.body_rem], 0
     jne .ph_ok
 .ph_nobody:
@@ -4545,6 +4550,16 @@ h2p_emit_headers:
     lea rdi, [h2p_nmbuf]
     mov rsi, [rsp + 24]
     call h2p_name_dropped            ; -> eax = 1 when it must not be forwarded
+    test eax, eax
+    jnz .eh_next
+    ; ...and the fields this head's own Connection value names (RFC 9110 7.6.1).
+    ; h2 must strip these regardless: RFC 9113 8.2.2 forbids connection-specific
+    ; fields in an h2 message at all (audit-report-10 Finding 2).
+    mov rdi, r12                     ; the head being translated...
+    mov rsi, r13                     ; ...and its length
+    lea rdx, [h2p_nmbuf]
+    mov rcx, [rsp + 24]
+    call linnea_http_head_conn_named
     test eax, eax
     jnz .eh_next
     ; forward only the FIRST content-length (RFC 9110 8.6, Finding 34), and none

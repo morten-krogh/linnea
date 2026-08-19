@@ -99,8 +99,36 @@ CASES = [
     ("204",           204, b""),        # 204 whose upstream sent one
     ("204clean",      204, b""),        # ...and the control that did not
     ("earlycl",       200, b"valid"),   # a 103 carrying one, then the real 200
+    # RFC 9110 15.3.6: a 205 implies no content and a server MUST NOT generate
+    # any. All three framing paths listed HEAD/204/304 and omitted 205, so a
+    # four-byte 205 was relayed as a four-byte response (audit-report-10
+    # Finding 1). Unlike 204 a 205 MAY carry Content-Length -- to say zero -- so
+    # this is NOT report 9's "Content-Length is forbidden" rule, and the two
+    # controls below are what stop the fix becoming "refuse every 205".
+    ("205body",       502, None),   # declares four bytes: a contradiction
+    ("205chunked",    502, None),   # ...and the other way of framing content
+    ("205zero",       205, b""),    # legal: Content-Length: 0
+    ("205bare",       205, b""),    # legal: no framing at all
+    # RFC 9110 7.6.1: Connection NAMES the connection-specific fields, and an
+    # intermediary must drop every name it lists. Linnea dropped the fixed list
+    # it knew and relayed whatever the upstream nominated (Finding 2). The
+    # request direction has had this rule since http_conn_option_named; the
+    # response direction never got it.
+    ("hopnamed",      200, b"body"),
+    ("hopnamedmulti", 200, b"body"),   # two lines, OWS, mixed case, plus close
+    ("earlyhop",      200, b"valid"),  # ...and on an INTERIM head
     ("simple",     200, b"backend body"),
 ]
+
+# route -> field names that must not survive on ANY protocol, in ANY field
+# section: the upstream nominated them in its own Connection header.
+NOMINATED = {
+    "hopnamed":      [b"x-backend-only"],
+    "hopnamedmulti": [b"x-one", b"x-two", b"x-three"],
+    "earlyhop":      [b"x-hint-only"],
+}
+# ...and the control that stops the fix becoming "drop everything unfamiliar".
+KEPT = {"hopnamed": b"x-kept", "hopnamedmulti": b"x-kept"}
 
 # Routes the HTTP/3 leg here cannot judge, and why. Listed rather than quietly
 # dropped, so a reader sees the gap instead of assuming coverage.
@@ -117,6 +145,7 @@ H3_SKIP = {
 INTERIM_SEQ = {
     "early":        ["103", "200"],
     "earlycl":      ["103", "200"],
+    "earlyhop":     ["103", "200"],
     "early-atonce": ["103", "200"],
     "multi-early":  ["103", "103", "100", "200"],
     "simple":       ["200"],
@@ -460,6 +489,30 @@ for route, got in RESULTS.items():
             leaked[proto] = hits
     check(f"{route}: no Content-Length on a 1xx or 204 (RFC 9110 8.6)",
           not leaked, f"  {leaked}" if leaked else "")
+
+# --- nothing the upstream declared connection-specific may travel ------------
+for route, names in NOMINATED.items():
+    got = RESULTS.get(route, {})
+    leaked = {}
+    for proto, v in got.items():
+        # h1 sends its OWN Connection header and must: it states this hop's
+        # keep-alive wish. Only h2 and h3, where the field is forbidden
+        # outright, are checked for it.
+        hits = [(st, f) for st, fields in v[3] for f in fields
+                if any(f.lower().startswith(n + b":") for n in names)
+                or (proto != "h1" and f.lower().startswith(b"connection:"))]
+        if hits:
+            leaked[proto] = hits
+    check(f"{route}: no Connection-nominated field reaches the client "
+          f"(RFC 9110 7.6.1)", not leaked, f"  {leaked}" if leaked else "")
+
+for route, keep in KEPT.items():
+    got = RESULTS.get(route, {})
+    present = {p: any(f.lower().startswith(keep + b":")
+                      for _, fields in v[3] for f in fields)
+               for p, v in got.items()}
+    check(f"{route}: the ordinary field beside them is still relayed",
+          all(present.values()), f"  {present}")
 
 for route, why in H3_SKIP.items():
     print(f"note: {route} not checked over HTTP/3 here -- {why}")

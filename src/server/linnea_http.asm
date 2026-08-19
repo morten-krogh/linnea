@@ -88,6 +88,8 @@ global linnea_http_proxy_error
 global linnea_http_request_timeout
 global linnea_http_upstream_head_valid
 global linnea_http_status_no_clen
+global linnea_http_status_no_content
+extern linnea_http_head_conn_named
 global linnea_http_proxy_head
 extern linnea_http_authority_host
 global linnea_http_proxy_log
@@ -3436,6 +3438,36 @@ linnea_http_status_no_clen:
 .nc_ret:
     ret
 
+; linnea_http_status_no_content(edi = status) -> eax = 1 when a response with
+; this status carries no content at all.
+; RFC 9110: 1xx and 204 (6.4.1), 205 (15.3.6 -- "the server MUST NOT generate
+; content in a 205 response"), 304 (15.4.5). A HEAD is the caller's business:
+; that depends on the request, not on the status.
+;
+; This is NOT linnea_http_status_no_clen, and the difference is the whole of
+; audit-report-10 Finding 1. That one answers "may this response carry a
+; Content-Length FIELD"; this one answers "may it carry CONTENT". They genuinely
+; disagree on 205: it may carry a Content-Length, but only to say zero. All
+; three framing paths listed HEAD/204/304 and omitted 205 -- easy to miss
+; precisely because report 9's predicate looked like it already covered it.
+; Touches only eax, so a caller may treat it as clobbering nothing else.
+linnea_http_status_no_content:
+    xor eax, eax
+    cmp edi, 100
+    jb .nn_ret
+    cmp edi, 199
+    jbe .nn_yes
+    cmp edi, 204
+    je .nn_yes
+    cmp edi, 205
+    je .nn_yes
+    cmp edi, 304
+    jne .nn_ret
+.nn_yes:
+    mov eax, 1
+.nn_ret:
+    ret
+
 ; linnea_http_upstream_head_valid(rdi = head buf, rsi = head length)
 ;   -> eax = 1 valid, 0 not.
 ; One gate on an upstream HTTP/1 response head, for every protocol that relays
@@ -3462,10 +3494,13 @@ linnea_http_upstream_head_valid:
     push r14
     push r15
     push rbp
-    sub rsp, 24                       ; [rsp]=cl seen flag, [rsp+8]=cl value
+    sub rsp, 40                       ; [rsp]=cl seen flag, [rsp+8]=cl value,
+                                      ; [rsp+16]=status, [rsp+24]=TE seen
     mov r12, rdi                      ; head buf
     mov r13, rsi                      ; head length
     mov qword [rsp], 0                ; no Content-Length seen yet
+    mov qword [rsp + 16], 0
+    mov qword [rsp + 24], 0
     xor rcx, rcx                      ; cursor
     ; --- the status line itself ------------------------------------------
     ; This used to be skipped outright, and only HTTP/1 checked it afterwards
@@ -3497,6 +3532,9 @@ linnea_http_upstream_head_valid:
     sub eax, '0'
     cmp eax, 9
     ja .hv_bad                        ; the status code is three DIGITS
+    imul edx, [rsp + 16], 10          ; keep the value: the 205 rule below is
+    add edx, eax                      ; the first thing here to need it
+    mov [rsp + 16], rdx
     inc ecx
     jmp .hv_code
 .hv_code_done:
@@ -3604,6 +3642,20 @@ linnea_http_upstream_head_valid:
     inc rcx
     jmp .hv_value
 .hv_value_end:
+    ; a Transfer-Encoding line, noted only so the 205 rule below can see it
+    cmp rbp, 17
+    jne .hv_not_te
+    lea rdi, [r12 + r15]
+    sub rdi, rbp
+    mov rsi, rbp
+    lea rdx, [hn_transfer_enc]
+    mov ecx, 17
+    call linnea_string_iequal
+    test eax, eax
+    jz .hv_not_te
+    mov qword [rsp + 24], 1
+    jmp .hv_next_line
+.hv_not_te:
     ; a Content-Length line: its value must agree with any earlier one
     cmp rbp, 14
     jne .hv_next_line
@@ -3673,12 +3725,35 @@ linnea_http_upstream_head_valid:
     add rcx, 2
     jmp .hv_line
 .hv_ok:
+    ; --- a 205 must not frame content -----------------------------------
+    ; RFC 9110 15.3.6: a 205 implies no content and a server MUST NOT generate
+    ; any. It differs from 204 in being ALLOWED a Content-Length -- to say zero
+    ; -- so this is a contradiction test, not report 9's "no such field" rule.
+    ; It is refused rather than normalised, and the reason is framing: dropping
+    ; the body while relaying "Content-Length: 4" gives the client a different
+    ; error, and dropping both leaves four bytes in the upstream buffer that the
+    ; next response on a kept-alive connection would be read out of. A backend
+    ; that contradicts itself is a bad gateway.
+    ;
+    ; Refusing Transfer-Encoding here is deliberately stricter than the letter,
+    ; which permits an empty chunked section: we cannot know it is empty without
+    ; reading it, and the alternative is relaying content on a status that must
+    ; have none. Written down so it stays a decision.
+    cmp qword [rsp + 16], 205
+    jne .hv_ok_go
+    cmp qword [rsp + 24], 0
+    jne .hv_bad                       ; 205 + Transfer-Encoding
+    cmp qword [rsp], 0
+    je .hv_ok_go                      ; no Content-Length at all: no content
+    cmp qword [rsp + 8], 0
+    jne .hv_bad                       ; 205 announcing content
+.hv_ok_go:
     mov eax, 1
     jmp .hv_ret
 .hv_bad:
     xor eax, eax
 .hv_ret:
-    add rsp, 24
+    add rsp, 40
     pop rbp
     pop r15
     pop r14
@@ -3866,6 +3941,19 @@ linnea_http_proxy_head:
     call http_hop_by_hop
     test eax, eax
     jnz .next_line
+    ; ...and every field THIS head's own Connection value names (RFC 9110
+    ; 7.6.1). The fixed table above is only the half of the rule that was known
+    ; when it was written; the value is the other half (audit-report-10
+    ; Finding 2). Interim heads come through here too, on the same loop.
+    mov rax, [rsp + 24]
+    mov rcx, r13
+    sub rcx, rax               ; name length
+    lea rdx, [r14 + rax]       ; name pointer
+    mov rdi, r14               ; the head it came from...
+    mov rsi, [rsp]             ; ...and that head's length
+    call linnea_http_head_conn_named
+    test eax, eax
+    jnz .next_line
     mov rcx, [rsp + 24]
     mov rax, r13
     sub rax, rcx
@@ -4023,11 +4111,13 @@ linnea_http_proxy_head:
     je .bad
     cmp qword [rbx + linnea_connection.is_head], 0
     jne .no_body               ; a HEAD response is head-only, whatever it claims
-    mov rax, [rbx + linnea_connection.up_status]
-    cmp rax, 204
-    je .no_body
-    cmp rax, 304
-    je .no_body
+    ; 1xx, 204, 205 and 304 carry no content, whatever the head says. 205 was
+    ; missing from all three of these lists (audit-report-10 Finding 1); the
+    ; rule is one predicate now so they cannot disagree again.
+    mov edi, [rbx + linnea_connection.up_status]
+    call linnea_http_status_no_content
+    test eax, eax
+    jnz .no_body
     test qword [rsp + 16], 1
     jz .until_eof              ; no Content-Length: chunked or close-delimited
     mov rax, [rsp + 8]

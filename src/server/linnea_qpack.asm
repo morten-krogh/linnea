@@ -47,6 +47,7 @@ extern linnea_static_etag_len
 extern linnea_static_lastmod
 extern linnea_time_http_now
 extern linnea_string_iequal
+extern linnea_http_head_conn_named
 extern linnea_string_from_u64
 
 section .rodata
@@ -870,6 +871,18 @@ linnea_qpack_encode_proxy:
     setne dl
     call .ep_classify                ; eax = 1 to drop, rdx = the seen bit
     or [rsp + 24], rdx
+    test eax, eax
+    jnz .ep_next
+    ; ...and the fields this head's own Connection value names (RFC 9110 7.6.1,
+    ; and RFC 9114 4.2 forbids them in an HTTP/3 message outright). qp_drop_tab
+    ; is the fixed half of the rule; this is the half the peer declares
+    ; (audit-report-10 Finding 2). Interim heads are re-encoded through here
+    ; too, each with its own head, so the rule cannot drift between them.
+    mov rdi, r12                     ; the head being re-encoded...
+    mov rsi, r13                     ; ...and its length
+    lea rdx, [qp_nmbuf]
+    mov rcx, [rsp + 32]
+    call linnea_http_head_conn_named
     test eax, eax
     jnz .ep_next
     ; the value, leading spaces trimmed
