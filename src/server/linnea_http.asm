@@ -3604,6 +3604,11 @@ linnea_http_upstream_head_valid:
     mov rbp, rcx
     sub rbp, r14                      ; name length
     jz .hv_bad                        ; empty name (colon at line start)
+    cmp rbp, LINNEA_HTTP_MAX_FIELD_NAME
+    ja .hv_bad                        ; longer than anything we will relay --
+                                      ; refused HERE so h1, h2 and h3 agree,
+                                      ; rather than being silently erased by
+                                      ; whichever encoder has a small buffer
     lea rdi, [r12 + r14]
     mov rsi, rbp
     call linnea_string_is_token       ; token name?
@@ -3781,6 +3786,26 @@ linnea_http_upstream_head_valid:
     add rcx, 2
     jmp .hv_line
 .hv_ok:
+    ; --- Transfer-Encoding is forbidden outright on 1xx and 204 ---------
+    ; RFC 9112 6.1, and an absolute prohibition rather than 205's conditional
+    ; one: those statuses are terminated at the first empty line and cannot
+    ; carry a body whatever the fields say, so the field can only mislead.
+    ; Refused here so all three protocols answer the same way BEFORE any of
+    ; them emits a head -- h1 used to emit an invalid 204 carrying the field
+    ; while h2 and h3 scrubbed it into a clean success, and on an interim head
+    ; h2 relayed a sanitised 103 and only then discovered the error, telling a
+    ; client that early metadata was valid when the response was malformed
+    ; (audit-report-12 Finding 1).
+    cmp qword [rsp + 24], 0
+    je .hv_te_status_ok               ; no Transfer-Encoding: nothing to judge
+    mov rax, [rsp + 16]
+    cmp rax, 204
+    je .hv_bad
+    cmp rax, 100
+    jb .hv_te_status_ok
+    cmp rax, 199
+    jbe .hv_bad
+.hv_te_status_ok:
     ; --- a 205 must not frame content -----------------------------------
     ; RFC 9110 15.3.6: a 205 implies no content and a server MUST NOT generate
     ; any. It differs from 204 in being ALLOWED a Content-Length -- to say zero

@@ -54,6 +54,17 @@ LINNEA_MAX_WORKERS              equ 256
 ; both fit one byte -- a wider CID index would be a redesign.
 LINNEA_BPF_STEER_HALF           equ 128
 
+; The longest response field NAME this proxy will relay. Not an HTTP limit --
+; RFC 9110 5.1 makes a field name a token of any length, and requires a proxy to
+; forward unrecognized fields -- but an implementation must bound its lowercase
+; scratch buffers somewhere. What matters is that the bound is ONE number,
+; enforced at the shared gate so every protocol answers the same way. It used to
+; be the SIZE of two encoder buffers, 64 bytes, enforced nowhere and applied only
+; by h2 and h3: a 65-byte extension field reached HTTP/1 clients and vanished for
+; everyone else (audit-report-12 Finding 2). Generous against the real world,
+; where the longest names in use are well under 50 bytes.
+LINNEA_HTTP_MAX_FIELD_NAME      equ 256
+
 ; what a location routes to
 LINNEA_LOC_KIND_ROOT     equ 0       ; serve files from .root
 LINNEA_LOC_KIND_PROXY    equ 1       ; forward to the upstream in .proxy_addr

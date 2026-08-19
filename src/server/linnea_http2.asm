@@ -4526,8 +4526,15 @@ h2p_emit_headers:
     sub rax, r14                     ; name length
     test rax, rax
     jz .eh_next
-    cmp rax, 64
-    ja .eh_next                      ; an implausible name: drop it
+    cmp rax, LINNEA_HTTP_MAX_FIELD_NAME
+    ja .eh_next                      ; a backstop on this buffer, not a
+                                     ; policy: the shared validator has
+                                     ; already refused a longer name, so
+                                     ; reaching here would be a bug. It
+                                     ; WAS the policy, at 64 bytes and
+                                     ; enforced only here, which erased
+                                     ; valid fields h1 forwarded
+                                     ; (audit-report-12 Finding 2).
     mov [rsp + 24], rax              ; the name's length, across the calls
     ; lowercase the name into the scratch (h2 forbids uppercase)
     lea rdi, [h2p_nmbuf]
@@ -5810,4 +5817,4 @@ h2_fd_sid:    resd 1
 h2_sv_now:    resq 1
 h2p_numbuf:   resb 24
 h2p_stbuf:    resb 4                 ; a status as three ASCII digits
-h2p_nmbuf:    resb 64                ; a response field name, lowercased
+h2p_nmbuf:    resb LINNEA_HTTP_MAX_FIELD_NAME                ; a response field name, lowercased

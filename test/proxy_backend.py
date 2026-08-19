@@ -226,6 +226,40 @@ def respond(conn, head, body, extra=b""):
         member = _gz.compress(b"transfer-coded payload")
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + member)
         conn.close()
+    elif path.endswith(b"/204te"):
+        # RFC 9112 6.1: a server MUST NOT send Transfer-Encoding in any 1xx or
+        # 204 response. Distinct from report 10's 205 rule -- a 205 MAY use
+        # transfer framing to make its zero-length termination unambiguous;
+        # 1xx and 204 may not carry the field at all (audit-report-12 Finding 1).
+        conn.sendall(b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n"
+                     b"\r\n5\r\nbody!\r\n0\r\n\r\n")
+    elif path.endswith(b"/204tezero"):
+        # The same head with an empty chunk: it is the FIELD that is forbidden,
+        # not the bytes behind it.
+        conn.sendall(b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n"
+                     b"\r\n0\r\n\r\n")
+    elif path.endswith(b"/earlyte"):
+        # ...and on an interim head, where h2 used to relay a scrubbed 103
+        # before discovering the error -- telling the client early metadata was
+        # valid when the upstream response is malformed.
+        conn.sendall(b"HTTP/1.1 103 Early Hints\r\nTransfer-Encoding: chunked\r\n"
+                     b"Link: </a.css>; rel=preload\r\n\r\n0\r\n\r\n"
+                     b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nvalid")
+    elif path.endswith(b"/name64"):
+        # A 64-byte field name: the boundary that already worked everywhere.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-" + b"a" * 62
+                     + b": kept\r\n\r\nbody")
+    elif path.endswith(b"/name65"):
+        # 65 bytes -- one past an ENCODER SCRATCH BUFFER, not any HTTP limit.
+        # h1 forwarded it, h2 and h3 silently erased it, so an extension field
+        # survived or vanished depending on ALPN (audit-report-12 Finding 2).
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-" + b"a" * 63
+                     + b": kept\r\n\r\nbody")
+    elif path.endswith(b"/namebig"):
+        # Past the documented limit: must be refused the same way everywhere,
+        # rather than served by one protocol and scrubbed by two.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-" + b"a" * 300
+                     + b": kept\r\n\r\nbody")
     elif path.endswith(b"/cegzip"):
         # The RIGHT layer for compressed bytes: Content-Encoding is a property of
         # the REPRESENTATION and is end-to-end, so it rides through a proxy

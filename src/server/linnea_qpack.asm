@@ -153,7 +153,7 @@ linnea_qpack_max_fss:  resq 1
 linnea_qpack_fss_over: resq 1
 ; scratch for relaying an upstream response head: one field name, lowercased,
 ; and the re-derived content-length as digits
-qp_nmbuf:  resb 64
+qp_nmbuf:  resb LINNEA_HTTP_MAX_FIELD_NAME
 qp_numbuf: resb 24
 
 section .text
@@ -841,8 +841,15 @@ linnea_qpack_encode_proxy:
     sub rax, r14                     ; name length
     test rax, rax
     jz .ep_next
-    cmp rax, 64
-    ja .ep_next                      ; an implausible name: drop it
+    cmp rax, LINNEA_HTTP_MAX_FIELD_NAME
+    ja .ep_next                      ; a backstop on this buffer, not a
+                                     ; policy: the shared validator has
+                                     ; already refused a longer name, so
+                                     ; reaching here would be a bug. It
+                                     ; WAS the policy, at 64 bytes and
+                                     ; enforced only here, which erased
+                                     ; valid fields h1 forwarded
+                                     ; (audit-report-12 Finding 2).
     mov [rsp + 32], rax
     ; lowercase the name into the scratch (HTTP/3 forbids uppercase, 4.1.2)
     lea rdi, [qp_nmbuf]

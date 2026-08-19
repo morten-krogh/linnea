@@ -134,6 +134,21 @@ CASES = [
     # were never meant to touch -- otherwise the fix above would have broken
     # every compressed backend response.
     ("cegzip",        200, None),
+    # RFC 9112 6.1: Transfer-Encoding MUST NOT appear on a 1xx or a 204 -- an
+    # absolute prohibition, unlike 205 where the field is permitted to state
+    # zero. h1 emitted an invalid 204 carrying it while h2/h3 scrubbed it into a
+    # clean success, so one bad backend head produced three client-visible
+    # answers (audit-report-12 Finding 1).
+    ("204te",         502, None),
+    ("204tezero",     502, None),   # it is the FIELD, not the bytes behind it
+    ("earlyte",       502, None),   # ...and on an interim head
+    # RFC 9110 5.1: a proxy MUST forward unrecognized fields. h2 and h3 dropped
+    # any field name past 64 bytes -- an encoder scratch-buffer size, not an
+    # HTTP limit or a configured policy -- while h1 forwarded it, so an
+    # extension field survived or vanished by ALPN (Finding 2).
+    ("name64",        200, b"body"),
+    ("name65",        200, b"body"),
+    ("namebig",       502, None),   # past the documented limit: refused everywhere
     ("simple",     200, b"backend body"),
 ]
 
@@ -148,6 +163,9 @@ NOMINATED = {
 # ...and the control that stops the fix becoming "drop everything unfamiliar".
 KEPT = {"hopnamed": b"x-kept", "hopnamedmulti": b"x-kept",
         "cegzip": b"content-encoding"}
+# route -> a field name that must survive on ALL THREE, whatever its length.
+# The point is not the length but that the three agree about it.
+LONGNAME = {"name64": b"x-" + b"a" * 62, "name65": b"x-" + b"a" * 63}
 
 # Routes the HTTP/3 leg here cannot judge, and why. Listed rather than quietly
 # dropped, so a reader sees the gap instead of assuming coverage.
@@ -560,6 +578,15 @@ for route in ("cegzip",):
     same = len(set(bodies.values())) == 1 and all(bodies.values())
     check(f"{route}: every protocol delivers the identical representation",
           same, f"  {[(p, len(b)) for p, b in bodies.items()]}")
+
+# --- a long-but-valid field name survives, identically, on all three ---------
+for route, name in LONGNAME.items():
+    got = RESULTS.get(route, {})
+    present = {p: any(f.lower().startswith(name + b":")
+                      for _, fields in v[3] for f in fields)
+               for p, v in got.items()}
+    check(f"{route}: the {len(name)}-byte field name is forwarded by every "
+          f"protocol (RFC 9110 5.1)", all(present.values()), f"  {present}")
 
 for route, why in H3_SKIP.items():
     print(f"note: {route} not checked over HTTP/3 here -- {why}")
