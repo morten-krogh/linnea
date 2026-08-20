@@ -632,6 +632,8 @@ emit_field:
     pop rsi
     test r11d, r11d
     jnz .ef_malformed
+    cmp qword [rbx + linnea_h2_req.mf_seen], 0
+    jne .ef_malformed                ; a second one: one count, not a list
     mov [rbx + linnea_h2_req.mf_val], r10
     mov qword [rbx + linnea_h2_req.mf_seen], 1
     jmp .no_rebuild

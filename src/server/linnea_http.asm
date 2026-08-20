@@ -1310,7 +1310,15 @@ linnea_http_handle:
     ;
     ; 1*DIGIT and nothing else, so a value that is not a number is a bad
     ; request rather than a field to ignore: it asks for a hop count we cannot
-    ; work out.
+    ; work out. A SECOND line is refused for the same reason and by the same
+    ; rule as the singleton conditionals beside it (audit-report-32): the field
+    ; is one count, not a list, so two of them are two answers to one question.
+    ; Keeping the last let a client decide by field ORDER whether the request
+    ; was forwarded at all -- "0 then 1" went upstream and "1 then 0" was
+    ; answered here -- and HTTP/1 forwarded a decremented line per original
+    ; occurrence while h2 and h3 emitted one (audit-report-34).
+    test qword [rsp + 136], 64
+    jnz .resp_400
     mov rdi, [rsp + 72]
     mov rsi, [rsp + 80]
     call linnea_string_to_u64  ; -> rax = value, edx = 0 ok / 1 syntax / 2 range

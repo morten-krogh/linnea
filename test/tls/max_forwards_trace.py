@@ -104,6 +104,19 @@ REFUSED = {"http1.1": "400", "http2": "000", "h3": "000"}
 check("a Max-Forwards that is not a number is refused",
       {p: run(p, "/hello.txt", None, ["Max-Forwards: soon"]) for p in protos},
       {p: REFUSED[p] for p in protos})
+
+# ...and a SECOND line, for the same reason: the field is one count, not a
+# list, so two of them are two answers to one question. Keeping the last let a
+# client decide by field ORDER whether the request was forwarded at all -- "0
+# then 1" went upstream, "1 then 0" was answered here -- and HTTP/1 forwarded a
+# decremented line per original occurrence while h2 and h3 emitted one
+# (audit-report-34). Equal values are refused too: there is nothing to
+# reconcile, unlike two identical Content-Lengths describing one body.
+for a, b in (("0", "1"), ("1", "0"), ("2", "2")):
+    check(f"a repeated Max-Forwards ({a} then {b}) is refused",
+          {p: run(p, "/api/headers", "OPTIONS",
+                  [f"Max-Forwards: {a}", f"Max-Forwards: {b}"]) for p in protos},
+          {p: REFUSED[p] for p in protos})
 # ...and where we are the origin it changes nothing
 check("a static GET carrying one is served normally",
       {p: run(p, "/hello.txt", None, ["Max-Forwards: 5"]) for p in protos},
