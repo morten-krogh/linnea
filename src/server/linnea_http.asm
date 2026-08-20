@@ -119,8 +119,8 @@ extern linnea_time_parse_http_date
 extern linnea_time_http_now
 ; request-evaluation helpers shared with the h2/h3 serve paths; they live in
 ; linnea_static.asm so the h3 test binaries link without this file's deps
-extern linnea_http_ae_accepts
 extern linnea_http_identity_refused
+extern linnea_http_coding_ok
 extern linnea_http_inm_match
 extern linnea_http_etag_match
 extern linnea_http_ifrange_match
@@ -2048,24 +2048,19 @@ linnea_http_handle:
     ; at r15, so the name before it stays intact for the MIME lookup.
     cmp qword [rsp + 208], 0
     je .open_plain             ; no Accept-Encoding: nothing to negotiate
-    ; each Accept-Encoding line is its own span (h1-14): the coding is taken if
-    ; ANY of them accepts it, which is what joining the lines would have said.
-    mov qword [rsp + 400], 0
-.br_span:
-    mov rcx, [rsp + 400]
-    cmp rcx, [rsp + 208]
-    jae .try_gzip              ; no line accepts br
-    shl rcx, 4
-    lea rax, [rsp + 352]
-    add rax, rcx
-    mov rdi, [rax]
-    mov rsi, [rax + 8]
+    ; Each Accept-Encoding line is its own span (h1-14) and the whole rule --
+    ; the named entry, then the wildcard, then the default -- lives in
+    ; linnea_http_coding_ok, which h2 and h3 reach through
+    ; linnea_static_open_enc. This used to walk the spans here with its own
+    ; loop, which is how h1 came to answer the wildcard differently from
+    ; nothing at all (audit-report-36).
+    lea rdi, [rsp + 352]
+    mov rsi, [rsp + 208]
     lea rdx, [enc_br]
     mov ecx, enc_br_len
-    call linnea_http_ae_accepts
-    inc qword [rsp + 400]
+    call linnea_http_coding_ok
     test eax, eax
-    jz .br_span
+    jz .try_gzip
     mov dword [r15], '.br'     ; three bytes and the NUL
     mov rdi, r13
     call .open_regular
@@ -2074,22 +2069,13 @@ linnea_http_handle:
     mov qword [rsp + 224], 2
     jmp .have_file
 .try_gzip:
-    mov qword [rsp + 400], 0
-.gz_span:
-    mov rcx, [rsp + 400]
-    cmp rcx, [rsp + 208]
-    jae .open_plain            ; no line accepts gzip
-    shl rcx, 4
-    lea rax, [rsp + 352]
-    add rax, rcx
-    mov rdi, [rax]
-    mov rsi, [rax + 8]
+    lea rdi, [rsp + 352]
+    mov rsi, [rsp + 208]
     lea rdx, [enc_gzip]
     mov ecx, enc_gzip_len
-    call linnea_http_ae_accepts
-    inc qword [rsp + 400]
+    call linnea_http_coding_ok
     test eax, eax
-    jz .gz_span
+    jz .open_plain
     mov dword [r15], '.gz'
     mov rdi, r13
     call .open_regular

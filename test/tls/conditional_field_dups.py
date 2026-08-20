@@ -20,7 +20,8 @@ one span per line since h1-14; HTTP/2 and HTTP/3 kept only the last, so
 `Accept-Encoding: br` followed by `Accept-Encoding: identity` served the plain
 file there and the .br variant here. Found beside report 32 -- on the very
 field whose treatment report 30 cited as the precedent for fixing the ETag
-lists.
+lists. Its `*` entry was ignored outright until report 36, which made `*;q=0`
+answer 200 and `*` serve the unencoded file past a variant it could have sent.
 
 usage: conditional_field_dups.py <port> <cafile> [curl-h3]
 """
@@ -129,6 +130,73 @@ case("identity;q=0.5 still allows the plain file",
 case("a fourth is refused, not silently dropped",
      ["Accept-Encoding: identity", "Accept-Encoding: gzip",
       "Accept-Encoding: deflate", "Accept-Encoding: br"], "431/plain",
+     path="/aetest.txt", want_header="content-encoding")
+
+
+# --- the wildcard, which stands for every coding the list does not name -------
+# RFC 9110 12.5.3 gives three steps in order: a coding named explicitly is
+# governed by its own q; otherwise `*` governs; otherwise the coding is
+# unacceptable -- except identity, which is acceptable by default. Only the
+# first and last were implemented, so `*` was read as if it were absent: `*;q=0`
+# refused nothing and was answered 200, and `*` selected nothing and fell back
+# to the unencoded file even where a variant was sitting there (audit-report-36).
+#
+# The reason I gave for leaving it out, one commit earlier, was that honouring
+# `*` "would mean guessing which coding the client meant". That guess only
+# exists for `*` used as a POSITIVE selector, and there is none to make here:
+# this server holds two variants and prefers br to gzip, and choosing among
+# codings the client called equally acceptable is the server's to make. The
+# NEGATIVE case, `*;q=0`, never needed a guess at all.
+case("Accept-Encoding: * takes the coding this server prefers",
+     ["Accept-Encoding: *"], "200/br",
+     path="/aetest.txt", want_header="content-encoding")
+# br is tried first, so a row where br exists cannot tell "the wildcard chose"
+# from "the wildcard was ignored and br happened to be first". This one can.
+case("...and reaches gzip where that is the variant there is",
+     ["Accept-Encoding: *"], "200/gzip",
+     path="/gztest.txt", want_header="content-encoding")
+case("...and asks for no coding where there is none",
+     ["Accept-Encoding: *"], "200/plain",
+     path="/hello.txt", want_header="content-encoding")
+# the negative half: identity is acceptable by default, and *;q=0 is one of the
+# two ways RFC 9110 names for excluding it
+case("*;q=0 refuses every coding not named, identity included",
+     ["Accept-Encoding: *;q=0"], "406/plain",
+     path="/hello.txt", want_header="content-encoding")
+case("...and is not rescued by variants the client did not name",
+     ["Accept-Encoding: *;q=0"], "406/plain",
+     path="/aetest.txt", want_header="content-encoding")
+# "unless a more specific entry for identity exists", in the RFC's words
+case("...unless identity is allowed separately",
+     ["Accept-Encoding: *;q=0, identity;q=1"], "200/plain",
+     path="/aetest.txt", want_header="content-encoding")
+case("...or a coding we hold is",
+     ["Accept-Encoding: *;q=0, br;q=1"], "200/br",
+     path="/aetest.txt", want_header="content-encoding")
+# the same precedence read the other way: the wildcard must not override a
+# coding the client named, whichever of them appears first
+case("a named coding stays authoritative over the wildcard",
+     ["Accept-Encoding: br;q=0, *"], "200/gzip",
+     path="/aetest.txt", want_header="content-encoding")
+case("...and that holds when the named one is identity",
+     ["Accept-Encoding: identity;q=0, *"], "200/br",
+     path="/aetest.txt", want_header="content-encoding")
+case("...leaving 406 when refusing identity leaves nothing",
+     ["Accept-Encoding: identity;q=0, *"], "406/plain",
+     path="/hello.txt", want_header="content-encoding")
+# and the wildcard is subject to the line-combining rule like any other member:
+# a refusal on one line does not decide a coding that a later line allows
+case("a wildcard on one line, a coding on another",
+     ["Accept-Encoding: *;q=0", "Accept-Encoding: br"], "200/br",
+     path="/aetest.txt", want_header="content-encoding")
+case("...and the pair is still 406 where that coding is not held",
+     ["Accept-Encoding: *;q=0", "Accept-Encoding: br"], "406/plain",
+     path="/hello.txt", want_header="content-encoding")
+# an empty field value names no coding at all -- so nothing is named, no
+# wildcard governs, and only the default survives (RFC 9110 12.5.3). curl sends
+# an empty-valued field for "Name;", where "Name:" would delete it.
+case("an empty Accept-Encoding asks for no coding at all",
+     ["Accept-Encoding;"], "200/plain",
      path="/aetest.txt", want_header="content-encoding")
 
 

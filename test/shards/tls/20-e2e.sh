@@ -55,6 +55,14 @@ if [ "$ktls" = 1 ]; then
     # so one request served different bytes depending on the protocol.
     printf 'plain payload' > $WWW/aetest.txt
     printf 'br payload' > $WWW/aetest.txt.br
+    # a second coding, so the wildcard rows can tell "any coding will do" from
+    # "the only one there is": with both present, `Accept-Encoding: *` has to
+    # land on the one this server prefers (audit-report-36).
+    printf 'gz payload' > $WWW/aetest.txt.gz
+    # ...and a resource with gzip but no br, so the wildcard is seen reaching a
+    # coding that is not simply the first one tried.
+    printf 'plain only' > $WWW/gztest.txt
+    printf 'gz only' > $WWW/gztest.txt.gz
     # Max-Forwards counts the hops an OPTIONS may cross, and TRACE reflects the
     # request back to whoever sent it -- one is a directive addressed to the
     # intermediary and was ignored, the other was forwarded to a backend that
@@ -68,7 +76,8 @@ if [ "$ktls" = 1 ]; then
     out=$(timeout 90 python3 test/tls/conditional_field_dups.py ${P61443} $CA $h3arg 2>&1)
     rc=$?
     first_fail=$(echo "$out" | grep -m1 FAIL)
-    rm -f $WWW/aetest.txt $WWW/aetest.txt.br
+    rm -f $WWW/aetest.txt $WWW/aetest.txt.br $WWW/aetest.txt.gz \
+          $WWW/gztest.txt $WWW/gztest.txt.gz
     [ $rc -eq 0 ]
     check "repeated singleton conditionals refused, Accept-Encoding combined, on every protocol ${first_fail}" $?
 

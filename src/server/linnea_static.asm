@@ -21,6 +21,7 @@ global linnea_static_etag_len
 global linnea_static_lastmod
 global linnea_http_ae_accepts
 global linnea_http_identity_refused
+global linnea_http_coding_ok
 global linnea_http_inm_match
 global linnea_http_etag_match
 global linnea_http_ifrange_match
@@ -276,9 +277,11 @@ linnea_static_open_enc:
     mov r14, rdi                     ; path start
     test r13, r13
     jz .oe_plain                     ; no Accept-Encoding: nothing to negotiate
-    lea rdi, [enc_br_st]
-    mov esi, enc_br_st_len
-    call .oe_any_accepts
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [enc_br_st]
+    mov ecx, enc_br_st_len
+    call linnea_http_coding_ok
     test eax, eax
     jz .oe_try_gz
     mov dword [rbx], '.br'           ; three bytes and the NUL
@@ -290,9 +293,11 @@ linnea_static_open_enc:
     xor r9d, r9d
     jmp .oe_ret
 .oe_try_gz:
-    lea rdi, [enc_gzip_st]
-    mov esi, enc_gzip_st_len
-    call .oe_any_accepts
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [enc_gzip_st]
+    mov ecx, enc_gzip_st_len
+    call linnea_http_coding_ok
     test eax, eax
     jz .oe_plain
     mov dword [rbx], '.gz'
@@ -329,41 +334,6 @@ linnea_static_open_enc:
     pop r12
     pop rbx
     ret
-; .oe_any_accepts(rdi = coding, esi = its length) -> eax = 1 when ANY of the
-; caller's Accept-Encoding spans accepts it. Repeated field lines are the
-; comma-joined value, so asking each in turn is the same question as asking the
-; join, without copying anything -- the shape HTTP/1 has used since h1-14.
-; Preserves r12/r13/r14/rbx, which the caller is holding.
-.oe_any_accepts:
-    push rbx
-    push r15
-    push rdi
-    push rsi
-    xor r15d, r15d                   ; span cursor
-.oe_span:
-    cmp r15, r13
-    jae .oe_span_no
-    mov rbx, r15
-    shl rbx, 4
-    add rbx, r12
-    mov rdi, [rbx]
-    mov rsi, [rbx + 8]
-    mov rdx, [rsp + 8]               ; the coding, as pushed
-    mov ecx, [rsp]
-    call linnea_http_ae_accepts
-    inc r15
-    test eax, eax
-    jz .oe_span
-    mov eax, 1
-    jmp .oe_span_ret
-.oe_span_no:
-    xor eax, eax
-.oe_span_ret:
-    add rsp, 16                      ; the coding and its length
-    pop r15
-    pop rbx
-    ret
-
 ; linnea_static_validators(rdi=mtime, rsi=size) — format the response validators
 ; for the file just opened into linnea_static_etag / linnea_static_lastmod,
 ; setting linnea_static_etag_len. The ETag is "<hex mtime>-<hex size>" in
@@ -643,46 +613,132 @@ linnea_http_ae_accepts:
     pop rbx
     ret
 
-; linnea_http_identity_refused(rdi = span array, rsi = span count) -> rax = 1
-; when any Accept-Encoding line names `identity` with q=0.
+; ae_verdict(rdi = span array, rsi = span count, rdx = token, rcx = token len)
+;   -> rax: 2 named and allowed somewhere, 1 named everywhere it appears but
+;      always refused, 0 never named at all.
 ;
-; RFC 9110 12.5.3: a representation with no content coding "is acceptable by
-; default unless specifically excluded" -- and identity;q=0 excludes it. The
-; negotiation only ever asked whether br or gzip was allowed, never whether the
-; form it actually falls back to was, so a client that refused the unencoded
-; representation was served it (audit-report-35).
-;
-; `*;q=0` would exclude it too, and is deliberately not handled here for the
-; reason ae_accepts gives for `*` generally: it would mean guessing. Written
-; down rather than left implied.
-linnea_http_identity_refused:
+; Repeated field lines are one list, so a coding allowed by any of them is
+; allowed. The three-way answer is what the rules below need: "not named" is a
+; different thing from "named with q=0", and for identity they are opposite.
+ae_verdict:
     push rbx
     push r12
     push r13
+    push r14
+    push r15
+    sub rsp, 8
     mov rbx, rdi
     mov r12, rsi
-    xor r13d, r13d
-.ir_span:
-    cmp r13, r12
-    jae .ir_no
-    mov rax, r13
+    mov r13, rdx
+    mov r14, rcx
+    xor r15d, r15d                    ; span cursor
+    mov qword [rsp], 0                ; named anywhere?
+.av_span:
+    cmp r15, r12
+    jae .av_done
+    mov rax, r15
     shl rax, 4
     mov rdi, [rbx + rax]
     mov rsi, [rbx + rax + 8]
+    mov rdx, r13
+    mov rcx, r14
+    call linnea_http_ae_accepts       ; rax = allowed, rdx = named at all
+    inc r15
+    test rdx, rdx
+    jz .av_span
+    mov qword [rsp], 1
+    test eax, eax
+    jz .av_span                       ; named here but refused; a later line may allow
+    mov eax, 2
+    jmp .av_ret
+.av_done:
+    mov rax, [rsp]                    ; 1 = named and always refused, 0 = never named
+.av_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_http_coding_ok(rdi = span array, rsi = count, rdx = token, rcx = len)
+;   -> rax = 1 when this content coding may be sent.
+;
+; RFC 9110 12.5.3, in order: a coding named explicitly is governed by its own q;
+; otherwise the wildcard's q governs; otherwise a coding that is not identity is
+; not acceptable. The wildcard used to be ignored entirely, on the grounds that
+; honouring `*` "would mean guessing which coding the client meant" -- but the
+; guess it feared only exists for `*` as a POSITIVE selector, and there is none
+; here: this server holds two variants and has its own order of preference
+; between them, which is what a server is entitled to choose (audit-report-36).
+linnea_http_coding_ok:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    mov r14, rcx
+    call ae_verdict
+    cmp rax, 2
+    je .ck_yes
+    cmp rax, 1
+    je .ck_no                         ; named with q=0: the specific entry wins
+    mov rdi, rbx
+    mov rsi, r12
+    lea rdx, [enc_star_st]
+    mov ecx, enc_star_st_len
+    call ae_verdict
+    cmp rax, 2
+    je .ck_yes
+.ck_no:
+    xor eax, eax
+    jmp .ck_ret
+.ck_yes:
+    mov eax, 1
+.ck_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_http_identity_refused(rdi = span array, rsi = span count) -> rax = 1
+; when the client will not take the unencoded form.
+;
+; RFC 9110 12.5.3: a representation with no content coding "is acceptable by
+; default unless specifically excluded by the Accept-Encoding field stating
+; either an identity;q=0 or a *;q=0 without a more specific entry for identity".
+; Both halves are implemented; the default is what makes this different from
+; every other coding, and why ae_verdict has to distinguish "never named" from
+; "named and refused" (audit-report-35, then 36 for the wildcard).
+linnea_http_identity_refused:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
     lea rdx, [enc_identity_st]
     mov ecx, enc_identity_st_len
-    call linnea_http_ae_accepts       ; rax = allowed, rdx = named at all
-    inc r13
-    test rdx, rdx
-    jz .ir_span                       ; this line never mentions identity
-    test eax, eax
-    jnz .ir_span                      ; mentioned and allowed
-    mov eax, 1                        ; mentioned and refused
-    jmp .ir_ret
+    call ae_verdict
+    cmp rax, 2
+    je .ir_no                         ; identity;q>0: explicitly allowed
+    cmp rax, 1
+    je .ir_yes                        ; identity;q=0: explicitly refused
+    mov rdi, rbx                      ; not named: the wildcard may still refuse it
+    mov rsi, r12
+    lea rdx, [enc_star_st]
+    mov ecx, enc_star_st_len
+    call ae_verdict
+    cmp rax, 1
+    je .ir_yes                        ; *;q=0 and no identity entry
 .ir_no:
     xor eax, eax
+    jmp .ir_ret
+.ir_yes:
+    mov eax, 1
 .ir_ret:
-    pop r13
     pop r12
     pop rbx
     ret
@@ -983,6 +1039,8 @@ enc_gzip_st:  db "gzip"
 enc_gzip_st_len equ $ - enc_gzip_st
 enc_identity_st: db "identity"
 enc_identity_st_len equ $ - enc_identity_st
+enc_star_st: db "*"
+enc_star_st_len equ $ - enc_star_st
 ext_html_h2: db "html"
 ext_css_h2:  db "css"
 ext_js_h2:   db "js"
