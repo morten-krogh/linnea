@@ -99,7 +99,7 @@ struc linnea_h2_req
     ; legal list member changes the answer to a conditional request and does it
     ; silently, so a matching tag on the fourth line became a 200 where a 304
     ; was due, or a 412 on a request that had to pass (audit-report-31). The
-    ; fourth sets .etag_over and the request is answered 431 -- refused, not
+    ; fourth sets .list_over and the request is answered 431 -- refused, not
     ; silently shortened, and refused the same way on all three protocols.
     ; HTTP/1 does the same, though it alone could re-walk its head: none of the
     ; three can re-walk a DECODED field section -- the QPACK/HPACK dynamic table
@@ -121,12 +121,13 @@ struc linnea_h2_req
     .ifm_ptr3:    resq 1
     .ifm_len3:    resq 1
     .ifm_n:       resq 1
-    ; 1 when either list carried more lines than there are spans. The decode is
+    ; 1 when a list field carried more lines than there are spans -- the
+    ; entity-tag preconditions or Accept-Encoding. The decode is
     ; NOT aborted for it: stopping mid-block would leave the HPACK dynamic table
     ; behind the peer's and cost the whole connection, where the request itself
     ; is merely one we will not answer. The serve path reads this before it does
     ; anything else and returns 431.
-    .etag_over:   resq 1
+    .list_over:   resq 1
     ; 1 when the request carried an Expect value that is not 100-continue.
     ; A proxy location forwards it for the backend to judge; where we are the
     ; origin it is a 417, because serving the resource anyway tells the client
@@ -153,8 +154,14 @@ struc linnea_h2_req
     ; served the .br variant. Found beside audit-report-32, and the same defect
     ; report 30 fixed for the entity-tag lists, on the very field whose
     ; treatment report 30 cited as the precedent. Ignoring a fourth line can
-    ; only narrow what is served, never answer wrongly, so it is ignored here
-    ; exactly as HTTP/1 ignores it.
+    ; A fourth line is refused here too, and the reasoning that once let it be
+    ; ignored was wrong: I wrote that dropping a coding "can only narrow what is
+    ; served, never answer wrongly" (audit-report-32). A list member can be a
+    ; PROHIBITION -- `identity;q=0` says the unencoded form is unacceptable --
+    ; so dropping one can turn a refusal into permission, which is not
+    ; narrowing. And even for plain preferences the same legal request served a
+    ; different representation depending only on which line carried `br`
+    ; (audit-report-35).
     .ae_ptr:      resq 1        ; accept-encoding spans; .ae_n is the count
     .ae_len:      resq 1
     .ae_ptr2:     resq 1

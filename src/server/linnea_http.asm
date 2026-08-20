@@ -1430,10 +1430,15 @@ linnea_http_handle:
     ; the plain file. Record each line as its own (ptr,len) span instead; the
     ; negotiation below tries them all, which is the same answer as joining them
     ; without having to copy the values anywhere. Three spans is far more than a
-    ; real client sends; further lines are ignored rather than growing the frame.
+    ; real client sends, and a FOURTH is refused rather than ignored: a list
+    ; member can be a prohibition -- `identity;q=0` says the unencoded form is
+    ; unacceptable -- so dropping one can turn a refusal into permission, and
+    ; even for ordinary preferences the same legal request served a different
+    ; representation depending only on which line carried `br`
+    ; (audit-report-35; the reasoning that let it be ignored was mine, in 32).
     mov rcx, [rsp + 208]       ; spans recorded so far
     cmp rcx, 3
-    jae .header_next
+    jae .resp_431
     shl rcx, 4                 ; -> byte offset of this span in the array
     lea rax, [rsp + 352]
     add rax, rcx

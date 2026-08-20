@@ -885,7 +885,7 @@ emit_field:
     clc
     ret
 .inm_toomany:
-    mov qword [rbx + linnea_h2_req.etag_over], 1   ; 431 at serve, not dropped
+    mov qword [rbx + linnea_h2_req.list_over], 1   ; 431 at serve, not dropped
     clc
     ret
 .not_inm:
@@ -930,7 +930,7 @@ emit_field:
     clc
     ret
 .ifm_toomany:
-    mov qword [rbx + linnea_h2_req.etag_over], 1   ; 431 at serve, not dropped
+    mov qword [rbx + linnea_h2_req.list_over], 1   ; 431 at serve, not dropped
     clc
     ret
 .not_ifm:
@@ -993,13 +993,16 @@ emit_field:
     jnz .not_ae
     mov rax, [rbx + linnea_h2_req.ae_n]
     cmp rax, 3
-    jae .ae_full               ; a fourth line can only narrow what we serve
+    jae .ae_toomany            ; refused, not dropped: see linnea_hpack.inc
     shl rax, 4
     lea rdx, [rbx + linnea_h2_req.ae_ptr]
     mov [rdx + rax], rsi
     mov [rdx + rax + 8], rdi
     inc qword [rbx + linnea_h2_req.ae_n]
-.ae_full:
+    clc
+    ret
+.ae_toomany:
+    mov qword [rbx + linnea_h2_req.list_over], 1   ; 431 at serve, not dropped
     clc
     ret
 .not_ae:

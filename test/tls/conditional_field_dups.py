@@ -97,6 +97,22 @@ case("...or when an earlier line does not",
      path="/aetest.txt", want_header="content-encoding")
 case("no Accept-Encoding at all serves the plain file",
      [], "200/plain", path="/aetest.txt", want_header="content-encoding")
+# Three spans is more than any client sends, and a FOURTH line is refused
+# rather than dropped. The reasoning that once let it be dropped was mine, in
+# report 32: "a fourth line can only narrow what is served, never answer
+# wrongly". A list member can be a PROHIBITION -- identity;q=0 says the
+# unencoded form is unacceptable -- so dropping one can turn a refusal into
+# permission. And even for ordinary preferences the same legal request served a
+# different representation depending only on which line carried br
+# (audit-report-35).
+case("three Accept-Encoding lines are all honoured",
+     ["Accept-Encoding: identity", "Accept-Encoding: gzip",
+      "Accept-Encoding: br"], "200/br",
+     path="/aetest.txt", want_header="content-encoding")
+case("a fourth is refused, not silently dropped",
+     ["Accept-Encoding: identity", "Accept-Encoding: gzip",
+      "Accept-Encoding: deflate", "Accept-Encoding: br"], "431/plain",
+     path="/aetest.txt", want_header="content-encoding")
 
 
 # --- Cookie: split lines must be JOINED before a hop that is not h2/h3 -------

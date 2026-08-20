@@ -986,8 +986,8 @@ linnea_h3_serve:
     ; more If-Match/If-None-Match lines than can be combined: answered before
     ; anything is routed or opened, so a proxy location cannot forward a list
     ; with a member missing either (audit-report-31)
-    cmp qword [rbx + linnea_h2_req.etag_over], 0
-    jne .etag_over_431
+    cmp qword [rbx + linnea_h2_req.list_over], 0
+    jne .list_over_431
     ; no validators or content-range until a file is opened and the request's
     ; conditionals and range are evaluated
     mov qword [linnea_qpack_send_validators], 0
@@ -1635,7 +1635,7 @@ linnea_h3_serve:
     mov r9d, body_425_len
     call linnea_h3_build_response
     jmp .sret
-.etag_over_431:
+.list_over_431:
     mov rdi, r12
     call linnea_h3_build_431
     jmp .sret
