@@ -1582,8 +1582,9 @@ hcn_connection: db "connection"
 ; EXTENSIBILITY mechanism -- how a peer marks a field connection-specific that
 ; no implementation has heard of -- so a fixed table cannot implement the rule,
 ; only the half of it that was known when the table was written. The request
-; direction has had the real rule since http_conn_option_named; the response
-; direction had only the table, so an upstream sending
+; direction had a rule of its own that read only the LAST Connection line, and
+; calls this one now (audit-report-29); the response direction had only the
+; table, so an upstream sending
 ;     Connection: X-Backend-Only
 ;     X-Backend-Only: leaked
 ; delivered X-Backend-Only to the client on all three protocols

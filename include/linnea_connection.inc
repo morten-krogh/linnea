@@ -232,8 +232,6 @@ struc linnea_connection
     ; before forwarding. Without it the rewriter dropped only Connection itself
     ; and passed the named fields straight to the backend — which is exactly the
     ; header-smuggling primitive that requirement exists to close.
-    .conn_opts:     resq 1         ; -> the field value, 0 = no Connection field
-    .conn_opts_len: resq 1
     .upgrade:       resq 1         ; 1 = the client asked to upgrade and the
                                    ; wish was forwarded; a 101 starts a tunnel
     .ws_c2u_busy:   resq 1         ; an op is in flight client->upstream

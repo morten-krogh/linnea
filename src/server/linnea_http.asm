@@ -396,7 +396,7 @@ hn_if_match:    db "if-match"
 hn_if_unmod:    db "if-unmodified-since"
 ; Fields that are hop-by-hop in themselves, whatever Connection says. RFC 9110
 ; 7.6.1 makes an intermediary drop the fields a Connection value NAMES — that is
-; http_conn_option_named — but these are connection-specific on their own and
+; linnea_http_head_conn_named — but these are connection-specific on their own and
 ; must not be forwarded even when the peer never lists them. A client that sends
 ; `Keep-Alive: timeout=5` or `TE: gzip` without naming it in Connection had it
 ; relayed to the backend verbatim, which is the same smuggling surface 7.6.1
@@ -671,104 +671,6 @@ http_hop_by_hop:
     pop rbx
     ret
 
-; http_conn_option_named(rdi = field name, rsi = name length, rbx = connection)
-;   -> eax = 1 when the client's Connection field lists this name.
-;
-; RFC 9110 7.6.1 MUST: an intermediary parses Connection before forwarding and
-; removes every field the value names, then Connection itself. Only Connection
-; and Expect were being dropped, so a client sending
-;     Connection: X-Auth-Bypass
-;     X-Auth-Bypass: 1
-; had X-Auth-Bypass delivered to the backend as an ordinary end-to-end field.
-; That is the header-smuggling shape the requirement exists to close: the client
-; marks a field hop-by-hop, we forward it anyway, and the backend cannot tell it
-; was never meant to arrive.
-;
-; `upgrade` is deliberately not matched. The upgrade path re-emits Connection:
-; upgrade itself and relies on the client's Upgrade field being forwarded, so
-; treating that one token as a removal instruction would break the tunnel the
-; server is setting up — there the intermediary is a participant, not a
-; bystander.
-;
-; Everything the loop needs lives in callee-saved registers, so no value has to
-; be pushed across the comparison calls and the stack parity the caller left is
-; untouched.
-http_conn_option_named:
-    push rbx
-    push rbp
-    push r12
-    push r13
-    push r14
-    push r15
-    mov r12, rdi                      ; the name we are asking about
-    mov r13, rsi
-    mov r14, [rbx + linnea_connection.conn_opts]
-    test r14, r14
-    jz .cn_no                         ; no Connection field at all
-    mov r15, r14
-    add r15, [rbx + linnea_connection.conn_opts_len]   ; value end
-.cn_tok:
-    cmp r14, r15
-    jae .cn_no
-    movzx ecx, byte [r14]
-    cmp cl, ','
-    je .cn_step
-    cmp cl, ' '
-    je .cn_step
-    cmp cl, 9
-    je .cn_step
-    mov rbp, r14                      ; token start; find its end
-.cn_end:
-    cmp rbp, r15
-    jae .cn_have
-    movzx ecx, byte [rbp]
-    cmp cl, ','
-    je .cn_have
-    cmp cl, ' '
-    je .cn_have
-    cmp cl, 9
-    je .cn_have
-    inc rbp
-    jmp .cn_end
-.cn_have:
-    mov rcx, rbp
-    sub rcx, r14                      ; token length
-    cmp rcx, r13
-    jne .cn_next                      ; lengths differ: cannot match
-    mov rdi, r12
-    mov rsi, r13
-    mov rdx, r14
-    call linnea_string_iequal
-    test eax, eax
-    jz .cn_next
-    ; a match — unless it is `upgrade`, which this server forwards on purpose
-    mov rdi, r14
-    mov rsi, rbp
-    sub rsi, r14
-    lea rdx, [hn_upgrade]
-    mov ecx, 7
-    call linnea_string_iequal
-    test eax, eax
-    jnz .cn_no                        ; the upgrade token names a field we keep
-    mov eax, 1
-    jmp .cn_ret
-.cn_next:
-    mov r14, rbp                      ; resume after this token
-    jmp .cn_tok
-.cn_step:
-    inc r14
-    jmp .cn_tok
-.cn_no:
-    xor eax, eax
-.cn_ret:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    ret
-
 
 linnea_http_handle:
     push rbx
@@ -801,7 +703,6 @@ linnea_http_handle:
     mov qword [rsp + 208], 0   ; no Accept-Encoding lines yet (a count, h1-14)
     mov qword [rsp + 224], 0   ; nothing negotiated
     mov qword [rsp + 232], 0   ; no upgrade asked
-    mov qword [rbx + linnea_connection.conn_opts], 0      ; no Connection field yet
     mov qword [rsp + 240], 0   ; no Range yet
     mov qword [rsp + 256], 0   ; no If-Range yet
     mov ecx, [rbx + linnea_connection.server]
@@ -1161,20 +1062,14 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jz .try_content_len
-    ; keep the value: every token in it names a field the proxy must not forward
-    mov rax, [rsp + 72]
-    mov [rbx + linnea_connection.conn_opts], rax
-    mov rax, [rsp + 80]
-    mov [rbx + linnea_connection.conn_opts_len], rax
-    mov rdi, [rsp + 72]
-    mov rsi, [rsp + 80]
-    lea rdx, [hv_close]
-    mov ecx, 5
-    call linnea_string_iequal
-    test eax, eax
-    jz .conn_tokens
-    mov qword [rsp + 24], 0
-    jmp .header_next
+    ; A value that is entirely "close" used to be short-circuited here, and the
+    ; shortcut cleared keep-alive WITHOUT the "close is final" flag the token
+    ; loop sets -- so a later `Connection: keep-alive` line put persistence back
+    ; on and the socket was held against the wish of the client that had already
+    ; said close. The token loop below handles a lone "close" correctly and has
+    ; since report 10; the special case only existed to skip it. Found beside
+    ; audit-report-29, and the same defect: a rule applied per LINE to a field
+    ; whose lines are one list.
 .conn_tokens:
     ; scan the comma-separated list for the "upgrade" token; the name
     ; scratch at [rsp+56/64] is free once the name has matched
@@ -2717,13 +2612,49 @@ linnea_http_handle:
     call http_hop_by_hop
     test eax, eax
     jnz .proxy_next_line
-    ; and every field the client's own Connection value names (RFC 9110 7.6.1)
+    ; and every field ANY of the client's Connection values names (RFC 9110
+    ; 7.6.1). The whole head is re-walked per field rather than one value being
+    ; kept as a span: Connection is list-valued, repeated field lines are one
+    ; list in order (RFC 9110 5.3), and the span held only the LAST line. So
+    ;     Connection: X-Auth-Bypass
+    ;     Connection: keep-alive
+    ;     X-Auth-Bypass: 1
+    ; nominated the field hop-by-hop and forwarded it to the backend anyway,
+    ; while the same request with the lines swapped removed it (audit-report-29).
+    ; The response direction has walked the head since report 10, and its
+    ; comment already claimed the request direction "has had the real rule" --
+    ; which is what a claim in a comment is worth.
+    ;
+    ; One field is exempt, and only while one condition holds: `Upgrade`, when
+    ; the client itself asked to upgrade. `Connection: upgrade` names Upgrade
+    ; hop-by-hop like any other token, but there the server is a PARTICIPANT
+    ; rather than a bystander -- it re-emits Connection: upgrade of its own and
+    ; needs the client's Upgrade to reach the backend, or the tunnel it is
+    ; setting up cannot be agreed. Written as "this field, given that wish"
+    ; rather than as a name the matcher never matches: the response direction
+    ; had it the second way and leaked `Upgrade: websocket` out of an ordinary
+    ; 200 (audit-report-11).
+    test qword [rsp + 232], 1         ; did the client ask to upgrade?
+    jz .proxy_conn_named
     mov rcx, [rsp + 56]
     mov rax, r10
     sub rax, rcx
     lea rdi, [r14 + rcx]
     mov rsi, rax
-    call http_conn_option_named
+    lea rdx, [hn_upgrade]
+    mov ecx, 7
+    call linnea_string_iequal
+    test eax, eax
+    jnz .proxy_copy_line              ; the tunnel needs it forwarded
+.proxy_conn_named:
+    mov rcx, [rsp + 56]
+    mov rax, r10
+    sub rax, rcx
+    lea rdx, [r14 + rcx]              ; the field name being considered
+    mov rcx, rax
+    mov rdi, r14                      ; ...against this whole request head
+    mov rsi, [rbx + linnea_connection.head_len]
+    call linnea_http_head_conn_named
     test eax, eax
     jnz .proxy_next_line              ; hop-by-hop: it stops here
 .proxy_copy_line:

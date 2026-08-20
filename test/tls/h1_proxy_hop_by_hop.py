@@ -106,6 +106,36 @@ case("Connection: upgrade does not strip the Upgrade field",
      must_remain=["Upgrade"])
 
 
+# --- repeated Connection lines are ONE list (RFC 9110 5.3) ------------------
+# Every case above puts its names on a single line, and the rewriter kept one
+# value: the LAST one. So the nomination below was overwritten by a line that
+# names nothing, and X-Auth-Bypass went to the backend as an ordinary
+# end-to-end field -- while the same request with the two lines swapped removed
+# it. A client could therefore choose whether its own hop-by-hop marking was
+# honoured, by writing the list in the order that suited it (audit-report-29).
+case("a name on an earlier Connection line is still removed",
+     b"Connection: X-Auth-Bypass\r\nConnection: keep-alive\r\n"
+     b"X-Auth-Bypass: 1\r\nX-Keep: d\r\n",
+     must_be_gone=["X-Auth-Bypass"],
+     must_remain=["X-Keep"])
+
+case("...and on a later one, which is the order that always worked",
+     b"Connection: keep-alive\r\nConnection: X-Auth-Bypass\r\n"
+     b"X-Auth-Bypass: 1\r\n",
+     must_be_gone=["X-Auth-Bypass"])
+
+case("names spread across three Connection lines all go",
+     b"Connection: X-One\r\nConnection: X-Two\r\nConnection: keep-alive\r\n"
+     b"X-One: a\r\nX-Two: b\r\nX-Keep: d\r\n",
+     must_be_gone=["X-One", "X-Two"],
+     must_remain=["X-Keep"])
+
+# the upgrade exception is about the token, not about which line carries it
+case("upgrade on its own line still does not strip Upgrade",
+     b"Connection: keep-alive\r\nConnection: upgrade\r\nUpgrade: websocket\r\n",
+     must_remain=["Upgrade"])
+
+
 # --- fields that are hop-by-hop in THEMSELVES (RFC 9110 7.6.1) -------------
 # The Connection-named half above was Q168. These need no Connection entry at
 # all: they are connection-specific by definition, and forwarding them hands the

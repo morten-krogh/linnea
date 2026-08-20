@@ -202,7 +202,6 @@ linnea_h3_proxy_start:
     mov qword [r12 + linnea_connection.peer_ip_len], 0
     mov qword [r12 + linnea_connection.keep_alive], 0
     mov qword [r12 + linnea_connection.upgrade], 0    ; h3 has no upgrade to forward
-    mov qword [r12 + linnea_connection.conn_opts], 0
     mov qword [r12 + linnea_connection.up_status], 0
     mov qword [r12 + linnea_connection.relayed], 0
     mov qword [r12 + linnea_connection.up_len], 0

@@ -28,11 +28,17 @@ HOST = b"one.test"
 
 
 def probe(conn_value, budget=2.5):
-    """-> (the Connection value we answered, seconds until the peer closed)"""
+    """-> (the Connection value we answered, seconds until the peer closed)
+
+    conn_value may be a list, in which case it is sent as one Connection field
+    line per element -- which says exactly the same thing (RFC 9110 5.3)."""
+    if isinstance(conn_value, str):
+        conn_value = [conn_value]
+    lines = b"".join(b"Connection: " + v.encode() + b"\r\n" for v in conn_value)
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
     s.settimeout(budget)
     s.sendall(b"GET /hello.txt HTTP/1.1\r\nHost: " + HOST + b"\r\n"
-              + b"Connection: " + conn_value.encode() + b"\r\n\r\n")
+              + lines + b"\r\n")
     start = time.time()
     out = b""
     closed = None
@@ -79,6 +85,37 @@ for value in ("keep-alive", "TE", "upgrade"):
     else:
         print(f"FAIL {value!r} was closed, but nothing asked for it")
         fails += 1
+
+# Repeated field lines are ONE list, so these say the same as the comma forms
+# above. A value that was entirely "close" used to be short-circuited before the
+# token loop, and the shortcut cleared keep-alive without the "close is final"
+# flag the loop sets -- so a later `Connection: keep-alive` LINE put persistence
+# back on and the socket was held against a client that had already said close.
+# Found beside audit-report-29, and the same defect: a rule applied per LINE to
+# a field whose lines are one list.
+for value in (["close", "keep-alive"], ["keep-alive", "close"],
+              ["TE", "close", "keep-alive"]):
+    answer, closed = probe(value)
+    shown = " / ".join(value)
+    if answer == "close" and closed is not None:
+        print(f"ok   {shown!r} on separate lines -> close, socket closed")
+    elif answer != "close":
+        print(f"FAIL {shown!r} on separate lines was answered "
+              f"Connection: {answer!r}, want close")
+        fails += 1
+    else:
+        print(f"FAIL {shown!r} on separate lines was answered close "
+              f"but the socket stayed open")
+        fails += 1
+
+# ...and repeating a line that does not ask to close must still keep it
+answer, closed = probe(["keep-alive", "TE"])
+if answer != "close":
+    print(f"ok   'keep-alive / TE' on separate lines keeps the connection "
+          f"(Connection: {answer})")
+else:
+    print("FAIL 'keep-alive / TE' on separate lines was closed, but nothing asked")
+    fails += 1
 
 # a token that merely starts with "close" is a different token
 answer, closed = probe("closely")
