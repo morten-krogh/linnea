@@ -59,13 +59,25 @@ CASES = [
     ("INM one line",        [f"If-None-Match: {MISS}, {etag}"],                 "304"),
     ("INM tag on line 1",   [f"If-None-Match: {etag}", f"If-None-Match: {MISS}"], "304"),
     ("INM tag on line 2",   [f"If-None-Match: {MISS}", f"If-None-Match: {etag}"], "304"),
-    ("INM tag on line 3",   [f"If-None-Match: \"a\"", f"If-None-Match: \"b\"",
+    ("INM tag on line 3",   ['If-None-Match: "a"', 'If-None-Match: "b"',
                              f"If-None-Match: {etag}"],                          "304"),
     ("INM no line matches", [f"If-None-Match: {MISS}", 'If-None-Match: "other"'], "200"),
     ("IM one line",         [f"If-Match: {MISS}, {etag}"],                       "200"),
     ("IM tag on line 2",    [f"If-Match: {MISS}", f"If-Match: {etag}"],          "200"),
     ("IM tag on line 1",    [f"If-Match: {etag}", f"If-Match: {MISS}"],          "200"),
     ("IM no line matches",  [f"If-Match: {MISS}", 'If-Match: "other"'],          "412"),
+    # Three spans is more than any client sends, and a FOURTH line is REFUSED
+    # rather than dropped: discarding a legal list member changes the answer to
+    # a conditional request and does it silently -- a matching tag on the fourth
+    # line was a 200 where a 304 was due, and a 412 on a request that had to
+    # pass (audit-report-31). All three protocols refuse at the same count, and
+    # before routing, so a proxy location cannot forward a shortened list either.
+    ("INM four lines",      ['If-None-Match: "m1"', 'If-None-Match: "m2"',
+                             'If-None-Match: "m3"', f"If-None-Match: {etag}"],   "431"),
+    ("INM six lines",       [f'If-None-Match: "m{i}"' for i in range(5)]
+                            + [f"If-None-Match: {etag}"],                        "431"),
+    ("IM four lines",       ['If-Match: "m1"', 'If-Match: "m2"',
+                             'If-Match: "m3"', f"If-Match: {etag}"],             "431"),
 ]
 
 fails = 0

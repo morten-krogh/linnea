@@ -1517,6 +1517,11 @@ h2_serve:
     ; draining: GOAWAY already went out, refuse this new stream
     cmp qword [rbx + linnea_connection.h2_state], LINNEA_H2_DRAINING
     je .drain_refuse
+    ; more If-Match/If-None-Match lines than can be combined: answered before
+    ; anything is routed or opened, so a proxy location cannot forward a list
+    ; with a member missing either (audit-report-31)
+    cmp qword [r12 + linnea_h2_req.etag_over], 0
+    jne .etag_over_431
     ; CONNECT: a registered method we do not implement (no tunnels). Decline with
     ; 405 before any :path handling — a CONNECT carries no :path. h2-15.
     mov rdi, [r12 + linnea_h2_req.method_ptr]
@@ -1990,6 +1995,14 @@ h2_serve:
     mov eax, 13
     jmp .out
 
+.etag_over_431:
+    mov qword [rsp + S_LSTAT], 431
+    mov qword [rsp + S_LBYTES], 0
+    mov rdi, rbx
+    mov rsi, [rsp + S_SID]
+    mov rdx, [rsp + S_OUT]
+    call h2_431_stream               ; -> rax = response length
+    jmp .out
 .drain_refuse:
     ; the worker is draining: refuse the new stream (nothing was opened)
     mov rdi, [rsp + S_OUT]

@@ -966,6 +966,11 @@ linnea_h3_serve:
     mov [rsp + 48], r9               ; when the request carried none)
     mov [rsp + 56], rsi              ; the caller's root, for a request that
     mov [rsp + 64], rdx              ; routes to no location of its own
+    ; more If-Match/If-None-Match lines than can be combined: answered before
+    ; anything is routed or opened, so a proxy location cannot forward a list
+    ; with a member missing either (audit-report-31)
+    cmp qword [rbx + linnea_h2_req.etag_over], 0
+    jne .etag_over_431
     ; no validators or content-range until a file is opened and the request's
     ; conditionals and range are evaluated
     mov qword [linnea_qpack_send_validators], 0
@@ -1553,6 +1558,10 @@ linnea_h3_serve:
     lea r8, [body_425]
     mov r9d, body_425_len
     call linnea_h3_build_response
+    jmp .sret
+.etag_over_431:
+    mov rdi, r12
+    call linnea_h3_build_431
     jmp .sret
 .bad:
     mov rdi, r12

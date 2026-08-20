@@ -1288,9 +1288,17 @@ linnea_http_handle:
     ; followed by `If-Match: <current>` was 412 where the one-line spelling
     ; passed. Recorded as spans and tried in turn, exactly as Accept-Encoding is
     ; (audit-report-30).
+    ; Three spans is far more than any client sends, but a FOURTH must not be
+    ; dropped on the floor: discarding a legal list member changes the answer
+    ; to a conditional request, and does it silently -- a matching tag on the
+    ; fourth line became a 200 where a 304 was due, or a 412 on a request that
+    ; had to pass (audit-report-31). What cannot be combined is refused instead,
+    ; and refused the same way on all three protocols: none of them can re-walk
+    ; a decoded field section, so the policy is set by the one that cannot
+    ; rather than split between them.
     mov rcx, [rsp + 312]       ; spans recorded so far
     cmp rcx, 3
-    jae .header_next
+    jae .too_many_etags
     shl rcx, 4                 ; -> byte offset of this span in the array
     lea rax, [rsp + 480]
     add rax, rcx
@@ -1311,7 +1319,7 @@ linnea_http_handle:
 .inm_header:                   ; a list too, and recorded the same way
     mov rcx, [rsp + 176]
     cmp rcx, 3
-    jae .header_next
+    jae .too_many_etags
     shl rcx, 4
     lea rax, [rsp + 432]
     add rax, rcx
@@ -1449,6 +1457,8 @@ linnea_http_handle:
     add r10, rcx
     sub r11, rcx
     jmp .te_elem
+.too_many_etags:
+    jmp .resp_431              ; more entity-tag lines than can be combined
 .header_next:
     add r15, 2                 ; past the CRLF
     jmp .header_loop

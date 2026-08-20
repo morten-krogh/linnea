@@ -95,8 +95,16 @@ struc linnea_h2_req
     ; where HTTP/1 let the FIRST decide: the same request was 304 on one
     ; protocol and 200 on another, and reversing the client's two lines swapped
     ; which protocol was right (audit-report-30). Three spans is far more than a
-    ; real client sends; further lines are ignored, which can only cost a 304 or
-    ; earn a 412, never serve a stale representation.
+    ; real client sends. A FOURTH is refused rather than dropped: discarding a
+    ; legal list member changes the answer to a conditional request and does it
+    ; silently, so a matching tag on the fourth line became a 200 where a 304
+    ; was due, or a 412 on a request that had to pass (audit-report-31). The
+    ; fourth sets .etag_over and the request is answered 431 -- refused, not
+    ; silently shortened, and refused the same way on all three protocols.
+    ; HTTP/1 does the same, though it alone could re-walk its head: none of the
+    ; three can re-walk a DECODED field section -- the QPACK/HPACK dynamic table
+    ; has moved on -- so the policy is set by the two that cannot, rather than
+    ; letting the protocols disagree again in the tail (audit-report-30).
     .inm_ptr:     resq 1        ; if-none-match spans; .inm_n is the count
     .inm_len:     resq 1
     .inm_ptr2:    resq 1
@@ -113,6 +121,12 @@ struc linnea_h2_req
     .ifm_ptr3:    resq 1
     .ifm_len3:    resq 1
     .ifm_n:       resq 1
+    ; 1 when either list carried more lines than there are spans. The decode is
+    ; NOT aborted for it: stopping mid-block would leave the HPACK dynamic table
+    ; behind the peer's and cost the whole connection, where the request itself
+    ; is merely one we will not answer. The serve path reads this before it does
+    ; anything else and returns 431.
+    .etag_over:   resq 1
     .ius_ptr:     resq 1        ; if-unmodified-since value, 0 if absent
     .ius_len:     resq 1
     .rng_ptr:     resq 1        ; range value, 0 if absent
