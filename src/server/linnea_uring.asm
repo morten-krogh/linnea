@@ -2527,6 +2527,23 @@ linnea_uring_run:
 .relay_next:
     cmp qword [r12 + linnea_connection.body_rem], 0
     je .proxy_finish
+    ; body_rem is -1 for a chunked response as well as for a close-delimited
+    ; one, and only the second of those ends at the upstream's close: a chunked
+    ; message ends at its TERMINAL CHUNK. Asking body_rem alone meant reading
+    ; on after a message that was already complete, which a backend closing the
+    ; connection then hid -- linnea sends Connection: close upstream, so almost
+    ; every backend does. One that does not left the exchange sitting until
+    ; proxy_timeout: the client had its whole body in 0 ms and the connection
+    ; was held 10 s, closed as "upstream timeout", and the 200 it had already
+    ; been served NEVER REACHED THE ACCESS LOG (audit-report-26).
+    ;
+    ; The EOF path has asked this since report 24; it just asked too late to
+    ; matter, because reaching it depends on the upstream doing something.
+    cmp qword [r12 + linnea_connection.resp_chunked], 0
+    je .relay_read_on
+    cmp qword [r12 + linnea_connection.resp_chunk_state], LINNEA_CHUNK_DONE
+    je .proxy_finish
+.relay_read_on:
     mov rdi, r12
     lea rsi, [r12 + linnea_connection.up_buf]
     mov edx, LINNEA_CONN_UP_BUF

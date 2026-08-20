@@ -13,6 +13,12 @@ What h1 can do is decline to finish. This asserts exactly that, and its control
 -- the same split write carrying a VALID body -- because "refuses the malformed
 one" is worth nothing if it also broke the ordinary one.
 
+It also asserts that a complete chunked response ENDS when its terminal chunk
+arrives, rather than when the upstream happens to close: a backend that holds
+its socket open used to leave the exchange sitting until proxy_timeout with the
+client's whole body already delivered, and the 200 it had been served never
+reached the access log at all (audit-report-26).
+
 It also asserts the harder half, which audit-report-25 read the source as
 missing: a malformation that STRADDLES the read boundary. "4;a", "0\r\nNot" and
 "4\r\nbody" are all valid prefixes; only the second write makes them wrong, so
@@ -22,6 +28,7 @@ reassembles to a valid token value and must arrive whole.
 """
 import socket
 import sys
+import time
 
 PORT = int(sys.argv[1])
 
@@ -44,7 +51,29 @@ def fetch(path):
     return head, body
 
 
+def keepalive_backend():
+    """A chunked message ends at its terminal chunk, not at the upstream's
+    close. The backend here sends a complete response and then holds its socket
+    open for three seconds; the exchange must be over long before that."""
+    t0 = time.time()
+    head, body = fetch("/api/chunkkeepalive")
+    took = time.time() - t0
+    if b" 200 " not in head.split(b"\r\n")[0]:
+        status = head.split(b"\r\n")[0]
+        return f"keep-alive backend: not 200: {status!r}"
+    if not body.endswith(b"0\r\n\r\n"):
+        return f"keep-alive backend: body not terminated: {body!r}"
+    if took > 1.5:
+        return (f"keep-alive backend: the response was complete but the "
+                f"exchange took {took:.1f}s -- it waited for the upstream")
+    return None
+
+
 def main():
+    late = keepalive_backend()
+    if late is not None:
+        return late
+
     head, body = fetch("/api/chunklategood")
     if b" 200 " not in head.split(b"\r\n")[0]:
         status = head.split(b"\r\n")[0]

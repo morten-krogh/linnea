@@ -264,6 +264,18 @@ def respond(conn, head, body, extra=b""):
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
         time.sleep(0.3)
         conn.sendall(b"4;=bad\r\nbody\r\n0\r\n\r\n")
+    elif path.endswith(b"/chunkkeepalive"):
+        # A COMPLETE chunked response, and then the socket is held open. linnea
+        # asks every backend for Connection: close, so almost all of them close
+        # here and the relay finishes on the EOF -- which is exactly what hid
+        # the relay asking `body_rem` alone about a message that ends at its
+        # terminal chunk. A backend that ignores the request header left the
+        # exchange sitting until proxy_timeout with the client's whole body
+        # already delivered (audit-report-26). Three seconds is longer than the
+        # check waits and shorter than any timeout it could hit.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     b"4\r\nbody\r\n0\r\n\r\n")
+        time.sleep(3)
     elif path.endswith(b"/chunksplitext"):
         # The malformation STRADDLES the read boundary: "4;a" is a valid prefix
         # and only ",b" makes it wrong, so the decoder must have carried its
