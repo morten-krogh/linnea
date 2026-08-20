@@ -99,6 +99,14 @@ struc linnea_config_location
                                                   ; (0 = healthy)
     .bk_fails:      resq LINNEA_MAX_BACKENDS      ; consecutive failures
     .rr_cursor:     resq 1                        ; round-robin position
+    ; 1 = upstream connections to this location's backends may be kept and
+    ; reused. OFF by default and deliberately opt-in, like nginx's
+    ; proxy_http_version 1.1 + keepalive: sending "Connection: close" upstream
+    ; is what currently GUARANTEES a close-delimited response terminates, and a
+    ; backend that sends neither Content-Length nor chunked would hang without
+    ; it. Turning this on is the operator asserting their backend delimits its
+    ; responses, which HTTP/1.1 requires but does not enforce.
+    .proxy_keepalive: resq 1
     .redirect:      resb LINNEA_MAX_ROOT + 1      ; URL prefix the 301 points at
     .redirect_len:  resq 1
     .cache_control: resb LINNEA_MAX_ROOT + 1      ; Cache-Control value for static

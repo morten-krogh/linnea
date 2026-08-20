@@ -137,6 +137,7 @@ extern linnea_ratelimit_on
 extern linnea_uring_now
 extern linnea_upstream_closed
 extern linnea_upstream_pick
+extern linnea_upstream_take
 extern linnea_upstream_limit
 
 section .rodata
@@ -353,6 +354,12 @@ hdr_cl_up_len   equ $ - hdr_cl_up
 hdr_crlf_up:    db 13, 10
 hdr_up_close:   db "Connection: close", 13, 10, 13, 10
 hdr_up_close_len equ $ - hdr_up_close
+; Said explicitly rather than by omission. HTTP/1.1 defaults to keep-alive, so
+; the field is not required -- but a backend behind an intermediary that
+; downgrades reads the absence differently from the word, and the word costs 24
+; bytes once per request.
+hdr_up_keep:    db "Connection: keep-alive", 13, 10, 13, 10
+hdr_up_keep_len equ $ - hdr_up_keep
 hdr_up_keepalive: db "Connection: keep-alive", 13, 10, 13, 10
 hdr_up_keepalive_len equ $ - hdr_up_keepalive
 hdr_up_upgrade: db "Connection: upgrade", 13, 10, 13, 10
@@ -2698,6 +2705,14 @@ linnea_http_handle:
     mov [rbx + linnea_connection.is_head], rcx ; a HEAD response has no body
     mov qword [rbx + linnea_connection.up_status], 0
     mov qword [rbx + linnea_connection.relayed], 0
+    ; Per-REQUEST upstream state, cleared per request. Connection slots are
+    ; reused, and these three are written from one request and read by the next
+    ; stage of another: a stale up_no_reuse (set because some earlier backend
+    ; said close) silently vetoed every later reuse on that slot, which is how
+    ; keep-alive appeared to work on a fresh server and stop working afterwards.
+    mov qword [rbx + linnea_connection.up_reusable], 0
+    mov qword [rbx + linnea_connection.up_no_reuse], 0
+    mov qword [rbx + linnea_connection.up_pooled], 0
     mov qword [rbx + linnea_connection.up_len], 0
     mov qword [rbx + linnea_connection.body_rem], 0
     xor ecx, ecx               ; upgrade only when Connection lists the
@@ -2956,6 +2971,25 @@ linnea_http_handle:
     call .append
     cmp qword [rbx + linnea_connection.upgrade], 0
     jne .proxy_conn_upgrade
+    ; "Connection: close" is what makes a close-delimited response terminate, so
+    ; it goes unless this location opted into keep-alive AND the method is one
+    ; that may be sent again. Reuse is confined to safe methods because a pooled
+    ; socket can always lose a race with the backend's own idle timeout, and the
+    ; only sound answer to that race is to be able to repeat the request.
+    ; [rsp] is 0 for GET and 1 for HEAD; -1/-2 for everything else, which the
+    ; unsigned compare excludes.
+    mov rcx, [rsp + 152]              ; the matched location
+    test rcx, rcx
+    jz .proxy_conn_close
+    cmp qword [rcx + linnea_config_location.proxy_keepalive], 0
+    je .proxy_conn_close
+    cmp qword [rsp], 1
+    ja .proxy_conn_close
+    mov qword [rbx + linnea_connection.up_reusable], 1
+    lea rdi, [hdr_up_keep]
+    mov esi, hdr_up_keep_len
+    jmp .proxy_conn_emit
+.proxy_conn_close:
     lea rdi, [hdr_up_close]    ; one request per upstream connection
     mov esi, hdr_up_close_len
     jmp .proxy_conn_emit
@@ -2979,6 +3013,30 @@ linnea_http_handle:
     mov [rbx + linnea_connection.file_ptr], rax
     ; the backend gets no more connections than it was sized for: past the
     ; ceiling the request is refused here rather than passed on
+    ; choose which backend this request starts on, and begin its attempt count.
+    ; First, because a parked connection belongs to ONE backend and there is
+    ; nothing to look for until we know which.
+    mov rdi, [rbx + linnea_connection.location]
+    call linnea_upstream_pick
+    mov [rbx + linnea_connection.up_backend], rax
+    mov qword [rbx + linnea_connection.up_tries], 1
+    mov qword [rbx + linnea_connection.up_pooled], 0
+    ; A reusable leg looks in the pool BEFORE the ceiling is consulted: a parked
+    ; connection is already counted against it, so making a request wait for
+    ; headroom it does not need would be the ceiling refusing its own inventory.
+    cmp qword [rbx + linnea_connection.up_reusable], 0
+    je .up_fresh
+    mov rdi, [rbx + linnea_connection.location]
+    mov rsi, [rbx + linnea_connection.up_backend]
+    call linnea_upstream_take
+    cmp eax, -1
+    je .up_fresh
+    mov [rbx + linnea_connection.up_fd], eax
+    mov qword [rbx + linnea_connection.up_pooled], 1
+    mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
+    mov eax, LINNEA_HTTP_PROXY
+    jmp .ret
+.up_fresh:
     call linnea_upstream_count
     cmp rax, [linnea_upstream_limit]
     jae .resp_503
@@ -2991,11 +3049,6 @@ linnea_http_handle:
     jae .resp_502
     mov [rbx + linnea_connection.up_fd], eax
     call linnea_upstream_open
-    ; choose which backend this request starts on, and begin its attempt count
-    mov rdi, [rbx + linnea_connection.location]
-    call linnea_upstream_pick
-    mov [rbx + linnea_connection.up_backend], rax
-    mov qword [rbx + linnea_connection.up_tries], 1
     mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_CONNECTING
     mov eax, LINNEA_HTTP_PROXY
     jmp .ret
@@ -4261,6 +4314,50 @@ linnea_http_upstream_head_valid:
 ; Locals:
 ;   [rsp+0] head end   [rsp+8] Content-Length   [rsp+16] flags: 1=CL, 2=TE
 ;   [rsp+24] line cursor  [rsp+32] CR offset    [rsp+40] header lines end
+; http_value_has_close(rdi = value, rsi = length) -> eax = 1 when the bytes
+; contain "close" in any case. Not a token walk: this is a veto, and the safe
+; direction is to over-refuse.
+http_value_has_close:
+    push rbx
+    xor eax, eax
+    cmp rsi, 5
+    jb .hc_no
+    sub rsi, 5
+    xor ecx, ecx
+.hc_scan:
+    cmp rcx, rsi
+    ja .hc_no
+    movzx ebx, byte [rdi + rcx]
+    or ebx, 0x20
+    cmp bl, 'c'
+    jne .hc_next
+    movzx ebx, byte [rdi + rcx + 1]
+    or ebx, 0x20
+    cmp bl, 'l'
+    jne .hc_next
+    movzx ebx, byte [rdi + rcx + 2]
+    or ebx, 0x20
+    cmp bl, 'o'
+    jne .hc_next
+    movzx ebx, byte [rdi + rcx + 3]
+    or ebx, 0x20
+    cmp bl, 's'
+    jne .hc_next
+    movzx ebx, byte [rdi + rcx + 4]
+    or ebx, 0x20
+    cmp bl, 'e'
+    jne .hc_next
+    mov eax, 1
+    pop rbx
+    ret
+.hc_next:
+    inc rcx
+    jmp .hc_scan
+.hc_no:
+    xor eax, eax
+    pop rbx
+    ret
+
 linnea_http_proxy_head:
     push rbx
     push r12
@@ -4485,7 +4582,23 @@ linnea_http_proxy_head:
     mov ecx, 10
     call linnea_string_iequal
     test eax, eax
-    jnz .next_line             ; ours replaces it
+    jz .not_conn_field
+    ; Ours replaces it -- but read it first. A backend that says "close" is
+    ; about to go, and parking that socket would hand the next request a race
+    ; with its FIN. Matched as a SUBSTRING on purpose: a false positive costs
+    ; one connection, a false negative costs a failed request.
+    mov rdi, r14
+    add rdi, r13
+    inc rdi                    ; just past the colon
+    mov rsi, [rsp + 32]        ; end of line
+    sub rsi, r13
+    dec rsi
+    call http_value_has_close
+    test eax, eax
+    jz .next_line
+    mov qword [rbx + linnea_connection.up_no_reuse], 1
+    jmp .next_line
+.not_conn_field:
     ; The response side leaked these just as the request side did: a backend
     ; answering `Keep-Alive: timeout=5` had it relayed to a client whose
     ; connection to us has nothing to do with ours to the backend.

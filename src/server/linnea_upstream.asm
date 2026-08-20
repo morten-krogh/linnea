@@ -26,6 +26,8 @@
 ; absent one, and is left to proxy_timeout.
 
 %include "linnea_config.inc"
+%include "linnea_syscall.inc"
+%include "linnea_uring.inc"
 
 ; Consecutive failures before a backend stops being chosen first. Not a
 ; per-request cost: failover already covered those requests.
@@ -34,12 +36,29 @@ LINNEA_UP_MAX_FAILS equ 3
 ; is short enough that a backend restarting is picked up on its own.
 LINNEA_UP_FAIL_NS   equ 10000000000
 
+; --- the idle upstream pool -------------------------------------------------
+; Connections are parked per worker, keyed by (location, backend). 32 slots is
+; an absolute bound on idle upstream descriptors a worker can hold, which a
+; per-location pool would not give: locations are configurable and their product
+; with backends is not something a config author should have to reason about.
+LINNEA_UP_POOL_SLOTS equ 32
+; How long a parked connection may sit before it is thrown away rather than
+; used. This must stay BELOW whatever the backend's own keep-alive timeout is,
+; or the backend closes first and every reuse races its FIN. Five seconds is
+; under every common default (nginx 75s, most frameworks 5-15s) and is the
+; cheap half of the defence; the liveness peek in _take is the other half.
+LINNEA_UP_IDLE_NS    equ 5000000000
+
+global linnea_upstream_park
+global linnea_upstream_take
+global linnea_upstream_pool_close
 global linnea_upstream_pick
 global linnea_upstream_addr
 global linnea_upstream_mark_ok
 global linnea_upstream_mark_fail
 
 extern linnea_uring_now
+extern linnea_upstream_closed
 extern linnea_log_stamp
 extern linnea_log_write
 
@@ -225,5 +244,158 @@ linnea_upstream_mark_fail:
     call up_log
 .done:
     pop r12
+    pop rbx
+    ret
+
+
+section .bss
+; at == 0 means the slot is empty, so .bss's zeroing is the initialisation. A
+; parked entry always carries a nonzero monotonic stamp, and fd 0 is a legal
+; descriptor — which is why emptiness is not spelled with the fd.
+up_pool_fd:     resd LINNEA_UP_POOL_SLOTS
+up_pool_loc:    resq LINNEA_UP_POOL_SLOTS
+up_pool_bk:     resq LINNEA_UP_POOL_SLOTS
+up_pool_at:     resq LINNEA_UP_POOL_SLOTS
+
+section .text
+
+; pool_drop(rsi = slot) — close the parked descriptor and empty the slot.
+pool_drop:
+    push rsi
+    mov edi, [up_pool_fd + rsi * 4]
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    call linnea_upstream_closed
+    pop rsi
+    mov qword [up_pool_at + rsi * 8], 0
+    ret
+
+; linnea_upstream_park(rdi = location, rsi = backend, edx = fd) -> eax
+;   1 = parked (the pool owns the descriptor now)
+;   0 = not parked; the caller still owns it and must close it
+;
+; The caller decides WHETHER a connection may be parked — that judgement is
+; about the response that just came over it, not about the pool.
+linnea_upstream_park:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13d, edx
+    call linnea_uring_now             ; eats rdi/rsi
+    xor ecx, ecx
+.pk_scan:
+    cmp rcx, LINNEA_UP_POOL_SLOTS
+    jae .pk_full
+    cmp qword [up_pool_at + rcx * 8], 0
+    je .pk_free
+    inc rcx
+    jmp .pk_scan
+.pk_free:
+    mov [up_pool_fd + rcx * 4], r13d
+    mov [up_pool_loc + rcx * 8], rbx
+    mov [up_pool_bk + rcx * 8], r12
+    mov [up_pool_at + rcx * 8], rax
+    mov eax, 1
+    jmp .pk_ret
+.pk_full:
+    xor eax, eax
+.pk_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_upstream_take(rdi = location, rsi = backend) -> eax = fd, or -1
+;
+; A parked connection is only worth having if the backend has not closed it in
+; the meantime, and the stamp alone cannot say: it records when WE parked it,
+; not what the peer did afterwards. So a candidate is peeked at without
+; blocking — EOF or unexpected bytes mean it is not reusable. That leaves a real
+; but small race (the peer may close between the peek and our send), which is
+; why reuse is confined to methods that may be retried.
+;
+; Stale slots met along the way are closed regardless of which backend they
+; belong to: this walk is the only reaper there is.
+linnea_upstream_take:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+    mov rbx, rdi
+    mov r12, rsi
+    call linnea_uring_now
+    mov r13, rax
+    xor r14d, r14d
+.tk_scan:
+    cmp r14, LINNEA_UP_POOL_SLOTS
+    jae .tk_none
+    cmp qword [up_pool_at + r14 * 8], 0
+    je .tk_next
+    mov rax, r13
+    sub rax, [up_pool_at + r14 * 8]
+    mov rcx, LINNEA_UP_IDLE_NS
+    cmp rax, rcx
+    jb .tk_fresh
+    mov rsi, r14                      ; too old for anyone: reap it
+    call pool_drop
+    jmp .tk_next
+.tk_fresh:
+    cmp [up_pool_loc + r14 * 8], rbx
+    jne .tk_next
+    cmp [up_pool_bk + r14 * 8], r12
+    jne .tk_next
+    ; a candidate: is the peer still there?
+    mov r15d, [up_pool_fd + r14 * 4]
+    mov eax, LINNEA_SYS_RECVFROM
+    mov edi, r15d
+    mov rsi, rsp                      ; one byte of scratch
+    mov edx, 1
+    mov r10d, LINNEA_MSG_PEEK | LINNEA_MSG_DONTWAIT
+    xor r8d, r8d
+    xor r9d, r9d
+    syscall
+    cmp rax, -LINNEA_EAGAIN
+    jne .tk_dead                      ; 0 = closed, >0 = bytes we never asked for
+    mov qword [up_pool_at + r14 * 8], 0   ; the caller owns it now
+    mov eax, r15d
+    jmp .tk_ret
+.tk_dead:
+    mov rsi, r14
+    call pool_drop
+.tk_next:
+    inc r14
+    jmp .tk_scan
+.tk_none:
+    mov eax, -1
+.tk_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_upstream_pool_close() — drop every parked connection. For a worker on
+; its way out: a descriptor the pool holds belongs to no request, so nothing
+; waits on it and it would otherwise be closed only by process exit.
+linnea_upstream_pool_close:
+    push rbx
+    xor ebx, ebx
+.pc_loop:
+    cmp rbx, LINNEA_UP_POOL_SLOTS
+    jae .pc_done
+    cmp qword [up_pool_at + rbx * 8], 0
+    je .pc_next
+    mov rsi, rbx
+    call pool_drop
+.pc_next:
+    inc rbx
+    jmp .pc_loop
+.pc_done:
     pop rbx
     ret

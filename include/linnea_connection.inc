@@ -116,6 +116,16 @@ struc linnea_connection
     ; another backend, and the count is what stops it circling.
     .up_backend:    resq 1
     .up_tries:      resq 1
+    ; 1 = this leg may be parked in the idle pool when the exchange ends
+    ; cleanly. Decided when the request head is built (the location opted in and
+    ; the method is safe), not at the end, because by then the method is gone.
+    .up_reusable:   resq 1
+    ; 1 = the upstream's own response said Connection: close. It vetoes parking:
+    ; the peer is about to go, and a socket parked in that state would be handed
+    ; to a request that then races the FIN.
+    .up_no_reuse:   resq 1
+    ; 1 = this leg came from the pool rather than from a fresh connect.
+    .up_pooled:     resq 1
     .proxy_state:   resq 1         ; LINNEA_PROXY_*
     .location:      resq 1         ; matched location* (static config memory)
     .vhost:         resq 1         ; server* handling the request, for the log

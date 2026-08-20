@@ -351,6 +351,42 @@ EOF
     wait $fo_pid 2>/dev/null
     rm -f "$fo"
 
+    # --- upstream keep-alive --------------------------------------------
+    # Opt-in per location, because sending "Connection: close" upstream is what
+    # makes a close-delimited response terminate -- a backend that sends neither
+    # Content-Length nor chunked would hang without it. Turning it on is the
+    # operator asserting their backend delimits its responses.
+    #
+    # Reuse is invisible from the client: same status, same body, same headers
+    # either way. Every check reads the BACKEND's accept counter, which is the
+    # only direct evidence there is.
+    python3 test/marker_backend.py ${P61481} A >/dev/null 2>&1 &
+    ka_a=$!
+    python3 test/rude_backend.py ${P61484} >/dev/null 2>&1 &
+    ka_r=$!
+    sleep 0.5
+    kt=$CFG/keepalive.json
+    cat > "$kt" <<EOF
+{ "log": "$PWD/$RUNDIR/keepalive.log", "timeout": 5, "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61485}, "hostname": "localhost",
+    "locations": [
+      { "prefix": "/ka",   "proxy": "127.0.0.1:${P61481}", "proxy_keepalive": 1 },
+      { "prefix": "/noka", "proxy": "127.0.0.1:${P61481}" },
+      { "prefix": "/r",    "proxy": "127.0.0.1:${P61484}", "proxy_keepalive": 1 },
+      { "prefix": "/", "root": "$PWD/$WWW" } ] } ] }
+EOF
+    start_server "$kt"
+    kt_pid=$SRV_PID
+    out=$(timeout 120 python3 test/upstream_keepalive.py ${P61485} ${P61481} ${P61484} 2>&1)
+    rc=$?
+    first_fail=$(echo "$out" | grep -m1 FAIL)
+    kill $ka_a $ka_r 2>/dev/null
+    [ $rc -eq 0 ]
+    check "upstream connections are reused, and not when reuse would be unsafe ${first_fail}" $?
+    kill $kt_pid 2>/dev/null
+    wait $kt_pid 2>/dev/null
+    rm -f "$kt"
+
 
     # A canned h3 error must describe ITSELF. The QPACK encoder reads
     # content-encoding, the validators, content-range, location and

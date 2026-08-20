@@ -42,6 +42,10 @@ LINNEA_POLLHUP       equ 16
 LINNEA_SYS_SENDTO    equ 44
 LINNEA_SYS_SENDMSG   equ 46
 LINNEA_MSG_DONTWAIT  equ 0x40
+; Look at what is waiting without consuming it. The upstream pool uses this to
+; ask a parked connection whether the peer is still there: a byte peeked is a
+; byte the next real read still sees.
+LINNEA_MSG_PEEK      equ 0x02
 ; Without MSG_NOSIGNAL a write to a peer that has already gone raises SIGPIPE,
 ; whose default action kills the process outright.
 LINNEA_MSG_NOSIGNAL  equ 0x4000

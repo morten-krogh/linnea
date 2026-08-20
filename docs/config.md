@@ -213,12 +213,85 @@ coexist and `/api/x` goes to `/api`.
 |---|---|---|---|---|
 | `prefix` | string | — **required** | ≤ 255 | Path prefix. **Must start with `/`.** |
 | `root` | string | one of three | ≤ 255 | Serve static files from this directory. Must exist. |
-| `proxy` | string | one of three | ≤ 255 | Forward to an HTTP/1.1 backend. **`IPv4:port` only**, e.g. `"127.0.0.1:8080"`. |
+| `proxy` | string or array | one of three | ≤ 255 each, ≤ 8 entries | Forward to an HTTP/1.1 backend. **`IPv4:port` only**, e.g. `"127.0.0.1:8080"`. An **array** names several backends: `["127.0.0.1:8080", "127.0.0.1:8081"]`. Requests are spread over them in turn, and one that refuses a connection is stepped over. |
+| `proxy_keepalive` | integer | `0` (off) | 0 or 1 | Keep upstream connections open and reuse them. Only on a `proxy` location. See **Upstream connections** below. |
 | `redirect` | string | one of three | ≤ 255 | Reply 301 to this URL prefix. **Must start with `http://` or `https://`.** |
 | `cache_control` | string | none | ≤ 255 | `Cache-Control` value for static responses. Only meaningful with `root`. |
 
 > **Exactly one of `root`, `proxy` or `redirect`.** Zero is an error and so are
 > two: *"location requires prefix and exactly one of root, proxy or redirect"*.
+
+---
+
+## Upstream connections
+
+### Several backends
+
+`proxy` may name a list. Requests go round the backends in turn, and a backend
+that refuses a connection is stepped over — within the same request, so the
+client is served by the next one rather than shown a 502:
+
+```json
+{ "prefix": "/api", "proxy": ["127.0.0.1:8080", "127.0.0.1:8081"] }
+```
+
+Health is **passive**. Nothing is probed on a timer, so no traffic exists that a
+user did not ask for. Three consecutive connect failures take a backend out of
+rotation for ten seconds; the first success after that puts it back. Being out
+of rotation only decides where a request *starts* — while any backend is up, no
+request fails because of it.
+
+**Failover is attempted only when the connection is refused**, never after the
+request has been sent. Once the head is out, a backend that goes quiet may
+already have acted on it, and sending it again would be inventing a second
+request the client made once. A backend that accepts and then hangs is a *slow*
+backend, not an absent one, and is left to `proxy_timeout`.
+
+Three lines in the error log record what happened, because the access log
+cannot: a failover is invisible there — the client was served, so the line says
+`200` and names no backend.
+
+```
+upstream 127.0.0.1:8081 connect failed
+upstream 127.0.0.1:8081 failed out of rotation
+upstream 127.0.0.1:8081 back in rotation
+```
+
+### Keeping connections open
+
+By default linnea opens one connection per proxied request and sends
+`Connection: close` upstream. `proxy_keepalive: 1` keeps them instead:
+
+```json
+{ "prefix": "/api", "proxy": "127.0.0.1:8080", "proxy_keepalive": 1 }
+```
+
+**It is off by default on purpose.** `Connection: close` is what makes a
+close-delimited response terminate — a backend that sends neither
+`Content-Length` nor `Transfer-Encoding: chunked` relies on the close to end its
+message. Turning keep-alive on is you asserting that your backend delimits its
+responses, which HTTP/1.1 requires but does not enforce. It is the same reason
+nginx needs `proxy_http_version 1.1` before its `keepalive` does anything.
+
+A connection is kept only when **all** of these hold:
+
+* the location opted in;
+* the request method was `GET` or `HEAD`. A pooled socket can always lose a race
+  with the backend's own idle timeout, and the only sound answer to that race is
+  to repeat the request — which a `POST` may not be;
+* the backend did not answer `Connection: close`;
+* the response body was delimited and fully consumed — an exact
+  `Content-Length`, or chunked through its terminal chunk.
+
+A connection is parked for at most **five seconds**, and is checked for
+liveness before it is reused. Keep your backend's own idle timeout above that,
+or it will close first and every reuse will race its `FIN`. Each worker holds at
+most 32 idle upstream connections in total.
+
+What it is worth depends on what your backend pays per connection, not on TCP.
+Against a backend that spawns a thread or forks per connection the saving is
+large; against one with a pre-forked pool it is closer to the cost of the
+handshake alone.
 
 ---
 

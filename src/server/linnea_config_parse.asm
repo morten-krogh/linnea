@@ -95,6 +95,8 @@ key_redirect:           db "redirect"
 key_redirect_len        equ $ - key_redirect
 key_cache_control:      db "cache_control"
 key_cache_control_len   equ $ - key_cache_control
+key_proxy_keepalive:    db "proxy_keepalive"
+key_proxy_keepalive_len equ $ - key_proxy_keepalive
 key_cert:               db "cert"
 key_cert_len            equ $ - key_cert
 key_key:                db "key"
@@ -186,6 +188,10 @@ msg_hsts_type:          db "hsts takes the header VALUE as a string, e.g. "
 msg_hsts_type_len       equ $ - msg_hsts_type
 msg_nosniff:            db "nosniff must be 0 or 1"
 msg_nosniff_len         equ $ - msg_nosniff
+msg_pka:                db "proxy_keepalive must be 0 or 1"
+msg_pka_len             equ $ - msg_pka
+msg_pka_kind:           db "proxy_keepalive needs a proxy location"
+msg_pka_kind_len        equ $ - msg_pka_kind
 msg_v6only:             db "v6only must be 0 or 1"
 msg_v6only_len          equ $ - msg_v6only
 msg_cc_long:            db "cache_control too long"
@@ -1125,6 +1131,13 @@ linnea_parse_location:
     call linnea_string_equal
     test eax, eax
     jnz .key_cache_control
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_proxy_keepalive]
+    mov ecx, key_proxy_keepalive_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_proxy_keepalive
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -1182,6 +1195,16 @@ linnea_parse_location:
     lea rdi, [rbx + linnea_config_location.cache_control]
     mov rsi, rax
     call linnea_string_copy
+    jmp .member_sep
+
+.key_proxy_keepalive:
+    test r12d, 32
+    jnz .dup
+    or r12d, 32
+    call linnea_parse_u64
+    cmp rax, 1
+    ja .pka_range
+    mov [rbx + linnea_config_location.proxy_keepalive], rax
     jmp .member_sep
 
 .key_proxy:
@@ -1331,7 +1354,15 @@ linnea_parse_location:
     jmp .member_loop
 .end_object:
     call linnea_parse_advance
-    and r12d, ~16              ; cache_control is optional, any kind
+    ; proxy_keepalive is optional, but unlike cache_control it is meaningless
+    ; anywhere but a proxy location -- and a key that is silently ignored is a
+    ; config that lies about what the server will do.
+    test r12d, 32
+    jz .pka_ok
+    test r12d, 4
+    jz .pka_kind
+.pka_ok:
+    and r12d, ~(16 | 32)       ; cache_control is optional, any kind
     cmp r12d, 3                ; prefix + root
     je .done
     cmp r12d, 5                ; prefix + proxy
@@ -1381,6 +1412,14 @@ linnea_parse_location:
 ; only because linnea_parse_fail ends at linnea_error_die and the process never
 ; returns here — stated rather than assumed, since a later change making a parse
 ; error recoverable would turn each of them into a corrupted stack.
+.pka_range:
+    lea rdi, [msg_pka]
+    mov esi, msg_pka_len
+    jmp linnea_parse_fail
+.pka_kind:
+    lea rdi, [msg_pka_kind]
+    mov esi, msg_pka_kind_len
+    jmp linnea_parse_fail
 .bad_proxy_list:
     lea rdi, [msg_bad_proxy_list]
     mov esi, msg_bad_proxy_list_len

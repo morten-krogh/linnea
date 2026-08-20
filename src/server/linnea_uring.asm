@@ -62,6 +62,7 @@ extern linnea_connection_count_ip
 extern linnea_crash_install
 extern linnea_ratelimit_init
 extern linnea_upstream_open
+extern linnea_upstream_park
 extern linnea_upstream_closed
 extern linnea_upstream_addr
 extern linnea_upstream_pick
@@ -1450,8 +1451,17 @@ linnea_uring_run:
     cmp qword [r12 + linnea_connection.req_body_rem], 0
     jne .capture_start
 .proxy_connect_now:
+    ; A leg taken from the idle pool is already connected, so its exchange
+    ; starts at the send; linnea_http_proxy left proxy_state saying which.
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
+    je .proxy_send_pooled
     mov rdi, r12               ; the request goes to an upstream first
     call linnea_uring_arm_connect
+    call linnea_uring_submit_now
+    jmp .wait
+.proxy_send_pooled:
+    mov rdi, r12
+    call linnea_uring_arm_up_send
     call linnea_uring_submit_now
     jmp .wait
 .capture_start:
@@ -2585,6 +2595,38 @@ linnea_uring_run:
     mov edi, [r12 + linnea_connection.up_fd]
     cmp edi, -1
     je .proxy_logged
+    ; Keep it only if this exchange ended EXACTLY where its framing said it
+    ; would. "Connection: close" used to hide a length we got wrong -- the close
+    ; ended the message whatever we believed. A pooled connection hides nothing:
+    ; the next request on it would read the remainder of this response as its
+    ; own head. So the bar is all four of: the location opted in and the method
+    ; was safe (both in up_reusable), the backend did not say close, and the
+    ; body was delimited and fully consumed. A close-delimited response cannot
+    ; pass it -- body_rem stays -1 and it ends at the very close that makes the
+    ; socket unusable.
+    cmp qword [r12 + linnea_connection.up_reusable], 0
+    je .proxy_close_up
+    cmp qword [r12 + linnea_connection.up_no_reuse], 0
+    jne .proxy_close_up
+    cmp qword [r12 + linnea_connection.resp_chunked], 0
+    je .proxy_park_counted
+    cmp qword [r12 + linnea_connection.resp_chunk_state], LINNEA_CHUNK_DONE
+    jne .proxy_close_up        ; chunked, but not through the terminal chunk
+    jmp .proxy_park
+.proxy_park_counted:
+    cmp qword [r12 + linnea_connection.body_rem], 0
+    jne .proxy_close_up        ; -1 = close-delimited, > 0 = short
+.proxy_park:
+    mov rdi, [r12 + linnea_connection.location]
+    mov rsi, [r12 + linnea_connection.up_backend]
+    mov edx, [r12 + linnea_connection.up_fd]
+    call linnea_upstream_park
+    test eax, eax
+    jz .proxy_close_up         ; pool full: close it, exactly as before
+    mov dword [r12 + linnea_connection.up_fd], -1
+    jmp .proxy_logged
+.proxy_close_up:
+    mov edi, [r12 + linnea_connection.up_fd]
     mov eax, LINNEA_SYS_CLOSE
     syscall
     call linnea_upstream_closed
