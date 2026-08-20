@@ -265,6 +265,17 @@ EOF
         out=$(timeout 30 python3 test/quic/h3_single_frame_maxbody.py ${P61470} 64 2>&1 | tail -1)
         [ "$out" = "OK" ]
         check "h3 max_body bounds a single-frame body too ($out)" $?
+        # ...and the OTHER cap check, on the reassembly path, which bounds each
+        # DATA frame's declared length against the headroom that is LEFT. The
+        # case that exercises the subtraction is a body SPLIT across frames
+        # whose sum crosses the cap while no single frame comes near it; the
+        # boundary itself is asserted one below, exactly at, and one above
+        # (audit-report-38 asked for all three positions). The driver asserts
+        # that its sends actually left as separate packets, because coalesced
+        # they would silently retest the single-frame path above and pass.
+        out=$(timeout 60 python3 test/quic/h3_multi_frame_maxbody.py ${P61470} 64 2>&1 | tail -1)
+        [ "$out" = "OK" ]
+        check "h3 max_body bounds a body split across DATA frames ($out)" $?
         # Finding 18: content-length must equal the DATA sum (RFC 9114 4.1.3), the
         # check h2 makes at END_STREAM and h3 did not -- a short/long body was
         # routed around the client's declared framing. Small bodies, so the same
