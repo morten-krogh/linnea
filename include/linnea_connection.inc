@@ -111,6 +111,11 @@ struc linnea_connection
     ; --- proxying ---------------------------------------------------
     .up_fd:         resd 1         ; upstream socket, -1 = none
     .up_pad:        resd 1
+    ; Which of the location's backends this leg is on, and how many have been
+    ; tried for this request. Both are per-REQUEST: a retry moves the leg to
+    ; another backend, and the count is what stops it circling.
+    .up_backend:    resq 1
+    .up_tries:      resq 1
     .proxy_state:   resq 1         ; LINNEA_PROXY_*
     .location:      resq 1         ; matched location* (static config memory)
     .vhost:         resq 1         ; server* handling the request, for the log

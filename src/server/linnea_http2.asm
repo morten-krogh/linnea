@@ -102,6 +102,9 @@ extern linnea_ratelimit_take
 extern linnea_ratelimit_on
 extern linnea_uring_now
 extern linnea_upstream_closed
+extern linnea_upstream_pick
+extern linnea_upstream_mark_ok
+extern linnea_upstream_mark_fail
 extern linnea_upstream_limit
 
 section .rodata
@@ -3262,6 +3265,10 @@ h2p_open_upstream:
     js .ou_nosock
     mov [rbx + linnea_h2p.fd], eax
     call linnea_upstream_open
+    mov rdi, [rbx + linnea_h2p.location]
+    call linnea_upstream_pick
+    mov [rbx + linnea_h2p.backend], rax
+    mov qword [rbx + linnea_h2p.tries], 1
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_CONNECTING
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_CONN
     pop rbx
@@ -3276,6 +3283,43 @@ h2p_open_upstream:
     ; the backend answered badly — it was never asked
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FAILED
     mov qword [rbx + linnea_h2p.status], 503
+    pop rbx
+    ret
+
+; h2p_reconnect(rdi = h2p slot) -> eax = 0 armed, -1 could not
+; The failed socket goes first: it cannot be reused and holding it would leak a
+; descriptor for the life of the exchange.
+h2p_reconnect:
+    push rbx
+    mov rbx, rdi
+    mov edi, [rbx + linnea_h2p.fd]
+    cmp edi, -1
+    je .rc_nofd
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    call linnea_upstream_closed
+    mov dword [rbx + linnea_h2p.fd], -1
+.rc_nofd:
+    mov edi, LINNEA_AF_INET
+    mov esi, LINNEA_SOCK_STREAM
+    xor edx, edx
+    mov eax, LINNEA_SYS_SOCKET
+    syscall
+    test eax, eax
+    js .rc_fail
+    mov [rbx + linnea_h2p.fd], eax
+    call linnea_upstream_open
+    mov rdi, [rbx + linnea_h2p.location]
+    call linnea_upstream_pick
+    mov [rbx + linnea_h2p.backend], rax
+    inc qword [rbx + linnea_h2p.tries]
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_CONNECTING
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_CONN
+    xor eax, eax
+    pop rbx
+    ret
+.rc_fail:
+    mov eax, -1
     pop rbx
     ret
 
@@ -3364,13 +3408,35 @@ linnea_h2p_event:
 .ev_connect:
     test r14d, r14d
     js .ev_conn_failed
+    mov rdi, [rbx + linnea_h2p.location]
+    mov rsi, [rbx + linnea_h2p.backend]
+    call linnea_upstream_mark_ok
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_SENDING
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
     jmp .ev_service
 .ev_conn_failed:
+    ; the h2 twin of the h1/h3 failover in linnea_uring.asm: count the failure,
+    ; then move to the next backend while nothing of the request has been sent.
+    ; r14d holds the result and must survive the calls.
+    push r14
+    mov rdi, [rbx + linnea_h2p.location]
+    mov rsi, [rbx + linnea_h2p.backend]
+    call linnea_upstream_mark_fail
+    pop r14
+    mov rax, [rbx + linnea_h2p.location]
+    mov rax, [rax + linnea_config_location.proxy_count]
+    cmp [rbx + linnea_h2p.tries], rax
+    jae .ev_conn_giveup
+    mov rdi, rbx
+    call h2p_reconnect
+    test eax, eax
+    js .ev_conn_giveup
+    jmp .ev_service
+.ev_conn_giveup:
     cmp r14d, -LINNEA_ECANCELED
     je .ev_timeout
     jmp .ev_bad_gateway
+
 .ev_send:
     test r14d, r14d
     js .ev_send_err

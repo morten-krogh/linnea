@@ -136,6 +136,7 @@ extern linnea_ratelimit_take
 extern linnea_ratelimit_on
 extern linnea_uring_now
 extern linnea_upstream_closed
+extern linnea_upstream_pick
 extern linnea_upstream_limit
 
 section .rodata
@@ -2990,6 +2991,11 @@ linnea_http_handle:
     jae .resp_502
     mov [rbx + linnea_connection.up_fd], eax
     call linnea_upstream_open
+    ; choose which backend this request starts on, and begin its attempt count
+    mov rdi, [rbx + linnea_connection.location]
+    call linnea_upstream_pick
+    mov [rbx + linnea_connection.up_backend], rax
+    mov qword [rbx + linnea_connection.up_tries], 1
     mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_CONNECTING
     mov eax, LINNEA_HTTP_PROXY
     jmp .ret

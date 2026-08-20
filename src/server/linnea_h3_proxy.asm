@@ -50,6 +50,7 @@ extern linnea_connection_alloc
 extern linnea_connection_free
 extern linnea_upstream_open
 extern linnea_upstream_closed
+extern linnea_upstream_pick
 extern linnea_upstream_count
 extern linnea_upstream_limit
 extern linnea_config_instance
@@ -466,6 +467,11 @@ linnea_h3_proxy_start:
     cmp rax, -4095
     jae .st_nosock
     mov [r12 + linnea_connection.up_fd], eax
+    ; choose which backend this request starts on, and begin its attempt count
+    mov rdi, [r12 + linnea_connection.location]
+    call linnea_upstream_pick
+    mov [r12 + linnea_connection.up_backend], rax
+    mov qword [r12 + linnea_connection.up_tries], 1
     call linnea_upstream_open
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CONNECTING
     ; The connect is the io_uring loop's to queue, and this module is not the

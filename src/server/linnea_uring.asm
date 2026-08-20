@@ -61,7 +61,12 @@ extern linnea_network_peer_addr
 extern linnea_connection_count_ip
 extern linnea_crash_install
 extern linnea_ratelimit_init
+extern linnea_upstream_open
 extern linnea_upstream_closed
+extern linnea_upstream_addr
+extern linnea_upstream_pick
+extern linnea_upstream_mark_ok
+extern linnea_upstream_mark_fail
 extern linnea_upstream_limit
 extern linnea_connection_alloc
 extern linnea_connection_free
@@ -2177,14 +2182,37 @@ linnea_uring_run:
     jne .h3_leg_reap           ; the stream it answers is gone
     test r15d, r15d
     jz .connect_ok
+    ; This backend did not answer. Count it against its health, then move the
+    ; request to the next one if the location names another that has not been
+    ; tried. Safe HERE AND ONLY HERE: no byte of the request has been sent, so
+    ; the request cannot arrive twice. Past this point a silent backend is a
+    ; slow backend, not an absent one, and belongs to proxy_timeout.
+    mov rdi, [r12 + linnea_connection.location]
+    mov rsi, [r12 + linnea_connection.up_backend]
+    call linnea_upstream_mark_fail
     cmp r15d, -LINNEA_ECANCELED
     je .connect_timeout
     mov esi, 502               ; refused, unreachable, no route
-    jmp .proxy_fail
+    jmp .connect_failover
 .connect_timeout:
     mov esi, 504
-    jmp .proxy_fail
+.connect_failover:
+    mov rax, [r12 + linnea_connection.location]
+    mov rax, [rax + linnea_config_location.proxy_count]
+    cmp [r12 + linnea_connection.up_tries], rax
+    jae .proxy_fail            ; every backend this location names has been tried
+    push rsi                   ; keep the status, in case the retry cannot start
+    mov rdi, r12
+    call linnea_uring_up_reconnect
+    pop rsi
+    test eax, eax
+    js .proxy_fail
+    jmp .wait
 .connect_ok:
+    ; it answered: whatever it did before, this backend is up
+    mov rdi, [r12 + linnea_connection.location]
+    mov rsi, [r12 + linnea_connection.up_backend]
+    call linnea_upstream_mark_ok
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
     mov rdi, r12
     call linnea_uring_arm_up_send
@@ -3545,6 +3573,47 @@ h3p_arm:
     call linnea_uring_arm_connect
     jmp linnea_uring_submit_now
 
+; linnea_uring_up_reconnect(rdi = connection*) -> eax = 0 armed, -1 could not
+; Close the upstream socket whose connect failed, take a fresh one, move to the
+; next backend and connect again. The old fd must go first: it is in a failed
+; state and holding it would leak a descriptor for the life of the request.
+linnea_uring_up_reconnect:
+    push rbx
+    mov rbx, rdi
+    mov edi, [rbx + linnea_connection.up_fd]
+    cmp edi, -1
+    je .no_old
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    call linnea_upstream_closed
+    mov dword [rbx + linnea_connection.up_fd], -1
+.no_old:
+    mov eax, LINNEA_SYS_SOCKET
+    mov edi, LINNEA_AF_INET
+    mov esi, LINNEA_SOCK_STREAM
+    xor edx, edx
+    syscall
+    cmp rax, -4095
+    jae .no_socket
+    mov [rbx + linnea_connection.up_fd], eax
+    call linnea_upstream_open
+    mov rdi, [rbx + linnea_connection.location]
+    call linnea_upstream_pick
+    mov [rbx + linnea_connection.up_backend], rax
+    inc qword [rbx + linnea_connection.up_tries]
+    mov rdi, rbx
+    call linnea_uring_arm_connect
+    call linnea_uring_submit_now
+    xor eax, eax
+    pop rbx
+    ret
+.no_socket:
+    ; out of descriptors: the caller answers with the status it already had,
+    ; which is the failure of the backend rather than of this retry
+    mov eax, -1
+    pop rbx
+    ret
+
 ; linnea_uring_arm_connect(rdi=connection*)
 ; Queue a connect to the matched proxy location's upstream, with a linked
 ; idle timeout so an unresponsive upstream cannot pin the connection. The
@@ -3557,8 +3626,12 @@ linnea_uring_arm_connect:
     mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
     mov ecx, [rbx + linnea_connection.up_fd]
     mov [rax + LINNEA_SQE_FD], ecx
-    mov rcx, [rbx + linnea_connection.location]
-    lea rcx, [rcx + linnea_config_location.proxy_addr]
+    push rax
+    mov rdi, [rbx + linnea_connection.location]
+    mov rsi, [rbx + linnea_connection.up_backend]
+    call linnea_upstream_addr          ; the CHOSEN backend, not the first
+    mov rcx, rax
+    pop rax
     mov [rax + LINNEA_SQE_ADDR], rcx
     mov qword [rax + LINNEA_SQE_OFF], LINNEA_SOCKADDR_IN_SIZE
     mov rcx, [rbx + linnea_connection.index]
@@ -3809,8 +3882,12 @@ linnea_uring_arm_h2p_ops:
     mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
     mov ecx, [r12 + linnea_h2p.fd]
     mov [rax + LINNEA_SQE_FD], ecx
-    mov rcx, [r12 + linnea_h2p.location]
-    lea rcx, [rcx + linnea_config_location.proxy_addr]
+    push rax
+    mov rdi, [r12 + linnea_h2p.location]
+    mov rsi, [r12 + linnea_h2p.backend]
+    call linnea_upstream_addr
+    mov rcx, rax
+    pop rax
     mov [rax + LINNEA_SQE_ADDR], rcx
     mov qword [rax + LINNEA_SQE_OFF], LINNEA_SOCKADDR_IN_SIZE
     mov edx, LINNEA_UD_H2UP_CONNECT

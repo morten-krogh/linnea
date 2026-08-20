@@ -297,6 +297,8 @@ struc linnea_h2p
     .sid:       resq 1            ; the client stream id
     .gen:       resq 1            ; the connection incarnation this belongs to
     .location:  resq 1            ; matched location* (connect addr, log)
+    .backend:   resq 1            ; which of the location's backends this leg is on
+    .tries:     resq 1            ; backends attempted for this request
     .srv:       resq 1            ; the vhost that matched, for its headers
     .req_len:   resq 1            ; rewritten request bytes (head, then body)
     .sent:      resq 1            ; upstream send progress
