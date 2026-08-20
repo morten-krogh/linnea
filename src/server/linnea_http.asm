@@ -367,6 +367,8 @@ known_methods:  db 4, "POST"
                 db 5, "TRACE"
                 db 5, "PATCH"
                 db 0
+method_trace:   db "TRACE"
+method_options: db "OPTIONS"
 method_get:     db "GET"
 method_head:    db "HEAD"
 index_html:     db "index.html"
@@ -392,6 +394,9 @@ hn_content_len: db "content-length"
 hn_transfer_enc: db "transfer-encoding"
 hn_host:        db "host"
 hn_expect:      db "expect"
+hn_max_forwards: db "max-forwards"
+hdr_max_forwards: db "Max-Forwards: "
+hdr_max_forwards_len equ $ - hdr_max_forwards
 hv_100_continue: db "100-continue"
 resp_100:       db "HTTP/1.1 100 Continue", 13, 10, 13, 10
 resp_100_len    equ $ - resp_100
@@ -687,13 +692,15 @@ linnea_http_handle:
     push r13
     push r14
     push r15
-    sub rsp, 528               ; +32 for the two precondition fields, +64 for the
+    sub rsp, 544               ; +32 for the two precondition fields, +64 for the
                                ; Accept-Encoding span array (h1-14): [352] holds
                                ; three (ptr,len) pairs, [400] the scan index, and
                                ; [416]/[424] the version token as the client wrote
                                ; it, for the access log, [432] and [480] three
                                ; (ptr,len) spans each for If-None-Match and
-                               ; If-Match, counted at [176] and [312]
+                               ; If-Match, counted at [176] and [312], and
+                               ; [528] the Max-Forwards value (bit 64 of the
+                               ; framing flags says whether one was sent)
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -1240,6 +1247,13 @@ linnea_http_handle:
     jnz .expect_header
     mov rdi, [rsp + 56]
     mov rsi, [rsp + 64]
+    lea rdx, [hn_max_forwards]
+    mov ecx, 12
+    call linnea_string_iequal
+    test eax, eax
+    jnz .mf_header
+    mov rdi, [rsp + 56]
+    mov rsi, [rsp + 64]
     lea rdx, [hn_if_match]
     mov ecx, 8
     call linnea_string_iequal
@@ -1270,6 +1284,26 @@ linnea_http_handle:
     mov [rsp + 88], rax
     mov rax, [rsp + 80]
     mov [rsp + 96], rax
+    jmp .header_next
+.mf_header:
+    ; RFC 9110 7.6.2: Max-Forwards limits how many intermediaries an OPTIONS or
+    ; TRACE may cross. At zero we are the final recipient and MUST answer
+    ; ourselves rather than forward; above zero we MUST forward a value one
+    ; lower. Neither happened -- the field was copied upstream untouched, so a
+    ; chain of proxies would circulate a request whose whole purpose is to stop
+    ; at a chosen hop. TRACE is refused outright now, so OPTIONS is the method
+    ; this serves (audit-report-33 follow-up).
+    ;
+    ; 1*DIGIT and nothing else, so a value that is not a number is a bad
+    ; request rather than a field to ignore: it asks for a hop count we cannot
+    ; work out.
+    mov rdi, [rsp + 72]
+    mov rsi, [rsp + 80]
+    call linnea_string_to_u64  ; -> rax = value, edx = 0 ok / 1 syntax / 2 range
+    test edx, edx
+    jnz .resp_400
+    mov [rsp + 528], rax
+    or qword [rsp + 136], 64   ; a Max-Forwards was sent
     jmp .header_next
 .expect_header:
     ; 100-continue is the only expectation defined, and the only one this server
@@ -1901,8 +1935,24 @@ linnea_http_handle:
     mov [rsp + 152], rax       ; five places downstream re-read the match here
     test rax, rax
     jz .resp_404               ; no location claims this path
+    ; TRACE reflects the request it received back to whoever sent it. At an
+    ; origin that is a curiosity; through a PROXY it hands the caller whatever
+    ; the request carried by the time it arrived -- its own credentials among
+    ; it, and any header an intermediary added. A static location has always
+    ; answered it 405 as a method it does not serve; a proxy location forwarded
+    ; it to a backend that might implement it. Refused here instead, before the
+    ; kinds diverge, so the answer no longer depends on which location matched.
+    ; It also settles Max-Forwards for TRACE: there is no hop to count to.
+    mov rdi, r14               ; the method text sits at in_buf[0)
+    mov rsi, [rsp + 104]
+    lea rdx, [method_trace]
+    mov ecx, 5
+    call linnea_string_equal   ; case-sensitive: a method is (RFC 9110 9.1)
+    test eax, eax
+    jnz .resp_405
+    mov rax, [rsp + 152]       ; linnea_string_equal took rax
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
-    je .proxy_start
+    je .proxy_max_forwards
     ; Past the proxy branch every answer is ours to make -- a file, a redirect,
     ; an error -- so an expectation we cannot meet is refused rather than
     ; ignored: serving the resource would tell the client by omission that it
@@ -2521,6 +2571,25 @@ linnea_http_handle:
 
 ; --- proxy location: rewrite the request and open the upstream socket ---
 ; The event loop takes it from here (connect, send, read the head back).
+.proxy_max_forwards:
+    ; RFC 9110 7.6.2: an OPTIONS carrying Max-Forwards: 0 has reached its final
+    ; recipient -- us -- and MUST NOT be forwarded. Above zero it goes on with a
+    ; value one lower, which the rewriter emits. Only OPTIONS reaches this with
+    ; the field meaning anything: TRACE is already refused above, and 7.6.2
+    ; leaves every other method free to ignore it.
+    test qword [rsp + 136], 64
+    jz .proxy_start            ; no Max-Forwards: nothing to count
+    mov rdi, r14
+    mov rsi, [rsp + 104]
+    lea rdx, [method_options]
+    mov ecx, 7
+    call linnea_string_equal
+    mov r11d, eax              ; .proxy_build takes the matched LOCATION from
+    mov rax, [rsp + 152]       ; rax, and the compare above returned into it
+    test r11d, r11d
+    jz .proxy_start            ; not OPTIONS: the field is not ours to act on
+    cmp qword [rsp + 528], 0
+    je .resp_options           ; zero hops left: we are the final recipient
 .proxy_start:
     ; A chunked body still arriving: capture it before anything is built or
     ; connected. The head cannot be rewritten yet — its Content-Length is the
@@ -2661,6 +2730,46 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jnz .proxy_next_line       ; ours replaces it
+    ; Max-Forwards goes on with one hop taken off it (RFC 9110 7.6.2), and only
+    ; for the method it counts for: OPTIONS. The zero case never reaches here --
+    ; it was answered before the upstream was chosen -- so the value is at least
+    ; one and the subtraction cannot wrap.
+    test qword [rsp + 136], 64
+    jz .not_max_forwards
+    mov rcx, [rsp + 56]
+    mov rax, r10
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_max_forwards]
+    mov ecx, 12
+    call linnea_string_iequal
+    test eax, eax
+    jz .not_max_forwards
+    push r10
+    mov rdi, r14
+    mov rsi, [rsp + 104 + 8]
+    lea rdx, [method_options]
+    mov ecx, 7
+    call linnea_string_equal
+    pop r10
+    test eax, eax
+    jz .proxy_copy_line        ; another method: forwarded untouched
+    lea rdi, [hdr_max_forwards]
+    mov esi, hdr_max_forwards_len
+    call .append
+    mov rdi, [rsp + 528]
+    dec rdi                    ; one hop taken; the zero case never gets here
+    lea rsi, [num_buf]
+    call linnea_string_from_u64   ; -> rax = digits written
+    lea rdi, [num_buf]
+    mov rsi, rax
+    call .append
+    lea rdi, [crlf]
+    mov esi, 2
+    call .append
+    jmp .proxy_next_line
+.not_max_forwards:
     ; The whole body is already buffered, so there is nothing left for the
     ; upstream to authorize: forwarding a 100-continue expectation would only
     ; invite a 100 Continue, which this exchange has no way to handle. That is
@@ -3000,7 +3109,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 528
+    add rsp, 544
     pop r15
     pop r14
     pop r13

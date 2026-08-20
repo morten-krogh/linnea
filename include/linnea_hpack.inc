@@ -132,6 +132,13 @@ struc linnea_h2_req
     ; origin it is a 417, because serving the resource anyway tells the client
     ; its expectation was met (audit-report-33).
     .expect_bad:  resq 1
+    ; RFC 9110 7.6.2: Max-Forwards counts the intermediaries an OPTIONS may
+    ; cross. Kept out of the rebuilt head and re-emitted by the proxy head
+    ; builder -- decremented for OPTIONS, unchanged for anything else -- the
+    ; same shape the joined Cookie line uses, so the collector's register
+    ; discipline is left alone.
+    .mf_val:      resq 1
+    .mf_seen:     resq 1
     .ius_ptr:     resq 1        ; if-unmodified-since value, 0 if absent
     .ius_len:     resq 1
     .rng_ptr:     resq 1        ; range value, 0 if absent

@@ -67,6 +67,7 @@ extern linnea_qpack_ccontrol_len
 extern linnea_config_match_location
 extern linnea_static_normalize
 extern linnea_static_open
+extern linnea_string_equal
 extern linnea_static_open_enc
 extern linnea_static_mime
 extern linnea_static_validators
@@ -98,6 +99,10 @@ body_405_len   equ $ - body_405
 body_425:      db "425 Too Early", 10
 body_425_len   equ $ - body_425
 body_417:      db "417 Expectation Failed", 10
+method_trace_h3:   db "TRACE"
+method_options_h3: db "OPTIONS"
+body_options_h3:   db "Allow: GET, HEAD, OPTIONS", 10
+body_options_h3_len equ $ - body_options_h3
 body_417_len   equ $ - body_417
 proto_h3: db "HTTP/3"
 proto_h3_len equ $ - proto_h3
@@ -1043,6 +1048,38 @@ linnea_h3_serve:
     call linnea_config_match_location
     test rax, rax
     jz .notfound                     ; no location claims this path
+    ; TRACE reflects the received request to whoever sent it; through a proxy
+    ; that hands the caller its own credentials. Refused before the kinds
+    ; diverge, so the answer does not depend on which location matched.
+    push rax
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    mov rsi, [rbx + linnea_h2_req.method_len]
+    lea rdx, [method_trace_h3]
+    mov ecx, 5
+    call linnea_string_equal
+    mov r11d, eax              ; the verdict; the pop below wants rax back
+    pop rax
+    test r11d, r11d
+    jnz .resp_405
+    ; RFC 9110 7.6.2: an OPTIONS carrying Max-Forwards: 0 has reached its final
+    ; recipient and MUST NOT be forwarded.
+    cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
+    jne .h3_mf_done
+    cmp qword [rbx + linnea_h2_req.mf_seen], 0
+    je .h3_mf_done
+    cmp qword [rbx + linnea_h2_req.mf_val], 0
+    jne .h3_mf_done
+    push rax
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    mov rsi, [rbx + linnea_h2_req.method_len]
+    lea rdx, [method_options_h3]
+    mov ecx, 7
+    call linnea_string_equal
+    mov r11d, eax
+    pop rax
+    test r11d, r11d
+    jnz .resp_options_final
+.h3_mf_done:
     ; every answer below is ours to make -- a file, a redirect, an error -- so
     ; an expectation we cannot meet is refused, not ignored. A proxy location
     ; forwards it instead, the backend being the one asked (audit-report-33).
@@ -1568,6 +1605,16 @@ linnea_h3_serve:
     mov ecx, txt_plain_len
     lea r8, [body_405]
     mov r9d, body_405_len
+    call linnea_h3_build_response
+    jmp .sret
+.resp_options_final:
+    ; the final recipient of an OPTIONS describes ITSELF (RFC 9110 9.3.7)
+    mov rdi, r12
+    mov esi, 200
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_options_h3]
+    mov r9d, body_options_h3_len
     call linnea_h3_build_response
     jmp .sret
 .resp_417:

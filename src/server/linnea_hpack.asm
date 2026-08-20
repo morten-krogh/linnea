@@ -71,6 +71,7 @@ hdr_pconn:      db "proxy-connection"
 hdr_tenc:       db "transfer-encoding"
 hdr_upg:        db "upgrade"
 hdr_cookie:     db "cookie"
+hdr_mf:         db "max-forwards"
 hdr_expect:     db "expect"
 expect_100_val: db "100-continue"
 
@@ -542,6 +543,8 @@ emit_field:
     je .rb_chk_host
     cmp rdx, 6
     je .rb_chk_cookie
+    cmp rdx, 12
+    je .rb_chk_mf
     cmp rdx, 7
     je .rb_chk_upg
     cmp rdx, 10
@@ -606,6 +609,36 @@ emit_field:
 .rb_ck_over:
     mov qword [rbx + linnea_h2_req.ck_len], -1
     jmp .no_rebuild
+.rb_chk_mf:
+    ; 12 characters, like "max-forwards". Recorded and kept out of the rebuild;
+    ; the proxy head builder re-emits it, decremented when the method is OPTIONS
+    ; (RFC 9110 7.6.2). A value that is not 1*DIGIT is a bad request, not a
+    ; field to ignore: it asks for a hop count we cannot work out.
+    push rsi
+    push rdi
+    lea r9, [hdr_mf]
+    call name_eq
+    jne .rb_mf_no
+    push rax
+    push rdx
+    mov rdi, [rsp + 24]              ; value ptr
+    mov rsi, [rsp + 16]              ; value len
+    call linnea_string_to_u64        ; -> rax = value, edx = 0 ok / 1 / 2
+    mov r11d, edx
+    mov r10, rax
+    pop rdx
+    pop rax
+    pop rdi
+    pop rsi
+    test r11d, r11d
+    jnz .ef_malformed
+    mov [rbx + linnea_h2_req.mf_val], r10
+    mov qword [rbx + linnea_h2_req.mf_seen], 1
+    jmp .no_rebuild
+.rb_mf_no:
+    pop rdi
+    pop rsi
+    jmp .rebuild
 .rb_chk_expect:
     push rsi
     push rdi

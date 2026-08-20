@@ -55,6 +55,16 @@ if [ "$ktls" = 1 ]; then
     # so one request served different bytes depending on the protocol.
     printf 'plain payload' > $WWW/aetest.txt
     printf 'br payload' > $WWW/aetest.txt.br
+    # Max-Forwards counts the hops an OPTIONS may cross, and TRACE reflects the
+    # request back to whoever sent it -- one is a directive addressed to the
+    # intermediary and was ignored, the other was forwarded to a backend that
+    # might implement it (audit-report-33 follow-up).
+    out=$(timeout 90 python3 test/tls/max_forwards_trace.py ${P61443} $CA $h3arg 2>&1)
+    rc=$?
+    first_fail=$(echo "$out" | grep -m1 FAIL)
+    [ $rc -eq 0 ]
+    check "Max-Forwards is counted and TRACE refused, on every protocol ${first_fail}" $?
+
     out=$(timeout 90 python3 test/tls/conditional_field_dups.py ${P61443} $CA $h3arg 2>&1)
     rc=$?
     first_fail=$(echo "$out" | grep -m1 FAIL)

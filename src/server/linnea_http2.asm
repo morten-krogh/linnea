@@ -1586,8 +1586,36 @@ h2_serve:
     test rax, rax
     jz .resp_404
     mov [rsp + S_LOC], rax
+    ; TRACE reflects the received request to whoever sent it; through a proxy
+    ; that hands the caller its own credentials and anything an intermediary
+    ; added. Refused before the kinds diverge, so the answer does not depend on
+    ; which location matched (audit-report-33 follow-up).
+    mov rdi, [r12 + linnea_h2_req.method_ptr]
+    mov rsi, [r12 + linnea_h2_req.method_len]
+    lea rdx, [method_trace_h2]
+    mov ecx, 5
+    call linnea_string_equal
+    test eax, eax
+    jnz .resp_405
+    mov rax, [rsp + S_LOC]           ; the compare returned into rax
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
+    jne .h2_not_proxy
+    ; RFC 9110 7.6.2: an OPTIONS carrying Max-Forwards: 0 has reached its final
+    ; recipient and MUST NOT be forwarded; we answer for ourselves.
+    cmp qword [r12 + linnea_h2_req.mf_seen], 0
     je .serve_proxy
+    cmp qword [r12 + linnea_h2_req.mf_val], 0
+    jne .serve_proxy
+    mov rdi, [r12 + linnea_h2_req.method_ptr]
+    mov rsi, [r12 + linnea_h2_req.method_len]
+    lea rdx, [method_options_h2]
+    mov ecx, 7
+    call linnea_string_equal
+    test eax, eax
+    jnz .h2_options_final
+    jmp .serve_proxy
+.h2_not_proxy:
+    mov rax, [rsp + S_LOC]
     ; Past the proxy branch every answer is ours to make, so an expectation we
     ; cannot meet is refused rather than ignored: serving the resource would
     ; tell the client by omission that it had been honoured. A proxy location
@@ -2109,6 +2137,42 @@ h2_serve:
     inc rax                          ; overflow sentinel: the check below fails it
     mov [r12 + linnea_h2_req.hb_cur], rax
 .sp_cookies_done:
+    ; ...and Max-Forwards, kept out of the rebuild so it could be re-emitted
+    ; here: one hop fewer for an OPTIONS (RFC 9110 7.6.2), untouched for any
+    ; other method, which 7.6.2 leaves free to ignore it. The zero case never
+    ; reaches here -- it was answered before the upstream was chosen -- so the
+    ; subtraction cannot wrap.
+    cmp qword [r12 + linnea_h2_req.mf_seen], 0
+    je .sp_mf_done
+    ; the value first, while nothing else is held: is this an OPTIONS?
+    mov rdi, [r12 + linnea_h2_req.method_ptr]
+    mov rsi, [r12 + linnea_h2_req.method_len]
+    lea rdx, [method_options_h2]
+    mov ecx, 7
+    call linnea_string_equal
+    mov rdi, [r12 + linnea_h2_req.mf_val]
+    test eax, eax
+    jz .sp_mf_render
+    dec rdi                          ; one hop taken
+.sp_mf_render:
+    lea rsi, [mf_num_buf]
+    call linnea_string_from_u64      ; -> rax = digits written
+    mov rdx, rax                     ; hold the digit count across the bound
+    mov rdi, [r12 + linnea_h2_req.hb_cur]
+    lea rax, [rdi + rdx]
+    add rax, mf_hdr_name_len + 2
+    cmp rax, [r12 + linnea_h2_req.hb_end]
+    ja .resp_431
+    lea rsi, [mf_hdr_name]
+    mov rcx, mf_hdr_name_len
+    rep movsb
+    lea rsi, [mf_num_buf]
+    mov rcx, rdx
+    rep movsb
+    mov word [rdi], 0x0a0d           ; CRLF
+    add rdi, 2
+    mov [r12 + linnea_h2_req.hb_cur], rdi
+.sp_mf_done:
     mov rax, [r12 + linnea_h2_req.hb_cur]
     cmp rax, [r12 + linnea_h2_req.hb_end]
     ja .resp_431                     ; rebuilt header block overflowed
@@ -2366,6 +2430,12 @@ h2_serve:
     lea rax, [status_431_h2]
     lea r14, [body_431]
     mov r15d, body_431_len
+    jmp .error
+.h2_options_final:
+    ; the final recipient of an OPTIONS describes ITSELF (RFC 9110 9.3.7)
+    lea rax, [status_200_h2]
+    lea r14, [body_options_h2]
+    mov r15d, body_options_h2_len
     jmp .error
 .resp_417:
     lea rax, [status_417_h2]
@@ -5931,6 +6001,12 @@ h2_nosniff_val_len equ $ - h2_nosniff_val
 status_301_h2:   db "301"
 status_421_h2:   db "421"
 status_429_h2:   db "429"
+method_options_h2: db "OPTIONS"
+method_trace_h2:   db "TRACE"
+body_options_h2:   db "Allow: GET, HEAD, OPTIONS", 10
+body_options_h2_len equ $ - body_options_h2
+mf_hdr_name:     db "Max-Forwards: "
+mf_hdr_name_len  equ $ - mf_hdr_name
 status_417_h2:   db "417"
 status_431_h2:   db "431"
 body_429: db "429 Too Many Requests", 10
@@ -6014,6 +6090,7 @@ body_405: db "405 Method Not Allowed", 10
 body_405_len equ $ - body_405
 
 section .bss
+mf_num_buf: resb 24              ; the re-emitted Max-Forwards value
 h2_path_buf:  resb LINNEA_HTTP2_PATH_BUF
 h2_goaway_code: resd 1                ; the code the GOAWAY below reports
 h2_err_conn:  resq 1                  ; the connection an inline error is answering

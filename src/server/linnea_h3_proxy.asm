@@ -53,6 +53,7 @@ extern linnea_upstream_closed
 extern linnea_upstream_count
 extern linnea_upstream_limit
 extern linnea_config_instance
+extern linnea_string_equal
 extern linnea_string_from_u64
 extern linnea_string_to_u64
 extern linnea_http_upstream_head_valid
@@ -112,6 +113,9 @@ http11_host_len equ $ - http11_host
 h3_ck_hdr:     db "Cookie: "
 h3_ck_hdr_len  equ $ - h3_ck_hdr
 h3_ck_crlf:    db 13, 10
+h3_mf_hdr:     db "Max-Forwards: "
+h3_mf_hdr_len  equ $ - h3_mf_hdr
+h3_mf_options: db "OPTIONS"
 hdr_clen:      db "Content-Length: "
 hdr_clen_len   equ $ - hdr_clen
 ; RFC 9110 7.6.3: name the hop and the protocol it was received on. The client
@@ -349,6 +353,35 @@ linnea_h3_proxy_start:
     ; shortened Cookie is a different request. The h2 path answers 431 here.
     jmp .st_431
 .st_cookies_done:
+    ; ...and Max-Forwards, kept out of the rebuild so it can be re-emitted with
+    ; one hop taken off for an OPTIONS (RFC 9110 7.6.2) and untouched for any
+    ; other method. The zero case never reaches here: it was answered before an
+    ; upstream was chosen, so the subtraction cannot wrap.
+    cmp qword [rbx + linnea_h2_req.mf_seen], 0
+    je .st_mf_done
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    mov rsi, [rbx + linnea_h2_req.method_len]
+    lea rdx, [h3_mf_options]
+    mov ecx, 7
+    call linnea_string_equal
+    mov rdi, [rbx + linnea_h2_req.mf_val]
+    test eax, eax
+    jz .st_mf_render
+    dec rdi
+.st_mf_render:
+    lea rsi, [num_buf]
+    call linnea_string_from_u64      ; -> rax = digits written
+    mov r13, rax
+    lea rdi, [h3_mf_hdr]
+    mov esi, h3_mf_hdr_len
+    call .up_append
+    lea rdi, [num_buf]
+    mov rsi, r13
+    call .up_append
+    lea rdi, [h3_ck_crlf]
+    mov esi, 2
+    call .up_append
+.st_mf_done:
     ; Content-Length is ours to declare: the body is whole and counted here,
     ; whatever framing (or none) the client used to send it.
     mov r13, [linnea_h3_proxy_body_len]
