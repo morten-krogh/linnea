@@ -368,11 +368,11 @@ log_from:       db " from "
 log_from_len    equ $ - log_from
 log_quote:      db ' "'
 log_endq:       db '" '
-; the protocol closes the quoted request, as the Common Log Format has it.
-; Every request this handler accepts is HTTP/1.1 — the version check admits
-; nothing else — so it is a constant here.
-log_proto11:    db " HTTP/1.1"
-log_proto11_len equ $ - log_proto11
+; the protocol closes the quoted request, as the Common Log Format has it. It
+; is written from the request line, not from a constant: the version check
+; admits 1.0 and 1.2-1.9 as well as 1.1, and 505 exists precisely to answer a
+; version this server does not implement -- so a constant made the log silent
+; about the one field the status was about.
 log_dash:       db "-"
 log_sp:         db " "
 log_nl:         db 10
@@ -775,9 +775,11 @@ linnea_http_handle:
     push r13
     push r14
     push r15
-    sub rsp, 416               ; +32 for the two precondition fields, +64 for the
+    sub rsp, 432               ; +32 for the two precondition fields, +64 for the
                                ; Accept-Encoding span array (h1-14): [352] holds
-                               ; three (ptr,len) pairs, [400] the scan index
+                               ; three (ptr,len) pairs, [400] the scan index, and
+                               ; [416]/[424] the version token as the client wrote
+                               ; it, for the access log
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -792,6 +794,7 @@ linnea_http_handle:
     mov qword [rsp + 128], 0   ; no body
     mov qword [rsp + 136], 0   ; no Content-Length/Transfer-Encoding seen
     mov qword [rsp + 144], 0   ; no raw target yet
+    mov qword [rsp + 416], 0   ; ...and no version token yet
     mov qword [rsp + 176], 0   ; no If-None-Match yet
     mov qword [rsp + 192], 0   ; no If-Modified-Since yet
     mov qword [rsp + 208], 0   ; no Accept-Encoding lines yet (a count, h1-14)
@@ -1010,6 +1013,21 @@ linnea_http_handle:
     lea rax, [r15 + 8]
     cmp rax, r13
     ja .resp_400
+    ; Keep the token for the access log before anything is decided about it.
+    ; That log wrote a fixed " HTTP/1.1" for every HTTP/1 request, so a 1.0
+    ; request was recorded as 1.1 and -- worse -- the one status that IS about
+    ; the version said nothing about it: an HTTP/2 connection preface,
+    ; "PRI * HTTP/2.0", is correctly answered 505 and was logged as
+    ; `"PRI * HTTP/1.1" 505`, a line this server cannot produce, since that
+    ; literal request is a 400. Found from a production 5xx alert where the
+    ; logged line was the only evidence and it described a message nobody sent.
+    ;
+    ; Eight bytes because every version this grammar admits is exactly
+    ; "HTTP/x.y". A longer one fails the CRLF check below and is a 400 whose
+    ; logged version is its first eight bytes.
+    lea rcx, [r14 + r15]
+    mov [rsp + 416], rcx
+    mov qword [rsp + 424], 8
     mov rax, [r14 + r15]
     mov rcx, [version_11]
     cmp rax, rcx
@@ -2861,8 +2879,16 @@ linnea_http_handle:
     mov esi, 1
 .log_target:
     call linnea_log_write
-    lea rdi, [log_proto11]
-    mov esi, log_proto11_len
+    lea rdi, [log_sp]
+    mov esi, 1
+    call linnea_log_write
+    mov rdi, [rsp + 416]
+    mov rsi, [rsp + 424]
+    test rdi, rdi
+    jnz .log_version
+    lea rdi, [log_dash]        ; the line never got as far as a version
+    mov esi, 1
+.log_version:
     call linnea_log_write
     lea rdi, [log_endq]
     mov esi, 2
@@ -2881,7 +2907,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 416
+    add rsp, 432
     pop r15
     pop r14
     pop r13
@@ -3241,7 +3267,8 @@ linnea_http_log_conn:
     push r13
     push r14
     push r15
-    sub rsp, 32
+    sub rsp, 48                ; [32]/[40]: the version token, scanned like the
+                               ; method and target rather than assumed
     mov rbx, rdi
     mov [rsp], rsi             ; status
     mov [rsp + 8], rdx         ; body bytes
@@ -3266,6 +3293,27 @@ linnea_http_log_conn:
     inc r15
     jmp .target_scan
 .target_done:
+    ; The version is the rest of the line, and it is re-derived here for the
+    ; same reason the method and target are: this logger writes what arrived.
+    ; It used to write a constant, which made every version but 1.1 a fiction.
+    mov qword [rsp + 32], 0    ; no version on the line
+    lea rax, [r15 + 1]
+    cmp rax, [rbx + linnea_connection.in_len]
+    jae .no_version            ; the line ended at the target
+    lea rcx, [r14 + rax]
+    mov [rsp + 32], rcx        ; version ptr
+    mov rcx, rax               ; ...and it runs to the CR, or to what arrived
+.version_scan:
+    cmp rcx, [rbx + linnea_connection.in_len]
+    jae .version_end
+    cmp byte [r14 + rcx], 13
+    je .version_end
+    inc rcx
+    jmp .version_scan
+.version_end:
+    sub rcx, rax
+    mov [rsp + 40], rcx        ; version len
+.no_version:
     sub r15, r13
     mov [rsp + 24], r15        ; target len
     add r13, r14               ; target ptr
@@ -3308,8 +3356,16 @@ linnea_http_log_conn:
     mov rdi, r13
     mov rsi, [rsp + 24]
     call linnea_log_write
-    lea rdi, [log_proto11]
-    mov esi, log_proto11_len
+    lea rdi, [log_sp]
+    mov esi, 1
+    call linnea_log_write
+    mov rdi, [rsp + 32]
+    mov rsi, [rsp + 40]
+    test rdi, rdi
+    jnz .lc_version
+    lea rdi, [log_dash]
+    mov esi, 1
+.lc_version:
     call linnea_log_write
     lea rdi, [log_endq]
     mov esi, 2
@@ -3324,7 +3380,7 @@ linnea_http_log_conn:
     lea rdi, [log_nl]
     mov esi, 1
     call linnea_log_write
-    add rsp, 32
+    add rsp, 48
     pop r15
     pop r14
     pop r13

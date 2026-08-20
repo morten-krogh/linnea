@@ -323,6 +323,25 @@ check "request log 405" $?
 grep -qE '^\[20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\] request' "$LOG"
 check "log timestamps" $?
 
+# ...and the version in that line is the one the client sent, not a constant.
+# Every check above uses curl, which speaks 1.1, so all of them passed while
+# the log wrote " HTTP/1.1" for a 1.0 request and for the HTTP/2 preface it
+# answers 505 -- `"PRI * HTTP/1.1" 505` being a line this server cannot
+# produce, since that literal request is a 400.
+out=$(timeout 30 python3 test/h1_log_version.py ${P61080} 2>&1 | tail -1)
+[ "$out" = "OK" ]
+check "log version: the requests themselves are answered as expected ($out)" $?
+grep -qF '"GET /hello.txt HTTP/1.0" 200' "$LOG"
+check "log version: 1.0 is logged as 1.0" $?
+grep -qF '"GET /hello.txt HTTP/1.2" 200' "$LOG"
+check "log version: 1.2 is logged as 1.2, not as the 1.1 it is treated as" $?
+grep -qF '"PRI * HTTP/2.0" 505' "$LOG"
+check "log version: the HTTP/2 preface is logged as what it was" $?
+grep -qF '"GET /hello.txt HTTP/3.0" 505' "$LOG"
+check "log version: an unimplemented major version survives into the log" $?
+grep -qF '"GET /api/simple HTTP/1.0" 200' "$LOG"
+check "log version: the proxy's own log line carries it too" $?
+
 # --- keep-alive: two requests, one connection (count accepts in the log) ---
 before=$(grep -c "accepted connection" "$LOG")
 resp=$(curl -s --max-time 4 http://127.0.0.1:${P61080}/hello.txt http://127.0.0.1:${P61080}/index.html)
