@@ -127,6 +127,11 @@ struc linnea_h2_req
     ; is merely one we will not answer. The serve path reads this before it does
     ; anything else and returns 431.
     .etag_over:   resq 1
+    ; 1 when the request carried an Expect value that is not 100-continue.
+    ; A proxy location forwards it for the backend to judge; where we are the
+    ; origin it is a 417, because serving the resource anyway tells the client
+    ; its expectation was met (audit-report-33).
+    .expect_bad:  resq 1
     .ius_ptr:     resq 1        ; if-unmodified-since value, 0 if absent
     .ius_len:     resq 1
     .rng_ptr:     resq 1        ; range value, 0 if absent

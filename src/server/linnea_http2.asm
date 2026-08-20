@@ -1588,6 +1588,12 @@ h2_serve:
     mov [rsp + S_LOC], rax
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
     je .serve_proxy
+    ; Past the proxy branch every answer is ours to make, so an expectation we
+    ; cannot meet is refused rather than ignored: serving the resource would
+    ; tell the client by omission that it had been honoured. A proxy location
+    ; has already branched away and forwards it (audit-report-33).
+    cmp qword [r12 + linnea_h2_req.expect_bad], 0
+    jne .resp_417
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
     je .serve_redirect
     ; static files answer GET and HEAD only
@@ -2360,6 +2366,11 @@ h2_serve:
     lea rax, [status_431_h2]
     lea r14, [body_431]
     mov r15d, body_431_len
+    jmp .error
+.resp_417:
+    lea rax, [status_417_h2]
+    lea r14, [body_417]
+    mov r15d, body_417_len
     jmp .error
 
 .h2_304:
@@ -5920,6 +5931,7 @@ h2_nosniff_val_len equ $ - h2_nosniff_val
 status_301_h2:   db "301"
 status_421_h2:   db "421"
 status_429_h2:   db "429"
+status_417_h2:   db "417"
 status_431_h2:   db "431"
 body_429: db "429 Too Many Requests", 10
 body_429_len equ $ - body_429
@@ -5937,6 +5949,8 @@ body_421_h2: db "421 Misdirected Request", 10
 body_421_h2_len equ $ - body_421_h2
 body_413: db "413 Content Too Large", 10
 body_413_len equ $ - body_413
+body_417: db "417 Expectation Failed", 10
+body_417_len equ $ - body_417
 ; --- proxy-over-h2 literals ---
 h2p_http11:      db " HTTP/1.1", 13, 10, "Host: "
 h2p_http11_len   equ $ - h2p_http11

@@ -635,7 +635,10 @@ emit_field:
     pop rdi
     pop rsi
     test r11d, r11d
-    jz .rebuild                      ; a different expectation: forward it
+    jnz .rb_expect_100
+    mov qword [rbx + linnea_h2_req.expect_bad], 1   ; 417 if we are the origin
+    jmp .rebuild                     ; a different expectation: forward it
+.rb_expect_100:
     mov qword [rbx + linnea_h2_req.expect_100], 1
     jmp .no_rebuild                  ; stripped: we generate the 100 ourselves
 .rb_expect_no:

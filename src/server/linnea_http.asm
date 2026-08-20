@@ -188,6 +188,15 @@ resp_413:       db "HTTP/1.1 413 Content Too Large", 13, 10
                 db "Content-Length: 0", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_413_len    equ $ - resp_413
+; RFC 9110 15.5.18: an expectation this server cannot meet. Only 100-continue
+; is defined, and only a proxy location can pass another one on for a backend
+; to judge; where we ARE the origin, serving the resource anyway would tell the
+; client its expectation was met (audit-report-33).
+resp_417:       db "HTTP/1.1 417 Expectation Failed", 13, 10
+                db "Server: linnea", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_417_len    equ $ - resp_417
 resp_414:       db "HTTP/1.1 414 URI Too Long", 13, 10
                 db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
@@ -1263,15 +1272,27 @@ linnea_http_handle:
     mov [rsp + 96], rax
     jmp .header_next
 .expect_header:
-    ; the only expectation defined is 100-continue (10.1.1); any other value
-    ; would be a 417, and none exists to send
+    ; 100-continue is the only expectation defined, and the only one this server
+    ; can meet. Another one used to fall through to ordinary processing, which
+    ; served the resource and told the client by omission that its expectation
+    ; had been honoured. Recorded here and answered 417 at the static branch;
+    ; a PROXY location still forwards it, because there the backend is the one
+    ; being asked and it may well be able to meet it (audit-report-33).
+    ;
+    ; The whole value is compared, so a list -- "100-continue, feature-x" -- is
+    ; an unsupported expectation, not a recognised one with something extra:
+    ; a value we do not understand in full is one we cannot promise to meet.
+    ; h2 and h3 compare the same way, which is what keeps the three agreeing.
     mov rdi, [rsp + 72]
     mov rsi, [rsp + 80]
     lea rdx, [hv_100_continue]
     mov ecx, 12
     call linnea_string_iequal
     test eax, eax
-    jz .header_next
+    jnz .expect_100_seen
+    or qword [rsp + 232], 8    ; an expectation we cannot meet (2 is Upgrade's)
+    jmp .header_next
+.expect_100_seen:
     ; RFC 9110 10.1.1: a server "MUST NOT send a 100 (Continue) response to an
     ; HTTP/1.0 client", which has no way to understand it -- the interim status
     ; would be read as the final one and the response as garbage. A 1.0 client
@@ -1882,6 +1903,14 @@ linnea_http_handle:
     jz .resp_404               ; no location claims this path
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
     je .proxy_start
+    ; Past the proxy branch every answer is ours to make -- a file, a redirect,
+    ; an error -- so an expectation we cannot meet is refused rather than
+    ; ignored: serving the resource would tell the client by omission that it
+    ; had been honoured. A PROXY location has already branched away above and
+    ; forwards it, because there the backend is the one being asked
+    ; (audit-report-33).
+    test qword [rsp + 232], 8
+    jnz .resp_417
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
     je .redirect_check
 
@@ -2854,6 +2883,11 @@ linnea_http_handle:
     lea rax, [resp_413]
     mov ecx, resp_413_len
     mov qword [rsp + 112], 413
+    jmp .resp_static
+.resp_417:
+    lea rax, [resp_417]
+    mov ecx, resp_417_len
+    mov qword [rsp + 112], 417
     jmp .resp_static
 .resp_414:
     lea rax, [resp_414]

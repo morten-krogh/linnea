@@ -177,4 +177,28 @@ expect_case("Expect: 100-continue never reaches the backend",
 expect_case("an unknown expectation is forwarded for the backend to refuse",
             ["Expect: other-expectation"], 1)
 
+# --- ...and where WE are the origin, we refuse it ourselves -------------------
+# 100-continue is the only expectation this server can meet. Another one used to
+# fall through to ordinary processing: the resource was served, which tells the
+# client by omission that its expectation was honoured (audit-report-33). A
+# proxy location still forwards it, because there the backend is the one asked
+# and may well be able to meet it -- which is the whole distinction.
+case("an unknown expectation on a static path is 417",
+     ["Expect: feature-x"], "417")
+case("...and on a redirect, which is equally our own answer",
+     ["Expect: feature-x"], "417", path="/old")
+case("...but a proxy location forwards it instead of refusing",
+     ["Expect: feature-x"], "200", path="/api/simple")
+case("100-continue alone is still met, not refused",
+     ["Expect: 100-continue"], "200")
+case("a redirect without one still redirects",
+     [], "301", path="/old")
+# a value we do not understand IN FULL is one we cannot promise to meet, so a
+# recognised member cannot conceal an unsupported one -- in a list or on a
+# second field line
+case("a list carrying an unknown member is 417",
+     ["Expect: 100-continue, feature-x"], "417")
+case("a second line carrying an unknown member is 417",
+     ["Expect: 100-continue", "Expect: feature-x"], "417")
+
 sys.exit(1 if fails else 0)

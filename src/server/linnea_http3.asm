@@ -97,6 +97,8 @@ body_405:      db "405 Method Not Allowed", 10
 body_405_len   equ $ - body_405
 body_425:      db "425 Too Early", 10
 body_425_len   equ $ - body_425
+body_417:      db "417 Expectation Failed", 10
+body_417_len   equ $ - body_417
 proto_h3: db "HTTP/3"
 proto_h3_len equ $ - proto_h3
 body_421: db "421 Misdirected Request", 10
@@ -1041,6 +1043,14 @@ linnea_h3_serve:
     call linnea_config_match_location
     test rax, rax
     jz .notfound                     ; no location claims this path
+    ; every answer below is ours to make -- a file, a redirect, an error -- so
+    ; an expectation we cannot meet is refused, not ignored. A proxy location
+    ; forwards it instead, the backend being the one asked (audit-report-33).
+    cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
+    je .h3_expect_ok
+    cmp qword [rbx + linnea_h2_req.expect_bad], 0
+    jne .resp_417
+.h3_expect_ok:
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_REDIRECT
     je .redirect
     cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
@@ -1558,6 +1568,15 @@ linnea_h3_serve:
     mov ecx, txt_plain_len
     lea r8, [body_405]
     mov r9d, body_405_len
+    call linnea_h3_build_response
+    jmp .sret
+.resp_417:
+    mov rdi, r12
+    mov esi, 417
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_417]
+    mov r9d, body_417_len
     call linnea_h3_build_response
     jmp .sret
 .resp_425:
