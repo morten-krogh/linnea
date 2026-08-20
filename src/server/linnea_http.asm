@@ -425,6 +425,20 @@ hn_if_unmod:    db "if-unmodified-since"
 ; own Upgrade header has to reach the client through the copy loop for the
 ; handshake to complete. Connection and Transfer-Encoding are absent too — both
 ; are already handled where the rewriters replace them.
+; RFC 9110 gives each of these a single-value grammar, so a second line is a
+; message that contradicts itself. One byte of length, one of bit, then the
+; name -- the bit avoids a variable shift, which would want cl and the line
+; cursor lives in rcx.
+hv_singletons:
+    db 12, 0x01, "content-type"
+    db  8, 0x02, "location"
+    db  4, 0x04, "etag"
+    db 13, 0x08, "last-modified"
+    db  7, 0x10, "expires"
+    db  3, 0x20, "age"
+    db 11, 0x40, "retry-after"
+    db 13, 0x80, "content-range"
+    db  0, 0
 hop_by_hop_names:
     db 10, "keep-alive"
     db  2, "te"
@@ -3772,13 +3786,16 @@ linnea_http_upstream_head_valid:
     push r14
     push r15
     push rbp
-    sub rsp, 40                       ; [rsp]=cl seen flag, [rsp+8]=cl value,
-                                      ; [rsp+16]=status, [rsp+24]=TE line count
+    sub rsp, 56                       ; [rsp]=cl seen flag, [rsp+8]=cl value,
+                                      ; [rsp+16]=status, [rsp+24]=TE line count,
+                                      ; [rsp+32]=singleton fields seen (bitmask),
+                                      ; [rsp+40]=the line cursor across that scan
     mov r12, rdi                      ; head buf
     mov r13, rsi                      ; head length
     mov qword [rsp], 0                ; no Content-Length seen yet
     mov qword [rsp + 16], 0
     mov qword [rsp + 24], 0
+    mov qword [rsp + 32], 0           ; no singleton field seen yet
     xor rcx, rcx                      ; cursor
     ; --- the status line itself ------------------------------------------
     ; This used to be skipped outright, and only HTTP/1 checked it afterwards
@@ -3943,6 +3960,48 @@ linnea_http_upstream_head_valid:
     inc rcx
     jmp .hv_value
 .hv_value_end:
+    ; --- fields that may appear at most once -----------------------------
+    ; Each of these defines ONE value: a media type, a target, a validator, a
+    ; date. Two of them are a message that says two different things, and this
+    ; gate relayed both onward -- a 302 carrying `Location: /one` and
+    ; `Location: /two` reached the client with both, and clients disagree about
+    ; which to follow, so a cache and a browser can end up at different URLs.
+    ; The duplicate Content-Length beside them has been refused since report 6;
+    ; nothing else was. Found by sweeping repeated RESPONSE fields after the
+    ; request-side sweep that produced reports 28-32.
+    ;
+    ; Content-Length is deliberately absent from the table: two identical
+    ; lengths describe the same body and are reconciled below, which is a
+    ; different rule from "this field cannot repeat".
+    mov [rsp + 40], rcx               ; iequal does not promise the cursor
+    lea rbx, [hv_singletons]
+.hv_sing_loop:
+    movzx eax, byte [rbx]
+    test eax, eax
+    jz .hv_sing_done
+    cmp rax, rbp
+    jne .hv_sing_next
+    push rbx
+    lea rdi, [r12 + r15]
+    sub rdi, rbp                      ; the field name
+    mov rsi, rbp
+    lea rdx, [rbx + 2]
+    mov ecx, eax
+    call linnea_string_iequal
+    pop rbx
+    test eax, eax
+    jnz .hv_sing_hit
+.hv_sing_next:
+    movzx eax, byte [rbx]
+    lea rbx, [rbx + rax + 2]
+    jmp .hv_sing_loop
+.hv_sing_hit:
+    movzx eax, byte [rbx + 1]         ; this field's bit, so no shift is needed
+    test [rsp + 32], rax              ; ...and the cursor in rcx stays put
+    jnz .hv_bad                       ; a second one: two answers to one question
+    or [rsp + 32], rax
+.hv_sing_done:
+    mov rcx, [rsp + 40]
     ; a Transfer-Encoding line, noted only so the 205 rule below can see it
     cmp rbp, 17
     jne .hv_not_te
@@ -4144,7 +4203,7 @@ linnea_http_upstream_head_valid:
 .hv_bad:
     xor eax, eax
 .hv_ret:
-    add rsp, 40
+    add rsp, 56
     pop rbp
     pop r15
     pop r14

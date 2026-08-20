@@ -264,6 +264,30 @@ def respond(conn, head, body, extra=b""):
         conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
         time.sleep(0.3)
         conn.sendall(b"4;=bad\r\nbody\r\n0\r\n\r\n")
+    elif path.rsplit(b"/", 1)[1].startswith(b"dup"):
+        # A field RFC 9110 gives a single-value grammar, sent twice. Two of them
+        # are a message that says two different things, and this proxy used to
+        # relay both onward: a 302 carrying two Locations reached the client
+        # with both, and clients disagree about which to follow. The duplicate
+        # Content-Length beside them has been refused since report 6; nothing
+        # else was. The last two rows are the control -- a LIST field repeats
+        # legally and both values must still arrive.
+        name = {b"dupctype": b"Content-Type", b"duploc": b"Location",
+                b"dupetag": b"ETag", b"duplastmod": b"Last-Modified",
+                b"dupexpires": b"Expires", b"dupage": b"Age",
+                b"dupretry": b"Retry-After", b"dupcrange": b"Content-Range",
+                b"dupvary": b"Vary", b"dupcookie": b"Set-Cookie",
+                }[path.rsplit(b"/", 1)[1]]
+        vals = {b"Age": (b"1", b"2"), b"Retry-After": (b"1", b"2"),
+                b"Content-Range": (b"bytes 0-0/4", b"bytes 1-1/4"),
+                b"Expires": (b"Wed, 01 Jan 2020 00:00:00 GMT",
+                             b"Fri, 01 Jan 2100 00:00:00 GMT"),
+                b"Last-Modified": (b"Wed, 01 Jan 2020 00:00:00 GMT",
+                                   b"Fri, 01 Jan 2100 00:00:00 GMT"),
+                }.get(name, (b"one", b"two"))
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                     b"%s: %s\r\n%s: %s\r\n\r\nbody"
+                     % (name, vals[0], name, vals[1]))
     elif path.endswith(b"/chunkkeepalive"):
         # A COMPLETE chunked response, and then the socket is held open. linnea
         # asks every backend for Connection: close, so almost all of them close

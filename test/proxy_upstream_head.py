@@ -252,6 +252,26 @@ CASES = [
     ("chunkextunterm",    502, None),
     ("chunkextquoted",    200, b"body"),
     ("chunkextbws",       200, b"body"),
+    # Fields RFC 9110 gives a single-value grammar: a second line is a message
+    # that says two different things, and this gate relayed both onward -- a 302
+    # with two Locations reached the client with both, and clients disagree
+    # about which to follow. cldupe above is the contrast: two IDENTICAL lengths
+    # describe the same body and are reconciled, which is a different rule from
+    # "this field cannot repeat". Found by sweeping repeated RESPONSE fields
+    # after the request-side sweep behind reports 28-32.
+    ("dupctype",   502, None),
+    ("duploc",     502, None),
+    ("dupetag",    502, None),
+    ("duplastmod", 502, None),
+    ("dupexpires", 502, None),
+    ("dupage",     502, None),
+    ("dupretry",   502, None),
+    ("dupcrange",  502, None),
+    # ...and the controls: a LIST field repeats legally, so both values must
+    # still arrive. Without these the rule could become "any repeat is bad",
+    # which would break every backend that sets two cookies.
+    ("dupvary",    200, b"body"),
+    ("dupcookie",  200, b"body"),
     ("simple",     200, b"backend body"),
 ]
 
