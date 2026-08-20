@@ -359,7 +359,9 @@ EOF
     #
     # Reuse is invisible from the client: same status, same body, same headers
     # either way. Every check reads the BACKEND's accept counter, which is the
-    # only direct evidence there is.
+    # only direct evidence there is. Driven over all three protocols, because
+    # h1, h2 and h3 each build their own upstream head and each had to be
+    # taught the same rule.
     python3 test/marker_backend.py ${P61481} A >/dev/null 2>&1 &
     ka_a=$!
     python3 test/rude_backend.py ${P61484} >/dev/null 2>&1 &
@@ -369,6 +371,7 @@ EOF
     cat > "$kt" <<EOF
 { "log": "$PWD/$RUNDIR/keepalive.log", "timeout": 5, "workers": 1,
   "servers": [ { "host": "127.0.0.1", "port": ${P61485}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
     "locations": [
       { "prefix": "/ka",   "proxy": "127.0.0.1:${P61481}", "proxy_keepalive": 1 },
       { "prefix": "/noka", "proxy": "127.0.0.1:${P61481}" },
@@ -377,12 +380,13 @@ EOF
 EOF
     start_server "$kt"
     kt_pid=$SRV_PID
-    out=$(timeout 120 python3 test/upstream_keepalive.py ${P61485} ${P61481} ${P61484} 2>&1)
+    out=$(timeout 200 python3 test/tls/upstream_keepalive.py ${P61485} $CA \
+          ${P61481} ${P61484} $h3arg 2>&1)
     rc=$?
     first_fail=$(echo "$out" | grep -m1 FAIL)
     kill $ka_a $ka_r 2>/dev/null
     [ $rc -eq 0 ]
-    check "upstream connections are reused, and not when reuse would be unsafe ${first_fail}" $?
+    check "upstream connections are reused on every protocol, and not when reuse would be unsafe ${first_fail}" $?
     kill $kt_pid 2>/dev/null
     wait $kt_pid 2>/dev/null
     rm -f "$kt"

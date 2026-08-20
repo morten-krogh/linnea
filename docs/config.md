@@ -288,6 +288,9 @@ liveness before it is reused. Keep your backend's own idle timeout above that,
 or it will close first and every reuse will race its `FIN`. Each worker holds at
 most 32 idle upstream connections in total.
 
+All three protocols reuse: an HTTP/1, HTTP/2 or HTTP/3 client reaching a
+keep-alive location is served over the same pool.
+
 What it is worth depends on what your backend pays per connection, not on TCP.
 Against a backend that spawns a thread or forks per connection the saving is
 large; against one with a pre-forked pool it is closer to the cost of the

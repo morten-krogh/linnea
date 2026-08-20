@@ -49,6 +49,7 @@ LINNEA_UP_POOL_SLOTS equ 32
 ; cheap half of the defence; the liveness peek in _take is the other half.
 LINNEA_UP_IDLE_NS    equ 5000000000
 
+global linnea_upstream_method_safe
 global linnea_upstream_park
 global linnea_upstream_take
 global linnea_upstream_pool_close
@@ -247,6 +248,39 @@ linnea_upstream_mark_fail:
     pop rbx
     ret
 
+
+; linnea_upstream_method_safe(rdi = method, rsi = length) -> eax = 1 for GET and
+; HEAD, 0 for everything else.
+;
+; The rule that decides whether an upstream connection may be reused for this
+; request. Not "idempotent" (PUT and DELETE are, and are still visible when
+; repeated) but "safe": a pooled socket can lose a race with the backend's idle
+; timeout, and the answer to that race is to send the request again. HTTP/1
+; already classified its method while parsing and reuses that; h2 and h3 have
+; the token in hand and ask here, so the rule is written once.
+linnea_upstream_method_safe:
+    xor eax, eax
+    cmp rsi, 3
+    jne .ms_head
+    ; two bytes then one, rather than a dword masked down: the token may end at
+    ; the last byte its buffer owns, and a wide read there is a fault waiting
+    ; for the wrong page boundary
+    cmp word [rdi], 'GE'
+    jne .ms_no
+    cmp byte [rdi + 2], 'T'
+    jne .ms_no
+    mov eax, 1
+    ret
+.ms_head:
+    cmp rsi, 4
+    jne .ms_no
+    cmp dword [rdi], 0x44414548      ; "HEAD", little-endian
+    jne .ms_no
+    mov eax, 1
+    ret
+.ms_no:
+    xor eax, eax
+    ret
 
 section .bss
 ; at == 0 means the slot is empty, so .bss's zeroing is the initialisation. A

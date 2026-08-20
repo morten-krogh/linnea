@@ -50,6 +50,9 @@ extern linnea_connection_alloc
 extern linnea_connection_free
 extern linnea_upstream_open
 extern linnea_upstream_closed
+extern linnea_upstream_method_safe
+extern linnea_upstream_park
+extern linnea_upstream_take
 extern linnea_upstream_pick
 extern linnea_upstream_count
 extern linnea_upstream_limit
@@ -61,6 +64,7 @@ extern linnea_http_upstream_head_valid
 extern linnea_http_status_no_content
 extern linnea_http_status_no_clen
 extern linnea_string_iequal
+extern linnea_string_has_token
 extern linnea_spill_open
 extern linnea_spill_write
 extern linnea_spill_chunked
@@ -125,6 +129,10 @@ hdr_via:       db "Via: 3 linnea", 13, 10
 hdr_via_len    equ $ - hdr_via
 hdr_close:     db "Connection: close", 13, 10, 13, 10
 hdr_close_len  equ $ - hdr_close
+hdr_keep:      db "Connection: keep-alive", 13, 10, 13, 10
+hdr_keep_len   equ $ - hdr_keep
+hn_conn_h3:    db "connection"
+val_close_h3:  db "close"
 proto_h3:      db "HTTP/3"
 proto_h3_len   equ $ - proto_h3
 hn_te:         db "transfer-encoding"
@@ -219,6 +227,10 @@ linnea_h3_proxy_start:
     mov [r12 + linnea_connection.location], rax
     mov rax, [rsp + 8]
     mov [r12 + linnea_connection.vhost], rax
+    ; per-REQUEST, and legs come from a reused pool of connection slots. This
+    ; one is cleared HERE rather than beside the other two at .st_socket,
+    ; because the head builder in between is what sets it.
+    mov qword [r12 + linnea_connection.up_reusable], 0
     ; a HEAD request takes no body, whatever the backend sends back
     xor eax, eax
     cmp qword [rbx + linnea_h2_req.method_len], 4
@@ -279,7 +291,7 @@ linnea_h3_proxy_start:
     mov rax, [rbx + linnea_h2_req.hb_cur]
     sub rax, [rbx + linnea_h2_req.hb_start]
     add rcx, rax
-    add rcx, http11_host_len + hdr_clen_len + hdr_via_len + hdr_close_len + 32
+    add rcx, http11_host_len + hdr_clen_len + hdr_via_len + hdr_keep_len + 32
     ; ...and the body, when it is the in-memory kind. A captured body is mapped
     ; and queued behind the head (.st_body_file) and costs up_buf nothing, but a
     ; request that arrived whole in one datagram is COPIED in behind the head by
@@ -411,6 +423,28 @@ linnea_h3_proxy_start:
     lea rdi, [hdr_via]
     mov esi, hdr_via_len
     call .up_append
+    ; Keep the connection when this location opted in and the method may be
+    ; sent again -- the same rule and the same reasons as h1 (docs/config.md,
+    ; "Upstream connections"). Otherwise close, which is also what makes a
+    ; close-delimited response terminate.
+    mov rcx, [r12 + linnea_connection.location]
+    test rcx, rcx
+    jz .st_conn_close
+    cmp qword [rcx + linnea_config_location.proxy_keepalive], 0
+    je .st_conn_close
+    push rbx
+    mov rdi, [rbx + linnea_h2_req.method_ptr]
+    mov rsi, [rbx + linnea_h2_req.method_len]
+    call linnea_upstream_method_safe
+    pop rbx
+    test eax, eax
+    jz .st_conn_close
+    mov qword [r12 + linnea_connection.up_reusable], 1
+    lea rdi, [hdr_keep]
+    mov esi, hdr_keep_len
+    call .up_append
+    jmp .st_sendwin
+.st_conn_close:
     lea rdi, [hdr_close]             ; one request per upstream connection,
     mov esi, hdr_close_len           ; then the empty line that ends the head
     call .up_append
@@ -458,7 +492,27 @@ linnea_h3_proxy_start:
     mov [r12 + linnea_connection.file_size], r13
     mov [r12 + linnea_connection.file_rem], r13
 .st_socket:
-    ; --- the socket, which the loop then connects --------------------
+    ; --- the connection: a parked one if there is one, else a new socket -----
+    ; choose the backend first; a parked connection belongs to exactly one
+    mov qword [r12 + linnea_connection.up_no_reuse], 0
+    mov qword [r12 + linnea_connection.up_pooled], 0
+    mov rdi, [r12 + linnea_connection.location]
+    call linnea_upstream_pick
+    mov [r12 + linnea_connection.up_backend], rax
+    mov qword [r12 + linnea_connection.up_tries], 1
+    cmp qword [r12 + linnea_connection.up_reusable], 0
+    je .st_fresh
+    mov rdi, [r12 + linnea_connection.location]
+    mov rsi, [r12 + linnea_connection.up_backend]
+    call linnea_upstream_take
+    cmp eax, -1
+    je .st_fresh
+    mov [r12 + linnea_connection.up_fd], eax
+    mov qword [r12 + linnea_connection.up_pooled], 1
+    ; already connected: the loop's hook starts this leg at the send
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
+    jmp .st_armed
+.st_fresh:
     mov eax, LINNEA_SYS_SOCKET
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM
@@ -467,13 +521,9 @@ linnea_h3_proxy_start:
     cmp rax, -4095
     jae .st_nosock
     mov [r12 + linnea_connection.up_fd], eax
-    ; choose which backend this request starts on, and begin its attempt count
-    mov rdi, [r12 + linnea_connection.location]
-    call linnea_upstream_pick
-    mov [r12 + linnea_connection.up_backend], rax
-    mov qword [r12 + linnea_connection.up_tries], 1
     call linnea_upstream_open
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CONNECTING
+.st_armed:
     ; The connect is the io_uring loop's to queue, and this module is not the
     ; loop's to reach into — the loop installs the hook at startup, the way the
     ; QUIC pool takes its free hook. Without one (a unit test with no loop
@@ -709,6 +759,30 @@ linnea_h3_proxy_head:
                                      ; for a response that could not be sent
     jmp .ph_restart
 .ph_final:
+    ; A backend that says "close" is about to go; parking that socket would
+    ; hand the next request a race with its FIN.
+    ;
+    ; rcx is the head length and .ph_find neither preserves it nor can -- it
+    ; takes the NAME length in the same register. So it is saved before ecx is
+    ; touched, and every path below reaches the pop.
+    push rcx
+    mov rdi, r12
+    mov rsi, rcx
+    lea rdx, [hn_conn_h3]
+    mov ecx, 10
+    call .ph_find
+    test rdx, rdx
+    jz .ph_conn_done
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [val_close_h3]
+    mov ecx, 5
+    call .ph_val_has
+    test eax, eax
+    jz .ph_conn_done
+    mov qword [rbx + linnea_connection.up_no_reuse], 1
+.ph_conn_done:
+    pop rcx                          ; the head length, for the framing lookups
     ; --- body framing: Transfer-Encoding: chunked wins over Content-Length,
     ; and a response that carries no body at all overrides both.
     mov qword [rbx + linnea_connection.capture_chunked], 0
@@ -927,78 +1001,8 @@ linnea_h3_proxy_head:
 ; .ph_val_has(rdi = value, rsi = len, rdx = token, ecx = token len)
 ;   -> eax = 1 when the comma-separated value lists the token.
 .ph_val_has:
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    mov rbx, rdi
-    mov r12, rsi
-    mov r13, rdx
-    mov r14d, ecx
-    xor r15d, r15d                   ; element start
-.vh_elem:
-    cmp r15, r12
-    jae .vh_no
-    cmp byte [rbx + r15], ' '
-    je .vh_skip
-    cmp byte [rbx + r15], 9
-    jne .vh_end_scan
-.vh_skip:
-    inc r15
-    jmp .vh_elem
-.vh_end_scan:
-    mov rcx, r15
-.vh_find_comma:
-    cmp rcx, r12
-    jae .vh_test
-    cmp byte [rbx + rcx], ','
-    je .vh_test
-    inc rcx
-    jmp .vh_find_comma
-.vh_test:
-    mov rax, rcx
-    sub rax, r15                     ; element length, trailing space trimmed
-    lea rdx, [rbx + r15]             ; the element's first byte
-.vh_trim:
-    test rax, rax
-    jz .vh_after
-    movzx r8d, byte [rdx + rax - 1]
-    cmp r8b, ' '
-    je .vh_trim_one
-    cmp r8b, 9
-    jne .vh_after
-.vh_trim_one:
-    dec rax
-    jmp .vh_trim
-.vh_after:
-    cmp rax, r14
-    jne .vh_next
-    push rcx
-    lea rdi, [rbx + r15]
-    mov rsi, rax
-    mov rdx, r13
-    mov rcx, r14
-    call linnea_string_iequal
-    pop rcx
-    test eax, eax
-    jnz .vh_yes
-.vh_next:
-    lea r15, [rcx + 1]
-    cmp rcx, r12
-    jb .vh_elem
-.vh_no:
-    xor eax, eax
-    jmp .vh_ret
-.vh_yes:
-    mov eax, 1
-.vh_ret:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
+    ; the shared #rule matcher: this used to be a local copy
+    jmp linnea_string_has_token
 
 ; linnea_h3_proxy_body(rdi = leg, rsi = bytes, rdx = count)
 ;   -> rax = 0 need more, 1 the body is complete, -1 the upstream broke its
@@ -1285,6 +1289,31 @@ linnea_h3_proxy_deliver:
     mov eax, LINNEA_SYS_MUNMAP
     syscall
 .dl_done:
+    ; The response is delivered and the upstream exchange is over. Keep the
+    ; connection on the same terms h1 uses: the location opted in and the method
+    ; was safe (up_reusable), the backend did not say close, and the body was
+    ; delimited -- counted and fully consumed, or chunked through its terminal
+    ; chunk, which is what .pb_done means for each. A close-delimited response
+    ; has capture_chunked 0 and body_rem still -1, so it cannot pass.
+    cmp qword [rbx + linnea_connection.up_reusable], 0
+    je .dl_release
+    cmp qword [rbx + linnea_connection.up_no_reuse], 0
+    jne .dl_release
+    cmp dword [rbx + linnea_connection.up_fd], -1
+    je .dl_release
+    cmp qword [rbx + linnea_connection.capture_chunked], 0
+    jne .dl_park
+    cmp qword [rbx + linnea_connection.body_rem], 0
+    jne .dl_release
+.dl_park:
+    mov rdi, [rbx + linnea_connection.location]
+    mov rsi, [rbx + linnea_connection.up_backend]
+    mov edx, [rbx + linnea_connection.up_fd]
+    call linnea_upstream_park
+    test eax, eax
+    jz .dl_release             ; pool full: release closes it, as before
+    mov dword [rbx + linnea_connection.up_fd], -1
+.dl_release:
     mov rdi, rbx
     call linnea_h3_proxy_release
     add rsp, 32

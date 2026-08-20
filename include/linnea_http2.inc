@@ -299,6 +299,9 @@ struc linnea_h2p
     .location:  resq 1            ; matched location* (connect addr, log)
     .backend:   resq 1            ; which of the location's backends this leg is on
     .tries:     resq 1            ; backends attempted for this request
+    .reusable:  resq 1            ; 1 = this leg may be parked when it ends cleanly
+    .no_reuse:  resq 1            ; 1 = the backend's response said Connection: close
+    .pooled:    resq 1            ; 1 = it came from the pool, not a fresh connect
     .srv:       resq 1            ; the vhost that matched, for its headers
     .req_len:   resq 1            ; rewritten request bytes (head, then body)
     .sent:      resq 1            ; upstream send progress

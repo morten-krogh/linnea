@@ -5,6 +5,7 @@ default rel
 global linnea_string_length
 global linnea_string_equal
 global linnea_string_iequal
+global linnea_string_has_token
 global linnea_string_copy
 global linnea_string_from_u64
 global linnea_string_to_u64
@@ -535,4 +536,86 @@ linnea_chunk_ext_step:
     and eax, 7
     movzx edx, byte [tchar_map + rcx]
     bt edx, eax
+    ret
+
+; linnea_string_has_token(rdi = value, rsi = length, rdx = token, ecx = token
+;   length) -> eax = 1 when the comma-separated value contains that token,
+;   compared case-insensitively with surrounding whitespace trimmed.
+;
+; RFC 9110 5.6.1's #rule, which several fields are: Connection, Transfer-
+; Encoding, TE, Accept-Encoding. It lives here because every link set has this
+; object, and because the alternative — each protocol deciding for itself what
+; "the value says close" means — is the shape that produced audit reports 28-37.
+linnea_string_has_token:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    mov r14d, ecx
+    xor r15d, r15d                   ; element start
+.ht_elem:
+    cmp r15, r12
+    jae .ht_no
+    cmp byte [rbx + r15], ' '
+    je .ht_skip
+    cmp byte [rbx + r15], 9
+    jne .ht_end_scan
+.ht_skip:
+    inc r15
+    jmp .ht_elem
+.ht_end_scan:
+    mov rcx, r15
+.ht_find_comma:
+    cmp rcx, r12
+    jae .ht_test
+    cmp byte [rbx + rcx], ','
+    je .ht_test
+    inc rcx
+    jmp .ht_find_comma
+.ht_test:
+    mov rax, rcx
+    sub rax, r15                     ; element length, trailing space trimmed
+    lea rdx, [rbx + r15]             ; the element's first byte
+.ht_trim:
+    test rax, rax
+    jz .ht_after
+    movzx r8d, byte [rdx + rax - 1]
+    cmp r8b, ' '
+    je .ht_trim_one
+    cmp r8b, 9
+    jne .ht_after
+.ht_trim_one:
+    dec rax
+    jmp .ht_trim
+.ht_after:
+    cmp rax, r14
+    jne .ht_next
+    push rcx
+    lea rdi, [rbx + r15]
+    mov rsi, rax
+    mov rdx, r13
+    mov rcx, r14
+    call linnea_string_iequal
+    pop rcx
+    test eax, eax
+    jnz .ht_yes
+.ht_next:
+    lea r15, [rcx + 1]
+    cmp rcx, r12
+    jb .ht_elem
+.ht_no:
+    xor eax, eax
+    jmp .ht_ret
+.ht_yes:
+    mov eax, 1
+.ht_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret

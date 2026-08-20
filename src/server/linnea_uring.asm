@@ -3612,7 +3612,14 @@ linnea_uring_arm_send_buf:
 ; publishes the SQ, so the connect would otherwise sit unqueued until some
 ; unrelated connection happened to submit.
 h3p_arm:
+    ; a leg that took a parked connection is already connected, so its first
+    ; operation is the send, not the connect
+    cmp qword [rdi + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
+    je .h3p_send
     call linnea_uring_arm_connect
+    jmp linnea_uring_submit_now
+.h3p_send:
+    call linnea_uring_arm_up_send
     jmp linnea_uring_submit_now
 
 ; linnea_uring_up_reconnect(rdi = connection*) -> eax = 0 armed, -1 could not

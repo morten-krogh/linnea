@@ -103,6 +103,10 @@ extern linnea_ratelimit_on
 extern linnea_uring_now
 extern linnea_upstream_closed
 extern linnea_upstream_pick
+extern linnea_upstream_method_safe
+extern linnea_upstream_park
+extern linnea_upstream_take
+extern linnea_string_has_token
 extern linnea_upstream_mark_ok
 extern linnea_upstream_mark_fail
 extern linnea_upstream_limit
@@ -2278,7 +2282,18 @@ h2_serve:
     mov rax, [r12 + linnea_h2_req.hb_cur]
     sub rax, [r12 + linnea_h2_req.hb_start]
     add rcx, rax
-    add rcx, 64                      ; literals + the Content-Length line
+    ; The literals this builder adds around the request's own bytes:
+    ;   " " x2 + "HTTP/1.1" CRLF        10 + 2
+    ;   "Host: " CRLF                    8   (the value is auth_len, above)
+    ;   "Content-Length: " + 20 digits + CRLF   38
+    ;   "Via: 2 linnea" CRLF            15
+    ;   "Connection: keep-alive" CRLF CRLF   26  (the longer of the two)
+    ; = 99. The old allowance of 64 did not cover them and never could: it was
+    ; short before keep-alive added five bytes to the longest Connection line.
+    ; Nothing overflowed, because HEAD_MAX is 8192 against a 16384-byte buf --
+    ; 8 KB of slack absorbed the difference. Corrected rather than left to be
+    ; rediscovered by whoever adds the next field.
+    add rcx, 128                     ; literals + the Content-Length line
     cmp rcx, LINNEA_H2P_HEAD_MAX
     ja .proxy_toobig
     lea rdi, [r13 + linnea_h2p.buf]
@@ -2916,6 +2931,33 @@ h2p_kill:
 h2p_release:
     test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
     jnz .rel_zombie
+    ; Keep the connection on the same terms h1 and h3 use. BODY_DONE is what
+    ; says the response ended where its framing promised -- h2 refuses to set it
+    ; for a truncated body (Finding 31). F_EOF excludes the close-delimited
+    ; case, which reaches BODY_DONE legitimately but does so because the peer
+    ; hung up: that socket is already gone.
+    cmp dword [rax + linnea_h2p.fd], -1
+    je .rel_close
+    cmp qword [rax + linnea_h2p.reusable], 0
+    je .rel_close
+    cmp qword [rax + linnea_h2p.no_reuse], 0
+    jne .rel_close
+    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
+    jz .rel_close
+    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_EOF
+    jnz .rel_close
+    push rax
+    mov rdi, [rax + linnea_h2p.location]
+    mov rsi, [rax + linnea_h2p.backend]
+    mov edx, [rax + linnea_h2p.fd]
+    call linnea_upstream_park
+    pop rcx                          ; the slot; this function preserves it
+    test eax, eax
+    jz .rel_kept
+    mov dword [rcx + linnea_h2p.fd], -1   ; the pool owns it; nothing to close
+.rel_kept:
+    mov rax, rcx
+.rel_close:
     push rax
     mov edi, [rax + linnea_h2p.fd]
     cmp edi, -1
@@ -3205,9 +3247,43 @@ h2p_finalize:
     lea rsi, [h2p_via]                     ; RFC 9110 7.6.3: name this hop
     mov ecx, h2p_via_len
     rep movsb
+    ; Keep the connection when this location opted in and the method may be
+    ; sent again -- the same rule and reasons as h1 and h3. The method is the
+    ; first token of the head this function is finishing, which is the only
+    ; place h2p has it: the leg carries no request struct.
+    push rdi                               ; the write cursor rep movsb needs
+    mov qword [rbx + linnea_h2p.reusable], 0
+    mov rcx, [rbx + linnea_h2p.location]
+    test rcx, rcx
+    jz .fin_conn_close
+    cmp qword [rcx + linnea_config_location.proxy_keepalive], 0
+    je .fin_conn_close
+    lea rdi, [rbx + linnea_h2p.buf]
+    xor ecx, ecx
+.fin_meth_scan:
+    cmp ecx, 8
+    jae .fin_conn_close                    ; no space in 8: not GET or HEAD
+    cmp byte [rdi + rcx], ' '
+    je .fin_meth_found
+    inc ecx
+    jmp .fin_meth_scan
+.fin_meth_found:
+    mov rsi, rcx
+    call linnea_upstream_method_safe
+    test eax, eax
+    jz .fin_conn_close
+    mov qword [rbx + linnea_h2p.reusable], 1
+    pop rdi
+    lea rsi, [h2p_conn_keep]
+    mov ecx, h2p_conn_keep_len
+    rep movsb
+    jmp .fin_conn_done
+.fin_conn_close:
+    pop rdi
     lea rsi, [h2p_conn_close]              ; "Connection: close" CRLF CRLF
     mov ecx, h2p_conn_close_len
     rep movsb
+.fin_conn_done:
     ; the collected body follows the head — unless it outgrew the slot and was
     ; captured to a file, in which case it is sent from a mapping instead and
     ; the head must stay head-only
@@ -3256,6 +3332,28 @@ h2p_open_upstream:
     call linnea_upstream_count
     cmp rax, [linnea_upstream_limit]
     jae .ou_busy
+    ; the backend first: a parked connection belongs to exactly one of them
+    mov qword [rbx + linnea_h2p.no_reuse], 0
+    mov qword [rbx + linnea_h2p.pooled], 0
+    mov rdi, [rbx + linnea_h2p.location]
+    call linnea_upstream_pick
+    mov [rbx + linnea_h2p.backend], rax
+    mov qword [rbx + linnea_h2p.tries], 1
+    cmp qword [rbx + linnea_h2p.reusable], 0
+    je .ou_fresh
+    mov rdi, [rbx + linnea_h2p.location]
+    mov rsi, [rbx + linnea_h2p.backend]
+    call linnea_upstream_take
+    cmp eax, -1
+    je .ou_fresh
+    mov [rbx + linnea_h2p.fd], eax
+    mov qword [rbx + linnea_h2p.pooled], 1
+    ; already connected: this leg starts at the send
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_SENDING
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
+    pop rbx
+    ret
+.ou_fresh:
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM
     xor edx, edx
@@ -3265,10 +3363,6 @@ h2p_open_upstream:
     js .ou_nosock
     mov [rbx + linnea_h2p.fd], eax
     call linnea_upstream_open
-    mov rdi, [rbx + linnea_h2p.location]
-    call linnea_upstream_pick
-    mov [rbx + linnea_h2p.backend], rax
-    mov qword [rbx + linnea_h2p.tries], 1
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_CONNECTING
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_CONN
     pop rbx
@@ -4205,6 +4299,28 @@ h2p_parse_head:
     mov [rbx + linnea_h2p.rd], rcx   ; first body byte
     mov [rbx + linnea_h2p.wr], rcx   ; decoded body starts here too
     mov [rbx + linnea_h2p.off], rcx
+    ; A backend that says "close" is about to go; parking that socket would
+    ; hand the next request a race with its FIN. rcx is the head length and
+    ; h2p_head_find takes the NAME length in the same register, so it is saved
+    ; across both calls and every path below reaches the pop.
+    push rcx
+    mov rdi, r12
+    mov rsi, rcx
+    lea rdx, [h2p_hn_conn]
+    mov ecx, 10
+    call h2p_head_find
+    test rdx, rdx
+    jz .ph_conn_done
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [h2p_val_close]
+    mov ecx, 5
+    call h2p_val_has
+    test eax, eax
+    jz .ph_conn_done
+    mov qword [rbx + linnea_h2p.no_reuse], 1
+.ph_conn_done:
+    pop rcx
     ; framing: Transfer-Encoding: chunked wins over Content-Length
     mov rdi, r12
     mov rsi, rcx
@@ -6124,6 +6240,10 @@ h2p_via:         db "Via: 2 linnea", 13, 10
 h2p_via_len      equ $ - h2p_via
 h2p_via_val:     db "1.1 linnea"
 h2p_via_val_len  equ $ - h2p_via_val
+h2p_conn_keep:   db "Connection: keep-alive", 13, 10, 13, 10
+h2p_conn_keep_len equ $ - h2p_conn_keep
+h2p_hn_conn:     db "connection"
+h2p_val_close:   db "close"
 h2p_conn_close:  db "Connection: close", 13, 10, 13, 10
 h2p_conn_close_len equ $ - h2p_conn_close
 h2p_hn_te:       db "transfer-encoding"

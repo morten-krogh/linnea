@@ -114,6 +114,7 @@ extern linnea_string_trim_ows
 extern linnea_chunk_ext_step
 extern linnea_spill_chunked
 extern linnea_string_iequal
+extern linnea_string_has_token
 extern linnea_time_http_date
 extern linnea_time_parse_http_date
 extern linnea_time_http_now
@@ -412,6 +413,7 @@ log_dash:       db "-"
 log_sp:         db " "
 log_nl:         db 10
 
+val_close_h1:   db "close"
 hn_connection:  db "connection"
 hn_content_len: db "content-length"
 hn_transfer_enc: db "transfer-encoding"
@@ -4314,50 +4316,6 @@ linnea_http_upstream_head_valid:
 ; Locals:
 ;   [rsp+0] head end   [rsp+8] Content-Length   [rsp+16] flags: 1=CL, 2=TE
 ;   [rsp+24] line cursor  [rsp+32] CR offset    [rsp+40] header lines end
-; http_value_has_close(rdi = value, rsi = length) -> eax = 1 when the bytes
-; contain "close" in any case. Not a token walk: this is a veto, and the safe
-; direction is to over-refuse.
-http_value_has_close:
-    push rbx
-    xor eax, eax
-    cmp rsi, 5
-    jb .hc_no
-    sub rsi, 5
-    xor ecx, ecx
-.hc_scan:
-    cmp rcx, rsi
-    ja .hc_no
-    movzx ebx, byte [rdi + rcx]
-    or ebx, 0x20
-    cmp bl, 'c'
-    jne .hc_next
-    movzx ebx, byte [rdi + rcx + 1]
-    or ebx, 0x20
-    cmp bl, 'l'
-    jne .hc_next
-    movzx ebx, byte [rdi + rcx + 2]
-    or ebx, 0x20
-    cmp bl, 'o'
-    jne .hc_next
-    movzx ebx, byte [rdi + rcx + 3]
-    or ebx, 0x20
-    cmp bl, 's'
-    jne .hc_next
-    movzx ebx, byte [rdi + rcx + 4]
-    or ebx, 0x20
-    cmp bl, 'e'
-    jne .hc_next
-    mov eax, 1
-    pop rbx
-    ret
-.hc_next:
-    inc rcx
-    jmp .hc_scan
-.hc_no:
-    xor eax, eax
-    pop rbx
-    ret
-
 linnea_http_proxy_head:
     push rbx
     push r12
@@ -4585,15 +4543,17 @@ linnea_http_proxy_head:
     jz .not_conn_field
     ; Ours replaces it -- but read it first. A backend that says "close" is
     ; about to go, and parking that socket would hand the next request a race
-    ; with its FIN. Matched as a SUBSTRING on purpose: a false positive costs
-    ; one connection, a false negative costs a failed request.
+    ; with its FIN. Connection is a #rule (RFC 9110 7.6.1), so the token matcher
+    ; decides it, not a substring: "closed-loop" is not "close".
     mov rdi, r14
     add rdi, r13
     inc rdi                    ; just past the colon
     mov rsi, [rsp + 32]        ; end of line
     sub rsi, r13
     dec rsi
-    call http_value_has_close
+    lea rdx, [val_close_h1]
+    mov ecx, 5
+    call linnea_string_has_token     ; the #rule matcher every protocol shares
     test eax, eax
     jz .next_line
     mov qword [rbx + linnea_connection.up_no_reuse], 1
