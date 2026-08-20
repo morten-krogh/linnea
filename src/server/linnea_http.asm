@@ -2633,8 +2633,14 @@ linnea_http_handle:
     test eax, eax
     jnz .proxy_next_line       ; ours replaces it
     ; The whole body is already buffered, so there is nothing left for the
-    ; upstream to authorize: forwarding Expect would only invite a 100
-    ; Continue, which this exchange has no way to handle.
+    ; upstream to authorize: forwarding a 100-continue expectation would only
+    ; invite a 100 Continue, which this exchange has no way to handle. That is
+    ; true of 100-continue and of nothing else -- an expectation we do not know
+    ; is the BACKEND's to refuse, with the 417 RFC 9110 10.1.1 defines, and
+    ; dropping every Expect made HTTP/1 the only protocol that never gave it the
+    ; chance: h2 and h3 forward it (found sweeping the collectors after
+    ; audit-report-32). The value decides, so it is read here rather than the
+    ; name alone; r10 is the colon offset and the checks below still need it.
     mov rcx, [rsp + 56]
     mov rax, r10
     sub rax, rcx
@@ -2644,7 +2650,23 @@ linnea_http_handle:
     mov ecx, 6
     call linnea_string_iequal
     test eax, eax
-    jnz .proxy_next_line
+    jz .not_expect_line
+    push r10
+    lea rdi, [r14 + r10 + 1]         ; past the colon
+    mov rsi, [rsp + 64 + 8]          ; line end (one push deep)
+    sub rsi, r10
+    dec rsi
+    call linnea_string_trim_ows      ; -> rax = ptr, rdx = length
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [hv_100_continue]
+    mov ecx, 12
+    call linnea_string_iequal
+    pop r10
+    test eax, eax
+    jnz .proxy_next_line             ; ours to answer: not forwarded
+    jmp .proxy_copy_line             ; any other expectation goes upstream
+.not_expect_line:
     ; Transfer-Encoding never goes upstream: the body was decoded on the way in,
     ; so forwarding the header would promise the backend a framing that is no
     ; longer there. A Content-Length describing the decoded body is emitted with

@@ -152,6 +152,7 @@ cookie_case("one cookie line is passed through unchanged",
 # The same guard switched this off for h3 too, so an h3 client's
 # Expect: 100-continue was forwarded upstream and no interim 100 was generated.
 def expect_case(label, headers, want_count):
+    """want_count is how many Expect lines the backend should see."""
     global fails
     got = {}
     for p in protos:
@@ -167,5 +168,13 @@ def expect_case(label, headers, want_count):
 
 expect_case("Expect: 100-continue never reaches the backend",
             ["Expect: 100-continue"], 0)
+# ...and an expectation we do NOT know is the backend's to refuse with a 417,
+# so it must travel. HTTP/1 dropped every Expect, which made it the only
+# protocol that never gave the backend the chance; HTTP/2 and HTTP/3 answered
+# 431 to one instead, because the field NAME was destroyed by the comparison
+# that decided it was not 100-continue and the rebuilt line ran the header
+# block past its end.
+expect_case("an unknown expectation is forwarded for the backend to refuse",
+            ["Expect: other-expectation"], 1)
 
 sys.exit(1 if fails else 0)

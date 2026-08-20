@@ -615,14 +615,26 @@ emit_field:
     ; "expect": only "100-continue" is handled -- the proxy path emits a local
     ; interim 100 and strips the field (RFC 9110 10.1.1, Finding 33). Any other
     ; expectation is forwarded unchanged for the backend to answer (e.g. 417).
-    mov rdi, [rsp + 8]               ; value ptr
-    mov rsi, [rsp]                   ; value len
+    ; .rebuild wants rax = the field NAME and rdx = its length, and
+    ; linnea_string_iequal returns in rax and uses rdx for an argument -- so
+    ; both are gone by the time the "forward it" branch is taken. The name was
+    ; then appended with a destroyed pointer and length, which ran hb_cur past
+    ; hb_end and answered 431 to any expectation other than 100-continue on a
+    ; proxied request. name_eq above leaves rax and rdx alone, which is why the
+    ; not-an-expect path was always fine and only this one was not.
+    push rax
+    push rdx
+    mov rdi, [rsp + 24]              ; value ptr
+    mov rsi, [rsp + 16]              ; value len
     lea rdx, [expect_100_val]
     mov rcx, 12
     call linnea_string_iequal        ; eax = 1 when equal (case-insensitive)
+    mov r11d, eax                    ; the verdict, across the restores
+    pop rdx
+    pop rax
     pop rdi
     pop rsi
-    test eax, eax
+    test r11d, r11d
     jz .rebuild                      ; a different expectation: forward it
     mov qword [rbx + linnea_h2_req.expect_100], 1
     jmp .no_rebuild                  ; stripped: we generate the 100 ourselves
