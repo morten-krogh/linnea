@@ -117,7 +117,7 @@ it forbids the unencoded form — so dropping it turns a refusal into permission
 which is not narrowing. The distinction I drew between this field and the ETag
 lists never existed.
 
-### Found beside it, and NOT fixed — `identity;q=0` is never consulted
+### Found beside it, and now fixed too — `identity;q=0` was never consulted
 
 The negotiator asks only "is `br` acceptable?" and "is `gzip` acceptable?". It
 never asks whether *identity* is acceptable, so the prohibition is ignored
@@ -134,16 +134,42 @@ and says the origin SHOULD answer **406** when no available representation is
 acceptable — which is both rows, since `identity;q=0` names no coding it will
 take.
 
-This is left open deliberately. It is a change to what the *serving* path
-returns rather than proxy hygiene, its failure mode is answering 406 to a
-client that would have been served, and `linnea_http_ae_accepts` carries a
-documented decision not to honour `*` for a related reason. It wants a decision,
-not a quiet fix.
+Taken as a separate decision, since it changes what the *serving* path returns
+rather than proxy hygiene and its failure mode is refusing a client that would
+have been served. Now, on all three:
+
+```
+  identity;q=0        (a .br variant exists, br not offered)   406
+  identity;q=0        (no variant at all)                      406
+  identity;q=0, br    (a .br variant exists)                   200, br
+  identity;q=0.5                                               200, plain
+  no Accept-Encoding                                           200, plain
+```
+
+The third row is the one that keeps the rule honest: **refusing identity is not
+refusing everything.** A client that excludes the unencoded form and names a
+coding we hold gets that coding, and only a request with nothing left to send
+becomes a 406.
+
+`linnea_http_ae_accepts` had to learn a distinction it did not carry: it
+returned "may I send this?", which is `0` both for a coding never mentioned and
+for one mentioned with `q=0`. Those are **opposite** answers for identity —
+absent, it is acceptable by default; named with `q=0`, it is forbidden. It now
+returns "was it named at all" beside the verdict, and collapsing the two is
+exactly why this went unnoticed.
+
+`*;q=0` would also exclude identity and is deliberately still not handled, for
+the reason the helper already gives for `*` generally: honouring it would mean
+guessing which coding the client meant. That limit is written into the code
+rather than left implied.
 
 ### Coverage
 
-`test/tls/conditional_field_dups.py` gains two rows: three lines all honoured
-(`br` still served), and a fourth refused. The second fails on a pre-fix binary.
+`test/tls/conditional_field_dups.py` gains five rows: three lines all honoured
+(`br` still served) and a fourth refused; then `identity;q=0` as a 406, the same
+with `br` still serving br, and `identity;q=0.5` still serving plain. Two fail on
+a pre-fix binary — the fourth-line refusal and the 406 — and the three controls
+pass before and after, which is what stops either rule from over-applying.
 
 Full suite: **781 passed, 0 failed**.
 

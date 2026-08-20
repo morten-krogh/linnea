@@ -1691,7 +1691,11 @@ h2_serve:
     call linnea_static_open_enc            ; -> rax = base, rdx = size, r8 = coding
     mov [rsp + S_ENC], r8
     test rax, rax
-    jz .resp_404
+    jnz .h2_opened
+    cmp r9d, 1
+    je .resp_406                     ; the client refused every form we have
+    jmp .resp_404
+.h2_opened:
     mov [rsp + S_BASE], rax
     mov [rsp + S_SIZE], rdx
     mov qword [rsp + S_ROFF], 0      ; whole file until a range narrows it
@@ -2436,6 +2440,11 @@ h2_serve:
     lea rax, [status_200_h2]
     lea r14, [body_options_h2]
     mov r15d, body_options_h2_len
+    jmp .error
+.resp_406:
+    lea rax, [status_406_h2]
+    lea r14, [body_406]
+    mov r15d, body_406_len
     jmp .error
 .resp_417:
     lea rax, [status_417_h2]
@@ -6007,6 +6016,7 @@ body_options_h2:   db "Allow: GET, HEAD, OPTIONS", 10
 body_options_h2_len equ $ - body_options_h2
 mf_hdr_name:     db "Max-Forwards: "
 mf_hdr_name_len  equ $ - mf_hdr_name
+status_406_h2:   db "406"
 status_417_h2:   db "417"
 status_431_h2:   db "431"
 body_429: db "429 Too Many Requests", 10
@@ -6025,6 +6035,8 @@ body_421_h2: db "421 Misdirected Request", 10
 body_421_h2_len equ $ - body_421_h2
 body_413: db "413 Content Too Large", 10
 body_413_len equ $ - body_413
+body_406: db "406 Not Acceptable", 10
+body_406_len equ $ - body_406
 body_417: db "417 Expectation Failed", 10
 body_417_len equ $ - body_417
 ; --- proxy-over-h2 literals ---

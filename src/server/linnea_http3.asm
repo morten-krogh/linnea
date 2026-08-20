@@ -98,6 +98,8 @@ body_405:      db "405 Method Not Allowed", 10
 body_405_len   equ $ - body_405
 body_425:      db "425 Too Early", 10
 body_425_len   equ $ - body_425
+body_406:      db "406 Not Acceptable", 10
+body_406_len   equ $ - body_406
 body_417:      db "417 Expectation Failed", 10
 method_trace_h3:   db "TRACE"
 method_options_h3: db "OPTIONS"
@@ -1179,7 +1181,11 @@ linnea_h3_serve:
     call linnea_static_open_enc      ; rax = base (0 = missing), rdx = size,
     mov [linnea_qpack_cenc], r8      ; r8 = the coding served
     test rax, rax
-    jz .notfound
+    jnz .h3_opened
+    cmp r9d, 1
+    je .resp_406                     ; the client refused every form we have
+    jmp .notfound
+.h3_opened:
     mov r15, rax                     ; mapped body base (1 = empty file)
     mov rbp, rdx                     ; body size
     ; validators for this file, then the request's conditionals: If-None-Match
@@ -1615,6 +1621,15 @@ linnea_h3_serve:
     mov ecx, txt_plain_len
     lea r8, [body_options_h3]
     mov r9d, body_options_h3_len
+    call linnea_h3_build_response
+    jmp .sret
+.resp_406:
+    mov rdi, r12
+    mov esi, 406
+    lea rdx, [txt_plain]
+    mov ecx, txt_plain_len
+    lea r8, [body_406]
+    mov r9d, body_406_len
     call linnea_h3_build_response
     jmp .sret
 .resp_417:

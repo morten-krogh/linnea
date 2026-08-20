@@ -120,6 +120,7 @@ extern linnea_time_http_now
 ; request-evaluation helpers shared with the h2/h3 serve paths; they live in
 ; linnea_static.asm so the h3 test binaries link without this file's deps
 extern linnea_http_ae_accepts
+extern linnea_http_identity_refused
 extern linnea_http_inm_match
 extern linnea_http_etag_match
 extern linnea_http_ifrange_match
@@ -192,6 +193,14 @@ resp_413_len    equ $ - resp_413
 ; is defined, and only a proxy location can pass another one on for a backend
 ; to judge; where we ARE the origin, serving the resource anyway would tell the
 ; client its expectation was met (audit-report-33).
+; RFC 9110 15.5.7 with 12.5.3: the client excluded the unencoded form with
+; identity;q=0 and no coded variant it named is available, so there is no
+; representation left that it will take.
+resp_406:       db "HTTP/1.1 406 Not Acceptable", 13, 10
+                db "Server: linnea", 13, 10
+                db "Content-Length: 0", 13, 10
+                db "Connection: close", 13, 10, 13, 10
+resp_406_len    equ $ - resp_406
 resp_417:       db "HTTP/1.1 417 Expectation Failed", 13, 10
                 db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
@@ -2089,6 +2098,19 @@ linnea_http_handle:
     mov qword [rsp + 224], 1
     jmp .have_file
 .open_plain:
+    ; The fallback is the unencoded form. identity;q=0 forbids it (RFC 9110
+    ; 12.5.3), and nothing coded was acceptable or it would have been served
+    ; above -- so there is no representation left that this client will take
+    ; (audit-report-35). Only asked when an Accept-Encoding was actually sent:
+    ; absent, every coding including identity is acceptable.
+    cmp qword [rsp + 208], 0
+    je .open_plain_go
+    lea rdi, [rsp + 352]
+    mov rsi, [rsp + 208]
+    call linnea_http_identity_refused
+    test eax, eax
+    jnz .resp_406
+.open_plain_go:
     mov byte [r15], 0          ; drop whichever suffix was tried
     mov qword [rsp + 224], 0
     mov rdi, r13
@@ -3019,6 +3041,11 @@ linnea_http_handle:
     lea rax, [resp_413]
     mov ecx, resp_413_len
     mov qword [rsp + 112], 413
+    jmp .resp_static
+.resp_406:
+    lea rax, [resp_406]
+    mov ecx, resp_406_len
+    mov qword [rsp + 112], 406
     jmp .resp_static
 .resp_417:
     lea rax, [resp_417]

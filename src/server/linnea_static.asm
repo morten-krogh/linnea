@@ -20,6 +20,7 @@ global linnea_static_etag
 global linnea_static_etag_len
 global linnea_static_lastmod
 global linnea_http_ae_accepts
+global linnea_http_identity_refused
 global linnea_http_inm_match
 global linnea_http_etag_match
 global linnea_http_ifrange_match
@@ -254,7 +255,9 @@ linnea_static_open:
 
 ; linnea_static_open_enc(rdi=path start, rsi=path end, rdx=Accept-Encoding
 ;   value ptr (0 = none), rcx=its len) -> rax = base (0 = miss, 1 = empty),
-;   rdx = size, r8 = coding served (0 plain, 1 gzip, 2 br).
+;   rdx = size, r8 = coding served (0 plain, 1 gzip, 2 br), r9 = 1 when the
+;   client refused the unencoded form and no coded variant was acceptable --
+;   rax is 0 there and the caller answers 406, not 404.
 ; Content-encoding negotiation, the h1 recipe shared: a pre-compressed file
 ; sitting beside the plain one is the whole opt-in — when the client's
 ; Accept-Encoding allows the coding and "<path>.br" (tried first: it
@@ -284,6 +287,7 @@ linnea_static_open_enc:
     test rax, rax
     jz .oe_try_gz
     mov r8d, 2
+    xor r9d, r9d
     jmp .oe_ret
 .oe_try_gz:
     lea rdi, [enc_gzip_st]
@@ -297,12 +301,28 @@ linnea_static_open_enc:
     test rax, rax
     jz .oe_plain
     mov r8d, 1
+    xor r9d, r9d
     jmp .oe_ret
 .oe_plain:
+    ; the fallback is the unencoded form, so this is where it matters whether
+    ; the client will take it: identity;q=0 forbids it, and nothing else we
+    ; could send is acceptable either or we would have sent it above
+    mov rdi, r12
+    mov rsi, r13
+    call linnea_http_identity_refused
+    test eax, eax
+    jnz .oe_unacceptable
     mov byte [rbx], 0                ; drop whichever suffix was tried
     mov rdi, r14
     call linnea_static_open
     xor r8d, r8d
+    xor r9d, r9d
+    jmp .oe_ret
+.oe_unacceptable:
+    xor eax, eax                     ; nothing to serve...
+    xor edx, edx
+    xor r8d, r8d
+    mov r9d, 1                       ; ...and it is a 406, not a 404
 .oe_ret:
     pop r14
     pop r13
@@ -448,7 +468,15 @@ linnea_static_mime:
 ; and its own preference between them (br first), so all it needs to know
 ; is whether a coding is allowed at all. "*" is not honoured — it would
 ; mean guessing which coding the client meant.
+;
+; rdx comes back 1 when the coding was NAMED at all, whatever its q. A caller
+; that only wants "may I send this?" ignores it; the identity check below needs
+; it, because "not mentioned" and "mentioned with q=0" are opposite answers for
+; the unencoded form: absent, identity is acceptable by default (RFC 9110
+; 12.5.3); named with q=0, it is forbidden. Returning only "accepted" collapsed
+; the two, which is why identity;q=0 went unnoticed for as long as it did.
 ; Locals: [rsp+0] token end (linnea_string_iequal clobbers rcx)
+;         [rsp+8] the found flag, which no register survives the compare
 linnea_http_ae_accepts:
     push rbx
     push r12
@@ -460,6 +488,7 @@ linnea_http_ae_accepts:
     mov r12, rsi               ; value len
     mov r13, rdx               ; token
     mov r14, rcx               ; token len
+    mov qword [rsp + 8], 0     ; not named yet
     xor r15d, r15d             ; cursor
 .element:
     cmp r15, r12
@@ -514,6 +543,7 @@ linnea_http_ae_accepts:
     lea r15, [rcx + 1]
     jmp .element
 .matched:
+    mov qword [rsp + 8], 1     ; named; the q below decides whether it is allowed
     mov r15, rcx               ; parameters may still refuse it
 .param_ws:
     cmp r15, r12
@@ -604,9 +634,54 @@ linnea_http_ae_accepts:
 .no:
     xor eax, eax
 .ret:
+    mov rdx, [rsp + 8]         ; was it named at all?
     add rsp, 16
     pop r15
     pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_http_identity_refused(rdi = span array, rsi = span count) -> rax = 1
+; when any Accept-Encoding line names `identity` with q=0.
+;
+; RFC 9110 12.5.3: a representation with no content coding "is acceptable by
+; default unless specifically excluded" -- and identity;q=0 excludes it. The
+; negotiation only ever asked whether br or gzip was allowed, never whether the
+; form it actually falls back to was, so a client that refused the unencoded
+; representation was served it (audit-report-35).
+;
+; `*;q=0` would exclude it too, and is deliberately not handled here for the
+; reason ae_accepts gives for `*` generally: it would mean guessing. Written
+; down rather than left implied.
+linnea_http_identity_refused:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    xor r13d, r13d
+.ir_span:
+    cmp r13, r12
+    jae .ir_no
+    mov rax, r13
+    shl rax, 4
+    mov rdi, [rbx + rax]
+    mov rsi, [rbx + rax + 8]
+    lea rdx, [enc_identity_st]
+    mov ecx, enc_identity_st_len
+    call linnea_http_ae_accepts       ; rax = allowed, rdx = named at all
+    inc r13
+    test rdx, rdx
+    jz .ir_span                       ; this line never mentions identity
+    test eax, eax
+    jnz .ir_span                      ; mentioned and allowed
+    mov eax, 1                        ; mentioned and refused
+    jmp .ir_ret
+.ir_no:
+    xor eax, eax
+.ir_ret:
     pop r13
     pop r12
     pop rbx
@@ -906,6 +981,8 @@ enc_br_st:    db "br"
 enc_br_st_len equ $ - enc_br_st
 enc_gzip_st:  db "gzip"
 enc_gzip_st_len equ $ - enc_gzip_st
+enc_identity_st: db "identity"
+enc_identity_st_len equ $ - enc_identity_st
 ext_html_h2: db "html"
 ext_css_h2:  db "css"
 ext_js_h2:   db "js"

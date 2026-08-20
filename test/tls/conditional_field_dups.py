@@ -109,6 +109,23 @@ case("three Accept-Encoding lines are all honoured",
      ["Accept-Encoding: identity", "Accept-Encoding: gzip",
       "Accept-Encoding: br"], "200/br",
      path="/aetest.txt", want_header="content-encoding")
+# identity;q=0 forbids the unencoded form (RFC 9110 12.5.3). The negotiation
+# only ever asked whether br or gzip was allowed, never whether the form it
+# actually falls back to was -- so a client that refused the unencoded
+# representation was served it, on all three protocols (audit-report-35).
+# Nothing here is available that this client will take, which is a 406.
+case("identity;q=0 with nothing else acceptable is 406",
+     ["Accept-Encoding: identity;q=0"], "406/plain",
+     path="/aetest.txt", want_header="content-encoding")
+# ...but refusing identity is not refusing everything: br is offered and we
+# have it. Without this row the rule could become "identity;q=0 is always 406".
+case("...while identity;q=0 with br still serves br",
+     ["Accept-Encoding: identity;q=0, br"], "200/br",
+     path="/aetest.txt", want_header="content-encoding")
+# only q=0 refuses; any nonzero q still allows the unencoded form
+case("identity;q=0.5 still allows the plain file",
+     ["Accept-Encoding: identity;q=0.5"], "200/plain",
+     path="/aetest.txt", want_header="content-encoding")
 case("a fourth is refused, not silently dropped",
      ["Accept-Encoding: identity", "Accept-Encoding: gzip",
       "Accept-Encoding: deflate", "Accept-Encoding: br"], "431/plain",
