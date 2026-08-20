@@ -14,8 +14,23 @@
 ;
 ;   GET  /api/random   {"value":N}, 1 <= N <= 1000, from getrandom(2).
 ;
-; One request per connection: linnea proxies with Connection: close, so there
-; is nothing to gain from keeping it.
+; KEEP-ALIVE, for GET. This said "one request per connection: linnea proxies
+; with Connection: close, so there is nothing to gain from keeping it" -- true
+; when it was written, and stale the day linnea learned to keep its upstream
+; connections. The proxy then asked and this still answered "close" to
+; everything, so enabling proxy_keepalive on /api changed nothing at all: a
+; comment describing the other end of a protocol goes out of date silently,
+; because nothing here fails when it does.
+;
+; A GET is answered and the connection goes round for another request unless
+; the client asked to close. An UPLOAD still ends the connection: do_upload
+; consumes a body of its own choosing, so what remains in the buffer afterwards
+; is its business rather than the loop's -- and linnea only ever reuses a
+; connection for GET and HEAD, so a POST always arrives on a fresh one anyway.
+;
+; The read deadline below is what bounds a kept connection. It must stay ABOVE
+; linnea's own five-second park cap, or this end closes first and every reuse
+; races the FIN; at ten seconds it is.
 ;
 ; A connection is served in its own forked child, up to MAX_CHILDREN of them.
 ; The syscalls are still blocking and each child still does one thing at a time
@@ -189,10 +204,22 @@ st_413_len      equ $ - st_413
 st_500:         db "HTTP/1.1 500 Internal Server Error", 13, 10
 st_500_len      equ $ - st_500
 
+; Two spellings of the same head. Which one goes out is decided per response by
+; [keep_alive], never assumed: a response that says keep-alive over a connection
+; this server is about to close would leave the proxy holding a socket it thinks
+; it may reuse -- which is the one mistake a backend can make here that the
+; proxy cannot detect until it has already sent the next request into it.
 resp_fixed:     db "Content-Type: application/json", 13, 10
                 db "Connection: close", 13, 10
                 db "Content-Length: "
 resp_fixed_len  equ $ - resp_fixed
+resp_keep:      db "Content-Type: application/json", 13, 10
+                db "Connection: keep-alive", 13, 10
+                db "Content-Length: "
+resp_keep_len   equ $ - resp_keep
+hn_conn_api:    db "connection"
+hn_conn_api_len equ $ - hn_conn_api
+val_close_api:  db "close"
 resp_crlf2:     db 13, 10, 13, 10
 resp_crlf2_len  equ $ - resp_crlf2
 
@@ -249,6 +276,10 @@ sockaddr:       resb 16
 headbuf:        resb HEAD_BUF
 head_len:       resq 1            ; bytes up to and including the blank line
 in_len:         resq 1            ; everything read so far (head + body prefix)
+; 1 = the response now being composed will say keep-alive, and this connection
+; goes round for another request. Cleared at the top of every request so it can
+; only ever be earned, never inherited from the one before.
+keep_alive:     resq 1
 iobuf:          resb IO_BUF
 namebuf:        resb NAME_MAX + 8
 name_len:       resq 1
@@ -459,6 +490,9 @@ set_timeout:
 ; handle_conn() — read one request head, dispatch on method and path.
 handle_conn:
     push rbx
+    mov qword [in_len], 0          ; nothing buffered on a new connection
+.request:
+    mov qword [keep_alive], 0      ; earned per request, never inherited
     call read_head
     test rax, rax
     js .done                       ; no head: the peer went away, or sent junk
@@ -477,6 +511,11 @@ handle_conn:
     call path_is
     test eax, eax
     jz .notfound
+    ; An upload ends the connection, and that is not a limitation to work
+    ; around. do_upload consumes a body of its own choosing, so what is left in
+    ; the buffer afterwards is its business, not this loop's -- and linnea only
+    ; ever reuses a connection for GET and HEAD, so a POST always arrives on a
+    ; fresh one. Closing after it is what the other side already expects.
     call do_upload
     jmp .done
 .get:
@@ -487,8 +526,32 @@ handle_conn:
     call path_is
     test eax, eax
     jz .notfound
+    ; The only route worth keeping a connection for. Keep it unless the client
+    ; asked otherwise -- and only after do_random has succeeded, so a response
+    ; that failed to compose cannot leave the connection open claiming success.
+    call req_wants_close
+    test eax, eax
+    jnz .get_close
+    mov qword [keep_alive], 1
+.get_close:
     call do_random
-    jmp .done
+    cmp qword [keep_alive], 0
+    je .done
+    ; Carry over whatever followed this head: on a kept connection those bytes
+    ; are the next request, and dropping them is a stall the client cannot see
+    ; the cause of. GET has no body, so everything past the head is next.
+    mov rcx, [in_len]
+    sub rcx, [head_len]
+    jz .next_empty
+    lea rdi, [headbuf]
+    lea rsi, [headbuf]
+    add rsi, [head_len]
+    mov [in_len], rcx
+    rep movsb
+    jmp .request
+.next_empty:
+    mov qword [in_len], 0
+    jmp .request
 .notfound:
     lea rdi, [st_404]
     mov esi, st_404_len
@@ -990,8 +1053,15 @@ send_status:
     mov r12, rcx                   ; body length
     lea rdx, [iobuf]               ; rdi/rsi are already the status line
     call append
+    cmp qword [keep_alive], 0
+    je .st_close_hdr
+    lea rdi, [resp_keep]
+    mov esi, resp_keep_len
+    jmp .st_conn_hdr
+.st_close_hdr:
     lea rdi, [resp_fixed]
     mov esi, resp_fixed_len
+.st_conn_hdr:
     mov rdx, rax
     call append
     mov rdi, r12
@@ -1045,8 +1115,17 @@ send_buf:
 ; starts arriving in the same segments.
 read_head:
     push rbx
-    mov qword [in_len], 0
     mov qword [head_len], 0
+    ; in_len is NOT cleared here any more. On a kept connection the bytes after
+    ; one request's head are the beginning of the next, and zeroing here threw
+    ; them away -- which is invisible until a client pipelines. handle_conn owns
+    ; the buffer's contents across requests; this only owns the head.
+.check:
+    cmp qword [in_len], 0
+    je .more
+    call find_head_end
+    test rax, rax
+    jnz .have
 .more:
     mov rax, HEAD_BUF
     sub rax, [in_len]
@@ -1063,9 +1142,8 @@ read_head:
     cmp rax, 0
     jle .fail                      ; EOF, error, or the read deadline
     add [in_len], rax
-    call find_head_end             ; rax = head length, or 0 while incomplete
-    test rax, rax
-    jz .more
+    jmp .check
+.have:
     mov [head_len], rax
     xor eax, eax
     pop rbx
@@ -1084,6 +1162,87 @@ read_head:
     ; which is exactly why it is fixed HERE rather than left to the new process
     ; model to cover up.
     mov rax, -1
+    pop rbx
+    ret
+
+; req_wants_close() -> eax = 1 when this request's head asks for the connection
+; to be closed.
+;
+; Only linnea reaches this port, and it says either "close" or "keep-alive" --
+; but a backend that ignores the field and keeps the socket anyway is a backend
+; that hangs onto connections its client has finished with, so it is read.
+; Scans for the field name, then for the token in ITS value: a bare search of
+; the whole head would find the word in a target or a filename.
+req_wants_close:
+    push rbx
+    push r12
+    push r13
+    xor r12d, r12d                 ; line start
+.rc_line:
+    mov rax, r12
+    add rax, hn_conn_api_len + 1
+    cmp rax, [head_len]
+    jae .rc_no
+    ; is this line "connection:"?
+    xor ecx, ecx
+.rc_name:
+    cmp ecx, hn_conn_api_len
+    jae .rc_name_ok
+    movzx eax, byte [headbuf + r12 + rcx]
+    or eax, 0x20                   ; field names are case-insensitive
+    movzx ebx, byte [hn_conn_api + rcx]
+    cmp al, bl
+    jne .rc_next
+    inc ecx
+    jmp .rc_name
+.rc_name_ok:
+    cmp byte [headbuf + r12 + rcx], ':'
+    jne .rc_next
+    ; the value runs to the CR; look for "close" in it
+    lea r13, [r12 + hn_conn_api_len + 1]
+.rc_val:
+    mov rax, r13
+    add rax, 5
+    cmp rax, [head_len]
+    ja .rc_no
+    cmp byte [headbuf + r13], 13
+    je .rc_no
+    xor ecx, ecx
+.rc_tok:
+    cmp ecx, 5
+    jae .rc_yes
+    movzx eax, byte [headbuf + r13 + rcx]
+    or eax, 0x20
+    movzx ebx, byte [val_close_api + rcx]
+    cmp al, bl
+    jne .rc_val_next
+    inc ecx
+    jmp .rc_tok
+.rc_val_next:
+    inc r13
+    jmp .rc_val
+.rc_next:
+    ; to the next line
+.rc_eol:
+    cmp r12, [head_len]
+    jae .rc_no
+    cmp byte [headbuf + r12], 10
+    je .rc_eol_done
+    inc r12
+    jmp .rc_eol
+.rc_eol_done:
+    inc r12
+    jmp .rc_line
+.rc_yes:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.rc_no:
+    xor eax, eax
+    pop r13
+    pop r12
     pop rbx
     ret
 

@@ -32,22 +32,45 @@ def want(label, ok, detail=""):
         bad.append(label)
 
 
-def req(raw, timeout=20):
-    s = socket.create_connection(("127.0.0.1", PORT), timeout=timeout)
-    s.sendall(raw)
+def read_one(s):
+    """One complete response: the head, then exactly Content-Length bytes.
+
+    Reading to EOF instead is what a one-shot client does, and it worked while
+    this server closed after every response. It keeps connections for GET now,
+    so reading to EOF waits out the ten-second read deadline on EVERY request --
+    which did not fail loudly, it just made the suite twenty times slower and
+    broke the two checks that measure how long something takes. A test that
+    reads until the peer goes away is measuring the peer's timeout, not the
+    response."""
     d = b""
     try:
-        while True:
+        while b"\r\n\r\n" not in d:
+            c = s.recv(4096)
+            if not c:
+                return b"", b""
+            d += c
+        head, _, body = d.partition(b"\r\n\r\n")
+        n = 0
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                n = int(line.split(b":", 1)[1])
+        while len(body) < n:
             c = s.recv(4096)
             if not c:
                 break
-            d += c
+            body += c
+        return head, body[:n]
     except socket.timeout:
-        pass
-    s.close()
-    if not d:
         return b"", b""
-    head, _, body = d.partition(b"\r\n\r\n")
+
+
+def req(raw, timeout=20):
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=timeout)
+    s.sendall(raw)
+    head, body = read_one(s)
+    s.close()
+    if not head:
+        return b"", b""
     return head.split(b"\r\n")[0], body
 
 
@@ -150,6 +173,63 @@ want("a silent peer's own connection ends at the deadline",
 want("a silent peer is served nothing at all", got == b"",
      "got %r" % got[:60] if got else "no response, connection closed")
 stuck.close()
+
+# --- keep-alive ---------------------------------------------------------
+# The proxy in front of this asks for a connection it can reuse, and answering
+# "close" to everything is how enabling proxy_keepalive on /api came to change
+# nothing at all. Reuse is invisible in any single response, so the check is
+# that SEVERAL requests are answered over ONE socket.
+ka = socket.create_connection(("127.0.0.1", PORT), timeout=20)
+answered = 0
+said_keep = 0
+for _ in range(5):
+    ka.sendall(b"GET /api/random HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, body = read_one(ka)
+    if not head:
+        break
+    answered += 1
+    if b"keep-alive" in head.lower():
+        said_keep += 1
+    if not body.startswith(b'{"value":'):
+        break
+ka.close()
+want("five GETs are answered over one connection",
+     answered == 5 and said_keep == 5,
+     "%d answered, %d said keep-alive" % (answered, said_keep))
+
+# ...and a client that says close gets a closed connection, not a promise
+c = socket.create_connection(("127.0.0.1", PORT), timeout=20)
+c.sendall(b"GET /api/random HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+head, _ = read_one(c)
+tail = c.recv(64)
+c.close()
+want("Connection: close is honoured, and said back",
+     b"close" in head.lower().split(b"connection:")[1].split(b"\r\n")[0] and tail == b"",
+     "head says close and the peer closed" if tail == b"" else "peer did not close")
+
+# Pipelining follows from keeping the connection: the bytes after one head are
+# the next request, and read_head used to discard them.
+pl = socket.create_connection(("127.0.0.1", PORT), timeout=20)
+one = b"GET /api/random HTTP/1.1\r\nHost: x\r\n\r\n"
+pl.sendall(one + one)
+h1, b1 = read_one(pl)
+h2, b2 = read_one(pl)
+pl.close()
+want("two pipelined GETs are both answered",
+     b1.startswith(b'{"value":') and b2.startswith(b'{"value":'),
+     "both answered" if b2 else "the second was lost")
+
+# An upload ends the connection whatever it asks for: the body it consumes is
+# its own business, so the loop does not try to find where the next request
+# starts.
+up = socket.create_connection(("127.0.0.1", PORT), timeout=20)
+up.sendall(b"POST /api/upload HTTP/1.1\r\nHost: x\r\nX-Filename: t.txt\r\n"
+           b"Content-Length: 5\r\n\r\nhello")
+head, _ = read_one(up)
+tail = up.recv(64)
+up.close()
+want("an upload closes the connection", head.startswith(b"HTTP/1.1 200") and tail == b"",
+     "closed after 200" if tail == b"" else "still open")
 
 print()
 print("all ok" if not bad else "%d FAILED: %s" % (len(bad), ", ".join(bad)))
