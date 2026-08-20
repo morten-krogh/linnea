@@ -133,8 +133,23 @@ struc linnea_h2_req
     .rng_len:     resq 1
     .ifr_ptr:     resq 1        ; if-range value, 0 if absent
     .ifr_len:     resq 1
-    .ae_ptr:      resq 1        ; accept-encoding value, 0 if absent
+    ; accept-encoding is list-valued too, so repeated field lines are the
+    ; comma-joined value and a coding is acceptable if ANY line accepts it
+    ; (RFC 9110 5.3). Keeping one span meant the LAST line decided, so
+    ; `Accept-Encoding: br` then `Accept-Encoding: identity` served the plain
+    ; file here while HTTP/1 -- which has kept a span per line since h1-14 --
+    ; served the .br variant. Found beside audit-report-32, and the same defect
+    ; report 30 fixed for the entity-tag lists, on the very field whose
+    ; treatment report 30 cited as the precedent. Ignoring a fourth line can
+    ; only narrow what is served, never answer wrongly, so it is ignored here
+    ; exactly as HTTP/1 ignores it.
+    .ae_ptr:      resq 1        ; accept-encoding spans; .ae_n is the count
     .ae_len:      resq 1
+    .ae_ptr2:     resq 1
+    .ae_len2:     resq 1
+    .ae_ptr3:     resq 1
+    .ae_len3:     resq 1
+    .ae_n:        resq 1
     ; Header rebuild for proxying: when .hb_start is nonzero, emit_field
     ; appends every forwardable field as an h1 "name: value\r\n" line at
     ; .hb_cur (bounded by .hb_end; overflow parks .hb_cur past .hb_end).

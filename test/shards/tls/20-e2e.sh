@@ -48,6 +48,20 @@ if [ "$ktls" = 1 ]; then
     [ $rc -eq 0 ]
     check "repeated If-Match/If-None-Match lines are one list on every protocol ${first_fail}" $?
 
+    # ...and the fields beside them, which divide the other way: the singleton
+    # conditionals (one date, validator or range each) refuse a repeat on all
+    # three, while Accept-Encoding combines its lines on all three
+    # (audit-report-32). h1 kept the first and h2/h3 the last for both kinds,
+    # so one request served different bytes depending on the protocol.
+    printf 'plain payload' > $WWW/aetest.txt
+    printf 'br payload' > $WWW/aetest.txt.br
+    out=$(timeout 90 python3 test/tls/conditional_field_dups.py ${P61443} $CA $h3arg 2>&1)
+    rc=$?
+    first_fail=$(echo "$out" | grep -m1 FAIL)
+    rm -f $WWW/aetest.txt $WWW/aetest.txt.br
+    [ $rc -eq 0 ]
+    check "repeated singleton conditionals refused, Accept-Encoding combined, on every protocol ${first_fail}" $?
+
     # One connection, two requests: keep-alive has to survive the handoff.
     # -w reports per transfer, so sum it: the second request must open no
     # new connection (and so must not repeat the handshake).

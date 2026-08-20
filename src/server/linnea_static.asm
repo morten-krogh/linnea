@@ -268,16 +268,14 @@ linnea_static_open_enc:
     push r13
     push r14
     mov rbx, rsi                     ; path end
-    mov r12, rdx                     ; ae ptr
-    mov r13, rcx                     ; ae len
+    mov r12, rdx                     ; the caller's array of (ptr,len) spans
+    mov r13, rcx                     ; how many of them
     mov r14, rdi                     ; path start
-    test r12, r12
+    test r13, r13
     jz .oe_plain                     ; no Accept-Encoding: nothing to negotiate
-    mov rdi, r12
-    mov rsi, r13
-    lea rdx, [enc_br_st]
-    mov ecx, enc_br_st_len
-    call linnea_http_ae_accepts
+    lea rdi, [enc_br_st]
+    mov esi, enc_br_st_len
+    call .oe_any_accepts
     test eax, eax
     jz .oe_try_gz
     mov dword [rbx], '.br'           ; three bytes and the NUL
@@ -288,11 +286,9 @@ linnea_static_open_enc:
     mov r8d, 2
     jmp .oe_ret
 .oe_try_gz:
-    mov rdi, r12
-    mov rsi, r13
-    lea rdx, [enc_gzip_st]
-    mov ecx, enc_gzip_st_len
-    call linnea_http_ae_accepts
+    lea rdi, [enc_gzip_st]
+    mov esi, enc_gzip_st_len
+    call .oe_any_accepts
     test eax, eax
     jz .oe_plain
     mov dword [rbx], '.gz'
@@ -311,6 +307,40 @@ linnea_static_open_enc:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+; .oe_any_accepts(rdi = coding, esi = its length) -> eax = 1 when ANY of the
+; caller's Accept-Encoding spans accepts it. Repeated field lines are the
+; comma-joined value, so asking each in turn is the same question as asking the
+; join, without copying anything -- the shape HTTP/1 has used since h1-14.
+; Preserves r12/r13/r14/rbx, which the caller is holding.
+.oe_any_accepts:
+    push rbx
+    push r15
+    push rdi
+    push rsi
+    xor r15d, r15d                   ; span cursor
+.oe_span:
+    cmp r15, r13
+    jae .oe_span_no
+    mov rbx, r15
+    shl rbx, 4
+    add rbx, r12
+    mov rdi, [rbx]
+    mov rsi, [rbx + 8]
+    mov rdx, [rsp + 8]               ; the coding, as pushed
+    mov ecx, [rsp]
+    call linnea_http_ae_accepts
+    inc r15
+    test eax, eax
+    jz .oe_span
+    mov eax, 1
+    jmp .oe_span_ret
+.oe_span_no:
+    xor eax, eax
+.oe_span_ret:
+    add rsp, 16                      ; the coding and its length
+    pop r15
     pop rbx
     ret
 

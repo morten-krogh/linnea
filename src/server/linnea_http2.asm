@@ -979,8 +979,8 @@ linnea_h2_handle:
 %define L_OUT    linnea_h2_req_size + 24
 %define L_BIG    linnea_h2_req_size + 32
 %define L_ASM    linnea_h2_req_size + 40
-%if L_ASM + 8 > 520
-  %error "h2_build_request stack frame (sub rsp,520) too small for req + locals"
+%if L_ASM + 8 > 600
+  %error "h2_build_request stack frame (sub rsp,600) too small for req + locals"
 %endif
 h2_build_request:
     push rbx
@@ -989,13 +989,13 @@ h2_build_request:
     push r14
     push r15
     push rbp
-    ; 520, not a round 512: six pushes leave rsp 8 past a 16-byte boundary, so an
+    ; 600, not a round 592: six pushes leave rsp 8 past a 16-byte boundary, so an
     ; even frame would hand every callee a misaligned stack. Nothing under here
     ; uses an aligned SSE load today, so this was a trap rather than a crash — but
     ; it is one movaps away from being a crash, and the AES paths are close by.
     ; It grew from 392 when the request struct took a .cl_val; the %error above
     ; is what says so, rather than a local being silently overwritten.
-    sub rsp, 520
+    sub rsp, 600
     mov rbx, rdi                     ; conn
     mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
@@ -1418,7 +1418,7 @@ h2_build_request:
     mov dword [h2_goaway_code], LINNEA_H2_COMPRESSION_ERR
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
-    add rsp, 520
+    add rsp, 600
     pop rbp
     pop r15
     pop r14
@@ -1652,8 +1652,8 @@ h2_serve:
     ; the MIME lookup below keeps using the name before it)
     mov rdi, [rsp + S_JOIN]
     mov rsi, r14
-    mov rdx, [r12 + linnea_h2_req.ae_ptr]
-    mov rcx, [r12 + linnea_h2_req.ae_len]
+    lea rdx, [r12 + linnea_h2_req.ae_ptr]   ; one span per field line
+    mov rcx, [r12 + linnea_h2_req.ae_n]
     call linnea_static_open_enc            ; -> rax = base, rdx = size, r8 = coding
     mov [rsp + S_ENC], r8
     test rax, rax

@@ -848,6 +848,13 @@ emit_field:
     pop rdi
     pop rsi
     jnz .not_ims
+    ; A second occurrence is refused, exactly as a second content-length is:
+    ; these define one date, validator or range, not a list, so two of them are
+    ; a request that says two different things. Overwriting kept the LAST while
+    ; HTTP/1 kept the FIRST, which made one request 304 here and 200 there
+    ; (audit-report-32).
+    cmp qword [rbx + linnea_h2_req.ims_ptr], 0
+    jne .ef_malformed
     mov [rbx + linnea_h2_req.ims_ptr], rsi
     mov [rbx + linnea_h2_req.ims_len], rdi
     clc
@@ -886,6 +893,8 @@ emit_field:
     pop rdi
     pop rsi
     jnz .not_ius
+    cmp qword [rbx + linnea_h2_req.ius_ptr], 0
+    jne .ef_malformed
     mov [rbx + linnea_h2_req.ius_ptr], rsi
     mov [rbx + linnea_h2_req.ius_len], rdi
     clc
@@ -900,6 +909,8 @@ emit_field:
     pop rdi
     pop rsi
     jnz .not_range
+    cmp qword [rbx + linnea_h2_req.rng_ptr], 0
+    jne .ef_malformed
     mov [rbx + linnea_h2_req.rng_ptr], rsi
     mov [rbx + linnea_h2_req.rng_len], rdi
     clc
@@ -914,6 +925,8 @@ emit_field:
     pop rdi
     pop rsi
     jnz .not_ifr
+    cmp qword [rbx + linnea_h2_req.ifr_ptr], 0
+    jne .ef_malformed
     mov [rbx + linnea_h2_req.ifr_ptr], rsi
     mov [rbx + linnea_h2_req.ifr_len], rdi
     clc
@@ -928,8 +941,15 @@ emit_field:
     pop rdi
     pop rsi
     jnz .not_ae
-    mov [rbx + linnea_h2_req.ae_ptr], rsi
-    mov [rbx + linnea_h2_req.ae_len], rdi
+    mov rax, [rbx + linnea_h2_req.ae_n]
+    cmp rax, 3
+    jae .ae_full               ; a fourth line can only narrow what we serve
+    shl rax, 4
+    lea rdx, [rbx + linnea_h2_req.ae_ptr]
+    mov [rdx + rax], rsi
+    mov [rdx + rax + 8], rdi
+    inc qword [rbx + linnea_h2_req.ae_n]
+.ae_full:
     clc
     ret
 .not_ae:

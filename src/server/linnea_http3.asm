@@ -1117,8 +1117,8 @@ linnea_h3_serve:
     ; the MIME lookup below keeps using the name before it)
     mov rdi, [h3_join]
     mov rsi, r14
-    mov rdx, [rbx + linnea_h2_req.ae_ptr]
-    mov rcx, [rbx + linnea_h2_req.ae_len]
+    lea rdx, [rbx + linnea_h2_req.ae_ptr]   ; one span per field line
+    mov rcx, [rbx + linnea_h2_req.ae_n]
     call linnea_static_open_enc      ; rax = base (0 = missing), rdx = size,
     mov [linnea_qpack_cenc], r8      ; r8 = the coding served
     test rax, rax

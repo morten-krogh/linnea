@@ -1309,8 +1309,16 @@ linnea_http_handle:
     inc qword [rsp + 312]
     jmp .header_next
 .ius_header:
+    ; A SECOND occurrence is refused, not resolved. These four each define one
+    ; date, validator or range -- not a list -- so two of them are a request
+    ; that says two different things, and "first occurrence wins" quietly picked
+    ; one. It picked the opposite one from h2 and h3, which kept the last, so
+    ; the same request was 200 here and 304 there and swapping the client's two
+    ; lines swapped which was which; a doubled Range served byte 0 on HTTP/1 and
+    ; byte 10 on the other two (audit-report-32). Refusing is what Host and
+    ; Content-Length have always done with a repeat, and for the same reason.
     cmp qword [rsp + 328], 0
-    jne .header_next
+    jne .resp_400              ; a second one: the request says two things
     mov rax, [rsp + 72]
     mov [rsp + 328], rax
     mov rax, [rsp + 80]
@@ -1331,7 +1339,7 @@ linnea_http_handle:
     jmp .header_next
 .ims_header:
     cmp qword [rsp + 192], 0
-    jne .header_next
+    jne .resp_400              ; a second one: the request says two things
     mov rax, [rsp + 72]
     mov [rsp + 192], rax
     mov rax, [rsp + 80]
@@ -1358,9 +1366,9 @@ linnea_http_handle:
     mov [rax + 8], rdx
     inc qword [rsp + 208]
     jmp .header_next
-.range_header:                 ; first occurrence wins, as for Host
+.range_header:
     cmp qword [rsp + 240], 0
-    jne .header_next
+    jne .resp_400              ; a second one: the request says two things
     mov rax, [rsp + 72]
     mov [rsp + 240], rax
     mov rax, [rsp + 80]
@@ -1368,7 +1376,7 @@ linnea_http_handle:
     jmp .header_next
 .ifr_header:
     cmp qword [rsp + 256], 0
-    jne .header_next
+    jne .resp_400              ; a second one: the request says two things
     mov rax, [rsp + 72]
     mov [rsp + 256], rax
     mov rax, [rsp + 80]
