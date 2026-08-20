@@ -110,6 +110,7 @@ extern linnea_string_from_hex_u64
 extern linnea_string_equal
 extern linnea_string_is_token
 extern linnea_string_is_tchar
+extern linnea_string_trim_ows
 extern linnea_chunk_ext_step
 extern linnea_spill_chunked
 extern linnea_string_iequal
@@ -1479,18 +1480,61 @@ linnea_http_handle:
 .te_header:
     ; "chunked" is the one coding we implement (RFC 9112 7.1 makes receiving it
     ; a MUST); anything else still earns a 501. Bit 2 is "a coding we cannot
-    ; do", bit 4 is "chunked".
-    mov rdi, [rsp + 72]
-    mov rsi, [rsp + 80]
+    ; do", bit 4 is "chunked", bit 32 is "chunked more than once".
+    ;
+    ; The value is walked as a LIST because that is what it is. Repeated field
+    ; lines are one comma-separated list in order (RFC 9110 5.3), so two
+    ; "Transfer-Encoding: chunked" lines say "chunked, chunked" -- which RFC
+    ; 9112 6.1 forbids, chunked being applicable at most once. Comparing the
+    ; whole value against "chunked" made the two spellings of one message
+    ; disagree with each other: written on one line it was 501, written on two
+    ; it was 200 and the body was decoded and routed (audit-report-28).
+    mov r10, [rsp + 72]        ; element cursor
+    mov r11, [rsp + 80]        ; bytes left in the list
+.te_elem:
+    test r11, r11
+    jz .header_next
+    xor rcx, rcx               ; the element runs to the next comma
+.te_scan:
+    cmp rcx, r11
+    jae .te_elem_end
+    cmp byte [r10 + rcx], ','
+    je .te_elem_end
+    inc rcx
+    jmp .te_scan
+.te_elem_end:
+    push r10                   ; nothing below may touch an rsp-relative local
+    push r11                   ; until these are popped
+    push rcx
+    mov rdi, r10
+    mov rsi, rcx
+    call linnea_string_trim_ows       ; -> rax = ptr, rdx = length
+    mov rdi, rax
+    mov rsi, rdx
     lea rdx, [hv_chunked]
     mov ecx, 7
     call linnea_string_iequal
+    pop rcx
+    pop r11
+    pop r10
     test eax, eax
-    jz .te_unsupported
+    jz .te_elem_other
+    test qword [rsp + 136], 4
+    jnz .te_elem_again
     or qword [rsp + 136], 4
-    jmp .header_next
-.te_unsupported:
+    jmp .te_elem_next
+.te_elem_again:
+    or qword [rsp + 136], 32   ; twice, which is not a coding but a malformed one
+    jmp .te_elem_next
+.te_elem_other:
     or qword [rsp + 136], 2
+.te_elem_next:
+    cmp rcx, r11
+    jae .header_next           ; that was the last element
+    inc rcx                    ; step over the comma
+    add r10, rcx
+    sub r11, rcx
+    jmp .te_elem
 .header_next:
     add r15, 2                 ; past the CRLF
     jmp .header_loop
@@ -1542,6 +1586,12 @@ linnea_http_handle:
 .host_done:
     test qword [rsp + 136], 2
     jnz .resp_501                      ; a coding we do not implement
+    ; ...and chunked applied more than once is not an unimplemented coding but
+    ; an invalid message, so it is a 400 and it is judged after the 501: a list
+    ; carrying both an unknown coding and a repeated chunked is still answered
+    ; for the coding we cannot do.
+    test qword [rsp + 136], 32
+    jnz .resp_400
     ; Transfer-Encoding and Content-Length together is the classic smuggling
     ; setup: RFC 9112 6.1 says the message framing is invalid, answer 400 and
     ; close. It used to fall out as a 501 because any TE at all was refused.

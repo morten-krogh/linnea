@@ -22,6 +22,8 @@ Each mode prints OK or a reason. Modes:
   smuggle a chunk size that overflows 64 bits must not wrap to zero: that reads
           as the last chunk, ends the body early, and turns the bytes behind it
           into a second request
+  telist  Transfer-Encoding as a LIST: repeated field lines combine, so two
+          "chunked" lines are "chunked, chunked", which may not be applied twice
 """
 import os
 import hashlib
@@ -358,6 +360,82 @@ def mode_sizeline():
     return "OK"
 
 
+# Transfer-Encoding on a REQUEST. Repeated field lines are one comma-separated
+# list in order (RFC 9110 5.3), so two "Transfer-Encoding: chunked" lines say
+# "chunked, chunked" -- and chunked may be applied at most once (RFC 9112 6.1).
+# The two spellings of that one message used to disagree with each other: on one
+# line it was 501, on two it was 200 and the body was decoded and routed
+# (audit-report-28). The unsupported-coding rows are the controls: this rule is
+# about a coding applied twice, and must not quietly become "any list is bad".
+TE_LISTS = [
+    ("one chunked",       [b"Transfer-Encoding: chunked"],                   b"200"),
+    ("two chunked lines", [b"Transfer-Encoding: chunked"] * 2,               b"400"),
+    ("chunked, chunked",  [b"Transfer-Encoding: chunked, chunked"],          b"400"),
+    ("three lines",       [b"Transfer-Encoding: chunked"] * 3,               b"400"),
+    ("chunked then gzip", [b"Transfer-Encoding: chunked",
+                           b"Transfer-Encoding: gzip"],                      b"501"),
+    ("gzip then chunked", [b"Transfer-Encoding: gzip",
+                           b"Transfer-Encoding: chunked"],                   b"501"),
+    ("gzip, chunked",     [b"Transfer-Encoding: gzip, chunked"],             b"501"),
+    ("chunked, gzip",     [b"Transfer-Encoding: chunked, gzip"],             b"501"),
+    ("chunked + length",  [b"Transfer-Encoding: chunked",
+                           b"Content-Length: 4"],                            b"400"),
+]
+
+
+def te_case(pad, headers):
+    """The head first, and the body only if the server has not already answered.
+
+    Every verdict in TE_LISTS is reached from the HEAD, so a refusal arrives
+    while a body sent in the same write would still be going out -- and the RST
+    that follows discards the response we came to read.
+
+    The wait is a bare recv rather than read_response, because read_response
+    sets its own 20 s timeout on the socket: passing it a short one and
+    expecting to be handed control back only meant blocking past the server's
+    body clock, and the valid row came back 408 instead of 200.
+    """
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=20)
+    try:
+        s.sendall(b"POST /api/echo HTTP/1.1\r\nHost: one.test\r\n"
+                  + b"\r\n".join(headers) + b"\r\n\r\n")
+        s.settimeout(1.0)
+        try:
+            early = s.recv(65536)
+        except socket.timeout:
+            early = b""
+        if not early:
+            s.settimeout(20)         # it is waiting for the body: send it
+            lead = b"%x\r\n" % pad + b"P" * pad + b"\r\n" if pad else b""
+            s.sendall(lead + b"4\r\nbody\r\n0\r\n\r\n")
+            head, _ = read_response(s)
+            return head
+        s.settimeout(20)             # an answer is already coming: finish it
+        while b"\r\n\r\n" not in early:
+            d = s.recv(65536)
+            if not d:
+                break
+            early += d
+        return early.partition(b"\r\n\r\n")[0]
+    except (BrokenPipeError, ConnectionResetError, socket.timeout):
+        return None
+    finally:
+        s.close()
+
+
+def mode_telist():
+    for name, headers, want in TE_LISTS:
+        # the verdict is the head's, so the body size must not change it
+        for pad, which in ((0, "buffered"), (40000, "captured")):
+            head = te_case(pad, headers)
+            if head is None:
+                return f"{name} ({which}): no reply, wanted {want.decode()}"
+            if head.split(b" ")[1:2] != [want]:
+                status = head.split(b"\r\n")[0]
+                return f"{name} ({which}): {status!r}, wanted {want.decode()}"
+    return "OK"
+
+
 def mode_smuggle():
     """The wrap above, stated as what it costs: a chunk size that overflows to
     zero ends the body early, and everything after it is parsed as the next
@@ -392,7 +470,7 @@ def mode_smuggle():
 MODES = {"big": mode_big, "twice": mode_twice, "head": mode_head, "bad": mode_bad,
          "abort": mode_abort, "cap": mode_cap, "flood": mode_flood,
          "pipeline": mode_pipeline, "sizeline": mode_sizeline,
-         "smuggle": mode_smuggle}
+         "smuggle": mode_smuggle, "telist": mode_telist}
 
 try:
     print(MODES[sys.argv[1]]())
