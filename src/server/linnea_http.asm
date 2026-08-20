@@ -678,11 +678,13 @@ linnea_http_handle:
     push r13
     push r14
     push r15
-    sub rsp, 432               ; +32 for the two precondition fields, +64 for the
+    sub rsp, 528               ; +32 for the two precondition fields, +64 for the
                                ; Accept-Encoding span array (h1-14): [352] holds
                                ; three (ptr,len) pairs, [400] the scan index, and
                                ; [416]/[424] the version token as the client wrote
-                               ; it, for the access log
+                               ; it, for the access log, [432] and [480] three
+                               ; (ptr,len) spans each for If-None-Match and
+                               ; If-Match, counted at [176] and [312]
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -698,7 +700,7 @@ linnea_http_handle:
     mov qword [rsp + 136], 0   ; no Content-Length/Transfer-Encoding seen
     mov qword [rsp + 144], 0   ; no raw target yet
     mov qword [rsp + 416], 0   ; ...and no version token yet
-    mov qword [rsp + 176], 0   ; no If-None-Match yet
+    mov qword [rsp + 176], 0   ; no If-None-Match lines yet (a count)
     mov qword [rsp + 192], 0   ; no If-Modified-Since yet
     mov qword [rsp + 208], 0   ; no Accept-Encoding lines yet (a count, h1-14)
     mov qword [rsp + 224], 0   ; nothing negotiated
@@ -873,7 +875,7 @@ linnea_http_handle:
     ; accept, and asterisk-form is how OPTIONS asks about the server itself.
     ; Both are recognised here, before the target is used for anything.
     mov qword [rsp + 304], 0   ; not an OPTIONS * request
-    mov qword [rsp + 312], 0   ; If-Match absent
+    mov qword [rsp + 312], 0   ; ...and no If-Match lines (also a count)
     mov qword [rsp + 328], 0   ; If-Unmodified-Since absent
     mov rax, [rsp + 8]
     cmp qword [rsp + 16], 1
@@ -1278,13 +1280,25 @@ linnea_http_handle:
     jnz .header_next
     or qword [rsp + 232], 4    ; the client is waiting for permission
     jmp .header_next
-.ifm_header:                   ; first occurrence wins, as for Host
-    cmp qword [rsp + 312], 0
-    jne .header_next
-    mov rax, [rsp + 72]
-    mov [rsp + 312], rax
-    mov rax, [rsp + 80]
-    mov [rsp + 320], rax
+.ifm_header:
+    ; RFC 9110 5.3 once more: If-Match carries an entity-tag LIST, so repeated
+    ; lines are the comma-joined value. The Host rule was applied instead --
+    ; first occurrence wins -- which is a rule for a field that may not repeat
+    ; at all, and it changed the meaning of a legal request: `If-Match: "miss"`
+    ; followed by `If-Match: <current>` was 412 where the one-line spelling
+    ; passed. Recorded as spans and tried in turn, exactly as Accept-Encoding is
+    ; (audit-report-30).
+    mov rcx, [rsp + 312]       ; spans recorded so far
+    cmp rcx, 3
+    jae .header_next
+    shl rcx, 4                 ; -> byte offset of this span in the array
+    lea rax, [rsp + 480]
+    add rax, rcx
+    mov rdx, [rsp + 72]        ; value ptr
+    mov [rax], rdx
+    mov rdx, [rsp + 80]        ; value len
+    mov [rax + 8], rdx
+    inc qword [rsp + 312]
     jmp .header_next
 .ius_header:
     cmp qword [rsp + 328], 0
@@ -1294,13 +1308,18 @@ linnea_http_handle:
     mov rax, [rsp + 80]
     mov [rsp + 336], rax
     jmp .header_next
-.inm_header:                   ; first occurrence wins, as for Host
-    cmp qword [rsp + 176], 0
-    jne .header_next
-    mov rax, [rsp + 72]
-    mov [rsp + 176], rax
-    mov rax, [rsp + 80]
-    mov [rsp + 184], rax
+.inm_header:                   ; a list too, and recorded the same way
+    mov rcx, [rsp + 176]
+    cmp rcx, 3
+    jae .header_next
+    shl rcx, 4
+    lea rax, [rsp + 432]
+    add rax, rcx
+    mov rdx, [rsp + 72]
+    mov [rax], rdx
+    mov rdx, [rsp + 80]
+    mov [rax + 8], rdx
+    inc qword [rsp + 176]
     jmp .header_next
 .ims_header:
     cmp qword [rsp + 192], 0
@@ -1992,14 +2011,24 @@ linnea_http_handle:
     ; update the fields exist to prevent.
     cmp qword [rsp + 312], 0
     je .check_ius
-    mov rdi, [rsp + 312]
-    mov rsi, [rsp + 320]
+    ; any line may carry the matching tag, which is what joining them would say
+    mov qword [rsp + 408], 0
+.ifm_span:
+    mov rcx, [rsp + 408]
+    cmp rcx, [rsp + 312]
+    jae .resp_412              ; no line matched
+    shl rcx, 4
+    lea rax, [rsp + 480]
+    add rax, rcx
+    mov rdi, [rax]
+    mov rsi, [rax + 8]
     lea rdx, [etag_buf]
     mov rcx, [etag_len]
     mov r8d, 1                 ; If-Match compares strongly (13.1.1)
     call linnea_http_etag_match
+    inc qword [rsp + 408]
     test eax, eax
-    jz .resp_412
+    jz .ifm_span
     jmp .check_inm             ; If-Match present: If-Unmodified-Since is skipped
 .check_ius:
     cmp qword [rsp + 328], 0
@@ -2014,14 +2043,23 @@ linnea_http_handle:
 .check_inm:
     cmp qword [rsp + 176], 0
     je .check_ims
-    mov rdi, [rsp + 176]
-    mov rsi, [rsp + 184]
+    mov qword [rsp + 408], 0
+.inm_span:
+    mov rcx, [rsp + 408]
+    cmp rcx, [rsp + 176]
+    jae .send_full             ; no line matched, and that overrides If-Modified-Since
+    shl rcx, 4
+    lea rax, [rsp + 432]
+    add rax, rcx
+    mov rdi, [rax]
+    mov rsi, [rax + 8]
     lea rdx, [etag_buf]
     mov rcx, [etag_len]
     call linnea_http_inm_match
+    inc qword [rsp + 408]
     test eax, eax
-    jnz .resp_304
-    jmp .send_full             ; a mismatch overrides any If-Modified-Since
+    jz .inm_span
+    jmp .resp_304
 .check_ims:
     cmp qword [rsp + 192], 0
     je .send_full
@@ -2888,7 +2926,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 432
+    add rsp, 528
     pop r15
     pop r14
     pop r13

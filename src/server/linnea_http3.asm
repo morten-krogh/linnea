@@ -955,10 +955,11 @@ linnea_h3_serve:
     push r14
     push r15
     push rbp
-    sub rsp, 72                      ; [0/8] mime ptr/len, [16/24] range
+    sub rsp, 88                      ; [0/8] mime ptr/len, [16/24] range
     ;                                ; offset/length, [32] ranged flag,
     ;                                ; [40/48] the request body a proxy forwards,
-    ;                                ; [56/64] the root the caller passed
+    ;                                ; [56/64] the root the caller passed,
+    ;                                ; [72] the If-Match/If-None-Match span cursor
     mov rbx, rdi                     ; req
     mov r12, rcx                     ; out
     mov [rsp + 40], r8               ; the body the reader joined for us (0/0
@@ -1130,16 +1131,28 @@ linnea_h3_serve:
     ; failure is 412 and beats an If-None-Match that would have said 304. Same
     ; evaluation as h1 (Q187) and h2, so the answer no longer depends on which
     ; protocol carried the request.
-    mov rdi, [rbx + linnea_h2_req.ifm_ptr]
-    test rdi, rdi
-    jz .chk_ius
-    mov rsi, [rbx + linnea_h2_req.ifm_len]
+    ; ...and each line of either field is its own span, any of which may carry
+    ; the matching tag: they are lists, and repeated lines are the comma-joined
+    ; value (RFC 9110 5.3). Keeping one span let the LAST line decide here while
+    ; the FIRST decided on h1 (audit-report-30).
+    cmp qword [rbx + linnea_h2_req.ifm_n], 0
+    je .chk_ius
+    mov qword [rsp + 72], 0
+.ifm_span:
+    mov rax, [rsp + 72]
+    cmp rax, [rbx + linnea_h2_req.ifm_n]
+    jae .h3_412                      ; no line matched
+    shl rax, 4
+    lea rdx, [rbx + linnea_h2_req.ifm_ptr]
+    mov rdi, [rdx + rax]
+    mov rsi, [rdx + rax + 8]
     lea rdx, [linnea_static_etag]
     mov rcx, [linnea_static_etag_len]
     mov r8d, 1                       ; If-Match compares strongly (13.1.1)
     call linnea_http_etag_match
+    inc qword [rsp + 72]
     test eax, eax
-    jz .h3_412
+    jz .ifm_span
     jmp .chk_inm
 .chk_ius:
     mov rdi, [rbx + linnea_h2_req.ius_ptr]
@@ -1152,16 +1165,24 @@ linnea_h3_serve:
     cmp [linnea_static_mtime], rax
     ja .h3_412
 .chk_inm:
-    mov rdi, [rbx + linnea_h2_req.inm_ptr]
-    test rdi, rdi
-    jz .chk_ims
-    mov rsi, [rbx + linnea_h2_req.inm_len]
+    cmp qword [rbx + linnea_h2_req.inm_n], 0
+    je .chk_ims
+    mov qword [rsp + 72], 0
+.inm_span:
+    mov rax, [rsp + 72]
+    cmp rax, [rbx + linnea_h2_req.inm_n]
+    jae .cond_done                   ; no line matched, which beats If-Modified-Since
+    shl rax, 4
+    lea rdx, [rbx + linnea_h2_req.inm_ptr]
+    mov rdi, [rdx + rax]
+    mov rsi, [rdx + rax + 8]
     lea rdx, [linnea_static_etag]
     mov rcx, [linnea_static_etag_len]
     call linnea_http_inm_match
+    inc qword [rsp + 72]
     test eax, eax
-    jnz .h3_304
-    jmp .cond_done
+    jz .inm_span
+    jmp .h3_304
 .chk_ims:
     mov rdi, [rbx + linnea_h2_req.ims_ptr]
     test rdi, rdi
@@ -1545,7 +1566,7 @@ linnea_h3_serve:
     xor r8d, r8d                     ; complete response in out, nothing mapped
     xor r9d, r9d
 .sret_large:
-    add rsp, 72
+    add rsp, 88
     pop rbp
     pop r15
     pop r14

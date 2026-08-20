@@ -87,12 +87,32 @@ struc linnea_h2_req
     .scratch_end: resq 1        ; end of the scratch region
     .prio_ptr:    resq 1        ; the `priority` field value (RFC 9218), 0 if absent
     .prio_len:    resq 1
-    .inm_ptr:     resq 1        ; if-none-match value, 0 if absent
+    ; if-none-match and if-match carry entity-tag LISTS, and repeated field
+    ; lines are the comma-joined value (RFC 9110 5.3). Each line is kept as its
+    ; own span and they are tried in turn, which is the same answer as joining
+    ; them without copying anything -- the shape Accept-Encoding has had on the
+    ; HTTP/1 side since h1-14. Overwriting one span meant the LAST line decided,
+    ; where HTTP/1 let the FIRST decide: the same request was 304 on one
+    ; protocol and 200 on another, and reversing the client's two lines swapped
+    ; which protocol was right (audit-report-30). Three spans is far more than a
+    ; real client sends; further lines are ignored, which can only cost a 304 or
+    ; earn a 412, never serve a stale representation.
+    .inm_ptr:     resq 1        ; if-none-match spans; .inm_n is the count
     .inm_len:     resq 1
+    .inm_ptr2:    resq 1
+    .inm_len2:    resq 1
+    .inm_ptr3:    resq 1
+    .inm_len3:    resq 1
+    .inm_n:       resq 1
     .ims_ptr:     resq 1        ; if-modified-since value, 0 if absent
     .ims_len:     resq 1
-    .ifm_ptr:     resq 1        ; if-match value, 0 if absent
+    .ifm_ptr:     resq 1        ; if-match spans; .ifm_n is the count
     .ifm_len:     resq 1
+    .ifm_ptr2:    resq 1
+    .ifm_len2:    resq 1
+    .ifm_ptr3:    resq 1
+    .ifm_len3:    resq 1
+    .ifm_n:       resq 1
     .ius_ptr:     resq 1        ; if-unmodified-since value, 0 if absent
     .ius_len:     resq 1
     .rng_ptr:     resq 1        ; range value, 0 if absent

@@ -823,8 +823,16 @@ emit_field:
     pop rdi
     pop rsi
     jnz .not_inm
-    mov [rbx + linnea_h2_req.inm_ptr], rsi
-    mov [rbx + linnea_h2_req.inm_len], rdi
+    ; one span per line, up to three (see linnea_hpack.inc)
+    mov rax, [rbx + linnea_h2_req.inm_n]
+    cmp rax, 3
+    jae .inm_full
+    shl rax, 4
+    lea rdx, [rbx + linnea_h2_req.inm_ptr]
+    mov [rdx + rax], rsi
+    mov [rdx + rax + 8], rdi
+    inc qword [rbx + linnea_h2_req.inm_n]
+.inm_full:
     clc
     ret
 .not_inm:
@@ -851,8 +859,15 @@ emit_field:
     pop rdi
     pop rsi
     jnz .not_ifm
-    mov [rbx + linnea_h2_req.ifm_ptr], rsi
-    mov [rbx + linnea_h2_req.ifm_len], rdi
+    mov rax, [rbx + linnea_h2_req.ifm_n]
+    cmp rax, 3
+    jae .ifm_full
+    shl rax, 4
+    lea rdx, [rbx + linnea_h2_req.ifm_ptr]
+    mov [rdx + rax], rsi
+    mov [rdx + rax + 8], rdi
+    inc qword [rbx + linnea_h2_req.ifm_n]
+.ifm_full:
     clc
     ret
 .not_ifm:

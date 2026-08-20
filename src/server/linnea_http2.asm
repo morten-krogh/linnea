@@ -979,8 +979,8 @@ linnea_h2_handle:
 %define L_OUT    linnea_h2_req_size + 24
 %define L_BIG    linnea_h2_req_size + 32
 %define L_ASM    linnea_h2_req_size + 40
-%if L_ASM + 8 > 408
-  %error "h2_build_request stack frame (sub rsp,408) too small for req + locals"
+%if L_ASM + 8 > 520
+  %error "h2_build_request stack frame (sub rsp,520) too small for req + locals"
 %endif
 h2_build_request:
     push rbx
@@ -989,13 +989,13 @@ h2_build_request:
     push r14
     push r15
     push rbp
-    ; 408, not a round 400: six pushes leave rsp 8 past a 16-byte boundary, so an
+    ; 520, not a round 512: six pushes leave rsp 8 past a 16-byte boundary, so an
     ; even frame would hand every callee a misaligned stack. Nothing under here
     ; uses an aligned SSE load today, so this was a trap rather than a crash — but
     ; it is one movaps away from being a crash, and the AES paths are close by.
     ; It grew from 392 when the request struct took a .cl_val; the %error above
     ; is what says so, rather than a local being silently overwritten.
-    sub rsp, 408
+    sub rsp, 520
     mov rbx, rdi                     ; conn
     mov [rsp + L_OUT], rcx           ; out cursor (where the response goes)
     mov [rsp + L_START], rsi
@@ -1418,7 +1418,7 @@ h2_build_request:
     mov dword [h2_goaway_code], LINNEA_H2_COMPRESSION_ERR
     mov rax, LINNEA_H2_REQ_ERR
 .ret:
-    add rsp, 408
+    add rsp, 520
     pop rbp
     pop r15
     pop r14
@@ -1465,6 +1465,7 @@ h2_build_request:
 %define S_ENC   120             ; coding served (0 plain, 1 gzip, 2 br)
 %define S_LSTAT 128             ; access log: numeric status (0 = do not log)
 %define S_LBYTES 136            ; access log: body bytes
+%define S_COND  144             ; cursor over the If-Match/If-None-Match spans
 ; h2_data_window_take(rdi = conn, rsi = body length) -> rax = 1 when the body may
 ; go out now, 0 when it must be withheld. Debits the connection window on success.
 ;
@@ -1668,16 +1669,30 @@ h2_serve:
     ; If-None-Match that would otherwise have produced a 304. h1 got this in
     ; Q187; without it here the same request gets a different answer depending
     ; on which protocol carried it.
-    mov rdi, [r12 + linnea_h2_req.ifm_ptr]
-    test rdi, rdi
-    jz .chk_ius
-    mov rsi, [r12 + linnea_h2_req.ifm_len]
+    ; Each If-Match line is its own span and any of them may carry the matching
+    ; tag -- the field is a list, and repeated lines are the comma-joined value
+    ; (RFC 9110 5.3). One span meant the LAST line decided here while the FIRST
+    ; decided on h1, so the same request was 412 on one protocol and 200 on the
+    ; other, and swapping the client's two lines swapped which was right
+    ; (audit-report-30).
+    cmp qword [r12 + linnea_h2_req.ifm_n], 0
+    je .chk_ius
+    mov qword [rsp + S_COND], 0
+.ifm_span:
+    mov rax, [rsp + S_COND]
+    cmp rax, [r12 + linnea_h2_req.ifm_n]
+    jae .h2_412                      ; no line matched
+    shl rax, 4
+    lea rdx, [r12 + linnea_h2_req.ifm_ptr]
+    mov rdi, [rdx + rax]
+    mov rsi, [rdx + rax + 8]
     lea rdx, [linnea_static_etag]
     mov rcx, [linnea_static_etag_len]
     mov r8d, 1                       ; If-Match compares strongly (13.1.1)
     call linnea_http_etag_match
+    inc qword [rsp + S_COND]
     test eax, eax
-    jz .h2_412
+    jz .ifm_span
     jmp .chk_inm
 .chk_ius:
     mov rdi, [r12 + linnea_h2_req.ius_ptr]
@@ -1690,16 +1705,24 @@ h2_serve:
     cmp [linnea_static_mtime], rax
     ja .h2_412
 .chk_inm:
-    mov rdi, [r12 + linnea_h2_req.inm_ptr]
-    test rdi, rdi
-    jz .chk_ims
-    mov rsi, [r12 + linnea_h2_req.inm_len]
+    cmp qword [r12 + linnea_h2_req.inm_n], 0
+    je .chk_ims
+    mov qword [rsp + S_COND], 0
+.inm_span:
+    mov rax, [rsp + S_COND]
+    cmp rax, [r12 + linnea_h2_req.inm_n]
+    jae .cond_done                   ; no line matched, which beats If-Modified-Since
+    shl rax, 4
+    lea rdx, [r12 + linnea_h2_req.inm_ptr]
+    mov rdi, [rdx + rax]
+    mov rsi, [rdx + rax + 8]
     lea rdx, [linnea_static_etag]
     mov rcx, [linnea_static_etag_len]
     call linnea_http_inm_match
+    inc qword [rsp + S_COND]
     test eax, eax
-    jnz .h2_304
-    jmp .cond_done
+    jz .inm_span
+    jmp .h2_304
 .chk_ims:
     mov rdi, [r12 + linnea_h2_req.ims_ptr]
     test rdi, rdi

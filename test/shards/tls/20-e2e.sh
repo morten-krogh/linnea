@@ -32,6 +32,22 @@ if [ "$ktls" = 1 ]; then
     check_http "tls static body"   "hello from linnea" "$resp"
     check_http "tls static status" "200 OK" "$resp"
 
+    # If-Match and If-None-Match are entity-tag LISTS, so repeated field lines
+    # are the comma-joined value (RFC 9110 5.3). h1 kept the FIRST occurrence
+    # and h2/h3 the LAST, so the same legal request got different answers from
+    # each protocol and reversing the client's two lines swapped which was
+    # right (audit-report-30). Driven across all three, because "they agree"
+    # is half of what was wrong.
+    h3arg=""
+    if [ -x "$CURLH3" ] && "$CURLH3" -V 2>/dev/null | grep -q HTTP3; then
+        h3arg="$CURLH3"
+    fi
+    out=$(timeout 90 python3 test/tls/etag_list_lines.py ${P61443} $CA $h3arg 2>&1)
+    rc=$?
+    first_fail=$(echo "$out" | grep -m1 FAIL)
+    [ $rc -eq 0 ]
+    check "repeated If-Match/If-None-Match lines are one list on every protocol ${first_fail}" $?
+
     # One connection, two requests: keep-alive has to survive the handoff.
     # -w reports per transfer, so sum it: the second request must open no
     # new connection (and so must not repeat the handshake).
