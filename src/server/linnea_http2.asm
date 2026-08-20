@@ -2658,7 +2658,12 @@ h2_serve:
     ; bare URL and hands it to the very clients the variant was for (h1-15's
     ; sibling on h2). The negotiated 200 emits the same header at index 59.
     cmp qword [rsp + S_LSTAT], 404
+    je .emit_vary_h2
+    ; ...and the 406, which unlike the 404 depends on Accept-Encoding by
+    ; definition rather than only on a static path (audit-report-37).
+    cmp qword [rsp + S_LSTAT], 406
     jne .no_vary_h2
+.emit_vary_h2:
     mov esi, 59                      ; vary: accept-encoding
     lea rdx, [h2_ae_name]
     mov ecx, h2_ae_name_len

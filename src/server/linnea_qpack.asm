@@ -650,11 +650,17 @@ linnea_qpack_encode_response:
     ; plain file beside it is served to whoever takes the encoding and 404s
     ; everyone else, so without Vary a shared cache stores this 404 under the
     ; bare URL and then hands it to the very clients the variant was for
-    ; (h1-15's sibling on h3). Only the 404 needs it — 400/405/421/431/503 do
-    ; not depend on Accept-Encoding, and saying they do would split their cache
-    ; entries for nothing.
+    ; (h1-15's sibling on h3). The 406 needs it for a stronger reason: it is
+    ; the one status that exists ONLY because of Accept-Encoding. It is absent
+    ; from the list below because it did not exist when this was written, which
+    ; is how the enumeration went stale (audit-report-37). 400/405/421/431/503
+    ; do not depend on Accept-Encoding, and saying they do would split their
+    ; cache entries for nothing.
     cmp r12d, 404
+    je .emit_vary_h3
+    cmp r12d, 406
     jne .no_validators
+.emit_vary_h3:
     QROOM 2
     mov rdi, rbx
     mov byte [rdi], 0xc0 | 59        ; vary: accept-encoding — indexed, static

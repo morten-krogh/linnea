@@ -196,9 +196,15 @@ resp_413_len    equ $ - resp_413
 ; RFC 9110 15.5.7 with 12.5.3: the client excluded the unencoded form with
 ; identity;q=0 and no coded variant it named is available, so there is no
 ; representation left that it will take.
+; The 406 is the one status that exists ONLY because of Accept-Encoding, so it
+; carries Vary unconditionally where the 404 needs a separate blob for the
+; static path alone (resp_404_vary above). Added with the status itself in
+; 4185ddf and missed there: the header three lines up states the rule, and the
+; new status walked straight past it (audit-report-37).
 resp_406:       db "HTTP/1.1 406 Not Acceptable", 13, 10
                 db "Server: linnea", 13, 10
                 db "Content-Length: 0", 13, 10
+                db "Vary: Accept-Encoding", 13, 10
                 db "Connection: close", 13, 10, 13, 10
 resp_406_len    equ $ - resp_406
 resp_417:       db "HTTP/1.1 417 Expectation Failed", 13, 10

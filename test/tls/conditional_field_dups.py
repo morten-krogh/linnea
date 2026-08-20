@@ -167,16 +167,35 @@ case("...and is not rescued by variants the client did not name",
      ["Accept-Encoding: *;q=0"], "406/plain",
      path="/aetest.txt", want_header="content-encoding")
 # "unless a more specific entry for identity exists", in the RFC's words
+# a control, not a test: with identity named and allowed and no coding named,
+# a build that ignores the wildcard answers plain too. There is no resource on
+# which this request distinguishes them -- kept because the rule must not
+# over-apply and start refusing it.
 case("...unless identity is allowed separately",
      ["Accept-Encoding: *;q=0, identity;q=1"], "200/plain",
      path="/aetest.txt", want_header="content-encoding")
 case("...or a coding we hold is",
      ["Accept-Encoding: *;q=0, br;q=1"], "200/br",
      path="/aetest.txt", want_header="content-encoding")
+# ...and the row above only shows the half it names. br is this server's first
+# preference, so serving br proves nothing about whether *;q=0 excluded gzip and
+# identity -- it is the same answer a build that ignores the wildcard gives. On a
+# resource holding gzip and no br, the same request has nowhere to go and must be
+# 406; that one fails on a pre-fix binary, where it is 200/plain (audit-report-37
+# asked for this case, and asking for it is what showed the aetest row was a
+# control wearing a test's clothes).
+case("...where refusing all but br leaves a gzip-only resource unservable",
+     ["Accept-Encoding: *;q=0, br;q=1"], "406/plain",
+     path="/gztest.txt", want_header="content-encoding")
 # the same precedence read the other way: the wildcard must not override a
 # coding the client named, whichever of them appears first
 case("a named coding stays authoritative over the wildcard",
      ["Accept-Encoding: br;q=0, *"], "200/gzip",
+     path="/aetest.txt", want_header="content-encoding")
+# the same with the wildcard's q spelled out, which is how a client is most
+# likely to write it
+case("...spelled with an explicit q on the wildcard",
+     ["Accept-Encoding: br;q=0, *;q=1"], "200/gzip",
      path="/aetest.txt", want_header="content-encoding")
 case("...and that holds when the named one is identity",
      ["Accept-Encoding: identity;q=0, *"], "200/br",
@@ -192,6 +211,44 @@ case("a wildcard on one line, a coding on another",
 case("...and the pair is still 406 where that coding is not held",
      ["Accept-Encoding: *;q=0", "Accept-Encoding: br"], "406/plain",
      path="/hello.txt", want_header="content-encoding")
+# --- and a negotiated response must say it was negotiated ---------------------
+# A response whose selection depended on Accept-Encoding needs Vary, or a shared
+# cache stores it under the bare URL and serves it to a client that sent a
+# different one. The 200, 206, 304 and the static 404 all carried it; the 406
+# did not, because it was added two commits after the rule and nothing
+# re-asked the question of the new status (audit-report-37). The 406 needs it
+# most of all -- it is the one status that exists ONLY because of this field.
+#
+# The value's case differs by protocol and legitimately so: h1 and h2 send the
+# literal "Accept-Encoding", h3 sends QPACK static entry 59 whose built-in value
+# is lowercase. Compared case-insensitively, so a cosmetic difference is not
+# frozen into a requirement.
+def vary_case(label, headers, path, want_status):
+    global fails
+    got = {}
+    for p_ in protos:
+        r = run(p_, headers, path=path, want_header="vary")
+        code, _, val = r.partition("/")
+        got[p_] = f"{code}/{val.lower()}"
+    want = f"{want_status}/accept-encoding"
+    if all(v == want for v in got.values()):
+        print(f"ok   {label}")
+    else:
+        print(f"FAIL {label}: want {want} everywhere, got {got}")
+        fails += 1
+
+
+vary_case("a 406 says it varies on Accept-Encoding",
+          ["Accept-Encoding: identity;q=0"], "/hello.txt", "406")
+vary_case("...as the wildcard spelling of the same refusal does",
+          ["Accept-Encoding: *;q=0"], "/hello.txt", "406")
+# the responses that already had it, so the rule is asserted for the whole set
+# rather than only for the status that was found missing
+vary_case("...and a negotiated 200 still does", ["Accept-Encoding: br"],
+          "/aetest.txt", "200")
+vary_case("...and a 404 on a static path", ["Accept-Encoding: br"],
+          "/nope-not-here.txt", "404")
+
 # an empty field value names no coding at all -- so nothing is named, no
 # wildcard governs, and only the default survives (RFC 9110 12.5.3). curl sends
 # an empty-valued field for "Name;", where "Name:" would delete it.
