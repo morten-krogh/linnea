@@ -63,6 +63,17 @@ if [ "$ktls" = 1 ]; then
     # coding that is not simply the first one tried.
     printf 'plain only' > $WWW/gztest.txt
     printf 'gz only' > $WWW/gztest.txt.gz
+    # A precompressed variant OLDER than its source must not be served: the two
+    # forms of one URL would carry different bodies, each with its own
+    # self-consistent validator, and a cache would hold both. The sleep is
+    # load-bearing -- the check compares mtimes, and files written in the same
+    # second would be indistinguishable.
+    printf 'STALE-VARIANT' > $WWW/stale.txt.br
+    printf 'FRESH-SOURCE' > $WWW/fresh.txt
+    sleep 1.1
+    printf 'STALE-SOURCE' > $WWW/stale.txt
+    printf 'FRESH-VARIANT' > $WWW/fresh.txt.br
+    printf 'BR-ONLY' > $WWW/bronly.txt.br
     # Max-Forwards counts the hops an OPTIONS may cross, and TRACE reflects the
     # request back to whoever sent it -- one is a directive addressed to the
     # intermediary and was ignored, the other was forwarded to a backend that
@@ -76,8 +87,15 @@ if [ "$ktls" = 1 ]; then
     out=$(timeout 90 python3 test/tls/conditional_field_dups.py ${P61443} $CA $h3arg 2>&1)
     rc=$?
     first_fail=$(echo "$out" | grep -m1 FAIL)
+    out=$(timeout 90 python3 test/tls/variant_staleness.py ${P61443} $CA $h3arg 2>&1)
+    rc=$?
+    first_fail=$(echo "$out" | grep -m1 FAIL)
+    [ $rc -eq 0 ]
+    check "a precompressed variant older than its source is not served ${first_fail}" $?
     rm -f $WWW/aetest.txt $WWW/aetest.txt.br $WWW/aetest.txt.gz \
-          $WWW/gztest.txt $WWW/gztest.txt.gz
+          $WWW/gztest.txt $WWW/gztest.txt.gz \
+          $WWW/stale.txt $WWW/stale.txt.br $WWW/fresh.txt $WWW/fresh.txt.br \
+          $WWW/bronly.txt.br
     [ $rc -eq 0 ]
     check "repeated singleton conditionals refused, Accept-Encoding combined, on every protocol ${first_fail}" $?
 

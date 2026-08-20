@@ -13,6 +13,8 @@ LINNEA_STATIC_MAX_PATH equ 2048     ; bound on the decoded path length
 global linnea_static_normalize
 global linnea_static_open
 global linnea_static_open_enc
+global linnea_static_variant_fresh
+global linnea_static_mtime_of
 global linnea_static_mime
 global linnea_static_mtime
 global linnea_static_validators
@@ -266,17 +268,92 @@ linnea_static_open:
 ; The suffix and NUL are written at path end (the caller's buffer has room);
 ; the caller's MIME lookup keeps using the name before the suffix, and the
 ; validators describe the variant actually opened.
+; static_mtime_of(rdi = NUL-terminated path) -> rax = st_mtime, or -1 when the
+; path does not exist or is not a regular file.
+;
+; A separate statbuf from linnea_static_open's: that one carries the size and
+; mtime of the file actually being served, and the answers here must not
+; overwrite what the caller's ETag and Last-Modified are built from.
+linnea_static_mtime_of:
+static_mtime_of:
+    push rbx
+    lea rsi, [enc_statbuf]
+    mov eax, LINNEA_SYS_STAT
+    syscall
+    cmp rax, -4095
+    jae .mt_no
+    mov eax, [enc_statbuf + LINNEA_STAT_ST_MODE]
+    and eax, LINNEA_S_IFMT
+    cmp eax, LINNEA_S_IFREG
+    jne .mt_no
+    mov rax, [enc_statbuf + LINNEA_STAT_ST_MTIME]
+    pop rbx
+    ret
+.mt_no:
+    mov rax, -1
+    pop rbx
+    ret
+
+; linnea_static_variant_fresh(rdi = variant path, rsi = the source's mtime, or
+;   -1 when there is no source)
+;   -> eax = 1 when this variant may be served.
+;
+; A PRECOMPRESSED VARIANT THAT IS OLDER THAN ITS SOURCE IS STALE, and serving it
+; is worse than not compressing: the two forms of one URL then carry DIFFERENT
+; bodies, each with its own self-consistent ETag and Last-Modified taken from
+; whichever file was opened. Nothing revalidates into correctness, and Vary:
+; Accept-Encoding makes a shared cache store both quite legally -- so a client
+; that accepts br keeps yesterday's page and one that does not gets today's.
+; Demonstrated on this server before the check existed; it is the mechanism
+; behind every "regenerate the .br or browsers see the old page" deploy note.
+;
+; A source that does not exist leaves nothing to be stale against: a ".br with
+; no plain file beside it" is a resource in its own right, which is why the
+; static 404 carries Vary. Such a variant is authoritative and is served.
+;
+; Exported because HTTP/1 opens its variants itself rather than through
+; linnea_static_open_enc, so the rule would otherwise exist twice and the two
+; copies would drift -- which they already did once, when the wildcard was
+; honoured here and ignored there (audit-report-36).
+linnea_static_variant_fresh:
+static_variant_fresh:
+    push rbx
+    mov rbx, rsi
+    call static_mtime_of
+    cmp rax, -1
+    je .vf_no                        ; no such variant
+    cmp rbx, -1
+    je .vf_yes                       ; no source to be older than
+    cmp rax, rbx
+    jb .vf_no                        ; older than the source: stale
+.vf_yes:
+    mov eax, 1
+    pop rbx
+    ret
+.vf_no:
+    xor eax, eax
+    pop rbx
+    ret
+
 linnea_static_open_enc:
     push rbx
     push r12
     push r13
     push r14
+    push r15
     mov rbx, rsi                     ; path end
     mov r12, rdx                     ; the caller's array of (ptr,len) spans
     mov r13, rcx                     ; how many of them
     mov r14, rdi                     ; path start
     test r13, r13
     jz .oe_plain                     ; no Accept-Encoding: nothing to negotiate
+    ; The source's mtime, once, for the staleness test each variant faces.
+    ; Asked by path rather than by opening it: most requests take a variant and
+    ; never read the plain file at all.
+    mov byte [rbx], 0
+    mov rdi, r14
+    call static_mtime_of
+    mov r15, rax
     mov rdi, r12
     mov rsi, r13
     lea rdx, [enc_br_st]
@@ -285,6 +362,11 @@ linnea_static_open_enc:
     test eax, eax
     jz .oe_try_gz
     mov dword [rbx], '.br'           ; three bytes and the NUL
+    mov rdi, r14
+    mov rsi, r15
+    call static_variant_fresh
+    test eax, eax
+    jz .oe_try_gz                    ; missing, or older than the source
     mov rdi, r14
     call linnea_static_open
     test rax, rax
@@ -301,6 +383,11 @@ linnea_static_open_enc:
     test eax, eax
     jz .oe_plain
     mov dword [rbx], '.gz'
+    mov rdi, r14
+    mov rsi, r15
+    call static_variant_fresh
+    test eax, eax
+    jz .oe_plain                     ; missing, or older than the source
     mov rdi, r14
     call linnea_static_open
     test rax, rax
@@ -329,6 +416,7 @@ linnea_static_open_enc:
     xor r8d, r8d
     mov r9d, 1                       ; ...and it is a 406, not a 404
 .oe_ret:
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -1195,6 +1283,11 @@ mime_table_h2:
 
 section .bss
 static_statbuf:  resb LINNEA_STAT_SIZE
+; A second one, for the staleness question. Kept apart from static_statbuf on
+; purpose: that buffer holds the size and mtime of the file being SERVED, which
+; the caller's ETag and Last-Modified are built from, and answering a question
+; about a different file into it would quietly relabel the response.
+enc_statbuf:     resb LINNEA_STAT_SIZE
 linnea_static_mtime:    resq 1       ; st_mtime of the last linnea_static_open
 linnea_static_etag:     resb 48      ; '"' + 16 + '-' + 16 + '"' fits well inside
 linnea_static_etag_len: resq 1

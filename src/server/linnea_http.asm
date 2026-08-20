@@ -122,6 +122,8 @@ extern linnea_time_http_now
 ; linnea_static.asm so the h3 test binaries link without this file's deps
 extern linnea_http_identity_refused
 extern linnea_http_coding_ok
+extern linnea_static_variant_fresh
+extern linnea_static_mtime_of
 extern linnea_http_inm_match
 extern linnea_http_etag_match
 extern linnea_http_ifrange_match
@@ -678,6 +680,9 @@ section .text
 ;   [rsp+296] Host field lines seen (RFC 9112 3.2 wants exactly one)
 ;   [rsp+312] If-Match ptr (0 = absent)          [rsp+320] its len
 ;   [rsp+328] If-Unmodified-Since ptr (0 = absent) [rsp+336] its len
+;   [rsp+352] Accept-Encoding spans (3 x 16 bytes, ending at 399)
+;   [rsp+400] the source file's mtime, for the precompressed-variant staleness
+;             test -- the slot immediately after that array
 ;   [rsp+304] asterisk-form: the target was "*", so the request is about the
 ;             server itself rather than any resource (OPTIONS *)
 
@@ -2070,6 +2075,11 @@ linnea_http_handle:
     ; linnea_static_open_enc. This used to walk the spans here with its own
     ; loop, which is how h1 came to answer the wildcard differently from
     ; nothing at all (audit-report-36).
+    ; the source's mtime, once, for the staleness test each variant faces
+    mov byte [r15], 0
+    mov rdi, r13
+    call linnea_static_mtime_of
+    mov [rsp + 400], rax
     lea rdi, [rsp + 352]
     mov rsi, [rsp + 208]
     lea rdx, [enc_br]
@@ -2078,6 +2088,14 @@ linnea_http_handle:
     test eax, eax
     jz .try_gzip
     mov dword [r15], '.br'     ; three bytes and the NUL
+    ; A variant older than its source is stale, and serving it hands this
+    ; client a different body from the one an identity client gets -- each with
+    ; its own self-consistent ETag, so nothing ever revalidates into agreement.
+    mov rdi, r13
+    mov rsi, [rsp + 400]
+    call linnea_static_variant_fresh
+    test eax, eax
+    jz .try_gzip
     mov rdi, r13
     call .open_regular
     test eax, eax
@@ -2093,6 +2111,11 @@ linnea_http_handle:
     test eax, eax
     jz .open_plain
     mov dword [r15], '.gz'
+    mov rdi, r13
+    mov rsi, [rsp + 400]
+    call linnea_static_variant_fresh
+    test eax, eax
+    jz .open_plain
     mov rdi, r13
     call .open_regular
     test eax, eax

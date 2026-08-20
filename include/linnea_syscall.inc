@@ -8,6 +8,8 @@ LINNEA_SYS_WRITE     equ 1
 LINNEA_SYS_OPEN      equ 2
 LINNEA_SYS_CLOSE     equ 3
 LINNEA_SYS_FSTAT     equ 5
+LINNEA_SYS_STAT      equ 4       ; stat(2) by path, for asking about a
+                                 ; file without opening or mapping it
 LINNEA_SYS_STATFS    equ 137     ; what KIND of filesystem a path is on, which
                                  ; is the difference between an upload capture
                                  ; that can be written back and evicted and one
