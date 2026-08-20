@@ -167,6 +167,7 @@ LINNEA_H3_HEAD_MAX     equ 1024
 LINNEA_H3_FS_BUF       equ 4096
 LINNEA_H3_PATH_ROOT equ LINNEA_MAX_ROOT + 1   ; room for the root in front of the path
 LINNEA_H3_HDRS_BUF equ 8192      ; proxy header rebuild for an h3 request
+LINNEA_H3_COOKIE_BUF equ 8192    ; split cookie field lines joined for the h1 hop
 
 ; --- proxying to an HTTP/1.1 upstream (linnea_h3_proxy.asm) ---------------
 ; The upstream response head we will re-encode, capped exactly where HTTP/2

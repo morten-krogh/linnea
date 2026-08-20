@@ -98,4 +98,74 @@ case("...or when an earlier line does not",
 case("no Accept-Encoding at all serves the plain file",
      [], "200/plain", path="/aetest.txt", want_header="content-encoding")
 
+
+# --- Cookie: split lines must be JOINED before a hop that is not h2/h3 -------
+# RFC 9113 8.2.3 and RFC 9114 4.2.1, in the same words: a client may split
+# Cookie across field lines for compression, and an intermediary MUST
+# concatenate them with "; " before passing them on. h2 has since Finding 32;
+# h3 never did, because the decoder guards the rule on a buffer h3 was not
+# given -- a guard added to stop a null write from crashing, which also
+# switched the behaviour off. A backend reading Cookie sees the first line
+# only, so a session cookie a browser split was silently truncated.
+def cookie_case(label, headers, expect):
+    global fails
+    got = {}
+    for p in protos:
+        body = fetch_body(p, headers, "/api/headers")
+        lines = [l.split(":", 1)[1].strip()
+                 for l in body.replace("\r", "").split("\n")
+                 if l.lower().startswith("cookie:")]
+        got[p] = "|".join(lines)
+    want = {p: (expect[p] if isinstance(expect, dict) else expect) for p in protos}
+    if got == want:
+        print(f"ok   {label}")
+    else:
+        print(f"FAIL {label}: want {want}, got {got}")
+        fails += 1
+
+
+def fetch_body(proto, headers, path):
+    """The response BODY, which is where the echo backend reports what it was
+    given. run() discards it (-o /dev/null): the first version of these cases
+    asked run() for a body, got the response HEAD, found no cookie lines in it
+    and passed -- a check that could not fail. The cookie rows failed loudly
+    and gave it away; the Expect row would have passed forever."""
+    cmd = ([curl_h3, "--http3-only"] if proto == "h3" else ["curl", f"--{proto}"])
+    cmd += ["-s", "--max-time", "12", "--cacert", ca, "--resolve", RESOLVE]
+    for h in headers:
+        cmd += ["-H", h]
+    cmd.append(f"https://localhost:{port}{path}")
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
+SPLIT = ["Cookie: a=1", "Cookie: b=2", "Cookie: c=3"]
+# HTTP/1 relays what it was given: an h1 client does not split Cookie, and
+# forwarding the lines as they arrived is what an h1 hop is for.
+cookie_case("split cookie lines are joined for the backend",
+            SPLIT, {"http1.1": "a=1|b=2|c=3", "http2": "a=1; b=2; c=3",
+                    "h3": "a=1; b=2; c=3"})
+cookie_case("one cookie line is passed through unchanged",
+            ["Cookie: a=1; b=2"], "a=1; b=2")
+
+
+# --- Expect: 100-continue is ours to answer, not the backend's ---------------
+# The same guard switched this off for h3 too, so an h3 client's
+# Expect: 100-continue was forwarded upstream and no interim 100 was generated.
+def expect_case(label, headers, want_count):
+    global fails
+    got = {}
+    for p in protos:
+        body = fetch_body(p, headers, "/api/headers")
+        got[p] = sum(1 for l in body.replace("\r", "").split("\n")
+                     if l.lower().startswith("expect:"))
+    if all(v == want_count for v in got.values()):
+        print(f"ok   {label}")
+    else:
+        print(f"FAIL {label}: want {want_count} everywhere, got {got}")
+        fails += 1
+
+
+expect_case("Expect: 100-continue never reaches the backend",
+            ["Expect: 100-continue"], 0)
+
 sys.exit(1 if fails else 0)

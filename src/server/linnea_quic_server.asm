@@ -123,6 +123,7 @@ extern linnea_h3_owner_idx
 extern linnea_h3_owner_gen
 extern linnea_h3_owner_sid
 extern h3_hdrs_buf
+extern h3_cookie_buf
 extern linnea_h3_body_off
 extern linnea_h3_body_len
 extern linnea_qpack_ccontrol_ptr
@@ -3531,6 +3532,12 @@ linnea_quic_server_datagram:
     mov [req + linnea_h2_req.hb_cur], rax
     lea rax, [h3_hdrs_buf + LINNEA_H3_HDRS_BUF]
     mov [req + linnea_h2_req.hb_end], rax
+    ; ...and the buffer split Cookie lines are joined into, which is what makes
+    ; the decoder run that rule for h3 at all: it is guarded on this pointer
+    ; being set, so h3 forwarded the lines unjoined and never stripped an
+    ; Expect: 100-continue it should answer itself
+    lea rax, [h3_cookie_buf]
+    mov [req + linnea_h2_req.ck_buf], rax
     ; Parse the request. A stream that arrived in one piece is walked here and
     ; now; one that was consumed as it arrived has already been walked, and only
     ; its field section is still to decode -- which waited for exactly this

@@ -30,6 +30,7 @@ global linnea_h3_build_response_head
 global linnea_h3_serve
 global linnea_h3_srv
 global h3_hdrs_buf
+global h3_cookie_buf
 global linnea_h3_tx_cap
 global linnea_h3_owner_idx
 global linnea_h3_owner_gen
@@ -156,6 +157,15 @@ linnea_h3_body_fd: resq 1
 ; the request we send upstream. Same size as h2's, and overflow is detectable:
 ; the rebuild parks hb_cur past hb_end rather than writing past it.
 h3_hdrs_buf: resb LINNEA_H3_HDRS_BUF
+; RFC 9114 4.2.1 in the same words RFC 9113 8.2.3 uses for HTTP/2: a client may
+; split Cookie across field lines for compression, and an intermediary MUST
+; join them with "; " before a hop that is not HTTP/3. h2 has done that since
+; Finding 32; h3 did not, because the decoder guards the whole block on ck_buf
+; being set and h3 passed none -- a guard added to stop a null write from
+; crashing, which also switched the behaviour off. A backend reading Cookie
+; sees the first line only, so a session cookie a browser split was silently
+; truncated. Same buffer size as h2's, and the same overflow rule (ck_len -1).
+h3_cookie_buf: resb LINNEA_H3_COOKIE_BUF
 ; May this request start a CHUNKED response? 1 while any of the connection's
 ; response-stream slots is free, 0 when all are busy — set by the QUIC server
 ; per request before linnea_h3_serve, which refuses a large body with a 503

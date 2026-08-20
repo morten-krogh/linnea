@@ -109,6 +109,9 @@ section .rodata
 
 http11_host:   db " HTTP/1.1", 13, 10, "Host: "
 http11_host_len equ $ - http11_host
+h3_ck_hdr:     db "Cookie: "
+h3_ck_hdr_len  equ $ - h3_ck_hdr
+h3_ck_crlf:    db 13, 10
 hdr_clen:      db "Content-Length: "
 hdr_clen_len   equ $ - hdr_clen
 ; RFC 9110 7.6.3: name the hop and the protocol it was received on. The client
@@ -318,6 +321,34 @@ linnea_h3_proxy_start:
     mov rsi, [rbx + linnea_h2_req.hb_cur]
     sub rsi, rdi
     call .up_append
+    ; ...and the cookie field lines, joined into one. RFC 9114 4.2.1 lets an
+    ; HTTP/3 client split Cookie across lines for compression and requires an
+    ; intermediary to concatenate them with "; " before a hop that is not
+    ; HTTP/3 -- the same rule, in the same words, that RFC 9113 8.2.3 sets for
+    ; HTTP/2 and that h2 has followed since Finding 32. h3 forwarded them
+    ; unjoined, so a backend reading Cookie saw the first line's crumbs and a
+    ; session cookie a browser had split was silently truncated. The values
+    ; were accumulated during the decode; one line goes out here.
+    mov r13, [rbx + linnea_h2_req.ck_len]
+    test r13, r13
+    jz .st_cookies_done              ; no cookie field at all
+    cmp r13, -1
+    je .st_cookie_over               ; the join outgrew its buffer
+    lea rdi, [h3_ck_hdr]
+    mov esi, h3_ck_hdr_len
+    call .up_append
+    mov rdi, [rbx + linnea_h2_req.ck_buf]
+    mov rsi, r13
+    call .up_append
+    lea rdi, [h3_ck_crlf]
+    mov esi, 2
+    call .up_append
+    jmp .st_cookies_done
+.st_cookie_over:
+    ; too much cookie to join: refusing is the only honest answer, since a
+    ; shortened Cookie is a different request. The h2 path answers 431 here.
+    jmp .st_431
+.st_cookies_done:
     ; Content-Length is ours to declare: the body is whole and counted here,
     ; whatever framing (or none) the client used to send it.
     mov r13, [linnea_h3_proxy_body_len]
