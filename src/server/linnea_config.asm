@@ -72,6 +72,8 @@ dump_prefix:            db ": prefix="
 dump_prefix_len         equ $ - dump_prefix
 dump_root:              db " root="
 dump_root_len           equ $ - dump_root
+dump_bk_sep:    db ", "
+dump_bk_sep_len equ $ - dump_bk_sep
 dump_proxy:             db " proxy="
 dump_proxy_len          equ $ - dump_proxy
 dump_redirect:          db " redirect="
@@ -693,11 +695,40 @@ linnea_config_dump:
     mov rsi, [r15 + linnea_config_location.redirect_len]
     jmp .loc_target
 .loc_proxy:
+    ; every backend, comma-separated. A location that names a spare and dumps
+    ; only the first would let a typo in the spare survive --test, which is the
+    ; one place it can be caught before traffic depends on it.
     lea rdi, [dump_proxy]
     mov esi, dump_proxy_len
     call linnea_print_stdout
+    ; r13 is the SERVER pointer in this function and r12/r14/r15 are taken too,
+    ; so the backend counter lives on the stack rather than borrowing one.
+    push r13
+    xor r13d, r13d
+.loc_bk_loop:
+    cmp r13, [r15 + linnea_config_location.proxy_count]
+    jae .loc_bk_done
+    test r13, r13
+    jz .loc_bk_first
+    lea rdi, [dump_bk_sep]
+    mov esi, dump_bk_sep_len
+    call linnea_print_stdout
+.loc_bk_first:
+    mov rax, r13
+    imul rax, rax, LINNEA_MAX_PROXY_STR + 1
     lea rdi, [r15 + linnea_config_location.proxy_str]
-    mov rsi, [r15 + linnea_config_location.proxy_str_len]
+    add rdi, rax
+    mov rsi, [r15 + linnea_config_location.proxy_str_len + r13 * 8]
+    call linnea_print_stdout
+    inc r13
+    jmp .loc_bk_loop
+.loc_bk_done:
+    pop r13
+    lea rdi, [newline]
+    mov esi, 1
+    call linnea_print_stdout
+    inc r14
+    jmp .loc_loop
 .loc_target:
     call linnea_print_stdout
     lea rdi, [newline]

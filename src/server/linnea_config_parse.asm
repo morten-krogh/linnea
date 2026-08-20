@@ -130,6 +130,12 @@ msg_location_keys:      db "location requires prefix and exactly one of root, pr
 msg_location_keys_len   equ $ - msg_location_keys
 msg_bad_proxy:          db "invalid proxy address (IPv4:port required)"
 msg_bad_proxy_len       equ $ - msg_bad_proxy
+msg_bad_proxy_list:     db "proxy list must be an array of ip:port strings"
+msg_bad_proxy_list_len  equ $ - msg_bad_proxy_list
+msg_bad_proxy_empty:    db "proxy list names no backend"
+msg_bad_proxy_empty_len equ $ - msg_bad_proxy_empty
+msg_bad_proxy_many:     db "too many proxy backends"
+msg_bad_proxy_many_len  equ $ - msg_bad_proxy_many
 msg_unterminated:       db "unterminated string"
 msg_unterminated_len    equ $ - msg_unterminated
 msg_escape:             db "escape sequences not supported"
@@ -1182,17 +1188,72 @@ linnea_parse_location:
     test r12d, 4
     jnz .dup
     or r12d, 4
+    ; "proxy" is either one "ip:port" or an ARRAY of them. One backend is the
+    ; overwhelmingly common shape and stays spelled the way it always was; the
+    ; array is what lets a location name a spare (audit follow-up: upstream
+    ; keep-alive and failover).
+    mov qword [rbx + linnea_config_location.proxy_count], 0
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, '['
+    je .proxy_array
+    call .proxy_one                    ; a bare string: exactly one backend
+    mov qword [rbx + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
+    jmp .member_sep
+.proxy_array:
+    call linnea_parse_advance          ; past '['
+.proxy_elem:
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ']'
+    je .proxy_array_end
+    call .proxy_one
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ','
+    jne .proxy_array_end
+    call linnea_parse_advance
+    jmp .proxy_elem
+.proxy_array_end:
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ']'
+    jne .bad_proxy_list
+    call linnea_parse_advance
+    cmp qword [rbx + linnea_config_location.proxy_count], 0
+    je .bad_proxy_empty                ; "proxy": [] names no upstream at all
+    mov qword [rbx + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
+    jmp .member_sep
+
+; .proxy_one — parse one "ip:port" string at the cursor and append it to this
+; location's backend list. Both spellings above come through here, so the
+; grammar is written once: the single-string form is the one-element case of
+; the array, not a second implementation of it.
+.proxy_one:
+    push r13
+    push r14
+    push r15
+    mov rax, [rbx + linnea_config_location.proxy_count]
+    cmp rax, LINNEA_MAX_BACKENDS
+    jae .bad_proxy_many
     call linnea_parse_string
     cmp rdx, LINNEA_MAX_PROXY_STR
     ja .proxy_long
-    mov [rbx + linnea_config_location.proxy_str_len], rdx
+    ; slot = proxy_count; str slot is (MAX+1)-strided, addr slot 16-strided
+    mov r14, [rbx + linnea_config_location.proxy_count]
+    mov [rbx + linnea_config_location.proxy_str_len + r14 * 8], rdx
+    mov r13, r14
+    imul r13, r13, LINNEA_MAX_PROXY_STR + 1
     lea rdi, [rbx + linnea_config_location.proxy_str]
+    add rdi, r13
     mov rsi, rax
+    push rdx
     call linnea_string_copy
-    ; split "ip:port" at the ':' — the ip half is NUL-terminated in place
-    ; (we own the buffer), parsed, and the ':' restored
+    pop rdx
     lea r13, [rbx + linnea_config_location.proxy_str]
-    mov rdx, [rbx + linnea_config_location.proxy_str_len]
+    mov r14, [rbx + linnea_config_location.proxy_count]
+    imul r14, r14, LINNEA_MAX_PROXY_STR + 1
+    add r13, r14                       ; r13 = this backend's string
     xor ecx, ecx
 .proxy_colon_scan:
     cmp rcx, rdx
@@ -1208,15 +1269,16 @@ linnea_parse_location:
     cmp rax, rdx
     jae .bad_proxy             ; empty port part
     mov r14, rcx               ; ':' offset
+    push rdx
     mov byte [r13 + r14], 0
     mov rdi, r13
     call linnea_network_parse_ipv4
     mov byte [r13 + r14], ':'
+    pop rdx
     cmp rax, -1
     je .bad_proxy
     mov r15d, eax              ; ip, network byte order
     ; port: decimal digits only, 1-65535
-    mov rdx, [rbx + linnea_config_location.proxy_str_len]
     sub rdx, r14
     dec rdx                    ; digit count
     lea rsi, [r13 + r14 + 1]
@@ -1238,14 +1300,21 @@ linnea_parse_location:
 .proxy_port_done:
     test eax, eax
     jz .bad_proxy
-    ; prebuild the upstream sockaddr_in
+    ; prebuild this backend's sockaddr_in
+    mov r14, [rbx + linnea_config_location.proxy_count]
+    shl r14, 4                         ; * sizeof(sockaddr_in slot)
     lea rdi, [rbx + linnea_config_location.proxy_addr]
+    add rdi, r14
     mov word [rdi], LINNEA_AF_INET
     xchg al, ah                ; htons
     mov [rdi + 2], ax
     mov [rdi + 4], r15d
     mov qword [rdi + 8], 0
-    mov qword [rbx + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
+    inc qword [rbx + linnea_config_location.proxy_count]
+    pop r15
+    pop r14
+    pop r13
+    ret
 
 .member_sep:
     call linnea_parse_skip_ws
@@ -1307,6 +1376,22 @@ linnea_parse_location:
 .bad_proxy:
     lea rdi, [msg_bad_proxy]
     mov esi, msg_bad_proxy_len
+    jmp linnea_parse_fail
+; These three jump out of .proxy_one without unwinding its pushes. That is safe
+; only because linnea_parse_fail ends at linnea_error_die and the process never
+; returns here — stated rather than assumed, since a later change making a parse
+; error recoverable would turn each of them into a corrupted stack.
+.bad_proxy_list:
+    lea rdi, [msg_bad_proxy_list]
+    mov esi, msg_bad_proxy_list_len
+    jmp linnea_parse_fail
+.bad_proxy_empty:
+    lea rdi, [msg_bad_proxy_empty]
+    mov esi, msg_bad_proxy_empty_len
+    jmp linnea_parse_fail
+.bad_proxy_many:
+    lea rdi, [msg_bad_proxy_many]
+    mov esi, msg_bad_proxy_many_len
     jmp linnea_parse_fail
 
 ; --- low-level helpers -------------------------------------------------

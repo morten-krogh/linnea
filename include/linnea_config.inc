@@ -7,6 +7,11 @@ LINNEA_MAX_HOSTNAME     equ 255      ; max hostname string length (DNS limit)
 LINNEA_MAX_PREFIX       equ 255      ; max location prefix length
 LINNEA_MAX_ROOT         equ 255      ; max document root path length
 LINNEA_MAX_PROXY_STR    equ 63       ; max proxy "ip:port" string length
+; Backends one proxy location may name. A location used to hold exactly one
+; upstream; naming several is what lets a dead one be stepped over instead of
+; answered with a 502. Eight is generous for this server's shape and costs
+; ~66 KB of .bss across every location of every server, against a 238 MB total.
+LINNEA_MAX_BACKENDS     equ 8
 LINNEA_MAX_LOG          equ 255      ; max log file path length
 LINNEA_MAX_CONFIG_FILE  equ 1 << 20  ; sanity cap on config file size
 
@@ -79,10 +84,21 @@ struc linnea_config_location
     .kind:          resq 1                        ; LINNEA_LOC_KIND_*
     .root:          resb LINNEA_MAX_ROOT + 1      ; NUL-terminated document root
     .root_len:      resq 1
-    .proxy_addr:    resb 16                       ; upstream sockaddr_in, prebuilt at
-                                                  ; parse time (static: safe SQE addr)
-    .proxy_str:     resb LINNEA_MAX_PROXY_STR + 1 ; upstream "ip:port" for dump/log
-    .proxy_str_len: resq 1
+    ; --- upstreams: .proxy_count of them, in selection order -------------
+    ; Each sockaddr_in is prebuilt at parse time and lives in the parsed config,
+    ; so it outlives any SQE that points at it.
+    .proxy_count:   resq 1                        ; 1..LINNEA_MAX_BACKENDS
+    .proxy_addr:    resb 16 * LINNEA_MAX_BACKENDS ; upstream sockaddr_in[]
+    .proxy_str:     resb (LINNEA_MAX_PROXY_STR + 1) * LINNEA_MAX_BACKENDS
+    .proxy_str_len: resq LINNEA_MAX_BACKENDS      ; "ip:port" each, for dump/log
+    ; --- per-worker upstream state, NOT configuration --------------------
+    ; Workers are forked, so these live in a copy-on-write page and are private
+    ; to each worker without a separate table. They are deliberately not part of
+    ; the config dump: a --test run has no workers and nothing to report.
+    .bk_dead_at:    resq LINNEA_MAX_BACKENDS      ; monotonic s it was failed out
+                                                  ; (0 = healthy)
+    .bk_fails:      resq LINNEA_MAX_BACKENDS      ; consecutive failures
+    .rr_cursor:     resq 1                        ; round-robin position
     .redirect:      resb LINNEA_MAX_ROOT + 1      ; URL prefix the 301 points at
     .redirect_len:  resq 1
     .cache_control: resb LINNEA_MAX_ROOT + 1      ; Cache-Control value for static
