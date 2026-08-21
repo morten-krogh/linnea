@@ -31,7 +31,7 @@ own QUIC stream and an upload is consumed as it arrives rather than held whole.<
 <h3>Upload and checksum</h3>
 <p class="ep"><code>POST /api/upload</code> — the file <em>is</em> the request
 body. The server hashes it as it lands and deletes it immediately; only the
-name, size and digest come back.</p>
+name, size and digest come back. <span id="up-limit"></span></p>
 <input type="file" id="up-file">
 <button id="up-go">Upload</button>
 <button id="up-cancel" disabled>Cancel</button>

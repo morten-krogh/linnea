@@ -37,6 +37,27 @@ const upBar = document.getElementById("up-progress");
 const upFill = document.getElementById("up-fill");
 const upCancel = document.getElementById("up-cancel");
 
+// The server refuses an upload larger than this (linnea's max_body). Kept here
+// so the page can STATE the cap and reject an oversized file BEFORE sending it —
+// which also sidesteps a browser disagreement: Chrome surfaces the server's
+// early 413, but Firefox and Safari report a 413 that arrives mid-upload as a
+// bare "network error". Checking the size up front gives every browser the same
+// clear message and never starts a doomed upload. Must match the server's
+// max_body; there is nowhere the server can correct a number written here.
+const UP_MAX = 1048576;                       // 1 MiB
+
+function fmtBytes(n) {
+    if (n >= 1048576 && n % 1048576 === 0) { return (n / 1048576) + " MiB"; }
+    if (n >= 1024 && n % 1024 === 0) { return (n / 1024) + " KiB"; }
+    return n.toLocaleString() + " bytes";
+}
+
+// State the cap up front, from the constant above so there is one place to change.
+{
+    const lim = document.getElementById("up-limit");
+    if (lim) { lim.textContent = "Uploads are capped at " + fmtBytes(UP_MAX) + " on this demo."; }
+}
+
 // The upload in flight, so Cancel has something to abort. One at a time —
 // upGo is disabled for the duration — so a single reference is enough.
 let upXhr = null;
@@ -147,6 +168,14 @@ function upSend(f, m) {
 upGo.onclick = async () => {
     const f = upFile.files[0];
     if (!f) { upOut.textContent = "choose a file first"; upProgress(null); return; }
+    // Refuse an oversized file here, before sending a byte -- so the message is
+    // the same in every browser and matches what the server would do anyway.
+    if (f.size > UP_MAX) {
+        upOut.textContent = "that file is " + f.size.toLocaleString()
+            + " bytes — the demo caps uploads at " + fmtBytes(UP_MAX);
+        upProgress(null);
+        return;
+    }
     upGo.disabled = true;                     // one upload at a time, or the
     upCancel.disabled = false;                // bar is reporting on two
     upOut.textContent =
