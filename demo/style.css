@@ -1,0 +1,181 @@
+body {
+    font-family: sans-serif;
+    max-width: 60rem;
+    margin: 4rem auto;
+    padding: 0 1rem;
+    color: #222;
+}
+
+h1 {
+    color: #2a6041;
+    border-bottom: 3px solid #2a6041;
+    padding-bottom: 0.3rem;
+}
+
+code {
+    background: #eee;
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+}
+
+figure {
+    margin: 2rem 0 0;
+}
+
+.gallery {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1.5rem;
+    margin-top: 2rem;
+}
+
+.gallery figure {
+    margin: 0;
+}
+
+img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 6px;
+    display: block;
+}
+
+figcaption {
+    font-size: 0.85rem;
+    color: #555;
+    margin-top: 0.5rem;
+}
+
+h2 {
+    color: #2a6041;
+    margin-top: 2.5rem;
+}
+
+.api {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1.5rem;
+    margin: 1.5rem 0 2.5rem;
+}
+
+.card {
+    border: 1px solid #cfd8d2;
+    border-radius: 6px;
+    padding: 1rem 1.2rem 1.2rem;
+    background: #fbfdfc;
+}
+
+.card h3 {
+    margin: 0 0 0.4rem;
+    color: #2a6041;
+}
+
+.card .ep {
+    font-size: 0.9rem;
+    color: #555;
+    margin: 0 0 0.9rem;
+}
+
+button {
+    background: #2a6041;
+    color: #fff;
+    border: 0;
+    border-radius: 4px;
+    padding: 0.5rem 0.9rem;
+    font-size: 1rem;
+    cursor: pointer;
+}
+
+button:hover {
+    background: #38805a;
+}
+
+input[type=file] {
+    display: block;
+    margin-bottom: 0.7rem;
+    font-size: 0.9rem;
+}
+
+output {
+    display: block;
+    margin-top: 0.8rem;
+    font-family: monospace;
+    font-size: 0.85rem;
+    word-break: break-all;
+    color: #333;
+    min-height: 1.2rem;
+}
+
+.agree {
+    color: #2a6041;
+}
+
+/* Upload progress. Hidden until there is something to report, so the card does
+   not carry an empty trough at rest. */
+.progress {
+    height: 0.5rem;
+    margin-top: 0.8rem;
+    background: #e4ebe7;
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+#up-fill {
+    width: 0;
+    height: 100%;
+    background: #2a6041;
+    transition: width 0.1s linear;
+}
+
+/* Sent, but the answer has not come back yet: the file is on its way through
+   and the server is still hashing it. A full bar that just sat there read as a
+   finished upload with the result missing. */
+.progress.waiting #up-fill {
+    background: repeating-linear-gradient(
+        135deg, #2a6041 0 0.5rem, #38805a 0.5rem 1rem);
+    animation: progress-wait 1s linear infinite;
+}
+
+@keyframes progress-wait {
+    from { background-position: 0 0; }
+    to   { background-position: 1.42rem 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #up-fill { transition: none; }
+    .progress.waiting #up-fill { animation: none; }
+}
+
+@media (max-width: 40rem) {
+    .api {
+        grid-template-columns: 1fr;
+    }
+}
+
+.disagree {
+    color: #a33;
+    font-weight: bold;
+}
+
+/* The counter is the point of its card, so it is not monospace fine print
+   the way the API outputs are. */
+output.counter {
+    font-family: inherit;
+    font-size: 2.6rem;
+    font-weight: bold;
+    color: #2a6041;
+    line-height: 1.1;
+    margin: 0.2rem 0 0.8rem;
+    min-height: 2.9rem;
+}
+
+.ws-status {
+    font-size: 0.85rem;
+    color: #555;
+    margin: 0.7rem 0 0;
+}
+
+button:disabled {
+    background: #b6c4bc;
+    cursor: default;
+}

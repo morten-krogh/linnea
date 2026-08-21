@@ -1,0 +1,96 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>linnea.amberbio.com</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="/favicon.ico">
+</head>
+<body>
+<h1>linnea.amberbio.com</h1>
+<p>This page is served for the hostname <code>linnea.amberbio.com</code>
+from its own document root, <code>/home/linnea/www/linnea</code>.</p>
+<p>Served by the Linnea server — an HTTP/TLS server written in x86-64
+assembly — with SNI selecting this vhost's certificate.</p>
+
+<h2>Try the API</h2>
+<p>Both endpoints live under <code>/api</code>, which this server routes to a
+small HTTP/1.1 backend on loopback. Your browser reaches them over whichever
+protocol it negotiated — including HTTP/3, where the request is carried on its
+own QUIC stream and an upload is consumed as it arrives rather than held whole.</p>
+
+<div class="api">
+<section class="card">
+<h3>Random number</h3>
+<p class="ep"><code>GET /api/random</code></p>
+<button id="rand-go">Fetch a number</button>
+<output id="rand-out"></output>
+</section>
+
+<section class="card">
+<h3>Upload and checksum</h3>
+<p class="ep"><code>POST /api/upload</code> — the file <em>is</em> the request
+body. The server hashes it as it lands and deletes it immediately; only the
+name, size and digest come back.</p>
+<input type="file" id="up-file">
+<button id="up-go">Upload</button>
+<button id="up-cancel" disabled>Cancel</button>
+<div class="progress" id="up-progress" role="progressbar" aria-label="upload progress"
+ aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><div id="up-fill"></div></div>
+<output id="up-out"></output>
+</section>
+</div>
+
+<h2>A shared counter, over WebSocket</h2>
+<p>This one is not a request and a response. The <code>/ws</code> location is
+relayed to a backend as an opaque tunnel — this server forwards the upgrade,
+then stops reading and never sees a frame. Everything RFC&nbsp;6455 happens at
+the far end, in assembly: the handshake token, the framing, the unmasking.</p>
+<p>What the tunnel buys is the direction of travel. Pressing the button sends
+three bytes up the socket; the new value comes back down <em>every</em> open
+socket, including ones that asked for nothing. Open this page in a second tab
+and watch both numbers move together.</p>
+<p>The socket is a separate HTTP/1.1 connection, so it runs alongside the
+HTTP/2 or HTTP/3 carrying the rest of the page rather than over it.</p>
+
+<div class="api">
+<section class="card">
+<h3>The counter</h3>
+<p class="ep"><code>wss://linnea.amberbio.com/ws</code></p>
+<output id="ws-count" class="counter">—</output>
+<button id="ws-go" disabled>Increment</button>
+<p id="ws-status" class="ws-status">connecting…</p>
+</section>
+</div>
+
+<h2>Video, and byte ranges</h2>
+<p>Scrubbing the timeline makes the browser ask for byte ranges instead of the
+whole file: each seek is a <code>Range</code> request answered with
+<code>206 Partial Content</code>. The file is about 30&nbsp;MB, and nothing
+like all of it is sent unless you watch to the end.</p>
+<video controls preload="metadata" width="640" style="max-width:100%">
+  <source src="/OPEN-VIDEO-2025-025-001.mp4" type="video/mp4">
+  Your browser cannot play this video.
+</video>
+
+<p>Below are ten ~0.6&nbsp;MB images (~6&nbsp;MB in all), requested at once when
+the page loads. Over HTTP/3 they stream concurrently — each as a sequence of
+STREAM-frame chunks in its own QUIC packet under the 1200-byte datagram floor —
+interleaved over one shared, growing congestion window and acknowledged and
+flow-controlled as they go.</p>
+<div class="gallery">
+<figure><img src="/linnea1.png" width="1200" height="760" alt="Gradient test image 1"><figcaption>1</figcaption></figure>
+<figure><img src="/linnea2.png" width="1200" height="760" alt="Gradient test image 2"><figcaption>2</figcaption></figure>
+<figure><img src="/linnea3.png" width="1200" height="760" alt="Gradient test image 3"><figcaption>3</figcaption></figure>
+<figure><img src="/linnea4.png" width="1200" height="760" alt="Gradient test image 4"><figcaption>4</figcaption></figure>
+<figure><img src="/linnea5.png" width="1200" height="760" alt="Gradient test image 5"><figcaption>5</figcaption></figure>
+<figure><img src="/linnea6.png" width="1200" height="760" alt="Gradient test image 6"><figcaption>6</figcaption></figure>
+<figure><img src="/linnea7.png" width="1200" height="760" alt="Gradient test image 7"><figcaption>7</figcaption></figure>
+<figure><img src="/linnea8.png" width="1200" height="760" alt="Gradient test image 8"><figcaption>8</figcaption></figure>
+<figure><img src="/linnea9.png" width="1200" height="760" alt="Gradient test image 9"><figcaption>9</figcaption></figure>
+<figure><img src="/linnea10.png" width="1200" height="760" alt="Gradient test image 10"><figcaption>10</figcaption></figure>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

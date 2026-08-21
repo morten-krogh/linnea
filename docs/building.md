@@ -106,6 +106,7 @@ include/      shared .inc headers (struct layouts, syscall numbers, constants)
 test/         the suite: shard scripts, protocol fixtures, demo backends
 config/       systemd units and example configuration (see deployment.md)
 docs/         this documentation
+demo/         the demo web page for linnea.amberbio.com -- NOT the server
 ```
 
 How the pieces fit at runtime is [`architecture.md`](architecture.md).
