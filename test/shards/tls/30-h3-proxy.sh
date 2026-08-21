@@ -391,6 +391,47 @@ EOF
     wait $kt_pid 2>/dev/null
     rm -f "$kt"
 
+    # --- max_upstream must not refuse the pool's own inventory -----------
+    # A parked keep-alive connection is a live backend connection and is
+    # counted against max_upstream. Borrowing it opens no descriptor, so the
+    # ceiling has to be consulted where a socket is actually opened -- not
+    # before the pool is consulted. h2 and h3 tested it first and answered 503
+    # with a reusable descriptor sitting there, and because `take` is the only
+    # thing that reaps an expired entry, the refusal never reclaimed it either:
+    # the location stayed 503 rather than recovering (audit-report-39).
+    #
+    # The saturation row matters as much: a ceiling that stops refusing is not
+    # a fix. It uses a separate location with no keep-alive and a backend that
+    # sleeps, so nothing is poolable and 503 is the right answer.
+    python3 test/marker_backend.py ${P61481} A >/dev/null 2>&1 &
+    cap_a=$!
+    python3 test/slow_backend.py ${P61486} >/dev/null 2>&1 &
+    cap_s=$!
+    sleep 0.5
+    cp=$CFG/ceiling.json
+    cat > "$cp" <<EOF
+{ "log": "$PWD/$RUNDIR/ceiling.log", "timeout": 15, "proxy_timeout": 15,
+  "workers": 1, "max_upstream": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61487}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [
+      { "prefix": "/ka",   "proxy": "127.0.0.1:${P61481}", "proxy_keepalive": 1 },
+      { "prefix": "/slow", "proxy": "127.0.0.1:${P61486}" },
+      { "prefix": "/", "root": "$PWD/$WWW" } ] } ] }
+EOF
+    start_server "$cp"
+    cp_pid=$SRV_PID
+    out=$(timeout 240 python3 test/tls/upstream_ceiling.py ${P61487} $CA \
+          ${P61481} $h3arg 2>&1)
+    rc=$?
+    first_fail=$(echo "$out" | grep -m1 FAIL)
+    kill $cap_a $cap_s 2>/dev/null
+    [ $rc -eq 0 ]
+    check "max_upstream refuses a new connection, not a reusable one ${first_fail}" $?
+    kill $cp_pid 2>/dev/null
+    wait $cp_pid 2>/dev/null
+    rm -f "$cp"
+
 
     # A canned h3 error must describe ITSELF. The QPACK encoder reads
     # content-encoding, the validators, content-range, location and

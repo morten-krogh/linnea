@@ -3328,10 +3328,6 @@ h2p_finalize:
 h2p_open_upstream:
     push rbx
     mov rbx, rdi
-    ; the backend's ceiling applies whichever protocol the client speaks
-    call linnea_upstream_count
-    cmp rax, [linnea_upstream_limit]
-    jae .ou_busy
     ; the backend first: a parked connection belongs to exactly one of them
     mov qword [rbx + linnea_h2p.no_reuse], 0
     mov qword [rbx + linnea_h2p.pooled], 0
@@ -3354,6 +3350,18 @@ h2p_open_upstream:
     pop rbx
     ret
 .ou_fresh:
+    ; The ceiling is consulted HERE, and only here, because only this branch
+    ; opens a descriptor. A parked connection is already counted against
+    ; max_upstream -- it is a live backend connection -- so refusing to look in
+    ; the pool because the count is full is the ceiling refusing its own
+    ; inventory. Worse than a wasted reuse: `take` is the only thing that reaps
+    ; an expired pool entry, so an early refusal never reclaims the descriptor
+    ; either, and the location stays 503 rather than recovering after the idle
+    ; expiry (audit-report-39). h1 has had this ordering since the pool landed;
+    ; h2 and h3 kept the old one.
+    call linnea_upstream_count
+    cmp rax, [linnea_upstream_limit]
+    jae .ou_busy
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM
     xor edx, edx

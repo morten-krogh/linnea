@@ -190,10 +190,13 @@ linnea_h3_proxy_start:
     mov rax, [rbx + linnea_h2_req.hb_cur]
     cmp rax, [rbx + linnea_h2_req.hb_end]
     ja .st_431
-    ; the backend gets no more connections than it was sized for
-    call linnea_upstream_count
-    cmp rax, [linnea_upstream_limit]
-    jae .st_503
+    ; The backend's ceiling used to be tested HERE, before a leg even existed --
+    ; and therefore before the idle pool could be consulted. A parked connection
+    ; is already counted against max_upstream, so that refused the pool's own
+    ; inventory; and because `take` is the only thing that reaps an expired pool
+    ; entry, the refusal never reclaimed the descriptor either and the location
+    ; stayed 503 instead of recovering (audit-report-39). It now sits beside the
+    ; socket it governs, in .st_fresh.
     call linnea_connection_alloc     ; -> rax = leg, or 0 when the pool is full
     test rax, rax
     jz .st_503
@@ -513,6 +516,9 @@ linnea_h3_proxy_start:
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
     jmp .st_armed
 .st_fresh:
+    call linnea_upstream_count
+    cmp rax, [linnea_upstream_limit]
+    jae .st_busy                     ; a leg is live by now: give it back
     mov eax, LINNEA_SYS_SOCKET
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM
@@ -550,6 +556,14 @@ linnea_h3_proxy_start:
     mov rdi, r12
     call .st_drop
     mov eax, 502
+    jmp .st_ret
+.st_busy:
+    ; at the ceiling with nothing poolable to borrow. Unlike the old check this
+    ; one runs with a leg allocated, so it goes back before the 503 -- the same
+    ; shape .st_nosock has always had.
+    mov rdi, r12
+    call .st_drop
+    mov eax, 503
     jmp .st_ret
 .st_toobig:
     mov rdi, r12
