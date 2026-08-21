@@ -4,7 +4,7 @@
   "timeout": 60,
   "proxy_timeout": 10,
   "drain_timeout": 10,
-  "max_body": 67108864,
+  "max_body": 1048576,
   "rate_limit": 200,
   "spill_dir": "/var/lib/linnea/spill",
   "servers": [
