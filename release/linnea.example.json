@@ -1,0 +1,43 @@
+{
+  "log": "/var/log/linnea/access.log",
+  "error_log": "/var/log/linnea/error.log",
+  "workers": 0,
+  "timeout": 30,
+  "head_timeout": 10,
+  "drain_timeout": 30,
+  "max_connections": 4096,
+  "max_per_ip": 64,
+  "max_upstream": 256,
+  "max_body": 8388608,
+  "rate_limit": 200,
+  "http2": 1,
+  "spill_dir": "/var/lib/linnea/spill",
+
+  "servers": [
+    {
+      "host": "0.0.0.0",
+      "port": 443,
+      "hostname": "example.com",
+      "cert": "/etc/linnea/certs/example.com/fullchain.pem",
+      "key": "/etc/linnea/certs/example.com/privkey.pem",
+      "hsts": "max-age=31536000; includeSubDomains",
+      "nosniff": 1,
+      "locations": [
+        { "prefix": "/api",    "proxy": "127.0.0.1:8080", "proxy_keepalive": 1 },
+        { "prefix": "/static", "root": "/srv/example/static",
+          "cache_control": "public, max-age=604800" },
+        { "prefix": "/old",    "redirect": "https://example.com/new" },
+        { "prefix": "/",       "root": "/srv/example/www" }
+      ]
+    },
+    {
+      "host": "0.0.0.0",
+      "port": 80,
+      "hostname": "example.com",
+      "locations": [
+        { "prefix": "/.well-known/acme-challenge", "root": "/srv/acme" },
+        { "prefix": "/", "redirect": "https://example.com" }
+      ]
+    }
+  ]
+}

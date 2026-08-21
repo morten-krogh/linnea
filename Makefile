@@ -474,4 +474,25 @@ install:
 	install -m 0755 $(API_BIN) /usr/local/bin/linnea-api
 	install -m 0755 $(WS_BIN) /usr/local/bin/linnea-ws
 
-.PHONY: all clean test selftest tlstest probe api ws wsfast install
+# The downloadable release: the server, the prober, the example configs, a
+# run-focused README and a checksum file, packaged into one tarball. The demo
+# backends are deliberately left out -- they are examples, not the product.
+# `make release` reproduces exactly what the GitHub release ships, so the two
+# stay the same thing: the release is `make release`, nothing hidden.
+VERSION = 1.0.0
+RELNAME = linnea-$(VERSION)-linux-x86_64
+RELDIR  = dist/$(RELNAME)
+
+release: $(BIN) $(PROBE_BIN)
+	rm -rf $(RELDIR)
+	mkdir -p $(RELDIR)
+	install -m 0755 $(BIN)       $(RELDIR)/linnea
+	install -m 0755 $(PROBE_BIN) $(RELDIR)/linnea-probe
+	install -m 0644 release/linnea-minimal.json release/linnea.example.json \
+	                release/README.md $(RELDIR)/
+	cd $(RELDIR) && sha256sum linnea linnea-probe > SHA256SUMS
+	tar -C dist -czf dist/$(RELNAME).tar.gz $(RELNAME)
+	@echo "built dist/$(RELNAME).tar.gz"
+	@ls -1 $(RELDIR)
+
+.PHONY: all clean test selftest tlstest probe api ws wsfast install release

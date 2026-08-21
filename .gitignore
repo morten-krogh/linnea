@@ -37,6 +37,9 @@
 *.log
 *.log.rot
 
+# Release packages built by `make release`
+dist/
+
 # Fixtures the suite writes into its document root. Only a handful of files
 # under test/www are real (hello.txt, index.html, style.css, favicon.ico,
 # "a b.txt", sub/) — the rest are made and usually removed by run_tests.sh.

@@ -79,7 +79,20 @@ iteration; the full suite is what must pass before anything is deployed.
 `bin/linnea-probe` is a separate, dependency-free way to check conformance — it
 speaks HTTP/1, HTTP/2 and HTTP/3 and can be aimed at any server, including a
 live one, to test it against an independent implementation of the same
-protocols.
+protocols. See [`probe.md`](probe.md).
+
+## Packaging a release
+
+```sh
+make release
+```
+
+builds `linnea` and `linnea-probe`, assembles them with the example configs, a
+run-focused README and a `SHA256SUMS` file, and tars the result into
+`dist/linnea-<version>-linux-x86_64.tar.gz`. This is exactly what the GitHub
+release ships — the release *is* `make release`, so anyone can reproduce it and
+verify the published binaries against a build of their own. The demo backends
+are deliberately left out; the package is the product (`linnea`) and the prober.
 
 ## Layout
 

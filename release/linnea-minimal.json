@@ -1,0 +1,13 @@
+{
+  "log": "/tmp/linnea-access.log",
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 8080,
+      "hostname": "localhost",
+      "locations": [
+        { "prefix": "/", "root": "/tmp/linnea-www" }
+      ]
+    }
+  ]
+}

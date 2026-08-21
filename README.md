@@ -9,7 +9,8 @@ services. It is built from nothing but `nasm` and `ld`: no libc, no OpenSSL, no
 runtime, no third-party code. The TLS 1.3 stack and every cryptographic
 primitive under it (X25519, P-256, AES-GCM, SHA-2) are part of the source tree.
 
-It runs a live site on the public internet today.
+It runs a live site on the public internet today —
+**[linnea.amberbio.com](https://linnea.amberbio.com)**.
 
 ## Written by AI — that is the point
 
@@ -60,6 +61,19 @@ what that process is good and bad at, and where the real risks are.
   kTLS, a lossless hot upgrade (a config/binary reload that drops no connection),
   per-source connection and request-rate limits, and a slow-loris bound.
 
+## See it live
+
+**[linnea.amberbio.com](https://linnea.amberbio.com)** is served by linnea from
+this codebase — over HTTP/1.1, HTTP/2 and HTTP/3. You can check its protocol
+compliance yourself with the prober that ships alongside the server:
+
+```sh
+linnea-probe https://linnea.amberbio.com h3    # also h1, h2
+```
+
+`linnea-probe` runs a battery of compliance probes against any server and exits
+with the number of deviations found. See [`docs/probe.md`](docs/probe.md).
+
 ## Scope
 
 Linnea is an honest specialist, not a drop-in nginx. It does a focused set of
@@ -106,37 +120,47 @@ tests needing them are skipped when they are absent rather than failed.
 
 ## Quick start
 
-Requires `nasm` and a linker on Linux 5.19+/x86-64 — see
-[Dependencies](#dependencies).
+Two ways in, both trivial — either way you end up running **one static binary
+from a small JSON config**. (Linux 5.19+/x86-64; see [Dependencies](#dependencies).)
+
+### Download and run
+
+Grab the latest [release](https://github.com/morten-krogh/linnea/releases) — a
+tarball with the `linnea` binary, the `linnea-probe` prober, and example configs.
+No toolchain needed:
 
 ```sh
-make                                    # nasm + ld; no dependencies to install
+tar xzf linnea-*-linux-x86_64.tar.gz
+cd linnea-*-linux-x86_64
 
-mkdir -p /tmp/linnea /var/www
-echo '<h1>hello from linnea</h1>' > /var/www/index.html
-
-cat > quickstart.json <<'JSON'
-{
-  "log": "/tmp/linnea/access.log",
-  "servers": [
-    { "host": "127.0.0.1", "port": 8080, "hostname": "localhost",
-      "locations": [ { "prefix": "/", "root": "/var/www" } ] }
-  ]
-}
-JSON
-
-./bin/linnea --config quickstart.json
+mkdir -p /tmp/linnea-www
+echo '<h1>hello from linnea</h1>' > /tmp/linnea-www/index.html
+./linnea --config linnea-minimal.json
 ```
 
-Then, from another shell:
+### Build from source
+
+The build is `nasm` + `ld` with nothing to fetch, and produces the exact same
+binary the release ships (verifiably — see [`release/README.md`](release/README.md)):
+
+```sh
+make
+
+mkdir -p /tmp/linnea-www
+echo '<h1>hello from linnea</h1>' > /tmp/linnea-www/index.html
+./bin/linnea --config release/linnea-minimal.json
+```
+
+Either way, from another shell:
 
 ```sh
 curl http://127.0.0.1:8080/
 ```
 
-For TLS, HTTP/3 and proxying, see the configuration reference below. `linnea
---test --config <file>` checks a configuration (and its certificates) and exits
-without binding anything.
+For a real site — TLS, static content, a proxied API, redirects — start from
+[`release/linnea.example.json`](release/linnea.example.json) and the
+[configuration reference](docs/config.md). `linnea --test --config <file>` checks
+a configuration and its certificates without binding anything.
 
 ## Documentation
 
@@ -147,6 +171,7 @@ without binding anything.
 | [`docs/config.md`](docs/config.md) | The complete configuration reference — every key, scope, default and rule |
 | [`docs/proxying.md`](docs/proxying.md) | Reverse proxy: backends, load balancing, health, failover, upstream keep-alive |
 | [`docs/building.md`](docs/building.md) | Building from source, the toolchain, and running the tests |
+| [`docs/probe.md`](docs/probe.md) | `linnea-probe`, the standalone HTTP/1/2/3 compliance prober |
 | [`docs/deployment.md`](docs/deployment.md) | Running in production: systemd, TLS certificates, log rotation, the service model |
 | [`docs/shutdown.md`](docs/shutdown.md) | Stopping, reloading and restarting — and what each does to open connections |
 | [`docs/security.md`](docs/security.md) | Threat model, the self-contained crypto, the audit history, and how to report a vulnerability |
@@ -161,8 +186,8 @@ LINNEA_SUITE=full ./test/run_shards.sh   # the full, deploy-gating suite
 ```
 
 `bin/linnea-probe` is a dependency-free HTTP/1, HTTP/2 and HTTP/3 conformance
-prober that can be pointed at any server, including a live one. See
-[`docs/building.md`](docs/building.md).
+prober that can be pointed at any server, including a live one, and exits with
+the number of compliance deviations it finds. See [`docs/probe.md`](docs/probe.md).
 
 ## Contributing
 
