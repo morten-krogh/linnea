@@ -1,0 +1,58 @@
+# A SECOND instance of the /api backend, on port 7702, so linnea's /api location
+# has two upstreams to choose between. linnea-api holds no shared state -- each
+# upload is its own temp file, /api/random reads getrandom(2) -- so two instances
+# are fully independent and need no coordination.
+#
+# The point is failover during a restart. linnea's proxy fails over on a CONNECT
+# failure (and only there, because a retry is unambiguous only before any byte is
+# sent). With one backend a restart leaves a sub-second window where the listener
+# is down and a fresh connect gets 502; with two, that connect-fail moves the
+# request to the other instance in the same request, and passive health then
+# steps the restarting one out of rotation for 10s until it is back.
+#
+# THIS ONLY HELPS IF THE TWO DO NOT RESTART TOGETHER. After a rebuild, restart
+# them ONE AT A TIME (rolling), waiting for the first to be listening again
+# before the second -- never `systemctl restart linnea-api linnea-api2`, which
+# takes both down at once and reopens the very gap this exists to close.
+#
+# One-time install:
+#   sudo cp config/linnea-api2.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now linnea-api2
+# Then add 127.0.0.1:7702 to every /api location in linnea's config (see below)
+# and `sudo systemctl reload linnea`.
+#
+# After a rebuild (rolling, zero downtime while the other serves):
+#   make && sudo make install
+#   sudo systemctl restart linnea-api  && sleep 2 && sudo systemctl restart linnea-api2
+#
+# It differs from linnea-api.service in exactly two places: the port (7702) and
+# the scratch directory (linnea-api-2). Everything else is identical on purpose.
+
+[Unit]
+Description=Linnea /api backend, instance 2 (upload checksum + random number)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=linnea-svc
+Group=linnea-svc
+WorkingDirectory=/
+ExecStart=/usr/local/bin/linnea-api 7702 /var/lib/linnea-api-2
+StateDirectory=linnea-api-2
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=10
+
+CapabilityBoundingSet=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

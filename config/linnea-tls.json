@@ -17,7 +17,7 @@
       "hsts": "max-age=86400",
       "nosniff": 1,
       "locations": [
-        { "prefix": "/api", "proxy": "127.0.0.1:7700" },
+        { "prefix": "/api", "proxy": ["127.0.0.1:7700", "127.0.0.1:7702"], "proxy_keepalive": 1 },
         { "prefix": "/ws",  "proxy": "127.0.0.1:7701" },
         { "prefix": "/",    "root": "/var/www/linnea" }
       ]
@@ -31,7 +31,7 @@
       "hsts": "max-age=86400",
       "nosniff": 1,
       "locations": [
-        { "prefix": "/api", "proxy": "127.0.0.1:7700" },
+        { "prefix": "/api", "proxy": ["127.0.0.1:7700", "127.0.0.1:7702"], "proxy_keepalive": 1 },
         { "prefix": "/ws",  "proxy": "127.0.0.1:7701" },
         { "prefix": "/",    "root": "/var/www/linnea" }
       ]
