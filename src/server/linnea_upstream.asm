@@ -52,6 +52,7 @@ LINNEA_UP_IDLE_NS    equ 5000000000
 global linnea_upstream_method_safe
 global linnea_upstream_park
 global linnea_upstream_take
+global linnea_upstream_reap_one
 global linnea_upstream_pool_close
 global linnea_upstream_pick
 global linnea_upstream_addr
@@ -425,6 +426,61 @@ linnea_upstream_take:
 .tk_ret:
     add rsp, 8
     pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_upstream_reap_one() -> eax = 1 if a parked connection was dropped, 0 if
+; the pool held none. The fresh-connection path calls this when it is at the
+; max_upstream ceiling: a parked connection serves no request, so it must yield
+; to one that needs a socket. Without this the pool's own idle inventory refuses
+; new work permanently -- a POST (or any non-GET/HEAD, or a GET to another
+; backend) after a burst that filled the pool -- because `take` is the ONLY other
+; reaper and it runs for GET/HEAD alone, to the same (location, backend). An
+; entry past the idle cap is dropped first, it is stale for everyone anyway;
+; failing that the oldest parked entry goes. Preserves rbx/r12-r15.
+linnea_upstream_reap_one:
+    push rbx
+    push r12
+    push r13
+    push r14
+    call linnea_uring_now             ; eats rdi/rsi; callee-saved survive
+    mov r13, rax                      ; now
+    xor r14d, r14d                    ; cursor
+    mov r12, -1                       ; oldest parked slot found so far, -1 = none
+    mov rbx, -1                       ; its stamp (unsigned max = "none yet")
+.ro_scan:
+    cmp r14, LINNEA_UP_POOL_SLOTS
+    jae .ro_pick
+    mov rax, [up_pool_at + r14 * 8]
+    test rax, rax
+    jz .ro_next                       ; empty slot
+    mov rcx, r13
+    sub rcx, rax
+    mov rdx, LINNEA_UP_IDLE_NS
+    cmp rcx, rdx
+    jae .ro_drop                      ; past the idle cap: drop it now
+    cmp rax, rbx
+    jae .ro_next                      ; not older than the best so far
+    mov rbx, rax
+    mov r12, r14
+.ro_next:
+    inc r14
+    jmp .ro_scan
+.ro_pick:
+    cmp r12, -1
+    je .ro_empty                      ; nothing parked at all
+    mov r14, r12                      ; drop the oldest
+.ro_drop:
+    mov rsi, r14
+    call pool_drop
+    mov eax, 1
+    jmp .ro_ret
+.ro_empty:
+    xor eax, eax
+.ro_ret:
     pop r14
     pop r13
     pop r12

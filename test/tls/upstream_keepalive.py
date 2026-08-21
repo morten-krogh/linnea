@@ -18,6 +18,7 @@ as its own head.
 
 usage: upstream_keepalive.py <port> <cafile> <backend-port> <rude-port> [curl-h3]
 """
+import os
 import socket
 import subprocess
 import sys
@@ -104,6 +105,21 @@ for p in protos:
     good = sum(1 for _ in range(10) if get(p, "/r/x") == "R")
     check(f"{p}: a backend that closes a kept connection silently is survived "
           f"({good}/10)", good == 10)
+
+# The other half of that race: a backend whose parked socket is still open at
+# the liveness peek and closes only when the reused request is sent into it. The
+# peek cannot catch that one, which is why reuse is confined to GET/HEAD -- so
+# the request can be sent AGAIN. /rc is served by reuse_close_backend, which
+# answers request #1 keep-alive and closes on request #2. Each reused GET must
+# still come back 200 with body "C" (a resend on a fresh connection), never the
+# 502 the pool produced before the retry existed.
+rc_port = os.environ.get("RC_PORT")
+if rc_port:
+    for p in protos:
+        bodies = [get(p, "/rc/x") for _ in range(4)]
+        check(f"{p}: a reused socket the backend closes on the next request is "
+              f"retried on a fresh connection, not 502 ({bodies})",
+              bodies == ["C"] * 4)
 
 print("OK" if not fails else f"{fails} failed")
 sys.exit(1 if fails else 0)

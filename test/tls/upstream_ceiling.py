@@ -41,10 +41,13 @@ fails = 0
 _probes = 0
 
 
-def code(proto, path):
+def code(proto, path, method="GET"):
     cmd = ([curl_h3, "--http3-only"] if proto == "h3" else ["curl", f"--{proto}"])
     cmd += ["-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "20",
-            "--cacert", ca, "--resolve", RESOLVE, f"https://localhost:{port}{path}"]
+            "--cacert", ca, "--resolve", RESOLVE]
+    if method != "GET":
+        cmd += ["-X", method, "-d", "x"]
+    cmd.append(f"https://localhost:{port}{path}")
     return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
 
 
@@ -103,6 +106,17 @@ for p in protos:
     got = code(p, "/ka/x")
     check(f"{p}: and the location recovers after the idle expiry", got == "200",
           f"got {got}")
+
+    # A request that needs a NEW socket must reap an idle parked one rather than
+    # 503. The GET just above parked a connection and it holds the only slot; a
+    # POST cannot borrow it (it may not be replayed), so the fresh path has to
+    # reclaim the idle parked descriptor. Before the reap-on-refuse fix only
+    # take() reaped and it runs for GET/HEAD alone, so a POST after a GET burst
+    # answered 503 for the worker's life -- the report-39 shape that its own
+    # ordering fix did not reach.
+    got = code(p, "/ka/x", "POST")
+    check(f"{p}: a POST reaps an idle parked connection at the ceiling, not 503",
+          got == "200", f"got {got}")
 
 print("OK" if not fails else f"{fails} failed")
 sys.exit(1 if fails else 0)

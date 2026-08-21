@@ -126,6 +126,13 @@ struc linnea_connection
     .up_no_reuse:   resq 1
     ; 1 = this leg came from the pool rather than from a fresh connect.
     .up_pooled:     resq 1
+    ; Length of the rewritten upstream request head in up_buf. A pooled leg is a
+    ; GET/HEAD (no body), so this is the whole request: if the parked socket
+    ; turns out dead at send or before the first response byte, the request is
+    ; resent from up_buf on a fresh connection, which the GET/HEAD-only rule
+    ; exists to make safe. out_rem is the live send cursor and reaches 0, so the
+    ; length is kept apart from it.
+    .up_head_len:   resq 1
     .proxy_state:   resq 1         ; LINNEA_PROXY_*
     .location:      resq 1         ; matched location* (static config memory)
     .vhost:         resq 1         ; server* handling the request, for the log

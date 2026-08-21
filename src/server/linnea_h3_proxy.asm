@@ -56,6 +56,7 @@ extern linnea_upstream_park
 extern linnea_upstream_take
 extern linnea_upstream_pick
 extern linnea_upstream_count
+extern linnea_upstream_reap_one
 extern linnea_upstream_limit
 extern linnea_config_instance
 extern linnea_string_equal
@@ -513,13 +514,22 @@ linnea_h3_proxy_start:
     je .st_fresh
     mov [r12 + linnea_connection.up_fd], eax
     mov qword [r12 + linnea_connection.up_pooled], 1
+    ; snapshot the request head so a dead parked socket can be retried on a fresh
+    ; connection (out_rem is up_buf..head-end here; a reusable leg is GET/HEAD)
+    mov rcx, [r12 + linnea_connection.out_rem]
+    mov [r12 + linnea_connection.up_head_len], rcx
     ; already connected: the loop's hook starts this leg at the send
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
     jmp .st_armed
 .st_fresh:
     call linnea_upstream_count
     cmp rax, [linnea_upstream_limit]
-    jae .st_busy                     ; a leg is live by now: give it back
+    jb .st_room
+    call linnea_upstream_reap_one     ; an idle parked socket yields to a request
+    test eax, eax
+    jnz .st_fresh                      ; freed one: re-check the ceiling
+    jmp .st_busy                       ; genuinely at capacity: a leg is live, give it back
+.st_room:
     mov eax, LINNEA_SYS_SOCKET
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM

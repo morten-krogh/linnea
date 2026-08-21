@@ -374,6 +374,8 @@ EOF
     ka_a=$!
     python3 test/rude_backend.py ${P61484} >/dev/null 2>&1 &
     ka_r=$!
+    python3 test/reuse_close_backend.py ${P61494} >/dev/null 2>&1 &
+    ka_rc=$!
     sleep 0.5
     kt=$CFG/keepalive.json
     cat > "$kt" <<EOF
@@ -384,15 +386,16 @@ EOF
       { "prefix": "/ka",   "proxy": "127.0.0.1:${P61481}", "proxy_keepalive": 1 },
       { "prefix": "/noka", "proxy": "127.0.0.1:${P61481}" },
       { "prefix": "/r",    "proxy": "127.0.0.1:${P61484}", "proxy_keepalive": 1 },
+      { "prefix": "/rc",   "proxy": "127.0.0.1:${P61494}", "proxy_keepalive": 1 },
       { "prefix": "/", "root": "$PWD/$WWW" } ] } ] }
 EOF
     start_server "$kt"
     kt_pid=$SRV_PID
-    out=$(timeout 200 python3 test/tls/upstream_keepalive.py ${P61485} $CA \
+    out=$(RC_PORT=${P61494} timeout 200 python3 test/tls/upstream_keepalive.py ${P61485} $CA \
           ${P61481} ${P61484} $h3arg 2>&1)
     rc=$?
     first_fail=$(echo "$out" | grep -m1 FAIL)
-    kill $ka_a $ka_r 2>/dev/null
+    kill $ka_a $ka_r $ka_rc 2>/dev/null
     [ $rc -eq 0 ]
     check "upstream connections are reused on every protocol, and not when reuse would be unsafe ${first_fail}" $?
     kill $kt_pid 2>/dev/null

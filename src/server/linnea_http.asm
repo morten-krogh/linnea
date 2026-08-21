@@ -141,6 +141,7 @@ extern linnea_uring_now
 extern linnea_upstream_closed
 extern linnea_upstream_pick
 extern linnea_upstream_take
+extern linnea_upstream_reap_one
 extern linnea_upstream_limit
 
 section .rodata
@@ -3058,13 +3059,22 @@ linnea_http_handle:
     je .up_fresh
     mov [rbx + linnea_connection.up_fd], eax
     mov qword [rbx + linnea_connection.up_pooled], 1
+    ; snapshot the request head so a dead parked socket can be retried on a
+    ; fresh connection (out_rem is up_buf..head-end here; GET/HEAD has no body)
+    mov rcx, [rbx + linnea_connection.out_rem]
+    mov [rbx + linnea_connection.up_head_len], rcx
     mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
     mov eax, LINNEA_HTTP_PROXY
     jmp .ret
 .up_fresh:
     call linnea_upstream_count
     cmp rax, [linnea_upstream_limit]
-    jae .resp_503
+    jb .up_fresh_room
+    call linnea_upstream_reap_one     ; an idle parked socket yields to a request
+    test eax, eax
+    jnz .up_fresh                      ; freed one: re-check the ceiling
+    jmp .resp_503                      ; genuinely at capacity with live requests
+.up_fresh_room:
     mov eax, LINNEA_SYS_SOCKET
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM

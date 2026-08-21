@@ -103,6 +103,7 @@ extern linnea_ratelimit_on
 extern linnea_uring_now
 extern linnea_upstream_closed
 extern linnea_upstream_pick
+extern linnea_upstream_reap_one
 extern linnea_upstream_method_safe
 extern linnea_upstream_park
 extern linnea_upstream_take
@@ -3370,9 +3371,15 @@ h2p_open_upstream:
     ; either, and the location stays 503 rather than recovering after the idle
     ; expiry (audit-report-39). h1 has had this ordering since the pool landed;
     ; h2 and h3 kept the old one.
+.ou_ceiling:
     call linnea_upstream_count
     cmp rax, [linnea_upstream_limit]
-    jae .ou_busy
+    jb .ou_room
+    call linnea_upstream_reap_one     ; an idle parked socket yields to a request
+    test eax, eax
+    jnz .ou_ceiling                    ; freed one: re-check the ceiling
+    jmp .ou_busy                       ; genuinely at capacity with live requests
+.ou_room:
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM
     xor edx, edx
@@ -3432,6 +3439,46 @@ h2p_reconnect:
     pop rbx
     ret
 .rc_fail:
+    mov eax, -1
+    pop rbx
+    ret
+
+; h2p_retry_pooled(rdi = h2p slot) -> eax = 0 armed, -1 could not
+; A connection taken from the idle pool died at send or before its first
+; response byte -- the idle-timeout race the GET/HEAD-only reuse rule exists to
+; absorb. Resend on a FRESH connection to the SAME backend (unlike h2p_reconnect,
+; which moves to the next one on a connect failure). It is not a backend failure:
+; no health is counted and the attempt count is untouched, and it can happen only
+; once because the leg is no longer pooled afterwards. The request buffer is
+; intact -- callers gate on len == 0 -- so only the send cursor is rewound.
+h2p_retry_pooled:
+    push rbx
+    mov rbx, rdi
+    mov edi, [rbx + linnea_h2p.fd]
+    cmp edi, -1
+    je .rt_nofd
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    call linnea_upstream_closed
+    mov dword [rbx + linnea_h2p.fd], -1
+.rt_nofd:
+    mov edi, LINNEA_AF_INET
+    mov esi, LINNEA_SOCK_STREAM
+    xor edx, edx
+    mov eax, LINNEA_SYS_SOCKET
+    syscall
+    test eax, eax
+    js .rt_fail
+    mov [rbx + linnea_h2p.fd], eax
+    call linnea_upstream_open
+    mov qword [rbx + linnea_h2p.pooled], 0     ; a fresh leg now: no second retry
+    mov qword [rbx + linnea_h2p.sent], 0       ; replay the request from the top
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_CONNECTING
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_CONN
+    xor eax, eax
+    pop rbx
+    ret
+.rt_fail:
     mov eax, -1
     pop rbx
     ret
@@ -3496,7 +3543,7 @@ linnea_h2p_event:
     ; close-delimited body it is the legitimate end.
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_EOF
     cmp qword [rbx + linnea_h2p.state], LINNEA_H2P_RELAY
-    jne .ev_bad_gateway
+    jne .ev_eof_nohead
     mov rdi, rbx
     call h2p_decode
     test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
@@ -3514,10 +3561,29 @@ linnea_h2p_event:
     jne .ev_bad_gateway              ; fixed-length, still owed bytes
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
     jmp .ev_service
+.ev_eof_nohead:
+    cmp qword [rbx + linnea_h2p.pooled], 0
+    jne .ev_pooled_retry       ; a parked socket that closed before answering
+    jmp .ev_bad_gateway
 .ev_recv_err:
+    cmp qword [rbx + linnea_h2p.pooled], 0
+    jne .ev_pooled_retry       ; a dead parked socket: resend, do not blame it
     cmp r14d, -LINNEA_ECANCELED
     je .ev_timeout
     jmp .ev_bad_gateway
+; A leg from the idle pool failed at send or before its first response byte --
+; the idle-timeout race the GET/HEAD-only reuse rule exists to absorb. Resend
+; once on a fresh connection rather than answering, and rather than charging the
+; backend for a socket it parked and closed. Only while nothing has arrived: past
+; that the request buffer holds response bytes and the backend has answered.
+.ev_pooled_retry:
+    cmp qword [rbx + linnea_h2p.len], 0
+    jne .ev_bad_gateway        ; a response already began: not retriable
+    mov rdi, rbx
+    call h2p_retry_pooled
+    test eax, eax
+    js .ev_bad_gateway_counted ; could not resend: fail without a health strike
+    jmp .ev_service
 .ev_connect:
     test r14d, r14d
     js .ev_conn_failed
@@ -3592,6 +3658,8 @@ linnea_h2p_event:
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
     jmp .ev_service
 .ev_send_err:
+    cmp qword [rbx + linnea_h2p.pooled], 0
+    jne .ev_pooled_retry       ; a dead parked socket: resend, do not blame it
     cmp r14d, -LINNEA_ECANCELED
     je .ev_timeout
     jmp .ev_bad_gateway

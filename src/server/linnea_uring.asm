@@ -2338,9 +2338,28 @@ linnea_uring_run:
 .up_send_err:
     mov esi, 502               ; nothing sent to the client yet either way
     cmp r15d, -LINNEA_ECANCELED
-    jne .proxy_fail
+    jne .up_send_err_route
     mov esi, 504               ; backend accepted but stopped reading
+.up_send_err_route:
+    cmp qword [r12 + linnea_connection.up_pooled], 0
+    jne .pooled_retry          ; a dead parked socket: resend, do not blame it
     jmp .proxy_fail
+
+; A leg taken from the idle pool failed at send or before its first response
+; byte -- the idle-timeout race the GET/HEAD-only reuse rule exists to absorb.
+; Resend once on a fresh connection instead of answering, and instead of
+; charging the backend a health strike for a socket IT parked and closed.
+; esi holds the status to fall back to; entered only with up_pooled set.
+.pooled_retry:
+    cmp qword [r12 + linnea_connection.up_len], 0
+    jne .proxy_fail            ; a response already began: head gone, retry unsafe
+    push rsi
+    mov rdi, r12
+    call linnea_uring_up_retry_pooled
+    pop rsi
+    test eax, eax
+    js .proxy_fail_counted     ; could not start it: fail without a health strike
+    jmp .wait
 .up_send_done:
     ; The request is always complete by the time any of it is sent: a body too
     ; large to buffer was captured before the upstream was even connected, and
@@ -2383,12 +2402,15 @@ linnea_uring_run:
     cmp r15d, -LINNEA_ECANCELED
     je .head_timeout
     mov esi, 502
-    jmp .proxy_fail
+    jmp .head_fail
 .head_eof:
     mov esi, 502               ; upstream closed without a response
-    jmp .proxy_fail
+    jmp .head_fail
 .head_timeout:
     mov esi, 504
+.head_fail:
+    cmp qword [r12 + linnea_connection.up_pooled], 0
+    jne .pooled_retry          ; a parked socket that died before answering
     jmp .proxy_fail
 .head_data:
     mov eax, r15d
@@ -3703,6 +3725,56 @@ linnea_uring_up_reconnect:
 .no_socket:
     ; out of descriptors: the caller answers with the status it already had,
     ; which is the failure of the backend rather than of this retry
+    mov eax, -1
+    pop rbx
+    ret
+
+; linnea_uring_up_retry_pooled(rdi = connection*) -> eax = 0 armed, -1 could not
+; A connection taken from the idle pool turned out dead -- the peer closed it
+; after the liveness peek but before or during our send, or before it answered.
+; Reuse is confined to GET/HEAD precisely so this can be handled by sending the
+; request AGAIN, and this is where that promise is kept: open a FRESH connection
+; to the SAME backend and replay the head from up_buf. It is not a backend
+; failure -- no health is counted and the attempt count is untouched -- and it
+; happens at most once, because the leg is no longer pooled afterwards. The dead
+; socket is closed first; it is counted against max_upstream, so close-then-open
+; keeps the count balanced. Callers gate this on "pooled AND nothing received
+; yet" (up_len == 0), so up_buf still holds the head and the client has nothing.
+linnea_uring_up_retry_pooled:
+    push rbx
+    mov rbx, rdi
+    mov edi, [rbx + linnea_connection.up_fd]
+    cmp edi, -1
+    je .rp_no_old
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    call linnea_upstream_closed
+    mov dword [rbx + linnea_connection.up_fd], -1
+.rp_no_old:
+    mov eax, LINNEA_SYS_SOCKET
+    mov edi, LINNEA_AF_INET
+    mov esi, LINNEA_SOCK_STREAM
+    xor edx, edx
+    syscall
+    cmp rax, -4095
+    jae .rp_no_socket
+    mov [rbx + linnea_connection.up_fd], eax
+    call linnea_upstream_open
+    mov qword [rbx + linnea_connection.up_pooled], 0   ; a fresh leg now: no second retry
+    mov qword [rbx + linnea_connection.up_len], 0
+    lea rax, [rbx + linnea_connection.up_buf]
+    mov [rbx + linnea_connection.out_ptr], rax
+    mov rcx, [rbx + linnea_connection.up_head_len]
+    mov [rbx + linnea_connection.out_rem], rcx
+    mov qword [rbx + linnea_connection.file_rem], 0    ; GET/HEAD: no body behind the head
+    mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_CONNECTING
+    mov rdi, rbx
+    call linnea_uring_arm_connect
+    call linnea_uring_submit_now
+    xor eax, eax
+    pop rbx
+    ret
+.rp_no_socket:
     mov eax, -1
     pop rbx
     ret
