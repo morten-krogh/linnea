@@ -20,6 +20,7 @@ default rel
 %include "linnea_tls.inc"
 %include "linnea_quic.inc"
 %include "linnea_quic_conn.inc"
+%include "linnea_version.inc"
 
 global _start
 
@@ -84,7 +85,7 @@ usage_msg:  db "usage: linnea-probe <url> <protocol> [--host <name>]", 10
 usage_len   equ $ - usage_msg
 
 ; Bump on any change to observable behaviour (probe set, verdicts, output).
-probe_version:     db "linnea-probe 1.0.0", 10
+probe_version:     db "linnea-probe ", LINNEA_VERSION, 10
 probe_version_len  equ $ - probe_version
 opt_version:       db "--version"
 opt_version_len    equ $ - opt_version

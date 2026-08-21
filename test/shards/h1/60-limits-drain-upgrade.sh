@@ -142,6 +142,13 @@ out=$($BIN --help 2>/dev/null); rc=$?
 check "cli: --help prints the options to stdout, exit 0" $?
 $BIN -h >/dev/null 2>&1
 check "cli: -h is the same as --help" $?
+# --version prints "linnea <version>" to stdout and exits 0. Assert the shape,
+# not the exact number, so a version bump does not need this line edited too.
+out=$($BIN --version 2>/dev/null); rc=$?
+[ $rc -eq 0 ] && printf '%s\n' "$out" | grep -Eq "^linnea [0-9]+\.[0-9]+\.[0-9]+$"
+check "cli: --version prints the version to stdout, exit 0 ($out)" $?
+$BIN -v >/dev/null 2>&1
+check "cli: -v is the same as --version" $?
 # --bpf-probe must SAY something: which step refused and with what errno, or the
 # program fd it loaded. It used to answer "FAILED err=1" for all six causes,
 # which reads as EPERM whatever actually happened. Runs unprivileged here, so

@@ -12,6 +12,7 @@ The full option list:
   -c, --config <path>  read the configuration from <path>
   -t, --test           check the configuration and certificates, then exit
   -b, --bpf-probe      check that BPF reuseport steering loads, then exit
+  -v, --version        print the version and exit
   -h, --help           print this and exit
 ```
 

@@ -479,7 +479,9 @@ install:
 # backends are deliberately left out -- they are examples, not the product.
 # `make release` reproduces exactly what the GitHub release ships, so the two
 # stay the same thing: the release is `make release`, nothing hidden.
-VERSION = 1.0.0
+# One source for the version: include/linnea_version.inc, which the binaries
+# also compile in for --version. Bump it there.
+VERSION := $(shell sed -n 's/^%define LINNEA_VERSION "\(.*\)"/\1/p' include/linnea_version.inc)
 RELNAME = linnea-$(VERSION)-linux-x86_64
 RELDIR  = dist/$(RELNAME)
 

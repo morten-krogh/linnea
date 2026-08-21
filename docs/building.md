@@ -46,6 +46,7 @@ part of the product; the product is `linnea` (and `linnea-probe` alongside it).
 linnea --config <path>     # run with a configuration file
 linnea --test --config <path>   # check the config and certificates, then exit
 linnea --bpf-probe         # check that BPF reuseport steering loads, then exit
+linnea --version           # print the version and exit
 linnea --help
 ```
 

@@ -32,6 +32,7 @@ default rel
 
 %include "linnea_syscall.inc"
 %include "linnea_config.inc"
+%include "linnea_version.inc"
 
 global _start
 
@@ -84,12 +85,18 @@ opt_b_short:    db "-b", 0
 opt_bpf:        db "--bpf-probe", 0
 opt_h_short:    db "-h", 0
 opt_help:       db "--help", 0
+opt_v_short:    db "-v", 0
+opt_version:    db "--version", 0
+
+version_msg:    db "linnea ", LINNEA_VERSION, 10
+version_msg_len equ $ - version_msg
 
 help_msg:
     db "usage: linnea --config <config.json> [options]", 10, 10
     db "  -c, --config <path>  read the configuration from <path>", 10
     db "  -t, --test           check the configuration and certificates, then exit", 10
     db "  -b, --bpf-probe      check that BPF reuseport steering loads, then exit", 10
+    db "  -v, --version        print the version and exit", 10
     db "  -h, --help           print this and exit", 10
 help_msg_len    equ $ - help_msg
 
@@ -528,6 +535,16 @@ parse_args:
     call arg_is
     test eax, eax
     jnz .pa_help
+    mov rdi, r13
+    lea rsi, [opt_version]
+    call arg_is
+    test eax, eax
+    jnz .pa_version
+    mov rdi, r13
+    lea rsi, [opt_v_short]
+    call arg_is
+    test eax, eax
+    jnz .pa_version
     jmp .pa_bad                      ; an option we do not know
 .pa_mode_test:
     mov qword [cli_mode], 1
@@ -538,6 +555,13 @@ parse_args:
 .pa_help:
     lea rdi, [help_msg]              ; help is not an error: stdout, exit 0
     mov esi, help_msg_len
+    call linnea_print_stdout
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+.pa_version:
+    lea rdi, [version_msg]           ; also stdout, exit 0
+    mov esi, version_msg_len
     call linnea_print_stdout
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
