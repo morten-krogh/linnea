@@ -39,3 +39,23 @@ internet.
 ### Documentation
 - A full documentation set under `docs/`, and an honest account of how linnea is
   built with AI (`docs/ai-development.md`).
+
+### Release binaries
+
+The stripped x86-64 binaries shipped in `linnea-1.0.0-linux-x86_64.tar.gz` are
+byte-for-byte reproducible from the `v1.0.0` source and hash to:
+
+```
+129d7fd7e9515dfe59fa2cf65e69053d16459a99b967cf6cac2779366c959920  linnea
+6122814d9aa20f58c234bf4a03812753e2d1a400b732a7c0240edc0cef102996  linnea-probe
+```
+
+Reproduce and verify:
+
+```sh
+git checkout v1.0.0 && make && strip bin/linnea bin/linnea-probe
+sha256sum bin/linnea bin/linnea-probe
+```
+
+The `strip` is required — the default build carries DWARF debug info that embeds
+the build path, so only the stripped binaries hash identically everywhere.

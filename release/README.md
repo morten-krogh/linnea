@@ -76,16 +76,22 @@ Confirm the download matches the published checksums:
 sha256sum -c SHA256SUMS
 ```
 
-Because linnea is `nasm` + `ld` with no libraries and no optimizer, the build is
-reproducible — you can rebuild the exact same binary from source and check it
-yourself:
+Because linnea is `nasm` + `ld` with no libraries and no optimizer, the shipped
+binaries are **byte-for-byte reproducible** — build from source, strip, and
+compare:
 
 ```sh
 git clone https://github.com/morten-krogh/linnea && cd linnea
 git checkout v1.0.0
 make
-sha256sum bin/linnea      # matches the linnea entry in SHA256SUMS
+strip bin/linnea bin/linnea-probe
+sha256sum bin/linnea bin/linnea-probe   # match the entries in SHA256SUMS
 ```
+
+The `strip` matters: the default build carries DWARF debug info (`-g`) that
+embeds the absolute build path, so the *unstripped* file hash varies by where you
+built it. The release ships the **stripped** binaries, which carry no such info
+and hash identically in every build environment.
 
 ## More
 

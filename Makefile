@@ -488,11 +488,18 @@ release: $(BIN) $(PROBE_BIN)
 	mkdir -p $(RELDIR)
 	install -m 0755 $(BIN)       $(RELDIR)/linnea
 	install -m 0755 $(PROBE_BIN) $(RELDIR)/linnea-probe
+	# Strip the shipped binaries. The default build carries DWARF debug info
+	# (-g), which embeds absolute build paths and so makes the file hash depend
+	# on WHERE it was built -- a stripped binary has no such info, is byte-for-
+	# byte reproducible across build environments, and is ~4x smaller. This is
+	# what makes "rebuild and compare the hash" true (see release/README.md).
+	strip $(RELDIR)/linnea $(RELDIR)/linnea-probe
 	install -m 0644 release/linnea-minimal.json release/linnea.example.json \
 	                release/README.md $(RELDIR)/
 	cd $(RELDIR) && sha256sum linnea linnea-probe > SHA256SUMS
 	tar -C dist -czf dist/$(RELNAME).tar.gz $(RELNAME)
-	@echo "built dist/$(RELNAME).tar.gz"
+	cd dist && sha256sum $(RELNAME).tar.gz > SHA256SUMS
+	@echo "built dist/$(RELNAME).tar.gz and dist/SHA256SUMS"
 	@ls -1 $(RELDIR)
 
 .PHONY: all clean test selftest tlstest probe api ws wsfast install release
