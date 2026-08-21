@@ -99,10 +99,19 @@ are deliberately left out; the package is the product (`linnea`) and the prober.
 
 It also refreshes the ready-to-run binaries committed in
 [`../release/`](../release) — `release/linnea` and `release/linnea-probe` — the
-ones the [quick start](../README.md#have-the-repo--just-run-it) points at. They
-are stripped and reproducible, so `make release` only shows a git change when the
-code actually changed. **Run `make release` before tagging a release** so the
-committed binaries match the source at that tag.
+ones the [quick start](../README.md#have-the-repo--just-run-it) points at, and it
+writes `release/VERSION` so what is committed there is never a mystery. They are
+stripped and reproducible, so `make release` only shows a git change when the code
+actually changed.
+
+`release/` holds the **last release**, not master's current build — updating it on
+every commit would make every commit a public release, which is not what a commit
+is. So the release process is a deliberate step, not something on every push:
+
+1. Run the full suite — `./test/run_full_suite.sh` — and make sure it is green.
+2. `make release`, and commit the refreshed `release/` (and bump `VERSION` in the
+   Makefile for a new version).
+3. Tag, and attach `dist/linnea-<version>-linux-x86_64.tar.gz` to the release.
 
 ## Layout
 

@@ -486,6 +486,11 @@ RELDIR  = dist/$(RELNAME)
 release: $(BIN) $(PROBE_BIN)
 	rm -rf $(RELDIR)
 	mkdir -p $(RELDIR)
+	# The version, stated plainly inside release/ (committed) and in the tarball,
+	# so what is in release/ is never a mystery. release/ holds the LAST release;
+	# between releases it does not track master (committing a binary per commit
+	# would make every commit a public release, which we do not).
+	echo $(VERSION) > release/VERSION
 	install -m 0755 $(BIN)       $(RELDIR)/linnea
 	install -m 0755 $(PROBE_BIN) $(RELDIR)/linnea-probe
 	# Strip the shipped binaries. The default build carries DWARF debug info
@@ -495,7 +500,7 @@ release: $(BIN) $(PROBE_BIN)
 	# what makes "rebuild and compare the hash" true (see release/README.md).
 	strip $(RELDIR)/linnea $(RELDIR)/linnea-probe
 	install -m 0644 release/linnea-minimal.json release/linnea.example.json \
-	                release/README.md $(RELDIR)/
+	                release/README.md release/VERSION $(RELDIR)/
 	cd $(RELDIR) && sha256sum linnea linnea-probe > SHA256SUMS
 	tar -C dist -czf dist/$(RELNAME).tar.gz $(RELNAME)
 	cd dist && sha256sum $(RELNAME).tar.gz > SHA256SUMS
@@ -504,7 +509,7 @@ release: $(BIN) $(PROBE_BIN)
 	# byte-reproducible: git shows a change only when the code actually changed.
 	install -m 0755 $(RELDIR)/linnea       release/linnea
 	install -m 0755 $(RELDIR)/linnea-probe release/linnea-probe
-	@echo "built dist/$(RELNAME).tar.gz; refreshed release/linnea, release/linnea-probe"
+	@echo "built dist/$(RELNAME).tar.gz; refreshed release/{VERSION,linnea,linnea-probe}"
 	@ls -1 $(RELDIR)
 
 .PHONY: all clean test selftest tlstest probe api ws wsfast install release
