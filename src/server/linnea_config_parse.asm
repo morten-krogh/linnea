@@ -1225,26 +1225,29 @@ linnea_parse_location:
     jmp .member_sep
 .proxy_array:
     call linnea_parse_advance          ; past '['
-.proxy_elem:
+    ; The ONLY place a ']' may follow is here, before any element: that is the
+    ; empty list, which names no upstream and is refused. Past this point a
+    ; comma obliges another element, exactly as `servers` and `locations`
+    ; oblige another object -- the loop used to jump back above this test, so
+    ; `["a",]` was accepted while the same comma one line away was not
+    ; (audit-report-40).
     call linnea_parse_skip_ws
     call linnea_parse_peek
     cmp al, ']'
-    je .proxy_array_end
-    call .proxy_one
+    je .bad_proxy_empty                ; "proxy": [] names no upstream at all
+.proxy_elem:
+    call .proxy_one                    ; an element is REQUIRED at this point
     call linnea_parse_skip_ws
     call linnea_parse_peek
     cmp al, ','
     jne .proxy_array_end
     call linnea_parse_advance
+    call linnea_parse_skip_ws
     jmp .proxy_elem
 .proxy_array_end:
-    call linnea_parse_skip_ws
-    call linnea_parse_peek
-    cmp al, ']'
+    cmp al, ']'                        ; the peek above, whitespace already skipped
     jne .bad_proxy_list
     call linnea_parse_advance
-    cmp qword [rbx + linnea_config_location.proxy_count], 0
-    je .bad_proxy_empty                ; "proxy": [] names no upstream at all
     mov qword [rbx + linnea_config_location.kind], LINNEA_LOC_KIND_PROXY
     jmp .member_sep
 

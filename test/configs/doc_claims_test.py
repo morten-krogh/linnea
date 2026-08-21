@@ -78,6 +78,29 @@ test(EXAMPLE, "the documented example parses", True)
 # --- the JSON dialect ----------------------------------------------------
 test('{"log":"/tmp/l", /* c */ "servers":[]}', "comments rejected", False)
 test('{"log":"/tmp/l","servers":[],}', "trailing comma rejected", False)
+# ...including inside the multi-backend proxy array, which had its own loop and
+# its own answer: `["a",]` was accepted while the same comma one line away in
+# `locations` was not. A grammar that depends on which key you are under is not
+# the strict subset this file documents (audit-report-40).
+PROXY_ARR = ('{"log":"/tmp/l","servers":[{"host":"127.0.0.1","port":61899,'
+             '"hostname":"x.test","locations":[{"prefix":"/","proxy":%s}]}]}')
+test(PROXY_ARR % '["127.0.0.1:8080",]',
+     "proxy array: trailing comma rejected", False)
+test(PROXY_ARR % '["127.0.0.1:8080","127.0.0.1:8081",]',
+     "proxy array: trailing comma after several rejected", False)
+test(PROXY_ARR % '[,"127.0.0.1:8080"]',
+     "proxy array: leading comma rejected", False)
+test(PROXY_ARR % '["127.0.0.1:8080",,"127.0.0.1:8081"]',
+     "proxy array: doubled comma rejected", False)
+test(PROXY_ARR % '[]', "proxy array: empty list rejected", False,
+     "names no backend")
+# and the valid spellings, so the rule cannot be tightened into refusing them
+test(PROXY_ARR % '["127.0.0.1:8080"]', "proxy array: one backend accepted", True)
+test(PROXY_ARR % '["127.0.0.1:8080","127.0.0.1:8081"]',
+     "proxy array: two backends accepted", True)
+test(PROXY_ARR % '[ "127.0.0.1:8080" , "127.0.0.1:8081" ]',
+     "proxy array: whitespace around the comma accepted", True)
+test(PROXY_ARR % '"127.0.0.1:8080"', "proxy: the bare-string form accepted", True)
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",
