@@ -57,6 +57,7 @@ global linnea_upstream_pick
 global linnea_upstream_addr
 global linnea_upstream_mark_ok
 global linnea_upstream_mark_fail
+global linnea_upstream_mark_unanswered
 
 extern linnea_uring_now
 extern linnea_upstream_closed
@@ -73,6 +74,12 @@ log_up_pre:     db "upstream "
 log_up_pre_len  equ $ - log_up_pre
 log_up_fail:    db " connect failed", 10
 log_up_fail_len equ $ - log_up_fail
+; Said differently on purpose. "connect failed" sends an operator looking at
+; listeners and firewalls; a backend that ACCEPTED and then went quiet is a
+; different fault with a different place to look, and the two were reported
+; with the same words until response-stage failures started counting.
+log_up_noans:   db " accepted but did not answer", 10
+log_up_noans_len equ $ - log_up_noans
 log_up_out:     db " failed out of rotation", 10
 log_up_out_len  equ $ - log_up_out
 log_up_back:    db " back in rotation", 10
@@ -214,13 +221,23 @@ linnea_upstream_mark_ok:
 ; A connect did not complete. With one backend there is nothing to step over, so
 ; the bookkeeping is skipped entirely rather than kept and ignored.
 linnea_upstream_mark_fail:
+    lea rdx, [log_up_fail]
+    mov ecx, log_up_fail_len
+    jmp mark_fail_common
+
+; linnea_upstream_mark_unanswered(rdi = location, rsi = backend index)
+; The backend accepted and then failed to answer -- a timeout, a closed
+; connection, framing we will not relay. Counted identically; reported
+; differently, because the two faults are looked for in different places.
+linnea_upstream_mark_unanswered:
+    lea rdx, [log_up_noans]
+    mov ecx, log_up_noans_len
+mark_fail_common:
     push rbx
     push r12
     mov rbx, rdi
     mov r12, rsi
-    lea rdx, [log_up_fail]
-    mov ecx, log_up_fail_len
-    call up_log
+    call up_log                       ; rdx/rcx already carry the suffix
     mov rdi, rbx
     mov rsi, r12
     cmp qword [rdi + linnea_config_location.proxy_count], 2

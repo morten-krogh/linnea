@@ -68,6 +68,7 @@ extern linnea_upstream_addr
 extern linnea_upstream_pick
 extern linnea_upstream_mark_ok
 extern linnea_upstream_mark_fail
+extern linnea_upstream_mark_unanswered
 extern linnea_upstream_limit
 extern linnea_connection_alloc
 extern linnea_connection_free
@@ -2210,19 +2211,20 @@ linnea_uring_run:
     mov rax, [r12 + linnea_connection.location]
     mov rax, [rax + linnea_config_location.proxy_count]
     cmp [r12 + linnea_connection.up_tries], rax
-    jae .proxy_fail            ; every backend this location names has been tried
+    jae .proxy_fail_counted    ; every backend tried, and each was counted above
     push rsi                   ; keep the status, in case the retry cannot start
     mov rdi, r12
     call linnea_uring_up_reconnect
     pop rsi
     test eax, eax
-    js .proxy_fail
+    js .proxy_fail_counted
     jmp .wait
 .connect_ok:
-    ; it answered: whatever it did before, this backend is up
-    mov rdi, [r12 + linnea_connection.location]
-    mov rsi, [r12 + linnea_connection.up_backend]
-    call linnea_upstream_mark_ok
+    ; Health is cleared at COMPLETION, not here. Accepting a connection is not
+    ; evidence a backend is working: one that accepts every time and then times
+    ; out every time would have its counter zeroed on each connect and could
+    ; never reach the threshold. It is also the wrong place now that a pooled
+    ; connection skips the connect entirely.
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
     mov rdi, r12
     call linnea_uring_arm_up_send
@@ -2231,6 +2233,22 @@ linnea_uring_run:
 
 ; give up on the upstream and answer the client instead; esi = 502 or 504
 .proxy_fail:
+    ; The backend accepted and then failed to answer: a send error, a closed
+    ; connection, a timeout, framing we will not relay. Counted against
+    ; SELECTION -- whether this backend should keep receiving requests -- which
+    ; is a different question from whether THIS request may be retried
+    ; elsewhere. It may not: the head is already out, so the backend may have
+    ; acted on it. Confining failover to connect was right; letting the health
+    ; state inherit that restriction was not (audit follow-up).
+    ;
+    ; A 5xx from the backend is NOT counted. The application answered, which
+    ; means the backend is up; nginx draws the same line by default.
+    push rsi                   ; the status this failure will answer with
+    mov rdi, [r12 + linnea_connection.location]
+    mov rsi, [r12 + linnea_connection.up_backend]
+    call linnea_upstream_mark_unanswered
+    pop rsi
+.proxy_fail_counted:
     ; An HTTP/3 leg has no client socket to send on: its answer goes out as a
     ; QUIC stream, and the leg is freed rather than kept for a keep-alive that
     ; does not exist.
@@ -2592,6 +2610,10 @@ linnea_uring_run:
 ; the exchange is over: close the upstream, log it, then finish the
 ; response the same way a static one finishes (keep-alive or close)
 .proxy_finish:
+    ; a complete response: whatever this backend did before, it is working now
+    mov rdi, [r12 + linnea_connection.location]
+    mov rsi, [r12 + linnea_connection.up_backend]
+    call linnea_upstream_mark_ok
     mov edi, [r12 + linnea_connection.up_fd]
     cmp edi, -1
     je .proxy_logged

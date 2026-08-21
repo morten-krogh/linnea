@@ -51,6 +51,7 @@ extern linnea_connection_free
 extern linnea_upstream_open
 extern linnea_upstream_closed
 extern linnea_upstream_method_safe
+extern linnea_upstream_mark_ok
 extern linnea_upstream_park
 extern linnea_upstream_take
 extern linnea_upstream_pick
@@ -1303,6 +1304,12 @@ linnea_h3_proxy_deliver:
     mov eax, LINNEA_SYS_MUNMAP
     syscall
 .dl_done:
+    ; a complete response: whatever this backend did before, it is working now.
+    ; h3 does not pass through the uring loop's .proxy_finish, so it says so
+    ; here -- the failure side it DOES share, through .proxy_fail.
+    mov rdi, [rbx + linnea_connection.location]
+    mov rsi, [rbx + linnea_connection.up_backend]
+    call linnea_upstream_mark_ok
     ; The response is delivered and the upstream exchange is over. Keep the
     ; connection on the same terms h1 uses: the location opted in and the method
     ; was safe (up_reusable), the backend did not say close, and the body was

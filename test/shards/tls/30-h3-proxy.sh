@@ -312,6 +312,10 @@ EOF
     # which one answered; a third address has nothing behind it, so a
     # connect to it is refused and the request must move to the next.
     #
+    # EIGHT locations exactly, which is LINNEA_MAX_LOCATIONS -- there is no
+    # root location because nothing here asks for one, and adding a ninth is
+    # what a future edit will trip over.
+    #
     # Each protocol gets its OWN dead-first location. Health state is per
     # worker and per LOCATION, not per protocol, so one shared location
     # would be failed out by whichever protocol ran first and the other two
@@ -321,11 +325,15 @@ EOF
     mk_a=$!
     python3 test/marker_backend.py ${P61482} B >/dev/null 2>&1 &
     mk_b=$!
+    # accepts every connection and never answers: the fault a connect-only
+    # health check is blind to
+    python3 test/hang_backend.py ${P61488} >/dev/null 2>&1 &
+    mk_h=$!
     sleep 0.5
     fol=$PWD/$RUNDIR/failover.log
     fo=$CFG/failover.json
     cat > "$fo" <<EOF
-{ "log": "$fol", "timeout": 5, "workers": 1,
+{ "log": "$fol", "timeout": 5, "proxy_timeout": 2, "workers": 1,
   "servers": [ { "host": "127.0.0.1", "port": ${P61483}, "hostname": "localhost",
 "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
 "locations": [
@@ -333,17 +341,17 @@ EOF
   { "prefix": "/dead-h1", "proxy": ["127.0.0.1:${P61489}", "127.0.0.1:${P61481}"] },
   { "prefix": "/dead-h2", "proxy": ["127.0.0.1:${P61489}", "127.0.0.1:${P61481}"] },
   { "prefix": "/dead-h3", "proxy": ["127.0.0.1:${P61489}", "127.0.0.1:${P61481}"] },
-  { "prefix": "/only-h1", "proxy": ["127.0.0.1:${P61489}"] },
-  { "prefix": "/only-h2", "proxy": ["127.0.0.1:${P61489}"] },
-  { "prefix": "/only-h3", "proxy": ["127.0.0.1:${P61489}"] },
-  { "prefix": "/", "root": "$PWD/$WWW" } ] } ] }
+  { "prefix": "/only",    "proxy": ["127.0.0.1:${P61489}"] },
+  { "prefix": "/hang-h1", "proxy": ["127.0.0.1:${P61488}", "127.0.0.1:${P61481}"] },
+  { "prefix": "/hang-h2", "proxy": ["127.0.0.1:${P61488}", "127.0.0.1:${P61481}"] },
+  { "prefix": "/hang-h3", "proxy": ["127.0.0.1:${P61488}", "127.0.0.1:${P61481}"] } ] } ] }
 EOF
     start_server "$fo"
     fo_pid=$SRV_PID
-    out=$(timeout 150 python3 test/tls/upstream_failover.py ${P61483} $CA "$fol" $h3arg 2>&1)
+    out=$(timeout 300 python3 test/tls/upstream_failover.py ${P61483} $CA "$fol" $h3arg 2>&1)
     rc=$?
     first_fail=$(echo "$out" | grep -m1 FAIL)
-    kill $mk_a $mk_b 2>/dev/null
+    kill $mk_a $mk_b $mk_h 2>/dev/null
     [ $rc -eq 0 ]
     check "a proxy location spreads over its backends, steps past a dead one, and stops retrying it ${first_fail}" $?
 

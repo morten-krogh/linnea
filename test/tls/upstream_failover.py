@@ -25,6 +25,13 @@ That is not a hypothetical: driving one shared location is how this was first
 written, and h2 and h3 passed without executing a line of the paths they were
 meant to cover.
 
+Eight locations exactly, which is the per-server maximum, so there is no root
+location: nothing here requests one. The `/only` location is SHARED across
+protocols because a location with ONE backend accumulates no health state at
+all -- mark_fail returns early below two backends -- so there is nothing for one
+protocol to leave behind for the next. The dead-first and hang locations are
+per-protocol for the opposite reason.
+
 usage: upstream_failover.py <port> <cafile> <logfile> [curl-h3]
 """
 import subprocess
@@ -61,6 +68,18 @@ def upstream_failures():
         return 0
 
 
+def unanswered():
+    """...and how many backends accepted and then failed to answer. Reported
+    with different words on purpose: "connect failed" sends an operator to look
+    at listeners and firewalls, and a backend that accepted and went quiet is a
+    different fault found in a different place."""
+    try:
+        with open(logpath, "rb") as f:
+            return f.read().count(b"accepted but did not answer")
+    except FileNotFoundError:
+        return 0
+
+
 def check(label, ok):
     global fails
     if ok:
@@ -71,7 +90,8 @@ def check(label, ok):
 
 
 DEADFIRST = {"http1.1": "/dead-h1", "http2": "/dead-h2", "h3": "/dead-h3"}
-DEADONLY = {"http1.1": "/only-h1", "http2": "/only-h2", "h3": "/only-h3"}
+HANGFIRST = {"http1.1": "/hang-h1", "http2": "/hang-h2", "h3": "/hang-h3"}
+DEADONLY = {"http1.1": "/only", "http2": "/only", "h3": "/only"}
 
 for p in protos:
     dead, only = DEADFIRST[p], DEADONLY[p]
@@ -104,6 +124,25 @@ for p in protos:
     # a location whose only backend is down has nothing to fail over TO
     check(f"{p}: a location with one dead backend is 502",
           code(p, only) == "502")
+
+    # --- a backend that ACCEPTS and then never answers --------------------
+    # The failure mode a connect-only health check cannot see: reachable and
+    # completely useless. Health counted connect failures alone, so this
+    # backend stayed "healthy" for ever and kept taking its turn -- half the
+    # requests timing out, indefinitely.
+    #
+    # It is NOT failed over within the request: the head is already out, so the
+    # backend may have acted on it, and sending it again would invent a second
+    # request. The client sees 504 until the backend is out of rotation, which
+    # is what the run of trailing 200s asserts.
+    before = unanswered()
+    hung = [get(p, HANGFIRST[p]) for _ in range(8)]
+    logged = unanswered() - before
+    tail = [c for c in hung[-3:]]
+    check(f"{p}: a backend that accepts and hangs is failed out "
+          f"(last three: {tail})", all(c == "A" for c in tail))
+    check(f"{p}: ...counted as unanswered, not as a connect failure ({logged})",
+          logged == 3)
 
 print("OK" if not fails else f"{fails} failed")
 sys.exit(1 if fails else 0)

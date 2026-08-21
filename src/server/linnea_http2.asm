@@ -109,6 +109,7 @@ extern linnea_upstream_take
 extern linnea_string_has_token
 extern linnea_upstream_mark_ok
 extern linnea_upstream_mark_fail
+extern linnea_upstream_mark_unanswered
 extern linnea_upstream_limit
 
 section .rodata
@@ -2931,6 +2932,16 @@ h2p_kill:
 h2p_release:
     test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
     jnz .rel_zombie
+    ; A complete response says this backend is working. BODY_DONE is exactly
+    ; that claim -- h2 refuses to set it for a truncated body (Finding 31).
+    test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
+    jz .rel_not_ok
+    push rax
+    mov rdi, [rax + linnea_h2p.location]
+    mov rsi, [rax + linnea_h2p.backend]
+    call linnea_upstream_mark_ok
+    pop rax
+.rel_not_ok:
     ; Keep the connection on the same terms h1 and h3 use. BODY_DONE is what
     ; says the response ended where its framing promised -- h2 refuses to set it
     ; for a truncated body (Finding 31). F_EOF excludes the close-delimited
@@ -3510,9 +3521,10 @@ linnea_h2p_event:
 .ev_connect:
     test r14d, r14d
     js .ev_conn_failed
-    mov rdi, [rbx + linnea_h2p.location]
-    mov rsi, [rbx + linnea_h2p.backend]
-    call linnea_upstream_mark_ok
+    ; Health is cleared at COMPLETION, in h2p_release. Accepting a connection is
+    ; not evidence a backend works: one that accepts and then times out every
+    ; time would have its counter zeroed here on each attempt and could never
+    ; reach the threshold.
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_SENDING
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
     jmp .ev_service
@@ -3535,9 +3547,10 @@ linnea_h2p_event:
     js .ev_conn_giveup
     jmp .ev_service
 .ev_conn_giveup:
+    ; each attempt was counted in .ev_conn_failed; enter past the counter
     cmp r14d, -LINNEA_ECANCELED
-    je .ev_timeout
-    jmp .ev_bad_gateway
+    je .ev_timeout_counted
+    jmp .ev_bad_gateway_counted
 
 .ev_send:
     test r14d, r14d
@@ -3594,9 +3607,22 @@ linnea_h2p_event:
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_HEAD_RDY | LINNEA_H2P_F_HEAD_INTERIM
     jmp .ev_service
 .ev_timeout:
+    ; the backend accepted and then did not answer in time: counted against
+    ; SELECTION, never retried -- the head is already out (see .proxy_fail in
+    ; linnea_uring.asm for the full reasoning; the two must agree)
+    mov rdi, [rbx + linnea_h2p.location]
+    mov rsi, [rbx + linnea_h2p.backend]
+    call linnea_upstream_mark_unanswered
+.ev_timeout_counted:
     mov qword [rbx + linnea_h2p.status], 504
     jmp .ev_fail
 .ev_bad_gateway:
+    ; likewise: a closed connection, a send error, framing we will not relay.
+    ; NOT a 5xx from the application, which never reaches here.
+    mov rdi, [rbx + linnea_h2p.location]
+    mov rsi, [rbx + linnea_h2p.backend]
+    call linnea_upstream_mark_unanswered
+.ev_bad_gateway_counted:
     mov qword [rbx + linnea_h2p.status], 502
 .ev_fail:
     ; close the upstream now; the client still needs an answer, so the slot
