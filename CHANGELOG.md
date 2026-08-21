@@ -4,6 +4,35 @@ All notable changes to linnea are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project will use
 [semantic versioning](https://semver.org/) from its first tagged release.
 
+## [1.1.0] — 2026-08-21
+
+A small, additive release: the server learns to report its own version.
+
+### Added
+- `linnea --version` (and `-v`) prints the version and exits 0, mirroring
+  `--help`. The version string now lives in a single place and is compiled into
+  both the server and `linnea-probe`, so it can never drift between the two
+  binaries, the release tarball and the committed `release/` binary. The
+  `Server` response header still carries no version by design — `--version` is
+  the place to ask.
+
+### Release binaries
+
+The stripped x86-64 binaries shipped in `linnea-1.1.0-linux-x86_64.tar.gz` are
+byte-for-byte reproducible from the `v1.1.0` source and hash to:
+
+```
+fd36a16c3e18bf5bc816c32aafd0aa2501dd113a2f527e2c513bd89f612b2355  linnea
+b5308861941a4bfedb8288303ffb39c3192728cc94d9e3c5c7515eebbedd0398  linnea-probe
+```
+
+Reproduce and verify:
+
+```sh
+git checkout v1.1.0 && make && strip bin/linnea bin/linnea-probe
+sha256sum bin/linnea bin/linnea-probe
+```
+
 ## [1.0.0] — 2026-08-21
 
 The first properly documented public release. Linnea is a from-scratch HTTP/1.1,

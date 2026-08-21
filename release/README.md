@@ -13,7 +13,7 @@ contributions and audits by Codex) are at
 
 | File | What it is |
 |---|---|
-| `VERSION` | The release version this directory holds (e.g. `1.0.0`). |
+| `VERSION` | The release version this directory holds (e.g. `1.1.0`). |
 | `linnea` | The server. A statically linked binary — copy it and run it. |
 | `linnea-probe` | A standalone HTTP/1/2/3 compliance prober. Point it at any server. |
 | `linnea-minimal.json` | The smallest working config: serve static files over plain HTTP. |
@@ -84,7 +84,7 @@ compare:
 
 ```sh
 git clone https://github.com/morten-krogh/linnea && cd linnea
-git checkout v1.0.0
+git checkout v1.1.0
 make
 strip bin/linnea bin/linnea-probe
 sha256sum bin/linnea bin/linnea-probe   # match the entries in SHA256SUMS
