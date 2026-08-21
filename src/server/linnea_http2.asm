@@ -5787,6 +5787,8 @@ h2_select_vhost:
 .vscan:
     test r13, r13
     jz .vdone
+    test r15, r15
+    jz .vdone                              ; no connection vhost to scope the scan to
     mov r14, [rbx + linnea_config.server_count]
     xor ebp, ebp
 .vloop:
@@ -5795,6 +5797,18 @@ h2_select_vhost:
     mov rax, rbp
     imul rax, rax, linnea_config_server_size
     lea rax, [rbx + rax + linnea_config.servers]
+    ; Only the vhosts on THIS connection's listener are candidates. The scan
+    ; matched on hostname across every server, so two TLS servers sharing a
+    ; hostname on different ports both resolved to the first one: a request to
+    ; the second port was served from the first server's locations and root.
+    ; h1 has always filtered here; h2 never did, and h3 cannot reach the case
+    ; because its vhost table is built per port.
+    ;
+    ; r15 is the connection's own vhost throughout the loop -- it is only
+    ; replaced by a match, and that jumps straight to .vdone.
+    mov ecx, [rax + linnea_config_server.listen_fd]
+    cmp ecx, [r15 + linnea_config_server.listen_fd]
+    jne .vnext
     mov rcx, [rax + linnea_config_server.hostname_len]
     test rcx, rcx
     jz .vnext

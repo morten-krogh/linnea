@@ -180,6 +180,22 @@ between them. Two servers on one effective `address`/`port` must agree on
 > refused with a message that tells you the shape to use rather than a bare
 > quoting complaint.
 
+### HTTP/3 is served on one port
+
+QUIC listeners, the vhost table that maps SNI to a certificate, the `Alt-Svc`
+value and the BPF steering map are all built for **one** port: the first TLS
+server that is eligible for HTTP/3. A TLS server on any *other* port serves
+HTTP/1 and HTTP/2 normally and never HTTP/3.
+
+The loss is quiet from outside — that server's TCP still answers, so a browser
+simply never upgrades — so the server says it once at startup instead:
+
+```
+http3: served on one port only; TLS servers on any other port serve TCP only
+```
+
+If you serve the same site on 443 and 8443, only the first gets h3.
+
 ### Rules across servers
 
 - **`cert` and `key` go together.** One without the other is

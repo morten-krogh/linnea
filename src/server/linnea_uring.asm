@@ -234,6 +234,8 @@ log_drained:        db "worker drained", 10
 log_drained_len     equ $ - log_drained
 log_stopped:        db "worker stopping: connections dropped", 10
 log_stopped_len     equ $ - log_stopped
+log_h3port:         db "http3: served on one port only; TLS servers on any other port serve TCP only", 10
+log_h3port_len      equ $ - log_h3port
 log_h3cap:          db "http3: more distinct host addresses on the port than the QUIC listener cap; the excess serve TCP only", 10
 log_h3cap_len       equ $ - log_h3cap
 log_drain_late:     db "worker drain deadline reached, dropping what is left", 10
@@ -327,6 +329,9 @@ conn_full_warned:   resd 1     ; the pool-full warning has been logged already
 quic_fd:    resd 1                 ; the PRIMARY h3 socket (index 0): BPF, Alt-Svc, "is h3 on" guard
 quic_fds:   resd LINNEA_QUIC_MAX_LISTENERS   ; every h3 UDP socket on the port (index 0 == quic_fd)
 quic_nfd:   resd 1                 ; how many of quic_fds are live
+; 1 = at least one eligible TLS server sits on a port other than the h3 one, so
+; it serves TCP only. Reported once at startup rather than left silent.
+h3_offport: resb 1
 qrecv_cur_sock: resd 1            ; the socket index .on_qrecv is draining, for the re-arm
 qrecv_msg: resb LINNEA_QUIC_MAX_LISTENERS * (LINNEA_MSGHDR_SIZE)
 qrecv_iov: resb LINNEA_QUIC_MAX_LISTENERS * (LINNEA_IOVEC_SIZE)
@@ -528,7 +533,17 @@ linnea_uring_run:
     cmp qword [rax + linnea_config_server.location_count], 0
     je .quic_vhost_next
     cmp word [rax + linnea_config_server.port], r13w
-    jne .quic_vhost_next                                ; a vhost on another port
+    je .quic_vhost_onport
+    ; h3 is served on ONE port: the first eligible TLS server's. A TLS server on
+    ; any other port gets no h3 at all -- not its own listener, not a place in
+    ; the vhost table. That is deliberate (the table, the Alt-Svc value and the
+    ; BPF steering map are all built per port), but it was applied in silence,
+    ; and the loss is quiet from outside: that server's TCP still serves, so a
+    ; browser simply never upgrades. Remembered here and said once below, the
+    ; way the listener-cap case beside it already does.
+    mov byte [h3_offport], 1
+    jmp .quic_vhost_next
+.quic_vhost_onport:
     ; Neither a proxy nor a redirect location disqualifies a vhost any more.
     ; h3 routes to locations, reaches upstreams, and emits Location for a
     ; redirect (QPACK static index 12), so every kind can be served.
@@ -565,6 +580,13 @@ linnea_uring_run:
     inc r14
     jmp .quic_vhost
 .quic_vhost_done:
+    cmp byte [h3_offport], 0
+    je .quic_vhost_said
+    call linnea_log_stamp
+    lea rdi, [log_h3port]
+    mov esi, log_h3port_len
+    call linnea_log_write
+.quic_vhost_said:
     pop r14
     pop r13
     ; advertise HTTP/3 on this port from the TCP responses

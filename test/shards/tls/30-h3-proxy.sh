@@ -440,6 +440,40 @@ EOF
     wait $cp_pid 2>/dev/null
     rm -f "$cp"
 
+    # --- a vhost is (listener, hostname), never hostname alone ------------
+    # Two TLS servers sharing a hostname on different ports. h1 has always
+    # scoped its scan to the servers on the connection's own listener; h2
+    # matched the hostname across every server and returned the first, so the
+    # second port was served from the first server's root (audit follow-up).
+    # 443 and 8443 under one name is an ordinary shape.
+    mkdir -p $RUNDIR/vha $RUNDIR/vhb
+    echo SERVER-A > $RUNDIR/vha/who.txt
+    echo SERVER-B > $RUNDIR/vhb/who.txt
+    vp=$CFG/vhost-port.json
+    cat > "$vp" <<EOF
+{ "log": "$PWD/$RUNDIR/vhost-port.log", "timeout": 5, "workers": 1,
+  "servers": [
+    { "host": "127.0.0.1", "port": ${P61491}, "hostname": "localhost",
+      "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+      "locations": [ { "prefix": "/", "root": "$PWD/$RUNDIR/vha" } ] },
+    { "host": "127.0.0.1", "port": ${P61493}, "hostname": "localhost",
+      "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+      "locations": [ { "prefix": "/", "root": "$PWD/$RUNDIR/vhb" } ] } ] }
+EOF
+    start_server "$vp"
+    vp_pid=$SRV_PID
+    out=$(timeout 60 python3 test/tls/vhost_port_scope.py ${P61491} ${P61493} $CA 2>&1)
+    rc=$?
+    first_fail=$(echo "$out" | grep -m1 FAIL)
+    [ $rc -eq 0 ]
+    check "a vhost is (listener, hostname), on h1 and h2 alike ${first_fail}" $?
+    # ...and the one-port h3 limitation is stated rather than left silent
+    grep -q "served on one port only" "$RUNDIR/vhost-port.log"
+    check "http3's one-port limit is reported at startup" $?
+    kill $vp_pid 2>/dev/null
+    wait $vp_pid 2>/dev/null
+    rm -f "$vp"
+
 
     # A canned h3 error must describe ITSELF. The QPACK encoder reads
     # content-encoding, the validators, content-range, location and
