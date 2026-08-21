@@ -68,13 +68,15 @@ see [`deployment.md`](deployment.md).
 ## Testing
 
 ```sh
-make test                                  # the fast suite
-LINNEA_SUITE=full ./test/run_shards.sh     # the full, deploy-gating suite
+./test/run_fast_suite.sh     # quick iteration
+./test/run_full_suite.sh     # the full, deploy-gating suite
 ```
 
-`run_shards.sh` runs the suite as several concurrent jobs, each with its own
-port base, and prints a single pass/fail total. The fast suite is for quick
-iteration; the full suite is what must pass before anything is deployed.
+Both run the suite as several concurrent jobs, each with its own port base, and
+print a single pass/fail total; the full one adds the couple dozen slow checks
+and is what must pass before anything is deployed. `make test` is an alias for
+the fast suite. For a single directory, or a single-process run that is easier to
+read when debugging, use `./test/run_tests.sh` (optionally `LINNEA_SUITE=full`).
 
 `bin/linnea-probe` is a separate, dependency-free way to check conformance — it
 speaks HTTP/1, HTTP/2 and HTTP/3 and can be aimed at any server, including a

@@ -19,8 +19,7 @@ public internet. So the standard is not "it looks right" — it is **demonstrate
   *old* binary too and running both — the new behaviour must be visible on one
   and not the other.
 - **Test what you touched.** Add or extend a test that fails before your change
-  and passes after. The full suite (`LINNEA_SUITE=full ./test/run_shards.sh`)
-  must pass.
+  and passes after. The full suite (`./test/run_full_suite.sh`) must pass.
 - **Keep the build warning-free.** A new assembler warning is a real signal here
   (a truncated immediate, a suspicious size); do not add one.
 - **Fix every twin.** A rule usually lives in three places — the HTTP/1, HTTP/2

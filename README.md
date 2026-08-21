@@ -181,8 +181,8 @@ a configuration and its certificates without binding anything.
 Linnea ships with an extensive test suite and a standalone compliance prober.
 
 ```sh
-make test                       # the fast suite
-LINNEA_SUITE=full ./test/run_shards.sh   # the full, deploy-gating suite
+./test/run_fast_suite.sh     # quick iteration
+./test/run_full_suite.sh     # the full, deploy-gating suite
 ```
 
 `bin/linnea-probe` is a dependency-free HTTP/1, HTTP/2 and HTTP/3 conformance

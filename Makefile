@@ -445,7 +445,7 @@ test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
       bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs $(QPACKTEST_BIN) \
       $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN) $(RTXTEST_BIN) $(REPLAYTEST_BIN) \
       $(RINGTEST_BIN) $(WS_BIN) $(NETTEST_BIN) $(STRTEST_BIN)
-	./test/run_tests.sh
+	./test/run_fast_suite.sh
 
 # Install all four products to /usr/local/bin: bin_t under SELinux, so systemd
 # may exec the server, and the fresh inode picks up the standard label — no
