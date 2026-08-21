@@ -72,9 +72,42 @@ x86-64 with `io_uring`. If you need the breadth of a general-purpose proxy,
 reach for one; if you want a tiny, self-contained, QUIC-first edge server for a
 site you control, linnea is built for exactly that.
 
+## Dependencies
+
+Linnea's only runtime requirements are the operating system and the processor:
+
+- **Linux 5.19 or newer**, on an **x86-64** CPU.
+
+That is the whole list. Linnea makes raw system calls and links nothing else:
+
+- **No C runtime.** The binary has its own `_start`; there is no libc.
+- **No libraries — not even for `io_uring`, cryptography, or networking.**
+  `io_uring` is driven by hand through the raw syscall interface with no
+  `liburing`; the TLS 1.3 stack and every primitive under it (X25519, P-256,
+  AES-GCM, SHA-2) are in the source tree; the HTTP, QUIC and socket handling are
+  all direct syscalls.
+- **Statically linked.** The ELF binary depends only on the stable Linux syscall
+  ABI. There is nothing to install alongside it and nothing to keep in version
+  lockstep.
+
+The 5.19 floor is set by the newest kernel feature linnea relies on — `io_uring`
+multishot accept. It also uses kTLS, BPF reuseport steering for HTTP/3, and UDP
+GRO, all of which landed in older kernels. Without `CAP_BPF` the HTTP/3 steering
+falls back to the kernel's connection hash (see [`docs/config.md`](docs/config.md));
+everything else is required.
+
+**Building** additionally needs an assembler and a linker — **`nasm`** and
+**`ld`** — and nothing to fetch. See [`docs/building.md`](docs/building.md).
+
+**The tests** have their own dependencies, separate from the server: **`python3`**
+(the fixtures and demo backends are Python) and **`curl`**. A few HTTP/3 tests
+also need an HTTP/3-capable `curl` and the Python `aioquic`/`pylsqpack` packages;
+tests needing them are skipped when they are absent rather than failed.
+
 ## Quick start
 
-Requires a recent Linux on x86-64 with `io_uring`, plus `nasm` and a linker.
+Requires `nasm` and a linker on Linux 5.19+/x86-64 — see
+[Dependencies](#dependencies).
 
 ```sh
 make                                    # nasm + ld; no dependencies to install

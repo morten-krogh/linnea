@@ -5,8 +5,9 @@ and the Linux kernel. There is nothing to fetch, vendor or pin.
 
 ## Requirements
 
-- **Linux on x86-64**, with a kernel new enough for `io_uring` (roughly 5.6+;
-  newer is better, and some QUIC receive-side features use later additions).
+- **Linux 5.19 or newer, on x86-64.** The floor is set by `io_uring` multishot
+  accept; linnea also uses kTLS, BPF reuseport steering and UDP GRO, all older.
+  See [Dependencies](../README.md#dependencies).
 - **`nasm`** (the Netwide Assembler).
 - **`ld`** (GNU binutils, or any ELF linker).
 
