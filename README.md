@@ -120,38 +120,45 @@ tests needing them are skipped when they are absent rather than failed.
 
 ## Quick start
 
-Two ways in, both trivial — either way you end up running **one static binary
-from a small JSON config**. (Linux 5.19+/x86-64; see [Dependencies](#dependencies).)
+Either way you end up running **one static binary from a small JSON config**
+(Linux 5.19+/x86-64; see [Dependencies](#dependencies)).
 
-### Download and run
+### Have the repo — just run it
 
-Grab the latest [release](https://github.com/morten-krogh/linnea/releases) — a
-tarball with the `linnea` binary, the `linnea-probe` prober, and example configs.
-No toolchain needed:
+A ready-to-run, stripped `linnea` binary is committed in
+[`release/`](release), so there is nothing to build or download:
 
 ```sh
-tar xzf linnea-*-linux-x86_64.tar.gz
-cd linnea-*-linux-x86_64
-
 mkdir -p /tmp/linnea-www
 echo '<h1>hello from linnea</h1>' > /tmp/linnea-www/index.html
+./release/linnea --config release/linnea-minimal.json
+```
+
+### No repo — download and run
+
+Grab the latest [release](https://github.com/morten-krogh/linnea/releases): a
+tarball with the same binary plus `linnea-probe` and the example configs, no
+toolchain needed.
+
+```sh
+tar xzf linnea-*-linux-x86_64.tar.gz && cd linnea-*-linux-x86_64
+mkdir -p /tmp/linnea-www && echo '<h1>hello from linnea</h1>' > /tmp/linnea-www/index.html
 ./linnea --config linnea-minimal.json
 ```
 
 ### Build from source
 
-The build is `nasm` + `ld` with nothing to fetch, and produces the exact same
-binary the release ships (verifiably — see [`release/README.md`](release/README.md)):
+`make` fetches nothing (just `nasm` + `ld`) and builds `bin/linnea`:
 
 ```sh
-make
-
-mkdir -p /tmp/linnea-www
-echo '<h1>hello from linnea</h1>' > /tmp/linnea-www/index.html
-./bin/linnea --config release/linnea-minimal.json
+make && ./bin/linnea --config release/linnea-minimal.json
 ```
 
-Either way, from another shell:
+`bin/linnea` carries debug info; strip it and it is byte-for-byte the binary
+`release/` and the tarball ship — see [`docs/building.md`](docs/building.md) to
+verify one against the other.
+
+Any of the three, from another shell:
 
 ```sh
 curl http://127.0.0.1:8080/
@@ -161,6 +168,27 @@ For a real site — TLS, static content, a proxied API, redirects — start from
 [`release/linnea.example.json`](release/linnea.example.json) and the
 [configuration reference](docs/config.md). `linnea --test --config <file>` checks
 a configuration and its certificates without binding anything.
+
+## Run it as a service
+
+To run linnea under systemd with a zero-downtime reload, install it and use the
+generic unit [`config/linnea-simple.service`](config/linnea-simple.service):
+
+```sh
+make && sudo make install                            # binary -> /usr/local/bin/linnea
+sudo cp config/linnea-simple.service /etc/systemd/system/linnea.service
+# edit the ExecStart config path in the unit, then:
+sudo systemctl daemon-reload && sudo systemctl enable --now linnea
+
+sudo systemctl reload linnea    # apply a new config/binary, no dropped connections
+sudo systemctl restart linnea   # full restart (drops connections)
+```
+
+`reload` re-execs on SIGUSR2 and **refuses a bad config** (the old generation
+keeps serving), so a typo cannot take the site down. For the hardened production
+setup — a dedicated service user, capability sandboxing, TLS, log rotation — see
+[`config/linnea.service`](config/linnea.service) and
+[`docs/deployment.md`](docs/deployment.md).
 
 ## Documentation
 

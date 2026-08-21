@@ -499,7 +499,12 @@ release: $(BIN) $(PROBE_BIN)
 	cd $(RELDIR) && sha256sum linnea linnea-probe > SHA256SUMS
 	tar -C dist -czf dist/$(RELNAME).tar.gz $(RELNAME)
 	cd dist && sha256sum $(RELNAME).tar.gz > SHA256SUMS
-	@echo "built dist/$(RELNAME).tar.gz and dist/SHA256SUMS"
+	# Refresh the ready-to-run binaries committed in release/, so someone with
+	# the repo can run ./release/linnea with no build. Stripped, hence
+	# byte-reproducible: git shows a change only when the code actually changed.
+	install -m 0755 $(RELDIR)/linnea       release/linnea
+	install -m 0755 $(RELDIR)/linnea-probe release/linnea-probe
+	@echo "built dist/$(RELNAME).tar.gz; refreshed release/linnea, release/linnea-probe"
 	@ls -1 $(RELDIR)
 
 .PHONY: all clean test selftest tlstest probe api ws wsfast install release

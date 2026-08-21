@@ -89,12 +89,20 @@ protocols. See [`probe.md`](probe.md).
 make release
 ```
 
-builds `linnea` and `linnea-probe`, assembles them with the example configs, a
-run-focused README and a `SHA256SUMS` file, and tars the result into
+builds `linnea` and `linnea-probe`, **strips** them (so the file hash is
+byte-reproducible and carries no build path), assembles them with the example
+configs, a run-focused README and a `SHA256SUMS` file, and tars the result into
 `dist/linnea-<version>-linux-x86_64.tar.gz`. This is exactly what the GitHub
 release ships — the release *is* `make release`, so anyone can reproduce it and
 verify the published binaries against a build of their own. The demo backends
 are deliberately left out; the package is the product (`linnea`) and the prober.
+
+It also refreshes the ready-to-run binaries committed in
+[`../release/`](../release) — `release/linnea` and `release/linnea-probe` — the
+ones the [quick start](../README.md#have-the-repo--just-run-it) points at. They
+are stripped and reproducible, so `make release` only shows a git change when the
+code actually changed. **Run `make release` before tagging a release** so the
+committed binaries match the source at that tag.
 
 ## Layout
 
@@ -106,6 +114,7 @@ include/      shared .inc headers (struct layouts, syscall numbers, constants)
 test/         the suite: shard scripts, protocol fixtures, demo backends
 config/       systemd units and example configuration (see deployment.md)
 docs/         this documentation
+release/      a ready-to-run committed binary + example configs (also the download package)
 demo/         the demo web page for linnea.amberbio.com -- NOT the server
 ```
 

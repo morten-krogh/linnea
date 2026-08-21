@@ -1,8 +1,9 @@
 # Linnea — release package
 
 **Linnea** is a from-scratch HTTP/1.1, HTTP/2 and HTTP/3 web server and reverse
-proxy, written in x86-64 assembly with its own TLS 1.3 and no dependencies. This
-package is everything you need to run it.
+proxy, written in x86-64 assembly with its own TLS 1.3 and no dependencies.
+Whether you cloned the repo (you are in `release/`) or unpacked the download
+tarball, this directory has everything you need to run it.
 
 Source, full documentation, and how it is built (mostly by Claude, with some
 contributions and audits by Codex) are at
@@ -16,7 +17,7 @@ contributions and audits by Codex) are at
 | `linnea-probe` | A standalone HTTP/1/2/3 compliance prober. Point it at any server. |
 | `linnea-minimal.json` | The smallest working config: serve static files over plain HTTP. |
 | `linnea.example.json` | A complete config: TLS, static files, an API proxy, and redirects. |
-| `SHA256SUMS` | Checksums for the binaries (see "Verify" below). |
+| `SHA256SUMS` | Binary checksums — in the download tarball; from the repo, verify by rebuilding (see "Verify"). |
 
 ## Requirements
 

@@ -1,0 +1,45 @@
+# A minimal, generic systemd unit for running linnea as a service -- the simple
+# counterpart to the hardened production unit in linnea.service. Adjust the
+# ExecStart config path (and add User= if you do not want it to run as root),
+# then:
+#
+#   sudo cp config/linnea-simple.service /etc/systemd/system/linnea.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now linnea
+#
+# Zero-downtime reload -- applies a new config AND a new binary, and refuses a
+# bad config (leaving the old one serving); see docs/shutdown.md:
+#   sudo systemctl reload linnea
+# Restart -- drops open connections:
+#   sudo systemctl restart linnea
+#
+# For the hardened production setup this project actually runs -- a dedicated
+# service user, capability sandboxing, log/state directories -- see linnea.service.
+
+[Unit]
+Description=Linnea web server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Point this at your installed binary and config. `sudo make install` puts the
+# binary at /usr/local/bin/linnea; the config format is in docs/config.md.
+ExecStart=/usr/local/bin/linnea --config /etc/linnea/linnea.json
+# Reload = re-exec on SIGUSR2. It config-checks the new binary first and keeps
+# serving the old generation if the config is bad, so a typo cannot take the
+# site down.
+ExecReload=/bin/kill -USR2 $MAINPID
+# always, not on-failure: linnea exits 0 on SIGTERM, which on-failure treats as
+# a clean stop and would not restart.
+Restart=always
+RestartSec=1
+
+# Needed only to bind ports below 1024 (80/443); remove it if you bind high ports.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# HTTP/3 steers connections across workers with a BPF reuseport map, which wants
+# CAP_BPF and CAP_NET_ADMIN; without them h3 still works via the kernel's
+# connection hash. To enable, replace the line above with:
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
