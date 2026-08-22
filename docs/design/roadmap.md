@@ -58,6 +58,28 @@ probably the wrong change:
 - **Config is static JSON (~32 keys), reload-only.** No dynamic config plane;
   Envoy's xDS/filters have no analog here.
 
+### Certificate management (ACME / Let's Encrypt)
+
+The **gap is built-in ACME**, not renewal. Renewal already works: an unattended
+`certbot` timer does webroot `http-01`, and the deploy hook reloads linnea
+zero-downtime (trimming the chain only when it still verifies). What linnea lacks
+is what Caddy and Traefik make their flagship — obtaining and renewing its own
+certificates with no external tool — also present as Apache's `mod_md` and, in
+recent releases, native to nginx and HAProxy.
+
+Deliberately **low priority**, with a genuine identity tension:
+
+- The external certbot path already works, so this buys *self-containedness*, not
+  a fixed problem.
+- An in-process ACME client is a large new surface: outbound HTTPS to the CA,
+  JWS/account-key signing, challenge handling (`http-01`/`tls-alpn-01`/`dns-01`),
+  cert storage and renewal scheduling. It also makes linnea talk to the internet
+  as a *client* for the first time. Caddy's batteries-included posture is the
+  opposite of linnea's minimalism — see *What stays the differentiator*.
+- **Synergy:** an ACME client needs a **TLS client path**, the same prerequisite
+  as priority #1 (backend TLS + h2 upstreams). It is much cheaper once that
+  exists, and should be sequenced behind it.
+
 ### Substrate risk (not a feature, but the standing backdrop)
 
 Hand-written assembly with no memory safety and no type system; its own crypto is
@@ -83,4 +105,6 @@ If we narrow the gap for broader use, highest leverage first:
 
 The rest (caching, transforms, auth, WAF, xDS, tracing, service discovery) is
 lower priority and larger — take it on only under a deliberate decision to
-become a general-purpose proxy.
+become a general-purpose proxy. **Built-in ACME** (above) is a special case: low
+priority because the external certbot path already works, and best sequenced
+*after* #1 since it reuses the same TLS client path.
