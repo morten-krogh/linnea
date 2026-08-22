@@ -58,6 +58,26 @@ probably the wrong change:
 - **Config is static JSON (~32 keys), reload-only.** No dynamic config plane;
   Envoy's xDS/filters have no analog here.
 
+### Edge / client-facing (WebTransport)
+
+Everything else on this list is backend- or operator-facing; this is the one
+notable **client-facing** gap. linnea serves h1/h2/h3 request-response and
+tunnels WebSocket, but does not implement **WebTransport** (Extended CONNECT
+`:protocol=webtransport` over h3, the WebTransport SETTINGS, H3 datagrams,
+session/stream management).
+
+It is an **edge feature, not a backend one, and it does not ride the backend-h2
+work.** WebTransport is a QUIC-native *session* abstraction (bidirectional and
+unidirectional streams plus *unreliable* datagrams), not a request/response verb
+that translates across HTTP versions. If a browser uses WebTransport and the
+backend does not speak h3, it does **not** become a backend h2 request: the
+datagram semantics have no faithful home over TCP, and the stream half would
+require the backend to speak the rare WebTransport-over-h2 protocol (capsules),
+not plain h2. The realistic design, if ever pursued, is the **WebSocket
+precedent** — *terminate* the WebTransport session at linnea and bridge it to the
+backend over an app-chosen protocol (TCP / WebSocket / custom): an opaque tunnel,
+not a translation. **Deliberately not planned now.**
+
 ### Certificate management (ACME / Let's Encrypt)
 
 The **gap is built-in ACME**, not renewal. Renewal already works: an unattended
