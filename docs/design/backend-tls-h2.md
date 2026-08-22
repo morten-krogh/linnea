@@ -144,6 +144,27 @@ server already does its own handshake before the kTLS handoff.
   unmanaged-assembly-crypto surface the roadmap warns about. Mitigation for any
   real need: put a P-256 cert on the backend (linnea can generate it) and pin it.
 
+## Why not HTTP/3 to backends?
+
+The roadmap lists "no h2/h3/gRPC to upstreams" as a gap, but **h3 to backends is
+a deliberate non-goal**, and it is rare in the field. Among mainstream proxies
+only **Envoy** does upstream HTTP/3 (opt-in, relatively recent); **nginx,
+HAProxy and Caddy proxy to upstreams over h1/h2 only** — their h3 is a
+frontend/edge feature. The reasons apply doubly here:
+
+- The backend link is a controlled, reliable, low-latency network (loopback /
+  private LAN). QUIC's wins — 0-RTT, connection migration, HOL-blocking
+  avoidance on lossy/mobile paths, NAT traversal on the open internet — do not
+  apply there. On a clean local link, QUIC-over-UDP in userspace is pure overhead
+  versus TCP+kTLS.
+- It would require a full QUIC *client* to the backend (congestion control, loss
+  recovery, its own handshake) — an enormous amount of code — for marginal
+  benefit, and **backends almost never speak h3** anyway. h2 over TLS already
+  provides the multiplexing.
+- HTTP/3's entire value for linnea is on the browser-facing edge, which linnea
+  already does well. Backend transport therefore tops out at h2; h3-to-backend
+  sits alongside RSA as a non-goal.
+
 ## Tier 0 detail — backend TLS
 
 **Config** (touch-points and template from the config map):
