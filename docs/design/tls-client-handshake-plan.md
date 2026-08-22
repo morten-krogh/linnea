@@ -201,19 +201,28 @@ hard, novel, security-critical work):
   completes and the server accepts our Finished; wrong pin and an unoffered-group
   HRR fail cleanly.
 
+- **Config** (`e9f4295`) — per-location `proxy_tls` (0/1) + `proxy_pin` (64-hex
+  SHA-256 of the SPKI) + `proxy_sni`, through the parser, validation (proxy_tls
+  requires a pin; proxy-location only), docs, and doc_claims (7 claims). Nothing
+  consumes these yet.
+
 **Remaining (the async proxy integration — deep io_uring/serving-path work, best
-done as one deploy-gated unit):**
+done as one deploy-gated unit, validated by a self-hosted proxy-over-TLS test):**
 
 1. **Async driver** — refactor the handshake into a completion-driven
    `linnea_tls_client_input(hs, in, inlen, out, outcap)` over a per-connection
    arena (mirroring the server's `linnea_tls_hs_input`), so many backend
-   handshakes run concurrently. The blocking form above is the tested reference.
-2. **io_uring wiring** — a per-leg scratch arena, new `proxy_state` sub-states,
-   route backend-fd completions to the driver from `.connect_ok`, then the
-   client-oriented **kTLS handoff** (TX=c_ap, RX=s_ap, seqs per §decision 3).
-3. **Config** — `https://` backends (or a `proxy_tls` flag) + `proxy_pin` +
-   `proxy_sni`, through the parser/validation/docs/doc_claims.
-4. **Failover** + the self-hosted linnea→linnea-over-TLS integration test.
+   handshakes run concurrently. The blocking form above is the tested reference;
+   the cleanest path is a shared crypto core with two thin drivers (blocking for
+   the harness, async for the proxy), guarded by the existing OpenSSL harness
+   test plus a new chunk-fed resumability test.
+2. **io_uring wiring** — a per-leg scratch arena (NOT up_buf), new `proxy_state`
+   sub-states, route backend-fd completions to the driver from `.connect_ok`
+   (read `proxy_tls`/`proxy_pin`/`proxy_sni` there), then the client-oriented
+   **kTLS handoff** (TX=c_ap, RX=s_ap, seqs per §decision 3), then fall through to
+   the unchanged send/recv path.
+3. **Failover** (handshake fail → mark_fail → 502) + the self-hosted
+   linnea→linnea-over-TLS integration test.
 
 ## Definition of done
 
