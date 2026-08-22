@@ -12,6 +12,7 @@ LINNEA_MAX_PROXY_STR    equ 63       ; max proxy "ip:port" string length
 ; answered with a 502. Eight is generous for this server's shape and costs
 ; ~66 KB of .bss across every location of every server, against a 238 MB total.
 LINNEA_MAX_BACKENDS     equ 8
+LINNEA_MAX_SNI          equ 255      ; max backend SNI hostname length
 LINNEA_MAX_LOG          equ 255      ; max log file path length
 LINNEA_MAX_CONFIG_FILE  equ 1 << 20  ; sanity cap on config file size
 
@@ -91,6 +92,14 @@ struc linnea_config_location
     .proxy_addr:    resb 16 * LINNEA_MAX_BACKENDS ; upstream sockaddr_in[]
     .proxy_str:     resb (LINNEA_MAX_PROXY_STR + 1) * LINNEA_MAX_BACKENDS
     .proxy_str_len: resq LINNEA_MAX_BACKENDS      ; "ip:port" each, for dump/log
+    ; --- backend TLS (roadmap #1 Tier 0): connect to the backends over TLS 1.3
+    ; and authenticate them by PINNING the certificate's SPKI. Per-location: all
+    ; of a location's backends are https or none are. proxy_tls=1 requires a pin.
+    .proxy_tls:     resq 1                        ; 1 = backends are https
+    .proxy_pin:     resb 32                       ; pinned SHA-256(SPKI)
+    .proxy_pin_set: resq 1                        ; 1 = a pin was configured
+    .proxy_sni:     resb LINNEA_MAX_SNI + 1       ; SNI to send (NUL-terminated)
+    .proxy_sni_len: resq 1
     ; --- per-worker upstream state, NOT configuration --------------------
     ; Workers are forked, so these live in a copy-on-write page and are private
     ; to each worker without a separate table. They are deliberately not part of

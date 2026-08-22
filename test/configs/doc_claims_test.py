@@ -149,6 +149,28 @@ test(loc([{"prefix": "/", "redirect": "example.com"}]),
      "redirect without a scheme rejected", False, "http:// or https://")
 test(loc([{"prefix": "/", "proxy": "localhost:80"}]),
      "proxy as a DNS name rejected", False, "invalid proxy address")
+
+# --- backend TLS (proxy_tls / proxy_pin / proxy_sni) ---------------------
+PIN = "a" * 64
+def tlsloc(**extra):
+    l = {"prefix": "/api", "proxy": "127.0.0.1:8080"}
+    l.update(extra)
+    return loc([{"prefix": "/", "root": D}, l])
+test(tlsloc(proxy_tls=1, proxy_pin=PIN, proxy_sni="b.internal"),
+     "backend TLS: proxy_tls + pin + sni accepted", True)
+test(tlsloc(proxy_tls=1, proxy_pin=PIN),
+     "backend TLS: proxy_tls + pin (no sni) accepted", True)
+test(tlsloc(proxy_tls=1),
+     "backend TLS: proxy_tls without a pin rejected", False, "requires proxy_pin")
+test(tlsloc(proxy_tls=1, proxy_pin="abcd"),
+     "backend TLS: short pin rejected", False, "64 hex")
+test(tlsloc(proxy_tls=1, proxy_pin="z" * 64),
+     "backend TLS: non-hex pin rejected", False, "64 hex")
+test(tlsloc(proxy_tls=2, proxy_pin=PIN),
+     "backend TLS: proxy_tls out of range rejected", False, "0 or 1")
+test(loc([{"prefix": "/", "root": D, "proxy_tls": 1, "proxy_pin": PIN}]),
+     "backend TLS: proxy_tls on a non-proxy location rejected", False,
+     "need a proxy location")
 test(srv(host="localhost"), "host as a name rejected", False,
      "must be an IPv4 or IPv6 literal")
 test(srv(host="::"), 'host "::" accepted (dual-stack wildcard)', True)

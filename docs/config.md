@@ -232,6 +232,9 @@ coexist and `/api/x` goes to `/api`.
 | `root` | string | one of three | ≤ 255 | Serve static files from this directory. Must exist. |
 | `proxy` | string or array | one of three | ≤ 255 each, ≤ 8 entries | Forward to an HTTP/1.1 backend. **`IPv4:port` only**, e.g. `"127.0.0.1:8080"`. An **array** names several backends: `["127.0.0.1:8080", "127.0.0.1:8081"]`. Requests are spread over them in turn, and one that refuses a connection is stepped over. |
 | `proxy_keepalive` | integer | `0` (off) | 0 or 1 | Keep upstream connections open and reuse them. Only on a `proxy` location. See **Upstream connections** below. |
+| `proxy_tls` | integer | `0` (off) | 0 or 1 | Connect to this location's backends over **TLS 1.3** instead of plaintext. Only on a `proxy` location, and **requires `proxy_pin`**. See **Backend TLS** below. |
+| `proxy_pin` | string | none | exactly 64 hex chars | The backend certificate's identity: **SHA-256 of its SubjectPublicKeyInfo**, hex-encoded. Required when `proxy_tls` is on; authentication is by this pin, not a CA. |
+| `proxy_sni` | string | none | ≤ 255 | The server name to send in the TLS ClientHello (SNI) to a `proxy_tls` backend. Optional — needed only if the backend selects its certificate by SNI. |
 | `redirect` | string | one of three | ≤ 255 | Reply 301 to this URL prefix. **Must start with `http://` or `https://`.** |
 | `cache_control` | string | none | ≤ 255 | `Cache-Control` value for static responses. Only meaningful with `root`. |
 
@@ -312,6 +315,40 @@ What it is worth depends on what your backend pays per connection, not on TCP.
 Against a backend that spawns a thread or forks per connection the saving is
 large; against one with a pre-forked pool it is closer to the cost of the
 handshake alone.
+
+### Backend TLS
+
+`proxy_tls: 1` makes linnea connect to a location's backends over TLS 1.3
+instead of plaintext. Because linnea proxies to backends **you** run, it
+authenticates them by **pinning the certificate**, not by a CA trust store:
+`proxy_pin` is the SHA-256 of the backend certificate's SubjectPublicKeyInfo,
+and the handshake fails unless the backend presents exactly that key (and proves
+it holds the matching private key). `proxy_tls` therefore **requires**
+`proxy_pin`.
+
+```json
+{
+  "prefix": "/api",
+  "proxy": "10.0.0.5:8443",
+  "proxy_tls": 1,
+  "proxy_pin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "proxy_sni": "api.internal"
+}
+```
+
+Compute the pin from the backend's certificate:
+
+```sh
+openssl x509 -in backend.crt -noout -pubkey \
+  | openssl pkey -pubin -outform DER | openssl dgst -sha256
+```
+
+The profile is fixed — TLS 1.3, x25519, `TLS_AES_128_GCM_SHA256`, and an **ECDSA
+P-256** backend certificate (the same profile linnea serves). RSA backends and
+CA/trust-store verification are out of scope; the pin is the trust decision.
+`proxy_sni` sets the ClientHello server name, needed only when the backend picks
+its certificate by SNI. On any authentication failure the exchange returns 502 —
+there is no fallback to plaintext.
 
 ---
 

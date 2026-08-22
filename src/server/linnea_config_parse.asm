@@ -97,6 +97,12 @@ key_cache_control:      db "cache_control"
 key_cache_control_len   equ $ - key_cache_control
 key_proxy_keepalive:    db "proxy_keepalive"
 key_proxy_keepalive_len equ $ - key_proxy_keepalive
+key_proxy_tls:          db "proxy_tls"
+key_proxy_tls_len       equ $ - key_proxy_tls
+key_proxy_pin:          db "proxy_pin"
+key_proxy_pin_len       equ $ - key_proxy_pin
+key_proxy_sni:          db "proxy_sni"
+key_proxy_sni_len       equ $ - key_proxy_sni
 key_cert:               db "cert"
 key_cert_len            equ $ - key_cert
 key_key:                db "key"
@@ -190,8 +196,16 @@ msg_nosniff:            db "nosniff must be 0 or 1"
 msg_nosniff_len         equ $ - msg_nosniff
 msg_pka:                db "proxy_keepalive must be 0 or 1"
 msg_pka_len             equ $ - msg_pka
-msg_pka_kind:           db "proxy_keepalive needs a proxy location"
+msg_pka_kind:           db "proxy_keepalive/tls/pin/sni need a proxy location"
 msg_pka_kind_len        equ $ - msg_pka_kind
+msg_ptls:               db "proxy_tls must be 0 or 1"
+msg_ptls_len            equ $ - msg_ptls
+msg_tls_needs_pin:      db "proxy_tls requires proxy_pin"
+msg_tls_needs_pin_len   equ $ - msg_tls_needs_pin
+msg_pin_bad:            db "proxy_pin must be 64 hex chars (SHA-256 of the SPKI)"
+msg_pin_bad_len         equ $ - msg_pin_bad
+msg_sni_long:           db "proxy_sni too long"
+msg_sni_long_len        equ $ - msg_sni_long
 msg_v6only:             db "v6only must be 0 or 1"
 msg_v6only_len          equ $ - msg_v6only
 msg_cc_long:            db "cache_control too long"
@@ -1138,6 +1152,27 @@ linnea_parse_location:
     call linnea_string_equal
     test eax, eax
     jnz .key_proxy_keepalive
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_proxy_tls]
+    mov ecx, key_proxy_tls_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_proxy_tls
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_proxy_pin]
+    mov ecx, key_proxy_pin_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_proxy_pin
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_proxy_sni]
+    mov ecx, key_proxy_sni_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_proxy_sni
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -1205,6 +1240,61 @@ linnea_parse_location:
     cmp rax, 1
     ja .pka_range
     mov [rbx + linnea_config_location.proxy_keepalive], rax
+    jmp .member_sep
+
+.key_proxy_tls:
+    test r12d, 64
+    jnz .dup
+    or r12d, 64
+    call linnea_parse_u64
+    cmp rax, 1
+    ja .ptls_range
+    mov [rbx + linnea_config_location.proxy_tls], rax
+    jmp .member_sep
+
+.key_proxy_pin:
+    ; the pin is SHA-256 of the backend's SubjectPublicKeyInfo, as 64 hex chars.
+    test r12d, 128
+    jnz .dup
+    or r12d, 128
+    call linnea_parse_string           ; rax = ptr, rdx = len
+    cmp rdx, 64
+    jne .pin_bad
+    mov r13, rax                       ; hex string (key name no longer needed)
+    lea r14, [rbx + linnea_config_location.proxy_pin]
+    xor r8d, r8d                       ; output byte index
+.pin_loop:
+    cmp r8d, 32
+    jae .pin_done
+    movzx edi, byte [r13 + r8*2]       ; high nibble
+    call cfg_hexnib
+    cmp eax, -1
+    je .pin_bad
+    mov ecx, eax
+    shl ecx, 4
+    movzx edi, byte [r13 + r8*2 + 1]   ; low nibble
+    call cfg_hexnib
+    cmp eax, -1
+    je .pin_bad
+    or ecx, eax
+    mov [r14 + r8], cl
+    inc r8d
+    jmp .pin_loop
+.pin_done:
+    mov qword [rbx + linnea_config_location.proxy_pin_set], 1
+    jmp .member_sep
+
+.key_proxy_sni:
+    test r12d, 256
+    jnz .dup
+    or r12d, 256
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_SNI
+    ja .sni_long
+    mov [rbx + linnea_config_location.proxy_sni_len], rdx
+    lea rdi, [rbx + linnea_config_location.proxy_sni]
+    mov rsi, rax
+    call linnea_string_copy
     jmp .member_sep
 
 .key_proxy:
@@ -1360,12 +1450,21 @@ linnea_parse_location:
     ; proxy_keepalive is optional, but unlike cache_control it is meaningless
     ; anywhere but a proxy location -- and a key that is silently ignored is a
     ; config that lies about what the server will do.
-    test r12d, 32
-    jz .pka_ok
+    ; keepalive/tls/pin/sni (bits 32/64/128/256) are meaningful only on a proxy
+    ; location -- a silently-ignored key is a config that lies.
+    mov eax, r12d
+    and eax, (32 | 64 | 128 | 256)
+    jz .proxyopt_ok
     test r12d, 4
     jz .pka_kind
-.pka_ok:
-    and r12d, ~(16 | 32)       ; cache_control is optional, any kind
+.proxyopt_ok:
+    ; a TLS backend must be pinned (both-or-neither, like cert/key)
+    test r12d, 64
+    jz .tls_ok
+    test r12d, 128
+    jz .tls_needs_pin
+.tls_ok:
+    and r12d, ~(16 | 32 | 64 | 128 | 256)   ; strip optional keys
     cmp r12d, 3                ; prefix + root
     je .done
     cmp r12d, 5                ; prefix + proxy
@@ -1423,6 +1522,22 @@ linnea_parse_location:
     lea rdi, [msg_pka_kind]
     mov esi, msg_pka_kind_len
     jmp linnea_parse_fail
+.ptls_range:
+    lea rdi, [msg_ptls]
+    mov esi, msg_ptls_len
+    jmp linnea_parse_fail
+.tls_needs_pin:
+    lea rdi, [msg_tls_needs_pin]
+    mov esi, msg_tls_needs_pin_len
+    jmp linnea_parse_fail
+.pin_bad:
+    lea rdi, [msg_pin_bad]
+    mov esi, msg_pin_bad_len
+    jmp linnea_parse_fail
+.sni_long:
+    lea rdi, [msg_sni_long]
+    mov esi, msg_sni_long_len
+    jmp linnea_parse_fail
 .bad_proxy_list:
     lea rdi, [msg_bad_proxy_list]
     mov esi, msg_bad_proxy_list_len
@@ -1437,6 +1552,25 @@ linnea_parse_location:
     jmp linnea_parse_fail
 
 ; --- low-level helpers -------------------------------------------------
+
+; cfg_hexnib(dil=ascii) -> eax = 0..15, or -1 if not a hex digit. Clobbers eax
+; only (reads edi). Case-insensitive.
+cfg_hexnib:
+    lea eax, [rdi - '0']
+    cmp eax, 9
+    jbe .ret                   ; '0'-'9'
+    mov eax, edi
+    or eax, 0x20               ; fold to lowercase
+    lea eax, [rax - 'a' + 10]
+    cmp eax, 15
+    ja .bad
+    cmp eax, 10
+    jb .bad
+    ret
+.bad:
+    mov eax, -1
+.ret:
+    ret
 
 ; linnea_parse_skip_ws() — advance pos past space, tab, newline, CR.
 linnea_parse_skip_ws:
