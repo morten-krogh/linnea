@@ -206,23 +206,31 @@ hard, novel, security-critical work):
   requires a pin; proxy-location only), docs, and doc_claims (7 claims). Nothing
   consumes these yet.
 
-**Remaining (the async proxy integration — deep io_uring/serving-path work, best
-done as one deploy-gated unit, validated by a self-hosted proxy-over-TLS test):**
+- **Async resumable driver** (`3b1b97b`) — one crypto core over a per-connection
+  `linnea_tls_client_hs` (`include/linnea_tls_client.inc`), driven two ways:
+  `linnea_tls_client_start(hs, pin, sni, snilen)` builds the ClientHello, and
+  `linnea_tls_client_input(hs, in, inlen) -> MORE/DONE/FAIL` feeds received
+  bytes (idempotent per call: re-processes the whole accumulated buffer, so no
+  fine-grained resume state). On DONE, `hs.out` holds the client Finished and
+  `hs.c_ap`/`hs.s_ap` are the app secrets. The blocking `linnea_tls_client_handshake`
+  is now a thin wrapper over this same core. Proven vs openssl s_server at every
+  fragment size (1..500-byte reads); the shard has a 1-byte-fragment check.
 
-1. **Async driver** — refactor the handshake into a completion-driven
-   `linnea_tls_client_input(hs, in, inlen, out, outcap)` over a per-connection
-   arena (mirroring the server's `linnea_tls_hs_input`), so many backend
-   handshakes run concurrently. The blocking form above is the tested reference;
-   the cleanest path is a shared crypto core with two thin drivers (blocking for
-   the harness, async for the proxy), guarded by the existing OpenSSL harness
-   test plus a new chunk-fed resumability test.
-2. **io_uring wiring** — a per-leg scratch arena (NOT up_buf), new `proxy_state`
-   sub-states, route backend-fd completions to the driver from `.connect_ok`
-   (read `proxy_tls`/`proxy_pin`/`proxy_sni` there), then the client-oriented
-   **kTLS handoff** (TX=c_ap, RX=s_ap, seqs per §decision 3), then fall through to
-   the unchanged send/recv path.
-3. **Failover** (handshake fail → mark_fail → 502) + the self-hosted
-   linnea→linnea-over-TLS integration test.
+**Remaining — io_uring wiring (the last piece; deep serving-path work, gate on a
+self-hosted proxy-over-TLS test + a green full suite):**
+
+1. At `.connect_ok` (`linnea_uring.asm`) for a `proxy_tls` location: allocate a
+   per-leg `linnea_tls_client_hs` arena (lazily-mapped pool keyed by conn index,
+   like `h2_dyn_pool`), `linnea_tls_client_start` (pin/sni from the config),
+   `arm_up_send` the ClientHello, set a new `proxy_state` (PROXY_TLS_HS).
+2. Route backend-fd send/recv completions in PROXY_TLS_HS to
+   `linnea_tls_client_input`; on MORE arm another recv, on FAIL mark_fail→502,
+   on DONE `arm_up_send` the client Finished then the client-oriented **kTLS
+   handoff** (`linnea_ktls_enable` with TX=c_ap, RX=s_ap; client TX seq 0) and
+   fall through to PROXY_SENDING — the existing send/recv path, now over kTLS.
+3. Skip TLS-backend connection pooling in v1 (sidesteps the kTLS MSG_PEEK
+   question). Self-hosted test: linnea proxying /api over TLS to openssl s_server
+   (or linnea) with the SPKI pinned.
 
 ## Definition of done
 
