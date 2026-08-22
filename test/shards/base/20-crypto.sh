@@ -26,6 +26,24 @@ else
     check "crypto selftest (binary not built — run 'make selftest')" 1
 fi
 
+# P-256 ECDSA VERIFY (backend TLS): RFC 6979 known-answer + tampered/off-curve
+# negatives + strict-DER decoding + a fuzz pass, via the selftest verify modes.
+# The KAT, strict-DER and fuzz need no external deps; the OpenSSL random-nonce
+# interop portion skips itself if openssl is absent. The off-curve-Q case is the
+# load-bearing one: a missing on-curve check would accept it (see crypto-review).
+if [ -x ./bin/linnea-selftest ]; then
+    if python3 test/crypto/diff_p256_ecdsa_verify.py 20 150 \
+           >$RUNDIR/p256verify.out 2>&1; then
+        check "p256 ecdsa-verify: KAT + off-curve/tamper + strict-DER + fuzz" 0
+    else
+        check "p256 ecdsa-verify: KAT + off-curve/tamper + strict-DER + fuzz" 1
+        cat $RUNDIR/p256verify.out
+    fi
+    rm -f $RUNDIR/p256verify.out
+else
+    check "p256 ecdsa-verify test (selftest binary unavailable)" 1
+fi
+
 # QUIC crypto known-answer tests (RFC 9001 / 9000). Built by `make quictest`.
 if [ -x ./bin/linnea-quictest ]; then
     if ./bin/linnea-quictest >$RUNDIR/linnea_quictest.out 2>&1; then

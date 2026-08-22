@@ -17,19 +17,30 @@ default rel
 %include "linnea_p256_point.inc"
 
 global linnea_p256_ecdsa_sign
+global linnea_p256_ecdsa_verify
+global linnea_p256_ecdsa_verify_der
 
 extern linnea_hmac_sha256
 extern linnea_p256_scalar_frombytes
 extern linnea_p256_scalar_tobytes
 extern linnea_p256_scalar_mul
 extern linnea_p256_scalar_add
+extern linnea_p256_scalar_sub
 extern linnea_p256_scalar_inv
 extern linnea_p256_scalar_is_zero
 extern linnea_p256_scalar_is_valid
 extern linnea_p256_fe_mul
+extern linnea_p256_fe_sq
+extern linnea_p256_fe_add
+extern linnea_p256_fe_sub
 extern linnea_p256_fe_inv
+extern linnea_p256_fe_frombytes
 extern linnea_p256_fe_tobytes
+extern linnea_p256_fe_1
+extern linnea_p256_fe_is_zero
+extern linnea_p256_fe_is_valid
 extern linnea_p256_point_mul
+extern linnea_p256_point_add
 extern linnea_p256_g
 
 section .text
@@ -325,3 +336,349 @@ linnea_p256_ecdsa_sign:
     HMAC_K_TO [rsp + K], [rsp + HBUF], 33
     HMAC_K_TO [rsp + V], [rsp + V], 32
     jmp .retry
+
+; ============================================================================
+; ECDSA P-256 verify (added for backend TLS: verifying a server's
+; CertificateVerify). See docs/design/ecdsa-verify-plan.md.
+;
+; Verify touches only PUBLIC data -- the public key, the signature, the message
+; hash. There is no secret, so unlike the signer it needs no constant-time
+; discipline: it branches freely on validation failures. Its only obligations
+; are correctness and never faulting on malformed input.
+; ============================================================================
+
+section .rodata
+align 8
+; The curve coefficient b, 32 big-endian bytes (plain, not Montgomery). The
+; point module keeps only 3b in Montgomery form and file-local, so the on-curve
+; test carries its own b and converts it with fe_frombytes at run time.
+p256_b_be:
+    db 0x5a,0xc6,0x35,0xd8,0xaa,0x3a,0x93,0xe7
+    db 0xb3,0xeb,0xbd,0x55,0x76,0x98,0x86,0xbc
+    db 0x65,0x1d,0x06,0xb0,0xcc,0x53,0xb0,0xf6
+    db 0x3b,0xce,0x3c,0x3e,0x27,0xd2,0x60,0x4b
+
+section .text
+
+; Stack layout for linnea_p256_ecdsa_verify. No callee-saved registers are used,
+; so there are no pushes; the frame is 872 (== 8 mod 16), which with the return
+; address leaves rsp 16-aligned at every call.
+%define V_HASHP  0      ; saved argument pointers
+%define V_RP     8
+%define V_SP    16
+%define V_QP    24
+%define V_QPT   32      ; Q, projective point (96)
+%define V_RPT  128      ; R = u1*G + u2*Q, projective point (96)
+%define V_T2   224      ; u2*Q, projective point (96)
+%define V_EM   320      ; e mod n, Montgomery
+%define V_RM   352      ; r mod n, Montgomery
+%define V_SM   384      ; s mod n, Montgomery
+%define V_W    416      ; s^-1 mod n
+%define V_U1   448      ; e*w mod n
+%define V_U2   480      ; r*w mod n
+%define V_U1B  512      ; u1, plain big-endian bytes (for the ladder)
+%define V_U2B  544      ; u2, plain big-endian bytes
+%define V_VV   576      ; x(R) mod n, Montgomery
+%define V_BM   608      ; b, Montgomery
+%define V_LHS  640      ; y^2
+%define V_RHS  672      ; x^3 - 3x + b
+%define V_TA   704      ; scratch fe
+%define V_TB   736      ; scratch fe
+%define V_ZI   768      ; 1/Z
+%define V_XA   800      ; affine x, Montgomery
+%define V_XB   832      ; affine x, bytes
+%define VERIFY_FRAME 872
+
+; linnea_p256_ecdsa_verify(rdi=hash, rsi=r, rdx=s, rcx=pubkey) -> rax in {0,1}.
+;   hash: the 32-byte message digest. r, s: 32 big-endian bytes each (already
+;   range-checked here). pubkey: 64 bytes, the uncompressed affine point X||Y
+;   (SEC1 without the 0x04 prefix). Returns 1 iff the signature is valid.
+linnea_p256_ecdsa_verify:
+    sub rsp, VERIFY_FRAME
+    mov [rsp + V_HASHP], rdi
+    mov [rsp + V_RP], rsi
+    mov [rsp + V_SP], rdx
+    mov [rsp + V_QP], rcx
+
+    ; 1. r and s must each be in [1, n-1].
+    mov rdi, [rsp + V_RP]
+    call linnea_p256_scalar_is_valid
+    test eax, eax
+    jz .bad
+    mov rdi, [rsp + V_SP]
+    call linnea_p256_scalar_is_valid
+    test eax, eax
+    jz .bad
+
+    ; 2. The public-key coordinates must be canonical (each < p) BEFORE
+    ;    frombytes silently reduces them.
+    mov rdi, [rsp + V_QP]
+    call linnea_p256_fe_is_valid
+    test eax, eax
+    jz .bad
+    mov rdi, [rsp + V_QP]
+    add rdi, 32
+    call linnea_p256_fe_is_valid
+    test eax, eax
+    jz .bad
+
+    ; 3. Build Q = (X : Y : 1) and check it is on the curve. An off-curve Q is
+    ;    the invalid-curve attack; the complete addition formula would give a
+    ;    confident wrong answer, so this rejection is security-critical.
+    lea rdi, [rsp + V_QPT + linnea_p256_point.x]
+    mov rsi, [rsp + V_QP]
+    call linnea_p256_fe_frombytes
+    lea rdi, [rsp + V_QPT + linnea_p256_point.y]
+    mov rsi, [rsp + V_QP]
+    add rsi, 32
+    call linnea_p256_fe_frombytes
+    lea rdi, [rsp + V_QPT + linnea_p256_point.z]
+    call linnea_p256_fe_1
+
+    lea rdi, [rsp + V_BM]                       ; b -> Montgomery
+    lea rsi, [p256_b_be]
+    call linnea_p256_fe_frombytes
+
+    lea rdi, [rsp + V_LHS]                      ; lhs = Y^2
+    lea rsi, [rsp + V_QPT + linnea_p256_point.y]
+    call linnea_p256_fe_sq
+    lea rdi, [rsp + V_TA]                       ; ta = X^2
+    lea rsi, [rsp + V_QPT + linnea_p256_point.x]
+    call linnea_p256_fe_sq
+    lea rdi, [rsp + V_TA]                       ; ta = X^3
+    lea rsi, [rsp + V_TA]
+    lea rdx, [rsp + V_QPT + linnea_p256_point.x]
+    call linnea_p256_fe_mul
+    lea rdi, [rsp + V_TB]                       ; tb = 2X
+    lea rsi, [rsp + V_QPT + linnea_p256_point.x]
+    lea rdx, [rsp + V_QPT + linnea_p256_point.x]
+    call linnea_p256_fe_add
+    lea rdi, [rsp + V_TB]                       ; tb = 3X
+    lea rsi, [rsp + V_TB]
+    lea rdx, [rsp + V_QPT + linnea_p256_point.x]
+    call linnea_p256_fe_add
+    lea rdi, [rsp + V_RHS]                      ; rhs = X^3 - 3X
+    lea rsi, [rsp + V_TA]
+    lea rdx, [rsp + V_TB]
+    call linnea_p256_fe_sub
+    lea rdi, [rsp + V_RHS]                      ; rhs = X^3 - 3X + b
+    lea rsi, [rsp + V_RHS]
+    lea rdx, [rsp + V_BM]
+    call linnea_p256_fe_add
+    lea rdi, [rsp + V_TA]                       ; lhs - rhs
+    lea rsi, [rsp + V_LHS]
+    lea rdx, [rsp + V_RHS]
+    call linnea_p256_fe_sub
+    lea rdi, [rsp + V_TA]
+    call linnea_p256_fe_is_zero
+    test eax, eax
+    jz .bad
+
+    ; 4. w = s^-1 mod n; u1 = e*w; u2 = r*w (all mod n, Montgomery).
+    lea rdi, [rsp + V_SM]
+    mov rsi, [rsp + V_SP]
+    call linnea_p256_scalar_frombytes
+    lea rdi, [rsp + V_W]
+    lea rsi, [rsp + V_SM]
+    call linnea_p256_scalar_inv
+    lea rdi, [rsp + V_EM]
+    mov rsi, [rsp + V_HASHP]
+    call linnea_p256_scalar_frombytes
+    lea rdi, [rsp + V_RM]
+    mov rsi, [rsp + V_RP]
+    call linnea_p256_scalar_frombytes
+    lea rdi, [rsp + V_U1]
+    lea rsi, [rsp + V_EM]
+    lea rdx, [rsp + V_W]
+    call linnea_p256_scalar_mul
+    lea rdi, [rsp + V_U2]
+    lea rsi, [rsp + V_RM]
+    lea rdx, [rsp + V_W]
+    call linnea_p256_scalar_mul
+
+    ; The ladder reads its scalar as PLAIN big-endian bytes, so convert u1, u2
+    ; out of Montgomery form first -- the easy place to go wrong.
+    lea rdi, [rsp + V_U1B]
+    lea rsi, [rsp + V_U1]
+    call linnea_p256_scalar_tobytes
+    lea rdi, [rsp + V_U2B]
+    lea rsi, [rsp + V_U2]
+    call linnea_p256_scalar_tobytes
+
+    ; 5. R = u1*G + u2*Q.
+    lea rdi, [rsp + V_RPT]
+    lea rsi, [rsp + V_U1B]
+    lea rdx, [linnea_p256_g]
+    call linnea_p256_point_mul
+    lea rdi, [rsp + V_T2]
+    lea rsi, [rsp + V_U2B]
+    lea rdx, [rsp + V_QPT]
+    call linnea_p256_point_mul
+    lea rdi, [rsp + V_RPT]                      ; add allows r to alias p
+    lea rsi, [rsp + V_RPT]
+    lea rdx, [rsp + V_T2]
+    call linnea_p256_point_add
+
+    ; 6. Reject R == infinity (Z == 0).
+    lea rdi, [rsp + V_RPT + linnea_p256_point.z]
+    call linnea_p256_fe_is_zero
+    test eax, eax
+    jnz .bad
+
+    ; 7. v = x(R) mod n = (X/Z) reduced mod n.
+    lea rdi, [rsp + V_ZI]
+    lea rsi, [rsp + V_RPT + linnea_p256_point.z]
+    call linnea_p256_fe_inv
+    lea rdi, [rsp + V_XA]
+    lea rsi, [rsp + V_RPT + linnea_p256_point.x]
+    lea rdx, [rsp + V_ZI]
+    call linnea_p256_fe_mul
+    lea rdi, [rsp + V_XB]
+    lea rsi, [rsp + V_XA]
+    call linnea_p256_fe_tobytes
+    lea rdi, [rsp + V_VV]
+    lea rsi, [rsp + V_XB]
+    call linnea_p256_scalar_frombytes
+
+    ; 8. Accept iff v == r (mod n): v - r == 0.
+    lea rdi, [rsp + V_VV]
+    lea rsi, [rsp + V_VV]
+    lea rdx, [rsp + V_RM]
+    call linnea_p256_scalar_sub
+    lea rdi, [rsp + V_VV]
+    call linnea_p256_scalar_is_zero             ; rax = accept/reject
+    add rsp, VERIFY_FRAME
+    ret
+
+.bad:
+    xor eax, eax
+    add rsp, VERIFY_FRAME
+    ret
+
+; p256_der_parse_uint(rdi=in, rsi=inlen, rdx=out32) -> rax = bytes consumed
+;   (tag+len+content) on success, 0 on any error. Strict DER for a non-negative
+;   INTEGER: tag 0x02, short-form length, minimal encoding (no needless leading
+;   0x00), non-negative (top content bit clear), magnitude <= 32 bytes.
+;   Left-pads the magnitude big-endian into out32. File-local.
+;
+;   Strictness matters: lax/BER decoding is a classic signature-malleability and
+;   bypass source (Wycheproof exercises it heavily).
+p256_der_parse_uint:
+    cmp rsi, 2                  ; need at least tag + length
+    jb .err
+    cmp byte [rdi], 0x02        ; INTEGER tag
+    jne .err
+    movzx rcx, byte [rdi + 1]   ; length
+    test rcx, rcx
+    jz .err                     ; empty INTEGER is invalid
+    cmp rcx, 0x80
+    jae .err                    ; long form / indefinite not allowed
+    lea rax, [rcx + 2]          ; tag + len + content must fit in inlen
+    cmp rax, rsi
+    ja .err
+    test byte [rdi + 2], 0x80   ; top bit set => negative => reject
+    jnz .err
+    cmp rcx, 1
+    je .nozero
+    cmp byte [rdi + 2], 0
+    jne .nozero
+    test byte [rdi + 3], 0x80   ; leading 0x00 legal only to clear a set top bit
+    jz .err                     ; otherwise it is non-minimal
+    lea r10, [rdi + 3]          ; strip the pad byte
+    lea r11, [rcx - 1]
+    jmp .havemag
+.nozero:
+    lea r10, [rdi + 2]
+    mov r11, rcx
+.havemag:
+    cmp r11, 32                 ; magnitude wider than the field => reject
+    ja .err
+    xor eax, eax                ; zero the 32-byte output
+    mov [rdx], rax
+    mov [rdx + 8], rax
+    mov [rdx + 16], rax
+    mov [rdx + 24], rax
+    mov r8, 32                  ; left-pad: dest = out + (32 - maglen)
+    sub r8, r11
+    lea r9, [rdx + r8]
+    xor rax, rax
+.cp:
+    cmp rax, r11
+    jae .cpdone
+    mov r8b, [r10 + rax]
+    mov [r9 + rax], r8b
+    inc rax
+    jmp .cp
+.cpdone:
+    lea rax, [rcx + 2]          ; consumed = tag + len + content
+    ret
+.err:
+    xor eax, eax
+    ret
+
+; Stack layout for linnea_p256_ecdsa_verify_der.
+%define D_HASH  0
+%define D_DER   8
+%define D_PUB  16
+%define D_R    24
+%define D_S    56
+%define D_CR   88               ; bytes consumed by r
+%define D_FRAME 104             ; no pushes; 104 == 8 mod 16
+
+; linnea_p256_ecdsa_verify_der(rdi=hash, rsi=der, rdx=der_len, rcx=pubkey)
+;   -> rax in {0,1}. Strictly decodes SEQUENCE { INTEGER r, INTEGER s } and
+;   verifies. Any decode error returns 0 (no fallback, no partial accept).
+linnea_p256_ecdsa_verify_der:
+    sub rsp, D_FRAME
+    mov [rsp + D_HASH], rdi
+    mov [rsp + D_DER], rsi
+    mov [rsp + D_PUB], rcx
+
+    cmp rdx, 2                  ; SEQUENCE tag + length
+    jb .derbad
+    cmp byte [rsi], 0x30
+    jne .derbad
+    movzx rax, byte [rsi + 1]  ; L
+    cmp rax, 0x80
+    jae .derbad                ; long form not allowed
+    lea r8, [rax + 2]          ; 2 + L must be exactly der_len (no trailing data)
+    cmp r8, rdx
+    jne .derbad
+
+    lea rdi, [rsi + 2]         ; parse r from the SEQUENCE content
+    mov rsi, rax               ; available = L
+    lea rdx, [rsp + D_R]
+    call p256_der_parse_uint
+    test rax, rax
+    jz .derbad
+    mov [rsp + D_CR], rax
+
+    mov rsi, [rsp + D_DER]     ; parse s, right after r
+    movzx rcx, byte [rsi + 1]  ; L
+    mov r10, [rsp + D_CR]
+    lea rdi, [rsi + 2]
+    add rdi, r10
+    mov rsi, rcx
+    sub rsi, r10               ; available = L - consumed(r)
+    lea rdx, [rsp + D_S]
+    call p256_der_parse_uint
+    test rax, rax
+    jz .derbad
+
+    add rax, [rsp + D_CR]      ; r and s together must fill the SEQUENCE exactly
+    mov rsi, [rsp + D_DER]
+    movzx rcx, byte [rsi + 1]
+    cmp rax, rcx
+    jne .derbad
+
+    mov rdi, [rsp + D_HASH]
+    lea rsi, [rsp + D_R]
+    lea rdx, [rsp + D_S]
+    mov rcx, [rsp + D_PUB]
+    call linnea_p256_ecdsa_verify
+    add rsp, D_FRAME
+    ret
+.derbad:
+    xor eax, eax
+    add rsp, D_FRAME
+    ret

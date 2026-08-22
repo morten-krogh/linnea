@@ -45,6 +45,8 @@ extern linnea_p256_scalar_sub
 extern linnea_p256_scalar_inv
 extern linnea_p256_scalar_is_valid
 extern linnea_p256_ecdsa_sign
+extern linnea_p256_ecdsa_verify
+extern linnea_p256_ecdsa_verify_der
 extern linnea_aesgcm_init
 extern linnea_aesgcm_seal
 extern linnea_aesgcm_open
@@ -66,6 +68,8 @@ mode_gopen:  db "aesgcm-open-stdin", 0
 mode_p256fe: db "p256-fe-stdin", 0
 mode_p256sc: db "p256-scalar-stdin", 0
 mode_p256ec: db "p256-ecdsa-stdin", 0
+mode_p256ecv:  db "p256-ecdsa-verify-stdin", 0
+mode_p256ecvd: db "p256-ecdsa-verifyder-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
 lbl_sha1:    db "sha1 "
@@ -238,6 +242,16 @@ _start:
     call streq
     test eax, eax
     jnz .p256ecstdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_p256ecv]
+    call streq
+    test eax, eax
+    jnz .p256ecvstdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_p256ecvd]
+    call streq
+    test eax, eax
+    jnz .p256ecvdstdin
 
 ; ---- known-answer tables --------------------------------------------
 .vectors:
@@ -1219,6 +1233,60 @@ _start:
     call linnea_print_stdout
     jmp .p256ecstdin
 .p256ecstdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; verify (raw): frame = hash(32) | pubkey X||Y (64) | r(32) | s(32) = 160 bytes,
+; output one byte: 1 = valid, 0 = invalid.
+.p256ecvstdin:
+    lea rdi, [inbuf]
+    mov rsi, 160
+    call read_full
+    cmp eax, 160
+    jne .p256ecvstdin_done
+    lea rdi, [inbuf]           ; hash
+    lea rsi, [inbuf + 96]      ; r
+    lea rdx, [inbuf + 128]     ; s
+    lea rcx, [inbuf + 32]      ; pubkey X||Y
+    call linnea_p256_ecdsa_verify
+    mov [outbuf], al
+    lea rdi, [outbuf]
+    mov rsi, 1
+    call linnea_print_stdout
+    jmp .p256ecvstdin
+.p256ecvstdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; verify (DER): frame = hash(32) | pubkey X||Y (64) | derlen(1) | der(derlen),
+; output one byte: 1 = valid, 0 = invalid.
+.p256ecvdstdin:
+    lea rdi, [inbuf]
+    mov rsi, 97               ; hash + pubkey + one length byte
+    call read_full
+    cmp eax, 97
+    jne .p256ecvdstdin_done
+    movzx rcx, byte [inbuf + 96]
+    mov [lenbuf], rcx         ; stash derlen across the second read
+    lea rdi, [inbuf + 97]
+    mov rsi, rcx
+    call read_full
+    mov ecx, [lenbuf]
+    cmp eax, ecx
+    jne .p256ecvdstdin_done
+    lea rdi, [inbuf]          ; hash
+    lea rsi, [inbuf + 97]     ; der
+    mov rdx, [lenbuf]         ; der length
+    lea rcx, [inbuf + 32]     ; pubkey X||Y
+    call linnea_p256_ecdsa_verify_der
+    mov [outbuf], al
+    lea rdi, [outbuf]
+    mov rsi, 1
+    call linnea_print_stdout
+    jmp .p256ecvdstdin
+.p256ecvdstdin_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall

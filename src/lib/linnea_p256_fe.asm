@@ -27,6 +27,8 @@ global linnea_p256_fe_copy
 global linnea_p256_fe_cmov
 global linnea_p256_fe_1
 global linnea_p256_fe_0
+global linnea_p256_fe_is_zero
+global linnea_p256_fe_is_valid
 global linnea_p256_ctx_p
 
 extern linnea_p256_mont_mul
@@ -115,3 +117,49 @@ linnea_p256_fe_copy:
     jmp linnea_p256_mont_copy
 linnea_p256_fe_cmov:
     jmp linnea_p256_mont_cmov
+
+; linnea_p256_fe_is_zero(rdi=a) — rax = 1 iff the field element is zero, else 0.
+;   Montgomery form maps zero to zero, so no conversion is needed. The point
+;   group's identity is Z == 0, which ECDSA verify must reject; the on-curve
+;   test also compares two elements by subtracting and asking this.
+linnea_p256_fe_is_zero:
+    mov rax, [rdi]
+    or rax, [rdi + 8]
+    or rax, [rdi + 16]
+    or rax, [rdi + 24]
+    neg rax                     ; CF = (a != 0)
+    sbb rax, rax                ; -1 if non-zero, 0 if zero
+    inc rax                     ; 1 if zero, 0 if non-zero
+    ret
+
+; linnea_p256_fe_is_valid(rdi=in) — rax = 1 iff the 32 big-endian bytes at rdi
+;   encode a field element in [0, p-1], else 0. Reads the raw encoding, NOT
+;   Montgomery form, and does NOT reduce: frombytes would silently fold an
+;   out-of-range coordinate into the field, so a client verifying an untrusted
+;   public key must reject a non-canonical X or Y before converting it. Zero is
+;   a legal coordinate, so unlike the scalar range test this accepts it.
+;   Mirrors linnea_p256_scalar_is_valid, but against p and without the != 0 test.
+linnea_p256_fe_is_valid:
+    mov r8, [rdi + 24]
+    bswap r8                    ; limb 0 (least significant)
+    mov r9, [rdi + 16]
+    bswap r9
+    mov r10, [rdi + 8]
+    bswap r10
+    mov r11, [rdi]
+    bswap r11                   ; limb 3 (most significant)
+
+    ; v < p ? Borrow out of v - p says yes. `mov` does not touch the flags,
+    ; so the chain survives reloading the minuend each step.
+    lea rcx, [linnea_p256_ctx_p]
+    mov rsi, r8
+    sub rsi, [rcx]
+    mov rsi, r9
+    sbb rsi, [rcx + 8]
+    mov rsi, r10
+    sbb rsi, [rcx + 16]
+    mov rsi, r11
+    sbb rsi, [rcx + 24]
+    sbb rax, rax                ; rax = -1 iff v < p
+    and rax, 1
+    ret
