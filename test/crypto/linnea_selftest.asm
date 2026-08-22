@@ -47,6 +47,8 @@ extern linnea_p256_scalar_is_valid
 extern linnea_p256_ecdsa_sign
 extern linnea_p256_ecdsa_verify
 extern linnea_p256_ecdsa_verify_der
+extern linnea_x509_find_spki
+extern linnea_x509_spki_point
 extern linnea_aesgcm_init
 extern linnea_aesgcm_seal
 extern linnea_aesgcm_open
@@ -70,6 +72,7 @@ mode_p256sc: db "p256-scalar-stdin", 0
 mode_p256ec: db "p256-ecdsa-stdin", 0
 mode_p256ecv:  db "p256-ecdsa-verify-stdin", 0
 mode_p256ecvd: db "p256-ecdsa-verifyder-stdin", 0
+mode_x509:     db "x509-p256-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
 lbl_sha1:    db "sha1 "
@@ -252,6 +255,11 @@ _start:
     call streq
     test eax, eax
     jnz .p256ecvdstdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_x509]
+    call streq
+    test eax, eax
+    jnz .x509stdin
 
 ; ---- known-answer tables --------------------------------------------
 .vectors:
@@ -1287,6 +1295,51 @@ _start:
     call linnea_print_stdout
     jmp .p256ecvdstdin
 .p256ecvdstdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; x509 leaf public-key extraction: frame = u32-LE der length | DER certificate.
+; output 97 bytes: status(1) | point X||Y (64) | sha256(SPKI) (32). On failure
+; status is 0 and the rest is unspecified. outbuf+200 stashes the SPKI span
+; across the point extraction (well clear of the 97-byte output region).
+.x509stdin:
+    lea rdi, [lenbuf]
+    mov rsi, 4
+    call read_full
+    cmp eax, 4
+    jne .x509stdin_done
+    mov ecx, [lenbuf]
+    lea rdi, [inbuf]
+    mov rsi, rcx
+    call read_full
+    lea rdi, [inbuf]
+    mov esi, [lenbuf]
+    call linnea_x509_find_spki       ; rax = SPKI ptr (0 = fail), rdx = SPKI len
+    test rax, rax
+    jz .x509_fail
+    mov [outbuf + 200], rax
+    mov [outbuf + 208], rdx
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [outbuf + 1]
+    call linnea_x509_spki_point      ; rax = 1/0, out64 at outbuf+1
+    test eax, eax
+    jz .x509_fail
+    mov rdi, [outbuf + 200]
+    mov rsi, [outbuf + 208]
+    lea rdx, [outbuf + 65]
+    call linnea_sha256               ; sha256(SPKI) at outbuf+65
+    mov byte [outbuf], 1
+    jmp .x509_emit
+.x509_fail:
+    mov byte [outbuf], 0
+.x509_emit:
+    lea rdi, [outbuf]
+    mov rsi, 97
+    call linnea_print_stdout
+    jmp .x509stdin
+.x509stdin_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall

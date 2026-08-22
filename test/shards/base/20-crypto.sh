@@ -44,6 +44,23 @@ else
     check "p256 ecdsa-verify test (selftest binary unavailable)" 1
 fi
 
+# X.509 leaf key extraction (backend TLS: the cert pin + the CertVerify key).
+# Walks an untrusted certificate to the SubjectPublicKeyInfo and reads the
+# prime256v1 point; checked against OpenSSL over the committed test certs, with
+# malformed inputs required to reject. Skips if openssl is unavailable (the
+# extraction itself has no dep, but the oracle does).
+if command -v openssl >/dev/null 2>&1 && [ -x ./bin/linnea-selftest ]; then
+    if python3 test/crypto/diff_x509_p256.py >$RUNDIR/x509p256.out 2>&1; then
+        check "x509: leaf P-256 key + SPKI pin extraction vs OpenSSL" 0
+    else
+        check "x509: leaf P-256 key + SPKI pin extraction vs OpenSSL" 1
+        cat $RUNDIR/x509p256.out
+    fi
+    rm -f $RUNDIR/x509p256.out
+else
+    check "x509 leaf key extraction (skipped: openssl unavailable)" 0
+fi
+
 # QUIC crypto known-answer tests (RFC 9001 / 9000). Built by `make quictest`.
 if [ -x ./bin/linnea-quictest ]; then
     if ./bin/linnea-quictest >$RUNDIR/linnea_quictest.out 2>&1; then

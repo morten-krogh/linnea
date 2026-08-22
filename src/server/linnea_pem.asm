@@ -20,6 +20,8 @@ default rel
 global linnea_pem_decode
 global linnea_pem_cert_list
 global linnea_pem_p256_key
+global linnea_x509_find_spki
+global linnea_x509_spki_point
 
 section .rodata
 
@@ -378,6 +380,187 @@ linnea_pem_p256_key:
 .fail:
     mov rax, -1
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- X.509 leaf-certificate public-key extraction (for backend TLS: pinning
+;      a server's cert and verifying its CertificateVerify). Client-side, and
+;      unlike everything above it parses an UNTRUSTED certificate, so it bounds
+;      every length against the input and rejects anything it does not expect.
+;      Still deliberately narrow: it finds the SubjectPublicKeyInfo and reads a
+;      prime256v1 point; it does not validate a chain, dates, or names -- the
+;      SPKI PIN is the trust decision (see docs/design/tls-client-handshake-plan.md).
+
+; der_any(rdi=p, rsi=end, edx unused) -> rax = content ptr (or -1),
+;   rcx = content length, dl = tag. DER TLV with the short, 0x81 and 0x82
+;   length forms (X.509 needs 0x82); non-minimal long forms and content that
+;   overruns end are rejected. File-local. Clobbers rax rcx rdx r8.
+der_any:
+    push rbx
+    mov rbx, rsi
+    sub rbx, rdi                 ; bytes available
+    cmp rbx, 2
+    jb .bad
+    movzx edx, byte [rdi]        ; tag -> dl
+    movzx ecx, byte [rdi + 1]
+    lea rax, [rdi + 2]
+    cmp ecx, 0x80
+    jb .have                     ; short form: the byte is the length
+    cmp ecx, 0x81
+    je .len1
+    cmp ecx, 0x82
+    je .len2
+    jmp .bad                     ; 0x83+ unsupported and unneeded for a cert
+.len1:
+    cmp rbx, 3
+    jb .bad
+    movzx ecx, byte [rdi + 2]
+    cmp ecx, 0x80
+    jb .bad                      ; 0x81 with a value < 128: non-minimal
+    lea rax, [rdi + 3]
+    jmp .have
+.len2:
+    cmp rbx, 4
+    jb .bad
+    movzx ecx, byte [rdi + 2]
+    shl ecx, 8
+    movzx r8d, byte [rdi + 3]
+    or ecx, r8d
+    cmp ecx, 0x100
+    jb .bad                      ; 0x82 with a value < 256: non-minimal
+    lea rax, [rdi + 4]
+.have:
+    mov rbx, rsi
+    sub rbx, rax                 ; content bytes available
+    cmp rbx, rcx
+    jb .bad                      ; content overruns end
+    pop rbx
+    ret
+.bad:
+    mov rax, -1
+    xor ecx, ecx
+    xor edx, edx
+    pop rbx
+    ret
+
+; ---- linnea_x509_find_spki(rdi=der, rsi=derlen) -> rax = pointer to the
+;      SubjectPublicKeyInfo SEQUENCE (its tag byte) or 0, rdx = that element's
+;      total length. Walks Certificate -> tbsCertificate and returns the child
+;      SEQUENCE whose AlgorithmIdentifier is id-ecPublicKey + prime256v1. For
+;      the pin, hash the returned span; for the key, pass it to
+;      linnea_x509_spki_point. ---------------------------------------------
+linnea_x509_find_spki:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    lea r15, [rdi + rsi]            ; der end
+    mov rsi, r15
+    call der_any                    ; Certificate SEQUENCE
+    cmp rax, -1
+    je .fail
+    cmp dl, 0x30
+    jne .fail
+    mov rdi, rax                    ; Certificate body
+    lea rbx, [rax + rcx]
+    mov rsi, rbx
+    call der_any                    ; tbsCertificate SEQUENCE
+    cmp rax, -1
+    je .fail
+    cmp dl, 0x30
+    jne .fail
+    mov r12, rax                    ; tbs cursor
+    lea r13, [rax + rcx]            ; tbs end
+.iter:
+    cmp r12, r13
+    jae .fail
+    mov rdi, r12
+    mov rsi, r13
+    call der_any
+    cmp rax, -1
+    je .fail
+    mov rbx, rax                    ; element content start
+    lea r14, [rax + rcx]            ; next element
+    cmp dl, 0x30                    ; only a SEQUENCE can be the SPKI
+    jne .adv
+    mov rdi, rbx                    ; open its first child (AlgorithmIdentifier)
+    mov rsi, r14
+    call der_any
+    cmp rax, -1
+    je .adv
+    cmp dl, 0x30
+    jne .adv
+    cmp rcx, alg_ec_len
+    jne .adv
+    mov rdi, rax
+    lea rsi, [alg_ec]
+    mov rcx, alg_ec_len
+    call bytes_eq
+    test eax, eax
+    jz .adv
+    mov rax, r12                    ; FOUND: the SPKI element is [r12, r14)
+    mov rdx, r14
+    sub rdx, r12
+    jmp .ret
+.adv:
+    mov r12, r14
+    jmp .iter
+.fail:
+    xor eax, eax
+    xor edx, edx
+.ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- linnea_x509_spki_point(rdi=spki, rsi=spkilen, rdx=out64) -> rax = 1 on
+;      success (out64 gets the 64-byte X||Y), 0 on failure. The SPKI is
+;      SEQUENCE { AlgorithmIdentifier, BIT STRING 00||04||X||Y }; only the
+;      uncompressed prime256v1 point is accepted. ---------------------------
+linnea_x509_spki_point:
+    push rbx
+    push r12
+    mov r12, rdx                    ; out64
+    lea rbx, [rdi + rsi]           ; spki end
+    mov rsi, rbx
+    call der_any                    ; SPKI SEQUENCE
+    cmp rax, -1
+    je .fail
+    cmp dl, 0x30
+    jne .fail
+    mov rdi, rax                    ; SPKI body
+    lea rbx, [rax + rcx]
+    mov rsi, rbx
+    call der_any                    ; skip AlgorithmIdentifier
+    cmp rax, -1
+    je .fail
+    lea rdi, [rax + rcx]           ; -> BIT STRING
+    mov rsi, rbx
+    call der_any                    ; BIT STRING
+    cmp rax, -1
+    je .fail
+    cmp dl, 0x03
+    jne .fail
+    cmp rcx, 66                    ; 00 unused-bits + 04 + X(32) + Y(32)
+    jne .fail
+    cmp byte [rax], 0x00
+    jne .fail
+    cmp byte [rax + 1], 0x04       ; uncompressed point only
+    jne .fail
+    lea rsi, [rax + 2]
+    mov rdi, r12
+    mov ecx, 64
+    rep movsb
+    mov eax, 1
+    jmp .ret
+.fail:
+    xor eax, eax
+.ret:
     pop r12
     pop rbx
     ret
