@@ -49,6 +49,7 @@ extern linnea_p256_ecdsa_verify
 extern linnea_p256_ecdsa_verify_der
 extern linnea_x509_find_spki
 extern linnea_x509_spki_point
+extern linnea_tls_client_verify_certverify
 extern linnea_aesgcm_init
 extern linnea_aesgcm_seal
 extern linnea_aesgcm_open
@@ -73,6 +74,7 @@ mode_p256ec: db "p256-ecdsa-stdin", 0
 mode_p256ecv:  db "p256-ecdsa-verify-stdin", 0
 mode_p256ecvd: db "p256-ecdsa-verifyder-stdin", 0
 mode_x509:     db "x509-p256-stdin", 0
+mode_tlscv:    db "tls-certverify-stdin", 0
 lbl_sha:     db "sha256 "
 lbl_sha_len  equ $ - lbl_sha
 lbl_sha1:    db "sha1 "
@@ -260,6 +262,11 @@ _start:
     call streq
     test eax, eax
     jnz .x509stdin
+    mov rdi, [rsp + 16]
+    lea rsi, [mode_tlscv]
+    call streq
+    test eax, eax
+    jnz .tlscvstdin
 
 ; ---- known-answer tables --------------------------------------------
 .vectors:
@@ -1340,6 +1347,37 @@ _start:
     call linnea_print_stdout
     jmp .x509stdin
 .x509stdin_done:
+    xor edi, edi
+    mov eax, LINNEA_SYS_EXIT
+    syscall
+
+; CertificateVerify: frame = transcript_hash(32) | pubkey X||Y (64) | derlen(1)
+; | der(derlen). Output one byte: 1 = signature valid, 0 = invalid.
+.tlscvstdin:
+    lea rdi, [inbuf]
+    mov rsi, 97               ; hash + pubkey + one length byte
+    call read_full
+    cmp eax, 97
+    jne .tlscvstdin_done
+    movzx rcx, byte [inbuf + 96]
+    mov [lenbuf], rcx
+    lea rdi, [inbuf + 97]
+    mov rsi, rcx
+    call read_full
+    mov ecx, [lenbuf]
+    cmp eax, ecx
+    jne .tlscvstdin_done
+    lea rdi, [inbuf]         ; transcript hash
+    lea rsi, [inbuf + 97]    ; signature DER
+    mov rdx, [lenbuf]        ; signature length
+    lea rcx, [inbuf + 32]    ; pubkey X||Y
+    call linnea_tls_client_verify_certverify
+    mov [outbuf], al
+    lea rdi, [outbuf]
+    mov rsi, 1
+    call linnea_print_stdout
+    jmp .tlscvstdin
+.tlscvstdin_done:
     xor edi, edi
     mov eax, LINNEA_SYS_EXIT
     syscall

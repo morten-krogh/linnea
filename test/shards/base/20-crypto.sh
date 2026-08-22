@@ -61,6 +61,20 @@ else
     check "x509 leaf key extraction (skipped: openssl unavailable)" 0
 fi
 
+# TLS 1.3 CertificateVerify (backend TLS): rebuild the RFC 8446 signed content
+# and ECDSA-verify it under the pinned server key, against OpenSSL as the signer.
+if command -v openssl >/dev/null 2>&1 && [ -x ./bin/linnea-selftest ]; then
+    if python3 test/crypto/diff_tls_certverify.py >$RUNDIR/tlscv.out 2>&1; then
+        check "tls: CertificateVerify accepts valid, rejects tampered (vs OpenSSL)" 0
+    else
+        check "tls: CertificateVerify accepts valid, rejects tampered (vs OpenSSL)" 1
+        cat $RUNDIR/tlscv.out
+    fi
+    rm -f $RUNDIR/tlscv.out
+else
+    check "tls CertificateVerify test (skipped: openssl unavailable)" 0
+fi
+
 # QUIC crypto known-answer tests (RFC 9001 / 9000). Built by `make quictest`.
 if [ -x ./bin/linnea-quictest ]; then
     if ./bin/linnea-quictest >$RUNDIR/linnea_quictest.out 2>&1; then

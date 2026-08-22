@@ -63,6 +63,7 @@ SELFTEST_OBJS = test/crypto/linnea_selftest.o src/lib/linnea_sha256.o \
                 src/lib/linnea_p256_scalar.o src/lib/linnea_p256_point.o \
                 src/lib/linnea_p256_ecdsa.o src/lib/linnea_aesgcm.o src/lib/linnea_tls_kdf.o \
                 src/lib/linnea_tls_record.o src/server/linnea_tls.o src/server/linnea_pem.o \
+                src/server/linnea_tls_client.o \
                 src/lib/linnea_print.o src/lib/linnea_string.o
 CRYPTO_VECS   = test/crypto/sha256_vectors.inc
 
