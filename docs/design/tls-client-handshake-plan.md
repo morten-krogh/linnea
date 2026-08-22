@@ -232,6 +232,59 @@ self-hosted proxy-over-TLS test + a green full suite):**
    question). Self-hosted test: linnea proxying /api over TLS to openssl s_server
    (or linnea) with the SPKI pinned.
 
+### Wiring integration map (exact, from the 2026-08-22 read)
+
+- Completion loop convention: dispatcher decodes CQE user_data → `eax`=op tag,
+  `r13`=conn index; up-leg handlers then `linnea_connection_at` → `r12`=conn,
+  `r15d`=bytes/`-errno`.
+- **Branch point**: `.connect_ok` (`linnea_uring.asm:2244-2254`), before it sets
+  `proxy_state=SENDING`/`arm_up_send`. Read `conn.location` (`linnea_connection.inc:137`)
+  → `linnea_config_location.proxy_tls`; if set, alloc the arena slot,
+  `linnea_tls_client_start` (pin/sni from the location), `arm_up_send_buf`
+  (`:3822`) the ClientHello, set `proxy_state=LINNEA_PROXY_TLS_HS` (new enum
+  value **10**; one state suffices — `hs.state` distinguishes CH-sent vs Fin-sent).
+- **Send completion**: in `.on_up_send` (`:2304`) add a `PROXY_TLS_HS` branch
+  before the normal advance (:2318): if `hs.state!=DONE` → `arm_up_recv` the
+  flight; if `hs.state==DONE` (client Finished just left) → kTLS handoff, then
+  `proxy_state=SENDING` + `arm_up_send` (the untouched request head).
+- **Recv completion**: in `.on_up_recv` (`:2380`) add a `PROXY_TLS_HS` branch
+  before the head path (:2398): feed `[out_buf, r15d]` to `linnea_tls_client_input`
+  (use `conn.out_buf` as the recv scratch — free during the handshake window),
+  MORE→`arm_up_recv`, DONE→`arm_up_send_buf` the client Finished, FAIL→502.
+- **kTLS mirror** of the server call (`linnea_uring.asm:2091-2098`): 
+  `linnea_ktls_enable(rdi=up_fd, rsi=&hs.c_ap, rdx=&hs.s_ap, rcx=0, r8=0)` — TX=c_ap,
+  RX=s_ap. Do NOT feed `hs.wkeys.seq` (that is the handshake-key seq).
+- **Arena**: mirror `h2_dyn_pool` (`linnea_http2.asm:6429`, mapped in an init
+  beside `linnea_h2p_init` at `linnea_start.asm:681`) — `pool + conn.index *
+  linnea_tls_client_hs_size`; no gen-reset needed (`_start` reinitializes). It is
+  ~58 KB/slot, demand-paged (MAP_PRIVATE|ANON). Spare conn field `.up_pad`
+  (`:113`) is free for a per-leg flag if needed.
+
+### Hazards (must handle before this is correct)
+
+- **H3 — the design fork.** After the backend socket is on kTLS, a backend
+  **NewSessionTicket** (a handshake-type record under the app key) makes the
+  proxy's next plain `RECV` (`:3861`) fail `-EIO` and consume it — the same
+  failure the server RX solves with `RECVMSG`+cmsg. openssl sends NSTs even with
+  no PSK modes offered. So one of:
+    (a) **kTLS + control-record-aware first read** — do the TLS leg's first
+        response `RECV` via `RECVMSG`+cmsg and skip type-22 records (mirror the
+        server RX at `linnea_connection.inc:343-348`); or drain NSTs in userspace
+        after Finished and pass `rx_seq` accordingly, then kTLS; or
+    (b) **userspace records for backend data** — skip kTLS on the backend; seal
+        the request and open the response through the record layer (`tls_open`
+        already skips NSTs, as the blocking app_recv does). No kTLS offload, but
+        no NST hazard and self-contained to the TLS leg.
+  Either way the "raw send/recv path unchanged" hope does not hold as-is.
+- **H4** — force `proxy_tls` legs non-pooled (`linnea_http.asm:3053`): a parked
+  kTLS socket / plaintext-head replay would corrupt a TLS leg.
+- **H6** — the linked idle timeout fires on handshake ops (`-ECANCELED` in
+  `r15d`) → route to 504, not a protocol failure.
+- **H7** — handshake-phase FAIL/timeout may failover (no request byte sent yet);
+  once in `SENDING`, the no-retry-after-head rule applies again.
+- **H5** — pass `&proxy_pin` only when `proxy_pin_set` (config already enforces
+  proxy_tls⇒pin).
+
 ## Definition of done
 
 **Done = Tier 0 complete:** linnea completes an authenticated, pinned TLS 1.3
