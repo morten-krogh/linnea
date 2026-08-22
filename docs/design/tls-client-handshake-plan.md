@@ -183,6 +183,40 @@ backends are exhausted. Never fall back to plaintext.
 6. Config (`proxy_sni`), alert parsing, timeout/failover, post-handshake ticket
    skipping; full suite green.
 
+## Implementation status (2026-08-22, branch `tls-client`)
+
+**Done, tested, and gated in the suite** (the authenticating client core — the
+hard, novel, security-critical work):
+
+- **ECDSA P-256 verify** (`linnea_p256_ecdsa_verify` + strict DER) — merged to
+  master. CAVP-style KAT, off-curve rejection, OpenSSL interop, fuzz.
+- **X.509 leaf key extraction** (`linnea_x509_find_spki`/`_spki_point`) — walks
+  an untrusted cert to the SPKI, reads the prime256v1 point; pin = sha256(SPKI).
+- **CertificateVerify** (`linnea_tls_client_verify_certverify`) — RFC 8446
+  signed content + ECDSA verify.
+- **The full authenticating handshake** (`linnea_tls_client_handshake`, blocking
+  form) — ClientHello/ServerHello/key schedule/flight decrypt, with the SPKI
+  pin, CertificateVerify, and server-Finished checks; HRR fatal. Proven against
+  `openssl s_server` (`test/shards/tls/70-backend-tls-client.sh`): pin match
+  completes and the server accepts our Finished; wrong pin and an unoffered-group
+  HRR fail cleanly.
+
+**Remaining (the async proxy integration — deep io_uring/serving-path work, best
+done as one deploy-gated unit):**
+
+1. **Async driver** — refactor the handshake into a completion-driven
+   `linnea_tls_client_input(hs, in, inlen, out, outcap)` over a per-connection
+   arena (mirroring the server's `linnea_tls_hs_input`), so many backend
+   handshakes run concurrently. The blocking form above is the tested reference.
+2. **io_uring wiring** — a per-leg scratch arena, new `proxy_state` sub-states,
+   route backend-fd completions to the driver from `.connect_ok`, then the
+   client-oriented **kTLS handoff** (TX=c_ap, RX=s_ap, seqs per §decision 3).
+3. **Config** — `https://` backends (or a `proxy_tls` flag) + `proxy_pin` +
+   `proxy_sni`, through the parser/validation/docs/doc_claims.
+4. **Failover** + the self-hosted linnea→linnea-over-TLS integration test.
+
+## Definition of done
+
 **Done = Tier 0 complete:** linnea completes an authenticated, pinned TLS 1.3
 handshake to a backend and proxies over kTLS for h1/h3 (then h2) clients; every
 failure mode (pin/CertVerify/Finished/HRR/alert/timeout) rejects cleanly to 502
