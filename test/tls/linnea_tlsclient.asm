@@ -16,6 +16,7 @@ global _start
 extern linnea_tls_client_handshake
 extern linnea_tls_client_app_send
 extern linnea_tls_client_app_recv
+extern cli_chunk_cap
 
 section .rodata
 sni_default: db "localhost"
@@ -43,6 +44,13 @@ _start:
     mov rdi, [rbp + 16]              ; argv[1] = port
     call atoi
     mov r15d, eax                    ; port
+
+    cmp qword [rbp], 3               ; optional argv[2] = recv chunk cap
+    jl .nochunk
+    mov rdi, [rbp + 24]
+    call atoi
+    mov [cli_chunk_cap], rax
+.nochunk:
 
     xor edi, edi                     ; read the 32-byte pin from stdin
     lea rsi, [pin_buf]

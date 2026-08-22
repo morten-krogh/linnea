@@ -31,6 +31,10 @@ PY
     out=$(timeout 8 ./bin/linnea-tlsclient ${P61710} <$RUNDIR/pin.bin 2>/dev/null)
     [ "$out" = "OK" ]
     check "backend TLS: authenticating handshake completes (pin match, vs openssl)" $?
+    # resumability: force the driver to reassemble across 1-byte reads
+    out=$(timeout 12 ./bin/linnea-tlsclient ${P61710} 1 <$RUNDIR/pin.bin 2>/dev/null)
+    [ "$out" = "OK" ]
+    check "backend TLS: handshake resumes across 1-byte record fragments" $?
     out=$(timeout 8 ./bin/linnea-tlsclient ${P61710} <$RUNDIR/wpin.bin 2>/dev/null)
     [ "$out" = "FAIL" ]
     check "backend TLS: wrong SPKI pin is refused" $?
