@@ -10,6 +10,7 @@ and the user docs in [`docs/`](..).
 - [`roadmap.md`](roadmap.md) — the scope gaps vs a general-purpose proxy, and what not to trade away.
 - [`backend-tls-h2.md`](backend-tls-h2.md) — design for TLS + HTTP/2 to backends (roadmap #1): the tiered, pin-not-trust-store scope.
 - [`ecdsa-verify-plan.md`](ecdsa-verify-plan.md) — implementation plan for ECDSA P-256 verify, the pivotal new primitive for backend TLS.
+- [`tls-client-handshake-plan.md`](tls-client-handshake-plan.md) — implementation plan for wiring the TLS 1.3 client handshake to a backend into the io_uring loop (completes Tier 0).
 - [`backend-h2-plan.md`](backend-h2-plan.md) — implementation plan for HTTP/2 to backends (roadmap #1, Tier 1): single-stream first, multiplexing later.
 - [`http2-plan.md`](http2-plan.md) — the HTTP/2 implementation arc.
 - [`http3-plan.md`](http3-plan.md) — the HTTP/3 (QUIC) implementation arc.
