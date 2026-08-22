@@ -97,6 +97,22 @@ $(TLSTEST_BIN): $(TLSTEST_OBJS)
 
 tlstest: $(TLSTEST_BIN)
 
+# --- backend TLS client handshake test harness (own _start) ---
+TLSCLIENT_BIN  = bin/linnea-tlsclient
+TLSCLIENT_OBJS = test/tls/linnea_tlsclient.o src/server/linnea_tls_client.o \
+                 src/lib/linnea_x25519.o src/lib/linnea_fe25519.o src/lib/linnea_sha256.o \
+                 src/lib/linnea_tls_kdf.o src/lib/linnea_tls_record.o src/lib/linnea_aesgcm.o \
+                 src/lib/linnea_p256_ecdsa.o src/lib/linnea_p256_mont.o src/lib/linnea_p256_fe.o \
+                 src/lib/linnea_p256_scalar.o src/lib/linnea_p256_point.o src/server/linnea_pem.o
+
+test/tls/linnea_tlsclient.o: test/tls/linnea_tlsclient.asm $(INCS)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
+$(TLSCLIENT_BIN): $(TLSCLIENT_OBJS)
+	$(LD) -o $@ $^
+
+tlsclient: $(TLSCLIENT_BIN)
+
 # --- QUIC crypto known-answer tests (own _start; RFC 9001 vectors) ---
 QUICTEST_BIN  = bin/linnea-quictest
 QUICTEST_OBJS = test/quic/linnea_quictest.o src/lib/linnea_quic_crypto.o \

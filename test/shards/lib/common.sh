@@ -113,6 +113,8 @@ P61701=$((PORTBASE + 701))
 P61702=$((PORTBASE + 702))
 P61703=$((PORTBASE + 703))
 P61704=$((PORTBASE + 704))   # the fast suite's short-interval websocket backend
+P61710=$((PORTBASE + 710))   # backend-TLS client handshake test (openssl s_server)
+P61711=$((PORTBASE + 711))   # backend-TLS client handshake test, HRR server
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 # What actually reached a proxy backend, appended to by test/proxy_backend.py.
