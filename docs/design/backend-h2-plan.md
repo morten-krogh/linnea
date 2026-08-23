@@ -229,6 +229,17 @@ after, reusing the proven translator; the TLS client gains an ALPN-`h2` offer.
   follow-ups). Config `proxy_h2` requires `proxy_tls`. Trap: the request head is
   at `out_ptr`/`out_rem`, not `up_buf`/`up_head_len`.
 
+- **Follow-ups DONE:** request bodies over h2 (`40ff960` — the driver's DATA
+  path fed from `file_ptr`/`file_rem`; 500 B + 500000 B byte-exact, 15 concurrent
+  POSTs) and **h3 clients** (`8138b7b` — synthesized response re-encoded through
+  the QPACK path `linnea_h3_proxy_head`/`_body`/`_deliver`; real curl-h3, small +
+  250000 B). tls shard 219/0.
+- **Follow-ups REMAINING:** h2 CLIENTS (Stage 1b — the `h2p` slot path, the big
+  one: run TLS+h2 inside the 285-line `linnea_h2p_event` slot machine, feed its
+  RELAY; deserves a focused session; h2 client → 502 until then); response-body
+  streaming (currently buffered ≤1 MiB); h3 + request body (spill sharing);
+  connection reuse (Stage 2 multiplexing, deferred by design).
+
 **Brick 3 (as designed) — resumable driver + proxy wiring.** Model
 on the TLS-client driver. A per-leg h2 context (in a reused arena keyed by
 conn.index, like the TLS handshake pool) holds the windows, an accumulate-in
