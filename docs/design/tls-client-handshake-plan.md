@@ -216,8 +216,18 @@ hard, novel, security-critical work):
   is now a thin wrapper over this same core. Proven vs openssl s_server at every
   fragment size (1..500-byte reads); the shard has a 1-byte-fragment check.
 
-**Remaining — io_uring wiring (the last piece; deep serving-path work, gate on a
-self-hosted proxy-over-TLS test + a green full suite):**
+- **io_uring wiring** (`754e57a`) — **DONE.** All three steps below are in
+  place and the route-(a) kTLS hazard (H3) is handled with control-record-aware
+  RECVMSG reads on the backend leg (`up_ktls_rx_record_type` / `up_ktls_prep_rx`,
+  the up_fd twin of the server's kTLS RX): a backend NewSessionTicket is skipped,
+  a close_notify becomes EOF. The per-leg arena pool moved to its own object
+  (`linnea_tls_client_pool.asm`) so the standalone harness stays free of
+  `linnea_memory_map`. TLS backend legs are never pooled (`linnea_http.asm`).
+  Validated self-hosted (linnea→linnea, pinned) in the tls shard: body relayed,
+  40 concurrent requests all 200, wrong pin → 502. **Full fast suite 774/0.**
+  Committed on branch `tls-client` (merge + deploy are the user's call).
+
+The three steps, as implemented:
 
 1. At `.connect_ok` (`linnea_uring.asm`) for a `proxy_tls` location: allocate a
    per-leg `linnea_tls_client_hs` arena (lazily-mapped pool keyed by conn index,
