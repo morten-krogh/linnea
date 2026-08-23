@@ -51,3 +51,62 @@ LINNEA_H2C_GOAWAY       equ -3       ; backend GOAWAY       -> caller 502
 ; The client's advertised receive windows: large, like the server's, so inbound
 ; WINDOW_UPDATE for the response body is rare.
 LINNEA_H2C_INITWIN      equ 4194304
+
+; Resumable driver states (linnea_h2c.state).
+LINNEA_H2C_ST_SEND_INIT equ 0   ; preface+SETTINGS+HEADERS staged, sending
+LINNEA_H2C_ST_SETTLE    equ 1   ; awaiting the server SETTINGS before body
+LINNEA_H2C_ST_SEND_BODY equ 2   ; streaming request DATA under flow control
+LINNEA_H2C_ST_RESP      equ 3   ; reading the response
+LINNEA_H2C_ST_DONE      equ 4
+LINNEA_H2C_ST_FAILED    equ 5
+
+; Driver step verdicts (rax from start / on_sent / on_recv).
+LINNEA_H2C_WANT_SEND    equ 0   ; arm a send of out_buf[out_sent .. out_len]
+LINNEA_H2C_WANT_RECV    equ 1   ; arm a recv, feed the bytes to on_recv
+LINNEA_H2C_DRV_DONE     equ 2   ; response complete; compose + relay
+LINNEA_H2C_DRV_FAIL     equ 3   ; wire/decode failure -> 502
+LINNEA_H2C_DRV_RST      equ 4   ; backend RST_STREAM -> 502
+LINNEA_H2C_DRV_GOAWAY   equ 5   ; backend GOAWAY -> 502
+
+; Per-leg driver buffer caps. Kept modest (per-leg arena, one per proxied conn).
+; IN_CAP must hold a retained partial frame (<= one max frame, ~16 KiB) plus a
+; whole fresh read; callers feed on_recv <= 32 KiB at a time.
+LINNEA_H2C_D_IN_CAP     equ 65536    ; recv accumulation (partial frame + a read)
+LINNEA_H2C_D_OUT_CAP    equ 32768    ; outbound staging
+LINNEA_H2C_D_BODY_CAP   equ 1048576  ; buffered response body (v1; stream later)
+
+; The resumable driver's per-leg context. Only CROSS-STEP state lives here; each
+; driver step is atomic on the worker, so the global scratch/carrier/decoder are
+; reused WITHIN a step (the header block is copied into the global decoder and
+; the results copied back), which reuses the whole tested h2c_decode unchanged.
+; The dynamic table persists here (it must survive across a header block, and any
+; trailer block). [h2c_ctx] points at the current leg before each driver entry.
+struc linnea_h2c
+    .state:        resq 1
+    .scheme:       resq 1
+    .stream_win:   resq 1        ; our stream-1 SEND window
+    .conn_win:     resq 1        ; connection SEND window
+    .status:       resq 1        ; decoded response :status
+    .hdrblk_len:   resq 1        ; reassembled response header block length
+    .hdrlines_len: resq 1        ; synthesized "name: value\r\n" bytes
+    .body_len:     resq 1        ; response body accumulated
+    ; request cursor (resumable body send)
+    .req_body:     resq 1
+    .req_body_len: resq 1
+    .body_sent:    resq 1
+    ; io staging
+    .out_len:      resq 1        ; bytes staged in .out_buf
+    .out_sent:     resq 1        ; bytes of .out_buf already sent
+    .in_len:       resq 1        ; bytes buffered in .in_buf awaiting a full frame
+    ; flags
+    .settled:      resq 1        ; server SETTINGS applied
+    .hdr_es:       resq 1        ; END_STREAM seen on the response HEADERS
+    .hdr_done:     resq 1        ; response header block decoded
+    ; embedded buffers + the decoder's persistent dynamic table
+    .dyn:          resb linnea_hpack_dyn_size
+    .hdrblk:       resb LINNEA_H2C_HDRBLK_CAP
+    .hdrlines:     resb LINNEA_H2C_HDRBLK_CAP
+    .body_buf:     resb LINNEA_H2C_D_BODY_CAP
+    .out_buf:      resb LINNEA_H2C_D_OUT_CAP
+    .in_buf:       resb LINNEA_H2C_D_IN_CAP
+endstruc

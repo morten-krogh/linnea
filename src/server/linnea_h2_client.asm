@@ -88,8 +88,8 @@ h2c_hdrlines_len: resq 1
 h2c_body_len:  resq 1
 h2c_stream_win: resq 1                          ; our stream-1 SEND window
 h2c_conn_win:  resq 1                           ; connection SEND window
-h2c_rx_len:    resq 1                           ; bytes buffered in h2c_frame_buf from a prior read
 h2c_scheme:    resq 1
+h2c_lit_form:  resq 1                           ; transient: current literal prefix width
 ; request-head parse spans
 h2c_m_ptr:     resq 1
 h2c_m_len:     resq 1
@@ -110,6 +110,9 @@ h2c_fr_len:    resq 1
 ; response assembly
 h2c_hdrblk_len: resq 1                           ; bytes in h2c_hdrblk
 h2c_hdr_es:    resq 1                            ; END_STREAM flag on the response HEADERS
+; --- resumable driver (proxy path): the current leg context, set at each driver
+; entry; the driver's own helpers read/write per-leg state through it. ---
+h2c_ctx:       resq 1
 
 section .text
 
@@ -131,7 +134,6 @@ linnea_h2c_exchange:
     mov qword [h2c_hdrlines_len], 0
     mov qword [h2c_body_len], 0
     mov qword [h2c_status], 0
-    mov qword [h2c_rx_len], 0
     mov qword [h2c_stream_win], 65535     ; default until server SETTINGS
     mov qword [h2c_conn_win], 65535
     mov r14, rsi                          ; h1 head ptr
@@ -1744,5 +1746,817 @@ reason_502_len equ $ - reason_502
 reason_503: db "Service Unavailable"
 reason_503_len equ $ - reason_503
 
+section .text
+; ============================================================================
+; Resumable driver (proxy io_uring path). Per-leg context via [h2c_ctx].
+; Reuses the tested pure helpers WITHIN a step; only cross-step state is per-leg.
+; ============================================================================
+global linnea_h2c_drv_start
+global linnea_h2c_drv_on_sent
+global linnea_h2c_drv_on_recv
+global linnea_h2c_drv_compose
+
+; d_out_append(rsi=ptr, rdx=len) — append to ctx.out_buf (rbx=ctx). CF on overflow.
+d_out_append:
+    mov rax, [rbx + linnea_h2c.out_len]
+    lea rcx, [rax + rdx]
+    cmp rcx, LINNEA_H2C_D_OUT_CAP
+    ja .of
+    push rsi
+    push rdi
+    lea rdi, [rbx + linnea_h2c.out_buf]
+    add rdi, rax
+    mov rcx, rdx
+    rep movsb
+    lea rax, [rbx + linnea_h2c.out_buf]
+    sub rdi, rax
+    mov [rbx + linnea_h2c.out_len], rdi
+    pop rdi
+    pop rsi
+    clc
+    ret
+.of:
+    stc
+    ret
+
+; d_stage_settings_ack() — stage a SETTINGS ACK (rbx=ctx).
+d_stage_settings_ack:
+    lea rsi, [d_ack_tmpl]
+    mov rdx, 9
+    jmp d_out_append
+section .rodata
+d_ack_tmpl: db 0,0,0, LINNEA_H2_FT_SETTINGS, LINNEA_H2_FL_ACK, 0,0,0,0
+section .text
+
+; d_stage_ping_ack(rsi=8-byte payload ptr) — stage a PING ACK (rbx=ctx).
+d_stage_ping_ack:
+    lea rdi, [d_scr]
+    mov byte [rdi],0
+    mov byte [rdi+1],0
+    mov byte [rdi+2],8
+    mov byte [rdi+3],LINNEA_H2_FT_PING
+    mov byte [rdi+4],LINNEA_H2_FL_ACK
+    mov dword [rdi+5],0
+    mov rax,[rsi]
+    mov [rdi+9],rax
+    lea rsi,[d_scr]
+    mov rdx,17
+    jmp d_out_append
 section .bss
-h2c_lit_form: resd 1
+d_scr: resb 32
+section .text
+
+; d_stage_window(edi=sid, esi=inc) — stage a WINDOW_UPDATE (rbx=ctx).
+d_stage_window:
+    push rbx
+    mov r8d, edi                       ; sid
+    mov r9d, esi                       ; inc
+    pop rbx
+    lea rax,[d_scr]
+    mov byte [rax],0
+    mov byte [rax+1],0
+    mov byte [rax+2],4
+    mov byte [rax+3],LINNEA_H2_FT_WINDOW
+    mov byte [rax+4],0
+    mov ecx,r8d
+    bswap ecx
+    mov [rax+5],ecx
+    mov ecx,r9d
+    bswap ecx
+    mov [rax+9],ecx
+    lea rsi,[d_scr]
+    mov rdx,13
+    jmp d_out_append
+
+; d_apply_settings(rsi=payload ptr, rcx=payload len) — set ctx.stream_win from
+; the server's INITIAL_WINDOW_SIZE (rbx=ctx).
+d_apply_settings:
+.l:
+    cmp rcx, 6
+    jb .done
+    movzx eax, byte [rsi]
+    shl eax, 8
+    movzx edx, byte [rsi+1]
+    or eax, edx
+    cmp eax, LINNEA_H2_SET_INITWIN
+    jne .next
+    movzx eax, byte [rsi+2]
+    shl eax,8
+    movzx edx, byte [rsi+3]
+    or eax,edx
+    shl eax,8
+    movzx edx, byte [rsi+4]
+    or eax,edx
+    shl eax,8
+    movzx edx, byte [rsi+5]
+    or eax,edx
+    mov [rbx + linnea_h2c.stream_win], rax
+.next:
+    add rsi,6
+    sub rcx,6
+    jmp .l
+.done:
+    ret
+
+; d_apply_window(rsi=payload ptr, rdi=sid) — grow ctx conn/stream send window.
+d_apply_window:
+    movzx eax, byte [rsi]
+    shl eax,8
+    movzx edx, byte [rsi+1]
+    or eax,edx
+    shl eax,8
+    movzx edx, byte [rsi+2]
+    or eax,edx
+    shl eax,8
+    movzx edx, byte [rsi+3]
+    or eax,edx
+    and eax, 0x7fffffff
+    test rdi, rdi
+    jnz .stream
+    add [rbx + linnea_h2c.conn_win], rax
+    ret
+.stream:
+    add [rbx + linnea_h2c.stream_win], rax
+    ret
+
+; d_decode_block() — decode ctx.hdrblk into ctx.status + ctx.hdrlines, reusing
+; the global decoder (wired to the per-leg dyn table). rbx=ctx. rax 0/-1.
+d_decode_block:
+    lea rax, [h2c_scratch]
+    mov [h2c_carrier + linnea_h2_req.scratch], rax
+    lea rcx, [rax + LINNEA_H2C_SCRATCH_CAP]
+    mov [h2c_carrier + linnea_h2_req.scratch_end], rcx
+    lea rdx, [rbx + linnea_h2c.dyn]
+    mov [h2c_carrier + linnea_h2_req.dyn], rdx
+    lea rsi, [rbx + linnea_h2c.hdrblk]
+    lea rdi, [h2c_hdrblk]
+    mov rcx, [rbx + linnea_h2c.hdrblk_len]
+    mov [h2c_hdrblk_len], rcx
+    rep movsb
+    mov qword [h2c_hdrlines_len], 0
+    mov qword [h2c_status], 0
+    call h2c_do_decode
+    test rax, rax
+    js .bad
+    mov rax, [h2c_status]
+    mov [rbx + linnea_h2c.status], rax
+    mov rcx, [h2c_hdrlines_len]
+    mov [rbx + linnea_h2c.hdrlines_len], rcx
+    lea rsi, [h2c_hdrlines]
+    lea rdi, [rbx + linnea_h2c.hdrlines]
+    rep movsb
+    xor eax, eax
+    ret
+.bad:
+    mov rax, -1
+    ret
+
+; d_stage_body() — stage the next request DATA chunk (rbx=ctx). Returns
+;   rax=0 staged (WANT_SEND), 1 window-blocked (WANT_RECV), 2 body complete.
+d_stage_body:
+    mov r8, [rbx + linnea_h2c.req_body_len]
+    sub r8, [rbx + linnea_h2c.body_sent]      ; remaining
+    jz .complete
+    mov r9, [rbx + linnea_h2c.stream_win]
+    mov rax, [rbx + linnea_h2c.conn_win]
+    cmp rax, r9
+    jae .m1
+    mov r9, rax
+.m1:
+    test r9, r9
+    jle .blocked
+    cmp r9, 16384
+    jbe .m2
+    mov r9, 16384
+.m2:
+    cmp r9, r8
+    jbe .m3
+    mov r9, r8                                 ; n = min(win,16384,remaining)
+.m3:
+    ; DATA frame header into d_scr, then append header + payload to out
+    lea rdi, [d_scr]
+    mov rax, r9
+    shr rax, 16
+    mov [rdi], al
+    mov rax, r9
+    shr rax, 8
+    mov [rdi+1], al
+    mov [rdi+2], r9b
+    mov byte [rdi+3], LINNEA_H2_FT_DATA
+    mov rax, [rbx + linnea_h2c.body_sent]
+    add rax, r9
+    cmp rax, [rbx + linnea_h2c.req_body_len]
+    jne .nl
+    mov byte [rdi+4], LINNEA_H2_FL_END_STREAM
+    jmp .fh
+.nl:
+    mov byte [rdi+4], 0
+.fh:
+    mov dword [rdi+5], 0x01000000
+    lea rsi, [d_scr]
+    mov rdx, 9
+    call d_out_append
+    jc .fail
+    mov rsi, [rbx + linnea_h2c.req_body]
+    add rsi, [rbx + linnea_h2c.body_sent]
+    mov rdx, r9
+    call d_out_append
+    jc .fail
+    sub [rbx + linnea_h2c.stream_win], r9
+    sub [rbx + linnea_h2c.conn_win], r9
+    add [rbx + linnea_h2c.body_sent], r9
+    xor eax, eax
+    ret
+.blocked:
+    mov rax, 1
+    ret
+.complete:
+    mov rax, 2
+    ret
+.fail:
+    mov rax, 1                                 ; treat as blocked (shouldn't happen)
+    ret
+
+; linnea_h2c_drv_start(rdi=ctx, rsi=h1head, rdx=h1len, rcx=body, r8=bodylen,
+;                      r9=scheme) -> rax verdict.
+linnea_h2c_drv_start:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [h2c_ctx], rdi
+    mov rbx, rdi
+    mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_SEND_INIT
+    mov [rbx+linnea_h2c.scheme], r9
+    mov qword [rbx+linnea_h2c.stream_win], 65535
+    mov qword [rbx+linnea_h2c.conn_win], 65535
+    mov qword [rbx+linnea_h2c.status], 0
+    mov qword [rbx+linnea_h2c.hdrblk_len], 0
+    mov qword [rbx+linnea_h2c.hdrlines_len], 0
+    mov qword [rbx+linnea_h2c.body_len], 0
+    mov [rbx+linnea_h2c.req_body], rcx
+    mov [rbx+linnea_h2c.req_body_len], r8
+    mov qword [rbx+linnea_h2c.body_sent], 0
+    mov qword [rbx+linnea_h2c.out_len], 0
+    mov qword [rbx+linnea_h2c.out_sent], 0
+    mov qword [rbx+linnea_h2c.in_len], 0
+    mov qword [rbx+linnea_h2c.settled], 0
+    mov qword [rbx+linnea_h2c.hdr_es], 0
+    mov qword [rbx+linnea_h2c.hdr_done], 0
+    lea rdi, [rbx+linnea_h2c.dyn]
+    call hpack_dyn_reset
+    mov r9, [rbx+linnea_h2c.scheme]
+    mov [h2c_scheme], r9
+    mov r14, rsi
+    mov r15, rdx
+    call h2c_build_headers               ; -> rax = block len in h2c_hdrblk
+    test rax, rax
+    js .fail
+    mov r12, rax
+    lea rdi, [rbx+linnea_h2c.out_buf]
+    lea rsi, [h2c_preface]
+    mov rcx, h2c_preface_len
+    rep movsb
+    mov byte [rdi],0
+    mov byte [rdi+1],0
+    mov byte [rdi+2],6
+    mov byte [rdi+3],LINNEA_H2_FT_SETTINGS
+    mov byte [rdi+4],0
+    mov dword [rdi+5],0
+    add rdi,9
+    mov byte [rdi],0
+    mov byte [rdi+1],LINNEA_H2_SET_INITWIN
+    mov byte [rdi+2],(LINNEA_H2C_INITWIN>>24)&0xff
+    mov byte [rdi+3],(LINNEA_H2C_INITWIN>>16)&0xff
+    mov byte [rdi+4],(LINNEA_H2C_INITWIN>>8)&0xff
+    mov byte [rdi+5],LINNEA_H2C_INITWIN&0xff
+    add rdi,6
+    mov rax,r12
+    shr rax,16
+    mov [rdi],al
+    mov rax,r12
+    shr rax,8
+    mov [rdi+1],al
+    mov [rdi+2],r12b
+    mov byte [rdi+3],LINNEA_H2_FT_HEADERS
+    mov al, LINNEA_H2_FL_END_HEADERS
+    cmp qword [rbx+linnea_h2c.req_body_len],0
+    jne .hb
+    or al, LINNEA_H2_FL_END_STREAM
+.hb:
+    mov [rdi+4],al
+    mov dword [rdi+5],0x01000000
+    add rdi,9
+    lea rsi,[h2c_hdrblk]
+    mov rcx,r12
+    rep movsb
+    lea rax,[rbx+linnea_h2c.out_buf]
+    sub rdi,rax
+    mov [rbx+linnea_h2c.out_len],rdi
+    mov rax, LINNEA_H2C_WANT_SEND
+    jmp .ret
+.fail:
+    mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_FAILED
+    mov rax, LINNEA_H2C_DRV_FAIL
+.ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_h2c_drv_on_sent(rdi=ctx, rsi=nsent) -> rax verdict.
+linnea_h2c_drv_on_sent:
+    push rbx
+    mov [h2c_ctx], rdi
+    mov rbx, rdi
+    add [rbx+linnea_h2c.out_sent], rsi
+    mov rax,[rbx+linnea_h2c.out_sent]
+    cmp rax,[rbx+linnea_h2c.out_len]
+    jb .more
+    mov qword [rbx+linnea_h2c.out_sent],0
+    mov qword [rbx+linnea_h2c.out_len],0
+    mov rax,[rbx+linnea_h2c.state]
+    cmp rax, LINNEA_H2C_ST_SEND_INIT
+    je .after_init
+    cmp rax, LINNEA_H2C_ST_SEND_BODY
+    je .after_body
+    mov rax, LINNEA_H2C_WANT_RECV
+    jmp .ret
+.after_init:
+    cmp qword [rbx+linnea_h2c.req_body_len],0
+    je .to_resp
+    mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_SETTLE
+    mov rax, LINNEA_H2C_WANT_RECV
+    jmp .ret
+.to_resp:
+    mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_RESP
+    mov rax, LINNEA_H2C_WANT_RECV
+    jmp .ret
+.after_body:
+    call d_stage_body
+    cmp rax, 0
+    je .want_send
+    cmp rax, 2
+    je .to_resp
+    mov rax, LINNEA_H2C_WANT_RECV
+    jmp .ret
+.want_send:
+    mov rax, LINNEA_H2C_WANT_SEND
+    jmp .ret
+.more:
+    mov rax, LINNEA_H2C_WANT_SEND
+.ret:
+    pop rbx
+    ret
+
+; linnea_h2c_drv_on_recv(rdi=ctx, rsi=data, rdx=len) -> rax verdict.
+; Accumulates into ctx.in_buf, parses every complete frame, and dispatches.
+linnea_h2c_drv_on_recv:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [h2c_ctx], rdi
+    mov rbx, rdi
+    ; append data to in_buf (bounded)
+    mov rax, [rbx+linnea_h2c.in_len]
+    lea r12, [rax + rdx]                ; new in_len
+    cmp r12, LINNEA_H2C_D_IN_CAP
+    ja .fail
+    lea rdi, [rbx+linnea_h2c.in_buf]
+    add rdi, rax
+    mov rcx, rdx
+    rep movsb
+    mov [rbx+linnea_h2c.in_len], r12
+    ; --- parse frames from in_buf[0 .. in_len) ---
+    xor r13, r13                        ; parse offset
+.parse:
+    mov r14, [rbx+linnea_h2c.in_len]
+    mov rax, r13
+    add rax, 9
+    cmp rax, r14
+    ja .compact                        ; < 9 bytes: need more
+    lea rsi, [rbx+linnea_h2c.in_buf]
+    add rsi, r13                        ; frame start
+    ; length (24-bit)
+    movzx eax, byte [rsi]
+    shl eax,8
+    movzx ecx, byte [rsi+1]
+    or eax,ecx
+    shl eax,8
+    movzx ecx, byte [rsi+2]
+    or eax,ecx
+    mov r15, rax                        ; frame payload len
+    mov rax, r13
+    add rax, 9
+    add rax, r15
+    cmp rax, r14
+    ja .compact                        ; frame not fully present
+    ; dispatch on type
+    movzx eax, byte [rsi+3]            ; type
+    movzx ecx, byte [rsi+4]           ; flags
+    mov [d_fr_flags], rcx
+    mov ecx, [rsi+5]
+    bswap ecx
+    and ecx, 0x7fffffff
+    mov [d_fr_sid], rcx
+    lea r12, [rsi+9]                   ; payload ptr
+    ; advance parse offset past this frame now
+    add r13, 9
+    add r13, r15
+    call d_dispatch                    ; rax: 0 ok, negative sentinel to return
+    test rax, rax
+    js .propagate
+    jmp .parse
+.compact:
+    ; move the unparsed tail [r13 .. in_len) to the front
+    mov r14, [rbx+linnea_h2c.in_len]
+    sub r14, r13                       ; remaining
+    test r13, r13
+    jz .no_move
+    lea rsi, [rbx+linnea_h2c.in_buf]
+    add rsi, r13
+    lea rdi, [rbx+linnea_h2c.in_buf]
+    mov rcx, r14
+    rep movsb
+.no_move:
+    mov [rbx+linnea_h2c.in_len], r14
+    ; mid-upload with the window reopened (or just settled): stage the next DATA
+    cmp qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_SEND_BODY
+    jne .chk_done
+    call d_stage_body
+    cmp rax, 2
+    jne .chk_done
+    mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_RESP
+.chk_done:
+    ; response complete?
+    cmp qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_DONE
+    je .done
+    ; output staged?
+    mov rax, [rbx+linnea_h2c.out_len]
+    cmp rax, [rbx+linnea_h2c.out_sent]
+    ja .want_send
+    mov rax, LINNEA_H2C_WANT_RECV
+    jmp .ret
+.want_send:
+    mov rax, LINNEA_H2C_WANT_SEND
+    jmp .ret
+.done:
+    mov rax, LINNEA_H2C_DRV_DONE
+    jmp .ret
+.propagate:
+    ; rax holds a negative sentinel: map to verdict
+    cmp rax, -2
+    je .rst
+    cmp rax, -3
+    je .goaway
+    mov rax, LINNEA_H2C_DRV_FAIL
+    jmp .ret
+.rst:
+    mov rax, LINNEA_H2C_DRV_RST
+    jmp .ret
+.goaway:
+    mov rax, LINNEA_H2C_DRV_GOAWAY
+    jmp .ret
+.fail:
+    mov rax, LINNEA_H2C_DRV_FAIL
+.ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; d_dispatch() — process one parsed frame. rbx=ctx, eax=type, r12=payload ptr,
+; r15=payload len, [d_fr_flags]/[d_fr_sid] set. Returns rax=0 ok, or -1/-2/-3.
+d_dispatch:
+    cmp eax, LINNEA_H2_FT_SETTINGS
+    je .settings
+    cmp eax, LINNEA_H2_FT_WINDOW
+    je .window
+    cmp eax, LINNEA_H2_FT_PING
+    je .ping
+    cmp eax, LINNEA_H2_FT_HEADERS
+    je .headers
+    cmp eax, LINNEA_H2_FT_CONT
+    je .cont
+    cmp eax, LINNEA_H2_FT_DATA
+    je .data
+    cmp eax, LINNEA_H2_FT_RST
+    je .rst
+    cmp eax, LINNEA_H2_FT_GOAWAY
+    je .goaway
+    xor eax, eax                        ; ignore unknown
+    ret
+.settings:
+    mov rax, [d_fr_flags]
+    test rax, LINNEA_H2_FL_ACK
+    jnz .ok
+    mov rsi, r12
+    mov rcx, r15
+    call d_apply_settings
+    call d_stage_settings_ack
+    mov qword [rbx+linnea_h2c.settled], 1
+    ; if we were settling before the body, start sending it now; the actual
+    ; staging happens in on_recv's post-parse step (uniform with WINDOW_UPDATE).
+    cmp qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_SETTLE
+    jne .ok
+    mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_SEND_BODY
+.ok:
+    xor eax, eax
+    ret
+.window:
+    mov rsi, r12
+    mov rdi, [d_fr_sid]
+    call d_apply_window
+    xor eax, eax
+    ret
+.ping:
+    mov rax, [d_fr_flags]
+    test rax, LINNEA_H2_FL_ACK
+    jnz .ok
+    mov rsi, r12
+    call d_stage_ping_ack
+    xor eax, eax
+    ret
+.headers:
+    cmp qword [d_fr_sid], 1
+    jne .ok
+    mov rax, [d_fr_flags]
+    and rax, LINNEA_H2_FL_END_STREAM
+    mov [rbx+linnea_h2c.hdr_es], rax
+    mov rsi, r12
+    mov rdx, r15
+    mov rax, [d_fr_flags]
+    test rax, LINNEA_H2_FL_PADDED
+    jz .h_np
+    movzx ecx, byte [rsi]
+    inc rsi
+    dec rdx
+    sub rdx, rcx
+.h_np:
+    test rax, LINNEA_H2_FL_PRIORITY
+    jz .h_npr
+    add rsi, 5
+    sub rdx, 5
+.h_npr:
+    call d_hdrblk_append
+    test rax, rax
+    js .bad
+    mov rax, [d_fr_flags]
+    test rax, LINNEA_H2_FL_END_HEADERS
+    jz .ok
+    call d_decode_block
+    test rax, rax
+    js .bad
+    mov qword [rbx+linnea_h2c.hdr_done], 1
+    cmp qword [rbx+linnea_h2c.hdr_es], 0
+    jne .complete
+    xor eax, eax
+    ret
+.cont:
+    cmp qword [d_fr_sid], 1
+    jne .ok
+    mov rsi, r12
+    mov rdx, r15
+    call d_hdrblk_append
+    test rax, rax
+    js .bad
+    mov rax, [d_fr_flags]
+    test rax, LINNEA_H2_FL_END_HEADERS
+    jz .ok
+    call d_decode_block
+    test rax, rax
+    js .bad
+    mov qword [rbx+linnea_h2c.hdr_done], 1
+    cmp qword [rbx+linnea_h2c.hdr_es], 0
+    jne .complete
+    xor eax, eax
+    ret
+.data:
+    cmp qword [d_fr_sid], 1
+    jne .ok
+    mov rsi, r12
+    mov rdx, r15
+    mov rax, [d_fr_flags]
+    test rax, LINNEA_H2_FL_PADDED
+    jz .d_np
+    movzx ecx, byte [rsi]
+    inc rsi
+    dec rdx
+    sub rdx, rcx
+.d_np:
+    call d_body_append
+    test rax, rax
+    js .bad
+    ; return flow-control credit for the whole frame payload
+    test r15, r15
+    jz .d_es
+    mov esi, r15d
+    xor edi, edi
+    call d_stage_window
+    mov esi, r15d
+    mov edi, 1
+    call d_stage_window
+.d_es:
+    mov rax, [d_fr_flags]
+    test rax, LINNEA_H2_FL_END_STREAM
+    jnz .complete
+    xor eax, eax
+    ret
+.complete:
+    mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_DONE
+    xor eax, eax
+    ret
+.rst:
+    mov rax, -2
+    ret
+.goaway:
+    mov rax, -3
+    ret
+.bad:
+    mov rax, -1
+    ret
+
+; d_hdrblk_append(rsi=ptr, rdx=len) — append to ctx.hdrblk (rbx=ctx). rax 0/-1.
+d_hdrblk_append:
+    test rdx, rdx
+    js .of
+    mov rax, [rbx+linnea_h2c.hdrblk_len]
+    lea rcx, [rax+rdx]
+    cmp rcx, LINNEA_H2C_HDRBLK_CAP
+    ja .of
+    push rsi
+    lea rdi, [rbx+linnea_h2c.hdrblk]
+    add rdi, rax
+    mov rcx, rdx
+    rep movsb
+    pop rsi
+    lea rax, [rbx+linnea_h2c.hdrblk]
+    sub rdi, rax
+    mov [rbx+linnea_h2c.hdrblk_len], rdi
+    xor eax, eax
+    ret
+.of:
+    mov rax, -1
+    ret
+
+; d_body_append(rsi=ptr, rdx=len) — append to ctx.body_buf (rbx=ctx). rax 0/-1.
+d_body_append:
+    test rdx, rdx
+    js .of
+    jz .ok
+    mov rax, [rbx+linnea_h2c.body_len]
+    lea rcx, [rax+rdx]
+    cmp rcx, LINNEA_H2C_D_BODY_CAP
+    ja .of
+    push rsi
+    lea rdi, [rbx+linnea_h2c.body_buf]
+    add rdi, rax
+    mov rcx, rdx
+    rep movsb
+    pop rsi
+    lea rax, [rbx+linnea_h2c.body_buf]
+    sub rdi, rax
+    mov [rbx+linnea_h2c.body_len], rdi
+.ok:
+    xor eax, eax
+    ret
+.of:
+    mov rax, -1
+    ret
+
+; linnea_h2c_drv_compose(rdi=ctx, rsi=out) -> rax = length. Writes the h1
+; response (status line + headers + content-length + body) to `out`.
+linnea_h2c_drv_compose:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r13, rsi                        ; out cursor
+    mov rdi, r13
+    lea rsi, [http11]
+    mov rcx, http11_len
+    rep movsb
+    mov rax, [rbx+linnea_h2c.status]
+    call h2c_dec3
+    mov byte [rdi], ' '
+    inc rdi
+    mov eax, [rbx+linnea_h2c.status]
+    mov r12, rdi
+    call h2c_reason
+    mov rdi, r12
+    mov rcx, rdx
+    rep movsb
+    mov byte [rdi],13
+    mov byte [rdi+1],10
+    add rdi,2
+    lea rsi, [rbx+linnea_h2c.hdrlines]
+    mov rcx, [rbx+linnea_h2c.hdrlines_len]
+    rep movsb
+    lea rsi, [hdr_cl]
+    mov rcx, hdr_cl_len
+    rep movsb
+    mov rax, [rbx+linnea_h2c.body_len]
+    call h2c_u64_dec
+    mov byte [rdi],13
+    mov byte [rdi+1],10
+    add rdi,2
+    mov byte [rdi],13
+    mov byte [rdi+1],10
+    add rdi,2
+    lea rsi, [rbx+linnea_h2c.body_buf]
+    mov rcx, [rbx+linnea_h2c.body_len]
+    rep movsb
+    mov rax, rdi
+    sub rax, r13
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+section .bss
+d_fr_flags: resq 1
+d_fr_sid:   resq 1
+h2c_drv_ctx: resb linnea_h2c_size          ; the test driver's leg context
+section .text
+
+; linnea_h2c_drv_blocking(rdi=fd, rsi=h1head, rdx=h1len, rcx=body, r8=bodylen,
+;   r9=scheme) -> rax = length in linnea_h2c_resp_buf, or -1. Drives the
+; RESUMABLE driver over a blocking socket (test entry: proves the async driver
+; produces the same result as the blocking exchange, over the fixture).
+global linnea_h2c_drv_blocking
+linnea_h2c_drv_blocking:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r14d, edi
+    lea rdi, [h2c_drv_ctx]
+    call linnea_h2c_drv_start
+    mov r13, rax
+.loop:
+    cmp r13, LINNEA_H2C_WANT_SEND
+    je .snd
+    cmp r13, LINNEA_H2C_WANT_RECV
+    je .rcv
+    cmp r13, LINNEA_H2C_DRV_DONE
+    je .done
+    mov rax, -1
+    jmp .ret
+.snd:
+    lea rbx, [h2c_drv_ctx]
+    mov r12, [rbx+linnea_h2c.out_len]
+    sub r12, [rbx+linnea_h2c.out_sent]
+    lea rsi, [rbx+linnea_h2c.out_buf]
+    add rsi, [rbx+linnea_h2c.out_sent]
+    mov edi, r14d
+    mov rdx, r12
+    call h2c_send_all
+    test rax, rax
+    js .fail
+    lea rdi, [h2c_drv_ctx]
+    mov rsi, r12
+    call linnea_h2c_drv_on_sent
+    mov r13, rax
+    jmp .loop
+.rcv:
+    mov rdx, 20480
+    mov rax, [h2c_chunk_cap]
+    test rax, rax
+    jz .rgo
+    cmp rax, rdx
+    jae .rgo
+    mov rdx, rax
+.rgo:
+    mov eax, LINNEA_SYS_READ
+    mov edi, r14d
+    lea rsi, [h2c_frame_buf]
+    syscall
+    test rax, rax
+    jle .fail
+    lea rdi, [h2c_drv_ctx]
+    lea rsi, [h2c_frame_buf]
+    mov rdx, rax
+    call linnea_h2c_drv_on_recv
+    mov r13, rax
+    jmp .loop
+.done:
+    lea rdi, [h2c_drv_ctx]
+    lea rsi, [linnea_h2c_resp_buf]
+    call linnea_h2c_drv_compose
+    jmp .ret
+.fail:
+    mov rax, -1
+.ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+

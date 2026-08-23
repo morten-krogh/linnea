@@ -14,6 +14,7 @@ default rel
 
 global _start
 extern linnea_h2c_exchange
+extern linnea_h2c_drv_blocking
 extern linnea_h2c_resp_buf
 extern h2c_chunk_cap
 
@@ -32,6 +33,7 @@ head_buf:  resb 4096
 body_buf:  resb 1048576
 head_len:  resq 1
 body_len:  resq 1
+use_drv:   resq 1
 
 section .text
 _start:
@@ -70,6 +72,15 @@ _start:
     call atoi
     mov [h2c_chunk_cap], rax
 .nochunk:
+    ; optional argv[5] = "drv" -> exercise the RESUMABLE driver instead
+    mov qword [use_drv], 0
+    cmp qword [rbp], 6
+    jl .nomode
+    mov rax, [rbp + 48]
+    cmp byte [rax], 'd'
+    jne .nomode
+    mov qword [use_drv], 1
+.nomode:
 
     ; --- build the h1 request head: "METHOD PATH HTTP/1.1\r\nHost: ...\r\n\r\n"
     lea rdi, [head_buf]
@@ -128,14 +139,20 @@ _start:
     test rax, rax
     js .fail
 
-    ; --- exchange ---
+    ; --- exchange (blocking) or drive the resumable driver ---
     mov edi, r14d
     lea rsi, [head_buf]
     mov rdx, [head_len]
     lea rcx, [body_buf]
     mov r8, [body_len]
     mov r9, LINNEA_H2_SCHEME_HTTP
+    cmp qword [use_drv], 0
+    jne .drv
     call linnea_h2c_exchange
+    jmp .after_ex
+.drv:
+    call linnea_h2c_drv_blocking
+.after_ex:
     test rax, rax
     js .fail
 
