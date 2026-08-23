@@ -177,6 +177,40 @@ h2c decouples wire correctness from TLS:
 - Wire into the shard fixtures + `test/configs` per the config map; keep the build
   warning-free.
 
+## Implementation approach (decided 2026-08-23, build start)
+
+**The leg is an h1↔h2 translator around the existing normalized h1 form.** The
+proxy already normalizes every client request (h1/h2/h3) to an **h1 request head**
+in `up_buf` (what the h1 backend leg sends) and relays backend responses as **h1
+response bytes** that the client-facing path re-serializes for h1/h2/h3. So the
+h2 leg does not need a new response model wired through the whole proxy: it
+**parses the h1 request head → HPACK HEADERS block** (+ DATA from the spill file),
+and **synthesizes an h1 response head** (`HTTP/1.1 <status> \r\n` + header lines)
+from the decoded h2 response, streaming DATA as the body. Everything downstream is
+untouched. This is the "response normalization is the integration seam," made
+concrete: normalize to h1 wire form, not a struct.
+
+**Response HPACK decode reuses the hard primitives without touching the audited
+request path.** `linnea_hpack_decode`/`emit_field` are request-shaped and heavily
+audited; instead the new file carries its own block-walk (a faithful copy of the
+`linnea_hpack_decode` control flow — indexed/literal/tsize, walk-on-after-fault,
+scratch return) that calls the already-`global` primitives `hpack_int`/`hpack_str`
+/`hpack_huffman` and the dyn-table helpers `hpack_dyn_get`/`hpack_dyn_insert`/
+`hpack_dyn_evict` (newly exported, read-only reuse). **Register discipline is
+inherited exactly**: `rbx` = a `linnea_h2_req` used purely as the scratch/dyn
+carrier (those primitives read `[rbx+.scratch]`/`[rbx+.scratch_end]` and take the
+carrier in `rdx`), `r12` = cursor, `r13` = end. The encoder is reimplemented
+locally (trivial, stateless: static-index refs + literals, as the probe does) so
+the new subsystem stays decoupled.
+
+**Test lever: a pure-stdlib h2c server** (`test/h2/h2c_server.py`) — no h2 tooling
+or Python h2 lib exists on the box — with a minimal HPACK codec covering exactly
+the forms the leg emits/consumes (static table + literals + Huffman + one dynamic
+insert/reference, raw and Huffman values). The blocking translator is tested over
+plaintext h2c against it first (fast, TLS-decoupled), mirroring how the TLS client
+was proven against `openssl s_server`. TLS+ALPN(`h2`) and the proxy wiring come
+after, reusing the proven translator; the TLS client gains an ALPN-`h2` offer.
+
 ## Sequencing / definition of done
 
 0. **Read linnea-probe's h2 client**; lift the client preface / request-encode /

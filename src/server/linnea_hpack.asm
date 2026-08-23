@@ -37,6 +37,13 @@ global hpack_huffman
 global emit_field
 global linnea_hpack_req_check
 global hpack_dyn_reset
+; exported for the backend h2 client's response decoder (linnea_h2_client.asm),
+; which walks a response block over these same primitives + static table.
+global hpack_dyn_get
+global hpack_dyn_insert
+global hpack_dyn_evict
+global hpack_static_tab
+global hpack_static_blob
 
 extern linnea_string_to_u64
 extern linnea_string_is_token
