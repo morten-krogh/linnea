@@ -211,6 +211,45 @@ plaintext h2c against it first (fast, TLS-decoupled), mirroring how the TLS clie
 was proven against `openssl s_server`. TLS+ALPN(`h2`) and the proxy wiring come
 after, reusing the proven translator; the TLS client gains an ALPN-`h2` offer.
 
+## Build status (2026-08-23) and the brick-3 plan
+
+- **Brick 1 DONE** (`c172b96`): blocking `linnea_h2c_exchange`, proven over h2c
+  (GET/POST/echo/large/flow-control/fragmented/GOAWAY/RST). The pure helpers
+  (`h2c_build_headers`, `h2c_decode`, `h2c_compose`, `h2c_apply_settings`/
+  `_window`, the HPACK encode/decode) are I/O-free and reused as-is by the driver.
+- **Brick 2 DONE** (`d6a1011`): TLS client offers ALPN `h2` via `hs.alpn_sel`;
+  `location.proxy_h2` field added; `.connect_tls` sets `alpn_sel` per connect.
+
+**Brick 3 — resumable driver + proxy wiring (the large remaining piece).** Model
+on the TLS-client driver. A per-leg h2 context (in a reused arena keyed by
+conn.index, like the TLS handshake pool) holds the windows, an accumulate-in
+buffer, a staged-out buffer, the reassembly buffers, the `linnea_h2_req` carrier
++ dyn table, and the request cursor. Interface:
+
+- `h2c_drv_start(ctx, h1head, h1len, body, bodylen, scheme)` → stages
+  preface+SETTINGS+HEADERS into `ctx.out`; state SEND_INIT. Caller arms a send.
+- `h2c_drv_on_sent(ctx)` → advance `out_sent`; by state: SEND_INIT → (body ?
+  SETTLE : RESP), WANT_RECV; SEND_BODY → stage next DATA up to the window, or
+  WANT_RECV when the window is spent, or RESP when the body is done.
+- `h2c_drv_on_recv(ctx, data, len)` → append to `ctx.in`; parse every COMPLETE
+  frame (non-blocking `next_frame`: "need more" if short); apply
+  SETTINGS/WINDOW/PING (staging ACKs/WINDOW_UPDATE into `ctx.out`), collect
+  HEADERS/CONTINUATION → decode, DATA → body; returns WANT_SEND (drain `ctx.out`),
+  WANT_RECV, DONE, or FAIL. On DONE the synthesized h1 response is in `ctx.resp`.
+
+Return codes drive one io_uring op at a time (arm send of `ctx.out[out_sent..]`,
+or arm recv into a scratch fed to on_recv), exactly like the TLS_HS branch.
+
+**THE INTEGRATION SEAM (identified, not yet built).** After the kTLS handoff a
+`proxy_h2` leg enters a new `proxy_state` LINNEA_PROXY_H2 (=11) instead of
+SENDING. The driver runs to DONE, producing the h1 response **in a buffer, not
+from a socket read** — so it must be injected into whatever consumes the h1
+backend response head today (the `.head_data`/`.relay_recv` path). The open task
+is to feed `ctx.resp` into that consumer as if it had been read from `up_fd`
+(the normalization seam). Study `.head_data` (response head parse) and the relay
+buffers before wiring. Body: v1 buffers the whole response body in `ctx`; a later
+pass can stream it. Stage 1b (h2 clients / `h2p` path) follows Stage 1a.
+
 ## Sequencing / definition of done
 
 0. **Read linnea-probe's h2 client**; lift the client preface / request-encode /
