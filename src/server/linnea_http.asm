@@ -3047,6 +3047,16 @@ linnea_http_handle:
     mov [rbx + linnea_connection.up_backend], rax
     mov qword [rbx + linnea_connection.up_tries], 1
     mov qword [rbx + linnea_connection.up_pooled], 0
+    ; A TLS backend leg is never pooled: a parked kTLS socket carries kernel
+    ; crypto state the pool does not track, and the plaintext-head retry would
+    ; write cleartext onto a socket expecting records. Force a fresh connect
+    ; (hence a fresh handshake) every time, and never park it.
+    mov rax, [rbx + linnea_connection.location]
+    cmp qword [rax + linnea_config_location.proxy_tls], 0
+    je .up_pool_ok
+    mov qword [rbx + linnea_connection.up_reusable], 0
+    jmp .up_fresh
+.up_pool_ok:
     ; A reusable leg looks in the pool BEFORE the ceiling is consulted: a parked
     ; connection is already counted against it, so making a request wait for
     ; headroom it does not need would be the ceiling refusing its own inventory.

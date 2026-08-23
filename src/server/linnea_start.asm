@@ -64,6 +64,7 @@ extern linnea_network_listen_all
 extern linnea_network_write_port_file
 extern linnea_connections_init
 extern linnea_h2p_init
+extern linnea_tls_client_pool_init
 extern linnea_uring_run
 extern linnea_print_stdout
 extern linnea_error_usage
@@ -682,6 +683,8 @@ spawn_worker:
     call linnea_connections_init
     mov rdi, [linnea_config_instance + linnea_config.max_connections]
     call linnea_h2p_init                  ; proxy-over-h2 upstream slots
+    mov rdi, [linnea_config_instance + linnea_config.max_connections]
+    call linnea_tls_client_pool_init      ; backend-TLS handshake arenas
     lea rdi, [linnea_config_instance]
     call linnea_uring_run      ; never returns
 .orphan:

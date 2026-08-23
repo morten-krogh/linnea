@@ -115,6 +115,9 @@ P61703=$((PORTBASE + 703))
 P61704=$((PORTBASE + 704))   # the fast suite's short-interval websocket backend
 P61710=$((PORTBASE + 710))   # backend-TLS client handshake test (openssl s_server)
 P61711=$((PORTBASE + 711))   # backend-TLS client handshake test, HRR server
+P61712=$((PORTBASE + 712))   # backend-TLS e2e: the linnea TLS BACKEND
+P61713=$((PORTBASE + 713))   # backend-TLS e2e: the pinning FRONT (good pin)
+P61714=$((PORTBASE + 714))   # backend-TLS e2e: the pinning front, wrong pin
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 # What actually reached a proxy backend, appended to by test/proxy_backend.py.

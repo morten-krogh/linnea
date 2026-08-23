@@ -51,6 +51,10 @@ LINNEA_PROXY_H3BODY     equ 9      ; an HTTP/3-owned leg capturing the upstream
                                    ; goes out as QUIC stream chunks once whole —
                                    ; so the response is buffered exactly as an
                                    ; oversized request body is on the way in.
+LINNEA_PROXY_TLS_HS     equ 10     ; running the TLS 1.3 client handshake to a
+                                   ; proxy_tls backend, before the request is
+                                   ; sent; driven by linnea_tls_client_input,
+                                   ; then the backend fd is handed to kTLS
 
 ; conn.chunk_state — where an incremental chunked decode stopped. The states
 ; are per BYTE, not per line: any of these boundaries can fall between two
@@ -358,6 +362,19 @@ struc linnea_connection
     ; A peer asked for a KeyUpdate of our own (RFC 8446 4.6.3 update_requested)
     ; and a send was in flight, so it waits for that send to complete.
     .ku_pending:     resq 1
+    ; --- backend TLS (proxy_tls): the UP leg's kTLS RX, separate from the
+    ; client-facing rx_* above because for an h2 client both are live at once.
+    ; up_ktls flips to 1 at the backend kTLS handoff; from then the up-leg reads
+    ; are RECVMSG so a backend NewSessionTicket/control record is skipped rather
+    ; than failing the plain recv with -EIO.
+    .up_ktls:        resq 1
+    .up_rx_msg:      resb LINNEA_KTLS_MSGHDR_SIZE
+    .up_rx_iov:      resb LINNEA_KTLS_IOVEC_SIZE
+    .up_rx_cmsg:     resb LINNEA_KTLS_CMSG_SIZE
+    .up_rx_msg_armed: resq 1
+    .up_rx_rectype:  resq 1
+    .up_rx_buf:      resq 1    ; the last up-leg read's buffer + length, so a
+    .up_rx_len:      resq 1    ; skipped control record re-arms it identically
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

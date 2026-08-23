@@ -43,6 +43,7 @@ default rel
 %include "linnea_quic_conn.inc"
 %include "linnea_tls.inc"
 %include "linnea_http2.inc"
+%include "linnea_tls_client.inc"
 
 global linnea_uring_run
 global drain_flag
@@ -110,6 +111,9 @@ extern linnea_tls_hs_init
 extern linnea_tls_hs_input
 extern linnea_tls_drain_early
 extern linnea_ktls_enable
+extern linnea_tls_client_start
+extern linnea_tls_client_input
+extern linnea_tls_client_hs_for
 extern linnea_ktls_rekey_rx
 extern linnea_ktls_rekey_tx
 extern linnea_ktls_key_update
@@ -2247,9 +2251,33 @@ linnea_uring_run:
     ; out every time would have its counter zeroed on each connect and could
     ; never reach the threshold. It is also the wrong place now that a pooled
     ; connection skips the connect entirely.
+    ; A proxy_tls backend runs the TLS 1.3 client handshake first; the request
+    ; goes out only after the kTLS handoff, on the now-encrypted socket.
+    mov rax, [r12 + linnea_connection.location]
+    cmp qword [rax + linnea_config_location.proxy_tls], 0
+    jne .connect_tls
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
     mov rdi, r12
     call linnea_uring_arm_up_send
+    call linnea_uring_submit_now
+    jmp .wait
+.connect_tls:
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_tls_client_hs_for         ; rax = this leg's handshake arena
+    mov rdi, rax
+    mov r8, [r12 + linnea_connection.location]
+    lea rsi, [r8 + linnea_config_location.proxy_pin]
+    lea rdx, [r8 + linnea_config_location.proxy_sni]
+    mov rcx, [r8 + linnea_config_location.proxy_sni_len]
+    call linnea_tls_client_start          ; builds the ClientHello into hs.out
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TLS_HS
+    mov qword [r12 + linnea_connection.up_ktls], 0
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_tls_client_hs_for
+    mov rdi, r12
+    lea rsi, [rax + linnea_tls_client_hs.out]
+    mov rdx, [rax + linnea_tls_client_hs.out_len]
+    call linnea_uring_arm_up_send_buf      ; send the ClientHello
     call linnea_uring_submit_now
     jmp .wait
 
@@ -2315,6 +2343,8 @@ linnea_uring_run:
     je .tunnel_up_send
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
     je .closing_c2u
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TLS_HS
+    je .tls_hs_up_send
     test r15d, r15d
     js .up_send_err
     mov eax, r15d
@@ -2376,6 +2406,84 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 
+; --- backend TLS handshake (proxy_tls): drive linnea_tls_client_input over the
+; backend socket, then hand it to kTLS and send the request. r12 = conn. The
+; whole handshake is before any request byte, so a failure may 502 safely.
+.tls_hs_up_send:
+    test r15d, r15d
+    js .up_send_err                    ; send failed -> the existing 502/504 path
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_tls_client_hs_for
+    cmp qword [rax + linnea_tls_client_hs.state], LINNEA_CLIENT_HS_DONE
+    je .tls_hs_handoff
+    mov rdi, r12                        ; ClientHello out: read the server flight
+    lea rsi, [r12 + linnea_connection.out_buf]
+    mov edx, LINNEA_CONN_OUT_BUF
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.tls_hs_handoff:
+    ; client Finished out: hand the backend socket to kTLS (client orientation:
+    ; TX = c_ap, RX = s_ap, app sequences 0), then send the request over it.
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_tls_client_hs_for
+    mov edi, [r12 + linnea_connection.up_fd]
+    lea rsi, [rax + linnea_tls_client_hs.c_ap]
+    lea rdx, [rax + linnea_tls_client_hs.s_ap]
+    xor ecx, ecx
+    xor r8d, r8d
+    call linnea_ktls_enable
+    test rax, rax
+    js .tls_hs_ktls_fail
+    mov qword [r12 + linnea_connection.up_ktls], 1
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
+    mov rdi, r12
+    call linnea_uring_arm_up_send       ; the request head waiting in up_buf
+    call linnea_uring_submit_now
+    jmp .wait
+.tls_hs_ktls_fail:
+    mov esi, 502
+    jmp .proxy_fail
+
+.tls_hs_up_recv:
+    test r15d, r15d
+    jg .tls_hs_feed
+    jz .tls_hs_eof
+    cmp r15d, -LINNEA_ECANCELED
+    je .tls_hs_timeout
+.tls_hs_eof:
+    mov esi, 502
+    jmp .proxy_fail
+.tls_hs_timeout:
+    mov esi, 504
+    jmp .proxy_fail
+.tls_hs_feed:
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_tls_client_hs_for
+    mov rdi, rax
+    lea rsi, [r12 + linnea_connection.out_buf]
+    mov edx, r15d
+    call linnea_tls_client_input       ; rax = MORE / DONE / FAIL
+    cmp rax, LINNEA_CLIENT_FAIL
+    je .tls_hs_eof
+    cmp rax, LINNEA_CLIENT_DONE
+    je .tls_hs_send_fin
+    mov rdi, r12                        ; MORE: read more of the flight
+    lea rsi, [r12 + linnea_connection.out_buf]
+    mov edx, LINNEA_CONN_OUT_BUF
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.tls_hs_send_fin:
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_tls_client_hs_for
+    mov rdi, r12
+    lea rsi, [rax + linnea_tls_client_hs.out]
+    mov rdx, [rax + linnea_tls_client_hs.out_len]
+    call linnea_uring_arm_up_send_buf   ; client Finished; its send does the handoff
+    call linnea_uring_submit_now
+    jmp .wait
+
 ; --- upstream recv completion: r15d = bytes or -errno ------------------
 .on_up_recv:
     mov rdi, r13
@@ -2387,6 +2495,21 @@ linnea_uring_run:
                                ; be serving someone else
     cmp qword [r12 + linnea_connection.h3_cancel], 0
     jne .h3_leg_reap           ; the stream it answers is gone
+    ; kTLS backend leg: classify the delivered record. A NewSessionTicket (or
+    ; other non-application record) is skipped by re-arming the same read; a
+    ; close_notify becomes r15d=0 (EOF) for the state handler below.
+    cmp qword [r12 + linnea_connection.up_ktls], 0
+    je .up_recv_classified
+    call up_ktls_rx_record_type
+    test eax, eax
+    jz .up_recv_classified
+    mov rdi, r12
+    mov rsi, [r12 + linnea_connection.up_rx_buf]
+    mov rdx, [r12 + linnea_connection.up_rx_len]
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.up_recv_classified:
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TUNNEL
     je .tunnel_up_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_CLOSING
@@ -2395,6 +2518,8 @@ linnea_uring_run:
     je .relay_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_H3BODY
     je .h3_body_recv
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TLS_HS
+    je .tls_hs_up_recv
     ; reading the response head
     test r15d, r15d
     jg .head_data
@@ -3471,6 +3596,80 @@ ktls_sqe_to_recvmsg:
     mov dword [rax + LINNEA_SQE_LEN], 1   ; one msghdr, not a byte count
     ret
 
+; --- backend-leg kTLS RX (proxy_tls): the up_fd mirror of the client-facing
+; kTLS RX above, using the connection's up_rx_* block so both can be live at
+; once (an h2 client's request reads and the backend's response reads).
+
+; up_ktls_rx_record_type(r12=conn, r15d=result) -> rax = 1 if the completed read
+; was a non-application record to SKIP (re-arm and read again); rax = 0 to
+; proceed (application data, or an error/EOF, with r15d forced to 0 for a
+; close_notify / other control record). Clobbers rax, rcx.
+up_ktls_rx_record_type:
+    cmp qword [r12 + linnea_connection.up_rx_msg_armed], 0
+    je .urt_ret0                      ; a plain recv (pre-kTLS): nothing asked
+    mov qword [r12 + linnea_connection.up_rx_msg_armed], 0
+    test r15d, r15d
+    jle .urt_ret0                     ; error/EOF delivers no record
+    cmp qword [r12 + linnea_connection.up_rx_msg + LINNEA_MSGHDR_CONTROLLEN], 16
+    jb .urt_ret0                      ; no cmsg came back: application data
+    lea rcx, [r12 + linnea_connection.up_rx_cmsg]
+    cmp dword [rcx + 8], LINNEA_SOL_TLS
+    jne .urt_ret0
+    cmp dword [rcx + 12], LINNEA_TLS_GET_RECORD_TYPE
+    jne .urt_ret0
+    movzx eax, byte [rcx + 16]
+    mov [r12 + linnea_connection.up_rx_rectype], rax
+    cmp eax, LINNEA_TLS_REC_APPDATA
+    je .urt_ret0                      ; the response: proceed
+    cmp eax, LINNEA_TLS_REC_HANDSHAKE
+    je .urt_skip                      ; a NewSessionTicket (or KeyUpdate): skip.
+                                      ; A KeyUpdate would break the next read and
+                                      ; fail the exchange -- acceptable for a
+                                      ; controlled backend; NSTs are the case.
+    xor r15d, r15d                    ; alert (close_notify) / other: EOF
+.urt_ret0:
+    xor eax, eax
+    ret
+.urt_skip:
+    mov eax, 1
+    ret
+
+; up_ktls_prep_rx(rdi=conn, rsi=buffer, edx=len) -> rax = msghdr*. The up-leg
+; twin of ktls_prep_rx.
+up_ktls_prep_rx:
+    mov [rdi + linnea_connection.up_rx_iov + LINNEA_IOVEC_BASE], rsi
+    mov ecx, edx
+    mov [rdi + linnea_connection.up_rx_iov + LINNEA_IOVEC_LEN], rcx
+    lea rax, [rdi + linnea_connection.up_rx_msg]
+    mov qword [rax + LINNEA_MSGHDR_NAME], 0
+    mov dword [rax + LINNEA_MSGHDR_NAMELEN], 0
+    lea rcx, [rdi + linnea_connection.up_rx_iov]
+    mov [rax + LINNEA_MSGHDR_IOV], rcx
+    mov qword [rax + LINNEA_MSGHDR_IOVLEN], 1
+    lea rcx, [rdi + linnea_connection.up_rx_cmsg]
+    mov [rax + LINNEA_MSGHDR_CONTROL], rcx
+    mov qword [rax + LINNEA_MSGHDR_CONTROLLEN], LINNEA_KTLS_CMSG_SIZE
+    mov dword [rax + LINNEA_MSGHDR_FLAGS], 0
+    mov qword [rdi + linnea_connection.up_rx_msg_armed], 1
+    ret
+
+; up_ktls_sqe_to_recvmsg(rbx=conn, rax=sqe) — turn a prepared up-leg RECV into a
+; RECVMSG. Preserves rax (the sqe).
+up_ktls_sqe_to_recvmsg:
+    push rax
+    push rax
+    mov rdi, rbx
+    mov rsi, [rax + LINNEA_SQE_ADDR]
+    mov edx, [rax + LINNEA_SQE_LEN]
+    call up_ktls_prep_rx
+    mov rcx, rax
+    pop rax
+    pop rax
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECVMSG
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1
+    ret
+
 ; linnea_uring_arm_recv(rdi=connection*)
 ; Queue a recv into the free tail of the connection's input buffer, with
 ; a linked idle timeout: if the peer stays silent the recv completes with
@@ -3865,6 +4064,16 @@ linnea_uring_arm_up_recv:
     mov [rax + LINNEA_SQE_ADDR], r12
     CLAMP_IO_LEN r13
     mov [rax + LINNEA_SQE_LEN], r13d
+    ; kTLS backend leg: stash this read (so a skipped control record can re-arm
+    ; it identically) and turn it into a RECVMSG so the kernel reports the record
+    ; type. up_ktls is 0 during the userspace handshake, so those reads stay plain.
+    mov qword [rbx + linnea_connection.up_rx_msg_armed], 0
+    cmp qword [rbx + linnea_connection.up_ktls], 0
+    je .aur_plain
+    mov [rbx + linnea_connection.up_rx_buf], r12
+    mov [rbx + linnea_connection.up_rx_len], r13
+    call up_ktls_sqe_to_recvmsg
+.aur_plain:
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_UP_RECV
