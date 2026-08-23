@@ -220,7 +220,16 @@ after, reusing the proven translator; the TLS client gains an ALPN-`h2` offer.
 - **Brick 2 DONE** (`d6a1011`): TLS client offers ALPN `h2` via `hs.alpn_sel`;
   `location.proxy_h2` field added; `.connect_tls` sets `alpn_sel` per connect.
 
-**Brick 3 — resumable driver + proxy wiring (the large remaining piece).** Model
+- **Brick 3 DONE** (`522f77e` driver, `dccf9b7` wiring): **works end to end for h1
+  clients** — curl(h1)→front(`proxy_h2`)→TLS+h2→linnea backend→200 (backend logs
+  `"... HTTP/2"`); 200000 B intact, 30/30 concurrent, wrong pin→502; full fast
+  suite 774/0, tls shard 218/0. The injection uses `out_ptr`/`out_rem` (head) +
+  `file_ptr`/`file_rem` (body) so the existing client-send path is unchanged. v1
+  scope = h1 clients (h3 client gated to 502; h2-client/request-body/streaming are
+  follow-ups). Config `proxy_h2` requires `proxy_tls`. Trap: the request head is
+  at `out_ptr`/`out_rem`, not `up_buf`/`up_head_len`.
+
+**Brick 3 (as designed) — resumable driver + proxy wiring.** Model
 on the TLS-client driver. A per-leg h2 context (in a reused arena keyed by
 conn.index, like the TLS handshake pool) holds the windows, an accumulate-in
 buffer, a staged-out buffer, the reassembly buffers, the `linnea_h2_req` carrier
