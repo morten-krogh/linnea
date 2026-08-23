@@ -73,6 +73,8 @@ ch_sigalgs:  db 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x04, 0x03
 ch_sigalgs_len equ $ - ch_sigalgs
 alpn_h1:     db "http/1.1"
 alpn_h1_len  equ $ - alpn_h1
+alpn_h2:     db "h2"
+alpn_h2_len  equ $ - alpn_h2
 
 hrr_random:  db 0xCF,0x21,0xAD,0x74,0xE5,0x9A,0x61,0x11,0xBE,0x1D,0x8C,0x02
              db 0x1E,0x65,0xB8,0x91,0xC2,0xA2,0x11,0x16,0x7A,0xBB,0x8C,0x5E
@@ -889,9 +891,18 @@ linnea_tls_client_start:
     mov [rbx + linnea_tls_client_hs.pin + 24], rax
     mov [rbx + linnea_tls_client_hs.sni_ptr], rdx
     mov [rbx + linnea_tls_client_hs.sni_len], rcx
+    ; ALPN offer: "h2" when the caller set alpn_sel, else "http/1.1".
+    cmp qword [rbx + linnea_tls_client_hs.alpn_sel], 0
+    je .alpn_h1
+    lea rax, [alpn_h2]
+    mov [rbx + linnea_tls_client_hs.alpn_ptr], rax
+    mov qword [rbx + linnea_tls_client_hs.alpn_len], alpn_h2_len
+    jmp .alpn_done
+.alpn_h1:
     lea rax, [alpn_h1]
     mov [rbx + linnea_tls_client_hs.alpn_ptr], rax
     mov qword [rbx + linnea_tls_client_hs.alpn_len], alpn_h1_len
+.alpn_done:
     mov qword [rbx + linnea_tls_client_hs.tr_len], 0
     mov qword [rbx + linnea_tls_client_hs.rbuf_len], 0
     mov qword [rbx + linnea_tls_client_hs.hs_plain_len], 0

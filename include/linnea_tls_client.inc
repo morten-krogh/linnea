@@ -47,6 +47,10 @@ struc linnea_tls_client_hs
     .sni_len:      resq 1
     .alpn_ptr:     resq 1
     .alpn_len:     resq 1
+    ; ALPN offer selector, set by the caller BEFORE linnea_tls_client_start:
+    ; 0 = "http/1.1" (default), 1 = "h2" (backend HTTP/2, Tier 1). Reused arenas
+    ; keep a stale value, so the proxy sets it on every connect.
+    .alpn_sel:     resq 1
     .tr_len:       resq 1
     .tr_ch_len:    resq 1                 ; transcript length after ClientHello, so
                                           ; each idempotent re-process keeps the CH

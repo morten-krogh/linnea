@@ -2266,6 +2266,10 @@ linnea_uring_run:
     call linnea_tls_client_hs_for         ; rax = this leg's handshake arena
     mov rdi, rax
     mov r8, [r12 + linnea_connection.location]
+    ; ALPN offer: h2 when this is a proxy_h2 backend, else http/1.1. The arena is
+    ; reused, so set it every connect (stale otherwise).
+    mov rcx, [r8 + linnea_config_location.proxy_h2]
+    mov [rax + linnea_tls_client_hs.alpn_sel], rcx
     lea rsi, [r8 + linnea_config_location.proxy_pin]
     lea rdx, [r8 + linnea_config_location.proxy_sni]
     mov rcx, [r8 + linnea_config_location.proxy_sni_len]

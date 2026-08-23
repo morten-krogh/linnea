@@ -100,6 +100,9 @@ struc linnea_config_location
     .proxy_pin_set: resq 1                        ; 1 = a pin was configured
     .proxy_sni:     resb LINNEA_MAX_SNI + 1       ; SNI to send (NUL-terminated)
     .proxy_sni_len: resq 1
+    .proxy_h2:      resq 1                        ; 1 = offer only ALPN h2 to the
+                                                  ; backend and speak HTTP/2 to it
+                                                  ; (Tier 1; requires proxy_tls)
     ; --- per-worker upstream state, NOT configuration --------------------
     ; Workers are forked, so these live in a copy-on-write page and are private
     ; to each worker without a separate table. They are deliberately not part of
