@@ -137,6 +137,50 @@ Integration follows the two existing backend paths (from the backend-path map):
 Model the leg on the `linnea_h2p` scaffolding (tag/gen/WANT-flag arming), as a new
 leg type, not by overloading the h1-shaped slot.
 
+### Stage 1b integration map (h2 clients, the h2p slot path) — 2026-08-23 read
+
+The h2p subsystem: `LINNEA_H2P_SLOTS = 8` slots per connection, each a
+`linnea_h2p` with its own `.fd`, `.state` (FREE/COLLECT/CONNECTING/SENDING/HEAD/
+RELAY/ZOMBIE), and a `LINNEA_H2P_BUF = 16384` `.buf`. `linnea_h2p_event`
+(conn, slot, tag, result) is the completion handler; `linnea_h2p_service` walks
+all slots emitting ready HEADERS/errors/RST into the client's `out_buf`;
+`h2_schedule` streams body DATA out of `.buf`. Request head+body are built into
+`.buf` (`.req_len`/`.sent`); the response is recv'd into `.buf` and consumed by
+`h2p_parse_head` + `h2p_decode` (h1 framing) as it streams.
+
+**The reuse seam is the same as Stage 1a:** produce a synthesized **h1 response**
+that `h2p_parse_head`/`h2p_decode` consume unchanged. So the leg = run TLS+the h2
+driver on the slot `.fd`, then present the driver's synthesized h1 response to the
+slot's existing HEAD/RELAY path.
+
+Plan (bricks):
+1. **Per-(conn,slot) arenas.** A pool keyed by `conn.index*LINNEA_H2P_SLOTS+slot`
+   for the TLS handshake (`linnea_tls_client_hs`) and the h2 driver context
+   (`linnea_h2c`, ~1.2 MB). 8×max_conn of each — demand-paged; consider a smaller
+   `LINNEA_H2C_D_BODY_CAP` for this path, or an acquire-on-demand shared pool, to
+   bound address space.
+2. **New slot sub-states** `H2P_TLS_HS`, `H2P_H2` (or a `.flags` bit) driven by the
+   slot's send/recv ops in `linnea_h2p_event`: `.ev_connect` for a proxy_h2 slot
+   starts the TLS handshake instead of `SENDING`; send/recv completions feed
+   `linnea_tls_client_input` then, after the kTLS handoff (client orientation,
+   control-record-aware RECVMSG reads for backend NSTs — the `up_ktls` twin), the
+   h2 driver (`linnea_h2c_drv_*`) with the request head already in `.buf[0..req_len]`
+   + the captured body (`.rq_*`).
+3. **Response feed (the bridge).** The driver BUFFERS the whole response
+   (`ctx.body_buf`); the slot RELAY streams from `.buf`. On driver DONE, write the
+   synthesized head into `.buf` (`.len`, state HEAD); then, where the relay would
+   arm another `.fd` recv, instead copy the next body chunk from `ctx.body_buf`
+   into `.buf` (a `RESP_FROM_CTX` flag + cursor). Large responses stream chunk by
+   chunk; no 16 KB cap.
+4. **Failover/health/timeout** already exist per slot (`.ev_conn_failed`,
+   `h2p_reconnect`, `mark_fail`); the TLS/h2 failures route through the same
+   `.ev_bad_gateway`. Non-pooled (a kTLS slot is never parked).
+
+**Risk:** this is in the scheduler that serves ALL h2 clients — every step must
+leave the h1-backend path untouched. Test the full h2-server suite green after
+each brick. This is the largest single piece of Tier 1; prod stays on the
+h1+h3-client build meanwhile.
+
 ## Config
 
 h2-to-backend is meaningful only over TLS (ALPN). Two options:
