@@ -66,6 +66,7 @@ extern linnea_connections_init
 extern linnea_h2p_init
 extern linnea_tls_client_pool_init
 extern linnea_h2c_pool_init
+extern linnea_h2p_leg_pool_init
 extern linnea_uring_run
 extern linnea_print_stdout
 extern linnea_error_usage
@@ -687,7 +688,9 @@ spawn_worker:
     mov rdi, [linnea_config_instance + linnea_config.max_connections]
     call linnea_tls_client_pool_init      ; backend-TLS handshake arenas
     mov rdi, [linnea_config_instance + linnea_config.max_connections]
-    call linnea_h2c_pool_init             ; backend-HTTP/2 leg contexts
+    call linnea_h2c_pool_init             ; backend-HTTP/2 leg contexts (up_fd path)
+    mov rdi, [linnea_config_instance + linnea_config.max_connections]
+    call linnea_h2p_leg_pool_init         ; backend-HTTP/2 leg arenas (h2p slot path)
     lea rdi, [linnea_config_instance]
     call linnea_uring_run      ; never returns
 .orphan:
