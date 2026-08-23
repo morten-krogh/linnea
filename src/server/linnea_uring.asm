@@ -2465,7 +2465,10 @@ linnea_uring_run:
     cmp qword [r12 + linnea_connection.h3_owner], 0
     jne .h2_leg_err
     ; the rewritten h1 request head is what the h1 leg would send: out_ptr/out_rem
-    ; (NOT up_buf/up_head_len — arm_up_send reads out_ptr/out_rem).
+    ; (NOT up_buf/up_head_len — arm_up_send reads out_ptr/out_rem). The request
+    ; body, if any, is the memory region the h1 leg queues behind the head:
+    ; file_ptr/file_rem (in_buf for a small inline body, or the spill mmap for a
+    ; large one — file_base owns that mapping and .response_done unmaps it).
     mov r14, [r12 + linnea_connection.out_ptr]
     mov r15, [r12 + linnea_connection.out_rem]
     mov rdi, [r12 + linnea_connection.index]
@@ -2473,8 +2476,8 @@ linnea_uring_run:
     mov rdi, rax
     mov rsi, r14
     mov rdx, r15
-    xor rcx, rcx                        ; v1: no request body over h2 yet
-    xor r8, r8
+    mov rcx, [r12 + linnea_connection.file_ptr]   ; request body ptr (0 = none)
+    mov r8,  [r12 + linnea_connection.file_rem]   ; request body length
     mov r9, LINNEA_H2C_SCHEME_HTTPS
     call linnea_h2c_drv_start           ; -> rax = verdict
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_H2
@@ -2537,7 +2540,9 @@ linnea_uring_run:
     mov [r12 + linnea_connection.file_ptr], rcx
     mov rax, [r14 + linnea_h2c.body_len]
     mov [r12 + linnea_connection.file_rem], rax
-    mov qword [r12 + linnea_connection.file_base], 0
+    ; leave file_base as-is: 0 for GET/inline, or the request-body spill mmap,
+    ; which .response_done unmaps after the response is sent. The response body
+    ; itself lives in the leg arena, not an mmap, so nothing new to track.
     mov qword [r12 + linnea_connection.keep_alive], 0
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
     mov rdi, r12
