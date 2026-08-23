@@ -167,6 +167,28 @@ EOF
     [ "$code" = 502 ]
     check "backend h2 e2e: a wrong pin fails and returns 502 (proxy_h2)" $?
 
+    # --- an h3 client through proxy_h2: the synthesized response is QPACK
+    # re-encoded and delivered over QUIC (a real curl-h3 client) ---
+    CURLH3=${LINNEA_CURL_H3:-$HOME/curl-h3/bin/curl}
+    if [ -x "$CURLH3" ]; then
+        cat > $CFG/bt-fe-h3.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-h3.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61717}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61712}",
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost",
+      "proxy_h2": 1 } ] } ] }
+EOF
+        start_server $CFG/bt-fe-h3.json
+        body=$("$CURLH3" --http3-only -sk --max-time 10 \
+            --resolve localhost:${P61717}:127.0.0.1 \
+            https://localhost:${P61717}/probe.txt 2>/dev/null)
+        [ "$body" = "BACKEND-OK" ]
+        check "backend h2 e2e: an h3 client is served via QPACK re-encode (proxy_h2)" $?
+    else
+        check "backend h2 e2e: h3 client (skipped: curl-h3 unavailable)" 0
+    fi
+
     rm -f $RUNDIR/bt_conc.txt $RUNDIR/h2_conc.txt "$btw/probe.txt" "$btw/big.bin"
 else
     check "backend TLS e2e proxy (skipped: tls ULP or openssl unavailable)" 0

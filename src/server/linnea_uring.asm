@@ -2459,11 +2459,14 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .h2_start:
-    ; v1 injects the synthesized response via out_ptr/arm_send — a TCP-client
-    ; send, correct for an h1 client. An h3 client (h3_owner set) needs the QPACK
-    ; re-encode path, not yet wired, so fail it cleanly rather than corrupt it.
+    ; An h3 client is delivered via the QPACK re-encode path at DONE. That path
+    ; spills the response body, which would clash with a request body already in
+    ; the spill file, so h3 + a request body is not supported yet -> 502.
     cmp qword [r12 + linnea_connection.h3_owner], 0
+    je .h2_start_go
+    cmp qword [r12 + linnea_connection.file_rem], 0
     jne .h2_leg_err
+.h2_start_go:
     ; the rewritten h1 request head is what the h1 leg would send: out_ptr/out_rem
     ; (NOT up_buf/up_head_len — arm_up_send reads out_ptr/out_rem). The request
     ; body, if any, is the memory region the h1 leg queues behind the head:
@@ -2530,6 +2533,8 @@ linnea_uring_run:
     mov rdi, [r12 + linnea_connection.index]
     call linnea_h2c_ctx_for
     mov r14, rax                        ; ctx (preserved across drv_head)
+    cmp qword [r12 + linnea_connection.h3_owner], 0
+    jne .h2_done_h3
     mov rdi, r14
     lea rsi, [r12 + linnea_connection.out_buf]
     call linnea_h2c_drv_head            ; rax = head length in out_buf
@@ -2549,6 +2554,33 @@ linnea_uring_run:
     call linnea_http_proxy_log
     mov rdi, r12
     call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+; --- h3 client: re-encode the synthesized h1 response through QPACK and deliver
+; over QUIC, the same path the h1-backend leg uses for an h3 client. The response
+; head goes into up_buf (h3_proxy_head reads it there); the body is fed whole
+; from the leg arena and spilled by h3_proxy_body; deliver mmaps + QPACK-encodes.
+.h2_done_h3:
+    mov rdi, r14
+    lea rsi, [r12 + linnea_connection.up_buf]
+    call linnea_h2c_drv_head            ; synthesized h1 head into up_buf
+    mov [r12 + linnea_connection.up_len], rax
+    mov rdi, r12
+    call linnea_h3_proxy_head
+    cmp eax, LINNEA_HTTP_HEAD_READY
+    jne .h2_leg_err
+    mov rdi, r12
+    lea rsi, [r14 + linnea_h2c.body_buf]
+    mov rdx, [r14 + linnea_h2c.body_len]
+    call linnea_h3_proxy_body           ; -> 1 done / 0 more / -1 error
+    test eax, eax
+    js .h2_leg_err
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    mov rdi, r12
+    call linnea_http_proxy_log
+    mov rdi, r12
+    mov esi, [quic_fd]
+    call linnea_h3_proxy_deliver
     call linnea_uring_submit_now
     jmp .wait
 .h2_up_send:
