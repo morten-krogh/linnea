@@ -153,12 +153,12 @@ linnea_h2c_exchange:
     mov byte [rdi + 0], 0
     mov byte [rdi + 1], 0
     mov byte [rdi + 2], 6
-    mov byte [rdi + 3], LINNEA_H2_FT_SETTINGS
+    mov byte [rdi + 3], LINNEA_H2C_FT_SETTINGS
     mov byte [rdi + 4], 0
     mov dword [rdi + 5], 0                ; sid 0
     add rdi, 9
     mov byte [rdi + 0], 0                 ; id hi
-    mov byte [rdi + 1], LINNEA_H2_SET_INITWIN
+    mov byte [rdi + 1], LINNEA_H2C_SET_INITWIN
     ; INITIAL_WINDOW_SIZE value, big-endian
     mov byte [rdi + 2], (LINNEA_H2C_INITWIN >> 24) & 0xff
     mov byte [rdi + 3], (LINNEA_H2C_INITWIN >> 16) & 0xff
@@ -181,12 +181,12 @@ linnea_h2c_exchange:
     shr rax, 8
     mov [rdi + 1], al
     mov [rdi + 2], bpl
-    mov byte [rdi + 3], LINNEA_H2_FT_HEADERS
+    mov byte [rdi + 3], LINNEA_H2C_FT_HEADERS
     ; flags: END_HEADERS always; END_STREAM iff no body
-    mov al, LINNEA_H2_FL_END_HEADERS
+    mov al, LINNEA_H2C_FL_END_HEADERS
     test r13, r13
     jnz .have_body_flag
-    or al, LINNEA_H2_FL_END_STREAM
+    or al, LINNEA_H2C_FL_END_STREAM
 .have_body_flag:
     mov [rdi + 4], al
     mov dword [rdi + 5], 0x01000000       ; stream id 1, big-endian
@@ -411,7 +411,7 @@ h2c_emit_method:
 
 ; h2c_emit_scheme(rdi=out) -> rdi advanced.
 h2c_emit_scheme:
-    cmp qword [h2c_scheme], LINNEA_H2_SCHEME_HTTPS
+    cmp qword [h2c_scheme], LINNEA_H2C_SCHEME_HTTPS
     je .https
     mov byte [rdi], 0x86          ; :scheme http
     inc rdi
@@ -814,8 +814,8 @@ h2c_next_frame:
 h2c_send_settings_ack:
     lea rdi, [h2c_out_buf]
     mov dword [rdi], 0
-    mov byte [rdi+3], LINNEA_H2_FT_SETTINGS
-    mov byte [rdi+4], LINNEA_H2_FL_ACK
+    mov byte [rdi+3], LINNEA_H2C_FT_SETTINGS
+    mov byte [rdi+4], LINNEA_H2C_FL_ACK
     mov dword [rdi+5], 0
     mov edi, dword [h2c_fd]
     lea rsi, [h2c_out_buf]
@@ -829,8 +829,8 @@ h2c_send_ping_ack:
     mov byte [rdi], 0
     mov byte [rdi+1], 0
     mov byte [rdi+2], 8
-    mov byte [rdi+3], LINNEA_H2_FT_PING
-    mov byte [rdi+4], LINNEA_H2_FL_ACK
+    mov byte [rdi+3], LINNEA_H2C_FT_PING
+    mov byte [rdi+4], LINNEA_H2C_FL_ACK
     mov dword [rdi+5], 0
     mov rax, [h2c_frame_buf+9]
     mov [rdi+9], rax
@@ -848,7 +848,7 @@ h2c_send_window:
     mov byte [rax], 0
     mov byte [rax+1], 0
     mov byte [rax+2], 4
-    mov byte [rax+3], LINNEA_H2_FT_WINDOW
+    mov byte [rax+3], LINNEA_H2C_FT_WINDOW
     mov byte [rax+4], 0
     mov ecx, edi
     bswap ecx
@@ -875,7 +875,7 @@ h2c_apply_settings:
     shl eax, 8
     movzx edx, byte [rsi+1]
     or eax, edx
-    cmp eax, LINNEA_H2_SET_INITWIN
+    cmp eax, LINNEA_H2C_SET_INITWIN
     jne .next
     movzx eax, byte [rsi+2]
     shl eax, 8
@@ -924,18 +924,18 @@ h2c_settle:
     call h2c_next_frame
     test rax, rax
     js .err
-    cmp eax, LINNEA_H2_FT_SETTINGS
+    cmp eax, LINNEA_H2C_FT_SETTINGS
     je .settings
-    cmp eax, LINNEA_H2_FT_WINDOW
+    cmp eax, LINNEA_H2C_FT_WINDOW
     je .win
-    cmp eax, LINNEA_H2_FT_PING
+    cmp eax, LINNEA_H2C_FT_PING
     je .ping
-    cmp eax, LINNEA_H2_FT_GOAWAY
+    cmp eax, LINNEA_H2C_FT_GOAWAY
     je .goaway
     jmp h2c_settle
 .settings:
     mov rax, [h2c_fr_flags]
-    test rax, LINNEA_H2_FL_ACK
+    test rax, LINNEA_H2C_FL_ACK
     jnz h2c_settle
     call h2c_apply_settings
     call h2c_send_settings_ack
@@ -969,15 +969,15 @@ h2c_pump_window:
     call h2c_next_frame
     test rax, rax
     js .err
-    cmp eax, LINNEA_H2_FT_WINDOW
+    cmp eax, LINNEA_H2C_FT_WINDOW
     je .w
-    cmp eax, LINNEA_H2_FT_SETTINGS
+    cmp eax, LINNEA_H2C_FT_SETTINGS
     je .s
-    cmp eax, LINNEA_H2_FT_PING
+    cmp eax, LINNEA_H2C_FT_PING
     je .p
-    cmp eax, LINNEA_H2_FT_RST
+    cmp eax, LINNEA_H2C_FT_RST
     je .rst
-    cmp eax, LINNEA_H2_FT_GOAWAY
+    cmp eax, LINNEA_H2C_FT_GOAWAY
     je .goaway
     jmp .err                      ; response before END_STREAM: unsupported in v1
 .w:
@@ -985,7 +985,7 @@ h2c_pump_window:
     jmp .chk
 .s:
     mov rax, [h2c_fr_flags]
-    test rax, LINNEA_H2_FL_ACK
+    test rax, LINNEA_H2C_FL_ACK
     jnz .chk
     call h2c_apply_settings
     call h2c_send_settings_ack
@@ -1046,12 +1046,12 @@ h2c_send_body:
     shr rax, 8
     mov [rdi+1], al
     mov [rdi+2], r13b
-    mov byte [rdi+3], LINNEA_H2_FT_DATA
+    mov byte [rdi+3], LINNEA_H2C_FT_DATA
     mov rax, rbx
     add rax, r13
     cmp rax, r15
     jne .notlast
-    mov byte [rdi+4], LINNEA_H2_FL_END_STREAM
+    mov byte [rdi+4], LINNEA_H2C_FL_END_STREAM
     jmp .fd
 .notlast:
     mov byte [rdi+4], 0
@@ -1141,26 +1141,26 @@ h2c_run_response:
     call h2c_next_frame
     test rax, rax
     js .err
-    cmp eax, LINNEA_H2_FT_SETTINGS
+    cmp eax, LINNEA_H2C_FT_SETTINGS
     je .settings
-    cmp eax, LINNEA_H2_FT_WINDOW
+    cmp eax, LINNEA_H2C_FT_WINDOW
     je .loop
-    cmp eax, LINNEA_H2_FT_PING
+    cmp eax, LINNEA_H2C_FT_PING
     je .ping
-    cmp eax, LINNEA_H2_FT_HEADERS
+    cmp eax, LINNEA_H2C_FT_HEADERS
     je .headers
-    cmp eax, LINNEA_H2_FT_CONT
+    cmp eax, LINNEA_H2C_FT_CONT
     je .cont
-    cmp eax, LINNEA_H2_FT_DATA
+    cmp eax, LINNEA_H2C_FT_DATA
     je .data
-    cmp eax, LINNEA_H2_FT_RST
+    cmp eax, LINNEA_H2C_FT_RST
     je .rst
-    cmp eax, LINNEA_H2_FT_GOAWAY
+    cmp eax, LINNEA_H2C_FT_GOAWAY
     je .goaway
     jmp .loop
 .settings:
     mov rax, [h2c_fr_flags]
-    test rax, LINNEA_H2_FL_ACK
+    test rax, LINNEA_H2C_FL_ACK
     jnz .loop
     call h2c_apply_settings
     call h2c_send_settings_ack
@@ -1172,19 +1172,19 @@ h2c_run_response:
     cmp qword [h2c_fr_sid], 1
     jne .loop
     mov rax, [h2c_fr_flags]
-    and rax, LINNEA_H2_FL_END_STREAM
+    and rax, LINNEA_H2C_FL_END_STREAM
     mov [h2c_hdr_es], rax
     lea rsi, [h2c_frame_buf+9]
     mov rdx, [h2c_fr_len]
     mov rax, [h2c_fr_flags]
-    test rax, LINNEA_H2_FL_PADDED
+    test rax, LINNEA_H2C_FL_PADDED
     jz .h_np
     movzx ecx, byte [rsi]
     inc rsi
     dec rdx
     sub rdx, rcx
 .h_np:
-    test rax, LINNEA_H2_FL_PRIORITY
+    test rax, LINNEA_H2C_FL_PRIORITY
     jz .h_npr
     add rsi, 5
     sub rdx, 5
@@ -1193,7 +1193,7 @@ h2c_run_response:
     test rax, rax
     js .err
     mov rax, [h2c_fr_flags]
-    test rax, LINNEA_H2_FL_END_HEADERS
+    test rax, LINNEA_H2C_FL_END_HEADERS
     jz .loop
     call h2c_do_decode
     test rax, rax
@@ -1211,7 +1211,7 @@ h2c_run_response:
     test rax, rax
     js .err
     mov rax, [h2c_fr_flags]
-    test rax, LINNEA_H2_FL_END_HEADERS
+    test rax, LINNEA_H2C_FL_END_HEADERS
     jz .loop
     call h2c_do_decode
     test rax, rax
@@ -1226,7 +1226,7 @@ h2c_run_response:
     lea rsi, [h2c_frame_buf+9]
     mov rdx, [h2c_fr_len]
     mov rax, [h2c_fr_flags]
-    test rax, LINNEA_H2_FL_PADDED
+    test rax, LINNEA_H2C_FL_PADDED
     jz .d_np
     movzx ecx, byte [rsi]
     inc rsi
@@ -1247,7 +1247,7 @@ h2c_run_response:
     call h2c_send_window
 .d_es:
     mov rax, [h2c_fr_flags]
-    test rax, LINNEA_H2_FL_END_STREAM
+    test rax, LINNEA_H2C_FL_END_STREAM
     jnz .done
     jmp .loop
 .rst:
@@ -1755,6 +1755,7 @@ global linnea_h2c_drv_start
 global linnea_h2c_drv_on_sent
 global linnea_h2c_drv_on_recv
 global linnea_h2c_drv_compose
+global linnea_h2c_drv_head
 
 ; d_out_append(rsi=ptr, rdx=len) — append to ctx.out_buf (rbx=ctx). CF on overflow.
 d_out_append:
@@ -1785,7 +1786,7 @@ d_stage_settings_ack:
     mov rdx, 9
     jmp d_out_append
 section .rodata
-d_ack_tmpl: db 0,0,0, LINNEA_H2_FT_SETTINGS, LINNEA_H2_FL_ACK, 0,0,0,0
+d_ack_tmpl: db 0,0,0, LINNEA_H2C_FT_SETTINGS, LINNEA_H2C_FL_ACK, 0,0,0,0
 section .text
 
 ; d_stage_ping_ack(rsi=8-byte payload ptr) — stage a PING ACK (rbx=ctx).
@@ -1794,8 +1795,8 @@ d_stage_ping_ack:
     mov byte [rdi],0
     mov byte [rdi+1],0
     mov byte [rdi+2],8
-    mov byte [rdi+3],LINNEA_H2_FT_PING
-    mov byte [rdi+4],LINNEA_H2_FL_ACK
+    mov byte [rdi+3],LINNEA_H2C_FT_PING
+    mov byte [rdi+4],LINNEA_H2C_FL_ACK
     mov dword [rdi+5],0
     mov rax,[rsi]
     mov [rdi+9],rax
@@ -1816,7 +1817,7 @@ d_stage_window:
     mov byte [rax],0
     mov byte [rax+1],0
     mov byte [rax+2],4
-    mov byte [rax+3],LINNEA_H2_FT_WINDOW
+    mov byte [rax+3],LINNEA_H2C_FT_WINDOW
     mov byte [rax+4],0
     mov ecx,r8d
     bswap ecx
@@ -1838,7 +1839,7 @@ d_apply_settings:
     shl eax, 8
     movzx edx, byte [rsi+1]
     or eax, edx
-    cmp eax, LINNEA_H2_SET_INITWIN
+    cmp eax, LINNEA_H2C_SET_INITWIN
     jne .next
     movzx eax, byte [rsi+2]
     shl eax,8
@@ -1942,12 +1943,12 @@ d_stage_body:
     shr rax, 8
     mov [rdi+1], al
     mov [rdi+2], r9b
-    mov byte [rdi+3], LINNEA_H2_FT_DATA
+    mov byte [rdi+3], LINNEA_H2C_FT_DATA
     mov rax, [rbx + linnea_h2c.body_sent]
     add rax, r9
     cmp rax, [rbx + linnea_h2c.req_body_len]
     jne .nl
-    mov byte [rdi+4], LINNEA_H2_FL_END_STREAM
+    mov byte [rdi+4], LINNEA_H2C_FL_END_STREAM
     jmp .fh
 .nl:
     mov byte [rdi+4], 0
@@ -2021,12 +2022,12 @@ linnea_h2c_drv_start:
     mov byte [rdi],0
     mov byte [rdi+1],0
     mov byte [rdi+2],6
-    mov byte [rdi+3],LINNEA_H2_FT_SETTINGS
+    mov byte [rdi+3],LINNEA_H2C_FT_SETTINGS
     mov byte [rdi+4],0
     mov dword [rdi+5],0
     add rdi,9
     mov byte [rdi],0
-    mov byte [rdi+1],LINNEA_H2_SET_INITWIN
+    mov byte [rdi+1],LINNEA_H2C_SET_INITWIN
     mov byte [rdi+2],(LINNEA_H2C_INITWIN>>24)&0xff
     mov byte [rdi+3],(LINNEA_H2C_INITWIN>>16)&0xff
     mov byte [rdi+4],(LINNEA_H2C_INITWIN>>8)&0xff
@@ -2039,11 +2040,11 @@ linnea_h2c_drv_start:
     shr rax,8
     mov [rdi+1],al
     mov [rdi+2],r12b
-    mov byte [rdi+3],LINNEA_H2_FT_HEADERS
-    mov al, LINNEA_H2_FL_END_HEADERS
+    mov byte [rdi+3],LINNEA_H2C_FT_HEADERS
+    mov al, LINNEA_H2C_FL_END_HEADERS
     cmp qword [rbx+linnea_h2c.req_body_len],0
     jne .hb
-    or al, LINNEA_H2_FL_END_STREAM
+    or al, LINNEA_H2C_FL_END_STREAM
 .hb:
     mov [rdi+4],al
     mov dword [rdi+5],0x01000000
@@ -2235,27 +2236,27 @@ linnea_h2c_drv_on_recv:
 ; d_dispatch() — process one parsed frame. rbx=ctx, eax=type, r12=payload ptr,
 ; r15=payload len, [d_fr_flags]/[d_fr_sid] set. Returns rax=0 ok, or -1/-2/-3.
 d_dispatch:
-    cmp eax, LINNEA_H2_FT_SETTINGS
+    cmp eax, LINNEA_H2C_FT_SETTINGS
     je .settings
-    cmp eax, LINNEA_H2_FT_WINDOW
+    cmp eax, LINNEA_H2C_FT_WINDOW
     je .window
-    cmp eax, LINNEA_H2_FT_PING
+    cmp eax, LINNEA_H2C_FT_PING
     je .ping
-    cmp eax, LINNEA_H2_FT_HEADERS
+    cmp eax, LINNEA_H2C_FT_HEADERS
     je .headers
-    cmp eax, LINNEA_H2_FT_CONT
+    cmp eax, LINNEA_H2C_FT_CONT
     je .cont
-    cmp eax, LINNEA_H2_FT_DATA
+    cmp eax, LINNEA_H2C_FT_DATA
     je .data
-    cmp eax, LINNEA_H2_FT_RST
+    cmp eax, LINNEA_H2C_FT_RST
     je .rst
-    cmp eax, LINNEA_H2_FT_GOAWAY
+    cmp eax, LINNEA_H2C_FT_GOAWAY
     je .goaway
     xor eax, eax                        ; ignore unknown
     ret
 .settings:
     mov rax, [d_fr_flags]
-    test rax, LINNEA_H2_FL_ACK
+    test rax, LINNEA_H2C_FL_ACK
     jnz .ok
     mov rsi, r12
     mov rcx, r15
@@ -2278,7 +2279,7 @@ d_dispatch:
     ret
 .ping:
     mov rax, [d_fr_flags]
-    test rax, LINNEA_H2_FL_ACK
+    test rax, LINNEA_H2C_FL_ACK
     jnz .ok
     mov rsi, r12
     call d_stage_ping_ack
@@ -2288,19 +2289,19 @@ d_dispatch:
     cmp qword [d_fr_sid], 1
     jne .ok
     mov rax, [d_fr_flags]
-    and rax, LINNEA_H2_FL_END_STREAM
+    and rax, LINNEA_H2C_FL_END_STREAM
     mov [rbx+linnea_h2c.hdr_es], rax
     mov rsi, r12
     mov rdx, r15
     mov rax, [d_fr_flags]
-    test rax, LINNEA_H2_FL_PADDED
+    test rax, LINNEA_H2C_FL_PADDED
     jz .h_np
     movzx ecx, byte [rsi]
     inc rsi
     dec rdx
     sub rdx, rcx
 .h_np:
-    test rax, LINNEA_H2_FL_PRIORITY
+    test rax, LINNEA_H2C_FL_PRIORITY
     jz .h_npr
     add rsi, 5
     sub rdx, 5
@@ -2309,7 +2310,7 @@ d_dispatch:
     test rax, rax
     js .bad
     mov rax, [d_fr_flags]
-    test rax, LINNEA_H2_FL_END_HEADERS
+    test rax, LINNEA_H2C_FL_END_HEADERS
     jz .ok
     call d_decode_block
     test rax, rax
@@ -2328,7 +2329,7 @@ d_dispatch:
     test rax, rax
     js .bad
     mov rax, [d_fr_flags]
-    test rax, LINNEA_H2_FL_END_HEADERS
+    test rax, LINNEA_H2C_FL_END_HEADERS
     jz .ok
     call d_decode_block
     test rax, rax
@@ -2344,7 +2345,7 @@ d_dispatch:
     mov rsi, r12
     mov rdx, r15
     mov rax, [d_fr_flags]
-    test rax, LINNEA_H2_FL_PADDED
+    test rax, LINNEA_H2C_FL_PADDED
     jz .d_np
     movzx ecx, byte [rsi]
     inc rsi
@@ -2365,7 +2366,7 @@ d_dispatch:
     call d_stage_window
 .d_es:
     mov rax, [d_fr_flags]
-    test rax, LINNEA_H2_FL_END_STREAM
+    test rax, LINNEA_H2C_FL_END_STREAM
     jnz .complete
     xor eax, eax
     ret
@@ -2479,6 +2480,59 @@ linnea_h2c_drv_compose:
     pop r12
     pop rbx
     ret
+
+; linnea_h2c_drv_head(rdi=ctx, rsi=out) -> rax = head length. Writes just the h1
+; response head (status line + relayed headers + content-length + connection:
+; close + blank line) to `out`; the proxy queues ctx.body_buf behind it. v1
+; closes the client connection after the response (no keep-alive).
+linnea_h2c_drv_head:
+    push rbx
+    push r13
+    mov rbx, rdi
+    mov r13, rsi
+    mov rdi, r13
+    lea rsi, [http11]
+    mov rcx, http11_len
+    rep movsb
+    mov rax, [rbx+linnea_h2c.status]
+    call h2c_dec3
+    mov byte [rdi], ' '
+    inc rdi
+    mov eax, [rbx+linnea_h2c.status]
+    push rdi
+    call h2c_reason
+    pop rdi
+    mov rcx, rdx
+    rep movsb
+    mov byte [rdi],13
+    mov byte [rdi+1],10
+    add rdi,2
+    lea rsi, [rbx+linnea_h2c.hdrlines]
+    mov rcx, [rbx+linnea_h2c.hdrlines_len]
+    rep movsb
+    lea rsi, [hdr_cl]
+    mov rcx, hdr_cl_len
+    rep movsb
+    mov rax, [rbx+linnea_h2c.body_len]
+    call h2c_u64_dec
+    mov byte [rdi],13
+    mov byte [rdi+1],10
+    add rdi,2
+    lea rsi, [hdr_conn_close]
+    mov rcx, hdr_conn_close_len
+    rep movsb
+    mov byte [rdi],13
+    mov byte [rdi+1],10
+    add rdi,2
+    mov rax, rdi
+    sub rax, r13
+    pop r13
+    pop rbx
+    ret
+
+section .rodata
+hdr_conn_close: db "connection: close", 13, 10
+hdr_conn_close_len equ $ - hdr_conn_close
 
 section .bss
 d_fr_flags: resq 1

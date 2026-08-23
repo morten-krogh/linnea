@@ -55,6 +55,10 @@ LINNEA_PROXY_TLS_HS     equ 10     ; running the TLS 1.3 client handshake to a
                                    ; proxy_tls backend, before the request is
                                    ; sent; driven by linnea_tls_client_input,
                                    ; then the backend fd is handed to kTLS
+LINNEA_PROXY_H2         equ 11     ; speaking HTTP/2 to a proxy_h2 backend over
+                                   ; the kTLS socket; driven by the h2 client
+                                   ; driver, which buffers the response, then the
+                                   ; synthesized h1 response goes to the client
 
 ; conn.chunk_state — where an incremental chunked decode stopped. The states
 ; are per BYTE, not per line: any of these boundaries can fall between two

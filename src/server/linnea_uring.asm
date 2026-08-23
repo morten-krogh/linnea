@@ -44,6 +44,7 @@ default rel
 %include "linnea_tls.inc"
 %include "linnea_http2.inc"
 %include "linnea_tls_client.inc"
+%include "linnea_h2_client.inc"
 
 global linnea_uring_run
 global drain_flag
@@ -114,6 +115,11 @@ extern linnea_ktls_enable
 extern linnea_tls_client_start
 extern linnea_tls_client_input
 extern linnea_tls_client_hs_for
+extern linnea_h2c_ctx_for
+extern linnea_h2c_drv_start
+extern linnea_h2c_drv_on_sent
+extern linnea_h2c_drv_on_recv
+extern linnea_h2c_drv_head
 extern linnea_ktls_rekey_rx
 extern linnea_ktls_rekey_tx
 extern linnea_ktls_key_update
@@ -2349,6 +2355,8 @@ linnea_uring_run:
     je .closing_c2u
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TLS_HS
     je .tls_hs_up_send
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_H2
+    je .h2_up_send
     test r15d, r15d
     js .up_send_err
     mov eax, r15d
@@ -2440,11 +2448,134 @@ linnea_uring_run:
     test rax, rax
     js .tls_hs_ktls_fail
     mov qword [r12 + linnea_connection.up_ktls], 1
+    ; A proxy_h2 backend speaks HTTP/2 over the kTLS socket instead of sending an
+    ; h1 request: start the h2 client driver with the head waiting in up_buf.
+    mov rax, [r12 + linnea_connection.location]
+    cmp qword [rax + linnea_config_location.proxy_h2], 0
+    jne .h2_start
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_SENDING
     mov rdi, r12
     call linnea_uring_arm_up_send       ; the request head waiting in up_buf
     call linnea_uring_submit_now
     jmp .wait
+.h2_start:
+    ; v1 injects the synthesized response via out_ptr/arm_send — a TCP-client
+    ; send, correct for an h1 client. An h3 client (h3_owner set) needs the QPACK
+    ; re-encode path, not yet wired, so fail it cleanly rather than corrupt it.
+    cmp qword [r12 + linnea_connection.h3_owner], 0
+    jne .h2_leg_err
+    ; the rewritten h1 request head is what the h1 leg would send: out_ptr/out_rem
+    ; (NOT up_buf/up_head_len — arm_up_send reads out_ptr/out_rem).
+    mov r14, [r12 + linnea_connection.out_ptr]
+    mov r15, [r12 + linnea_connection.out_rem]
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_h2c_ctx_for
+    mov rdi, rax
+    mov rsi, r14
+    mov rdx, r15
+    xor rcx, rcx                        ; v1: no request body over h2 yet
+    xor r8, r8
+    mov r9, LINNEA_H2C_SCHEME_HTTPS
+    call linnea_h2c_drv_start           ; -> rax = verdict
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_H2
+    jmp .h2_verdict
+
+; --- backend HTTP/2 leg: dispatch a driver verdict. r12 = conn, rax = verdict.
+.h2_verdict:
+    cmp rax, LINNEA_H2C_WANT_SEND
+    je .h2_do_send
+    cmp rax, LINNEA_H2C_WANT_RECV
+    je .h2_do_recv
+    cmp rax, LINNEA_H2C_DRV_DONE
+    je .h2_drv_done
+    mov esi, 502                        ; FAIL / RST / GOAWAY
+    jmp .proxy_fail
+.h2_do_send:
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_h2c_ctx_for
+    mov rcx, rax
+    mov rdi, r12
+    lea rsi, [rcx + linnea_h2c.out_buf]
+    add rsi, [rcx + linnea_h2c.out_sent]
+    mov rdx, [rcx + linnea_h2c.out_len]
+    sub rdx, [rcx + linnea_h2c.out_sent]
+    call linnea_uring_arm_up_send_buf
+    call linnea_uring_submit_now
+    jmp .wait
+.h2_do_recv:
+    mov rdi, r12
+    lea rsi, [r12 + linnea_connection.out_buf]   ; recv scratch (<= OUT_BUF)
+    mov edx, LINNEA_CONN_OUT_BUF
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+    jmp .wait
+.h2_drv_done:
+    ; the whole response is buffered in the leg context. Close the (non-pooled
+    ; TLS) backend leg, compose the h1 response head into out_buf, queue the body
+    ; behind it, and send to the client; .response_done then closes.
+    mov rdi, [r12 + linnea_connection.location]
+    mov rsi, [r12 + linnea_connection.up_backend]
+    call linnea_upstream_mark_ok
+    mov edi, [r12 + linnea_connection.up_fd]
+    cmp edi, -1
+    je .h2_done_compose
+    mov eax, LINNEA_SYS_CLOSE
+    syscall
+    call linnea_upstream_closed
+    mov dword [r12 + linnea_connection.up_fd], -1
+.h2_done_compose:
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_h2c_ctx_for
+    mov r14, rax                        ; ctx (preserved across drv_head)
+    mov rdi, r14
+    lea rsi, [r12 + linnea_connection.out_buf]
+    call linnea_h2c_drv_head            ; rax = head length in out_buf
+    lea rcx, [r12 + linnea_connection.out_buf]
+    mov [r12 + linnea_connection.out_ptr], rcx
+    mov [r12 + linnea_connection.out_rem], rax
+    lea rcx, [r14 + linnea_h2c.body_buf]
+    mov [r12 + linnea_connection.file_ptr], rcx
+    mov rax, [r14 + linnea_h2c.body_len]
+    mov [r12 + linnea_connection.file_rem], rax
+    mov qword [r12 + linnea_connection.file_base], 0
+    mov qword [r12 + linnea_connection.keep_alive], 0
+    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    mov rdi, r12
+    call linnea_http_proxy_log
+    mov rdi, r12
+    call linnea_uring_arm_send
+    call linnea_uring_submit_now
+    jmp .wait
+.h2_up_send:
+    test r15d, r15d
+    js .h2_leg_err
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_h2c_ctx_for
+    mov rdi, rax
+    mov esi, r15d
+    call linnea_h2c_drv_on_sent
+    jmp .h2_verdict
+.h2_up_recv:
+    test r15d, r15d
+    jg .h2_recv_data
+    jz .h2_leg_err
+    cmp r15d, -LINNEA_ECANCELED
+    je .h2_recv_timeout
+    jmp .h2_leg_err
+.h2_recv_timeout:
+    mov esi, 504
+    jmp .proxy_fail
+.h2_recv_data:
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_h2c_ctx_for
+    mov rdi, rax
+    lea rsi, [r12 + linnea_connection.out_buf]
+    mov edx, r15d
+    call linnea_h2c_drv_on_recv
+    jmp .h2_verdict
+.h2_leg_err:
+    mov esi, 502
+    jmp .proxy_fail
 .tls_hs_ktls_fail:
     mov esi, 502
     jmp .proxy_fail
@@ -2524,6 +2655,8 @@ linnea_uring_run:
     je .h3_body_recv
     cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TLS_HS
     je .tls_hs_up_recv
+    cmp qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_H2
+    je .h2_up_recv
     ; reading the response head
     test r15d, r15d
     jg .head_data

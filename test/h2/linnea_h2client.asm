@@ -145,7 +145,7 @@ _start:
     mov rdx, [head_len]
     lea rcx, [body_buf]
     mov r8, [body_len]
-    mov r9, LINNEA_H2_SCHEME_HTTP
+    mov r9, LINNEA_H2C_SCHEME_HTTP
     cmp qword [use_drv], 0
     jne .drv
     call linnea_h2c_exchange

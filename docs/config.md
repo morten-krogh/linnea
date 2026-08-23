@@ -235,6 +235,7 @@ coexist and `/api/x` goes to `/api`.
 | `proxy_tls` | integer | `0` (off) | 0 or 1 | Connect to this location's backends over **TLS 1.3** instead of plaintext. Only on a `proxy` location, and **requires `proxy_pin`**. See **Backend TLS** below. |
 | `proxy_pin` | string | none | exactly 64 hex chars | The backend certificate's identity: **SHA-256 of its SubjectPublicKeyInfo**, hex-encoded. Required when `proxy_tls` is on; authentication is by this pin, not a CA. |
 | `proxy_sni` | string | none | ≤ 255 | The server name to send in the TLS ClientHello (SNI) to a `proxy_tls` backend. Optional — needed only if the backend selects its certificate by SNI. |
+| `proxy_h2` | integer | `0` (off) | 0 or 1 | Speak **HTTP/2** to this location's backends (negotiated by ALPN over TLS). Only on a `proxy` location, and **requires `proxy_tls`**. See **Backend HTTP/2** below. |
 | `redirect` | string | one of three | ≤ 255 | Reply 301 to this URL prefix. **Must start with `http://` or `https://`.** |
 | `cache_control` | string | none | ≤ 255 | `Cache-Control` value for static responses. Only meaningful with `root`. |
 
@@ -349,6 +350,30 @@ CA/trust-store verification are out of scope; the pin is the trust decision.
 `proxy_sni` sets the ClientHello server name, needed only when the backend picks
 its certificate by SNI. On any authentication failure the exchange returns 502 —
 there is no fallback to plaintext.
+
+### Backend HTTP/2
+
+`proxy_h2: 1` makes linnea speak **HTTP/2** to a location's backends instead of
+HTTP/1.1. It is negotiated by ALPN over TLS, so `proxy_h2` **requires**
+`proxy_tls` (and its pin). linnea offers **only** `h2`: a backend that will not
+select it fails the exchange (502) — there is no silent fallback to HTTP/1.1.
+
+```json
+{
+  "prefix": "/api",
+  "proxy": "10.0.0.5:8443",
+  "proxy_tls": 1,
+  "proxy_pin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "proxy_sni": "api.internal",
+  "proxy_h2": 1
+}
+```
+
+This reaches backends that speak only HTTP/2 (some gRPC and modern app servers).
+It is one HTTP/2 stream per request over one connection — a correctness feature,
+not yet a throughput one; connection reuse and multiplexing come later. **v1
+serves HTTP/1.1 clients**; requests arriving over HTTP/3 to a `proxy_h2` location
+are answered 502 for now.
 
 ---
 

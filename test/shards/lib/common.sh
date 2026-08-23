@@ -118,6 +118,8 @@ P61711=$((PORTBASE + 711))   # backend-TLS client handshake test, HRR server
 P61712=$((PORTBASE + 712))   # backend-TLS e2e: the linnea TLS BACKEND
 P61713=$((PORTBASE + 713))   # backend-TLS e2e: the pinning FRONT (good pin)
 P61714=$((PORTBASE + 714))   # backend-TLS e2e: the pinning front, wrong pin
+P61715=$((PORTBASE + 715))   # backend-h2 e2e: the proxy_h2 FRONT (good pin)
+P61716=$((PORTBASE + 716))   # backend-h2 e2e: the proxy_h2 front, wrong pin
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 # What actually reached a proxy backend, appended to by test/proxy_backend.py.

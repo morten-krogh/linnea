@@ -119,7 +119,55 @@ EOF
     [ "$code" = 502 ]
     check "backend TLS e2e: a wrong pin fails the handshake and returns 502" $?
 
-    rm -f $RUNDIR/bt_conc.txt "$btw/probe.txt"
+    # --- proxy_h2: speak HTTP/2 to the pinned TLS backend (Tier 1) -----------
+    # The same TLS backend (bt-be) also speaks h2 by ALPN; a proxy_h2 front
+    # negotiates h2, runs the h2 client leg over the kTLS socket, and relays the
+    # synthesized h1 response to the (h1) client. v1 covers h1 clients.
+    cat > $CFG/bt-fe-h2.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-h2.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61715}, "hostname": "front.test",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61712}",
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost",
+      "proxy_h2": 1 } ] } ] }
+EOF
+    start_server $CFG/bt-fe-h2.json
+    body=$(curl -s --max-time 8 http://127.0.0.1:${P61715}/probe.txt)
+    [ "$body" = "BACKEND-OK" ]
+    check "backend h2 e2e: h1 client -> front -> TLS+h2 -> linnea (body relayed)" $?
+
+    # a large response must relay intact over the h2 leg (spans DATA frames)
+    python3 -c "open('$btw/big.bin','w').write('B'*200000)"
+    n=$(curl -s --max-time 12 http://127.0.0.1:${P61715}/big.bin | wc -c)
+    [ "$n" = 200000 ]
+    check "backend h2 e2e: a 200000-byte response relays intact over the h2 leg" $?
+
+    # concurrency: independent per-leg h2 contexts must not collide
+    : > $RUNDIR/h2_conc.txt
+    cpids=""
+    for i in $(seq 20); do
+        curl -s -o /dev/null --max-time 8 -w '%{http_code}\n' \
+            http://127.0.0.1:${P61715}/probe.txt >>$RUNDIR/h2_conc.txt &
+        cpids="$cpids $!"
+    done
+    wait $cpids 2>/dev/null
+    [ "$(grep -c '^200' $RUNDIR/h2_conc.txt)" = 20 ]
+    check "backend h2 e2e: 20 concurrent requests all 200 over the h2 leg" $?
+
+    # a wrong pin must fail the h2 leg's handshake -> 502
+    cat > $CFG/bt-fe-h2-bad.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-h2-bad.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61716}, "hostname": "front.test",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61712}",
+      "proxy_tls": 1, "proxy_pin": "$ZPIN", "proxy_sni": "localhost",
+      "proxy_h2": 1 } ] } ] }
+EOF
+    start_server $CFG/bt-fe-h2-bad.json
+    code=$(curl -s -o /dev/null --max-time 8 -w '%{http_code}' \
+        http://127.0.0.1:${P61716}/probe.txt)
+    [ "$code" = 502 ]
+    check "backend h2 e2e: a wrong pin fails and returns 502 (proxy_h2)" $?
+
+    rm -f $RUNDIR/bt_conc.txt $RUNDIR/h2_conc.txt "$btw/probe.txt" "$btw/big.bin"
 else
     check "backend TLS e2e proxy (skipped: tls ULP or openssl unavailable)" 0
 fi

@@ -103,6 +103,8 @@ key_proxy_pin:          db "proxy_pin"
 key_proxy_pin_len       equ $ - key_proxy_pin
 key_proxy_sni:          db "proxy_sni"
 key_proxy_sni_len       equ $ - key_proxy_sni
+key_proxy_h2:           db "proxy_h2"
+key_proxy_h2_len        equ $ - key_proxy_h2
 key_cert:               db "cert"
 key_cert_len            equ $ - key_cert
 key_key:                db "key"
@@ -202,6 +204,10 @@ msg_ptls:               db "proxy_tls must be 0 or 1"
 msg_ptls_len            equ $ - msg_ptls
 msg_tls_needs_pin:      db "proxy_tls requires proxy_pin"
 msg_tls_needs_pin_len   equ $ - msg_tls_needs_pin
+msg_h2_needs_tls:       db "proxy_h2 requires proxy_tls"
+msg_h2_needs_tls_len    equ $ - msg_h2_needs_tls
+msg_ph2:                db "proxy_h2 must be 0 or 1"
+msg_ph2_len             equ $ - msg_ph2
 msg_pin_bad:            db "proxy_pin must be 64 hex chars (SHA-256 of the SPKI)"
 msg_pin_bad_len         equ $ - msg_pin_bad
 msg_sni_long:           db "proxy_sni too long"
@@ -1173,6 +1179,13 @@ linnea_parse_location:
     call linnea_string_equal
     test eax, eax
     jnz .key_proxy_sni
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_proxy_h2]
+    mov ecx, key_proxy_h2_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_proxy_h2
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -1250,6 +1263,16 @@ linnea_parse_location:
     cmp rax, 1
     ja .ptls_range
     mov [rbx + linnea_config_location.proxy_tls], rax
+    jmp .member_sep
+
+.key_proxy_h2:
+    test r12d, 512
+    jnz .dup
+    or r12d, 512
+    call linnea_parse_u64
+    cmp rax, 1
+    ja .ph2_range
+    mov [rbx + linnea_config_location.proxy_h2], rax
     jmp .member_sep
 
 .key_proxy_pin:
@@ -1453,7 +1476,7 @@ linnea_parse_location:
     ; keepalive/tls/pin/sni (bits 32/64/128/256) are meaningful only on a proxy
     ; location -- a silently-ignored key is a config that lies.
     mov eax, r12d
-    and eax, (32 | 64 | 128 | 256)
+    and eax, (32 | 64 | 128 | 256 | 512)
     jz .proxyopt_ok
     test r12d, 4
     jz .pka_kind
@@ -1464,7 +1487,13 @@ linnea_parse_location:
     test r12d, 128
     jz .tls_needs_pin
 .tls_ok:
-    and r12d, ~(16 | 32 | 64 | 128 | 256)   ; strip optional keys
+    ; h2 to a backend runs over TLS (ALPN): proxy_h2 requires proxy_tls
+    test r12d, 512
+    jz .h2opt_ok
+    test r12d, 64
+    jz .h2_needs_tls
+.h2opt_ok:
+    and r12d, ~(16 | 32 | 64 | 128 | 256 | 512)   ; strip optional keys
     cmp r12d, 3                ; prefix + root
     je .done
     cmp r12d, 5                ; prefix + proxy
@@ -1529,6 +1558,14 @@ linnea_parse_location:
 .tls_needs_pin:
     lea rdi, [msg_tls_needs_pin]
     mov esi, msg_tls_needs_pin_len
+    jmp linnea_parse_fail
+.h2_needs_tls:
+    lea rdi, [msg_h2_needs_tls]
+    mov esi, msg_h2_needs_tls_len
+    jmp linnea_parse_fail
+.ph2_range:
+    lea rdi, [msg_ph2]
+    mov esi, msg_ph2_len
     jmp linnea_parse_fail
 .pin_bad:
     lea rdi, [msg_pin_bad]
