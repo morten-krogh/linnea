@@ -2554,6 +2554,15 @@ linnea_uring_run:
     ; itself lives in the leg arena, not an mmap, so nothing new to track.
     mov qword [r12 + linnea_connection.keep_alive], 0
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    ; the access line reads up_status + relayed. An h1 backend parses those out
+    ; of the upstream head and counts the body as it streams; route-a SYNTHESIZES
+    ; the head from the driver and sends the buffered body in one shot, so neither
+    ; was ever set -- a proxy_h2 request logged "0 0" for a response it delivered
+    ; correctly. Fill both from the driver's decoded response before the log.
+    mov rax, [r14 + linnea_h2c.status]
+    mov [r12 + linnea_connection.up_status], rax
+    mov rax, [r14 + linnea_h2c.body_len]
+    mov [r12 + linnea_connection.relayed], rax
     mov rdi, r12
     call linnea_http_proxy_log
     mov rdi, r12
