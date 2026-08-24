@@ -32,6 +32,15 @@ def want(label, ok, detail=""):
         bad.append(label)
 
 
+# What a recv() over-read, per socket. A response is delimited by
+# Content-Length, not by the end of a datagram: one recv() can return the tail
+# of the response being read AND the whole of the next one. Dropping that tail
+# is invisible until something pipelines -- and then it looks exactly like the
+# SERVER losing a request, which is what it was blamed for. The bytes go here
+# instead, and the next read_one on the same socket starts from them.
+_over = {}
+
+
 def read_one(s):
     """One complete response: the head, then exactly Content-Length bytes.
 
@@ -42,7 +51,7 @@ def read_one(s):
     broke the two checks that measure how long something takes. A test that
     reads until the peer goes away is measuring the peer's timeout, not the
     response."""
-    d = b""
+    d = _over.pop(s, b"")
     try:
         while b"\r\n\r\n" not in d:
             c = s.recv(4096)
@@ -59,6 +68,14 @@ def read_one(s):
             if not c:
                 break
             body += c
+        # only when there IS a tail: socket objects hash by identity, and a
+        # closed one's address can be handed to the next socket, which would
+        # then start reading from a dead connection's leftovers
+        rest = body[n:]
+        if rest:
+            _over[s] = rest
+        else:
+            _over.pop(s, None)
         return head, body[:n]
     except socket.timeout:
         return b"", b""
@@ -210,14 +227,19 @@ want("Connection: close is honoured, and said back",
 # Pipelining follows from keeping the connection: the bytes after one head are
 # the next request, and read_head used to discard them.
 pl = socket.create_connection(("127.0.0.1", PORT), timeout=20)
+# Both requests go out in ONE write, so they normally arrive in one read and
+# are answered back to back -- which means both responses normally come back in
+# one recv too. Reading that correctly is the client's job (see _over); this
+# check is about the server answering twice, so depth 4 as well as 2, to catch
+# a server that happens to handle exactly one carried-over request.
 one = b"GET /api/random HTTP/1.1\r\nHost: x\r\n\r\n"
-pl.sendall(one + one)
-h1, b1 = read_one(pl)
-h2, b2 = read_one(pl)
+pl.sendall(one * 4)
+got = [read_one(pl)[1] for _ in range(4)]
 pl.close()
-want("two pipelined GETs are both answered",
-     b1.startswith(b'{"value":') and b2.startswith(b'{"value":'),
-     "both answered" if b2 else "the second was lost")
+want("four pipelined GETs are all answered",
+     all(b.startswith(b'{"value":') for b in got),
+     "all four answered" if all(got) else
+     "%d of 4 answered" % sum(1 for b in got if b))
 
 # An upload ends the connection whatever it asks for: the body it consumes is
 # its own business, so the loop does not try to find where the next request
