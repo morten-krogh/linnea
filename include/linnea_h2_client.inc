@@ -102,6 +102,11 @@ struc linnea_h2c
     .settled:      resq 1        ; server SETTINGS applied
     .hdr_es:       resq 1        ; END_STREAM seen on the response HEADERS
     .hdr_done:     resq 1        ; response header block decoded
+    ; A header block is OPEN: a HEADERS/CONTINUATION arrived without END_HEADERS,
+    ; so the only frame that may follow is its CONTINUATION on the same stream
+    ; (RFC 9113 6.10). Without this the driver had no notion of a block being in
+    ; progress, so a CONTINUATION out of nowhere read as a response head.
+    .hdr_open:     resq 1
     ; embedded buffers + the decoder's persistent dynamic table
     .dyn:          resb linnea_hpack_dyn_size
     .hdrblk:       resb LINNEA_H2C_HDRBLK_CAP

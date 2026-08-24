@@ -496,6 +496,19 @@ EOF
     [ "$(tr_get /data-first $CODE1)" = 502 ]
     check "backend h2: DATA before the response head is refused, not prepended" $?
 
+    # --- header-block FRAMING, one layer below the classifier ---------------
+    # RFC 9113 6.10: a CONTINUATION may only follow a HEADERS/CONTINUATION whose
+    # block is still open, on the same stream, with no frame of any kind in
+    # between. The driver had no notion of a block being open, so a CONTINUATION
+    # out of nowhere was decoded as the response head and a PING could sit
+    # between a HEADERS and its continuation (audit-report-45). The last two
+    # rows were already refused before that fix -- for the right outcome by the
+    # wrong reason (the DATA-before-head rule) -- so they are controls.
+    for route in /cont-first /cont-interleaved /cont-data-between /cont-wrong-stream; do
+        [ "$(tr_get $route $CODE1)" = 502 ]
+        check "backend h2 framing: $route is refused" $?
+    done
+
     # refusing it must not wedge the front either
     python3 test/h2/h2c_server.py ${P61724} tls >$RUNDIR/bt_tr.log 2>&1 &
     trpid=$!

@@ -89,6 +89,7 @@ h2c_hdrlines_len: resq 1
 ; section, MALFORMED in a trailer section (RFC 9113 8.1) — which is the only
 ; place it is read. Cleared before every decode.
 h2c_saw_pseudo: resq 1
+h2c_hdr_open:  resq 1                           ; a header block awaits its CONTINUATION
 h2c_tr_status: resq 1                           ; status/lines held across a
 h2c_tr_lines:  resq 1                           ; trailer decode (see below)
 h2c_body_len:  resq 1
@@ -1143,11 +1144,24 @@ h2c_run_response:
     mov qword [h2c_hdrblk_len], 0
     mov qword [h2c_saw_pseudo], 0
     mov qword [h2c_hdr_es], 0
+    mov qword [h2c_hdr_open], 0
     xor ebx, ebx                   ; headers-decoded flag
 .loop:
     call h2c_next_frame
     test rax, rax
     js .err
+    ; the oracle's twin of d_dispatch's RFC 9113 6.10 gate -- see there
+    cmp qword [h2c_hdr_open], 0
+    jne .in_block
+    cmp eax, LINNEA_H2C_FT_CONT
+    je .err                        ; a continuation of nothing
+    jmp .type
+.in_block:
+    cmp eax, LINNEA_H2C_FT_CONT
+    jne .err                       ; anything else, interleaved
+    cmp qword [h2c_fr_sid], 1
+    jne .err
+.type:
     cmp eax, LINNEA_H2C_FT_SETTINGS
     je .settings
     cmp eax, LINNEA_H2C_FT_WINDOW
@@ -1201,7 +1215,8 @@ h2c_run_response:
     js .err
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_END_HEADERS
-    jz .loop
+    jz .h_open                     ; the block awaits its CONTINUATION
+    mov qword [h2c_hdr_open], 0
     movzx edi, bl                  ; 1 once the final response head is in
     mov rsi, [h2c_hdr_es]
     call h2c_classify_block
@@ -1226,7 +1241,8 @@ h2c_run_response:
     js .err
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_END_HEADERS
-    jz .loop
+    jz .loop                       ; still open, still owed a CONTINUATION
+    mov qword [h2c_hdr_open], 0
     movzx edi, bl                  ; 1 once the final response head is in
     mov rsi, [h2c_hdr_es]
     call h2c_classify_block
@@ -1272,6 +1288,9 @@ h2c_run_response:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_END_STREAM
     jnz .done
+    jmp .loop
+.h_open:
+    mov qword [h2c_hdr_open], 1
     jmp .loop
 .rst:
     mov rax, LINNEA_H2C_RST
@@ -2125,6 +2144,7 @@ linnea_h2c_drv_start:
     mov qword [rbx+linnea_h2c.conn_win], 65535
     mov qword [rbx+linnea_h2c.status], 0
     mov qword [rbx+linnea_h2c.hdrblk_len], 0
+    mov qword [rbx+linnea_h2c.hdr_open], 0
     mov qword [rbx+linnea_h2c.hdrlines_len], 0
     mov qword [rbx+linnea_h2c.body_len], 0
     mov [rbx+linnea_h2c.req_body], rcx
@@ -2367,6 +2387,23 @@ linnea_h2c_drv_on_recv:
 ; d_dispatch() — process one parsed frame. rbx=ctx, eax=type, r12=payload ptr,
 ; r15=payload len, [d_fr_flags]/[d_fr_sid] set. Returns rax=0 ok, or -1/-2/-3.
 d_dispatch:
+    ; RFC 9113 6.10: a CONTINUATION may only follow a HEADERS or CONTINUATION
+    ; whose block is still open, on the same stream, with NO frame of any kind
+    ; in between -- not a PING, not a SETTINGS, not one for another stream. The
+    ; driver had no notion of a block being open at all, so a CONTINUATION out
+    ; of nowhere was decoded as though it were the response head, and a PING
+    ; could sit between a HEADERS and its continuation (audit-report-45).
+    cmp qword [rbx+linnea_h2c.hdr_open], 0
+    jne .in_block
+    cmp eax, LINNEA_H2C_FT_CONT
+    je .bad                             ; a continuation of nothing
+    jmp .type
+.in_block:
+    cmp eax, LINNEA_H2C_FT_CONT
+    jne .bad                            ; anything else, interleaved
+    cmp qword [d_fr_sid], 1             ; the block was opened on stream 1
+    jne .bad
+.type:
     cmp eax, LINNEA_H2C_FT_SETTINGS
     je .settings
     cmp eax, LINNEA_H2C_FT_WINDOW
@@ -2400,6 +2437,10 @@ d_dispatch:
     jne .ok
     mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_SEND_BODY
 .ok:
+    xor eax, eax
+    ret
+.h_open:
+    mov qword [rbx+linnea_h2c.hdr_open], 1
     xor eax, eax
     ret
 .window:
@@ -2442,7 +2483,8 @@ d_dispatch:
     js .bad
     mov rax, [d_fr_flags]
     test rax, LINNEA_H2C_FL_END_HEADERS
-    jz .ok
+    jz .h_open                       ; the block awaits its CONTINUATION
+    mov qword [rbx+linnea_h2c.hdr_open], 0
     call d_decode_block
     test rax, rax
     js .bad
@@ -2465,7 +2507,8 @@ d_dispatch:
     js .bad
     mov rax, [d_fr_flags]
     test rax, LINNEA_H2C_FL_END_HEADERS
-    jz .ok
+    jz .ok                           ; still open, still owed a CONTINUATION
+    mov qword [rbx+linnea_h2c.hdr_open], 0
     call d_decode_block
     test rax, rax
     js .bad

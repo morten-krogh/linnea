@@ -21,6 +21,10 @@ Routes (by :path):
   /interim      -> a 103 informational HEADERS block, then the final 200
   /interim-two  -> two informational blocks (103, 100), then the final 200
   /interim-late -> MALFORMED: a 1xx block AFTER the final response, then DATA
+  /cont-first        -> MALFORMED: CONTINUATION with no header block open
+  /cont-interleaved  -> MALFORMED: PING between HEADERS and its CONTINUATION
+  /cont-data-between -> MALFORMED: DATA between HEADERS and its CONTINUATION
+  /cont-wrong-stream -> MALFORMED: CONTINUATION on a different stream
   anything else -> 404
 
 Usage: h2c_server.py <port> [mode]
@@ -263,6 +267,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/trailers"):
         respond_trailers(c, sid, path)
         return
+    if path.startswith("/cont-"):
+        respond_frames(c, sid, path)
+        return
     if path.startswith("/interim") or path in ("/no-status", "/data-first"):
         respond_interim(c, sid, path)
         return
@@ -319,6 +326,36 @@ def respond_trailers(c, sid, path):
         cut = len(tr) // 2
         c.send(frame(0x01, 0x01, sid, tr[:cut]))  # HEADERS, END_STREAM only
         c.send(frame(0x09, 0x04, sid, tr[cut:]))  # CONTINUATION, END_HEADERS
+
+
+def respond_frames(c, sid, path):
+    """Malformed HEADER-BLOCK FRAMING (RFC 9113 6.10): a CONTINUATION must
+    immediately follow a HEADERS/CONTINUATION whose block is still open, on the
+    same stream, with no frame of any kind in between."""
+    block = enc_status(200) + enc_header("content-type", "text/plain")
+    if path == "/cont-first":
+        # no open block at all: a CONTINUATION out of nowhere
+        c.send(frame(0x09, 0x04, sid, block))     # CONTINUATION, END_HEADERS
+        c.send(frame(0x00, 0x01, sid, b"body"))   # DATA, END_STREAM
+        return
+    cut = len(block) // 2
+    if path == "/cont-interleaved":
+        c.send(frame(0x01, 0x00, sid, block[:cut]))   # HEADERS, block left OPEN
+        c.send(frame(0x06, 0x00, 0, b"12345678"))     # PING in between
+        c.send(frame(0x09, 0x04, sid, block[cut:]))   # CONTINUATION, END_HEADERS
+        c.send(frame(0x00, 0x01, sid, b"body"))
+        return
+    if path == "/cont-data-between":
+        c.send(frame(0x01, 0x00, sid, block[:cut]))   # HEADERS, block left OPEN
+        c.send(frame(0x00, 0x00, sid, b"mid"))        # DATA in between
+        c.send(frame(0x09, 0x04, sid, block[cut:]))
+        c.send(frame(0x00, 0x01, sid, b"body"))
+        return
+    if path == "/cont-wrong-stream":
+        c.send(frame(0x01, 0x00, sid, block[:cut]))   # HEADERS on stream 1, OPEN
+        c.send(frame(0x09, 0x04, sid + 2, block[cut:]))  # CONTINUATION elsewhere
+        c.send(frame(0x00, 0x01, sid, b"body"))
+        return
 
 
 def respond_interim(c, sid, path):
