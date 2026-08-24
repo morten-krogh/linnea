@@ -3768,6 +3768,13 @@ linnea_h2p_event:
     test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_HEAD_SENT
     jz .ev_service
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_RST
+    jmp .ev_service                   ; RST the stream via the service pass. This
+                                      ; jmp was a fall-through into .ev_service
+                                      ; until the proxy_h2 leg handlers below were
+                                      ; inserted between the two; without it a
+                                      ; head-sent failure with an errored op falls
+                                      ; into .ev_tls_send -> .ev_bad_gateway ->
+                                      ; back here, an infinite mark_unanswered loop.
 ; ============================================================================
 ; proxy_h2 leg sub-state handlers: TLS handshake, then the h2 driver, over .fd.
 ; The recv landing for both is the leg's h2c out_buf (free during these phases);
