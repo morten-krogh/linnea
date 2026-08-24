@@ -47,6 +47,7 @@ default rel
 %include "linnea_h2_client.inc"
 
 global linnea_uring_run
+global h2p_krx_rectype              ; proxy_h2 leg kTLS record-type check (linnea_http2)
 global drain_flag
 global head_timeout_ns
 global linnea_uring_now
@@ -3821,6 +3822,36 @@ up_ktls_rx_record_type:
     mov eax, 1
     ret
 
+; h2p_krx_rectype(rdi = h2p slot*) -> eax: 0 = application data (feed the driver),
+; 1 = a control record to skip (a NewSessionTicket; re-arm and re-read), 2 = an
+; alert or other: treat as EOF. Only called for a recv that returned > 0 bytes.
+; The slot-scoped twin of up_ktls_rx_record_type, over the leg's krx_* fields, so
+; each of the up-to-LINNEA_H2P_SLOTS concurrent legs reads its own kTLS socket.
+h2p_krx_rectype:
+    cmp qword [rdi + linnea_h2p.krx_armed], 0
+    je .kt_data                       ; a plain recv (handshake): application data
+    mov qword [rdi + linnea_h2p.krx_armed], 0
+    cmp qword [rdi + linnea_h2p.krx_msg + LINNEA_MSGHDR_CONTROLLEN], 16
+    jb .kt_data                       ; no cmsg came back: application data
+    lea rcx, [rdi + linnea_h2p.krx_cmsg]
+    cmp dword [rcx + 8], LINNEA_SOL_TLS
+    jne .kt_data
+    cmp dword [rcx + 12], LINNEA_TLS_GET_RECORD_TYPE
+    jne .kt_data
+    movzx eax, byte [rcx + 16]
+    cmp eax, LINNEA_TLS_REC_APPDATA
+    je .kt_data                       ; the h2 response: feed it to the driver
+    cmp eax, LINNEA_TLS_REC_HANDSHAKE
+    je .kt_skip                       ; NewSessionTicket (or KeyUpdate): skip
+    mov eax, 2                        ; alert (close_notify) / other: EOF
+    ret
+.kt_data:
+    xor eax, eax
+    ret
+.kt_skip:
+    mov eax, 1
+    ret
+
 ; up_ktls_prep_rx(rdi=conn, rsi=buffer, edx=len) -> rax = msghdr*. The up-leg
 ; twin of ktls_prep_rx.
 up_ktls_prep_rx:
@@ -4583,10 +4614,14 @@ linnea_uring_arm_h2p_ops:
     mov edx, LINNEA_UD_H2UP_RECV
     jmp .ao_finish
 .ao_recv_leg:
-    ; TLS-handshake or h2-driver recv: land in the leg's h2c out_buf. A plain
-    ; recv — the self-hosted linnea backend offers no resumption so issues no
-    ; NST; a backend that does needs a control-record-aware RECVMSG here (the
-    ; up_fd leg's up_ktls_* is the template), a follow-up.
+    ; TLS-handshake or h2-driver recv: land in the leg's h2c out_buf. During the
+    ; userspace handshake (F_KTLS clear) a plain recv is right. Once the socket
+    ; is kTLS the kernel returns each TLS record with its type in a cmsg, and a
+    ; plain recv FAULTS (-EIO) on a control record -- a NewSessionTicket, which
+    ; most real backends (nginx, ...) send. Turn it into a RECVMSG so the
+    ; completion can read the type and skip the NST rather than 502. Each leg has
+    ; its own kTLS socket, so the msghdr/cmsg live in the SLOT's krx_* (up to
+    ; LINNEA_H2P_SLOTS concurrent legs per connection), not the connection's.
     and qword [r12 + linnea_h2p.flags], ~LINNEA_H2P_F_WANT_RECV
     or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
     mov rdi, [r12 + linnea_h2p.leg_lin]
@@ -4601,6 +4636,25 @@ linnea_uring_arm_h2p_ops:
     lea rdx, [rcx + linnea_h2c.out_buf]
     mov [rax + LINNEA_SQE_ADDR], rdx
     mov dword [rax + LINNEA_SQE_LEN], LINNEA_H2C_D_OUT_CAP
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_KTLS
+    jz .ao_recv_leg_done              ; plain recv during the userspace handshake
+    mov [r12 + linnea_h2p.krx_iov + LINNEA_IOVEC_BASE], rdx    ; rdx = out_buf ptr
+    mov qword [r12 + linnea_h2p.krx_iov + LINNEA_IOVEC_LEN], LINNEA_H2C_D_OUT_CAP
+    mov qword [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_NAME], 0
+    mov dword [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_NAMELEN], 0
+    lea rcx, [r12 + linnea_h2p.krx_iov]
+    mov [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_IOV], rcx
+    mov qword [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_IOVLEN], 1
+    lea rcx, [r12 + linnea_h2p.krx_cmsg]
+    mov [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_CONTROL], rcx
+    mov qword [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_CONTROLLEN], LINNEA_KTLS_CMSG_SIZE
+    mov dword [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_FLAGS], 0
+    mov qword [r12 + linnea_h2p.krx_armed], 1
+    lea rcx, [r12 + linnea_h2p.krx_msg]
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECVMSG
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1
+.ao_recv_leg_done:
     mov edx, LINNEA_UD_H2UP_RECV
 
 .ao_finish:

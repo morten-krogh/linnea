@@ -125,6 +125,7 @@ extern linnea_h2c_drv_start
 extern linnea_h2c_drv_on_sent
 extern linnea_h2c_drv_on_recv
 extern linnea_h2c_drv_head
+extern h2p_krx_rectype              ; kTLS record type of a proxy_h2 leg recv
 
 section .rodata
 
@@ -3852,8 +3853,17 @@ linnea_h2p_event:
     jmp .ev_h2_verdict
 .ev_h2_recv:
     test r14d, r14d
-    jg .ev_h2_recv_ok
-    jmp .ev_bad_gateway               ; eof/err mid-exchange -> 502
+    jle .ev_bad_gateway               ; eof/err mid-exchange -> 502
+    ; a kTLS read delivers one TLS record; a control record (a backend's
+    ; NewSessionTicket) is not part of the h2 stream. Skip it and re-read rather
+    ; than feed it to the driver -- otherwise a ticket-sending backend (nginx and
+    ; most real h2 servers) faults the leg and 502s a response it did answer.
+    mov rdi, rbx                      ; slot
+    call h2p_krx_rectype              ; eax: 0 data, 1 skip-control, 2 eof(alert)
+    cmp eax, 1
+    je .ev_h2_recv_skip
+    cmp eax, 2
+    je .ev_bad_gateway
 .ev_h2_recv_ok:
     call h2p_slot_ctx
     mov rdi, rax
@@ -3861,6 +3871,9 @@ linnea_h2p_event:
     mov edx, r14d
     call linnea_h2c_drv_on_recv       ; -> verdict
     jmp .ev_h2_verdict
+.ev_h2_recv_skip:
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV   ; re-read the next record
+    jmp .ev_service
 .ev_h2_verdict:
     cmp rax, LINNEA_H2C_WANT_SEND
     je .ev_h2_want_send
