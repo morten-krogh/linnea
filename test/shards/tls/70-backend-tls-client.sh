@@ -216,7 +216,155 @@ EOF
         check "backend h2 e2e: h3 client (skipped: curl-h3 unavailable)" 0
     fi
 
-    rm -f $RUNDIR/bt_conc.txt $RUNDIR/h2_conc.txt "$btw/probe.txt" "$btw/big.bin"
+    # --- an h2 client to a PLAIN proxy_tls backend (no proxy_h2) -------------
+    # The h2p leg started its backend TLS handshake on proxy_h2 rather than on
+    # proxy_tls, so an h2 CLIENT reaching a plain TLS backend sent its request
+    # head in cleartext to a socket expecting records: an unfailable 502 for a
+    # documented configuration (audit-report-41). h1 and h3 clients always
+    # worked, which is why nothing caught it -- every proxy_tls check above
+    # drives curl, and curl speaks HTTP/1.1 to a plaintext front.
+    cat > $CFG/bt-fe-tls-h2c.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-tls-h2c.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61719}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61712}",
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost" } ] } ] }
+EOF
+    start_server $CFG/bt-fe-tls-h2c.json
+    body=$(curl -s --http2 --cacert "$PWD/test/tls/server.crt" --max-time 8 \
+        --resolve localhost:${P61719}:127.0.0.1 \
+        https://localhost:${P61719}/probe.txt)
+    [ "$body" = "BACKEND-OK" ]
+    check "backend TLS e2e: an h2 client is served over a plain proxy_tls leg" $?
+
+    # a response past one slot buffer: the leg reads a RECORD at a time, so this
+    # walks the kTLS RECVMSG path and the buffer recycle many times over
+    n=$(curl -s --http2 --cacert "$PWD/test/tls/server.crt" --max-time 12 \
+        --resolve localhost:${P61719}:127.0.0.1 \
+        https://localhost:${P61719}/big.bin | wc -c)
+    [ "$n" = 200000 ]
+    check "backend TLS e2e: an h2 client receives a 200000-byte body over proxy_tls" $?
+
+    # concurrency: each leg holds its own handshake arena and kTLS RX block
+    : > $RUNDIR/tls_h2_conc.txt
+    cpids=""
+    for i in $(seq 20); do
+        curl -s -o /dev/null --max-time 10 --http2 --cacert "$PWD/test/tls/server.crt" \
+            --resolve localhost:${P61719}:127.0.0.1 -w '%{http_code}\n' \
+            https://localhost:${P61719}/probe.txt >>$RUNDIR/tls_h2_conc.txt &
+        cpids="$cpids $!"
+    done
+    wait $cpids 2>/dev/null
+    [ "$(grep -c '^200' $RUNDIR/tls_h2_conc.txt)" = 20 ]
+    check "backend TLS e2e: 20 concurrent h2 clients all 200 over proxy_tls legs" $?
+
+    # --- a backend that sends NewSessionTickets (openssl s_server) -----------
+    # Every proxy check above uses a linnea BACKEND, and linnea sends no session
+    # tickets — so none of them can see a leg mishandle one. A kTLS read returns
+    # one RECORD, and a plain recv faults (-EIO) on a control record: the ticket
+    # openssl and nginx send right after the handshake is exactly that. This is
+    # the only check here that fails when a leg reads its backend with a plain
+    # recv instead of a record-type-aware RECVMSG, on any of the three client
+    # paths. s_server answers HTTP/1.0 and closes, so it also proves a
+    # close-delimited body ends on the close_notify rather than an error.
+    openssl s_server -accept ${P61722} -cert test/tls/server.crt -key test/tls/server.key \
+        -tls1_3 -groups X25519 -ciphersuites TLS_AES_128_GCM_SHA256 -www -quiet \
+        >$RUNDIR/bt_nst.log 2>&1 &
+    nstp=$!
+    sleep 0.5
+    cat > $CFG/bt-fe-nst.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-nst.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61723}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61722}",
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost" } ] } ] }
+EOF
+    start_server $CFG/bt-fe-nst.json
+    for proto in --http1.1 --http2; do
+        code=$(curl -s -o /dev/null --max-time 10 $proto \
+            --cacert "$PWD/test/tls/server.crt" \
+            --resolve localhost:${P61723}:127.0.0.1 -w '%{http_code}' \
+            https://localhost:${P61723}/)
+        [ "$code" = 200 ]
+        check "backend TLS: a ticket-sending backend is relayed, not 502 (client $proto)" $?
+    done
+    if [ -x "$CURLH3" ]; then
+        code=$("$CURLH3" --http3-only -sk -o /dev/null --max-time 10 \
+            --resolve localhost:${P61723}:127.0.0.1 -w '%{http_code}' \
+            https://localhost:${P61723}/)
+        [ "$code" = 200 ]
+        check "backend TLS: a ticket-sending backend is relayed, not 502 (h3 client)" $?
+    else
+        check "backend TLS: ticket-sending backend, h3 client (skipped: curl-h3 unavailable)" 0
+    fi
+    kill $nstp 2>/dev/null; wait $nstp 2>/dev/null
+    rm -f $RUNDIR/bt_nst.log
+
+    # --- proxy_keepalive must never park a TLS backend leg -------------------
+    # A parked kTLS socket carries kernel crypto state the pool does not track,
+    # and the taker sends its head with none of it set up. h1 has refused to
+    # pool a TLS leg since backend TLS landed; the h2 and h3 legs had no such
+    # rule, and an h3 client was observed taking a parked kTLS leg out of the
+    # pool (audit-report-41). Count the BACKEND's accepts: N requests to a
+    # keep-alive TLS location must open N connections, not reuse one.
+    ka_probe() {   # $1 = how many requests, $2.. = the client command to repeat
+        local n=$1; shift
+        local before after i ok=0
+        before=$(awk '/accepted connection/{c++} END{print c+0}' $RUNDIR/bt-be.log)
+        for i in $(seq $n); do
+            [ "$("$@")" = "BACKEND-OK" ] && ok=$((ok + 1))
+        done
+        sleep 0.3
+        after=$(awk '/accepted connection/{c++} END{print c+0}' $RUNDIR/bt-be.log)
+        echo "$ok $((after - before))"
+    }
+
+    cat > $CFG/bt-fe-tls-ka.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-tls-ka.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61720}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61712}",
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost",
+      "proxy_keepalive": 1 } ] } ] }
+EOF
+    start_server $CFG/bt-fe-tls-ka.json
+    r=$(ka_probe 3 curl -s --http2 --cacert "$PWD/test/tls/server.crt" \
+        --max-time 8 --resolve localhost:${P61720}:127.0.0.1 \
+        https://localhost:${P61720}/probe.txt)
+    [ "$r" = "3 3" ]
+    check "backend TLS: proxy_keepalive parks no TLS leg (h2 client: 3 requests, 3 backend connections)" $?
+
+    if [ -x "$CURLH3" ]; then
+        r=$(ka_probe 3 "$CURLH3" --http3-only -sk --max-time 10 \
+            --resolve localhost:${P61720}:127.0.0.1 \
+            https://localhost:${P61720}/probe.txt)
+        [ "$r" = "3 3" ]
+        check "backend TLS: proxy_keepalive parks no TLS leg (h3 client: 3 requests, 3 backend connections)" $?
+    else
+        check "backend TLS: proxy_keepalive/h3 client (skipped: curl-h3 unavailable)" 0
+    fi
+
+    # the same for a proxy_h2 location, which is a TLS location too. Nothing but
+    # the "connection: close" the h2 driver stamps on every synthesized response
+    # was keeping these out of the pool -- incidental, and the reason the filed
+    # finding did not reproduce.
+    cat > $CFG/bt-fe-h2-ka.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-h2-ka.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61721}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61712}",
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost",
+      "proxy_h2": 1, "proxy_keepalive": 1 } ] } ] }
+EOF
+    start_server $CFG/bt-fe-h2-ka.json
+    r=$(ka_probe 3 curl -s --http2 --cacert "$PWD/test/tls/server.crt" \
+        --max-time 8 --resolve localhost:${P61721}:127.0.0.1 \
+        https://localhost:${P61721}/probe.txt)
+    [ "$r" = "3 3" ]
+    check "backend h2: proxy_keepalive parks no h2 leg (3 requests, 3 backend connections)" $?
+
+    rm -f $RUNDIR/bt_conc.txt $RUNDIR/h2_conc.txt $RUNDIR/tls_h2_conc.txt \
+          "$btw/probe.txt" "$btw/big.bin"
 else
     check "backend TLS e2e proxy (skipped: tls ULP or openssl unavailable)" 0
 fi

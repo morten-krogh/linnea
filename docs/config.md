@@ -297,6 +297,11 @@ nginx needs `proxy_http_version 1.1` before its `keepalive` does anything.
 A connection is kept only when **all** of these hold:
 
 * the location opted in;
+* the backend leg is **plaintext**. A TLS backend leg (`proxy_tls`, and so also
+  `proxy_h2`) is never parked: the socket carries kernel-TLS state the pool does
+  not track, so `proxy_keepalive` has no effect on such a location — it is
+  accepted and ignored rather than rejected, because the same location may be
+  moved on and off TLS;
 * the request method was `GET` or `HEAD`. A pooled socket can always lose a race
   with the backend's own idle timeout, and the only sound answer to that race is
   to repeat the request — which a `POST` may not be;
@@ -371,9 +376,10 @@ select it fails the exchange (502) — there is no silent fallback to HTTP/1.1.
 
 This reaches backends that speak only HTTP/2 (some gRPC and modern app servers).
 It is one HTTP/2 stream per request over one connection — a correctness feature,
-not yet a throughput one; connection reuse and multiplexing come later. **v1
-serves HTTP/1.1 clients**; requests arriving over HTTP/3 to a `proxy_h2` location
-are answered 502 for now.
+not yet a throughput one; connection reuse and multiplexing come later, and
+`proxy_keepalive` does nothing here (see **Keeping connections open**). Clients
+arriving over HTTP/1.1, HTTP/2 and HTTP/3 are all served; an HTTP/3 request
+carrying a **body** to a `proxy_h2` location is still answered 502.
 
 ---
 

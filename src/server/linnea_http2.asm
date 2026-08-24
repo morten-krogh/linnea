@@ -3284,6 +3284,14 @@ h2p_finalize:
     jz .fin_conn_close
     cmp qword [rcx + linnea_config_location.proxy_keepalive], 0
     je .fin_conn_close
+    ; A TLS backend leg is never parked, the same rule the h1 leg has carried
+    ; since backend TLS landed: a parked kTLS socket carries kernel crypto state
+    ; the pool does not track, and the taker sends its head with none of it set
+    ; up. Until then the only thing keeping such a leg out of the pool was the
+    ; "connection: close" the h2 driver stamps on every synthesized response —
+    ; incidental, and nothing at all for a plain proxy_tls leg (audit-report-41).
+    cmp qword [rcx + linnea_config_location.proxy_tls], 0
+    jne .fin_conn_close
     lea rdi, [rbx + linnea_h2p.buf]
     xor ecx, ecx
 .fin_meth_scan:
@@ -3554,6 +3562,19 @@ linnea_h2p_event:
     test r14d, r14d
     js .ev_recv_err
     jz .ev_eof
+    ; A kTLS leg (a plain proxy_tls backend) gets one TLS RECORD per read, with
+    ; its type in a cmsg. A backend's NewSessionTicket is a control record, not
+    ; response bytes: counting it into .len would feed ticket bytes to the head
+    ; parser. Skip it and read again; an alert is the close it announces.
+    test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_KTLS
+    jz .ev_recv_data
+    mov rdi, rbx                     ; slot
+    call h2p_krx_rectype             ; eax: 0 data, 1 skip-control, 2 eof(alert)
+    cmp eax, 1
+    je .ev_want_more
+    cmp eax, 2
+    je .ev_eof
+.ev_recv_data:
     add [rbx + linnea_h2p.len], r14d
     cmp qword [rbx + linnea_h2p.state], LINNEA_H2P_HEAD
     jne .ev_relay_data
@@ -3627,29 +3648,42 @@ linnea_h2p_event:
     ; not evidence a backend works: one that accepts and then times out every
     ; time would have its counter zeroed here on each attempt and could never
     ; reach the threshold.
-    ; A proxy_h2 backend runs the TLS 1.3 handshake (ALPN h2, SPKI pin) on this
-    ; slot's fd before any request; the h2 driver then speaks h2 over kTLS.
+    ; A proxy_tls backend runs the TLS 1.3 handshake (SPKI pin) on this slot's fd
+    ; before any request. What follows the handshake is what ALPN asked for: an
+    ; h2 driver for a proxy_h2 backend, the ordinary HTTP/1.1 send for a plain
+    ; one. The h1 and h3 legs have keyed this off proxy_tls since the backend
+    ; client landed; the h2p leg keyed it off proxy_h2, so an h2 CLIENT reaching
+    ; a plain proxy_tls location sent its request head in cleartext to a backend
+    ; expecting records — an unfailable 502 for a documented configuration.
     mov rax, [rbx + linnea_h2p.location]
-    cmp qword [rax + linnea_config_location.proxy_h2], 0
-    jne .ev_connect_h2
+    cmp qword [rax + linnea_config_location.proxy_tls], 0
+    jne .ev_connect_tls
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_SENDING
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
     jmp .ev_service
-.ev_connect_h2:
+.ev_connect_tls:
     call h2p_leg_linear               ; rbx = slot -> rax = linear slot index
     mov [rbx + linnea_h2p.leg_lin], rax
     mov rdi, rax
     call linnea_h2p_tls_hs_for        ; rax = this leg's TLS handshake arena
     mov rdi, rax
-    mov qword [rdi + linnea_tls_client_hs.alpn_sel], 1   ; offer ALPN h2
     mov r8, [rbx + linnea_h2p.location]
+    ; ALPN offer: h2 when this is a proxy_h2 backend, else http/1.1. The arena is
+    ; reused, so set it every connect (stale otherwise) — the same rule the h1/h3
+    ; leg follows in linnea_uring.asm .connect_tls.
+    mov rcx, [r8 + linnea_config_location.proxy_h2]
+    mov [rdi + linnea_tls_client_hs.alpn_sel], rcx
     lea rsi, [r8 + linnea_config_location.proxy_pin]
     lea rdx, [r8 + linnea_config_location.proxy_sni]
     mov rcx, [r8 + linnea_config_location.proxy_sni_len]
     call linnea_tls_client_start      ; ClientHello into hs.out
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_TLS
     mov qword [rbx + linnea_h2p.leg_sent], 0
-    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_PROXY_H2 | LINNEA_H2P_F_WANT_SEND
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
+    mov rax, [rbx + linnea_h2p.location]
+    cmp qword [rax + linnea_config_location.proxy_h2], 0
+    je .ev_service                    ; a plain TLS leg: no h2 driver to mark
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_PROXY_H2
     jmp .ev_service
 .ev_conn_failed:
     ; the h2 twin of the h1/h3 failover in linnea_uring.asm: count the failure,
@@ -3829,6 +3863,17 @@ linnea_h2p_event:
     test rax, rax
     js .ev_bad_gateway
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_KTLS
+    ; A plain proxy_tls backend speaks HTTP/1.1 over the socket kTLS now owns, so
+    ; the leg rejoins the ordinary SENDING/HEAD/RELAY path from here: the request
+    ; head is already in .buf and the send needs no change (kTLS encrypts what we
+    ; write). F_KTLS is what turns the reads into record-type-aware RECVMSGs.
+    mov rax, [rbx + linnea_h2p.location]
+    cmp qword [rax + linnea_config_location.proxy_h2], 0
+    jne .ev_tls_handoff_h2
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_SENDING
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
+    jmp .ev_service
+.ev_tls_handoff_h2:
     call h2p_slot_ctx                 ; rax = ctx
     mov rdi, rax
     lea rsi, [rbx + linnea_h2p.buf]   ; the rewritten h1 request head

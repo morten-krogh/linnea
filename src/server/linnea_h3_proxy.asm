@@ -437,6 +437,13 @@ linnea_h3_proxy_start:
     jz .st_conn_close
     cmp qword [rcx + linnea_config_location.proxy_keepalive], 0
     je .st_conn_close
+    ; A TLS backend leg is never parked, the same rule h1 has carried since
+    ; backend TLS landed: a parked kTLS socket carries kernel crypto state the
+    ; pool does not track (up_ktls is per-leg and the taker's is clear), so the
+    ; next request reads it as a plaintext socket. h3 was pooling them — a
+    ; second h3 request took the parked kTLS leg (audit-report-41).
+    cmp qword [rcx + linnea_config_location.proxy_tls], 0
+    jne .st_conn_close
     push rbx
     mov rdi, [rbx + linnea_h2_req.method_ptr]
     mov rsi, [rbx + linnea_h2_req.method_len]

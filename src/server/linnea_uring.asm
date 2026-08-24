@@ -4611,6 +4611,31 @@ linnea_uring_arm_h2p_ops:
     add rdx, [r12 + linnea_h2p.len]
     mov [rax + LINNEA_SQE_ADDR], rdx
     mov [rax + LINNEA_SQE_LEN], ecx
+    ; A plain proxy_tls backend answers over the kTLS socket: one record per
+    ; read, its type in a cmsg, and a plain recv FAULTS (-EIO) on a control
+    ; record — a NewSessionTicket, which most real backends send. Read it as a
+    ; RECVMSG so the completion can skip what is not application data. rdx is
+    ; the landing address and rcx the room, both still live here; the per-slot
+    ; krx_* block is the same one the handshake/h2 reads use (.ao_recv_leg).
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_KTLS
+    jz .ao_recv_norm_done
+    mov [r12 + linnea_h2p.krx_iov + LINNEA_IOVEC_BASE], rdx
+    mov [r12 + linnea_h2p.krx_iov + LINNEA_IOVEC_LEN], rcx
+    mov qword [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_NAME], 0
+    mov dword [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_NAMELEN], 0
+    lea rcx, [r12 + linnea_h2p.krx_iov]
+    mov [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_IOV], rcx
+    mov qword [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_IOVLEN], 1
+    lea rcx, [r12 + linnea_h2p.krx_cmsg]
+    mov [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_CONTROL], rcx
+    mov qword [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_CONTROLLEN], LINNEA_KTLS_CMSG_SIZE
+    mov dword [r12 + linnea_h2p.krx_msg + LINNEA_MSGHDR_FLAGS], 0
+    mov qword [r12 + linnea_h2p.krx_armed], 1
+    lea rcx, [r12 + linnea_h2p.krx_msg]
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECVMSG
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov dword [rax + LINNEA_SQE_LEN], 1
+.ao_recv_norm_done:
     mov edx, LINNEA_UD_H2UP_RECV
     jmp .ao_finish
 .ao_recv_leg:
