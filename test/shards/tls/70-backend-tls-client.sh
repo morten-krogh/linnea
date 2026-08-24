@@ -363,6 +363,78 @@ EOF
     [ "$r" = "3 3" ]
     check "backend h2: proxy_keepalive parks no h2 leg (3 requests, 3 backend connections)" $?
 
+    # --- a backend that answers with HTTP/2 response TRAILERS ---------------
+    # test/h2/h2c_server.py in "tls" mode is a real h2 server behind TLS 1.3 with
+    # ALPN h2, so it can stand where a linnea backend cannot: /trailers answers
+    # 200 with DATA that does NOT end the stream, then a TRAILER section (a
+    # second HEADERS block carrying END_STREAM). RFC 9113 8.1 allows that, and
+    # the linnea backend fixture cannot produce it — its last DATA frame carries
+    # END_STREAM. The trailer must reach the client as NOTHING: not as a header
+    # field, and not as a lost status (audit-report-42). Python also sends
+    # NewSessionTickets, so this doubles as a second ticket-sending backend.
+    cat > $CFG/bt-fe-tr.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-tr.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61725}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61724}",
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost",
+      "proxy_h2": 1 } ] } ] }
+EOF
+    start_server $CFG/bt-fe-tr.json
+
+    # the fixture serves one connection at a time, and a TLS leg is never
+    # pooled, so every request below is its own backend connection
+    tr_get() {   # $1 = path, $2.. = the client command (headers on stdout)
+        local path=$1; shift
+        python3 test/h2/h2c_server.py ${P61724} tls >$RUNDIR/bt_tr.log 2>&1 &
+        local pid=$!
+        sleep 0.5
+        "$@" "https://localhost:${P61725}$path" 2>/dev/null
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
+    H1="curl -s -D- --max-time 10 --http1.1 --cacert $PWD/test/tls/server.crt \
+        --resolve localhost:${P61725}:127.0.0.1"
+    H2="curl -s -D- --max-time 10 --http2 --cacert $PWD/test/tls/server.crt \
+        --resolve localhost:${P61725}:127.0.0.1"
+
+    out=$(tr_get /hello $H1)
+    printf '%s' "$out" | grep -q "^HTTP/1.1 200" \
+        && printf '%s' "$out" | grep -q "hello from h2c"
+    check "backend h2 trailers: the python h2 fixture answers through proxy_h2 (control)" $?
+
+    for proto in H1 H2; do
+        eval "cl=\$$proto"
+        out=$(tr_get /trailers $cl)
+        printf '%s' "$out" | grep -q " 200" \
+            && printf '%s' "$out" | grep -q "hello with trailers" \
+            && ! printf '%s' "$out" | grep -qi "x-checksum\|grpc-status"
+        check "backend h2 trailers: 200 + body, trailer NOT relayed as a header field ($proto client)" $?
+    done
+
+    out=$(tr_get /trailers-frag $H1)
+    printf '%s' "$out" | grep -q "^HTTP/1.1 200" \
+        && printf '%s' "$out" | grep -q "hello with trailers" \
+        && ! printf '%s' "$out" | grep -qi "x-checksum\|grpc-status"
+    check "backend h2 trailers: a trailer split across HEADERS + CONTINUATION is handled the same" $?
+
+    # a pseudo-header in a trailer is malformed (RFC 9113 8.1). It must fail the
+    # exchange, not rewrite the status the initial block already gave us.
+    out=$(tr_get /trailers-status $H1)
+    printf '%s' "$out" | grep -q "^HTTP/1.1 502"
+    check "backend h2 trailers: a pseudo-header in a trailer is refused, not honoured" $?
+
+    if [ -x "$CURLH3" ]; then
+        out=$(tr_get /trailers "$CURLH3" --http3-only -sk -D- --max-time 10 \
+              --resolve localhost:${P61725}:127.0.0.1)
+        printf '%s' "$out" | grep -q " 200" \
+            && printf '%s' "$out" | grep -q "hello with trailers" \
+            && ! printf '%s' "$out" | grep -qi "x-checksum\|grpc-status"
+        check "backend h2 trailers: 200 + body, trailer not relayed (h3 client)" $?
+    else
+        check "backend h2 trailers: h3 client (skipped: curl-h3 unavailable)" 0
+    fi
+    rm -f $RUNDIR/bt_tr.log
+
     rm -f $RUNDIR/bt_conc.txt $RUNDIR/h2_conc.txt $RUNDIR/tls_h2_conc.txt \
           "$btw/probe.txt" "$btw/big.bin"
 else

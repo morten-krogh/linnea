@@ -85,6 +85,12 @@ h2c_chunk_cap: resq 1                           ; 0 = read LINNEA_H2C_RXCHUNK at
 h2c_fd:        resq 1
 h2c_status:    resq 1                           ; decoded response :status
 h2c_hdrlines_len: resq 1
+; Set by h2c_emit for any field whose name starts with ':'. Legal in a header
+; section, MALFORMED in a trailer section (RFC 9113 8.1) — which is the only
+; place it is read. Cleared before every decode.
+h2c_saw_pseudo: resq 1
+h2c_tr_status: resq 1                           ; status/lines held across a
+h2c_tr_lines:  resq 1                           ; trailer decode (see below)
 h2c_body_len:  resq 1
 h2c_stream_win: resq 1                          ; our stream-1 SEND window
 h2c_conn_win:  resq 1                           ; connection SEND window
@@ -1135,6 +1141,7 @@ h2c_body_append:
 h2c_run_response:
     push rbx
     mov qword [h2c_hdrblk_len], 0
+    mov qword [h2c_saw_pseudo], 0
     mov qword [h2c_hdr_es], 0
     xor ebx, ebx                   ; headers-decoded flag
 .loop:
@@ -1195,10 +1202,21 @@ h2c_run_response:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_END_HEADERS
     jz .loop
+    test ebx, ebx
+    jnz .h_trailer                 ; a later block is the trailer section
     call h2c_do_decode
     test rax, rax
     js .err
+    mov qword [h2c_hdrblk_len], 0   ; per BLOCK, see d_decode_block
     mov ebx, 1
+    cmp qword [h2c_hdr_es], 0
+    jne .done
+    jmp .loop
+.h_trailer:
+    call h2c_decode_trailer
+    test rax, rax
+    js .err
+    mov qword [h2c_hdrblk_len], 0
     cmp qword [h2c_hdr_es], 0
     jne .done
     jmp .loop
@@ -1213,10 +1231,21 @@ h2c_run_response:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_END_HEADERS
     jz .loop
+    test ebx, ebx
+    jnz .c_trailer                 ; a later block is the trailer section
     call h2c_do_decode
     test rax, rax
     js .err
+    mov qword [h2c_hdrblk_len], 0   ; per BLOCK, see d_decode_block
     mov ebx, 1
+    cmp qword [h2c_hdr_es], 0
+    jne .done
+    jmp .loop
+.c_trailer:
+    call h2c_decode_trailer
+    test rax, rax
+    js .err
+    mov qword [h2c_hdrblk_len], 0
     cmp qword [h2c_hdr_es], 0
     jne .done
     jmp .loop
@@ -1460,7 +1489,7 @@ h2c_emit:
     test r13, r13
     jz .ok
     cmp byte [r12], ':'
-    je .ok                         ; unknown pseudo-header: ignore
+    je .pseudo                     ; unknown pseudo-header: not relayed
     mov rdi, r12
     mov rsi, r13
     call h2c_is_skip
@@ -1471,7 +1500,12 @@ h2c_emit:
 .ok:
     clc
     jmp .ret
+.pseudo:
+    mov qword [h2c_saw_pseudo], 1
+    clc
+    jmp .ret
 .status:
+    mov qword [h2c_saw_pseudo], 1
     xor eax, eax
     xor ecx, ecx
 .psl:
@@ -1880,8 +1914,40 @@ d_apply_window:
     add [rbx + linnea_h2c.stream_win], rax
     ret
 
+; h2c_decode_trailer() -> rax 0/-1. Decode the staged block for its HPACK side
+; effects ONLY. A response may carry a TRAILER section after the body (RFC 9113
+; 8.1): a second HEADERS block, ending the stream. It contributes neither the
+; status nor a relayed field — an intermediary may drop trailers, and this one
+; does — but it MUST still be decoded, because HPACK is stateful: a block left
+; undecoded desynchronizes the dynamic table for every block after it, on this
+; connection, for good. So decode it, then put back the status and the header
+; lines the INITIAL block produced. A pseudo-header in a trailer is malformed
+; and fails the exchange rather than reaching the client as a response field.
+h2c_decode_trailer:
+    mov rax, [h2c_status]
+    mov [h2c_tr_status], rax
+    mov rax, [h2c_hdrlines_len]
+    mov [h2c_tr_lines], rax
+    mov qword [h2c_saw_pseudo], 0
+    call h2c_do_decode
+    test rax, rax
+    js .bad
+    mov rax, [h2c_tr_status]
+    mov [h2c_status], rax
+    mov rax, [h2c_tr_lines]
+    mov [h2c_hdrlines_len], rax
+    cmp qword [h2c_saw_pseudo], 0
+    jne .bad
+    xor eax, eax
+    ret
+.bad:
+    mov rax, -1
+    ret
+
 ; d_decode_block() — decode ctx.hdrblk into ctx.status + ctx.hdrlines, reusing
 ; the global decoder (wired to the per-leg dyn table). rbx=ctx. rax 0/-1.
+; Only the FIRST completed block of a response may set either; ctx.hdr_done says
+; which block this is, and a later one is a trailer section.
 d_decode_block:
     lea rax, [h2c_scratch]
     mov [h2c_carrier + linnea_h2_req.scratch], rax
@@ -1894,8 +1960,16 @@ d_decode_block:
     mov rcx, [rbx + linnea_h2c.hdrblk_len]
     mov [h2c_hdrblk_len], rcx
     rep movsb
+    ; hdrblk holds ONE block. It used to be left filled, so a trailer section
+    ; decoded the concatenation of itself and the initial block — re-running the
+    ; initial block's bytes against a dynamic table those same bytes had already
+    ; grown, and re-emitting its fields ahead of the trailer's.
+    mov qword [rbx + linnea_h2c.hdrblk_len], 0
+    cmp qword [rbx + linnea_h2c.hdr_done], 0
+    jne .trailer
     mov qword [h2c_hdrlines_len], 0
     mov qword [h2c_status], 0
+    mov qword [h2c_saw_pseudo], 0
     call h2c_do_decode
     test rax, rax
     js .bad
@@ -1907,6 +1981,9 @@ d_decode_block:
     lea rdi, [rbx + linnea_h2c.hdrlines]
     rep movsb
     xor eax, eax
+    ret
+.trailer:
+    call h2c_decode_trailer          ; HPACK side effects only; ctx untouched
     ret
 .bad:
     mov rax, -1

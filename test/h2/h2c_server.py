@@ -15,6 +15,8 @@ Routes (by :path):
   /echo         -> 200, body = the request body verbatim (round-trip integrity)
   /big?n=N      -> 200, body = 'B'*N  (spans many DATA frames / windows)
   /status/NNN   -> NNN, small body
+  /trailers     -> 200 + DATA (no END_STREAM) + a response TRAILER section
+  /trailers-frag-> the same, trailer split across HEADERS + CONTINUATION
   anything else -> 404
 
 Usage: h2c_server.py <port> [mode]
@@ -22,6 +24,8 @@ Usage: h2c_server.py <port> [mode]
                    WINDOW_UPDATEs, forcing the client's body sender to wait.
   mode "goaway"    send GOAWAY instead of a response (negative test).
   mode "rst"       send RST_STREAM instead of a response (negative test).
+  mode "tls"       serve the same over TLS 1.3 with ALPN h2 (a proxy_h2 BACKEND;
+                   it sends NewSessionTickets, which the backend leg must skip).
 """
 import socket
 import struct
@@ -252,6 +256,9 @@ def respond(c, sid, method, path, body):
     q = ""
     if path and "?" in path:
         path, q = path.split("?", 1)
+    if path.startswith("/trailers"):
+        respond_trailers(c, sid, path)
+        return
     status, rbody, ctype = route(path, q, body)
 
     block = enc_status(status)
@@ -274,6 +281,32 @@ def respond(c, sid, method, path, body):
         i += len(piece)
         last = i >= len(rbody)
         c.send(frame(0x00, 0x01 if last else 0x00, sid, piece))
+
+
+def respond_trailers(c, sid, path):
+    """A 200 whose body DATA does NOT end the stream, followed by a response
+    TRAILER section (RFC 9113 8.1): a second HEADERS block carrying END_STREAM.
+    /trailers-frag splits that trailer across HEADERS + CONTINUATION, so
+    END_STREAM rides the HEADERS frame and END_HEADERS the CONTINUATION."""
+    rbody = b"hello with trailers\n"
+    block = enc_status(200)
+    block += enc_header("content-type", "text/plain")
+    block += enc_header("content-length", str(len(rbody)))
+    block += enc_header("x-h2c-server", "linnea-fixture", indexed=True)
+    c.send(frame(0x01, 0x04, sid, block))         # HEADERS, END_HEADERS only
+    c.send(frame(0x00, 0x00, sid, rbody))         # DATA, NO END_STREAM
+
+    tr = enc_header("x-checksum", "abc") + enc_header("grpc-status", "0")
+    if path == "/trailers-cl":
+        tr = enc_header("content-length", "5")
+    elif path == "/trailers-status":
+        tr = enc_status(500) + enc_header("x-checksum", "abc")
+    if path != "/trailers-frag":
+        c.send(frame(0x01, 0x05, sid, tr))        # HEADERS, END_HEADERS|END_STREAM
+    else:
+        cut = len(tr) // 2
+        c.send(frame(0x01, 0x01, sid, tr[:cut]))  # HEADERS, END_STREAM only
+        c.send(frame(0x09, 0x04, sid, tr[cut:]))  # CONTINUATION, END_HEADERS
 
 
 def route(path, q, body):
@@ -305,10 +338,25 @@ def main():
     srv.listen(16)
     # tiny window the smallwin body-writer chunks by
     Conn.win = 5
+    # mode "tls": the same server behind TLS 1.3 with ALPN h2, so it can stand in
+    # for a real h2 BACKEND behind a proxy_h2 location (which requires proxy_tls).
+    # Python/OpenSSL also sends NewSessionTickets, which linnea's leg must skip.
+    tls_ctx = None
+    if mode == "tls":
+        import os
+        import ssl
+        here = os.path.dirname(os.path.abspath(__file__))
+        crt = os.environ.get("LINNEA_TEST_CRT", os.path.join(here, "..", "tls", "server.crt"))
+        key = os.environ.get("LINNEA_TEST_KEY", os.path.join(here, "..", "tls", "server.key"))
+        tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_ctx.load_cert_chain(crt, key)
+        tls_ctx.set_alpn_protocols(["h2"])
     while True:
         conn, _ = srv.accept()
         conn.settimeout(15)
         try:
+            if tls_ctx is not None:
+                conn = tls_ctx.wrap_socket(conn, server_side=True)
             serve_one(conn, mode)
         except (ConnectionError, OSError, ValueError, IndexError):
             pass

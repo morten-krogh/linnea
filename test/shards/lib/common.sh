@@ -127,6 +127,8 @@ P61720=$((PORTBASE + 720))   # backend-TLS e2e: proxy_tls + proxy_keepalive (nev
 P61721=$((PORTBASE + 721))   # backend-h2 e2e: proxy_h2 + proxy_keepalive (never pooled)
 P61722=$((PORTBASE + 722))   # backend-TLS e2e: a ticket-sending backend (openssl s_server)
 P61723=$((PORTBASE + 723))   # backend-TLS e2e: the front in front of it
+P61724=$((PORTBASE + 724))   # backend-h2 e2e: the python h2 fixture over TLS (trailers)
+P61725=$((PORTBASE + 725))   # backend-h2 e2e: the front in front of it
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 # What actually reached a proxy backend, appended to by test/proxy_backend.py.
