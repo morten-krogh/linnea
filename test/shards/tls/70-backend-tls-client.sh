@@ -423,6 +423,48 @@ EOF
     printf '%s' "$out" | grep -q "^HTTP/1.1 502"
     check "backend h2 trailers: a pseudo-header in a trailer is refused, not honoured" $?
 
+    # A trailer section MUST carry END_STREAM (RFC 9113 8.1). Without it the
+    # block is not a trailer at all: the DATA that followed used to be appended
+    # to the body and its END_STREAM completed the exchange, so a backend
+    # protocol error reached the client as a response it believed was properly
+    # completed (audit-report-43). Refuse it instead.
+    CODE1="curl -s -o /dev/null -w %{http_code} --max-time 10 --http1.1 \
+        --cacert $PWD/test/tls/server.crt --resolve localhost:${P61725}:127.0.0.1"
+    CODE2="curl -s -o /dev/null -w %{http_code} --max-time 10 --http2 \
+        --cacert $PWD/test/tls/server.crt --resolve localhost:${P61725}:127.0.0.1"
+    for proto in CODE1 CODE2; do
+        eval "cl=\$$proto"
+        [ "$(tr_get /trailers-noes $cl)" = 502 ]
+        check "backend h2 trailers: a trailer with no END_STREAM is refused ($proto)" $?
+    done
+
+    # and refusing it must not wedge the front: the next request still works.
+    # One fixture across both, so this is the same front and the same worker.
+    python3 test/h2/h2c_server.py ${P61724} tls >$RUNDIR/bt_tr.log 2>&1 &
+    trpid=$!
+    sleep 0.5
+    c1=$($CODE1 "https://localhost:${P61725}/trailers-noes" 2>/dev/null)
+    c2=$($CODE1 "https://localhost:${P61725}/hello" 2>/dev/null)
+    kill $trpid 2>/dev/null; wait $trpid 2>/dev/null
+    [ "$c1" = 502 ] && [ "$c2" = 200 ]
+    check "backend h2 trailers: a refused trailer leaves the next request working ($c1 then $c2)" $?
+
+    # An INFORMATIONAL response is a later header block that is NOT a trailer:
+    # RFC 9113 8.1 allows zero or more 1xx blocks before the single final
+    # response. Treating every later block as a trailer made a 103 backend fail
+    # the exchange outright, and before that its fields leaked into the final
+    # response head. Neither: the 1xx is dropped and the FINAL head is the head.
+    out=$(tr_get /interim $H1)
+    printf '%s' "$out" | grep -q "^HTTP/1.1 200" \
+        && printf '%s' "$out" | grep -q "final after interim" \
+        && ! printf '%s' "$out" | grep -qi "^link:"
+    check "backend h2: a 1xx informational block is dropped and the final response is served" $?
+
+    out=$(tr_get /interim-two $H1)
+    printf '%s' "$out" | grep -q "^HTTP/1.1 200" \
+        && printf '%s' "$out" | grep -q "final after interim"
+    check "backend h2: two informational blocks before the final response" $?
+
     if [ -x "$CURLH3" ]; then
         out=$(tr_get /trailers "$CURLH3" --http3-only -sk -D- --max-time 10 \
               --resolve localhost:${P61725}:127.0.0.1)

@@ -17,6 +17,9 @@ Routes (by :path):
   /status/NNN   -> NNN, small body
   /trailers     -> 200 + DATA (no END_STREAM) + a response TRAILER section
   /trailers-frag-> the same, trailer split across HEADERS + CONTINUATION
+  /trailers-noes-> MALFORMED: a trailer block with no END_STREAM, then DATA
+  /interim      -> a 103 informational HEADERS block, then the final 200
+  /interim-two  -> two informational blocks (103, 100), then the final 200
   anything else -> 404
 
 Usage: h2c_server.py <port> [mode]
@@ -259,6 +262,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/trailers"):
         respond_trailers(c, sid, path)
         return
+    if path.startswith("/interim"):
+        respond_interim(c, sid, path)
+        return
     status, rbody, ctype = route(path, q, body)
 
     block = enc_status(status)
@@ -301,12 +307,33 @@ def respond_trailers(c, sid, path):
         tr = enc_header("content-length", "5")
     elif path == "/trailers-status":
         tr = enc_status(500) + enc_header("x-checksum", "abc")
-    if path != "/trailers-frag":
+    if path == "/trailers-noes":
+        # MALFORMED: a trailer section must carry END_STREAM (RFC 9113 8.1).
+        # This one does not, and DATA follows it and ends the stream instead.
+        c.send(frame(0x01, 0x04, sid, tr))        # HEADERS, END_HEADERS only
+        c.send(frame(0x00, 0x01, sid, b"more"))   # DATA, END_STREAM
+    elif path != "/trailers-frag":
         c.send(frame(0x01, 0x05, sid, tr))        # HEADERS, END_HEADERS|END_STREAM
     else:
         cut = len(tr) // 2
         c.send(frame(0x01, 0x01, sid, tr[:cut]))  # HEADERS, END_STREAM only
         c.send(frame(0x09, 0x04, sid, tr[cut:]))  # CONTINUATION, END_HEADERS
+
+
+def respond_interim(c, sid, path):
+    """An INFORMATIONAL response before the final one: RFC 9113 8.1 allows zero
+    or more 1xx HEADERS blocks ahead of the single final response. Legal, common
+    (103 Early Hints, 100 Continue), and a later HEADERS block that is NOT a
+    trailer."""
+    rbody = b"final after interim\n"
+    c.send(frame(0x01, 0x04, sid, enc_status(103) + enc_header("link", "</s.css>")))
+    if path == "/interim-two":
+        c.send(frame(0x01, 0x04, sid, enc_status(100)))
+    block = enc_status(200)
+    block += enc_header("content-type", "text/plain")
+    block += enc_header("content-length", str(len(rbody)))
+    c.send(frame(0x01, 0x04, sid, block))         # the FINAL response head
+    c.send(frame(0x00, 0x01, sid, rbody))         # DATA, END_STREAM
 
 
 def route(path, q, body):

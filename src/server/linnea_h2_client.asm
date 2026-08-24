@@ -1202,21 +1202,17 @@ h2c_run_response:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_END_HEADERS
     jz .loop
-    test ebx, ebx
-    jnz .h_trailer                 ; a later block is the trailer section
-    call h2c_do_decode
+    movzx edi, bl                  ; 1 once the final response head is in
+    mov rsi, [h2c_hdr_es]
+    call h2c_classify_block
     test rax, rax
     js .err
     mov qword [h2c_hdrblk_len], 0   ; per BLOCK, see d_decode_block
+    cmp rax, 1
+    je .loop                       ; informational: read on for the final head
+    cmp rax, 2
+    je .done                       ; a trailer section, END_STREAM checked
     mov ebx, 1
-    cmp qword [h2c_hdr_es], 0
-    jne .done
-    jmp .loop
-.h_trailer:
-    call h2c_decode_trailer
-    test rax, rax
-    js .err
-    mov qword [h2c_hdrblk_len], 0
     cmp qword [h2c_hdr_es], 0
     jne .done
     jmp .loop
@@ -1231,21 +1227,17 @@ h2c_run_response:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_END_HEADERS
     jz .loop
-    test ebx, ebx
-    jnz .c_trailer                 ; a later block is the trailer section
-    call h2c_do_decode
+    movzx edi, bl                  ; 1 once the final response head is in
+    mov rsi, [h2c_hdr_es]
+    call h2c_classify_block
     test rax, rax
     js .err
     mov qword [h2c_hdrblk_len], 0   ; per BLOCK, see d_decode_block
+    cmp rax, 1
+    je .loop                       ; informational: read on for the final head
+    cmp rax, 2
+    je .done                       ; a trailer section, END_STREAM checked
     mov ebx, 1
-    cmp qword [h2c_hdr_es], 0
-    jne .done
-    jmp .loop
-.c_trailer:
-    call h2c_decode_trailer
-    test rax, rax
-    js .err
-    mov qword [h2c_hdrblk_len], 0
     cmp qword [h2c_hdr_es], 0
     jne .done
     jmp .loop
@@ -1914,34 +1906,86 @@ d_apply_window:
     add [rbx + linnea_h2c.stream_win], rax
     ret
 
-; h2c_decode_trailer() -> rax 0/-1. Decode the staged block for its HPACK side
-; effects ONLY. A response may carry a TRAILER section after the body (RFC 9113
-; 8.1): a second HEADERS block, ending the stream. It contributes neither the
-; status nor a relayed field — an intermediary may drop trailers, and this one
-; does — but it MUST still be decoded, because HPACK is stateful: a block left
-; undecoded desynchronizes the dynamic table for every block after it, on this
-; connection, for good. So decode it, then put back the status and the header
-; lines the INITIAL block produced. A pseudo-header in a trailer is malformed
-; and fails the exchange rather than reaching the client as a response field.
-h2c_decode_trailer:
+; h2c_classify_block(rdi = 1 if the final response head is already in, else 0;
+;                     rsi = the END_STREAM bit of the frame that OPENED this
+;                     block) -> rax:
+;     0  this block IS the final response header section; the globals
+;        h2c_status / h2c_hdrlines(+_len) hold it and nothing else
+;     1  an informational (1xx) response: discarded, keep reading
+;     2  a valid trailer section: discarded, the response is complete
+;    -1  malformed
+;
+; A response is not one header block. RFC 9113 8.1: zero or more 1xx blocks,
+; then the single final response, then optionally a TRAILER section that ends
+; the stream. All three are "a completed HEADERS block", and only the middle one
+; is the response — so the block has to be classified by what is in it, not by
+; how many came before. Every one of them is decoded either way, because HPACK
+; is stateful: a block left undecoded desynchronizes the dynamic table for every
+; block after it, on this connection, for good.
+;
+; The staged block must already be in h2c_hdrblk/h2c_hdrblk_len. On 1, 2 and -1
+; the status and header lines the response head produced are put back, so a
+; discarded block leaves no trace in them.
+h2c_classify_block:
+    push rbx
+    push r12
+    mov rbx, rdi                     ; have-final-head flag
+    mov r12, rsi                     ; this block's END_STREAM bit
     mov rax, [h2c_status]
     mov [h2c_tr_status], rax
     mov rax, [h2c_hdrlines_len]
     mov [h2c_tr_lines], rax
+    mov qword [h2c_status], 0        ; judge THIS block's :status, not a stale one
     mov qword [h2c_saw_pseudo], 0
+    test rbx, rbx
+    jnz .decode                      ; a later block appends ABOVE the head's
+    mov qword [h2c_hdrlines_len], 0  ; no head yet: this block starts the lines
+.decode:
     call h2c_do_decode
     test rax, rax
     js .bad
+    ; --- informational? 1xx is not the response and not a trailer -------------
+    mov rax, [h2c_status]
+    cmp rax, 100
+    jb .not_1xx
+    cmp rax, 200
+    jae .not_1xx
+    test r12, r12
+    jnz .bad                         ; a 1xx cannot end the stream
+    call .restore
+    mov rax, 1
+    jmp .ret
+.not_1xx:
+    test rbx, rbx
+    jnz .trailer
+    xor eax, eax                     ; the final response header section
+    jmp .ret
+.trailer:
+    ; A trailer section carries no pseudo-header, and it MUST carry END_STREAM:
+    ; that bit is what makes it the end of the response rather than a stray
+    ; header block. Without it, the DATA that followed was appended to the body
+    ; and its END_STREAM completed the exchange, so a backend protocol error was
+    ; relayed as a response the client believed had completed properly
+    ; (audit-report-43).
+    call .restore
+    cmp qword [h2c_saw_pseudo], 0
+    jne .bad
+    test r12, r12
+    jz .bad
+    mov rax, 2
+    jmp .ret
+.restore:
     mov rax, [h2c_tr_status]
     mov [h2c_status], rax
     mov rax, [h2c_tr_lines]
     mov [h2c_hdrlines_len], rax
-    cmp qword [h2c_saw_pseudo], 0
-    jne .bad
-    xor eax, eax
     ret
 .bad:
+    call .restore
     mov rax, -1
+.ret:
+    pop r12
+    pop rbx
     ret
 
 ; d_decode_block() — decode ctx.hdrblk into ctx.status + ctx.hdrlines, reusing
@@ -1965,15 +2009,12 @@ d_decode_block:
     ; initial block's bytes against a dynamic table those same bytes had already
     ; grown, and re-emitting its fields ahead of the trailer's.
     mov qword [rbx + linnea_h2c.hdrblk_len], 0
-    cmp qword [rbx + linnea_h2c.hdr_done], 0
-    jne .trailer
-    mov qword [h2c_hdrlines_len], 0
-    mov qword [h2c_status], 0
-    mov qword [h2c_saw_pseudo], 0
-    call h2c_do_decode
+    mov rdi, [rbx + linnea_h2c.hdr_done]
+    mov rsi, [rbx + linnea_h2c.hdr_es]
+    call h2c_classify_block
     test rax, rax
-    js .bad
-    mov rax, [h2c_status]
+    jnz .ret                         ; -1 malformed, 1 informational, 2 trailer
+    mov rax, [h2c_status]            ; the final head: commit it to the leg
     mov [rbx + linnea_h2c.status], rax
     mov rcx, [h2c_hdrlines_len]
     mov [rbx + linnea_h2c.hdrlines_len], rcx
@@ -1981,12 +2022,7 @@ d_decode_block:
     lea rdi, [rbx + linnea_h2c.hdrlines]
     rep movsb
     xor eax, eax
-    ret
-.trailer:
-    call h2c_decode_trailer          ; HPACK side effects only; ctx untouched
-    ret
-.bad:
-    mov rax, -1
+.ret:
     ret
 
 ; d_stage_body() — stage the next request DATA chunk (rbx=ctx). Returns
@@ -2392,6 +2428,10 @@ d_dispatch:
     call d_decode_block
     test rax, rax
     js .bad
+    cmp rax, 1
+    je .ok                           ; informational: read on for the final head
+    cmp rax, 2
+    je .complete                     ; a trailer section, END_STREAM checked
     mov qword [rbx+linnea_h2c.hdr_done], 1
     cmp qword [rbx+linnea_h2c.hdr_es], 0
     jne .complete
@@ -2411,6 +2451,10 @@ d_dispatch:
     call d_decode_block
     test rax, rax
     js .bad
+    cmp rax, 1
+    je .ok                           ; informational: read on for the final head
+    cmp rax, 2
+    je .complete                     ; a trailer section, END_STREAM checked
     mov qword [rbx+linnea_h2c.hdr_done], 1
     cmp qword [rbx+linnea_h2c.hdr_es], 0
     jne .complete
