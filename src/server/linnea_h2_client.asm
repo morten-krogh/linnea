@@ -1244,6 +1244,8 @@ h2c_run_response:
 .data:
     cmp qword [h2c_fr_sid], 1
     jne .loop
+    test ebx, ebx
+    jz .err                        ; DATA before the response head, see d_dispatch
     lea rsi, [h2c_frame_buf+9]
     mov rdx, [h2c_fr_len]
     mov rax, [h2c_fr_flags]
@@ -1944,20 +1946,36 @@ h2c_classify_block:
     call h2c_do_decode
     test rax, rax
     js .bad
+    ; Once the final response head is in, EVERY later block is a trailer
+    ; section. An informational response cannot follow the response it informs
+    ; about, so a late 1xx is refused by the trailer rule — which admits no
+    ; pseudo-header — rather than mistaken for an early one. Asking "is it 1xx?"
+    ; FIRST let a post-final :status=103 be dropped as though it were allowed,
+    ; and the DATA after it completed the exchange (audit-report-44). The order
+    ; of these two questions IS the rule: what a block may be depends on what
+    ; has already arrived, not only on what is in it.
+    test rbx, rbx
+    jnz .trailer
     ; --- informational? 1xx is not the response and not a trailer -------------
     mov rax, [h2c_status]
     cmp rax, 100
-    jb .not_1xx
+    jb .final
     cmp rax, 200
-    jae .not_1xx
+    jae .final
     test r12, r12
     jnz .bad                         ; a 1xx cannot end the stream
     call .restore
     mov rax, 1
     jmp .ret
-.not_1xx:
-    test rbx, rbx
-    jnz .trailer
+.final:
+    ; A response header section must carry :status, and it must be one. Without
+    ; this the driver accepted a block that had none and synthesized
+    ; "HTTP/1.1 000 Status", leaving a downstream validator to notice — which
+    ; the proxy does, but the driver has callers that do not.
+    cmp rax, 200                     ; 1xx already went to the branch above
+    jb .bad
+    cmp rax, 599
+    ja .bad
     xor eax, eax                     ; the final response header section
     jmp .ret
 .trailer:
@@ -2463,6 +2481,11 @@ d_dispatch:
 .data:
     cmp qword [d_fr_sid], 1
     jne .ok
+    ; DATA before the response head is not body: nothing has said what this
+    ; response IS yet. It used to be appended anyway, so bytes that arrived
+    ; ahead of the head were prepended to the body the client received.
+    cmp qword [rbx+linnea_h2c.hdr_done], 0
+    je .bad
     mov rsi, r12
     mov rdx, r15
     mov rax, [d_fr_flags]

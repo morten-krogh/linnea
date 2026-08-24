@@ -20,6 +20,7 @@ Routes (by :path):
   /trailers-noes-> MALFORMED: a trailer block with no END_STREAM, then DATA
   /interim      -> a 103 informational HEADERS block, then the final 200
   /interim-two  -> two informational blocks (103, 100), then the final 200
+  /interim-late -> MALFORMED: a 1xx block AFTER the final response, then DATA
   anything else -> 404
 
 Usage: h2c_server.py <port> [mode]
@@ -262,7 +263,7 @@ def respond(c, sid, method, path, body):
     if path.startswith("/trailers"):
         respond_trailers(c, sid, path)
         return
-    if path.startswith("/interim"):
+    if path.startswith("/interim") or path in ("/no-status", "/data-first"):
         respond_interim(c, sid, path)
         return
     status, rbody, ctype = route(path, q, body)
@@ -326,6 +327,30 @@ def respond_interim(c, sid, path):
     (103 Early Hints, 100 Continue), and a later HEADERS block that is NOT a
     trailer."""
     rbody = b"final after interim\n"
+    if path == "/no-status":
+        # MALFORMED: a response header section must carry :status.
+        c.send(frame(0x01, 0x04, sid, enc_header("content-type", "text/plain")))
+        c.send(frame(0x00, 0x01, sid, b"nostatus"))
+        return
+    if path == "/data-first":
+        # MALFORMED: DATA before any response header block.
+        c.send(frame(0x00, 0x00, sid, b"early"))
+        block = enc_status(200) + enc_header("content-type", "text/plain")
+        c.send(frame(0x01, 0x04, sid, block))
+        c.send(frame(0x00, 0x01, sid, b"late"))
+        return
+    if path == "/interim-late":
+        # MALFORMED: an informational response cannot follow the final response
+        # it informs about, and a post-final block is a trailer section, which
+        # may carry no pseudo-header at all.
+        block = enc_status(200)
+        block += enc_header("content-type", "text/plain")
+        c.send(frame(0x01, 0x04, sid, block))     # the FINAL head, first
+        c.send(frame(0x00, 0x00, sid, b"body"))   # DATA, no END_STREAM
+        c.send(frame(0x01, 0x04, sid,             # a LATE 1xx: not legal here
+                     enc_status(103) + enc_header("link", "</late>")))
+        c.send(frame(0x00, 0x01, sid, b"more"))   # DATA, END_STREAM
+        return
     c.send(frame(0x01, 0x04, sid, enc_status(103) + enc_header("link", "</s.css>")))
     if path == "/interim-two":
         c.send(frame(0x01, 0x04, sid, enc_status(100)))

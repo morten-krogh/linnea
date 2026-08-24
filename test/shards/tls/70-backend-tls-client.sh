@@ -465,6 +465,47 @@ EOF
         && printf '%s' "$out" | grep -q "final after interim"
     check "backend h2: two informational blocks before the final response" $?
 
+    # ...and a 1xx block AFTER the final response is not an early response, it
+    # is a trailer section carrying a pseudo-header. Classifying by the block's
+    # own :status before asking what had already arrived let it be dropped as
+    # "early", and the DATA after it completed the exchange with a concatenated
+    # body (audit-report-44). What a block MAY be depends on what came before.
+    for proto in CODE1 CODE2; do
+        eval "cl=\$$proto"
+        [ "$(tr_get /interim-late $cl)" = 502 ]
+        check "backend h2: a 1xx block after the final response is refused ($proto)" $?
+    done
+    if [ -x "$CURLH3" ]; then
+        code=$(tr_get /interim-late "$CURLH3" --http3-only -sk -o /dev/null \
+               -w '%{http_code}' --max-time 10 \
+               --resolve localhost:${P61725}:127.0.0.1)
+        [ "$code" = 502 ]
+        check "backend h2: a 1xx block after the final response is refused (h3 client)" $?
+    else
+        check "backend h2: post-final 1xx, h3 client (skipped: curl-h3 unavailable)" 0
+    fi
+
+    # Two more of the same family, found by probing the classifier rather than
+    # filed: a response header section with NO :status was accepted and
+    # synthesized "HTTP/1.1 000 Status" (caught downstream, but the driver has
+    # callers with no such validator), and DATA arriving BEFORE the response
+    # head was appended to the body — so bytes that preceded the head were
+    # prepended to what the client received, under a 200.
+    [ "$(tr_get /no-status $CODE1)" = 502 ]
+    check "backend h2: a response header block with no :status is refused" $?
+    [ "$(tr_get /data-first $CODE1)" = 502 ]
+    check "backend h2: DATA before the response head is refused, not prepended" $?
+
+    # refusing it must not wedge the front either
+    python3 test/h2/h2c_server.py ${P61724} tls >$RUNDIR/bt_tr.log 2>&1 &
+    trpid=$!
+    sleep 0.5
+    c1=$($CODE1 "https://localhost:${P61725}/interim-late" 2>/dev/null)
+    c2=$($CODE1 "https://localhost:${P61725}/hello" 2>/dev/null)
+    kill $trpid 2>/dev/null; wait $trpid 2>/dev/null
+    [ "$c1" = 502 ] && [ "$c2" = 200 ]
+    check "backend h2: a refused post-final 1xx leaves the next request working ($c1 then $c2)" $?
+
     if [ -x "$CURLH3" ]; then
         out=$(tr_get /trailers "$CURLH3" --http3-only -sk -D- --max-time 10 \
               --resolve localhost:${P61725}:127.0.0.1)
