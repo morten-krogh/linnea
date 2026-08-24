@@ -1,3 +1,5 @@
+%ifndef LINNEA_HPACK_INC
+%define LINNEA_HPACK_INC
 ; HPACK (RFC 7541) decoder interface for the HTTP/2 request path (M16).
 ;
 ; The decoder runs with SETTINGS_HEADER_TABLE_SIZE = 0 advertised to the
@@ -202,3 +204,4 @@ struc linnea_h2_req
                                 ; (QPACK passes 0: HTTP/3 has its own table
                                 ; encoding, and we advertise zero capacity)
 endstruc
+%endif

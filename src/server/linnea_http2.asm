@@ -18,6 +18,8 @@ default rel
 %include "linnea_hpack.inc"
 %include "linnea_time.inc"
 %include "linnea_uring.inc"
+%include "linnea_tls_client.inc"     ; proxy_h2 leg: TLS handshake state
+%include "linnea_h2_client.inc"      ; proxy_h2 leg: h2 driver context + verdicts
 
 global linnea_h2_init
 global linnea_h2_handle
@@ -91,6 +93,7 @@ global linnea_h2p_init
 global linnea_h2p_at
 global linnea_h2p_event
 global linnea_h2p_service
+global h2p_resp_feed                 ; proxy_h2 response feed (called from .ao_recv)
 global linnea_h2p_conn_close
 global h2p_compact
 global linnea_h2_busy
@@ -112,6 +115,16 @@ extern linnea_upstream_mark_ok
 extern linnea_upstream_mark_fail
 extern linnea_upstream_mark_unanswered
 extern linnea_upstream_limit
+; proxy_h2 leg (h2 clients): TLS handshake + h2 driver on the slot .fd
+extern linnea_h2p_tls_hs_for
+extern linnea_h2p_h2c_for
+extern linnea_tls_client_start
+extern linnea_tls_client_input
+extern linnea_ktls_enable
+extern linnea_h2c_drv_start
+extern linnea_h2c_drv_on_sent
+extern linnea_h2c_drv_on_recv
+extern linnea_h2c_drv_head
 
 section .rodata
 
@@ -3483,6 +3496,23 @@ h2p_retry_pooled:
     pop rbx
     ret
 
+; --- proxy_h2 leg helpers: the slot's fixed position in h2p_pool encodes its
+; linear index (conn.index*SLOTS + slot), which keys its TLS + h2c arenas. This
+; avoids threading the (conn,slot) pair through the event handler. rbx = slot*.
+h2p_leg_linear:
+    mov rax, rbx
+    sub rax, [h2p_pool]
+    xor edx, edx
+    mov rcx, linnea_h2p_size
+    div rcx
+    ret
+h2p_slot_hs:                          ; -> rax = linnea_tls_client_hs
+    mov rdi, [rbx + linnea_h2p.leg_lin]
+    jmp linnea_h2p_tls_hs_for
+h2p_slot_ctx:                         ; -> rax = linnea_h2c driver context
+    mov rdi, [rbx + linnea_h2p.leg_lin]
+    jmp linnea_h2p_h2c_for
+
 ; linnea_h2p_event(rdi = conn, rsi = slot index, edx = op tag, ecx = result)
 ;   -> rax = 1 when the connection has frames to flush (out_ptr/out_rem set),
 ;      else 0. The io_uring loop's upstream-completion hook: advance the
@@ -3514,6 +3544,11 @@ linnea_h2p_event:
     je .ev_connect
     cmp r13d, LINNEA_UD_H2UP_SEND
     je .ev_send
+    ; --- recv completion: route the proxy_h2 sub-states first ---
+    cmp qword [rbx + linnea_h2p.state], LINNEA_H2P_TLS
+    je .ev_tls_recv
+    cmp qword [rbx + linnea_h2p.state], LINNEA_H2P_H2
+    je .ev_h2_recv
     ; --- recv: response bytes (or EOF / error) ---
     test r14d, r14d
     js .ev_recv_err
@@ -3591,8 +3626,29 @@ linnea_h2p_event:
     ; not evidence a backend works: one that accepts and then times out every
     ; time would have its counter zeroed here on each attempt and could never
     ; reach the threshold.
+    ; A proxy_h2 backend runs the TLS 1.3 handshake (ALPN h2, SPKI pin) on this
+    ; slot's fd before any request; the h2 driver then speaks h2 over kTLS.
+    mov rax, [rbx + linnea_h2p.location]
+    cmp qword [rax + linnea_config_location.proxy_h2], 0
+    jne .ev_connect_h2
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_SENDING
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
+    jmp .ev_service
+.ev_connect_h2:
+    call h2p_leg_linear               ; rbx = slot -> rax = linear slot index
+    mov [rbx + linnea_h2p.leg_lin], rax
+    mov rdi, rax
+    call linnea_h2p_tls_hs_for        ; rax = this leg's TLS handshake arena
+    mov rdi, rax
+    mov qword [rdi + linnea_tls_client_hs.alpn_sel], 1   ; offer ALPN h2
+    mov r8, [rbx + linnea_h2p.location]
+    lea rsi, [r8 + linnea_config_location.proxy_pin]
+    lea rdx, [r8 + linnea_config_location.proxy_sni]
+    mov rcx, [r8 + linnea_config_location.proxy_sni_len]
+    call linnea_tls_client_start      ; ClientHello into hs.out
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_TLS
+    mov qword [rbx + linnea_h2p.leg_sent], 0
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_PROXY_H2 | LINNEA_H2P_F_WANT_SEND
     jmp .ev_service
 .ev_conn_failed:
     ; the h2 twin of the h1/h3 failover in linnea_uring.asm: count the failure,
@@ -3619,6 +3675,10 @@ linnea_h2p_event:
     jmp .ev_bad_gateway_counted
 
 .ev_send:
+    cmp qword [rbx + linnea_h2p.state], LINNEA_H2P_TLS
+    je .ev_tls_send
+    cmp qword [rbx + linnea_h2p.state], LINNEA_H2P_H2
+    je .ev_h2_send
     test r14d, r14d
     js .ev_send_err
     test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_REQ_FILE
@@ -3708,6 +3768,116 @@ linnea_h2p_event:
     test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_HEAD_SENT
     jz .ev_service
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_RST
+; ============================================================================
+; proxy_h2 leg sub-state handlers: TLS handshake, then the h2 driver, over .fd.
+; The recv landing for both is the leg's h2c out_buf (free during these phases);
+; the arming (.ao_send/.ao_recv in linnea_uring.asm) picks the buffer by state.
+; r12=conn, rbx=slot; tls_client_* and drv_* preserve rbx and r12.
+; ============================================================================
+.ev_tls_send:
+    test r14d, r14d
+    js .ev_bad_gateway
+    add [rbx + linnea_h2p.leg_sent], r14
+    call h2p_slot_hs                  ; rax = hs
+    mov rcx, [rbx + linnea_h2p.leg_sent]
+    cmp rcx, [rax + linnea_tls_client_hs.out_len]
+    jb .ev_tls_want_send
+    cmp qword [rax + linnea_tls_client_hs.state], LINNEA_CLIENT_HS_DONE
+    je .ev_tls_handoff                ; the client Finished just went out
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV   ; read the flight
+    jmp .ev_service
+.ev_tls_want_send:
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
+    jmp .ev_service
+.ev_tls_recv:
+    test r14d, r14d
+    jle .ev_bad_gateway               ; eof/err during the handshake -> 502
+    call h2p_slot_ctx                 ; rax = ctx (the recv landed in ctx.out_buf)
+    lea rsi, [rax + linnea_h2c.out_buf]
+    mov edx, r14d
+    call h2p_slot_hs                  ; rax = hs
+    mov rdi, rax
+    call linnea_tls_client_input      ; -> MORE(0) / DONE(1) / FAIL(-1)
+    cmp rax, LINNEA_CLIENT_FAIL
+    je .ev_bad_gateway
+    cmp rax, LINNEA_CLIENT_DONE
+    je .ev_tls_recv_fin
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV    ; MORE
+    jmp .ev_service
+.ev_tls_recv_fin:
+    mov qword [rbx + linnea_h2p.leg_sent], 0
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND    ; send Finished
+    jmp .ev_service
+.ev_tls_handoff:
+    ; hand .fd to kTLS (client orientation: TX=c_ap, RX=s_ap, app seqs 0), then
+    ; start the h2 driver with the request head h2p_claim built in .buf.
+    call h2p_slot_hs                  ; rax = hs
+    mov edi, [rbx + linnea_h2p.fd]
+    lea rsi, [rax + linnea_tls_client_hs.c_ap]
+    lea rdx, [rax + linnea_tls_client_hs.s_ap]
+    xor ecx, ecx
+    xor r8d, r8d
+    call linnea_ktls_enable
+    test rax, rax
+    js .ev_bad_gateway
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_KTLS
+    call h2p_slot_ctx                 ; rax = ctx
+    mov rdi, rax
+    lea rsi, [rbx + linnea_h2p.buf]   ; the rewritten h1 request head
+    mov rdx, [rbx + linnea_h2p.req_len]
+    mov rcx, [rbx + linnea_h2p.rq_buf]    ; request body mapping (0 = none)
+    mov r8, [rbx + linnea_h2p.rq_wr]      ; its length (rq_rd is 0 at the start)
+    test rcx, rcx
+    jnz .ev_h2_start_go
+    xor r8, r8
+.ev_h2_start_go:
+    mov r9, LINNEA_H2C_SCHEME_HTTPS
+    call linnea_h2c_drv_start         ; -> verdict
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_H2
+    jmp .ev_h2_verdict
+.ev_h2_send:
+    test r14d, r14d
+    js .ev_bad_gateway
+    call h2p_slot_ctx
+    mov rdi, rax
+    mov esi, r14d
+    call linnea_h2c_drv_on_sent       ; -> verdict
+    jmp .ev_h2_verdict
+.ev_h2_recv:
+    test r14d, r14d
+    jg .ev_h2_recv_ok
+    jmp .ev_bad_gateway               ; eof/err mid-exchange -> 502
+.ev_h2_recv_ok:
+    call h2p_slot_ctx
+    mov rdi, rax
+    lea rsi, [rax + linnea_h2c.out_buf]  ; the recv landed here
+    mov edx, r14d
+    call linnea_h2c_drv_on_recv       ; -> verdict
+    jmp .ev_h2_verdict
+.ev_h2_verdict:
+    cmp rax, LINNEA_H2C_WANT_SEND
+    je .ev_h2_want_send
+    cmp rax, LINNEA_H2C_WANT_RECV
+    je .ev_h2_want_recv
+    cmp rax, LINNEA_H2C_DRV_DONE
+    je .ev_h2_done
+    jmp .ev_bad_gateway               ; FAIL / RST / GOAWAY -> 502
+.ev_h2_want_send:
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
+    jmp .ev_service
+.ev_h2_want_recv:
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
+    jmp .ev_service
+.ev_h2_done:
+    ; the whole response is buffered in the leg ctx. Present it to the existing
+    ; HEAD/RELAY path: compose the h1 head into .buf and parse it; the body is
+    ; then fed chunk by chunk from ctx as the relay drains (.ao_recv feed).
+    mov rdi, rbx
+    call h2p_resp_begin               ; -> rax = 0 ok, -1 malformed synthesized head
+    test rax, rax
+    js .ev_bad_gateway
+    jmp .ev_service
+
 .ev_service:
     mov rdi, r12
     call linnea_h2p_service          ; -> rax = 1 if frames are queued
@@ -3765,6 +3935,94 @@ h2p_free_slot:
     mov qword [rbx + linnea_h2p.rq_buf], 0
     mov qword [rbx + linnea_h2p.sid], 0
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FREE
+    ret
+
+; ============================================================================
+; proxy_h2 response feed: present the driver's buffered h1 response (head in the
+; leg ctx, body in ctx.body_buf) to the existing HEAD/RELAY path via .buf.
+; ============================================================================
+; h2p_resp_begin(rdi = slot*) -> rax = 0 ok, -1 malformed synthesized head.
+; Compose the h1 head into .buf, parse it, then feed the first body chunk.
+h2p_resp_begin:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov rdi, [rbx + linnea_h2p.leg_lin]
+    call linnea_h2p_h2c_for
+    mov r12, rax                      ; ctx
+    mov rdi, r12
+    lea rsi, [rbx + linnea_h2p.buf]
+    call linnea_h2c_drv_head          ; rax = head length in .buf
+    mov [rbx + linnea_h2p.len], rax
+    mov qword [rbx + linnea_h2p.resp_off], 0
+    mov rdi, rbx
+    call h2p_parse_head               ; -> 1 parsed, 0 need-more, -1 bad
+    cmp rax, 1
+    jne .rb_bad                       ; a synthesized head must parse whole
+    ; The backend leg is DONE: the whole response is buffered in the leg ctx, so
+    ; no further backend send/recv is owed. Drop the driver's leftover WANT_SEND
+    ; (and WANT_RECV, which h2p_resp_feed re-sets iff more body remains) before
+    ; entering the client-facing RELAY phase — otherwise arm_h2p_ops, seeing a
+    ; non-TLS/H2 state, would arm a *normal* h1 backend send (SENDING/HEAD) and
+    ; corrupt the exchange.
+    and qword [rbx + linnea_h2p.flags], ~(LINNEA_H2P_F_WANT_SEND | LINNEA_H2P_F_WANT_RECV)
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_RELAY
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_HEAD_RDY
+    mov rdi, rbx
+    call h2p_resp_feed                 ; first body chunk (also handles no body)
+    xor eax, eax
+    jmp .rb_ret
+.rb_bad:
+    mov rax, -1
+.rb_ret:
+    pop r12
+    pop rbx
+    ret
+
+; h2p_resp_feed(rdi = slot*) — append the next response-body chunk from the leg
+; ctx into .buf (.ao_recv has already compacted, freeing room), decode it, and
+; ask for more if the body is not exhausted. Called instead of a socket recv for
+; a RELAY-state proxy_h2 leg. Clobbers only caller-saved + the flags.
+h2p_resp_feed:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov rdi, [rbx + linnea_h2p.leg_lin]
+    call linnea_h2p_h2c_for
+    mov r12, rax                      ; ctx
+    mov r13, [r12 + linnea_h2c.body_len]
+    sub r13, [rbx + linnea_h2p.resp_off]     ; remaining body
+    jz .rf_decode                     ; nothing to append; let decode finish
+    mov rcx, LINNEA_H2P_BUF
+    sub rcx, [rbx + linnea_h2p.len]           ; room in .buf
+    jz .rf_more                       ; no room yet; the relay must drain first
+    cmp r13, rcx
+    jbe .rf_n
+    mov r13, rcx                      ; n = min(remaining, room)
+.rf_n:
+    lea rdi, [rbx + linnea_h2p.buf]
+    add rdi, [rbx + linnea_h2p.len]
+    lea rsi, [r12 + linnea_h2c.body_buf]
+    add rsi, [rbx + linnea_h2p.resp_off]
+    mov rcx, r13
+    rep movsb
+    add [rbx + linnea_h2p.len], r13
+    add [rbx + linnea_h2p.resp_off], r13
+.rf_decode:
+    mov rdi, rbx
+    call h2p_decode                   ; counted body: advances .wr, sets BODY_DONE
+    ; more body still to feed?
+    mov rax, [r12 + linnea_h2c.body_len]
+    cmp rax, [rbx + linnea_h2p.resp_off]
+    ja .rf_more
+    jmp .rf_ret
+.rf_more:
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_RECV
+.rf_ret:
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; linnea_h2p_service(rdi = conn) -> rax = 1 when out_ptr/out_rem now hold

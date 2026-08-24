@@ -120,6 +120,10 @@ extern linnea_h2c_drv_start
 extern linnea_h2c_drv_on_sent
 extern linnea_h2c_drv_on_recv
 extern linnea_h2c_drv_head
+; proxy_h2 leg on an h2p slot (h2 clients): per-slot TLS/h2 arenas + response feed
+extern linnea_h2p_tls_hs_for
+extern linnea_h2p_h2c_for
+extern h2p_resp_feed
 extern linnea_ktls_rekey_rx
 extern linnea_ktls_rekey_tx
 extern linnea_ktls_key_update
@@ -4449,6 +4453,13 @@ linnea_uring_arm_h2p_ops:
     mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
     mov ecx, [r12 + linnea_h2p.fd]
     mov [rax + LINNEA_SQE_FD], ecx
+    ; a proxy_h2 leg sends its TLS handshake buffer (hs.out) or the h2 driver's
+    ; staged frames (ctx.out_buf) instead of the h1 request in .buf.
+    mov rcx, [r12 + linnea_h2p.state]
+    cmp rcx, LINNEA_H2P_TLS
+    je .ao_send_tls
+    cmp rcx, LINNEA_H2P_H2
+    je .ao_send_h2
     ; the head comes from the front of the buffer; once it is out, the body
     ; comes from a mapping of the file it was captured to. This used to be
     ; either that or a FIFO the body streamed through, sharing these cursors;
@@ -4476,8 +4487,64 @@ linnea_uring_arm_h2p_ops:
     mov [rax + LINNEA_SQE_LEN], ecx
     mov edx, LINNEA_UD_H2UP_SEND
     jmp .ao_finish
+.ao_send_tls:
+    ; hs.out[leg_sent .. out_len] (rax = sqe; the arena lookups preserve it via
+    ; the stack and preserve r12/r13/r14).
+    push rax
+    mov rdi, [r12 + linnea_h2p.leg_lin]
+    call linnea_h2p_tls_hs_for        ; rax = hs
+    mov rdx, rax
+    pop rax
+    lea rcx, [rdx + linnea_tls_client_hs.out]
+    add rcx, [r12 + linnea_h2p.leg_sent]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov rcx, [rdx + linnea_tls_client_hs.out_len]
+    sub rcx, [r12 + linnea_h2p.leg_sent]
+    CLAMP_IO_LEN rcx
+    mov [rax + LINNEA_SQE_LEN], ecx
+    mov edx, LINNEA_UD_H2UP_SEND
+    jmp .ao_finish
+.ao_send_h2:
+    ; ctx.out_buf[out_sent .. out_len]
+    push rax
+    mov rdi, [r12 + linnea_h2p.leg_lin]
+    call linnea_h2p_h2c_for           ; rax = ctx
+    mov rdx, rax
+    pop rax
+    lea rcx, [rdx + linnea_h2c.out_buf]
+    add rcx, [rdx + linnea_h2c.out_sent]
+    mov [rax + LINNEA_SQE_ADDR], rcx
+    mov rcx, [rdx + linnea_h2c.out_len]
+    sub rcx, [rdx + linnea_h2c.out_sent]
+    CLAMP_IO_LEN rcx
+    mov [rax + LINNEA_SQE_LEN], ecx
+    mov edx, LINNEA_UD_H2UP_SEND
+    jmp .ao_finish
 
 .ao_recv:
+    ; proxy_h2 sub-flows: a TLS-handshake / h2-driver recv lands in the leg's h2c
+    ; out_buf (not .buf); a RELAY leg feeds the response body from the leg ctx
+    ; with no socket op (the driver already read the whole response).
+    mov rcx, [r12 + linnea_h2p.state]
+    cmp rcx, LINNEA_H2P_TLS
+    je .ao_recv_leg
+    cmp rcx, LINNEA_H2P_H2
+    je .ao_recv_leg
+    test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_PROXY_H2
+    jz .ao_recv_norm
+    and qword [r12 + linnea_h2p.flags], ~LINNEA_H2P_F_WANT_RECV
+    ; recycle what the client has already framed out of .buf so a response
+    ; larger than the slot buffer keeps flowing — but not while a send is
+    ; reading those bytes (the last DATA frame sends straight out of .buf)
+    cmp qword [rbx + linnea_connection.h2_tx_busy], 0
+    jne .ao_rf_feed
+    mov rdi, r12
+    call h2p_compact
+.ao_rf_feed:
+    mov rdi, r12
+    call h2p_resp_feed
+    jmp .ao_next
+.ao_recv_norm:
     ; recycle what the client has already taken, so a body larger than the
     ; buffer keeps streaming — but not while a send is reading those bytes
     cmp qword [rbx + linnea_connection.h2_tx_busy], 0
@@ -4504,6 +4571,27 @@ linnea_uring_arm_h2p_ops:
     add rdx, [r12 + linnea_h2p.len]
     mov [rax + LINNEA_SQE_ADDR], rdx
     mov [rax + LINNEA_SQE_LEN], ecx
+    mov edx, LINNEA_UD_H2UP_RECV
+    jmp .ao_finish
+.ao_recv_leg:
+    ; TLS-handshake or h2-driver recv: land in the leg's h2c out_buf. A plain
+    ; recv — the self-hosted linnea backend offers no resumption so issues no
+    ; NST; a backend that does needs a control-record-aware RECVMSG here (the
+    ; up_fd leg's up_ktls_* is the template), a follow-up.
+    and qword [r12 + linnea_h2p.flags], ~LINNEA_H2P_F_WANT_RECV
+    or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
+    mov rdi, [r12 + linnea_h2p.leg_lin]
+    call linnea_h2p_h2c_for           ; rax = ctx
+    push rax
+    call linnea_uring_get_sqe_zeroed  ; rax = sqe
+    pop rcx                           ; ctx
+    mov byte [rax + LINNEA_SQE_OPCODE], LINNEA_IORING_OP_RECV
+    mov byte [rax + LINNEA_SQE_FLAGS], LINNEA_IOSQE_IO_LINK
+    mov edx, [r12 + linnea_h2p.fd]
+    mov [rax + LINNEA_SQE_FD], edx
+    lea rdx, [rcx + linnea_h2c.out_buf]
+    mov [rax + LINNEA_SQE_ADDR], rdx
+    mov dword [rax + LINNEA_SQE_LEN], LINNEA_H2C_D_OUT_CAP
     mov edx, LINNEA_UD_H2UP_RECV
 
 .ao_finish:

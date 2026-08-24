@@ -50,21 +50,17 @@ linnea_h2p_leg_pool_init:
     pop rbx
     ret
 
-; linnea_h2p_tls_hs_for(rdi = conn index, rsi = slot index) -> rax = that leg's
-; linnea_tls_client_hs.
+; linnea_h2p_tls_hs_for(rdi = LINEAR slot index = conn.index*SLOTS + slot)
+;   -> rax = that leg's linnea_tls_client_hs. The caller derives the linear index
+;   from the slot pointer, so no (conn,slot) plumbing through the event handler.
 linnea_h2p_tls_hs_for:
-    imul rdi, rdi, LINNEA_H2P_SLOTS
-    add rdi, rsi
     imul rdi, rdi, linnea_tls_client_hs_size
     add rdi, [h2p_tls_pool]
     mov rax, rdi
     ret
 
-; linnea_h2p_h2c_for(rdi = conn index, rsi = slot index) -> rax = that leg's
-; linnea_h2c driver context.
+; linnea_h2p_h2c_for(rdi = LINEAR slot index) -> rax = that leg's linnea_h2c.
 linnea_h2p_h2c_for:
-    imul rdi, rdi, LINNEA_H2P_SLOTS
-    add rdi, rsi
     imul rdi, rdi, linnea_h2c_size
     add rdi, [h2p_h2c_pool]
     mov rax, rdi

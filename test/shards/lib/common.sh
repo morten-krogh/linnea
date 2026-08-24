@@ -121,6 +121,7 @@ P61714=$((PORTBASE + 714))   # backend-TLS e2e: the pinning front, wrong pin
 P61715=$((PORTBASE + 715))   # backend-h2 e2e: the proxy_h2 FRONT (good pin)
 P61716=$((PORTBASE + 716))   # backend-h2 e2e: the proxy_h2 front, wrong pin
 P61717=$((PORTBASE + 717))   # backend-h2 e2e: the TLS+h3 proxy_h2 front (h3 client)
+P61718=$((PORTBASE + 718))   # backend-h2 e2e: the TLS+h2 proxy_h2 front (h2 client)
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 # What actually reached a proxy backend, appended to by test/proxy_backend.py.

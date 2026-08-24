@@ -246,6 +246,11 @@ LINNEA_H2P_RELAY      equ 5       ; head parsed; body decoding and streaming
 LINNEA_H2P_FAILED     equ 6       ; answer .status (502/504) or RST, then free
 LINNEA_H2P_ZOMBIE     equ 7       ; conn/stream died with an op in flight; the
                                   ; completion frees the slot
+; --- backend HTTP/2 (proxy_h2) sub-states, before the normal HEAD/RELAY ---
+LINNEA_H2P_TLS        equ 8       ; running the TLS 1.3 client handshake on .fd
+LINNEA_H2P_H2         equ 9       ; running the h2 client driver over the kTLS .fd
+LINNEA_H2P_RESP       equ 10      ; feeding the synthesized h1 response from the
+                                  ; leg's h2c context into .buf for HEAD/RELAY
 
 ; slot flags
 LINNEA_H2P_F_HEAD_SENT equ 1      ; response HEADERS frame emitted
@@ -289,6 +294,14 @@ LINNEA_H2P_F_HEAD_INTERIM equ 65536 ; the parsed head is a 1xx informational
 ; would otherwise skip the RFC 9113 8.1.1 reconciliation entirely and let the
 ; measured body be forwarded under the client's own contradicted framing.
 LINNEA_H2P_F_HAS_CL    equ 131072
+; The leg speaks TLS+h2 to a proxy_h2 backend: .fd runs the TLS handshake then
+; the h2 driver before the response is presented to HEAD/RELAY. Set at connect.
+; These two are the backend-h2 leg flags; they take fresh high bits (NOT the
+; 32768/65536 that F_DEC_ERR and F_HEAD_INTERIM already own — a collision there
+; made a plain 200 response look like a 1xx interim and a decode error).
+LINNEA_H2P_F_PROXY_H2  equ 262144  ; 0x40000
+LINNEA_H2P_F_KTLS      equ 524288  ; 0x80000: .fd handed to kTLS (reads are
+                                   ; control-record aware RECVMSG, skipping NSTs)
 
 struc linnea_h2p
     .state:     resq 1
@@ -352,6 +365,20 @@ struc linnea_h2p
     .lg_bytes:  resq 1            ; body bytes framed to the client, for the
                                   ; access line (.off gets rebased by the
                                   ; buffer compaction, so it cannot serve)
+    ; --- proxy_h2 leg: TLS handshake + h2 driver over .fd, then RESP feed ---
+    .leg_lin:   resq 1            ; this slot's linear index (conn.index*SLOTS+slot),
+                                  ; keying its TLS + h2c arenas; set at connect
+    .leg_sent:  resq 1            ; TLS handshake out send progress (tls.out)
+    .resp_off:  resq 1            ; response body bytes copied ctx.body_buf -> .buf
+    ; kTLS RX on .fd: the h2 driver's recv is RECVMSG so a backend NewSessionTicket
+    ; (a control record) is skipped rather than failing the plain recv with -EIO.
+    ; Per-slot because up to LINNEA_H2P_SLOTS legs read at once.
+    .krx_msg:   resb 56           ; struct msghdr (== LINNEA_KTLS_MSGHDR_SIZE)
+    .krx_iov:   resb 16           ; struct iovec  (== LINNEA_KTLS_IOVEC_SIZE)
+    .krx_cmsg:  resb 32           ; cmsg space    (== LINNEA_KTLS_CMSG_SIZE)
+    .krx_armed: resq 1            ; 1 = the last recv was armed as RECVMSG
+    .krx_buf:   resq 1            ; that recv's landing buffer + length, so a
+    .krx_len:   resq 1            ; skipped control record re-arms it identically
     ; the access line's method and target, copied at the claim: the rewritten
     ; request head in buf is overwritten by the response long before the
     ; status is known. One length byte, then the (truncated) text.

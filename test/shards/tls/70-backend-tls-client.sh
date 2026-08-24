@@ -167,6 +167,33 @@ EOF
     [ "$code" = 502 ]
     check "backend h2 e2e: a wrong pin fails and returns 502 (proxy_h2)" $?
 
+    # --- an h2 client through proxy_h2: curl negotiates h2 by ALPN against a TLS
+    # front, which runs the h2 backend leg and frames the synthesized response
+    # back over the client's own h2 connection. This is the path the F_KTLS /
+    # F_HEAD_INTERIM flag-bit collision broke (a 200 looked like a 1xx interim,
+    # so the client got a spurious second HEADERS and an empty body). ---
+    cat > $CFG/bt-fe-h2c.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-h2c.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61718}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61712}",
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost",
+      "proxy_h2": 1 } ] } ] }
+EOF
+    start_server $CFG/bt-fe-h2c.json
+    body=$(curl -s --http2 --cacert "$PWD/test/tls/server.crt" --max-time 8 \
+        --resolve localhost:${P61718}:127.0.0.1 \
+        https://localhost:${P61718}/probe.txt)
+    [ "$body" = "BACKEND-OK" ]
+    check "backend h2 e2e: an h2 client (curl --http2) is framed a full-body 200 (proxy_h2)" $?
+
+    # the h2 client must get the whole large body, not just the first slot buffer
+    n=$(curl -s --http2 --cacert "$PWD/test/tls/server.crt" --max-time 12 \
+        --resolve localhost:${P61718}:127.0.0.1 \
+        https://localhost:${P61718}/big.bin | wc -c)
+    [ "$n" = 200000 ]
+    check "backend h2 e2e: an h2 client receives a 200000-byte body intact (proxy_h2)" $?
+
     # --- an h3 client through proxy_h2: the synthesized response is QPACK
     # re-encoded and delivered over QUIC (a real curl-h3 client) ---
     CURLH3=${LINNEA_CURL_H3:-$HOME/curl-h3/bin/curl}
