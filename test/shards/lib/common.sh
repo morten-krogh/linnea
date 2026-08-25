@@ -108,6 +108,7 @@ P61495=$((PORTBASE + 495))
 P61498=$((PORTBASE + 498))
 P61500=$((PORTBASE + 500))
 P61501=$((PORTBASE + 501))
+P61502=$((PORTBASE + 502))   # h3 stress: its own server, idle timeout not 5s
 P61671=$((PORTBASE + 671))
 P61701=$((PORTBASE + 701))
 P61702=$((PORTBASE + 702))

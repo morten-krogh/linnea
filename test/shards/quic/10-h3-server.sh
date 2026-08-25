@@ -121,7 +121,28 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # many, and whether it was the handshake or the data phase -- had gone to
     # /dev/null, and the answer cost a morning to recover. It prints only on a
     # failure, so a green run is as quiet as before.
-    stress_out=$(python3 test/quic/h3_stress_test.py ${P61452} 6 6 3 2>&1)
+    # ...against a server of its own, because the shared one advertises a
+    # five-second QUIC idle timeout and the check two blocks up asserts exactly
+    # that. Five seconds is too short for THIS client: it is a Python pump
+    # driving six concurrent transfers through an emulated network, and on a box
+    # running three suite jobs it can go quiet for longer than that between
+    # iterations. RFC 9000 10.1 closes an idle connection SILENTLY -- no
+    # CONNECTION_CLOSE, no RESET_STREAM -- so the transfer simply stopped and
+    # looked exactly like unrecovered loss.
+    #
+    # Measured under full CPU load at 6% loss, 60 seeds a side:
+    #   idle timeout 5s   3 failures in 120 seeds
+    #   idle timeout 30s  0 failures in 60
+    # and no RESET_STREAM in any of them, which is what ruled out the
+    # give-up-after-16-PTOs path before this was found.
+    cat > $CFG/tls-h3-stress.json <<EOF
+{ "log": "$PWD/$RUNDIR/h3-stress.log", "timeout": 30, "workers": 4,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61502}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/", "root": "$PWD/$WWW" } ] } ] }
+EOF
+    start_server $CFG/tls-h3-stress.json
+    stress_out=$(python3 test/quic/h3_stress_test.py ${P61502} 6 6 3 2>&1)
     [ $? -eq 0 ]
     check "h3 (io_uring): concurrent responses survive loss + reordering" $?
     printf '%s\n' "$stress_out" | grep -q "FAIL\|HANDSHAKE" \
