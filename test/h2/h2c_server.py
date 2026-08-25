@@ -55,6 +55,14 @@ Usage: h2c_server.py <port> [mode]
                    the protocol is at fault, so drive it from a client that
                    always reads.
   mode "throttle"  the same idea at 1024, which a real body can cross.
+  mode "pump7" / "pumpsid" / "pumpack" / "pumpok"
+                   throttle the upload to 1024 and, the moment the sender is
+                   blocked on credit, send a PING BEFORE the WINDOW_UPDATEs
+                   that unblock it: seven octets, stream 1, already an ACK, or
+                   legal. This is the only way to reach the blocking oracle's
+                   third frame loop, h2c_pump_window (audit-report-54). The
+                   response body reports the ACK that came back, so "no ACK for
+                   an ACK" is observable rather than assumed.
   mode "wdelta"    advertise 8192, let the client spend it, then LOWER
                    INITIAL_WINDOW_SIZE to 1024 granting nothing; the response
                    body reports how many bytes arrived afterwards (6.9.2).
@@ -235,7 +243,13 @@ def serve_one(sock, mode):
     # small enough that the sender must genuinely wait for credit and large
     # enough to carry a real body in reasonable time.
     modes = set(mode.split(","))
+    pump = ([m for m in modes if m.startswith("pump")] or [None])[0]
     init_win = 5 if "smallwin" in modes else (1024 if "throttle" in modes else 65535)
+    if pump:
+        init_win = 1024
+    c.pump = pump
+    c.pump_fired = False
+    c.pump_ack = None
     if "wdelta" in modes:
         init_win = 8192
     c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, init_win)))
@@ -264,7 +278,9 @@ def serve_one(sock, mode):
         elif ftype == 0x08:                       # WINDOW_UPDATE (ignore)
             pass
         elif ftype == 0x06:                       # PING
-            if not (flags & 0x01):
+            if flags & 0x01:
+                c.pump_ack = payload                   # what the client echoed
+            else:
                 c.send(frame(0x06, 0x01, 0, payload))  # ACK
         elif ftype == 0x01:                       # HEADERS
             blk = payload
@@ -301,6 +317,19 @@ def serve_one(sock, mode):
                     end_stream = True
                 continue
             body += payload
+            if c.pump and not c.pump_fired and payload:
+                # The sender has spent its 1024 and is now inside
+                # h2c_pump_window waiting for credit. Put the PING in front of
+                # the WINDOW_UPDATEs so it is read THERE and nowhere else.
+                c.pump_fired = True
+                if c.pump == "pump7":
+                    c.send(frame(0x06, 0x00, 0, b"1234567"))
+                elif c.pump == "pumpsid":
+                    c.send(frame(0x06, 0x00, 1, b"ABCDEFGH"))
+                elif c.pump == "pumpack":
+                    c.send(frame(0x06, 0x01, 0, b"ABCDEFGH"))
+                else:
+                    c.send(frame(0x06, 0x00, 0, b"ABCDEFGH"))
             # grant the client more window as we drain (smallwin path)
             if payload:
                 inc = len(payload)
@@ -313,6 +342,16 @@ def serve_one(sock, mode):
         elif ftype == 0x07:                       # GOAWAY
             return
         if got_headers and end_stream:
+            if c.pump:
+                got = c.pump_ack
+                rb = ("PUMP-ACK=%s BYTES=%d\n"
+                      % (got.decode("latin1") if got else "NONE",
+                         len(body))).encode()
+                blk = enc_status(200) + enc_header("content-type", "text/plain")
+                blk += enc_header("content-length", str(len(rb)))
+                c.send(frame(0x01, 0x04, sid, blk))
+                c.send(frame(0x00, 0x01, sid, rb))
+                continue
             respond(c, sid, method, path, body)
             # Drain until the client closes, so OUR close is a clean FIN. A real
             # h2 server keeps the connection open; closing here while the

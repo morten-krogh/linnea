@@ -871,6 +871,34 @@ h2c_send_ping_ack:
     call h2c_send_all
     ret
 
+; h2c_ping_frame() -> rax 0 = handled (echoed with ACK if it was a request),
+; -1 = the frame is malformed OR the ACK could not be sent; the caller ends the
+; exchange either way. 6.7: exactly 8 octets, stream 0, and an ACK is consumed
+; and never answered.
+;
+; This exists because the rule was written out three times. When the checks went
+; in (audit-report-46) two of the three copies were updated and the flow-control
+; pump's was not, so a malformed PING read while the upload waited for credit
+; was still echoed -- measured: a 7-octet PING came back as "1234567" plus a
+; byte from past the frame (audit-report-54). One caller, one rule.
+h2c_ping_frame:
+    cmp qword [h2c_fr_sid], 0
+    jne .bad
+    cmp qword [h2c_fr_len], 8
+    jne .bad
+    mov rax, [h2c_fr_flags]
+    test rax, LINNEA_H2C_FL_ACK
+    jnz .ok
+    call h2c_send_ping_ack
+    test rax, rax
+    js .bad                        ; the ACK could not be sent
+.ok:
+    xor eax, eax
+    ret
+.bad:
+    mov rax, -1
+    ret
+
 ; h2c_send_window(edi=sid, esi=inc)
 h2c_send_window:
     push rbx
@@ -1054,14 +1082,9 @@ h2c_settle:
     js .err                        ; malformed WINDOW_UPDATE (6.9)
     jmp h2c_settle
 .ping:
-    cmp qword [h2c_fr_sid], 0
-    jne .err
-    cmp qword [h2c_fr_len], 8
-    jne .err
-    mov rax, [h2c_fr_flags]
-    test rax, LINNEA_H2C_FL_ACK
-    jnz h2c_settle                 ; 6.7: never answer an ACK
-    call h2c_send_ping_ack
+    call h2c_ping_frame
+    test rax, rax
+    js .err
     jmp h2c_settle
 .goaway:
     cmp qword [h2c_fr_sid], 0
@@ -1119,7 +1142,9 @@ h2c_pump_window:
     call h2c_send_settings_ack
     jmp .chk
 .p:
-    call h2c_send_ping_ack
+    call h2c_ping_frame            ; unchecked until audit-report-54
+    test rax, rax
+    js .err
     jmp .chk
 .rst:
     cmp qword [h2c_fr_sid], 1      ; bounds as in d_dispatch
@@ -1332,14 +1357,9 @@ h2c_run_response:
     ; the oracle's twin of d_dispatch's check -- see there. It also never looked
     ; at the ACK flag, so it answered the backend's ACKs with ACKs of its own,
     ; which 6.7 forbids outright.
-    cmp qword [h2c_fr_sid], 0
-    jne .err
-    cmp qword [h2c_fr_len], 8
-    jne .err
-    mov rax, [h2c_fr_flags]
-    test rax, LINNEA_H2C_FL_ACK
-    jnz .loop
-    call h2c_send_ping_ack
+    call h2c_ping_frame
+    test rax, rax
+    js .err
     jmp .loop
 .headers:
     ; 6.1/6.2: this leg is single-stream. A HEADERS or DATA frame naming

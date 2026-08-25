@@ -643,6 +643,45 @@ PY
         check "backend h2 stream: $route is refused end to end" $?
     done
 
+    # --- a PING read while the UPLOAD waits for credit (6.7) ----------------
+    # The blocking oracle has a third frame loop, h2c_pump_window, reached only
+    # when the request window is exhausted mid-upload. When the PING checks went
+    # in (audit-report-46) two of its three copies were updated and this one was
+    # not, so a malformed PING read there was still echoed: a 7-octet PING came
+    # back as "1234567" plus a byte from PAST the frame, and an already-ACKed
+    # PING was answered with another ACK. The three copies are now one helper.
+    #
+    # This is oracle-only -- the driver was right on all four -- and the driver
+    # is what the end-to-end upload rows exercise, so nothing above could see
+    # it. The two must agree, so both are asserted here.
+    #
+    # Note the pre-fix body carried a literal NUL (the out-of-frame byte), which
+    # makes grep treat the stream as binary and print nothing at all; the helper
+    # strips NUL and CR so a check cannot silently read "no output" as a pass.
+    pump_probe() {  # $1 = fixture mode, $2.. = extra argv ("drv" for the driver)
+        local mode=$1; shift
+        python3 test/h2/h2c_server.py ${P61730} $mode >/dev/null 2>&1 &
+        local pid=$!
+        sleep 0.5
+        head -c 8192 /dev/zero | tr '\0' 'U' \
+            | timeout 20 ./bin/linnea-h2client ${P61730} /up POST 0 "$@" 2>&1 \
+            | tr '\r\0' '  '
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="drv" || argv=""
+        # the control: a LEGAL ping read in the pump is still echoed, so this
+        # cannot become a rule against PINGs during an upload
+        pump_probe pumpok $argv | grep -q "PUMP-ACK=ABCDEFGH"
+        check "backend h2 pump ping ($mode): a legal PING is echoed with ACK" $?
+        [ "$(pump_probe pump7 $argv | head -1)" = "H2C-FAIL" ]
+        check "backend h2 pump ping ($mode): a 7-octet PING is refused" $?
+        [ "$(pump_probe pumpsid $argv | head -1)" = "H2C-FAIL" ]
+        check "backend h2 pump ping ($mode): a PING naming a stream is refused" $?
+        pump_probe pumpack $argv | grep -q "PUMP-ACK=NONE"
+        check "backend h2 pump ping ($mode): an ACK is consumed, never answered" $?
+    done
+
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for
     # audit-report-51: a valid reset already ends the exchange in a 502, so a
