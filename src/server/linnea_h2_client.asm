@@ -1012,9 +1012,26 @@ h2c_settle:
     je .win
     cmp eax, LINNEA_H2C_FT_PING
     je .ping
+    cmp eax, LINNEA_H2C_FT_RST
+    je .rst                        ; settle did not dispatch this at all, so a
+                                   ; reset here fell through to the loop and the
+                                   ; body went out on a dead stream. I could not
+                                   ; build a case where that differed from the
+                                   ; driver -- a reset either lands while the
+                                   ; sender waits for credit, and both stop, or
+                                   ; it races a body already in flight, which
+                                   ; cannot be un-sent. Added for the two to
+                                   ; agree by construction (audit-report-51).
     cmp eax, LINNEA_H2C_FT_GOAWAY
     je .goaway
     jmp h2c_settle
+.rst:
+    cmp qword [h2c_fr_sid], 1
+    jne .err
+    cmp qword [h2c_fr_len], 4
+    jne .err
+    mov rax, LINNEA_H2C_RST
+    ret
 .settings:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_ACK
@@ -1045,6 +1062,10 @@ h2c_settle:
     call h2c_send_ping_ack
     jmp h2c_settle
 .goaway:
+    cmp qword [h2c_fr_sid], 0
+    jne .err
+    cmp qword [h2c_fr_len], 8
+    jb .err
     mov rax, LINNEA_H2C_GOAWAY
     ret
 .err:
@@ -1099,9 +1120,17 @@ h2c_pump_window:
     call h2c_send_ping_ack
     jmp .chk
 .rst:
+    cmp qword [h2c_fr_sid], 1      ; bounds as in d_dispatch
+    jne .err
+    cmp qword [h2c_fr_len], 4
+    jne .err
     mov rax, LINNEA_H2C_RST
     ret
 .goaway:
+    cmp qword [h2c_fr_sid], 0
+    jne .err
+    cmp qword [h2c_fr_len], 8
+    jb .err
     mov rax, LINNEA_H2C_GOAWAY
     ret
 .err:
@@ -1422,9 +1451,17 @@ h2c_run_response:
     mov qword [h2c_hdr_open], 1
     jmp .loop
 .rst:
+    cmp qword [h2c_fr_sid], 1      ; bounds as in d_dispatch
+    jne .err
+    cmp qword [h2c_fr_len], 4
+    jne .err
     mov rax, LINNEA_H2C_RST
     jmp .ret
 .goaway:
+    cmp qword [h2c_fr_sid], 0
+    jne .err
+    cmp qword [h2c_fr_len], 8
+    jb .err
     mov rax, LINNEA_H2C_GOAWAY
     jmp .ret
 .done:
@@ -2889,10 +2926,24 @@ d_dispatch:
     mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_DONE
     xor eax, eax
     ret
+    ; 6.4/6.8: RST_STREAM is exactly four octets on a nonzero stream, GOAWAY at
+    ; least eight on stream 0. Neither was checked -- a three-octet reset and a
+    ; GOAWAY naming a stream became ordinary terminal outcomes (audit-report-51).
+    ; This changes classification, not behaviour: a valid reset already ends the
+    ; exchange in a 502, so a malformed one did too. The distinction is for the
+    ; code to be able to tell them apart, not for anything downstream today.
 .rst:
+    cmp qword [d_fr_sid], 1
+    jne .bad
+    cmp r15, 4
+    jne .bad
     mov rax, -2
     ret
 .goaway:
+    cmp qword [d_fr_sid], 0
+    jne .bad
+    cmp r15, 8
+    jb .bad
     mov rax, -3
     ret
 .bad:

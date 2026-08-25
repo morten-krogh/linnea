@@ -36,6 +36,8 @@ Routes (by :path):
   /set-sid /set-acklen /set-len5 /set-maxwin -> MALFORMED SETTINGS
   /set-push0 /set-mf-ok -> LEGAL values for known settings
   /set-push1 /set-push2 /set-mf-low /set-mf-high -> values outside 6.5.2's bounds
+  /term-rstok /term-rst3 /term-rst0 -> RST_STREAM: legal, short, stream 0
+  /term-gook /term-goshort /term-gosid -> GOAWAY: legal, short, naming a stream
   /pad-ok          -> legal PADDED HEADERS and PADDED DATA
   /pad-h0 /pad-d0 /pad-over /prio-short -> MALFORMED padding / priority
   anything else -> 404
@@ -334,6 +336,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/trailers"):
         respond_trailers(c, sid, path)
         return
+    if path.startswith("/term"):
+        respond_terminal(c, sid, path)
+        return
     if path.startswith("/pad") or path == "/prio-short":
         respond_padded(c, sid, path)
         return
@@ -408,6 +413,29 @@ def respond_trailers(c, sid, path):
         cut = len(tr) // 2
         c.send(frame(0x01, 0x01, sid, tr[:cut]))  # HEADERS, END_STREAM only
         c.send(frame(0x09, 0x04, sid, tr[cut:]))  # CONTINUATION, END_HEADERS
+
+
+def respond_terminal(c, sid, path):
+    """RST_STREAM (6.4) and GOAWAY (6.8) instead of a response. Four octets on a
+    nonzero stream; at least eight on stream 0.
+
+    These do not discriminate the validation added for audit-report-51: a VALID
+    reset already ends the exchange in a 502, so a malformed one did too, and
+    both look identical from outside. They are here because backend terminal
+    frames had no coverage at all -- nothing said a reset produces a gateway
+    error rather than a hang."""
+    if path == "/term-rstok":       # a legal reset
+        c.send(frame(0x03, 0x00, sid, struct.pack(">I", 8)))
+    elif path == "/term-rst3":      # three octets
+        c.send(frame(0x03, 0x00, sid, b"\x00\x00\x00"))
+    elif path == "/term-rst0":      # naming stream 0
+        c.send(frame(0x03, 0x00, 0, struct.pack(">I", 8)))
+    elif path == "/term-gook":      # a legal goaway
+        c.send(frame(0x07, 0x00, 0, struct.pack(">II", 1, 0)))
+    elif path == "/term-goshort":   # an empty payload
+        c.send(frame(0x07, 0x00, 0, b""))
+    elif path == "/term-gosid":     # naming a stream
+        c.send(frame(0x07, 0x00, 1, struct.pack(">II", 0, 0)))
 
 
 def respond_padded(c, sid, path):

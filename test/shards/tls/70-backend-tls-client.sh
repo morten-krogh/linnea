@@ -552,6 +552,19 @@ PY
     [ "$(up_probe --http2)" = "$((64 * 1024))" ]
     check "backend h2 upload: ...and from an h2 client, whose body takes the h2p leg" $?
 
+    # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
+    # These do NOT discriminate the length/stream validation added for
+    # audit-report-51: a valid reset already ends the exchange in a 502, so a
+    # malformed one did too. They are here because backend terminal frames had
+    # no coverage at all -- nothing said a reset produces a gateway error rather
+    # than a hang, which is the behaviour worth holding.
+    for route in /term-rstok /term-rst3 /term-rst0 /term-gook /term-goshort /term-gosid; do
+        [ "$(tr_get $route $CODE1)" = 502 ]
+        check "backend h2 terminal: $route answers 502, not a hang" $?
+    done
+    [ "$(tr_get /hello $H1 | tail -1)" = "hello from h2c" ]
+    check "backend h2 terminal: ...and the next request still works" $?
+
     # --- padded frames (RFC 9113 6.1) ---------------------------------------
     # /pad-ok is the coverage: nothing exercised padded backend frames at all,
     # so nothing said padding WORKS. The four malformed cases are controls --
