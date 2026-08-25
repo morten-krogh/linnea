@@ -34,6 +34,8 @@ Routes (by :path):
                    unrelated stream, and an increment past 2^31-1
   /set-ok          -> a legal later SETTINGS
   /set-sid /set-acklen /set-len5 /set-maxwin -> MALFORMED SETTINGS
+  /pad-ok          -> legal PADDED HEADERS and PADDED DATA
+  /pad-h0 /pad-d0 /pad-over /prio-short -> MALFORMED padding / priority
   anything else -> 404
 
 Usage: h2c_server.py <port> [mode]
@@ -330,6 +332,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/trailers"):
         respond_trailers(c, sid, path)
         return
+    if path.startswith("/pad") or path == "/prio-short":
+        respond_padded(c, sid, path)
+        return
     if path.startswith("/set"):
         respond_settings(c, sid, path)
         return
@@ -401,6 +406,36 @@ def respond_trailers(c, sid, path):
         cut = len(tr) // 2
         c.send(frame(0x01, 0x01, sid, tr[:cut]))  # HEADERS, END_STREAM only
         c.send(frame(0x09, 0x04, sid, tr[cut:]))  # CONTINUATION, END_HEADERS
+
+
+def respond_padded(c, sid, path):
+    """PADDED and PRIORITY frames (RFC 9113 6.1, 6.2). A padded frame's payload
+    STARTS with a Pad Length octet, so a padded frame with an empty payload is
+    malformed -- and the octet must not be read before that is established.
+
+    Note what these can and cannot show. All four malformed cases were already
+    REFUSED before the ordering was fixed, because the append helpers reject the
+    negative length that results. They are controls for the refusal, not
+    evidence about the read. /pad-ok is the one that was genuinely uncovered:
+    nothing exercised padded backend frames at all, so nothing said padding
+    WORKS."""
+    blk = enc_status(200) + enc_header("content-type", "text/plain")
+    body = b"pad-body\n"
+    if path == "/pad-ok":          # legal padding on both frames
+        c.send(frame(0x01, 0x04 | 0x08, sid, b"\x04" + blk + b"\x00" * 4))
+        c.send(frame(0x00, 0x01 | 0x08, sid, b"\x03" + body + b"\x00" * 3))
+        return
+    if path == "/pad-h0":          # PADDED HEADERS, empty payload
+        c.send(frame(0x01, 0x04 | 0x08, sid, b""))
+    elif path == "/pad-over":      # pad length past what remains
+        c.send(frame(0x01, 0x04 | 0x08, sid, b"\x40" + blk))
+    elif path == "/prio-short":    # PRIORITY set, payload shorter than 5
+        c.send(frame(0x01, 0x04 | 0x20, sid, b"\x00\x00"))
+    else:                          # /pad-d0: good head, then padded empty DATA
+        c.send(frame(0x01, 0x04, sid, blk))
+        c.send(frame(0x00, 0x01 | 0x08, sid, b""))
+        return
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 def respond_settings(c, sid, path):

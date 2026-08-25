@@ -552,6 +552,19 @@ PY
     [ "$(up_probe --http2)" = "$((64 * 1024))" ]
     check "backend h2 upload: ...and from an h2 client, whose body takes the h2p leg" $?
 
+    # --- padded frames (RFC 9113 6.1) ---------------------------------------
+    # /pad-ok is the coverage: nothing exercised padded backend frames at all,
+    # so nothing said padding WORKS. The four malformed cases are controls --
+    # they were already refused before the pad-length read was moved after its
+    # bounds check, because the append helpers reject the negative length that
+    # results (audit-report-49).
+    [ "$(tr_get /pad-ok $H1 | tail -1)" = "pad-body" ]
+    check "backend h2 padding: a padded HEADERS and a padded DATA relay normally" $?
+    for route in /pad-h0 /pad-d0 /pad-over /prio-short; do
+        [ "$(tr_get $route $CODE1)" = 502 ]
+        check "backend h2 padding: $route is refused" $?
+    done
+
     # --- control frames: SETTINGS (RFC 9113 6.5) ----------------------------
     # A connection frame on stream 0; an ACK with no payload; a non-ACK payload
     # that is a whole number of six-octet records; INITIAL_WINDOW_SIZE within

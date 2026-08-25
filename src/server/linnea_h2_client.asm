@@ -1312,13 +1312,18 @@ h2c_run_response:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_PADDED
     jz .h_np
+    cmp rdx, 1
+    jl .err                          ; see d_dispatch: bounds before the read
     movzx ecx, byte [rsi]
     inc rsi
     dec rdx
     sub rdx, rcx
+    js .err
 .h_np:
     test rax, LINNEA_H2C_FL_PRIORITY
     jz .h_npr
+    cmp rdx, 5
+    jl .err
     add rsi, 5
     sub rdx, 5
 .h_npr:
@@ -1379,10 +1384,13 @@ h2c_run_response:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_PADDED
     jz .d_np
+    cmp rdx, 1
+    jl .err                          ; see d_dispatch: bounds before the read
     movzx ecx, byte [rsi]
     inc rsi
     dec rdx
     sub rdx, rcx
+    js .err
 .d_np:
     call h2c_body_append
     test rax, rax
@@ -2725,13 +2733,26 @@ d_dispatch:
     mov rax, [d_fr_flags]
     test rax, LINNEA_H2C_FL_PADDED
     jz .h_np
+    ; RFC 9113 6.1: PADDED means the payload STARTS with a Pad Length octet, so
+    ; a padded frame whose payload is empty is malformed and the octet must not
+    ; be read. The read came first and the length check came after, in the
+    ; append helper -- which does reject the negative result, so nothing stale
+    ; was ever relayed. That downstream check is the only thing that made it
+    ; safe, and audit-report-46 is what happens when there is no such check
+    ; below: the same read-then-hope shape, and the bytes went back to the
+    ; backend. Bounds first (audit-report-49).
+    cmp rdx, 1
+    jl .bad
     movzx ecx, byte [rsi]
     inc rsi
     dec rdx
     sub rdx, rcx
+    js .bad                          ; padding longer than what is left
 .h_np:
     test rax, LINNEA_H2C_FL_PRIORITY
     jz .h_npr
+    cmp rdx, 5
+    jl .bad                          ; the priority field is not there either
     add rsi, 5
     sub rdx, 5
 .h_npr:
@@ -2791,10 +2812,13 @@ d_dispatch:
     mov rax, [d_fr_flags]
     test rax, LINNEA_H2C_FL_PADDED
     jz .d_np
+    cmp rdx, 1
+    jl .bad                          ; see .headers: bounds before the read
     movzx ecx, byte [rsi]
     inc rsi
     dec rdx
     sub rdx, rcx
+    js .bad
 .d_np:
     call d_body_append
     test rax, rax
