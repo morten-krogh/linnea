@@ -113,6 +113,7 @@ extern linnea_upstream_take
 extern linnea_string_has_token
 extern linnea_upstream_mark_ok
 extern linnea_upstream_mark_fail
+extern linnea_upstream_log_oversize
 extern linnea_upstream_mark_unanswered
 extern linnea_upstream_limit
 ; proxy_h2 leg (h2 clients): TLS handshake + h2 driver on the slot .fd
@@ -3782,6 +3783,22 @@ linnea_h2p_event:
 .ev_bad_gateway:
     ; likewise: a closed connection, a send error, framing we will not relay.
     ; NOT a 5xx from the application, which never reaches here.
+    ; ...and NOT a response head past HDRBLK_CAP either: the backend delivered
+    ; that correctly and only our buffer objected, so it is logged as ours and
+    ; kept out of the health counters (see linnea_upstream_log_oversize).
+    test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_HDR_BIG
+    jnz .ev_bg_oursize               ; a buffer of ours said no, whatever the leg
+    test qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_PROXY_H2
+    jz .ev_bg_count
+    call h2p_slot_ctx
+    cmp qword [rax + linnea_h2c.hdr_big], 0
+    je .ev_bg_count
+.ev_bg_oursize:
+    mov rdi, [rbx + linnea_h2p.location]
+    mov rsi, [rbx + linnea_h2p.backend]
+    call linnea_upstream_log_oversize
+    jmp .ev_bad_gateway_counted
+.ev_bg_count:
     mov rdi, [rbx + linnea_h2p.location]
     mov rsi, [rbx + linnea_h2p.backend]
     call linnea_upstream_mark_unanswered
@@ -4017,7 +4034,10 @@ h2p_resp_begin:
     mov r12, rax                      ; ctx
     mov rdi, r12
     lea rsi, [rbx + linnea_h2p.buf]
+    mov rdx, LINNEA_H2P_BUF
     call linnea_h2c_drv_head          ; rax = head length in .buf
+    test rax, rax
+    js .rb_bad                        ; will not fit: ctx.hdr_big says whose
     mov [rbx + linnea_h2p.len], rax
     mov qword [rbx + linnea_h2p.resp_off], 0
     mov rdi, rbx
@@ -4711,7 +4731,7 @@ h2p_parse_head:
 .ph_found:
     add rcx, 4
     cmp rcx, LINNEA_H2P_RHEAD_MAX
-    ja .ph_bad                       ; a head this large is not worth relaying
+    ja .ph_toobig                    ; a head this large is not worth relaying
     ; reject a malformed upstream head before any of it is translated into an
     ; HTTP/2 field block the client would then have to reject (Finding 34)
     push rcx
@@ -4839,6 +4859,11 @@ h2p_parse_head:
     ja .ph_bad                       ; head keeps growing without terminating
     xor eax, eax
     jmp .ph_ret
+.ph_toobig:
+    ; ours, not the backend's -- the same distinction the leg makes for an
+    ; oversized block, made here for the h2-client path's own head cap. rbx is
+    ; the slot throughout this function.
+    or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_HDR_BIG
 .ph_bad:
     mov rax, -1
 .ph_ret:

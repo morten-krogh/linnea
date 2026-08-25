@@ -300,6 +300,10 @@ LINNEA_H2P_F_HAS_CL    equ 131072
 ; 32768/65536 that F_DEC_ERR and F_HEAD_INTERIM already own — a collision there
 ; made a plain 200 response look like a 1xx interim and a decode error).
 LINNEA_H2P_F_PROXY_H2  equ 262144  ; 0x40000
+; The response was refused for SIZE -- ours, not the backend's. Set wherever a
+; buffer of ours says no, so the failure is logged as our limit and kept out of
+; the backend's health counters.
+LINNEA_H2P_F_HDR_BIG   equ 1048576 ; 0x100000
 LINNEA_H2P_F_KTLS      equ 524288  ; 0x80000: .fd handed to kTLS (reads are
                                    ; control-record aware RECVMSG, skipping NSTs)
 

@@ -31,6 +31,7 @@ LINNEA_H2C_FL_PRIORITY   equ 0x20     ; HEADERS
 LINNEA_H2C_SET_HDRTAB    equ 0x01
 LINNEA_H2C_SET_INITWIN   equ 0x04
 LINNEA_H2C_SET_MAXFRAME  equ 0x05
+LINNEA_H2C_SET_MAXHDRS   equ 0x06     ; SETTINGS_MAX_HEADER_LIST_SIZE
 
 ; Scheme selector for the request :scheme pseudo-header.
 LINNEA_H2C_SCHEME_HTTP   equ 0
@@ -38,8 +39,11 @@ LINNEA_H2C_SCHEME_HTTPS  equ 1
 
 ; Buffer sizing (blocking leg; the proxy leg reuses per-connection arenas).
 LINNEA_H2C_OUT_CAP      equ 65536    ; outbound staging (preface+SETTINGS+HEADERS, DATA)
-LINNEA_H2C_HDRBLK_CAP   equ 16384    ; assembled response HEADERS/CONTINUATION block
-LINNEA_H2C_SCRATCH_CAP  equ 16384    ; hpack scratch (Huffman expansion + dyn copies)
+LINNEA_H2C_HDRBLK_CAP   equ 32768    ; assembled response HEADERS/CONTINUATION block
+LINNEA_H2C_SCRATCH_CAP  equ 32768    ; hpack scratch (Huffman expansion + dyn copies)
+                                     ; -- kept equal to HDRBLK_CAP: a single
+                                     ; literal may be as long as the block that
+                                     ; carries it, and must still expand
 LINNEA_H2C_RESP_CAP     equ 1048576  ; synthesized h1 response (head + body)
 LINNEA_H2C_RXCHUNK      equ 65536    ; per recv() request size
 
@@ -51,6 +55,22 @@ LINNEA_H2C_GOAWAY       equ -3       ; backend GOAWAY       -> caller 502
 ; The client's advertised receive windows: large, like the server's, so inbound
 ; WINDOW_UPDATE for the response body is rare.
 LINNEA_H2C_INITWIN      equ 4194304
+; What we tell a backend we will accept as a response header list. Its DEFAULT
+; when unsent is UNLIMITED (RFC 9113 6.5.2), so staying silent said "any size"
+; while the buffers quietly enforced far less -- and nginx, entitled to believe
+; us, sent an 18188-byte block and was refused.
+;
+; NOT HDRBLK_CAP. Accepting a block is only half the journey: the decoded head
+; is then written into the buffer the client's protocol reads from, and the
+; smallest of those (up_buf, 8448, for an h1 or h3 client) binds before
+; HDRBLK_CAP ever does. Advertising the block cap would promise four times what
+; the narrowest path can deliver -- the same dishonesty as advertising nothing,
+; wearing a number. So this is the smallest head we can render on ANY path,
+; rounded down, and it is the figure docs/config.md states.
+; 6144: LINNEA_H2P_RHEAD_MAX, the h2-client path's own cap on an upstream
+; response head, and the tightest of the four a head must pass. Advertising
+; anything larger promises what that path cannot render.
+LINNEA_H2C_MAXHDRS      equ 6144
 
 ; Resumable driver states (linnea_h2c.state).
 LINNEA_H2C_ST_SEND_INIT equ 0   ; preface+SETTINGS+HEADERS staged, sending
@@ -107,6 +127,9 @@ struc linnea_h2c
     ; (RFC 9113 6.10). Without this the driver had no notion of a block being in
     ; progress, so a CONTINUATION out of nowhere read as a response head.
     .hdr_open:     resq 1
+    ; the response header block outgrew HDRBLK_CAP: OUR limit, not a backend
+    ; fault, so the failure is logged and counted differently
+    .hdr_big:      resq 1
     ; embedded buffers + the decoder's persistent dynamic table
     .dyn:          resb linnea_hpack_dyn_size
     .hdrblk:       resb LINNEA_H2C_HDRBLK_CAP

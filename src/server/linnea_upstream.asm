@@ -58,6 +58,7 @@ global linnea_upstream_pick
 global linnea_upstream_addr
 global linnea_upstream_mark_ok
 global linnea_upstream_mark_fail
+global linnea_upstream_log_oversize
 global linnea_upstream_mark_unanswered
 
 extern linnea_uring_now
@@ -81,6 +82,14 @@ log_up_fail_len equ $ - log_up_fail
 ; with the same words until response-stage failures started counting.
 log_up_noans:   db " accepted but did not answer", 10
 log_up_noans_len equ $ - log_up_noans
+; A response we REFUSED, delivered correctly by a backend that did nothing
+; wrong: a head larger than the buffer we read it into. Said apart from "did not
+; answer" because it sends an operator to a different place -- our limit, not
+; their health -- and deliberately NOT counted against the backend below: taking
+; a working backend out of rotation over our own buffer would turn a limit into
+; an outage.
+log_up_big:     db " answered with a head past our limit -- refused here, not its fault", 10
+log_up_big_len  equ $ - log_up_big
 log_up_out:     db " failed out of rotation", 10
 log_up_out_len  equ $ - log_up_out
 log_up_back:    db " back in rotation", 10
@@ -225,6 +234,14 @@ linnea_upstream_mark_fail:
     lea rdx, [log_up_fail]
     mov ecx, log_up_fail_len
     jmp mark_fail_common
+
+; linnea_upstream_log_oversize(rdi = location, rsi = backend index)
+; Log only. See log_up_big: this is our limit, not a backend fault, so it must
+; not reach the health counters.
+linnea_upstream_log_oversize:
+    lea rdx, [log_up_big]
+    mov ecx, log_up_big_len
+    jmp up_log
 
 ; linnea_upstream_mark_unanswered(rdi = location, rsi = backend index)
 ; The backend accepted and then failed to answer -- a timeout, a closed

@@ -322,6 +322,56 @@ Against a backend that spawns a thread or forks per connection the saving is
 large; against one with a pre-forked pool it is closer to the cost of the
 handshake alone.
 
+### Response head limits
+
+A backend's response **head** is read into a fixed buffer, so there is a size
+past which linnea will not relay a response — and there has to be, because a
+backend that sends an unbounded head would otherwise be able to make linnea
+allocate without limit.
+
+| backend | limit | measured on |
+|---|---|---|
+| plaintext or `proxy_tls` | **8448 bytes** | the response head as text |
+| `proxy_h2` | **32768 bytes** | the compressed HPACK block on the wire |
+
+Over HTTP/2 those are two separate gates, and the second one usually binds
+first: a block that fits 32768 compressed is then **decoded** into the buffer
+the client's own protocol reads from, and then re-encoded for that client.
+The narrowest of those gates is **6144 bytes** of decoded response head, on the
+path serving an HTTP/2 client; an HTTP/1.1 or HTTP/3 client gets 8448. So the
+practical figure is **6 KiB of decoded response headers**, whatever the backend.
+The compressed gate is the more generous of the two on purpose: HPACK indexing
+means a large block can decode small, and such a response now relays where it
+used to be refused on its wire size alone.
+
+For comparison, nginx's own `proxy_buffer_size` — the same buffer for the same
+job — defaults to one page, 4 or 8 KiB.
+
+Over HTTP/2 the limit is also **advertised**: linnea sends
+`SETTINGS_MAX_HEADER_LIST_SIZE: 6144` in its client SETTINGS, so a backend is
+told what it may send rather than discovering it by being refused. The value is
+the *smallest* head linnea can render on any client path, not the largest block
+it can accept — advertising the latter would promise what the narrowest path
+cannot deliver. That setting is
+advisory, and a backend may ignore it — nginx does, sending the same header
+block whether or not it is told a limit. Either way a response head past the
+limit is answered **502**, and logged as ours:
+
+```
+upstream 127.0.0.1:8443 answered with a head past our limit -- refused here, not its fault
+```
+
+That line exists because the alternative was worse: these refusals used to be
+reported as `accepted but did not answer`, which sends an operator to inspect a
+backend that answered correctly and in full. A response refused this way is also
+**not** counted against the backend's health — a working backend must not be
+taken out of rotation over a buffer of ours.
+
+If you are hitting this, the response really is unusual: 8 KiB of response
+headers takes a large `Content-Security-Policy` plus a number of `Set-Cookie`s.
+Trimming what the backend sends is normally the better answer than raising a
+limit that exists to bound memory.
+
 ### Backend TLS
 
 `proxy_tls: 1` makes linnea connect to a location's backends over TLS 1.3

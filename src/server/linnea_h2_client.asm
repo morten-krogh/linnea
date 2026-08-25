@@ -159,7 +159,7 @@ linnea_h2c_exchange:
     ; SETTINGS frame: length=6, type=4, flags=0, sid=0, payload {0x0004, initwin}
     mov byte [rdi + 0], 0
     mov byte [rdi + 1], 0
-    mov byte [rdi + 2], 6
+    mov byte [rdi + 2], 12                ; two settings
     mov byte [rdi + 3], LINNEA_H2C_FT_SETTINGS
     mov byte [rdi + 4], 0
     mov dword [rdi + 5], 0                ; sid 0
@@ -171,6 +171,16 @@ linnea_h2c_exchange:
     mov byte [rdi + 3], (LINNEA_H2C_INITWIN >> 16) & 0xff
     mov byte [rdi + 4], (LINNEA_H2C_INITWIN >> 8) & 0xff
     mov byte [rdi + 5], LINNEA_H2C_INITWIN & 0xff
+    add rdi, 6
+    ; ...and the size of response header list we will actually accept. Unsent,
+    ; its default is unlimited, so the buffer bound became a promise we had not
+    ; made (audit follow-up: nginx, 18188 bytes, refused).
+    mov byte [rdi + 0], 0
+    mov byte [rdi + 1], LINNEA_H2C_SET_MAXHDRS
+    mov byte [rdi + 2], (LINNEA_H2C_MAXHDRS >> 24) & 0xff
+    mov byte [rdi + 3], (LINNEA_H2C_MAXHDRS >> 16) & 0xff
+    mov byte [rdi + 4], (LINNEA_H2C_MAXHDRS >> 8) & 0xff
+    mov byte [rdi + 5], LINNEA_H2C_MAXHDRS & 0xff
     add rdi, 6
 
     ; HEADERS frame: build the HPACK block first into h2c_hdrblk, then frame it.
@@ -2145,6 +2155,7 @@ linnea_h2c_drv_start:
     mov qword [rbx+linnea_h2c.status], 0
     mov qword [rbx+linnea_h2c.hdrblk_len], 0
     mov qword [rbx+linnea_h2c.hdr_open], 0
+    mov qword [rbx+linnea_h2c.hdr_big], 0
     mov qword [rbx+linnea_h2c.hdrlines_len], 0
     mov qword [rbx+linnea_h2c.body_len], 0
     mov [rbx+linnea_h2c.req_body], rcx
@@ -2172,7 +2183,7 @@ linnea_h2c_drv_start:
     rep movsb
     mov byte [rdi],0
     mov byte [rdi+1],0
-    mov byte [rdi+2],6
+    mov byte [rdi+2],12                   ; two settings, see the blocking twin
     mov byte [rdi+3],LINNEA_H2C_FT_SETTINGS
     mov byte [rdi+4],0
     mov dword [rdi+5],0
@@ -2183,6 +2194,13 @@ linnea_h2c_drv_start:
     mov byte [rdi+3],(LINNEA_H2C_INITWIN>>16)&0xff
     mov byte [rdi+4],(LINNEA_H2C_INITWIN>>8)&0xff
     mov byte [rdi+5],LINNEA_H2C_INITWIN&0xff
+    add rdi,6
+    mov byte [rdi],0
+    mov byte [rdi+1],LINNEA_H2C_SET_MAXHDRS
+    mov byte [rdi+2],(LINNEA_H2C_MAXHDRS>>24)&0xff
+    mov byte [rdi+3],(LINNEA_H2C_MAXHDRS>>16)&0xff
+    mov byte [rdi+4],(LINNEA_H2C_MAXHDRS>>8)&0xff
+    mov byte [rdi+5],LINNEA_H2C_MAXHDRS&0xff
     add rdi,6
     mov rax,r12
     shr rax,16
@@ -2578,7 +2596,7 @@ d_hdrblk_append:
     mov rax, [rbx+linnea_h2c.hdrblk_len]
     lea rcx, [rax+rdx]
     cmp rcx, LINNEA_H2C_HDRBLK_CAP
-    ja .of
+    ja .toobig
     push rsi
     lea rdi, [rbx+linnea_h2c.hdrblk]
     add rdi, rax
@@ -2590,6 +2608,10 @@ d_hdrblk_append:
     mov [rbx+linnea_h2c.hdrblk_len], rdi
     xor eax, eax
     ret
+.toobig:
+    ; the block outgrew the buffer. Recorded apart from a malformed one: the
+    ; backend did nothing wrong, and the failure must not read as its fault.
+    mov qword [rbx+linnea_h2c.hdr_big], 1
 .of:
     mov rax, -1
     ret
@@ -2668,13 +2690,29 @@ linnea_h2c_drv_compose:
     pop rbx
     ret
 
-; linnea_h2c_drv_head(rdi=ctx, rsi=out) -> rax = head length. Writes just the h1
-; response head (status line + relayed headers + content-length + connection:
-; close + blank line) to `out`; the proxy queues ctx.body_buf behind it. v1
-; closes the client connection after the response (no keep-alive).
+; linnea_h2c_drv_head(rdi=ctx, rsi=out, rdx=cap) -> rax = head length, or -1
+; when the head will not fit in `cap` bytes. Writes just the h1 response head
+; (status line + relayed headers + content-length + connection: close + blank
+; line) to `out`; the proxy queues ctx.body_buf behind it. v1 closes the client
+; connection after the response (no keep-alive).
+;
+; The capacity is not decoration. This wrote hdrlines with a bare rep movsb and
+; no bound, into buffers SMALLER than hdrlines can be: out_buf is 8512 bytes and
+; up_buf 8448, against a hdrlines that reaches HDRBLK_CAP. A backend answering
+; with ~15 KB of headers had ~6.7 KB written past the end of out_buf -- measured,
+; not theorised. It stayed inside the connection struct only because up_buf sits
+; next to out_buf and is dead on that path; up_buf is the LAST field, so a larger
+; head would have run into the next connection in the pool.
 linnea_h2c_drv_head:
     push rbx
     push r13
+    ; refuse before writing a byte. 128 covers the status line, the longest
+    ; reason phrase, "content-length: " + 20 digits, "connection: close" and the
+    ; blank line -- everything this function adds around hdrlines.
+    mov rax, [rdi + linnea_h2c.hdrlines_len]
+    add rax, 128
+    cmp rax, rdx
+    ja .nofit
     mov rbx, rdi
     mov r13, rsi
     mov rdi, r13
@@ -2713,6 +2751,14 @@ linnea_h2c_drv_head:
     add rdi,2
     mov rax, rdi
     sub rax, r13
+    pop r13
+    pop rbx
+    ret
+.nofit:
+    ; the same flag an oversized block sets, so the callers' existing "ours, not
+    ; the backend's" reporting covers this too
+    mov qword [rdi + linnea_h2c.hdr_big], 1
+    mov rax, -1
     pop r13
     pop rbx
     ret

@@ -71,6 +71,7 @@ extern linnea_upstream_addr
 extern linnea_upstream_pick
 extern linnea_upstream_mark_ok
 extern linnea_upstream_mark_fail
+extern linnea_upstream_log_oversize
 extern linnea_upstream_mark_unanswered
 extern linnea_upstream_limit
 extern linnea_connection_alloc
@@ -2499,8 +2500,24 @@ linnea_uring_run:
     je .h2_do_recv
     cmp rax, LINNEA_H2C_DRV_DONE
     je .h2_drv_done
+    ; a header block past HDRBLK_CAP is ours to own, not the backend's
+    push rax
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_h2c_ctx_for
+    cmp qword [rax + linnea_h2c.hdr_big], 0
+    pop rax
+    jne .h2_hdr_big
     mov esi, 502                        ; FAIL / RST / GOAWAY
     jmp .proxy_fail
+.h2_head_too_big:
+    ; the synthesized h1 head does not fit the buffer it goes in: our limit
+    ; again, reported and counted the same way
+.h2_hdr_big:
+    mov rdi, [r12 + linnea_connection.location]
+    mov rsi, [r12 + linnea_connection.up_backend]
+    call linnea_upstream_log_oversize
+    mov esi, 502
+    jmp .proxy_fail_counted
 .h2_do_send:
     mov rdi, [r12 + linnea_connection.index]
     call linnea_h2c_ctx_for
@@ -2542,7 +2559,10 @@ linnea_uring_run:
     jne .h2_done_h3
     mov rdi, r14
     lea rsi, [r12 + linnea_connection.out_buf]
+    mov rdx, LINNEA_CONN_OUT_BUF
     call linnea_h2c_drv_head            ; rax = head length in out_buf
+    test rax, rax
+    js .h2_head_too_big
     lea rcx, [r12 + linnea_connection.out_buf]
     mov [r12 + linnea_connection.out_ptr], rcx
     mov [r12 + linnea_connection.out_rem], rax
@@ -2577,7 +2597,10 @@ linnea_uring_run:
 .h2_done_h3:
     mov rdi, r14
     lea rsi, [r12 + linnea_connection.up_buf]
+    mov rdx, LINNEA_CONN_UP_BUF
     call linnea_h2c_drv_head            ; synthesized h1 head into up_buf
+    test rax, rax
+    js .h2_head_too_big
     mov [r12 + linnea_connection.up_len], rax
     mov rdi, r12
     call linnea_h3_proxy_head
@@ -2739,7 +2762,7 @@ linnea_uring_run:
     ; incomplete: read more, unless the head has filled the buffer
     mov rax, [r12 + linnea_connection.up_len]
     cmp rax, LINNEA_CONN_UP_BUF
-    jae .head_bad
+    jae .head_too_big
     mov rdi, r12
     lea rsi, [r12 + linnea_connection.up_buf]
     add rsi, rax
@@ -2748,6 +2771,19 @@ linnea_uring_run:
     call linnea_uring_arm_up_recv
     call linnea_uring_submit_now
     jmp .wait
+.head_too_big:
+    ; The backend answered, correctly, with a response head larger than the
+    ; buffer we read it into. HTTP/1.1 negotiates no bound on a response head,
+    ; so there was nothing for it to respect and nothing it did wrong: this is
+    ; our limit. Say that, and leave its health alone -- .proxy_fail_counted
+    ; enters past the counter.
+    push rsi
+    mov rdi, [r12 + linnea_connection.location]
+    mov rsi, [r12 + linnea_connection.up_backend]
+    call linnea_upstream_log_oversize
+    pop rsi
+    mov esi, 502
+    jmp .proxy_fail_counted
 .head_bad:
     mov esi, 502
     jmp .proxy_fail

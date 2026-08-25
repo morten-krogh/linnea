@@ -297,6 +297,14 @@ for i in $(seq 1 60); do
     # should say whether the server refused (curl 7) or the client simply ran
     # out of its 3s patience on a loaded box (curl 28).
     #
+    # ANSWERED, 2026-08-24: a red run under the 3-job concurrent suite reported
+    # `1 failed: 12:curl28`. Request 12 of 60 TIMED OUT; it was not refused.
+    # So the reload is not dropping requests -- the client's 3 s patience is
+    # simply not enough on a box running three suite jobs at once, and the flake
+    # is in the deadline, not in the server. Left as it is rather than raised:
+    # a 3 s ceiling on a loopback request is the thing that would notice a real
+    # regression here, and the diagnostic now says which of the two happened.
+    #
     # Take curl's status into up_rc on the very next line. Reading $? inside
     # the `if` body gets the status of the counter assignment -- which is
     # always 0 -- so this diagnostic used to record "curl0" for every failure
