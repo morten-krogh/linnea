@@ -25,7 +25,7 @@ import time
 import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
-from aioquic.quic.events import StreamDataReceived
+from aioquic.quic.events import ConnectionTerminated, StreamDataReceived, StreamReset
 
 WWW = os.path.join(os.environ.get("LINNEA_TEST_RUNDIR", "test"), "www")
 # the run's own document root: a copy, so a run may generate into it and
@@ -183,6 +183,15 @@ def run_trial(seed):
     lossy[0] = True                 # now stress the data path: drop + reorder
 
     streams = {}
+    # Why a stream stopped, not just that it did. A server that gives up on a
+    # chunk sends RESET_STREAM; one whose idle timer expires sends NOTHING at
+    # all (RFC 9000 10.1 closes silently). Both leave a stream short with
+    # fin=False, and they are indistinguishable from the byte count alone --
+    # which is how a five-second idle timeout spent a morning looking like a
+    # lost tail that was never retransmitted. Record both signals so the next
+    # failure says which happened.
+    resets = {}
+    ended = []
     for name, body in FILES:
         sid = conn.get_next_available_stream_id()
         get(conn, sid, name)
@@ -202,6 +211,11 @@ def run_trial(seed):
             if isinstance(ev, StreamDataReceived) and ev.stream_id in streams:
                 streams[ev.stream_id][2] += ev.data
                 streams[ev.stream_id][3] = streams[ev.stream_id][3] or ev.end_stream
+            elif isinstance(ev, StreamReset):
+                resets[ev.stream_id] = getattr(ev, "error_code", "?")
+            elif isinstance(ev, ConnectionTerminated):
+                ended.append("%s/%s" % (getattr(ev, "error_code", "?"),
+                                        getattr(ev, "reason_phrase", "") or ""))
             ev = conn.next_event()
         now_total = sum(len(v[2]) for v in streams.values())
         if now_total != got_total:
@@ -218,7 +232,10 @@ def run_trial(seed):
         results[name.decode()] = {
             "ok": ok, "fin": fin, "status": st,
             "got": len(data), "want": len(body),
+            "rst": resets.get(sid),
         }
+    if ended:
+        results["_closed"] = {"ok": True, "why": ended}
     s.close()
     return results
 
@@ -230,12 +247,18 @@ for seed in range(SEEDS):
         print(f"seed {seed:2d}: HANDSHAKE FAILED")
         bad += 1
         continue
+    closed = res.pop("_closed", None)
     failed = {n: r for n, r in res.items() if not r["ok"]}
     if failed:
         bad += 1
-        detail = ", ".join(f"{n}:{r['got']}/{r['want']} fin={r['fin']} st={r['status']}"
-                           for n, r in failed.items())
-        print(f"seed {seed:2d}: FAIL {len(failed)}/{len(res)} -> {detail}")
+        detail = ", ".join(
+            f"{n}:{r['got']}/{r['want']} fin={r['fin']} st={r['status']}"
+            + (f" RST={r['rst']}" if r.get("rst") is not None else "")
+            for n, r in failed.items())
+        # no RST and no close means the peer went SILENT -- an idle timeout or a
+        # stall, not a server that decided to stop
+        why = f" [closed: {'; '.join(closed['why'])}]" if closed else " [silent: no RST, no close]"
+        print(f"seed {seed:2d}: FAIL {len(failed)}/{len(res)} -> {detail}{why}")
     else:
         print(f"seed {seed:2d}: ok ({len(res)} streams)")
 
