@@ -552,6 +552,33 @@ PY
     [ "$(up_probe --http2)" = "$((64 * 1024))" ]
     check "backend h2 upload: ...and from an h2 client, whose body takes the h2p leg" $?
 
+    # --- control frames: SETTINGS (RFC 9113 6.5) ----------------------------
+    # A connection frame on stream 0; an ACK with no payload; a non-ACK payload
+    # that is a whole number of six-octet records; INITIAL_WINDOW_SIZE within
+    # 2^31-1. None of it was checked (audit-report-48). /set-ok is the control.
+    [ "$(tr_get /set-ok $H1 | tail -1)" = "set-body" ]
+    check "backend h2 settings: a legal later SETTINGS is applied and the response relays" $?
+    for route in /set-sid /set-acklen /set-len5 /set-maxwin; do
+        [ "$(tr_get $route $CODE1)" = 502 ]
+        check "backend h2 settings: $route is refused" $?
+    done
+
+    # ...and the value rule that is not about structure at all. 6.9.2 makes a
+    # change to INITIAL_WINDOW_SIZE a DELTA against every open stream's current
+    # window. The fixture lets the body spend all 8192, lowers the setting to
+    # 1024 and grants nothing, then reports how much arrived afterwards. The
+    # answer must be none: 0 + (1024 - 8192) is negative.
+    python3 test/h2/h2c_server.py ${P61728} tls,wdelta >/dev/null 2>&1 &
+    wdpid=$!
+    sleep 0.5
+    wdout=$(curl -s --http1.1 --cacert "$PWD/test/tls/server.crt" --max-time 30 \
+        --resolve localhost:${P61729}:127.0.0.1 \
+        --data-binary @$RUNDIR/up_body.bin \
+        https://localhost:${P61729}/echo | tr -d '"'"'\r'"'"' | tail -1)
+    kill $wdpid 2>/dev/null; wait $wdpid 2>/dev/null
+    [ "$wdout" = "AFTER=0" ]
+    check "backend h2 settings: lowering INITIAL_WINDOW_SIZE is a delta, not an assignment ($wdout)" $?
+
     # --- control frames: WINDOW_UPDATE (RFC 9113 6.9) -----------------------
     # Exactly four octets, a nonzero increment, stream 0 or the request stream,
     # and a window that stays inside 2^31-1. None of it was checked: a

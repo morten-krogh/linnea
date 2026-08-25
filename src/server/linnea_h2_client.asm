@@ -95,6 +95,7 @@ h2c_tr_lines:  resq 1                           ; trailer decode (see below)
 h2c_body_len:  resq 1
 h2c_stream_win: resq 1                          ; our stream-1 SEND window
 h2c_conn_win:  resq 1                           ; connection SEND window
+h2c_peer_init_win: resq 1                       ; peer's INITIAL_WINDOW_SIZE (6.9.2)
 h2c_scheme:    resq 1
 h2c_lit_form:  resq 1                           ; transient: current literal prefix width
 ; request-head parse spans
@@ -143,6 +144,7 @@ linnea_h2c_exchange:
     mov qword [h2c_status], 0
     mov qword [h2c_stream_win], 65535     ; default until server SETTINGS
     mov qword [h2c_conn_win], 65535
+    mov qword [h2c_peer_init_win], 65535
     mov r14, rsi                          ; h1 head ptr
     mov r15, rdx                          ; h1 head len
     mov r12, rcx                          ; body ptr
@@ -892,7 +894,20 @@ h2c_send_window:
 
 ; h2c_apply_settings() — record the server's INITIAL_WINDOW_SIZE as our stream-1
 ; send window (first SETTINGS; absolute, before any body has gone out).
+; h2c_apply_settings() -> rax 0 ok / -1 protocol error. The oracle's twin of
+; d_apply_settings, with 6.5's structural rules folded in so its three call
+; sites inherit them: stream 0, and a payload that is a whole number of
+; six-octet records. (The ACK-with-payload case is caught at the sites, which
+; are the only place the flag is examined.)
 h2c_apply_settings:
+    cmp qword [h2c_fr_sid], 0
+    jne .bad_s
+    mov rax, [h2c_fr_len]
+    xor edx, edx
+    mov rcx, 6
+    div rcx
+    test rdx, rdx
+    jnz .bad_s
     lea rsi, [h2c_frame_buf+9]
     mov rcx, [h2c_fr_len]
 .l:
@@ -914,12 +929,21 @@ h2c_apply_settings:
     shl eax, 8
     movzx edx, byte [rsi+5]
     or eax, edx
-    mov [h2c_stream_win], rax
+    cmp eax, 0x7fffffff
+    ja .bad_s
+    mov rdx, [h2c_peer_init_win]
+    mov [h2c_peer_init_win], rax
+    sub rax, rdx                     ; the delta, signed -- see d_apply_settings
+    add [h2c_stream_win], rax
 .next:
     add rsi, 6
     sub rcx, 6
     jmp .l
 .done:
+    xor eax, eax
+    ret
+.bad_s:
+    mov rax, -1
     ret
 
 ; h2c_apply_window() -> rax 0 ok / -1 protocol error. WINDOW_UPDATE: grow the
@@ -985,8 +1009,14 @@ h2c_settle:
 .settings:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_ACK
-    jnz h2c_settle
+    jz .s_apply
+    cmp qword [h2c_fr_len], 0
+    jne .err              ; an ACK with a payload (6.5)
+    jmp h2c_settle
+.s_apply:
     call h2c_apply_settings
+    test rax, rax
+    js .err
     call h2c_send_settings_ack
     xor eax, eax
     ret
@@ -1046,8 +1076,14 @@ h2c_pump_window:
 .s:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_ACK
-    jnz .chk
+    jz .s_apply2
+    cmp qword [h2c_fr_len], 0
+    jne .err              ; an ACK with a payload (6.5)
+    jmp .chk
+.s_apply2:
     call h2c_apply_settings
+    test rax, rax
+    js .err
     call h2c_send_settings_ack
     jmp .chk
 .p:
@@ -1084,10 +1120,10 @@ h2c_send_body:
     call h2c_pump_window
     test rax, rax
     js .done
-    mov r13, [h2c_stream_win]
+    mov r13, [h2c_stream_win]      ; min SIGNED -- see d_stage_body
     mov rax, [h2c_conn_win]
     cmp rax, r13
-    jae .n1
+    jge .n1
     mov r13, rax
 .n1:
     cmp r13, 16384
@@ -1237,8 +1273,14 @@ h2c_run_response:
 .settings:
     mov rax, [h2c_fr_flags]
     test rax, LINNEA_H2C_FL_ACK
-    jnz .loop
+    jz .s_apply3
+    cmp qword [h2c_fr_len], 0
+    jne .err              ; an ACK with a payload (6.5)
+    jmp .loop
+.s_apply3:
     call h2c_apply_settings
+    test rax, rax
+    js .err
     call h2c_send_settings_ack
     jmp .loop
 .win:
@@ -1979,6 +2021,16 @@ d_stage_window:
 ; NOT ignored so much as never asked about: we do not send ENABLE_PUSH 0, so a
 ; backend is entitled to PUSH_PROMISE at us. Those frames land in d_dispatch's
 ; "ignore unknown" arm today.
+; d_apply_settings(rsi=payload, rcx=len) -> rax 0 ok / -1 protocol error.
+; The caller has established stream 0 and a length that is a multiple of six.
+;
+; INITIAL_WINDOW_SIZE is applied as a DELTA (RFC 9113 6.9.2): a change adjusts
+; every open stream's CURRENT window by new - old. Assigning it outright was
+; correct only for the first SETTINGS, before any body had gone out. Measured
+; against a peer that let 8192 bytes through and then lowered the setting to
+; 1024 without granting anything: the correct window is 0 + (1024 - 8192),
+; negative, so not one further byte may be sent -- and 1024 bytes went out
+; (audit-report-48).
 d_apply_settings:
 .l:
     cmp rcx, 6
@@ -1999,12 +2051,21 @@ d_apply_settings:
     shl eax,8
     movzx edx, byte [rsi+5]
     or eax,edx
-    mov [rbx + linnea_h2c.stream_win], rax
+    cmp eax, 0x7fffffff
+    ja .bad_s                        ; 6.5.2: above the maximum window
+    mov rdx, [rbx + linnea_h2c.peer_init_win]
+    mov [rbx + linnea_h2c.peer_init_win], rax
+    sub rax, rdx                     ; the delta, signed
+    add [rbx + linnea_h2c.stream_win], rax
 .next:
     add rsi,6
     sub rcx,6
     jmp .l
 .done:
+    xor eax, eax
+    ret
+.bad_s:
+    mov rax, -1
     ret
 
 ; d_apply_window(rsi=payload ptr, rdi=sid) — grow ctx conn/stream send window.
@@ -2195,10 +2256,17 @@ d_stage_body:
     mov r8, [rbx + linnea_h2c.req_body_len]
     sub r8, [rbx + linnea_h2c.body_sent]      ; remaining
     jz .complete
+    ; min(stream, conn) -- SIGNED. A stream window may be negative, and since
+    ; 6.9.2 became a delta rather than an assignment it genuinely goes there: a
+    ; peer that lowers INITIAL_WINDOW_SIZE below what a stream has already spent
+    ; owes nothing until it grants. Taken unsigned, that negative window reads
+    ; as enormous, the connection window wins the minimum, and the sender spends
+    ; credit the peer never gave -- measured at 21808 bytes past a window of
+    ; -7168. The `jle` below was already signed; this comparison was not.
     mov r9, [rbx + linnea_h2c.stream_win]
     mov rax, [rbx + linnea_h2c.conn_win]
     cmp rax, r9
-    jae .m1
+    jge .m1
     mov r9, rax
 .m1:
     test r9, r9
@@ -2269,6 +2337,7 @@ linnea_h2c_drv_start:
     mov [rbx+linnea_h2c.scheme], r9
     mov qword [rbx+linnea_h2c.stream_win], 65535
     mov qword [rbx+linnea_h2c.conn_win], 65535
+    mov qword [rbx+linnea_h2c.peer_init_win], 65535
     mov qword [rbx+linnea_h2c.status], 0
     mov qword [rbx+linnea_h2c.hdrblk_len], 0
     mov qword [rbx+linnea_h2c.hdr_open], 0
@@ -2567,12 +2636,31 @@ d_dispatch:
     xor eax, eax                        ; ignore unknown
     ret
 .settings:
+    ; 6.5: SETTINGS is a connection frame -- stream 0 -- an ACK carries no
+    ; payload, and a non-ACK payload is a whole number of six-octet records.
+    ; None of that was checked, so a SETTINGS naming a stream, an ACK with
+    ; bytes in it, and a five-octet payload were all accepted and acknowledged
+    ; (audit-report-48).
+    cmp qword [d_fr_sid], 0
+    jne .bad
     mov rax, [d_fr_flags]
     test rax, LINNEA_H2C_FL_ACK
-    jnz .ok
+    jz .set_nonack
+    test r15, r15
+    jnz .bad                         ; an ACK with a payload
+    jmp .ok
+.set_nonack:
+    mov rax, r15
+    xor edx, edx
+    mov rcx, 6
+    div rcx
+    test rdx, rdx
+    jnz .bad                         ; not a multiple of six
     mov rsi, r12
     mov rcx, r15
     call d_apply_settings
+    test rax, rax
+    js .bad
     call d_stage_settings_ack
     mov qword [rbx+linnea_h2c.settled], 1
     ; if we were settling before the body, start sending it now; the actual

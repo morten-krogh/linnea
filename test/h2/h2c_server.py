@@ -32,6 +32,8 @@ Routes (by :path):
   /win-ok          -> legal WINDOW_UPDATEs, on the stream and the connection
   /win3 /win0 /win-sid /win-max -> MALFORMED: 3 octets, a zero increment, an
                    unrelated stream, and an increment past 2^31-1
+  /set-ok          -> a legal later SETTINGS
+  /set-sid /set-acklen /set-len5 /set-maxwin -> MALFORMED SETTINGS
   anything else -> 404
 
 Usage: h2c_server.py <port> [mode]
@@ -42,6 +44,9 @@ Usage: h2c_server.py <port> [mode]
                    the protocol is at fault, so drive it from a client that
                    always reads.
   mode "throttle"  the same idea at 1024, which a real body can cross.
+  mode "wdelta"    advertise 8192, let the client spend it, then LOWER
+                   INITIAL_WINDOW_SIZE to 1024 granting nothing; the response
+                   body reports how many bytes arrived afterwards (6.9.2).
   Modes are comma-separated: "tls,throttle" is both.
   mode "goaway"    send GOAWAY instead of a response (negative test).
   mode "rst"       send RST_STREAM instead of a response (negative test).
@@ -182,6 +187,8 @@ class Conn:
         self.s = sock
         self.mode = mode
         self.modes = set(mode.split(","))
+        self.lowered = False       # wdelta: the lowering SETTINGS has gone out
+        self.after = 0             # ...and the DATA bytes that arrived after it
         self.buf = b""
 
     def recv_exact(self, n):
@@ -218,6 +225,8 @@ def serve_one(sock, mode):
     # enough to carry a real body in reasonable time.
     modes = set(mode.split(","))
     init_win = 5 if "smallwin" in modes else (1024 if "throttle" in modes else 65535)
+    if "wdelta" in modes:
+        init_win = 8192
     c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, init_win)))
 
     hdr_block = b""
@@ -226,7 +235,18 @@ def serve_one(sock, mode):
     end_stream = False
     got_headers = False
     while True:
-        ftype, flags, sid, payload = c.read_frame()
+        try:
+            ftype, flags, sid, payload = c.read_frame()
+        except OSError:
+            # wdelta: the client has (correctly) stopped sending. Report how
+            # much arrived after the lowering SETTINGS.
+            if "wdelta" in c.modes and c.lowered:
+                rb = ("AFTER=%d\n" % c.after).encode()
+                blk = enc_status(200) + enc_header("content-type", "text/plain")
+                blk += enc_header("content-length", str(len(rb)))
+                c.send(frame(0x01, 0x04, 1, blk))
+                c.send(frame(0x00, 0x01, 1, rb))
+            return
         if ftype == 0x04:                         # SETTINGS
             if not (flags & 0x01):
                 c.send(frame(0x04, 0x01, 0, b""))  # ACK
@@ -248,6 +268,27 @@ def serve_one(sock, mode):
                 d = dict(hdrs)
                 method, path = d.get(":method"), d.get(":path")
         elif ftype == 0x00:                       # DATA
+            if "wdelta" in c.modes:
+                # RFC 9113 6.9.2: a change to INITIAL_WINDOW_SIZE adjusts every
+                # open stream's CURRENT window by the DIFFERENCE. Let the client
+                # spend its whole 8192, then lower the setting to 1024 and grant
+                # NOTHING. Correct: 0 + (1024 - 8192) is negative, so not one
+                # further byte may be sent, and the body says AFTER=0. Assigning
+                # the new value outright instead says AFTER=1024; assigning a
+                # correct delta but comparing windows unsigned says AFTER=21808,
+                # which is how this fixture caught the second bug.
+                if not c.lowered:
+                    body += payload
+                    if len(body) >= 8192:
+                        c.send(frame(0x04, 0x00, 0,
+                                     struct.pack(">HI", 0x04, 1024)))
+                        c.lowered = True
+                        c.s.settimeout(1.2)
+                else:
+                    c.after += len(payload)
+                if flags & 0x01:
+                    end_stream = True
+                continue
             body += payload
             # grant the client more window as we drain (smallwin path)
             if payload:
@@ -288,6 +329,9 @@ def respond(c, sid, method, path, body):
         path, q = path.split("?", 1)
     if path.startswith("/trailers"):
         respond_trailers(c, sid, path)
+        return
+    if path.startswith("/set"):
+        respond_settings(c, sid, path)
         return
     if path.startswith("/win"):
         respond_window(c, sid, path)
@@ -357,6 +401,28 @@ def respond_trailers(c, sid, path):
         cut = len(tr) // 2
         c.send(frame(0x01, 0x01, sid, tr[:cut]))  # HEADERS, END_STREAM only
         c.send(frame(0x09, 0x04, sid, tr[cut:]))  # CONTINUATION, END_HEADERS
+
+
+def respond_settings(c, sid, path):
+    """SETTINGS structure (RFC 9113 6.5): a connection frame on stream 0, an ACK
+    with no payload, a non-ACK payload that is a whole number of six-octet
+    records, and INITIAL_WINDOW_SIZE within 2^31-1. /set-ok is the control: a
+    perfectly legal later SETTINGS must still be applied and acknowledged."""
+    if path == "/set-sid":        # naming a stream
+        c.send(frame(0x04, 0x00, 1, struct.pack(">HI", 0x04, 65535)))
+    elif path == "/set-acklen":   # an ACK carrying a payload
+        c.send(frame(0x04, 0x01, 0, b"\x00"))
+    elif path == "/set-len5":     # not a multiple of six
+        c.send(frame(0x04, 0x00, 0, b"\x00\x04\x00\x00\x00"))
+    elif path == "/set-maxwin":   # INITIAL_WINDOW_SIZE above 2^31-1
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, 0xffffffff)))
+    elif path == "/set-ok":
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, 32768)))
+    body = b"set-body\n"
+    block = enc_status(200) + enc_header("content-type", "text/plain")
+    block += enc_header("content-length", str(len(body)))
+    c.send(frame(0x01, 0x04, sid, block))
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 def respond_window(c, sid, path):

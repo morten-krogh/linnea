@@ -132,6 +132,12 @@ struc linnea_h2c
     ; the response header block outgrew HDRBLK_CAP: OUR limit, not a backend
     ; fault, so the failure is logged and counted differently
     .hdr_big:      resq 1
+    ; The peer's last advertised INITIAL_WINDOW_SIZE. RFC 9113 6.9.2 makes a
+    ; change to it a DELTA applied to every open stream's current window, not a
+    ; new absolute window -- so the old value has to be remembered to compute
+    ; the difference. Starts at 65535, the protocol default, which makes the
+    ; first SETTINGS behave exactly as the old assignment did.
+    .peer_init_win: resq 1
     ; embedded buffers + the decoder's persistent dynamic table
     .dyn:          resb linnea_hpack_dyn_size
     .hdrblk:       resb LINNEA_H2C_HDRBLK_CAP
