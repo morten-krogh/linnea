@@ -148,14 +148,28 @@ def run_trial(seed):
 
     # bring up the handshake through the same lossy path
     send_out()
-    t_hs = time.time() + 10
+    # 40 s, not 10. This is wall-clock patience for the handshake on a box that
+    # may be running three suite jobs and saturating every core; it is not a
+    # measure of anything. At 10 s it went red about once in 200 seeds under
+    # full load and never unloaded -- and the connection was not failing, the
+    # client was giving up. Measured: 120 loaded seeds at 10 s produced one
+    # HANDSHAKE FAILED, 120 at 40 s produced none. It costs nothing when the
+    # handshake completes, which is the only path that matters here: this check
+    # exists to stress the DATA phase, and a handshake that has not come up is
+    # not what it is asking about.
+    t_hs = time.time() + 40
     while not conn._handshake_confirmed and time.time() < t_hs:
         now = clk()
         pump_in(now)
         if not heap:
             try:
                 r, _ = s.recvfrom(4096)
-                if rng.random() >= LOSS:
+                # honour lossy[0] here too. This branch dropped datagrams during
+                # the handshake, which the comment above says it does not do --
+                # so the check was quietly part handshake-loss test. NOT the
+                # cause of the flake above (it went red with this guard in place
+                # at the same rate), but the code should mean what it says.
+                if not lossy[0] or rng.random() >= LOSS:
                     conn.receive_datagram(r, addr, now=now)
             except (BlockingIOError, socket.error):
                 pass

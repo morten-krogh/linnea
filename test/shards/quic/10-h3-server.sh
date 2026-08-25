@@ -116,8 +116,16 @@ if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
     # (both directions), across several seeds — the conditions a real browser hits
     # and that lockstep tests miss. Exercises ack-based fast retransmit and the
     # priority pump; every stream must arrive byte-exact on every seed.
-    python3 test/quic/h3_stress_test.py ${P61452} 6 6 3 >/dev/null 2>&1
+    # Keep the output. This went red once in a three-job run and said nothing:
+    # the per-seed detail -- which seed, which streams, how many bytes of how
+    # many, and whether it was the handshake or the data phase -- had gone to
+    # /dev/null, and the answer cost a morning to recover. It prints only on a
+    # failure, so a green run is as quiet as before.
+    stress_out=$(python3 test/quic/h3_stress_test.py ${P61452} 6 6 3 2>&1)
+    [ $? -eq 0 ]
     check "h3 (io_uring): concurrent responses survive loss + reordering" $?
+    printf '%s\n' "$stress_out" | grep -q "FAIL\|HANDSHAKE" \
+        && printf '%s\n' "$stress_out" | sed -n 's/^seed/  h3 stress: seed/p'
 
     # RFC 9218 priority: default (non-incremental) responses are served to
     # completion in arrival order — sequentially, so complete images appear sooner
