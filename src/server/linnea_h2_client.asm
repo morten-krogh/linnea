@@ -962,6 +962,13 @@ h2c_settle:
     call h2c_apply_window
     jmp h2c_settle
 .ping:
+    cmp qword [h2c_fr_sid], 0
+    jne .err
+    cmp qword [h2c_fr_len], 8
+    jne .err
+    mov rax, [h2c_fr_flags]
+    test rax, LINNEA_H2C_FL_ACK
+    jnz h2c_settle                 ; 6.7: never answer an ACK
     call h2c_send_ping_ack
     jmp h2c_settle
 .goaway:
@@ -1197,6 +1204,16 @@ h2c_run_response:
     call h2c_send_settings_ack
     jmp .loop
 .ping:
+    ; the oracle's twin of d_dispatch's check -- see there. It also never looked
+    ; at the ACK flag, so it answered the backend's ACKs with ACKs of its own,
+    ; which 6.7 forbids outright.
+    cmp qword [h2c_fr_sid], 0
+    jne .err
+    cmp qword [h2c_fr_len], 8
+    jne .err
+    mov rax, [h2c_fr_flags]
+    test rax, LINNEA_H2C_FL_ACK
+    jnz .loop
     call h2c_send_ping_ack
     jmp .loop
 .headers:
@@ -2468,6 +2485,21 @@ d_dispatch:
     xor eax, eax
     ret
 .ping:
+    ; RFC 9113 6.7: a PING is exactly 8 octets, on stream 0. Neither was
+    ; checked, and d_stage_ping_ack reads a full qword from the payload pointer
+    ; regardless of the length the frame declared -- so a 7-byte PING was
+    ; answered with those seven bytes plus whatever followed them in the leg's
+    ; receive arena, echoed back to the backend. Measured, not inferred:
+    ; b"1234567\x00" (audit-report-46).
+    ;
+    ; Unused FLAG bits are deliberately not checked. 4.1 requires them to be
+    ; ignored on receipt, and the frontend's own matrix asserts only these two
+    ; PING errors -- rejecting a flag we do not know would be over-strict in a
+    ; place the spec is explicit about.
+    cmp qword [d_fr_sid], 0
+    jne .bad
+    cmp r15, 8
+    jne .bad
     mov rax, [d_fr_flags]
     test rax, LINNEA_H2C_FL_ACK
     jnz .ok

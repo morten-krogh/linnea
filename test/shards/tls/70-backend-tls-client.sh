@@ -496,6 +496,26 @@ EOF
     [ "$(tr_get /data-first $CODE1)" = 502 ]
     check "backend h2: DATA before the response head is refused, not prepended" $?
 
+    # --- control frames: PING (RFC 9113 6.7) --------------------------------
+    # A PING is exactly 8 octets on stream 0. Neither was checked, and the ACK
+    # builder read a full qword whatever the frame declared -- so a 7-octet PING
+    # was answered with those seven bytes plus whatever followed them in the
+    # leg's receive arena, echoed back to the backend (audit-report-46). The
+    # fixture reports what came back in the body, so these assert the ACK itself
+    # and not merely that a response arrived.
+    [ "$(tr_get /ping-ok $H1 | tail -1)" = "PING-ACKED" ]
+    check "backend h2 ping: a legal PING is echoed with ACK" $?
+    [ "$(tr_get /ping-ack $H1 | tail -1)" = "NO-REACK" ]
+    check "backend h2 ping: an ACK is consumed, never answered" $?
+    # 4.1: unused flag bits are IGNORED, not refused -- the control that keeps
+    # this check from being over-strict.
+    [ "$(tr_get /ping-flag $H1 | tail -1)" = "PING-ACKED" ]
+    check "backend h2 ping: an unused flag bit is ignored, not refused" $?
+    for route in /ping7 /ping-sid; do
+        [ "$(tr_get $route $CODE1)" = 502 ]
+        check "backend h2 ping: $route is refused" $?
+    done
+
     # --- header-block FRAMING, one layer below the classifier ---------------
     # RFC 9113 6.10: a CONTINUATION may only follow a HEADERS/CONTINUATION whose
     # block is still open, on the same stream, with no frame of any kind in

@@ -25,6 +25,9 @@ Routes (by :path):
   /cont-interleaved  -> MALFORMED: PING between HEADERS and its CONTINUATION
   /cont-data-between -> MALFORMED: DATA between HEADERS and its CONTINUATION
   /cont-wrong-stream -> MALFORMED: CONTINUATION on a different stream
+  /ping-ok / -ack / -flag  -> a legal PING / ACK / unused-flag PING before the
+                   response; the body reports what the client sent back
+  /ping7 / -sid    -> MALFORMED: 7-octet PING, and a PING naming a stream
   anything else -> 404
 
 Usage: h2c_server.py <port> [mode]
@@ -37,6 +40,7 @@ Usage: h2c_server.py <port> [mode]
 """
 import socket
 import struct
+import time
 import sys
 
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
@@ -267,6 +271,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/trailers"):
         respond_trailers(c, sid, path)
         return
+    if path.startswith("/ping"):
+        respond_ping(c, sid, path)
+        return
     if path.startswith("/cont-"):
         respond_frames(c, sid, path)
         return
@@ -326,6 +333,55 @@ def respond_trailers(c, sid, path):
         cut = len(tr) // 2
         c.send(frame(0x01, 0x01, sid, tr[:cut]))  # HEADERS, END_STREAM only
         c.send(frame(0x09, 0x04, sid, tr[cut:]))  # CONTINUATION, END_HEADERS
+
+
+def respond_ping(c, sid, path):
+    """A control frame before the response. RFC 9113 6.7: a PING is exactly 8
+    octets on stream 0, an ACK is never answered, and 4.1 requires unused flag
+    bits to be IGNORED rather than rejected.
+
+    The PING goes out alone and the response follows a moment later, so the
+    client parses it in a pass of its own -- otherwise the response completes in
+    the same pass and a staged ACK never reaches the wire, which is exactly how
+    an echo of out-of-frame bytes stays invisible.
+
+    /ping-ok and /ping-ack assert what came BACK, not just that a response
+    arrived: the body says whether the client answered as it should."""
+    want_ack = False
+    if path == "/ping7":         # one octet short: FRAME_SIZE_ERROR
+        c.send(frame(0x06, 0x00, 0, b"1234567"))
+    elif path == "/ping-sid":    # legal payload, illegal stream: PROTOCOL_ERROR
+        c.send(frame(0x06, 0x00, 1, b"ABCDEFGH"))
+    elif path == "/ping-flag":   # an unused flag bit: must be ignored, not refused
+        c.send(frame(0x06, 0x08, 0, b"ABCDEFGH"))
+        want_ack = True
+    elif path == "/ping-ok":     # a legal PING: must be echoed with ACK
+        c.send(frame(0x06, 0x00, 0, b"ABCDEFGH"))
+        want_ack = True
+    elif path == "/ping-ack":    # already an ACK: must NOT be answered
+        c.send(frame(0x06, 0x01, 0, b"ABCDEFGH"))
+    time.sleep(0.35)
+    got = None
+    c.s.settimeout(0.6)
+    try:
+        while True:
+            h = c.recv_exact(9)
+            ln = int.from_bytes(h[0:3], "big")
+            pay = c.recv_exact(ln) if ln else b""
+            if h[3] == 0x06 and (h[4] & 0x01):
+                got = pay
+                break
+    except Exception:
+        pass
+    c.s.settimeout(15)
+    if want_ack:
+        body = b"PING-ACKED\n" if got == b"ABCDEFGH" else b"PING-NOACK\n"
+    else:
+        body = b"NO-REACK\n" if got is None else b"REACKED\n"
+    block = enc_status(200) + enc_header("content-type", "text/plain")
+    block += enc_header("content-length", str(len(body)))
+    c.send(frame(0x01, 0x04, sid, block))
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 def respond_frames(c, sid, path):
