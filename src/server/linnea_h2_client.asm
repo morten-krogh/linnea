@@ -159,7 +159,7 @@ linnea_h2c_exchange:
     ; SETTINGS frame: length=6, type=4, flags=0, sid=0, payload {0x0004, initwin}
     mov byte [rdi + 0], 0
     mov byte [rdi + 1], 0
-    mov byte [rdi + 2], 12                ; two settings
+    mov byte [rdi + 2], 18                ; three settings
     mov byte [rdi + 3], LINNEA_H2C_FT_SETTINGS
     mov byte [rdi + 4], 0
     mov dword [rdi + 5], 0                ; sid 0
@@ -181,6 +181,16 @@ linnea_h2c_exchange:
     mov byte [rdi + 3], (LINNEA_H2C_MAXHDRS >> 16) & 0xff
     mov byte [rdi + 4], (LINNEA_H2C_MAXHDRS >> 8) & 0xff
     mov byte [rdi + 5], LINNEA_H2C_MAXHDRS & 0xff
+    add rdi, 6
+    ; We do not want pushes, and the DEFAULT is that we do (RFC 9113 6.5.2:
+    ; ENABLE_PUSH starts at 1). Left unsaid, a backend was entitled to
+    ; PUSH_PROMISE at us and we would have ignored the frames -- and a promise
+    ; split across a CONTINUATION now fails the leg outright against the 6.10
+    ; gate. Saying 0 makes a push a protocol error the backend must not commit:
+    ; a rule with an owner, rather than a frame we quietly drop.
+    mov byte [rdi + 0], 0
+    mov byte [rdi + 1], LINNEA_H2C_SET_PUSH
+    mov dword [rdi + 2], 0                ; ENABLE_PUSH = 0
     add rdi, 6
 
     ; HEADERS frame: build the HPACK block first into h2c_hdrblk, then frame it.
@@ -1179,6 +1189,8 @@ h2c_run_response:
     cmp qword [h2c_fr_sid], 1
     jne .err
 .type:
+    cmp eax, LINNEA_H2C_FT_PUSH    ; see d_dispatch: we asked for no pushes
+    je .err
     cmp eax, LINNEA_H2C_FT_SETTINGS
     je .settings
     cmp eax, LINNEA_H2C_FT_WINDOW
@@ -2231,7 +2243,7 @@ linnea_h2c_drv_start:
     rep movsb
     mov byte [rdi],0
     mov byte [rdi+1],0
-    mov byte [rdi+2],12                   ; two settings, see the blocking twin
+    mov byte [rdi+2],18                   ; three settings, see the blocking twin
     mov byte [rdi+3],LINNEA_H2C_FT_SETTINGS
     mov byte [rdi+4],0
     mov dword [rdi+5],0
@@ -2249,6 +2261,10 @@ linnea_h2c_drv_start:
     mov byte [rdi+3],(LINNEA_H2C_MAXHDRS>>16)&0xff
     mov byte [rdi+4],(LINNEA_H2C_MAXHDRS>>8)&0xff
     mov byte [rdi+5],LINNEA_H2C_MAXHDRS&0xff
+    add rdi,6
+    mov byte [rdi],0
+    mov byte [rdi+1],LINNEA_H2C_SET_PUSH
+    mov dword [rdi+2],0                   ; ENABLE_PUSH = 0
     add rdi,6
     mov rax,r12
     shr rax,16
@@ -2470,6 +2486,11 @@ d_dispatch:
     cmp qword [d_fr_sid], 1             ; the block was opened on stream 1
     jne .bad
 .type:
+    ; 8.4: having set ENABLE_PUSH 0, receipt of a PUSH_PROMISE is a connection
+    ; error. Before, it fell into the ignore-unknown arm at the end and the
+    ; promise was silently dropped.
+    cmp eax, LINNEA_H2C_FT_PUSH
+    je .bad
     cmp eax, LINNEA_H2C_FT_SETTINGS
     je .settings
     cmp eax, LINNEA_H2C_FT_WINDOW

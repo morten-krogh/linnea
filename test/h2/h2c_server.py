@@ -28,6 +28,7 @@ Routes (by :path):
   /ping-ok / -ack / -flag  -> a legal PING / ACK / unused-flag PING before the
                    response; the body reports what the client sent back
   /ping7 / -sid    -> MALFORMED: 7-octet PING, and a PING naming a stream
+  /push            -> a PUSH_PROMISE after the client said ENABLE_PUSH 0
   anything else -> 404
 
 Usage: h2c_server.py <port> [mode]
@@ -271,6 +272,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/trailers"):
         respond_trailers(c, sid, path)
         return
+    if path == "/push":
+        respond_push(c, sid)
+        return
     if path.startswith("/ping"):
         respond_ping(c, sid, path)
         return
@@ -333,6 +337,17 @@ def respond_trailers(c, sid, path):
         cut = len(tr) // 2
         c.send(frame(0x01, 0x01, sid, tr[:cut]))  # HEADERS, END_STREAM only
         c.send(frame(0x09, 0x04, sid, tr[cut:]))  # CONTINUATION, END_HEADERS
+
+
+def respond_push(c, sid):
+    """A PUSH_PROMISE after we advertised ENABLE_PUSH 0. RFC 9113 8.4 makes
+    receiving one a connection error for an endpoint that disabled push, so the
+    client must fail the exchange rather than quietly drop the promise."""
+    c.send(frame(0x05, 0x04, sid,
+                 struct.pack(">I", 2) + enc_header(":path", "/pushed")))
+    block = enc_status(200) + enc_header("content-type", "text/plain")
+    c.send(frame(0x01, 0x04, sid, block))
+    c.send(frame(0x00, 0x01, sid, b"body\n"))
 
 
 def respond_ping(c, sid, path):

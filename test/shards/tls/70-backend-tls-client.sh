@@ -516,6 +516,12 @@ EOF
         check "backend h2 ping: $route is refused" $?
     done
 
+    # We advertise ENABLE_PUSH 0, so 8.4 makes a PUSH_PROMISE a connection
+    # error rather than a frame to drop on the floor. Before we said so, the
+    # default was 1 -- a backend was entitled to push and we ignored it.
+    [ "$(tr_get /push $CODE1)" = 502 ]
+    check "backend h2: a PUSH_PROMISE is refused after ENABLE_PUSH 0" $?
+
     # --- header-block FRAMING, one layer below the classifier ---------------
     # RFC 9113 6.10: a CONTINUATION may only follow a HEADERS/CONTINUATION whose
     # block is still open, on the same stream, with no frame of any kind in
