@@ -39,6 +39,8 @@ Routes (by :path):
   /fsz-ok /fsz-big /fsz-hdr /fsz-split -> DATA of exactly 16384, of 16385,
                    an oversized HEADERS frame, and the same head split legally
                    across HEADERS + CONTINUATION (4.2 bounds each FRAME)
+  /sid-hdr0 /sid-hdr3 /sid-data0 /sid-data3 -> a HEADERS or DATA frame on a
+                   stream this leg never opened, before/inside a good response
   /term-rstok /term-rst3 /term-rst0 -> RST_STREAM: legal, short, stream 0
   /term-gook /term-goshort /term-gosid -> GOAWAY: legal, short, naming a stream
   /pad-ok          -> legal PADDED HEADERS and PADDED DATA
@@ -342,6 +344,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/fsz"):
         respond_framesize(c, sid, path)
         return
+    if path.startswith("/sid-"):
+        respond_wrongstream(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -442,6 +447,72 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+def respond_wrongstream(c, sid, path):
+    """Stream ownership (RFC 9113 6.1, 6.2). This leg is single-stream: the
+    request went out on stream 1, so a HEADERS or DATA frame naming any other
+    stream -- 0, or a stream we never opened -- cannot belong to this response.
+
+    Every route here ends with a perfectly good stream-1 response. That is the
+    point: before audit-report-53 the wrong-stream frames were skipped as though
+    they had never arrived, so the exchange succeeded and nothing downstream
+    could tell that the backend had sent them."""
+    blk = enc_status(200) + enc_header("content-type", "text/plain")
+    if path == "/sid-hdr0":           # a response head on stream 0
+        c.send(frame(0x01, 0x04, 0, blk))
+    elif path == "/sid-hdr3":         # a whole response on a stream we never opened
+        c.send(frame(0x01, 0x04, 3, blk))
+        c.send(frame(0x00, 0x01, 3, b"ignored\n"))
+    elif path == "/sid-hdr3-dyn":
+        # The same wrong-stream HEADERS, but its block INSERTS into the HPACK
+        # dynamic table, and the stream-1 response that follows references the
+        # inserted entry by index. HPACK state is per CONNECTION, so a block
+        # that is skipped instead of decoded desynchronises every later block.
+        c.send(frame(0x01, 0x04, 3,
+                     blk + enc_header("x-ghost", "ghost", indexed=True)))
+        c.send(frame(0x01, 0x04, sid, blk + enc_int(62, 7, 0x80)))
+        c.send(frame(0x00, 0x01, sid, b"real\n"))
+        return
+    elif path == "/sid-dyn-ok":
+        # The skew route with the wrong-stream frame REMOVED: the same two
+        # insertions, all on stream 1, and the final head names BOTH of them.
+        # 62 is the MOST RECENT insertion, so this must come back as
+        # "x-b: bbb" then "x-a: aaa" -- the row that fails if a fix breaks
+        # dynamic indexing rather than the stream check.
+        c.send(frame(0x01, 0x04, sid, enc_status(100)
+                     + enc_header("x-a", "aaa", indexed=True)
+                     + enc_header("x-b", "bbb", indexed=True)))
+        c.send(frame(0x01, 0x04, sid, blk
+                     + enc_int(62, 7, 0x80) + enc_int(63, 7, 0x80)))
+        c.send(frame(0x00, 0x01, sid, b"real\n"))
+        return
+    elif path == "/sid-hdr3-skew":
+        # The same desync, arranged so the bad index lands INSIDE our table
+        # instead of past its end. An informational 1xx inserts two entries, the
+        # skipped stream-3 block inserts a third, and the final head then names
+        # index 63. With that third insertion the backend means x-b: bbb; a
+        # decoder that skipped it resolves 63 one slot early, to x-a: aaa, and
+        # relays THAT under a clean 200. Same wire bytes, different header.
+        c.send(frame(0x01, 0x04, sid, enc_status(100)
+                     + enc_header("x-a", "aaa", indexed=True)
+                     + enc_header("x-b", "bbb", indexed=True)))
+        c.send(frame(0x01, 0x04, 3, enc_header("x-ghost", "ghost", indexed=True)))
+        c.send(frame(0x01, 0x04, sid, blk + enc_int(63, 7, 0x80)))
+        c.send(frame(0x00, 0x01, sid, b"real\n"))
+        return
+    elif path == "/sid-data0":        # body bytes on stream 0, mid-response
+        c.send(frame(0x01, 0x04, sid, blk))
+        c.send(frame(0x00, 0x00, 0, b"ignored\n"))
+        c.send(frame(0x00, 0x01, sid, b"real\n"))
+        return
+    elif path == "/sid-data3":        # body bytes on another stream, mid-response
+        c.send(frame(0x01, 0x04, sid, blk))
+        c.send(frame(0x00, 0x00, 3, b"ignored\n"))
+        c.send(frame(0x00, 0x01, sid, b"real\n"))
+        return
+    c.send(frame(0x01, 0x04, sid, blk))
+    c.send(frame(0x00, 0x01, sid, b"real\n"))
 
 
 def respond_terminal(c, sid, path):

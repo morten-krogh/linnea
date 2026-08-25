@@ -1342,8 +1342,15 @@ h2c_run_response:
     call h2c_send_ping_ack
     jmp .loop
 .headers:
+    ; 6.1/6.2: this leg is single-stream. A HEADERS or DATA frame naming
+    ; stream 0, or a stream we never opened, cannot belong to this response.
+    ; Skipping it is not the safe reading it looks like: HPACK state is per
+    ; CONNECTION, so a header block passed over rather than decoded shifts
+    ; every later dynamic index by one. Measured: a backend meaning index 63
+    ; had "x-a: aaa" relayed in place of "x-b: bbb", under a clean 200
+    ; (audit-report-53).
     cmp qword [h2c_fr_sid], 1
-    jne .loop
+    jne .err
     mov rax, [h2c_fr_flags]
     and rax, LINNEA_H2C_FL_END_STREAM
     mov [h2c_hdr_es], rax
@@ -1389,9 +1396,9 @@ h2c_run_response:
     jne .done
     jmp .loop
 .cont:
-    cmp qword [h2c_fr_sid], 1
-    jne .loop
-    lea rsi, [h2c_frame_buf+9]
+    cmp qword [h2c_fr_sid], 1          ; unreachable: the open-block gate above
+    jne .err                           ; already refuses a CONTINUATION that is
+    lea rsi, [h2c_frame_buf+9]         ; on another stream or opens nothing
     mov rdx, [h2c_fr_len]
     call h2c_hdrblk_append
     test rax, rax
@@ -1415,8 +1422,8 @@ h2c_run_response:
     jne .done
     jmp .loop
 .data:
-    cmp qword [h2c_fr_sid], 1
-    jne .loop
+    cmp qword [h2c_fr_sid], 1          ; see .headers
+    jne .err
     test ebx, ebx
     jz .err                        ; DATA before the response head, see d_dispatch
     lea rsi, [h2c_frame_buf+9]
@@ -2811,8 +2818,15 @@ d_dispatch:
     xor eax, eax
     ret
 .headers:
+    ; 6.1/6.2: this leg is single-stream. A HEADERS or DATA frame naming
+    ; stream 0, or a stream we never opened, cannot belong to this response.
+    ; Skipping it is not the safe reading it looks like: HPACK state is per
+    ; CONNECTION, so a header block passed over rather than decoded shifts
+    ; every later dynamic index by one. Measured: a backend meaning index 63
+    ; had "x-a: aaa" relayed in place of "x-b: bbb", under a clean 200
+    ; (audit-report-53).
     cmp qword [d_fr_sid], 1
-    jne .ok
+    jne .bad
     mov rax, [d_fr_flags]
     and rax, LINNEA_H2C_FL_END_STREAM
     mov [rbx+linnea_h2c.hdr_es], rax
@@ -2864,9 +2878,9 @@ d_dispatch:
     xor eax, eax
     ret
 .cont:
-    cmp qword [d_fr_sid], 1
-    jne .ok
-    mov rsi, r12
+    cmp qword [d_fr_sid], 1             ; unreachable: the open-block gate above
+    jne .bad                            ; already refuses a CONTINUATION that is
+    mov rsi, r12                        ; on another stream or opens nothing
     mov rdx, r15
     call d_hdrblk_append
     test rax, rax
@@ -2888,8 +2902,8 @@ d_dispatch:
     xor eax, eax
     ret
 .data:
-    cmp qword [d_fr_sid], 1
-    jne .ok
+    cmp qword [d_fr_sid], 1             ; see .headers
+    jne .bad
     ; DATA before the response head is not body: nothing has said what this
     ; response IS yet. It used to be appended anyway, so bytes that arrived
     ; ahead of the head were prepended to the body the client received.

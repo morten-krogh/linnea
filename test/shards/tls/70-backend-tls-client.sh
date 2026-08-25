@@ -580,26 +580,67 @@ PY
     # The split row is the one that keeps this from becoming a rule against
     # large header blocks: 4.2 bounds each frame, which is what CONTINUATION is
     # for, and a fix that read the limit as a block bound would fail it.
-    fs_probe() {   # $1 = path, $2.. = extra argv ("0 drv" for the driver)
+    h2c_probe() {  # $1 = path, $2.. = extra argv ("0 drv" for the driver);
+                   # echoes the whole exchange, head and body
         local path=$1; shift
         python3 test/h2/h2c_server.py ${P61730} >/dev/null 2>&1 &
         local pid=$!
         sleep 0.5
         # 2>&1: the tool prints its refusal (H2C-FAIL) on stderr, so dropping
         # stderr would leave an empty string that an equality check accepts.
-        timeout 10 ./bin/linnea-h2client ${P61730} "$path" GET "$@" 2>&1 | head -1
+        timeout 10 ./bin/linnea-h2client ${P61730} "$path" GET "$@" 2>&1
         kill $pid 2>/dev/null; wait $pid 2>/dev/null
     }
     for mode in oracle driver; do
         [ "$mode" = driver ] && argv="0 drv" || argv=""
-        printf '%s' "$(fs_probe /fsz-ok $argv)" | grep -q "^HTTP/1.1 200"
+        h2c_probe /fsz-ok $argv | head -1 | grep -q "^HTTP/1.1 200"
         check "backend h2 framesize ($mode): a 16384-byte DATA frame relays" $?
-        printf '%s' "$(fs_probe /fsz-split $argv)" | grep -q "^HTTP/1.1 200"
+        h2c_probe /fsz-split $argv | head -1 | grep -q "^HTTP/1.1 200"
         check "backend h2 framesize ($mode): a legally split header block relays" $?
-        [ "$(fs_probe /fsz-big $argv)" = "H2C-FAIL" ]
+        [ "$(h2c_probe /fsz-big $argv | head -1)" = "H2C-FAIL" ]
         check "backend h2 framesize ($mode): a 16385-byte DATA frame is refused" $?
-        [ "$(fs_probe /fsz-hdr $argv)" = "H2C-FAIL" ]
+        [ "$(h2c_probe /fsz-hdr $argv | head -1)" = "H2C-FAIL" ]
         check "backend h2 framesize ($mode): an oversized HEADERS frame is refused" $?
+    done
+
+    # --- stream ownership (RFC 9113 6.1, 6.2) -------------------------------
+    # The leg is single-stream. A HEADERS or DATA naming stream 0, or a stream
+    # we never opened, was SKIPPED as though it had not arrived, and the good
+    # stream-1 response behind it relayed as a clean 200 (audit-report-53).
+    #
+    # Skipping is not the conservative choice it looks like. HPACK state is per
+    # CONNECTION: a header block passed over rather than decoded shifts every
+    # later dynamic index by one. /sid-hdr3-skew is that measured -- the
+    # backend names index 63 meaning "x-b: bbb" and the pre-fix build relayed
+    # "x-a: aaa" instead, status 200, no error anywhere.
+    #
+    # /sid-hdr3-dyn is a control, not evidence: it was refused pre-fix too,
+    # because there the skew pushes the index past the END of our table and
+    # HPACK fails closed. It is the same defect landing safely, which is exactly
+    # why /sid-hdr3-skew exists -- an index that lands INSIDE the table is the
+    # one that corrupts silently.
+    #
+    # /sid-dyn-ok is the control that keeps the fix honest: the same two
+    # insertions and the same indices with the wrong-stream frame removed, which
+    # must still decode -- 62 being the most recent insertion, "x-b: bbb" then
+    # "x-a: aaa". A fix that broke dynamic indexing instead of the stream check
+    # passes every refusal row above and fails this one.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for route in /sid-hdr0 /sid-hdr3 /sid-data0 /sid-data3 /sid-hdr3-dyn \
+                     /sid-hdr3-skew; do
+            [ "$(h2c_probe $route $argv | head -1)" = "H2C-FAIL" ]
+            check "backend h2 stream ($mode): $route is refused" $?
+        done
+        sid_out=$(h2c_probe /sid-dyn-ok $argv)
+        printf '%s' "$sid_out" | grep -q "^HTTP/1.1 200" \
+            && printf '%s' "$sid_out" | grep -q "^x-b: bbb" \
+            && printf '%s' "$sid_out" | grep -q "^x-a: aaa"
+        check "backend h2 stream ($mode): legal dynamic indexing still decodes" $?
+    done
+    for route in /sid-hdr3 /sid-data3 /sid-hdr3-skew; do
+        [ "$(tr_get $route $CODE1)" = 502 ]
+        check "backend h2 stream: $route is refused end to end" $?
     done
 
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
