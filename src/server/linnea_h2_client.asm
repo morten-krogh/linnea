@@ -922,8 +922,15 @@ h2c_apply_settings:
 .done:
     ret
 
-; h2c_apply_window() — WINDOW_UPDATE: grow conn (sid 0) or stream (sid 1) window.
+; h2c_apply_window() -> rax 0 ok / -1 protocol error. WINDOW_UPDATE: grow the
+; conn (sid 0) or stream (sid 1) window. The oracle's twin of d_apply_window
+; plus the framing checks its callers used to skip -- see there for why the
+; maximum-window comparison is signed.
 h2c_apply_window:
+    cmp qword [h2c_fr_len], 4
+    jne .bad_w
+    cmp qword [h2c_fr_sid], 1
+    ja .bad_w
     movzx eax, byte [h2c_frame_buf+9]
     shl eax, 8
     movzx edx, byte [h2c_frame_buf+10]
@@ -935,12 +942,27 @@ h2c_apply_window:
     movzx edx, byte [h2c_frame_buf+12]
     or eax, edx
     and eax, 0x7fffffff
+    test eax, eax
+    jz .bad_w
     cmp qword [h2c_fr_sid], 0
     jne .stream
-    add [h2c_conn_win], rax
+    mov rcx, [h2c_conn_win]
+    add rcx, rax
+    cmp rcx, 0x7fffffff
+    jg .bad_w
+    mov [h2c_conn_win], rcx
+    xor eax, eax
     ret
 .stream:
-    add [h2c_stream_win], rax
+    mov rcx, [h2c_stream_win]
+    add rcx, rax
+    cmp rcx, 0x7fffffff
+    jg .bad_w
+    mov [h2c_stream_win], rcx
+    xor eax, eax
+    ret
+.bad_w:
+    mov rax, -1
     ret
 
 ; ============================================================================
@@ -970,6 +992,8 @@ h2c_settle:
     ret
 .win:
     call h2c_apply_window
+    test rax, rax
+    js .err                        ; malformed WINDOW_UPDATE (6.9)
     jmp h2c_settle
 .ping:
     cmp qword [h2c_fr_sid], 0
@@ -1016,6 +1040,8 @@ h2c_pump_window:
     jmp .err                      ; response before END_STREAM: unsupported in v1
 .w:
     call h2c_apply_window
+    test rax, rax
+    js .err                        ; malformed WINDOW_UPDATE (6.9)
     jmp .chk
 .s:
     mov rax, [h2c_fr_flags]
@@ -1194,7 +1220,7 @@ h2c_run_response:
     cmp eax, LINNEA_H2C_FT_SETTINGS
     je .settings
     cmp eax, LINNEA_H2C_FT_WINDOW
-    je .loop
+    je .win                        ; validated, not skipped (audit-report-47)
     cmp eax, LINNEA_H2C_FT_PING
     je .ping
     cmp eax, LINNEA_H2C_FT_HEADERS
@@ -1214,6 +1240,11 @@ h2c_run_response:
     jnz .loop
     call h2c_apply_settings
     call h2c_send_settings_ack
+    jmp .loop
+.win:
+    call h2c_apply_window
+    test rax, rax
+    js .err
     jmp .loop
 .ping:
     ; the oracle's twin of d_dispatch's check -- see there. It also never looked
@@ -1977,6 +2008,17 @@ d_apply_settings:
     ret
 
 ; d_apply_window(rsi=payload ptr, rdi=sid) — grow ctx conn/stream send window.
+; d_apply_window(rdi=sid, rsi=payload) -> rax 0 ok / -1 protocol error.
+; The caller has already established that the frame is four octets on a stream
+; this leg owns; what is left is the value. RFC 9113 6.9: a zero increment is a
+; protocol error, and 6.9.1 forbids a window above 2^31-1. Neither was checked
+; and the addition was unguarded, so a backend could inflate the credit the body
+; sender then spends (audit-report-47).
+;
+; The comparison is SIGNED. A window may legitimately be negative -- a SETTINGS
+; that lowers INITIAL_WINDOW_SIZE takes it there, and d_stage_body already
+; treats <= 0 as blocked -- and an unsigned test would read a negative window as
+; enormous and refuse a perfectly good increment.
 d_apply_window:
     movzx eax, byte [rsi]
     shl eax,8
@@ -1989,12 +2031,27 @@ d_apply_window:
     movzx edx, byte [rsi+3]
     or eax,edx
     and eax, 0x7fffffff
+    test eax, eax
+    jz .bad_w
     test rdi, rdi
     jnz .stream
-    add [rbx + linnea_h2c.conn_win], rax
+    mov rcx, [rbx + linnea_h2c.conn_win]
+    add rcx, rax
+    cmp rcx, 0x7fffffff
+    jg .bad_w
+    mov [rbx + linnea_h2c.conn_win], rcx
+    xor eax, eax
     ret
 .stream:
-    add [rbx + linnea_h2c.stream_win], rax
+    mov rcx, [rbx + linnea_h2c.stream_win]
+    add rcx, rax
+    cmp rcx, 0x7fffffff
+    jg .bad_w
+    mov [rbx + linnea_h2c.stream_win], rcx
+    xor eax, eax
+    ret
+.bad_w:
+    mov rax, -1
     ret
 
 ; h2c_classify_block(rdi = 1 if the final response head is already in, else 0;
@@ -2531,9 +2588,19 @@ d_dispatch:
     xor eax, eax
     ret
 .window:
-    mov rsi, r12
+    ; 6.9: exactly four octets, on stream 0 or the one stream this leg owns.
+    ; Neither was checked -- a three-octet update had its fourth byte read from
+    ; past the frame, and an update naming an unrelated stream credited stream 1
+    ; all the same (audit-report-47).
+    cmp r15, 4
+    jne .bad
     mov rdi, [d_fr_sid]
+    cmp rdi, 1
+    ja .bad
+    mov rsi, r12
     call d_apply_window
+    test rax, rax
+    js .bad
     xor eax, eax
     ret
 .ping:

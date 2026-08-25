@@ -516,6 +516,20 @@ EOF
         check "backend h2 ping: $route is refused" $?
     done
 
+    # --- control frames: WINDOW_UPDATE (RFC 9113 6.9) -----------------------
+    # Exactly four octets, a nonzero increment, stream 0 or the request stream,
+    # and a window that stays inside 2^31-1. None of it was checked: a
+    # three-octet update had its fourth byte read from past the frame, an
+    # update naming stream 3 credited stream 1, and the addition was unguarded
+    # (audit-report-47). /win-ok is the control -- legal updates must still
+    # apply and the response still relay.
+    [ "$(tr_get /win-ok $H1 | tail -1)" = "win-body" ]
+    check "backend h2 window: legal WINDOW_UPDATEs are applied and the response relays" $?
+    for route in /win3 /win0 /win-sid /win-max; do
+        [ "$(tr_get $route $CODE1)" = 502 ]
+        check "backend h2 window: $route is refused" $?
+    done
+
     # We advertise ENABLE_PUSH 0, so 8.4 makes a PUSH_PROMISE a connection
     # error rather than a frame to drop on the floor. Before we said so, the
     # default was 1 -- a backend was entitled to push and we ignored it.

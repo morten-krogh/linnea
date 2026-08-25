@@ -29,6 +29,9 @@ Routes (by :path):
                    response; the body reports what the client sent back
   /ping7 / -sid    -> MALFORMED: 7-octet PING, and a PING naming a stream
   /push            -> a PUSH_PROMISE after the client said ENABLE_PUSH 0
+  /win-ok          -> legal WINDOW_UPDATEs, on the stream and the connection
+  /win3 /win0 /win-sid /win-max -> MALFORMED: 3 octets, a zero increment, an
+                   unrelated stream, and an increment past 2^31-1
   anything else -> 404
 
 Usage: h2c_server.py <port> [mode]
@@ -272,6 +275,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/trailers"):
         respond_trailers(c, sid, path)
         return
+    if path.startswith("/win"):
+        respond_window(c, sid, path)
+        return
     if path == "/push":
         respond_push(c, sid)
         return
@@ -337,6 +343,31 @@ def respond_trailers(c, sid, path):
         cut = len(tr) // 2
         c.send(frame(0x01, 0x01, sid, tr[:cut]))  # HEADERS, END_STREAM only
         c.send(frame(0x09, 0x04, sid, tr[cut:]))  # CONTINUATION, END_HEADERS
+
+
+def respond_window(c, sid, path):
+    """WINDOW_UPDATE framing and flow control (RFC 9113 6.9). Exactly four
+    octets, a nonzero increment, stream 0 or the request stream, and a window
+    that stays within 2^31-1. /win-ok is the control: legal updates, one on the
+    stream and one on the connection, must still be applied and the response
+    relayed."""
+    if path == "/win3":         # three octets: FRAME_SIZE_ERROR
+        c.send(frame(0x08, 0x00, sid, b"\x00\x00\x01"))
+    elif path == "/win0":       # a zero increment: PROTOCOL_ERROR
+        c.send(frame(0x08, 0x00, sid, struct.pack(">I", 0)))
+    elif path == "/win-sid":    # an unrelated stream, credited to ours
+        c.send(frame(0x08, 0x00, 3, struct.pack(">I", 1)))
+    elif path == "/win-max":    # two of these put the window past 2^31-1
+        c.send(frame(0x08, 0x00, sid, struct.pack(">I", 0x7fffffff)))
+        c.send(frame(0x08, 0x00, sid, struct.pack(">I", 0x7fffffff)))
+    elif path == "/win-ok":
+        c.send(frame(0x08, 0x00, sid, struct.pack(">I", 1024)))
+        c.send(frame(0x08, 0x00, 0, struct.pack(">I", 1024)))
+    body = b"win-body\n"
+    block = enc_status(200) + enc_header("content-type", "text/plain")
+    block += enc_header("content-length", str(len(body)))
+    c.send(frame(0x01, 0x04, sid, block))
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 def respond_push(c, sid):
