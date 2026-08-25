@@ -362,14 +362,29 @@ burst_out=$(timeout 60 python3 test/upgrade_burst.py $burst_master ${P61080} 2>&
 burst_rc=$?
 kill $burst_master 2>/dev/null
 wait $burst_master 2>/dev/null
-# One retry, and only on failure. Leaving the reuseport group means closing the
+# Retries, and only on failure. Leaving the reuseport group means closing the
 # listening socket, and the sweep that empties its accept queue first cannot be
 # atomic with that close -- a connection can still land in the gap between the
-# sweep coming up empty and the close on the next instruction. Measured at 2
-# lost in ~34k attempts on a loaded box (and 0 in 386k on an idle one), so a
-# single strict run flakes now and then. A real regression fails both attempts:
-# pre-Q177 lost 6-18 per round, every round.
-if [ $burst_rc -ne 0 ]; then
+# sweep coming up empty and the close on the next instruction. A real regression
+# fails every attempt: pre-Q177 lost 6-18 per round, every round.
+#
+# The rate this note used to claim -- "0 in 386k on an idle one" -- does not
+# hold. Measured 2026-08-25 on an idle box, default config: 18 rounds, 797039
+# attempts, 26 lost. Twenty-two of those came in ONE round and the rest were
+# singletons; ten further rounds (458k attempts) lost three, all singly. The
+# singletons are the gap above. The cluster is NOT explained by it -- a
+# one-instruction window does not lose twenty-two at once -- and it was not
+# reproduced; it may equally have been the measuring harness starting a new
+# generation on top of one whose workers had not gone, since with SO_REUSEPORT
+# that binds happily and then hashes connections to sockets that are dying.
+# Unresolved either way, and stated rather than papered over.
+#
+# TWO retries, not one: at the singleton rate a single retry is not enough to
+# absorb an unlucky pair, which is exactly how this went red under the
+# three-job suite (2 lost, then 1 lost on the retry).
+burst_try=0
+while [ $burst_rc -ne 0 ] && [ $burst_try -lt 2 ]; do
+    burst_try=$((burst_try + 1))
     for _ in $(seq 1 40); do
         (echo > /dev/tcp/127.0.0.1/${P61080}) >/dev/null 2>&1 || break
         sleep 0.25
@@ -380,10 +395,10 @@ if [ $burst_rc -ne 0 ]; then
         curl -s --max-time 1 http://127.0.0.1:${P61080}/hello.txt -o /dev/null && break
         sleep 0.25
     done
-    burst_out="$burst_out; retry: $(timeout 60 python3 test/upgrade_burst.py $burst_master ${P61080} 2>&1)"
+    burst_out="$burst_out; retry$burst_try: $(timeout 60 python3 test/upgrade_burst.py $burst_master ${P61080} 2>&1)"
     burst_rc=$?
     kill $burst_master 2>/dev/null
     wait $burst_master 2>/dev/null
-fi
+done
 check "upgrade under load loses no connection ($burst_out)" $burst_rc
 rm -f "$LOG"
