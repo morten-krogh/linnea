@@ -37,7 +37,7 @@ echo "pre-building the unit-test binaries..."
 make -s bin/linnea-selftest bin/linnea-quictest bin/linnea-rtxtest \
         bin/linnea-nettest bin/linnea-strtest bin/linnea-qpacktest \
         bin/linnea-h3test bin/linnea-h3resp bin/linnea-ws-fast \
-        bin/linnea-quichs tlstest bin/linnea-tlsclient \
+        bin/linnea-quichs tlstest bin/linnea-tlsclient bin/linnea-h2client \
         >/dev/null 2>&1
 
 echo "running ${#jobs[@]} jobs of the $SUITE suite, port bases $BASE..$((BASE + (${#jobs[@]} - 1) * 1000))"

@@ -134,6 +134,8 @@ P61726=$((PORTBASE + 726))   # nginx interop: the real nginx h2 BACKEND (TLS)
 P61727=$((PORTBASE + 727))   # nginx interop: the proxy_h2 front in front of it
 P61728=$((PORTBASE + 728))   # backend-h2 upload: the flow-controlled h2 BACKEND
 P61729=$((PORTBASE + 729))   # backend-h2 upload: the proxy_h2 front in front of it
+P61730=$((PORTBASE + 730))   # backend-h2 frame size: a PLAINTEXT h2 fixture, driven
+                             # by bin/linnea-h2client directly (both parsers)
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 # What actually reached a proxy backend, appended to by test/proxy_backend.py.

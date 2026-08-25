@@ -816,6 +816,8 @@ h2c_next_frame:
     movzx ecx, byte [h2c_frame_buf+2]
     or eax, ecx
     mov [h2c_fr_len], rax
+    cmp rax, LINNEA_H2C_RX_FRAME_MAX   ; 4.2, before the buffer bound: a frame
+    ja .eof                            ; can fit in memory and still be illegal
     cmp rax, 20480 - 9
     ja .eof
     movzx eax, byte [h2c_frame_buf+4]
@@ -2603,6 +2605,8 @@ linnea_h2c_drv_on_recv:
     movzx ecx, byte [rsi+2]
     or eax,ecx
     mov r15, rax                        ; frame payload len
+    cmp r15, LINNEA_H2C_RX_FRAME_MAX    ; 4.2: refuse it now, rather than wait
+    ja .fail                            ; for a frame we will not accept anyway
     mov rax, r13
     add rax, 9
     add rax, r15

@@ -35,6 +35,19 @@ LINNEA_H2C_SET_INITWIN   equ 0x04
 LINNEA_H2C_SET_MAXFRAME  equ 0x05
 LINNEA_H2C_SET_MAXHDRS   equ 0x06     ; SETTINGS_MAX_HEADER_LIST_SIZE
 
+; The largest frame payload we let a BACKEND send us (RFC 9113 4.2). Our client
+; SETTINGS carries no SETTINGS_MAX_FRAME_SIZE, so the protocol default stands
+; and this is that default. It is OUR limit on the peer, and it is not the
+; backend's own MAX_FRAME_SIZE -- that one describes what the backend is willing
+; to RECEIVE and cannot enlarge what we accept.
+LINNEA_H2C_RX_FRAME_MAX equ 16384
+;
+; It was the receive BUFFERS that bounded this before: 20471 in the blocking
+; reader and 65527 in the resumable one, so a 16385-byte DATA frame the peer was
+; never allowed to send fitted in memory and was relayed (audit-report-52). A
+; buffer is not a protocol limit. If a MAX_FRAME_SIZE is ever advertised on this
+; leg, this must move with it rather than with the buffers.
+
 ; Scheme selector for the request :scheme pseudo-header.
 LINNEA_H2C_SCHEME_HTTP   equ 0
 LINNEA_H2C_SCHEME_HTTPS  equ 1

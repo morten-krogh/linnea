@@ -552,6 +552,56 @@ PY
     [ "$(up_probe --http2)" = "$((64 * 1024))" ]
     check "backend h2 upload: ...and from an h2 client, whose body takes the h2p leg" $?
 
+    # --- frame size (RFC 9113 4.2) ------------------------------------------
+    # We advertise no SETTINGS_MAX_FRAME_SIZE, so 16384 bounds every frame the
+    # backend may send us. What bounded it before was the receive BUFFERS --
+    # 20471 and 65527 -- so a 16385-byte DATA frame the peer was never allowed
+    # to send fitted in memory and was relayed (audit-report-52).
+    # /fsz-ok sits exactly on the boundary and is the row that stops this
+    # becoming a rule against large frames in general.
+    [ "$(tr_get /fsz-ok $CODE1)" = 200 ]
+    check "backend h2 framesize: a DATA frame of exactly 16384 relays" $?
+    for route in /fsz-big /fsz-hdr; do
+        [ "$(tr_get $route $CODE1)" = 502 ]
+        check "backend h2 framesize: $route is refused" $?
+    done
+    # /fsz-hdr is NOT this fix's work end to end: a 20000-byte header block is
+    # refused either way by the 6144-byte response-head bound, so that row is a
+    # control here, not evidence. The evidence for HEADERS is below.
+
+    # Both parsers, driven directly. Everything above reaches only the resumable
+    # DRIVER through a real front; bin/linnea-h2client is the one harness that
+    # also runs the blocking ORACLE, and the two are meant to agree frame for
+    # frame. It is also what makes the header rows discriminating, the tool
+    # having no 6144-byte head bound of its own:
+    #   /fsz-hdr    one HEADERS frame of ~20000 bytes  -> refused
+    #   /fsz-split  the SAME head across HEADERS + CONTINUATION, each frame
+    #               under the limit                    -> relays
+    # The split row is the one that keeps this from becoming a rule against
+    # large header blocks: 4.2 bounds each frame, which is what CONTINUATION is
+    # for, and a fix that read the limit as a block bound would fail it.
+    fs_probe() {   # $1 = path, $2.. = extra argv ("0 drv" for the driver)
+        local path=$1; shift
+        python3 test/h2/h2c_server.py ${P61730} >/dev/null 2>&1 &
+        local pid=$!
+        sleep 0.5
+        # 2>&1: the tool prints its refusal (H2C-FAIL) on stderr, so dropping
+        # stderr would leave an empty string that an equality check accepts.
+        timeout 10 ./bin/linnea-h2client ${P61730} "$path" GET "$@" 2>&1 | head -1
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        printf '%s' "$(fs_probe /fsz-ok $argv)" | grep -q "^HTTP/1.1 200"
+        check "backend h2 framesize ($mode): a 16384-byte DATA frame relays" $?
+        printf '%s' "$(fs_probe /fsz-split $argv)" | grep -q "^HTTP/1.1 200"
+        check "backend h2 framesize ($mode): a legally split header block relays" $?
+        [ "$(fs_probe /fsz-big $argv)" = "H2C-FAIL" ]
+        check "backend h2 framesize ($mode): a 16385-byte DATA frame is refused" $?
+        [ "$(fs_probe /fsz-hdr $argv)" = "H2C-FAIL" ]
+        check "backend h2 framesize ($mode): an oversized HEADERS frame is refused" $?
+    done
+
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for
     # audit-report-51: a valid reset already ends the exchange in a 502, so a

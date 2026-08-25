@@ -36,6 +36,9 @@ Routes (by :path):
   /set-sid /set-acklen /set-len5 /set-maxwin -> MALFORMED SETTINGS
   /set-push0 /set-mf-ok -> LEGAL values for known settings
   /set-push1 /set-push2 /set-mf-low /set-mf-high -> values outside 6.5.2's bounds
+  /fsz-ok /fsz-big /fsz-hdr /fsz-split -> DATA of exactly 16384, of 16385,
+                   an oversized HEADERS frame, and the same head split legally
+                   across HEADERS + CONTINUATION (4.2 bounds each FRAME)
   /term-rstok /term-rst3 /term-rst0 -> RST_STREAM: legal, short, stream 0
   /term-gook /term-goshort /term-gosid -> GOAWAY: legal, short, naming a stream
   /pad-ok          -> legal PADDED HEADERS and PADDED DATA
@@ -336,6 +339,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/trailers"):
         respond_trailers(c, sid, path)
         return
+    if path.startswith("/fsz"):
+        respond_framesize(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -413,6 +419,29 @@ def respond_trailers(c, sid, path):
         cut = len(tr) // 2
         c.send(frame(0x01, 0x01, sid, tr[:cut]))  # HEADERS, END_STREAM only
         c.send(frame(0x09, 0x04, sid, tr[cut:]))  # CONTINUATION, END_HEADERS
+
+
+def respond_framesize(c, sid, path):
+    """Frame size (RFC 9113 4.2). The client advertises no
+    SETTINGS_MAX_FRAME_SIZE, so the protocol default of 16384 bounds every frame
+    this backend may send. /fsz-ok sits exactly on the boundary and must relay;
+    a byte more must not, and neither must an oversized HEADERS frame -- the
+    limit is per FRAME, which is what CONTINUATION exists for, and /fsz-split
+    is the control that says so: the same oversized head, legally framed."""
+    blk = enc_status(200) + enc_header("content-type", "text/plain")
+    if path == "/fsz-hdr":            # one HEADERS frame past the limit
+        c.send(frame(0x01, 0x04, sid, blk + enc_header("x-pad", "z" * 20000)))
+        c.send(frame(0x00, 0x01, sid, b"big-head\n"))
+        return
+    if path == "/fsz-split":          # the same head, legally split
+        one = blk + enc_header("x-pad", "z" * 9000)
+        two = enc_header("x-pad2", "z" * 9000)
+        c.send(frame(0x01, 0x00, sid, one))     # no END_HEADERS
+        c.send(frame(0x09, 0x04, sid, two))     # CONTINUATION, END_HEADERS
+        c.send(frame(0x00, 0x01, sid, b"split-head\n"))
+        return
+    c.send(frame(0x01, 0x04, sid, blk))
+    c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
 
 
 def respond_terminal(c, sid, path):
