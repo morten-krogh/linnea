@@ -576,6 +576,20 @@ PY
         check "backend h2 settings: $route is refused" $?
     done
 
+    # 6.5.2 also gives BOUNDS for the defined identifiers, which is a different
+    # rule from "ignore what you do not know": a value outside them is a
+    # connection error. Only INITIAL_WINDOW_SIZE was checked (audit-report-50).
+    # The legal rows are the ones that keep this from becoming a rule against
+    # the identifiers themselves -- 16777215 is what real nginx advertises.
+    for route in /set-push0 /set-mf-ok; do
+        [ "$(tr_get $route $H1 | tail -1)" = "set-body" ]
+        check "backend h2 settings: $route is accepted (legal value)" $?
+    done
+    for route in /set-push1 /set-push2 /set-mf-low /set-mf-high; do
+        [ "$(tr_get $route $CODE1)" = 502 ]
+        check "backend h2 settings: $route is refused (value out of bounds)" $?
+    done
+
     # ...and the value rule that is not about structure at all. 6.9.2 makes a
     # change to INITIAL_WINDOW_SIZE a DELTA against every open stream's current
     # window. The fixture lets the body spend all 8192, lowers the setting to

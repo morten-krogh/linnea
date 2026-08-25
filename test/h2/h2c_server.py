@@ -34,6 +34,8 @@ Routes (by :path):
                    unrelated stream, and an increment past 2^31-1
   /set-ok          -> a legal later SETTINGS
   /set-sid /set-acklen /set-len5 /set-maxwin -> MALFORMED SETTINGS
+  /set-push0 /set-mf-ok -> LEGAL values for known settings
+  /set-push1 /set-push2 /set-mf-low /set-mf-high -> values outside 6.5.2's bounds
   /pad-ok          -> legal PADDED HEADERS and PADDED DATA
   /pad-h0 /pad-d0 /pad-over /prio-short -> MALFORMED padding / priority
   anything else -> 404
@@ -451,7 +453,21 @@ def respond_settings(c, sid, path):
         c.send(frame(0x04, 0x00, 0, b"\x00\x04\x00\x00\x00"))
     elif path == "/set-maxwin":   # INITIAL_WINDOW_SIZE above 2^31-1
         c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, 0xffffffff)))
-    elif path == "/set-ok":
+    elif path == "/set-push2":     # ENABLE_PUSH = 2: not 0 or 1
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x02, 2)))
+    elif path == "/set-push1":     # ENABLE_PUSH = 1: a SERVER may not send this,
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x02, 1)))  # and a client
+    elif path == "/set-push0":     # must reject it. 0 is the only legal value
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x02, 0)))  # from a server
+    elif path == "/set-mf-low":    # MAX_FRAME_SIZE below 2^14
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x05, 1)))
+    elif path == "/set-mf-high":   # MAX_FRAME_SIZE above 2^24-1
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x05, 16777216)))
+    elif path == "/set-mf-ok":     # BOTH ends of the legal range -- 16777215 is
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x05, 16384)))    # what
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x05, 16777215)))  # nginx
+    elif path == "/set-ok":                                               # sends
+
         c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, 32768)))
     body = b"set-body\n"
     block = enc_status(200) + enc_header("content-type", "text/plain")

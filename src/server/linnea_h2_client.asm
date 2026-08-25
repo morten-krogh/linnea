@@ -917,18 +917,27 @@ h2c_apply_settings:
     shl eax, 8
     movzx edx, byte [rsi+1]
     or eax, edx
-    cmp eax, LINNEA_H2C_SET_INITWIN
-    jne .next
-    movzx eax, byte [rsi+2]
-    shl eax, 8
-    movzx edx, byte [rsi+3]
-    or eax, edx
-    shl eax, 8
-    movzx edx, byte [rsi+4]
-    or eax, edx
-    shl eax, 8
-    movzx edx, byte [rsi+5]
-    or eax, edx
+    cmp eax, LINNEA_H2C_SET_INITWIN    ; bounds as in d_apply_settings
+    je .s_initwin
+    cmp eax, LINNEA_H2C_SET_PUSH
+    je .s_push
+    cmp eax, LINNEA_H2C_SET_MAXFRAME
+    je .s_maxframe
+    jmp .next
+.s_push:
+    call d_set_val
+    test eax, eax
+    jnz .bad_s
+    jmp .next
+.s_maxframe:
+    call d_set_val
+    cmp eax, 16384
+    jb .bad_s
+    cmp eax, 16777215
+    ja .bad_s
+    jmp .next
+.s_initwin:
+    call d_set_val
     cmp eax, 0x7fffffff
     ja .bad_s
     mov rdx, [h2c_peer_init_win]
@@ -2009,13 +2018,18 @@ d_stage_window:
 ;                       never indexes: h2c_build_headers emits 0x00 only,
 ;                       literal with a literal name, without indexing. There is
 ;                       no table to size, so there is nothing to honour.
-;   MAX_FRAME_SIZE      is a ceiling, and we are already under any legal one: we
-;                       emit nothing larger than 16384, which every peer must
-;                       accept. nginx offers 16777215; ignoring it forfeits an
-;                       optimisation, never correctness.
+;   MAX_FRAME_SIZE      is a ceiling we are already under -- we emit nothing
+;                       larger than 16384, which every peer must accept, so
+;                       nginx's 16777215 buys only an optimisation we decline.
+;                       Its VALUE is nonetheless checked against 6.5.2's bounds
+;                       now: "we need not act on it" and "we need not validate
+;                       it" are different claims, and this comment used to make
+;                       the first and imply the second (audit-report-50).
 ;   MAX_CONCURRENT      limits streams WE may open on this leg. A leg carries
 ;                       exactly one request on stream 1, so the smallest legal
-;                       value already accommodates us.
+;                       value already accommodates us. 6.5.2 gives it no bounds
+;                       beyond being a 32-bit value, so there is nothing to
+;                       reject.
 ;   MAX_HEADER_LIST_SIZE would bound the request head we send. Ours is capped far
 ;                       below any advertised value in practice, and neither nginx
 ;                       nor curl sends the setting at all -- the default is
@@ -2026,9 +2040,10 @@ d_stage_window:
 ; Unknown identifiers must be ignored (RFC 9113 6.5.2), which is what the walk
 ; below does by falling through .next.
 ;
-; NOT ignored so much as never asked about: we do not send ENABLE_PUSH 0, so a
-; backend is entitled to PUSH_PROMISE at us. Those frames land in d_dispatch's
-; "ignore unknown" arm today.
+; ENABLE_PUSH we now both send (0) and validate on receipt -- and validate more
+; strictly than "0 or 1", because 6.5.2 forbids a SERVER to set it to 1 at all
+; and obliges a client to treat receipt of 1 as a connection error. Zero is the
+; only value that may reach us here.
 ; d_apply_settings(rsi=payload, rcx=len) -> rax 0 ok / -1 protocol error.
 ; The caller has established stream 0 and a length that is a multiple of six.
 ;
@@ -2039,6 +2054,22 @@ d_stage_window:
 ; 1024 without granting anything: the correct window is 0 + (1024 - 8192),
 ; negative, so not one further byte may be sent -- and 1024 bytes went out
 ; (audit-report-48).
+; d_set_val(rsi = a six-octet SETTINGS record) -> eax = its 32-bit value.
+; Shared by both walkers so the identifier can be dispatched BEFORE the value is
+; read, without threading the value through a register the callers might want.
+d_set_val:
+    movzx eax, byte [rsi+2]
+    shl eax, 8
+    movzx edx, byte [rsi+3]
+    or eax, edx
+    shl eax, 8
+    movzx edx, byte [rsi+4]
+    or eax, edx
+    shl eax, 8
+    movzx edx, byte [rsi+5]
+    or eax, edx
+    ret
+
 d_apply_settings:
 .l:
     cmp rcx, 6
@@ -2047,18 +2078,34 @@ d_apply_settings:
     shl eax, 8
     movzx edx, byte [rsi+1]
     or eax, edx
+    ; 6.5.2 gives BOUNDS for the defined identifiers, and a value outside them
+    ; is a connection error -- which is a different rule from "ignore what you do
+    ; not know". Only INITIAL_WINDOW_SIZE was checked, so a backend could send
+    ; ENABLE_PUSH 2 or MAX_FRAME_SIZE 1 and be acknowledged (audit-report-50).
     cmp eax, LINNEA_H2C_SET_INITWIN
-    jne .next
-    movzx eax, byte [rsi+2]
-    shl eax,8
-    movzx edx, byte [rsi+3]
-    or eax,edx
-    shl eax,8
-    movzx edx, byte [rsi+4]
-    or eax,edx
-    shl eax,8
-    movzx edx, byte [rsi+5]
-    or eax,edx
+    je .s_initwin
+    cmp eax, LINNEA_H2C_SET_PUSH
+    je .s_push
+    cmp eax, LINNEA_H2C_SET_MAXFRAME
+    je .s_maxframe
+    jmp .next                        ; genuinely unknown: ignore, as 6.5.2 says
+.s_push:
+    ; Stricter than "0 or 1", and deliberately: a SERVER must not set this to 1,
+    ; and a client must treat receipt of 1 as a connection error. Only 0 may
+    ; ever reach us here.
+    call d_set_val
+    test eax, eax
+    jnz .bad_s
+    jmp .next
+.s_maxframe:
+    call d_set_val
+    cmp eax, 16384
+    jb .bad_s
+    cmp eax, 16777215
+    ja .bad_s
+    jmp .next                        ; in range; we emit 16384 regardless
+.s_initwin:
+    call d_set_val
     cmp eax, 0x7fffffff
     ja .bad_s                        ; 6.5.2: above the maximum window
     mov rdx, [rbx + linnea_h2c.peer_init_win]
