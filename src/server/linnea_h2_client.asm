@@ -1905,6 +1905,37 @@ d_stage_window:
 
 ; d_apply_settings(rsi=payload ptr, rcx=payload len) — set ctx.stream_win from
 ; the server's INITIAL_WINDOW_SIZE (rbx=ctx).
+; d_apply_settings(rsi=payload, rcx=len) — apply a backend's SETTINGS (rbx=ctx).
+;
+; INITIAL_WINDOW_SIZE is the only identifier acted on, and that is deliberate
+; rather than unfinished. Measured against the peers this actually meets: nginx
+; advertises MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE and MAX_FRAME_SIZE, and
+; nothing else. Taking the rest in turn --
+;
+;   HEADER_TABLE_SIZE   bounds the dynamic table an ENCODER may index into. Ours
+;                       never indexes: h2c_build_headers emits 0x00 only,
+;                       literal with a literal name, without indexing. There is
+;                       no table to size, so there is nothing to honour.
+;   MAX_FRAME_SIZE      is a ceiling, and we are already under any legal one: we
+;                       emit nothing larger than 16384, which every peer must
+;                       accept. nginx offers 16777215; ignoring it forfeits an
+;                       optimisation, never correctness.
+;   MAX_CONCURRENT      limits streams WE may open on this leg. A leg carries
+;                       exactly one request on stream 1, so the smallest legal
+;                       value already accommodates us.
+;   MAX_HEADER_LIST_SIZE would bound the request head we send. Ours is capped far
+;                       below any advertised value in practice, and neither nginx
+;                       nor curl sends the setting at all -- the default is
+;                       unlimited. Enforcing it here would be code no peer we
+;                       interoperate with can reach, and unreachable code that
+;                       enforces a protocol rule can only ever be wrong.
+;
+; Unknown identifiers must be ignored (RFC 9113 6.5.2), which is what the walk
+; below does by falling through .next.
+;
+; NOT ignored so much as never asked about: we do not send ENABLE_PUSH 0, so a
+; backend is entitled to PUSH_PROMISE at us. Those frames land in d_dispatch's
+; "ignore unknown" arm today.
 d_apply_settings:
 .l:
     cmp rcx, 6
