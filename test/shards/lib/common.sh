@@ -131,6 +131,8 @@ P61724=$((PORTBASE + 724))   # backend-h2 e2e: the python h2 fixture over TLS (t
 P61725=$((PORTBASE + 725))   # backend-h2 e2e: the front in front of it
 P61726=$((PORTBASE + 726))   # nginx interop: the real nginx h2 BACKEND (TLS)
 P61727=$((PORTBASE + 727))   # nginx interop: the proxy_h2 front in front of it
+P61728=$((PORTBASE + 728))   # backend-h2 upload: the flow-controlled h2 BACKEND
+P61729=$((PORTBASE + 729))   # backend-h2 upload: the proxy_h2 front in front of it
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 # What actually reached a proxy backend, appended to by test/proxy_backend.py.

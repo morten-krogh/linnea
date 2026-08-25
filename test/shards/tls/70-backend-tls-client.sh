@@ -516,6 +516,42 @@ EOF
         check "backend h2 ping: $route is refused" $?
     done
 
+    # --- the flow-controlled UPLOAD path ------------------------------------
+    # Everything above sends a request head and reads a body back. This sends a
+    # BODY, to a backend that will not take it all at once: the fixture
+    # advertises a 1024-byte INITIAL_WINDOW_SIZE and returns credit only as it
+    # drains, so linnea'"'"'s h2 body sender has to stage, block on the window, and
+    # resume on each WINDOW_UPDATE. That sender had no automated coverage at all
+    # until this -- the one harness that drives it, bin/linnea-h2client, is in
+    # no shard (audit-report-47).
+    cat > $CFG/bt-fe-up.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-up.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61729}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61728}",
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost",
+      "proxy_h2": 1 } ] } ] }
+EOF
+    start_server $CFG/bt-fe-up.json
+    python3 - "$RUNDIR/up_body.bin" <<'PY'
+import sys
+open(sys.argv[1], "w").write("U" * (64 * 1024))
+PY
+    up_probe() {   # $1 = client protocol flag; echoes the byte count returned
+        python3 test/h2/h2c_server.py ${P61728} tls,throttle >/dev/null 2>&1 &
+        local pid=$!
+        sleep 0.5
+        curl -s "$1" --cacert "$PWD/test/tls/server.crt" --max-time 30 \
+            --resolve localhost:${P61729}:127.0.0.1 \
+            --data-binary @$RUNDIR/up_body.bin \
+            https://localhost:${P61729}/echo | wc -c
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
+    [ "$(up_probe --http1.1)" = "$((64 * 1024))" ]
+    check "backend h2 upload: a 65536-byte body crosses a 1024-byte window 64 times (h1 client)" $?
+    [ "$(up_probe --http2)" = "$((64 * 1024))" ]
+    check "backend h2 upload: ...and from an h2 client, whose body takes the h2p leg" $?
+
     # --- control frames: WINDOW_UPDATE (RFC 9113 6.9) -----------------------
     # Exactly four octets, a nonzero increment, stream 0 or the request stream,
     # and a window that stays inside 2^31-1. None of it was checked: a

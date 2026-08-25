@@ -35,8 +35,14 @@ Routes (by :path):
   anything else -> 404
 
 Usage: h2c_server.py <port> [mode]
-  mode "smallwin"  advertise a tiny INITIAL_WINDOW_SIZE and dribble
+  mode "smallwin"  advertise a 5-byte INITIAL_WINDOW_SIZE and dribble
                    WINDOW_UPDATEs, forcing the client's body sender to wait.
+                   A stress rather than a realistic peer: at five bytes a frame
+                   two BLOCKING peers deadlock on their socket buffers before
+                   the protocol is at fault, so drive it from a client that
+                   always reads.
+  mode "throttle"  the same idea at 1024, which a real body can cross.
+  Modes are comma-separated: "tls,throttle" is both.
   mode "goaway"    send GOAWAY instead of a response (negative test).
   mode "rst"       send RST_STREAM instead of a response (negative test).
   mode "tls"       serve the same over TLS 1.3 with ALPN h2 (a proxy_h2 BACKEND;
@@ -175,6 +181,7 @@ class Conn:
     def __init__(self, sock, mode):
         self.s = sock
         self.mode = mode
+        self.modes = set(mode.split(","))
         self.buf = b""
 
     def recv_exact(self, n):
@@ -203,7 +210,14 @@ def serve_one(sock, mode):
     if c.recv_exact(len(PREFACE)) != PREFACE:
         return
     # our SETTINGS: a small INITIAL_WINDOW_SIZE in smallwin mode.
-    init_win = 5 if mode == "smallwin" else 65535
+    # smallwin: 5, which is a stress of the client's body sender rather than a
+    # realistic peer -- it makes one DATA frame per five bytes and two
+    # WINDOW_UPDATEs per frame, and two blocking peers will deadlock on their
+    # own socket buffers long before the protocol is at fault. throttle: 1024,
+    # small enough that the sender must genuinely wait for credit and large
+    # enough to carry a real body in reasonable time.
+    modes = set(mode.split(","))
+    init_win = 5 if "smallwin" in modes else (1024 if "throttle" in modes else 65535)
     c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, init_win)))
 
     hdr_block = b""
@@ -262,10 +276,10 @@ def serve_one(sock, mode):
 
 
 def respond(c, sid, method, path, body):
-    if c.mode == "goaway":
+    if "goaway" in c.modes:
         c.send(frame(0x07, 0x00, 0, struct.pack(">II", 0, 0)))
         return
-    if c.mode == "rst":
+    if "rst" in c.modes:
         c.send(frame(0x03, 0x00, sid, struct.pack(">I", 8)))  # CANCEL
         return
 
@@ -522,6 +536,8 @@ def route(path, q, body):
 
 def main():
     port = int(sys.argv[1])
+    # comma-separated, so "tls,throttle" can be both a TLS backend and a
+    # flow-controlled one -- the combination the proxy_h2 upload path needs
     mode = sys.argv[2] if len(sys.argv) > 2 else ""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -533,7 +549,7 @@ def main():
     # for a real h2 BACKEND behind a proxy_h2 location (which requires proxy_tls).
     # Python/OpenSSL also sends NewSessionTickets, which linnea's leg must skip.
     tls_ctx = None
-    if mode == "tls":
+    if "tls" in set(mode.split(",")):
         import os
         import ssl
         here = os.path.dirname(os.path.abspath(__file__))
