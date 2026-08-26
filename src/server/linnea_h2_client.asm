@@ -919,7 +919,7 @@ h2c_next_frame:
     ; the response loop all share, rather than in each of them: three copies of
     ; the PING rule is how audit-report-54 happened.
     cmp qword [h2c_preface_ok], 0
-    jne .ret
+    jne .prefaced                  ; NOT .ret: the frame checks below still apply
     mov qword [h2c_preface_ok], 1
     cmp eax, LINNEA_H2C_FT_SETTINGS
     jne .eof
@@ -928,6 +928,26 @@ h2c_next_frame:
     mov rcx, [h2c_fr_flags]
     test rcx, LINNEA_H2C_FL_ACK
     jnz .eof
+.prefaced:
+    ; RFC 9113 6.3: PRIORITY is deprecated but still DEFINED, and its structure
+    ; survives the deprecation -- exactly five octets, never on stream 0. We do
+    ; not act on the priority information (RFC 9218 carries priority instead),
+    ; but a defined frame type is not an unknown extension to be skipped: the
+    ; leg had no constant for 0x02 at all, so every malformed shape fell through
+    ; the unknown-frame arm and the response behind it was served
+    ; (audit-report-68). The frontend has enforced both halves for a long time,
+    ; in the same words; this is the backend leg finally asking.
+    ;
+    ; It lives HERE, in the reader that settle, the flow-control pump and the
+    ; response loop all share, because the rule depends only on the frame -- not
+    ; on which loop happens to be running. Same reasoning as the preface gate
+    ; above.
+    cmp eax, LINNEA_H2C_FT_PRIORITY
+    jne .ret
+    cmp qword [h2c_fr_len], 5
+    jne .eof                       ; 4.2/6.3: a wrong length
+    cmp qword [h2c_fr_sid], 0
+    je .eof                        ; 6.3: never on stream 0
 .ret:
     ret
 .eof:
@@ -3250,6 +3270,8 @@ d_dispatch:
     ; 8.4: having set ENABLE_PUSH 0, receipt of a PUSH_PROMISE is a connection
     ; error. Before, it fell into the ignore-unknown arm at the end and the
     ; promise was silently dropped.
+    cmp eax, LINNEA_H2C_FT_PRIORITY
+    je .priority
     cmp eax, LINNEA_H2C_FT_PUSH
     je .bad
     cmp eax, LINNEA_H2C_FT_SETTINGS
@@ -3310,6 +3332,17 @@ d_dispatch:
     mov qword [rbx+linnea_h2c.hdr_open], 1
     xor eax, eax
     ret
+.priority:
+    ; 6.3, the driver's twin of the rule in h2c_next_frame: exactly five
+    ; octets, never stream 0, and the priority information itself is ignored
+    ; once the structure is known to be legal. Deprecated is not undefined --
+    ; treating a defined type as an unknown extension is what audit-report-68
+    ; found, in both readers.
+    cmp r15, 5
+    jne .bad
+    cmp qword [d_fr_sid], 0
+    je .bad
+    jmp .ok
 .window:
     ; 6.9: exactly four octets, on stream 0 or the one stream this leg owns.
     ; Neither was checked -- a three-octet update had its fourth byte read from

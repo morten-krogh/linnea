@@ -44,6 +44,13 @@ if mode == "prefempty":
 elif mode != "prefnone":
     c.sendall(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, 65535)))
 
+if mode.startswith("pri"):
+    # AFTER the SETTINGS preface, deliberately: putting it before makes every
+    # row fail for the preface rule instead, which is how the first version of
+    # this probe managed to "refuse" its own legal control.
+    n = {"pri4": 4, "pri0": 0, "pri6": 6, "priok": 5, "prisid0": 5}[mode]
+    c.sendall(frame(0x02, 0x00, 0 if mode == "prisid0" else 1, b"\x00" * n))
+
 body = b"probe\n"
 answered = False
 try:

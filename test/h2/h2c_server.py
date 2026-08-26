@@ -487,6 +487,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/fc-"):
         respond_flow(c, sid, path)
         return
+    if path.startswith("/pri-"):
+        respond_priority(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -587,6 +590,24 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+def respond_priority(c, sid, path):
+    """The standalone PRIORITY frame, type 0x02 (RFC 9113 6.3). Deprecated, and
+    its two structural rules survive the deprecation: exactly five octets, and
+    never on stream 0. A receiver may ignore the priority information; it may
+    not treat a DEFINED frame type as an unknown extension and skip the checks.
+
+    Distinct from the PRIORITY FLAG on a HEADERS frame, which /prio-short
+    already covers -- same five octets, different rule."""
+    n = {"/pri-ok": 5, "/pri-0": 0, "/pri-4": 4, "/pri-6": 6, "/pri-sid0": 5}[path]
+    psid = 0 if path == "/pri-sid0" else sid
+    c.send(frame(0x02, 0x00, psid, b"\x00" * n))
+    body = b"pri-body\n"
+    blk = enc_status(200) + enc_header("content-type", "text/plain")
+    blk += enc_header("content-length", str(len(body)))
+    c.send(frame(0x01, 0x04, sid, blk))
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 def respond_flow(c, sid, path):

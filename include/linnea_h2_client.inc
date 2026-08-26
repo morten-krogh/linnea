@@ -13,6 +13,7 @@
 ; Frame types (RFC 9113 6).
 LINNEA_H2C_FT_DATA       equ 0x00
 LINNEA_H2C_FT_HEADERS    equ 0x01
+LINNEA_H2C_FT_PRIORITY   equ 0x02     ; deprecated, still DEFINED (6.3)
 LINNEA_H2C_FT_PUSH       equ 0x05
 LINNEA_H2C_FT_RST        equ 0x03
 LINNEA_H2C_FT_SETTINGS   equ 0x04

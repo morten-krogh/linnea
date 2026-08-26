@@ -792,6 +792,36 @@ PY
     [ "$(tr_get_m tls,prefempty /hello $CODE1)" = 200 ]
     check "backend h2 preface: an empty SETTINGS preface serves end to end" $?
 
+    # --- the standalone PRIORITY frame, type 0x02 (RFC 9113 6.3) ------------
+    # Deprecated, still DEFINED, and its structure survives the deprecation:
+    # exactly five octets, never on stream 0. The leg had no constant for 0x02
+    # at all, so every malformed shape fell through the unknown-frame arm and
+    # the response behind it was served (audit-report-68). The FRONTEND has
+    # enforced both halves for a long time, in the same words -- the eighth
+    # report running whose root is a rule this server has in one direction only.
+    #
+    # Distinct from the PRIORITY FLAG on a HEADERS frame: /prio-short covers
+    # that one. Same five octets, different rule, and the two are kept apart
+    # deliberately.
+    #
+    # /pri-sid0 is where we are stricter than the reference: nghttp2 refuses the
+    # wrong LENGTHS with FRAME_SIZE_ERROR but serves a PRIORITY on stream 0,
+    # which 6.3 makes a MUST-level PROTOCOL_ERROR. Our own frontend refuses it,
+    # so this keeps the two directions in agreement.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for bad in /pri-0 /pri-4 /pri-6 /pri-sid0; do
+            [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
+            check "backend h2 priority ($mode): $bad is refused" $?
+        done
+        st_probe /pri-ok $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 priority ($mode): a legal PRIORITY is ignored, not refused" $?
+    done
+    [ "$(tr_get /pri-4 $CODE1)" = 502 ]
+    check "backend h2 priority: a malformed PRIORITY is refused end to end" $?
+    [ "$(tr_get /pri-ok $CODE1)" = 200 ]
+    check "backend h2 priority: a legal one still serves end to end" $?
+
     # --- the :status GRAMMAR (RFC 9113 8.3.2, RFC 9110 15.1) ----------------
     # A status code is EXACTLY three digits. The h2 leg stopped at the first
     # byte that was not a digit and kept what it had, so the value was mined
