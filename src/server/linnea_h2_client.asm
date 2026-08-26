@@ -1112,6 +1112,26 @@ h2c_field_ok:
 ; The order matters. Checking the length first would ask the wrong question of a
 ; 304, whose declaration deliberately does not match what it sends.
 h2c_body_ok:
+    ; 0. HEAD, before anything else: RFC 9110 9.3.2 -- the response to a HEAD
+    ;    has no content, whatever its head declares. The declared length is what
+    ;    a GET WOULD have returned, so it is metadata and is NOT compared
+    ;    against these bytes; that exemption was here from audit-report-58. What
+    ;    was missing is its other half -- the bytes must not EXIST. The comment
+    ;    said "sends nothing" and nothing checked it (audit-report-63).
+    ;
+    ;    Measured before the fix: a HEAD whose backend sent DATA came back from
+    ;    the direct client API with the body attached, and reached an h1 client
+    ;    through a real proxy_h2 front with four bytes of content after the
+    ;    blank line. An h2 client saw none, because the h2 relay suppresses a
+    ;    HEAD body downstream -- which hides it on one route and does not make
+    ;    the backend response legal on either.
+    test rsi, rsi
+    jz .bo_status
+    test r8, r8
+    jnz .bo_bad
+    mov rax, 1
+    ret
+.bo_status:
     push rcx
     push rdx
     push rsi
@@ -1131,9 +1151,7 @@ h2c_body_ok:
     mov rax, 1
     test rdx, rdx
     jz .bo_ret                     ; nothing declared: nothing to contradict
-    test rsi, rsi
-    jnz .bo_ret                    ; HEAD
-    cmp rcx, r8
+    cmp rcx, r8                    ; HEAD already returned above
     je .bo_ret
 .bo_bad:
     xor eax, eax
@@ -2196,7 +2214,22 @@ h2c_compose:
     lea rsi, [hdr_cl]
     mov rcx, hdr_cl_len
     rep movsb
+    ; RFC 9110 9.3.2: a HEAD response's content-length is the length a GET
+    ; WOULD have returned. Writing the MEASURED body length reported 0 for
+    ; every HEAD -- destroying the one thing the method exists to ask for,
+    ; from a backend that had just said 4. The bytes that follow stay the
+    ; measured ones (none), which is what a HEAD response IS.
+    ;
+    ; This composition exists THREE times -- here, in the harness composer, and
+    ; in linnea_h2c_drv_head, which is the one production uses. All three get
+    ; it (audit-report-63, beside its filed finding).
     mov rax, [h2c_body_len]
+    cmp qword [h2c_is_head], 0
+    je .cl_have
+    cmp qword [h2c_cl_seen], 0
+    je .cl_have
+    mov rax, [h2c_cl_val]
+.cl_have:
     call h2c_u64_dec
     mov byte [rdi], 13
     mov byte [rdi+1], 10
@@ -3498,7 +3531,13 @@ linnea_h2c_drv_compose:
     lea rsi, [hdr_cl]
     mov rcx, hdr_cl_len
     rep movsb
-    mov rax, [rbx+linnea_h2c.body_len]
+    mov rax, [rbx+linnea_h2c.body_len]   ; the HEAD rule, see h2c_compose
+    cmp qword [rbx+linnea_h2c.is_head], 0
+    je .cl_have
+    cmp qword [rbx+linnea_h2c.cl_seen], 0
+    je .cl_have
+    mov rax, [rbx+linnea_h2c.cl_val]
+.cl_have:
     call h2c_u64_dec
     mov byte [rdi],13
     mov byte [rdi+1],10
@@ -3564,7 +3603,13 @@ linnea_h2c_drv_head:
     lea rsi, [hdr_cl]
     mov rcx, hdr_cl_len
     rep movsb
-    mov rax, [rbx+linnea_h2c.body_len]
+    mov rax, [rbx+linnea_h2c.body_len]   ; the HEAD rule, see h2c_compose
+    cmp qword [rbx+linnea_h2c.is_head], 0
+    je .cl_have
+    cmp qword [rbx+linnea_h2c.cl_seen], 0
+    je .cl_have
+    mov rax, [rbx+linnea_h2c.cl_val]
+.cl_have:
     call h2c_u64_dec
     mov byte [rdi],13
     mov byte [rdi+1],10

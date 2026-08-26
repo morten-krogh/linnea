@@ -1055,6 +1055,58 @@ PY
     [ "$(tr_get /sw-ok $CODE1)" = 200 ]
     check "backend h2 sweep: an ordinary response still serves end to end" $?
 
+    # --- a HEAD response has no content (RFC 9110 9.3.2) --------------------
+    # The HEAD exemption added for audit-report-58 waived the content-length
+    # comparison -- correctly, since a HEAD declares what a GET WOULD have
+    # returned -- but never asked the other half: that the bytes must not
+    # EXIST. The comment said "sends nothing" and nothing checked it
+    # (audit-report-63). The body was accepted, stored, and handed back by the
+    # client API with the response.
+    #
+    # The 2x2 is the whole rule: the same two response shapes, each legal under
+    # exactly one method.
+    #
+    #                       asked with GET      asked with HEAD
+    #   /cl-ok    (4, DATA)   legal               malformed
+    #   /cl-head  (4, none)   malformed           legal
+    #
+    # /cl-hd-nocl is the second half of the defect: with NO content-length the
+    # helper returned success from its "nothing declared" branch before the
+    # method was ever considered.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        cl_probe /cl-ok GET $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 head ($mode): a body for GET is legal" $?
+        [ "$(cl_probe /cl-ok HEAD $argv)" = "H2C-FAIL" ]
+        check "backend h2 head ($mode): ...and the same bytes for HEAD are not" $?
+        [ "$(cl_probe /cl-hd-data HEAD $argv)" = "H2C-FAIL" ]
+        check "backend h2 head ($mode): DATA in a HEAD response is refused" $?
+        [ "$(cl_probe /cl-hd-nocl HEAD $argv)" = "H2C-FAIL" ]
+        check "backend h2 head ($mode): ...even with no content-length declared" $?
+        # ...and the length a HEAD DOES report is the backend's, not our
+        # measurement of the body it correctly did not send. Reporting 0 here
+        # destroys the one thing the method exists to ask for.
+        cl_probe /cl-head HEAD $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 head ($mode): a legal HEAD still serves" $?
+        cl_probe /cl-head HEAD $argv >/dev/null 2>&1
+        python3 test/h2/h2c_server.py ${P61730} >/dev/null 2>&1 &
+        hdpid=$!
+        sleep 0.5
+        hdlen=$(timeout 10 ./bin/linnea-h2client ${P61730} /cl-head HEAD $argv \
+                </dev/null 2>&1 | tr -d '\r' | awk -F': ' '/^content-length/{print $2}')
+        kill $hdpid 2>/dev/null; wait $hdpid 2>/dev/null
+        [ "$hdlen" = 4 ]
+        check "backend h2 head ($mode): it reports the backend's length ($hdlen)" $?
+    done
+    [ "$(tr_get /cl-ok $CODE1 -I)" = 502 ]
+    check "backend h2 head: a HEAD response with content is refused end to end" $?
+    # head -1: $H1 already carries -D-, so adding -I makes curl print the head
+    # TWICE and the value would be "4\n4" -- equal to neither 4 nor 0.
+    hdlen=$(tr_get /cl-head $H1 -I | tr -d '\r' \
+            | awk -F': ' '/^content-length/{print $2}' | head -1)
+    [ "$hdlen" = 4 ]
+    check "backend h2 head: a HEAD reports the backend's length downstream ($hdlen)" $?
+
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for
     # audit-report-51: a valid reset already ends the exchange in a 502, so a

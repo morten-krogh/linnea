@@ -766,6 +766,15 @@ def respond_clen(c, sid, path, method):
     elif path == "/cl-204":       # CONTROL: no content, and no DATA frame
         c.send(frame(0x01, 0x05, sid, enc_status(204)))
         return
+    elif path == "/cl-hd-data":   # a HEAD response that carries content anyway
+        c.send(frame(0x01, 0x04, sid,
+                     enc_status(200) + enc_header("content-length", "4")))
+        c.send(frame(0x00, 0x01, sid, body))
+        return
+    elif path == "/cl-hd-nocl":   # ...and the same with no content-length at
+        c.send(frame(0x01, 0x04, sid, enc_status(200)))   # all, which took the
+        c.send(frame(0x00, 0x01, sid, body))              # "nothing declared"
+        return                                            # branch out early
     elif path == "/cl-head":      # CONTROL: a length with no body is what a
         # HEAD response IS. The fixture answers whatever method was asked, so
         # driving this with GET is the negative twin of the same bytes.
