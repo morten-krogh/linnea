@@ -940,6 +940,78 @@ h2c_ping_frame:
     mov rax, -1
     ret
 
+; h2c_field_ok(rdi=name, rsi=name len, rdx=value, rcx=value len) -> rax 1 ok, 0
+; malformed. RFC 9113 8.2.1, for an ORDINARY response field; 8.1.1 then says a
+; malformed response must not be forwarded.
+;
+; The name half was a repair rather than a check: h2c_hdrline_append lowercased
+; A-Z while copying, so "Content-Type" became "content-type" and the protocol
+; error left no trace (audit-report-60).
+;
+; The VALUE half was not checked at all, and that is the half with teeth. This
+; leg writes "name: value CRLF" into a synthesized HTTP/1 head which the proxy
+; bridge then RE-PARSES, so a CR LF inside a value forges a header line. It was
+; measured end to end: a backend sending ONE field whose value contained
+; "\r\nx-injected: yes" delivered x-injected as a real header to an h1 AND an h2
+; client. That is the response-direction twin of the note in linnea_hpack.asm's
+; emit_field, where a CR or LF forges a second REQUEST at the backend.
+;
+; Touches rax/r8/r9 only.
+h2c_field_ok:
+    xor eax, eax
+    test rsi, rsi
+    jz .fo_ret                     ; a field name is a token: never empty
+    xor r9, r9
+.fo_name:
+    cmp r9, rsi
+    jae .fo_name_ok
+    movzx r8d, byte [rdi + r9]
+    cmp r8b, 0x20
+    jbe .fo_ret                    ; 8.2.1 excludes 0x00-0x20 INCLUSIVE: SP too
+    cmp r8b, 0x7f
+    jae .fo_ret                    ; ...and 0x7f-0xff
+    cmp r8b, 'A'
+    jb .fo_name_next
+    cmp r8b, 'Z'
+    jbe .fo_ret                    ; uppercase: malformed, not something to fix
+.fo_name_next:
+    cmp r8b, ':'
+    je .fo_ret                     ; only a pseudo-header carries one, and it
+    inc r9                         ; never reaches here
+    jmp .fo_name
+.fo_name_ok:
+    test rcx, rcx
+    jz .fo_good                    ; an empty value is legal
+    ; 8.2.1: no CR, LF or NUL anywhere, and no leading or trailing SP/HTAB.
+    movzx r8d, byte [rdx]
+    cmp r8b, 0x20
+    je .fo_ret
+    cmp r8b, 0x09
+    je .fo_ret
+    lea r9, [rcx - 1]
+    movzx r8d, byte [rdx + r9]
+    cmp r8b, 0x20
+    je .fo_ret
+    cmp r8b, 0x09
+    je .fo_ret
+    xor r9, r9
+.fo_val:
+    cmp r9, rcx
+    jae .fo_good
+    movzx r8d, byte [rdx + r9]
+    test r8b, r8b
+    jz .fo_ret                     ; NUL
+    cmp r8b, 0x0d
+    je .fo_ret                     ; CR -- the forged line
+    cmp r8b, 0x0a
+    je .fo_ret                     ; LF
+    inc r9
+    jmp .fo_val
+.fo_good:
+    mov rax, 1
+.fo_ret:
+    ret
+
 ; h2c_clen_ok(rdi=status, rsi=is_head, rdx=cl_seen, rcx=cl_val, r8=body_len)
 ;   -> rax = 1 well-formed, 0 malformed.
 ;
@@ -1776,12 +1848,20 @@ h2c_emit:
     call h2c_ci_eq
     test rax, rax
     jnz .status
-    test r13, r13
-    jz .ok
     cmp byte [r12], ':'
-    je .pseudo
+    je .pseudo_maybe
     mov qword [h2c_regular_seen], 1  ; 8.3: every pseudo-header comes BEFORE
                                      ; the regular fields, so this closes them
+    ; 8.2.1, and BEFORE the skip table below: a name we would have dropped is
+    ; still a malformed response, so an uppercase "Connection" must fail rather
+    ; than quietly vanish into the hop-by-hop filter.
+    mov rdi, r12
+    mov rsi, r13
+    mov rdx, r14
+    mov rcx, r15
+    call h2c_field_ok
+    test rax, rax
+    jz .badfield
     ; RFC 9113 8.1.1: a content-length that does not equal the sum of the DATA
     ; payloads makes the response MALFORMED, and an intermediary must not
     ; forward it. The field is still dropped here -- the composer writes its own
@@ -1805,6 +1885,9 @@ h2c_emit:
 .ok:
     clc
     jmp .ret
+.pseudo_maybe:
+    test r13, r13
+    jz .badfield                   ; an empty name is not a pseudo-header either
 .pseudo:
     ; RFC 9113 8.3: a field block containing an UNDEFINED pseudo-header is
     ; malformed, and :status is the only one defined for a response. Recording
@@ -1862,6 +1945,7 @@ h2c_emit:
     clc
     jmp .ret
 .badst:
+.badfield:
     stc
     jmp .ret
 .clen:

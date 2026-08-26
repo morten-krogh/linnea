@@ -68,7 +68,16 @@ try:
                 blk = lit(":status", status) + lit(":unknown", "x")
             else:
                 blk = lit(":status", status)
-            blk += lit("content-type", "text/plain")
+            if mode == "fnupper":
+                blk += lit("Content-Type", "text/plain")
+            elif mode == "fvcrlf":
+                blk += lit("x-test", "a\r\nx-injected: yes")
+            elif mode == "fvsp":
+                blk += lit("x-test", " leading")
+            elif mode == "fnspace":
+                blk += lit("bad name", "v")
+            else:
+                blk += lit("content-type", "text/plain")
             blk += lit("content-length",
                        str(len(body)) if declare == "auto" else declare)
             c.sendall(frame(0x01, 0x04, sid, blk))

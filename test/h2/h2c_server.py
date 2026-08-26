@@ -471,6 +471,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/ps-"):
         respond_pseudo(c, sid, path)
         return
+    if path.startswith("/fn-") or path.startswith("/fv-"):
+        respond_fieldsyntax(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -571,6 +574,40 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+FIELD_CASES = {                    # RFC 9113 8.2.1 field validity
+    "/fn-ok":        ("x-ok", "fine"),               # the control
+    "/fn-upper":     ("Content-Type", "text/plain"), # uppercase name
+    "/fn-upper-conn": ("Connection", "close"),       # uppercase AND skipped
+    "/fn-space":     ("bad name", "v"),              # 0x20 is excluded too
+    "/fn-empty":     ("", "v"),                      # a name is a token
+    "/fn-ctl":       ("x\x01y", "v"),                # a control byte
+    "/fn-colon":     ("x:y", "v"),                   # ':' is not a name byte
+    "/fn-del":       ("x\x7fy", "v"),                # 0x7f..0xff
+    "/fv-crlf":      ("x-test", "a\r\nx-injected: yes"),
+    "/fv-lf":        ("x-test", "a\nx-injected: yes"),
+    "/fv-nul":       ("x-test", "a\x00b"),
+    "/fv-sp":        ("x-test", " leading"),         # 8.2.1: no leading SP/HTAB
+}
+
+
+def respond_fieldsyntax(c, sid, path):
+    """Field NAME and VALUE syntax (RFC 9113 8.2.1). A name may not be empty or
+    carry 0x00-0x20, uppercase, 0x7f-0xff or a bare ':'; a value may not carry
+    CR, LF or NUL, nor lead or trail with SP/HTAB. A response breaking any of
+    these is malformed and must not be forwarded (8.1.1).
+
+    The value cases are the ones with teeth: the leg writes "name: value CRLF"
+    into a synthesized HTTP/1 head that the proxy bridge then RE-PARSES, so a CR
+    LF in a value forges a header line -- the response-direction twin of the
+    request-side note in linnea_hpack.asm's emit_field."""
+    body = b"fs-body\n"
+    name, value = FIELD_CASES[path]
+    blk = enc_status(200) + enc_header(name, value)
+    blk += enc_header("content-length", str(len(body)))
+    c.send(frame(0x01, 0x04, sid, blk))
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 def respond_pseudo(c, sid, path):

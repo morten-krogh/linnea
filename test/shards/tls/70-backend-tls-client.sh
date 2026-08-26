@@ -895,6 +895,48 @@ PY
     [ "$(tr_get /ps-one $CODE1)" = 200 ]
     check "backend h2 pseudo: a single :status relays end to end" $?
 
+    # --- field NAME and VALUE syntax (RFC 9113 8.2.1) -----------------------
+    # A name may not be empty or carry 0x00-0x20, uppercase, 0x7f-0xff or a
+    # colon; a value may not carry CR, LF or NUL, nor lead or trail with SP or
+    # HTAB. A response breaking any of it is malformed and 8.1.1 forbids
+    # forwarding it. Fifth report running whose root is a rule the REQUEST side
+    # has (linnea_hpack.asm emit_field) and the response side did not.
+    #
+    # The name half was a REPAIR rather than a check -- h2c_hdrline_append
+    # lowercased A-Z while copying, so "Content-Type" became "content-type" and
+    # the error left no trace (audit-report-60, as filed).
+    #
+    # The VALUE half was not checked at all, and is the half with teeth: this
+    # leg writes "name: value CRLF" into a synthesized HTTP/1 head that the
+    # proxy bridge RE-PARSES. Measured end to end before the fix -- a backend
+    # sending ONE field whose value contained "\r\nx-injected: yes" delivered
+    # x-injected as a real header to an h1 client AND an h2 client. The e2e row
+    # below asserts the ABSENCE of that header, not merely a 502: a check that
+    # only looked at the status would pass on a build that still forged it.
+    #
+    # /fn-upper-conn is the row the report warned about: an uppercase
+    # "Connection" is dropped by the case-insensitive hop-by-hop filter anyway,
+    # so it must be refused for being malformed, not for being dropped.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for bad in /fn-upper /fn-upper-conn /fn-space /fn-empty /fn-ctl \
+                   /fn-colon /fn-del /fv-crlf /fv-lf /fv-nul /fv-sp; do
+            [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
+            check "backend h2 field ($mode): $bad is refused" $?
+        done
+        st_probe /fn-ok $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 field ($mode): an ordinary lowercase field relays" $?
+    done
+    [ "$(tr_get /fv-crlf $CODE1)" = 502 ]
+    check "backend h2 field: a CRLF in a value is refused end to end" $?
+    inj=$(tr_get /fv-crlf $H1 | grep -ci "x-injected")
+    [ "$inj" = 0 ]
+    check "backend h2 field: ...and forges no header downstream ($inj lines)" $?
+    [ "$(tr_get /fn-upper $CODE1)" = 502 ]
+    check "backend h2 field: an uppercase name is refused end to end" $?
+    [ "$(tr_get /fn-ok $CODE1)" = 200 ]
+    check "backend h2 field: an ordinary field relays end to end" $?
+
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for
     # audit-report-51: a valid reset already ends the exchange in a 502, so a
