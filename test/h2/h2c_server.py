@@ -93,6 +93,7 @@ Usage: h2c_server.py <port> [mode]
   mode "tls"       serve the same over TLS 1.3 with ALPN h2 (a proxy_h2 BACKEND;
                    it sends NewSessionTickets, which the backend leg must skip).
 """
+import os
 import socket
 import struct
 import time
@@ -275,6 +276,11 @@ def serve_one(sock, mode):
         init_win = 8192
     pref = ([m for m in modes if m.startswith("pref")] or [None])[0]
     c.pref = pref
+    if "qflood" in modes:
+        # One write, thousands of zero-length non-ACK SETTINGS frames. The first
+        # is the required server preface (audit-report-56); the rest are legal
+        # repeats, and each one obliges the client to queue a 9-byte ACK.
+        c.send(frame(0x04, 0x00, 0, b"") * int(os.environ.get("LINNEA_QFLOOD", "3600")))
     if pref:
         # Everything here happens BEFORE the server's SETTINGS, which is the
         # whole point. prefnone sends nothing at all until the response.
@@ -307,6 +313,11 @@ def serve_one(sock, mode):
     while True:
         try:
             ftype, flags, sid, payload = c.read_frame()
+            if "qflood" in c.modes and ftype not in (0x00, 0x01, 0x03, 0x04,
+                                                     0x06, 0x07, 0x08, 0x09):
+                print("QFLOOD-BADFRAME type=0x%02x flags=0x%02x sid=%d len=%d"
+                      % (ftype, flags, sid, len(payload)),
+                      file=sys.stderr, flush=True)
         except OSError:
             if "dupwin" in c.modes and not c.granted:
                 # The sender has spent the window and stalled. Whatever arrived
@@ -327,6 +338,8 @@ def serve_one(sock, mode):
                 c.send(frame(0x00, 0x01, 1, rb))
             return
         if ftype == 0x04:                         # SETTINGS
+            if flags & 0x01:
+                c.acks = getattr(c, "acks", 0) + 1
             if not (flags & 0x01):
                 for off in range(0, len(payload) - 5, 6):
                     ident, val = struct.unpack(">HI", payload[off:off+6])
@@ -497,6 +510,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/fcx-"):
         respond_tinyframes(c, sid, path)
         return
+    if path.startswith("/qflood"):
+        respond_qflood(c, sid, path, body)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -597,6 +613,31 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+def respond_qflood(c, sid, path, body):
+    """Report what the REQUEST body looked like on the wire. The flood itself is
+    sent at connection open (see main), before the client can finish sending its
+    body: thousands of zero-length SETTINGS frames in ONE write, each of which
+    the client must ACK, filling its 32 KiB output queue.
+
+    d_stage_body appended the 9-byte DATA header and the payload as TWO bounded
+    operations. With room for the header and not the payload, the header stayed
+    queued, body_sent did not advance, and the retry wrote a SECOND header in
+    front of the first one's declared payload -- so the peer reads a header as
+    body bytes (audit-report-71).
+
+    The check is byte-exact: the client sends 'U' repeated, so anything else in
+    the body is framing debris."""
+    n = len(body)
+    bad = body.count(b"U") != n
+    print("QFLOOD acks_from_client=%d body=%d bad=%d"
+          % (getattr(c, "acks", 0), n, bad), file=sys.stderr, flush=True)
+    rb = ("QFLOOD=%d bad=%d\n" % (n, 1 if bad else 0)).encode()
+    blk = enc_status(200) + enc_header("content-type", "text/plain")
+    blk += enc_header("content-length", str(len(rb)))
+    c.send(frame(0x01, 0x04, sid, blk))
+    c.send(frame(0x00, 0x01, sid, rb))
 
 
 def respond_tinyframes(c, sid, path):

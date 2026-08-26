@@ -894,6 +894,40 @@ PY
     # NOT "set --": that overwrites the SHARD's positional parameters, and the
     # runner still uses them -- the first version of this check corrupted the
     # suite footer into "run_tests.sh 200000 136680".
+    # --- a request DATA frame is staged WHOLE or not at all (6.1) ----------
+    # d_stage_body appended the 9-byte header and the payload as two bounded
+    # operations. With room for the header and not the payload, the header
+    # stayed queued while body_sent did not advance, so the retry wrote a SECOND
+    # header in front of the first one's declared payload (audit-report-71).
+    #
+    # Reachable from legal traffic: a backend that sends many small control
+    # frames in one read makes the client stage that many ACKs, and the queue is
+    # 32 KiB. Measured on the audited build: 1600 zero-length SETTINGS frames
+    # (14400 bytes of ACKs) still worked, 2400 (21600 bytes) broke the exchange
+    # -- the band where the header fits and a 16384-byte payload does not.
+    #
+    # The check is byte-exact on the REQUEST body the backend received; a status
+    # check would not see debris in the middle of it. The oracle rows are
+    # controls: it writes synchronously and has no staging queue to overrun.
+    qflood_probe() {  # $1 = SETTINGS frames, $2.. = extra argv; echoes the body report
+        local n=$1; shift
+        LINNEA_QFLOOD=$n python3 test/h2/h2c_server.py ${P61730} qflood \
+            >/dev/null 2>&1 &
+        local pid=$!
+        sleep 0.5
+        head -c 65536 /dev/zero | tr '\0' 'U' \
+            | timeout 40 ./bin/linnea-h2client ${P61730} /qflood POST "$@" 2>&1 \
+            | tr -d '\r' | grep -aoE "QFLOOD=[0-9]+ bad=[01]|H2C-FAIL" | head -1
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        [ "$(qflood_probe 2400 $argv)" = "QFLOOD=65536 bad=0" ]
+        check "backend h2 reqframe ($mode): a body survives a 2400-frame ACK flood" $?
+        [ "$(qflood_probe 100 $argv)" = "QFLOOD=65536 bad=0" ]
+        check "backend h2 reqframe ($mode): ...and a small flood, which always worked" $?
+    done
+
     for mode in oracle driver; do
         [ "$mode" = driver ] && argv="0 drv" || argv=""
         fsent=$(fcx_credit 200000 $argv | cut -d' ' -f1)

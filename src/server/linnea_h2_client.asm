@@ -2917,6 +2917,23 @@ d_stage_body:
     jbe .m3
     mov r9, r8                                 ; n = min(win,16384,remaining)
 .m3:
+    ; The frame goes in WHOLE or not at all. The header and the payload are two
+    ; bounded appends, and with room for the first and not the second the header
+    ; stayed queued while body_sent did not move -- so the retry wrote a SECOND
+    ; header in front of the first one's declared payload, and the peer read a
+    ; frame header as body bytes (audit-report-71).
+    ;
+    ; Reachable from legal traffic: a backend that sends enough small control
+    ; frames in one read makes us stage that many ACKs, and the queue is 32 KiB.
+    ; Measured: 1600 zero-length SETTINGS frames (14400 bytes of ACKs) still
+    ; worked, 2400 of them (21600 bytes) broke the exchange -- the band where the
+    ; 9-byte header fits and a 16384-byte payload does not.
+    mov rax, [rbx + linnea_h2c.out_len]
+    add rax, 9
+    add rax, r9
+    cmp rax, LINNEA_H2C_D_OUT_CAP
+    ja .blocked                       ; nothing appended, nothing advanced:
+                                      ; the caller drains and calls back
     ; DATA frame header into d_scr, then append header + payload to out
     lea rdi, [d_scr]
     mov rax, r9
