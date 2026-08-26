@@ -102,6 +102,12 @@ try:
             blk += lit("content-length",
                        str(len(body)) if declare == "auto" else declare)
             c.sendall(frame(0x01, 0x04, sid, blk))
-            c.sendall(frame(0x00, 0x01, sid, body))
+            if mode == "trailcl":
+                # body without END_STREAM, then a trailer carrying the
+                # prohibited content-length (RFC 9110 6.5.1)
+                c.sendall(frame(0x00, 0x00, sid, body))
+                c.sendall(frame(0x01, 0x05, sid, lit("content-length", "5")))
+            else:
+                c.sendall(frame(0x00, 0x01, sid, body))
 except Exception:
     pass

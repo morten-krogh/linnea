@@ -1108,6 +1108,30 @@ PY
     [ "$(tr_get /ps-upper $CODE1)" = 502 ]
     check "backend h2 pseudo: an uppercase :Status is refused end to end" $?
 
+    # RFC 9110 6.5.1: content-length is a MESSAGE FRAMING field and framing
+    # cannot be asserted after the content has arrived, so it is not a trailer
+    # field. It was decoded, discarded and the response completed cleanly
+    # (audit-report-74) -- while transfer-encoding, the OTHER framing field, was
+    # already refused anywhere in a response. nghttp2 as a client refuses this
+    # one too.
+    #
+    # /trailers and /trailers-frag are the controls that keep this from becoming
+    # a rule against trailers, and /cl-ok is the control that keeps it from
+    # becoming a rule against content-length: in the response HEAD it is exactly
+    # the framing assertion audit-report-58 added.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        [ "$(st_probe /trailers-cl $argv)" = "H2C-FAIL" ]
+        check "backend h2 trailer ($mode): a content-length trailer is refused" $?
+        st_probe /trailers $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 trailer ($mode): an ordinary trailer still relays" $?
+        st_probe /cl-ok $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 trailer ($mode): ...and content-length in the HEAD still works" $?
+    done
+    [ "$(tr_get /trailers-cl $CODE1)" = 502 ]
+    check "backend h2 trailer: a content-length trailer is refused end to end" $?
+
+
     # --- field NAME and VALUE syntax (RFC 9113 8.2.1) -----------------------
     # A name may not be empty or carry 0x00-0x20, uppercase, 0x7f-0xff or a
     # colon; a value may not carry CR, LF or NUL, nor lead or trail with SP or

@@ -2847,6 +2847,23 @@ h2c_classify_block:
     ; and its END_STREAM completed the exchange, so a backend protocol error was
     ; relayed as a response the client believed had completed properly
     ; (audit-report-43).
+    ; RFC 9110 6.5.1: content-length is a MESSAGE FRAMING field, and framing
+    ; cannot be asserted after the content has already arrived -- so it is not
+    ; a trailer field. The block is decoded first, because HPACK state is per
+    ; connection and skipping a block desynchronises every later one
+    ; (audit-report-53); it is refused after, not dropped.
+    ;
+    ; The policy was asymmetric before: transfer-encoding, the OTHER framing
+    ; field, was already refused anywhere in a response by the
+    ; connection-specific rule, while this one was specially parsed and then
+    ; silently forgiven (audit-report-74). nghttp2 as a client refuses it too.
+    ;
+    ; Deliberately narrow: 6.5.1 disallows several classes in trailers, but the
+    ; framing pair is what this leg has an opinion about and what the reference
+    ; enforces. Widening it to routing or response-control fields would be
+    ; inventing strictness a real backend may not expect.
+    cmp qword [h2c_cl_seen], 0     ; THIS block's, before .restore puts the
+    jne .bad                       ; response head's values back
     call .restore
     cmp qword [h2c_saw_pseudo], 0
     jne .bad
