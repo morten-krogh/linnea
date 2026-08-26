@@ -66,6 +66,11 @@ hop_proxyconn_len equ $ - hop_proxyconn
 hop_cl:          db "content-length"
 hop_cl_len       equ $ - hop_cl
 
+hop_tefield:     db "te"
+hop_tefield_len  equ $ - hop_tefield
+val_trailers:    db "trailers"
+val_trailers_len equ $ - val_trailers
+
 pseudo_status:   db ":status"
 pseudo_status_len equ $ - pseudo_status
 
@@ -942,6 +947,77 @@ h2c_ping_frame:
     mov rax, -1
     ret
 
+; h2c_conn_specific(rdi=name, rsi=name len, rdx=value, rcx=value len)
+;   -> rax = 1 when this field makes the message malformed (RFC 9113 8.2.2).
+;
+; Connection, Keep-Alive, Proxy-Connection, Transfer-Encoding and Upgrade are
+; forbidden outright. TE is the single exception the section allows, and only
+; for one value: it "MUST NOT contain any value other than trailers", compared
+; case-insensitively because it is a token. nghttp2 as a client agrees on every
+; one of these in a RESPONSE -- it refuses connection, transfer-encoding and
+; "te: gzip", and serves "te: trailers".
+h2c_conn_specific:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdx                    ; value ptr
+    mov r13, rcx                    ; value len
+    mov rbx, rdi                    ; name ptr (rsi = name len, kept)
+    lea rdx, [hop_connection]
+    mov rcx, hop_connection_len
+    call h2c_ci_eq
+    test rax, rax
+    jnz .cs_bad
+    mov rdi, rbx
+    lea rdx, [hop_keepalive]
+    mov rcx, hop_keepalive_len
+    call h2c_ci_eq
+    test rax, rax
+    jnz .cs_bad
+    mov rdi, rbx
+    lea rdx, [hop_proxyconn]
+    mov rcx, hop_proxyconn_len
+    call h2c_ci_eq
+    test rax, rax
+    jnz .cs_bad
+    mov rdi, rbx
+    lea rdx, [hop_te]               ; "transfer-encoding"
+    mov rcx, hop_te_len
+    call h2c_ci_eq
+    test rax, rax
+    jnz .cs_bad
+    mov rdi, rbx
+    lea rdx, [hop_upgrade]
+    mov rcx, hop_upgrade_len
+    call h2c_ci_eq
+    test rax, rax
+    jnz .cs_bad
+    mov rdi, rbx
+    lea rdx, [hop_tefield]          ; "te": allowed, but only as "trailers"
+    mov rcx, hop_tefield_len
+    call h2c_ci_eq
+    test rax, rax
+    jz .cs_ok
+    cmp r13, val_trailers_len
+    jne .cs_bad
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [val_trailers]
+    mov rcx, val_trailers_len
+    call h2c_ci_eq
+    test rax, rax
+    jz .cs_bad
+.cs_ok:
+    xor eax, eax
+    jmp .cs_ret
+.cs_bad:
+    mov rax, 1
+.cs_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; h2c_field_ok(rdi=name, rsi=name len, rdx=value, rcx=value len) -> rax 1 ok, 0
 ; malformed. RFC 9113 8.2.1, for an ORDINARY response field; 8.1.1 then says a
 ; malformed response must not be forwarded.
@@ -1014,37 +1090,54 @@ h2c_field_ok:
 .fo_ret:
     ret
 
-; h2c_clen_ok(rdi=status, rsi=is_head, rdx=cl_seen, rcx=cl_val, r8=body_len)
-;   -> rax = 1 well-formed, 0 malformed.
+; h2c_body_ok(rdi=status, rsi=is_head, rdx=cl_seen, rcx=cl_val, r8=body_len)
+;   -> rax = 1 the response body is legal, 0 malformed.
 ;
-; RFC 9113 8.1.1: a content-length that does not equal the sum of the DATA
-; payloads is malformed and must not be forwarded. The exceptions are the whole
-; difficulty, and both look exactly like the defect from the outside:
-;   - a HEAD response declares what a GET would have returned and sends no body;
-;   - 1xx, 204, 205 and 304 carry no content whatever the head says.
-; The status half is linnea_http_status_no_content, the SAME predicate the h1
-; leg calls, deliberately not a copy: three copies of that list once disagreed
-; on 205 (audit-report-10 Finding 1). The method half is the caller's, exactly
-; as it is on the h1 side.
-h2c_clen_ok:
-    mov rax, 1
-    test rdx, rdx
-    jz .co_ret                     ; nothing declared: nothing to contradict
-    test rsi, rsi
-    jnz .co_ret                    ; HEAD
+; Two rules, in this order, because the first decides whether the second even
+; applies:
+;
+;   1. A status defined to carry NO CONTENT must not carry any. 1xx, 204, 205
+;      and 304 (linnea_http_status_no_content, the SAME predicate the h1 leg
+;      calls -- three copies of that list once disagreed on 205,
+;      audit-report-10). A content-length beside such a status is metadata and
+;      stays legal; DATA bytes are not. Before this, a 204 whose backend sent a
+;      DATA frame was relayed as "HTTP/1.1 204 No Content" with
+;      "content-length: 8" AND eight bytes of body -- a response no client will
+;      read as content, leaving those bytes to be parsed as whatever comes next.
+;
+;   2. Otherwise, a declared content-length must equal the DATA bytes
+;      (RFC 9113 8.1.1, audit-report-58). A HEAD response is exempt: it declares
+;      what a GET would have returned and sends nothing.
+;
+; The order matters. Checking the length first would ask the wrong question of a
+; 304, whose declaration deliberately does not match what it sends.
+h2c_body_ok:
     push rcx
+    push rdx
+    push rsi
     push r8
-    mov edi, edi
-    call linnea_http_status_no_content   ; touches only eax
+    call linnea_http_status_no_content   ; edi = status; touches only eax
     pop r8
+    pop rsi
+    pop rdx
     pop rcx
     test eax, eax
+    jz .bo_content
+    test r8, r8
+    jnz .bo_bad                    ; content on a status that may carry none
     mov rax, 1
-    jnz .co_ret                    ; a status defined to carry no content
+    ret
+.bo_content:
+    mov rax, 1
+    test rdx, rdx
+    jz .bo_ret                     ; nothing declared: nothing to contradict
+    test rsi, rsi
+    jnz .bo_ret                    ; HEAD
     cmp rcx, r8
-    je .co_ret
+    je .bo_ret
+.bo_bad:
     xor eax, eax
-.co_ret:
+.bo_ret:
     ret
 
 ; h2c_send_window(edi=sid, esi=inc)
@@ -1649,9 +1742,9 @@ h2c_run_response:
     mov rdx, [h2c_cl_seen]
     mov rcx, [h2c_cl_val]
     mov r8, [h2c_body_len]
-    call h2c_clen_ok
+    call h2c_body_ok
     test rax, rax
-    jz .err                        ; 8.1.1, see h2c_clen_ok
+    jz .err                        ; 8.1.1 + no-content, see h2c_body_ok
     xor eax, eax
     jmp .ret
 .err:
@@ -1887,6 +1980,21 @@ h2c_emit:
     call h2c_field_ok
     test rax, rax
     jz .badfield
+    ; RFC 9113 8.2.2: "Any message containing connection-specific header fields
+    ; MUST be treated as malformed." These names were on the skip list, so a
+    ; response carrying Connection or Transfer-Encoding was quietly cleaned up
+    ; and relayed as if the backend had behaved. Dropping a field is not the
+    ; same as refusing the message -- the request side has said so since its own
+    ; sweep, in these words: "stripping them stopped the smuggle into an h1
+    ; upstream; it did not make the request the malformed one the RFC says it
+    ; is." (request-side-parity sweep, after audit-report-62.)
+    mov rdi, r12
+    mov rsi, r13
+    mov rdx, r14
+    mov rcx, r15
+    call h2c_conn_specific
+    test rax, rax
+    jnz .badfield
     ; RFC 9113 8.1.1: a content-length that does not equal the sum of the DATA
     ; payloads makes the response MALFORMED, and an intermediary must not
     ; forward it. The field is still dropped here -- the composer writes its own
@@ -3277,9 +3385,9 @@ d_dispatch:
     mov rdx, [rbx + linnea_h2c.cl_seen]
     mov rcx, [rbx + linnea_h2c.cl_val]
     mov r8, [rbx + linnea_h2c.body_len]
-    call h2c_clen_ok
+    call h2c_body_ok
     test rax, rax
-    jz .bad                        ; 8.1.1, see h2c_clen_ok
+    jz .bad                        ; 8.1.1 + no-content, see h2c_body_ok
     mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_DONE
     xor eax, eax
     ret

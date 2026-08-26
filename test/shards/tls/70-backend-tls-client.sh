@@ -1005,6 +1005,56 @@ PY
     [ "$(tr_get /interim $CODE1)" = 200 ]
     check "backend h2 101: a legal 103 interim still serves end to end" $?
 
+    # --- request-side parity sweep (after audit-report-62) ------------------
+    # Reports 56-62 were each one rule the REQUEST side enforces and the
+    # response side did not, found one report at a time. This block is the rest
+    # of that list, swept in one pass against linnea_hpack.asm's emit_field and
+    # linnea_http.asm's response-head validator.
+    #
+    # RFC 9113 8.2.2: "Any message containing connection-specific header fields
+    # MUST be treated as malformed." These names were on the skip list, so the
+    # response was quietly CLEANED UP and relayed as though the backend had
+    # behaved. Dropping a field is not refusing the message -- the request side
+    # has said exactly that since its own sweep. TE is the one exception the
+    # section allows, and only as "trailers"; /sw-te-tr is that control and
+    # nghttp2 agrees on every row here.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for bad in /sw-conn /sw-ka /sw-pconn /sw-tenc /sw-upg /sw-te-gz; do
+            [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
+            check "backend h2 sweep ($mode): $bad is refused (8.2.2)" $?
+        done
+        st_probe /sw-te-tr $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 sweep ($mode): te: trailers is the one allowed value" $?
+
+        # RFC 9110: 1xx, 204, 205 and 304 carry no content whatever the head
+        # says. A 204 whose backend sent DATA was relayed as "204 No Content"
+        # with content-length: 8 AND eight bytes of body -- a response no client
+        # reads as content, leaving those bytes for whatever parses next.
+        for bad in /sw-204-data /sw-304-data /sw-205-data; do
+            [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
+            check "backend h2 sweep ($mode): $bad is refused (content on a no-content status)" $?
+        done
+        st_probe /sw-204-ok $argv | grep -q "^HTTP/1.1 204"
+        check "backend h2 sweep ($mode): a 204 with no DATA still serves" $?
+        st_probe /sw-304-ok $argv | grep -q "^HTTP/1.1 304"
+        check "backend h2 sweep ($mode): a 304 with no DATA still serves" $?
+
+        # These were already correct when the sweep ran. They are pinned so the
+        # sweep's coverage is recorded rather than remembered, and so a later
+        # change has to mean it.
+        for bad in /sw-099 /sw-600 /sw-999 /sw-idx0 /sw-idxbig /sw-truncstr; do
+            [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
+            check "backend h2 sweep ($mode): $bad is refused (already correct)" $?
+        done
+    done
+    [ "$(tr_get /sw-tenc $CODE1)" = 502 ]
+    check "backend h2 sweep: transfer-encoding is refused end to end" $?
+    [ "$(tr_get /sw-204-data $CODE1)" = 502 ]
+    check "backend h2 sweep: content on a 204 is refused end to end" $?
+    [ "$(tr_get /sw-ok $CODE1)" = 200 ]
+    check "backend h2 sweep: an ordinary response still serves end to end" $?
+
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for
     # audit-report-51: a valid reset already ends the exchange in a 502, so a

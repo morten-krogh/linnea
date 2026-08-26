@@ -477,6 +477,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/hp-"):
         respond_hpack(c, sid, path)
         return
+    if path.startswith("/sw-"):
+        respond_sweep(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -577,6 +580,59 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+def respond_sweep(c, sid, path):
+    """The request-side parity sweep: rules linnea_hpack.asm / linnea_http.asm
+    enforce on a REQUEST or on an h1 upstream response, put to the backend-h2
+    RESPONSE leg. Each route sends an otherwise perfect response."""
+    body = b"sw-body\n"
+    ok_tail = enc_header("content-length", str(len(body)))
+    # --- RFC 9113 8.2.2: connection-specific fields are MALFORMED ---------
+    conn = {
+        "/sw-conn":   ("connection", "close"),
+        "/sw-ka":     ("keep-alive", "timeout=5"),
+        "/sw-pconn":  ("proxy-connection", "close"),
+        "/sw-tenc":   ("transfer-encoding", "chunked"),
+        "/sw-upg":    ("upgrade", "websocket"),
+        "/sw-te-tr":  ("te", "trailers"),          # the one permitted value
+        "/sw-te-gz":  ("te", "gzip"),              # ...and any other is not
+    }
+    if path in conn:
+        n, v = conn[path]
+        c.send(frame(0x01, 0x04, sid, enc_status(200) + enc_header(n, v) + ok_tail))
+        c.send(frame(0x00, 0x01, sid, body))
+        return
+    # --- a status that carries NO CONTENT, with a DATA frame anyway -------
+    if path in ("/sw-204-data", "/sw-304-data", "/sw-205-data"):
+        code = int(path.split("-")[1])
+        c.send(frame(0x01, 0x04, sid, enc_status(code)))
+        c.send(frame(0x00, 0x01, sid, body))       # content on a no-content status
+        return
+    if path in ("/sw-204-ok", "/sw-304-ok"):       # the controls: no DATA at all
+        c.send(frame(0x01, 0x05, sid, enc_status(int(path.split("-")[1]))))
+        return
+    # --- status range (RFC 9110 15) ---------------------------------------
+    if path in ("/sw-099", "/sw-600", "/sw-999"):
+        c.send(frame(0x01, 0x04, sid, enc_header(":status", path[4:]) + ok_tail))
+        c.send(frame(0x00, 0x01, sid, body))
+        return
+    # --- HPACK index errors (RFC 7541 6.1, 2.3.3) -------------------------
+    if path == "/sw-idx0":                         # index 0 is not a field
+        c.send(frame(0x01, 0x04, sid, b"\x80" + enc_status(200) + ok_tail))
+        c.send(frame(0x00, 0x01, sid, body))
+        return
+    if path == "/sw-idxbig":                       # far past the static table
+        c.send(frame(0x01, 0x04, sid, enc_status(200) + b"\xfe" + ok_tail))
+        c.send(frame(0x00, 0x01, sid, body))
+        return
+    if path == "/sw-truncstr":                     # a literal whose value runs
+        c.send(frame(0x01, 0x04, sid,              # off the end of the block
+                     enc_status(200) + b"\x00\x03abc\x7f"))
+        c.send(frame(0x00, 0x01, sid, body))
+        return
+    c.send(frame(0x01, 0x04, sid, enc_status(200) + ok_tail))
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 def respond_hpack(c, sid, path):
