@@ -76,6 +76,16 @@ pseudo_status_len equ $ - pseudo_status
 
 extern linnea_http_status_no_content
 
+; The window we advertise is a promise about what we will accept. Assert at
+; assembly time that the buffers can keep it, so lowering a cap without lowering
+; the advertisement fails the build instead of failing a backend (audit-report-64).
+%if LINNEA_H2C_INITWIN > LINNEA_H2C_D_BODY_CAP
+%error "advertised stream window exceeds the response body the driver retains"
+%endif
+%if LINNEA_H2C_INITWIN > LINNEA_H2C_RESP_CAP
+%error "advertised stream window exceeds the blocking oracle's response buffer"
+%endif
+
 section .bss
 alignb 16
 linnea_h2c_resp_buf: resb LINNEA_H2C_RESP_CAP   ; synthesized h1 response (out)

@@ -67,9 +67,21 @@ LINNEA_H2C_ERR          equ -1       ; wire/decode failure -> caller 502
 LINNEA_H2C_RST          equ -2       ; backend RST_STREAM  -> caller 502
 LINNEA_H2C_GOAWAY       equ -3       ; backend GOAWAY       -> caller 502
 
-; The client's advertised receive windows: large, like the server's, so inbound
-; WINDOW_UPDATE for the response body is rare.
-LINNEA_H2C_INITWIN      equ 4194304
+LINNEA_H2C_D_BODY_CAP   equ 1048576  ; buffered response body (v1; stream later)
+
+; The client's advertised receive window: exactly what we can actually TAKE.
+;
+; It was 4 MiB while the response body buffer held 1 MiB, so a backend that
+; believed us and sent 2 MiB -- well inside the window we had granted -- was cut
+; off with a 502 after spending the bandwidth. That is the same defect as the
+; MAX_HEADER_LIST_SIZE one recorded immediately below, one field over: an
+; advertisement the buffers do not honour. This is tied to the cap rather than
+; written out, so the two cannot drift, and linnea_h2_client.asm asserts the
+; relationship at assembly time.
+;
+; It stays large enough that inbound WINDOW_UPDATE for a response body is rare,
+; which is what the old value was reaching for.
+LINNEA_H2C_INITWIN      equ LINNEA_H2C_D_BODY_CAP
 ; What we tell a backend we will accept as a response header list. Its DEFAULT
 ; when unsent is UNLIMITED (RFC 9113 6.5.2), so staying silent said "any size"
 ; while the buffers quietly enforced far less -- and nginx, entitled to believe
@@ -108,7 +120,6 @@ LINNEA_H2C_DRV_GOAWAY   equ 5   ; backend GOAWAY -> 502
 ; whole fresh read; callers feed on_recv <= 32 KiB at a time.
 LINNEA_H2C_D_IN_CAP     equ 65536    ; recv accumulation (partial frame + a read)
 LINNEA_H2C_D_OUT_CAP    equ 32768    ; outbound staging
-LINNEA_H2C_D_BODY_CAP   equ 1048576  ; buffered response body (v1; stream later)
 
 ; The resumable driver's per-leg context. Only CROSS-STEP state lives here; each
 ; driver step is atomic on the worker, so the global scratch/carrier/decoder are

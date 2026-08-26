@@ -685,6 +685,15 @@ PY
             </dev/null 2>&1 | tr '\r\0' '  ' | head -1
         kill $pid 2>/dev/null; wait $pid 2>/dev/null
     }
+    st_probe_body() { # $1 = path, $2.. = extra argv; the whole exchange
+        local path=$1; shift
+        python3 test/h2/h2c_server.py ${P61730} >/dev/null 2>&1 &
+        local pid=$!
+        sleep 0.5
+        timeout 30 ./bin/linnea-h2client ${P61730} "$path" GET "$@" \
+            </dev/null 2>&1 | tr '\r\0' '  '
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
     st_probe() {    # $1 = path, $2.. = extra argv; first line only
         local path=$1; shift
         python3 test/h2/h2c_server.py ${P61730} >/dev/null 2>&1 &
@@ -1106,6 +1115,43 @@ PY
             | awk -F': ' '/^content-length/{print $2}' | head -1)
     [ "$hdlen" = 4 ]
     check "backend h2 head: a HEAD reports the backend's length downstream ($hdlen)" $?
+
+    # --- the advertised receive window is a PROMISE (audit-report-64) -------
+    # The leg advertised SETTINGS_INITIAL_WINDOW_SIZE = 4 MiB while its response
+    # body buffer held 1 MiB, so a backend that believed us and sent 2 MiB --
+    # well inside the window we had granted -- was cut off with a 502 after
+    # spending the bandwidth. Same defect as the MAX_HEADER_LIST_SIZE one that
+    # nginx found: an advertisement the buffers do not honour.
+    #
+    # The window is now tied to the cap in the header, and linnea_h2_client.asm
+    # refuses to ASSEMBLE if the two ever drift -- verified by raising it and
+    # watching the build fail. These rows are the runtime half: the backend
+    # reports what it was promised, and the boundary is exercised at exactly
+    # that size.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        adv=$(st_probe_body /fc-adv $argv | awk -F= '/^ADVWIN=/{print $2}')
+        [ "$adv" = 1048576 ]
+        check "backend h2 window ($mode): the backend is promised 1 MiB ($adv)" $?
+        st_probe_body /fc-size-1048576 $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 window ($mode): a body of exactly that size relays" $?
+        [ "$(st_probe /fc-huge $argv)" = "H2C-FAIL" ]
+        check "backend h2 window ($mode): twice that size is refused, not truncated" $?
+    done
+    # The report's own finding, deliberately NOT implemented: a backend that
+    # bursts past the 65535-byte CONNECTION window is still accepted. RFC 9113
+    # 6.9.1 says a receiver MAY error there, and nghttp2 as a client accepts the
+    # same burst with NO_ERROR. Pinned so a later reading of report 64 has to
+    # mean it.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        st_probe_body /fc-burst $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 window ($mode): an over-window burst is accepted (MAY, not MUST)" $?
+        st_probe_body /fc-polite $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 window ($mode): ...as is the same body sent politely" $?
+    done
+    [ "$(tr_get /fc-size-1048576 $CODE1)" = 200 ]
+    check "backend h2 window: a 1 MiB body relays end to end" $?
 
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for

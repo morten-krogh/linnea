@@ -328,6 +328,10 @@ def serve_one(sock, mode):
             return
         if ftype == 0x04:                         # SETTINGS
             if not (flags & 0x01):
+                for off in range(0, len(payload) - 5, 6):
+                    ident, val = struct.unpack(">HI", payload[off:off+6])
+                    if ident == 0x04:             # INITIAL_WINDOW_SIZE
+                        c.adv_win = val
                 c.send(frame(0x04, 0x01, 0, b""))  # ACK
         elif ftype == 0x08:                       # WINDOW_UPDATE (ignore)
             pass
@@ -480,6 +484,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/sw-"):
         respond_sweep(c, sid, path)
         return
+    if path.startswith("/fc-"):
+        respond_flow(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -580,6 +587,66 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+def respond_flow(c, sid, path):
+    """Receive-side flow control (RFC 9113 5.2, 6.9.1). The connection window
+    starts at 65535 and SETTINGS_INITIAL_WINDOW_SIZE does not change it -- only
+    a WINDOW_UPDATE does. /fc-burst writes five 16384-byte DATA frames without
+    reading the client's updates first, so the fourth already crosses 65535.
+
+    /fc-polite is the control: the same 81920 bytes, but each frame waits for
+    the credit that pays for it, which is what a conforming backend does."""
+    if path == "/fc-adv":
+        # What the client TOLD us it would accept. A window is a promise, and
+        # this is the backend's view of it (audit-report-64).
+        rb = ("ADVWIN=%d\n" % getattr(c, "adv_win", -1)).encode()
+        blk = enc_status(200) + enc_header("content-type", "text/plain")
+        blk += enc_header("content-length", str(len(rb)))
+        c.send(frame(0x01, 0x04, sid, blk))
+        c.send(frame(0x00, 0x01, sid, rb))
+        return
+    if path.startswith("/fc-size-"):
+        total = int(path.rsplit("-", 1)[1])
+        blk = enc_status(200) + enc_header("content-type", "text/plain")
+        blk += enc_header("content-length", str(total))
+        c.send(frame(0x01, 0x04, sid, blk))
+        sent = 0
+        while sent < total:
+            n = min(16384, total - sent)
+            sent += n
+            c.send(frame(0x00, 0x01 if sent >= total else 0x00, sid, b"H" * n))
+        return
+    if path == "/fc-huge":
+        # Larger than the 1 MiB the leg can retain, but well inside the 4 MiB
+        # stream window it ADVERTISES. What does a backend that believes us get?
+        total = 2 * 1024 * 1024
+        blk = enc_status(200) + enc_header("content-type", "text/plain")
+        blk += enc_header("content-length", str(total))
+        c.send(frame(0x01, 0x04, sid, blk))
+        sent = 0
+        while sent < total:
+            n = min(16384, total - sent)
+            sent += n
+            c.send(frame(0x00, 0x01 if sent >= total else 0x00, sid, b"H" * n))
+        return
+    total = 5 * 16384
+    blk = enc_status(200) + enc_header("content-type", "text/plain")
+    blk += enc_header("content-length", str(total))
+    c.send(frame(0x01, 0x04, sid, blk))
+    for i in range(5):
+        if path == "/fc-polite" and i:
+            # drain whatever the client has sent us before spending more credit
+            c.s.settimeout(2.0)
+            try:
+                while True:
+                    ft, fl, s2, pay = c.read_frame()
+                    if ft == 0x08:      # WINDOW_UPDATE: credit arrived
+                        break
+            except Exception:
+                pass
+            c.s.settimeout(15)
+        c.send(frame(0x00, 0x01 if i == 4 else 0x00, sid, b"F" * 16384))
 
 
 def respond_sweep(c, sid, path):
