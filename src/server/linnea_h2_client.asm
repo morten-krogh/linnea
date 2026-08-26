@@ -2566,6 +2566,16 @@ h2c_classify_block:
     jb .final
     cmp rax, 200
     jae .final
+    ; RFC 9113 8.6: HTTP/2 does not support 101, and 8.8.5 describes
+    ; informational responses as the 1xx codes OTHER than it. There is no
+    ; Upgrade-based protocol switch on an h2 stream, so a backend sending 101
+    ; has sent something this leg cannot translate -- accepting it as an interim
+    ; block DROPPED it and relayed whatever came next as the answer
+    ; (audit-report-62). The frontend has refused the same status from an h1
+    ; upstream since its own Finding 30, in almost these words: "101 has no
+    ; meaning over an h2 proxy".
+    cmp rax, 101
+    je .bad
     test r12, r12
     jnz .bad                         ; a 1xx cannot end the stream
     call .restore

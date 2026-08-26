@@ -973,6 +973,38 @@ PY
     [ "$(tr_get /hp-early $CODE1)" = 200 ]
     check "backend h2 hpack: a legal one still serves end to end" $?
 
+    # --- 101 is not an informational response (RFC 9113 8.6, 8.8.5) ---------
+    # HTTP/2 does not support 101: there is no Upgrade-based protocol switch on
+    # a stream, and 8.8.5 describes informational responses as the 1xx codes
+    # OTHER than it. The classifier took the whole 100..199 range as interim, so
+    # a 101 block was DROPPED and whatever came next was relayed as the answer
+    # (audit-report-62). Seventh report running whose root is a rule this server
+    # has in one direction only: the frontend has refused the same status from
+    # an h1 upstream since its own Finding 30.
+    #
+    # /interim-101-es is a control, not evidence: a 101 carrying END_STREAM was
+    # already refused before the fix, by the generic "a 1xx cannot end the
+    # stream" rule. Right outcome, wrong reason -- the row that proves this fix
+    # is /interim-101, where the block is otherwise perfectly well formed.
+    #
+    # The legal interim rows are the other controls: 103, and 103-then-100.
+    # nghttp2 1.66.0 as a client refuses 101 with PROTOCOL_ERROR and serves 103.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for bad in /interim-101 /interim-101-cont /interim-101-es; do
+            [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
+            check "backend h2 101 ($mode): $bad is refused" $?
+        done
+        for ok in /interim /interim-two; do
+            st_probe $ok $argv | grep -q "^HTTP/1.1 200"
+            check "backend h2 101 ($mode): $ok is still a legal interim" $?
+        done
+    done
+    [ "$(tr_get /interim-101 $CODE1)" = 502 ]
+    check "backend h2 101: a 101 from the backend is refused end to end" $?
+    [ "$(tr_get /interim $CODE1)" = 200 ]
+    check "backend h2 101: a legal 103 interim still serves end to end" $?
+
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for
     # audit-report-51: a valid reset already ends the exchange in a 502, so a

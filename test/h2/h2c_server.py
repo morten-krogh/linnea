@@ -1067,6 +1067,37 @@ def respond_interim(c, sid, path):
                      enc_status(103) + enc_header("link", "</late>")))
         c.send(frame(0x00, 0x01, sid, b"more"))   # DATA, END_STREAM
         return
+    if path == "/interim-clen":
+        # RFC 9110 8.6 says a server MUST NOT send content-length in a 1xx. Not
+        # part of report 62 -- surfaced while probing nghttp2, which refuses it.
+        c.send(frame(0x01, 0x04, sid,
+                     enc_status(103) + enc_header("content-length", "6")))
+        block = enc_status(200) + enc_header("content-type", "text/plain")
+        block += enc_header("content-length", str(len(rbody)))
+        c.send(frame(0x01, 0x04, sid, block))
+        c.send(frame(0x00, 0x01, sid, rbody))
+        return
+    if path.startswith("/interim-101"):
+        # RFC 9113 8.6: HTTP/2 does not support 101. It is not an informational
+        # response here -- 8.8.5 describes those as 1xx OTHER than 101 -- so a
+        # backend sending it has sent something this leg cannot translate: there
+        # is no Upgrade-based protocol switch on an h2 stream (audit-report-62).
+        blk = enc_header(":status", "101")
+        if path == "/interim-101-cont":     # the same, split across a frame
+            c.send(frame(0x01, 0x00, sid, blk[:1]))
+            c.send(frame(0x09, 0x04, sid, blk[1:]))
+        elif path == "/interim-101-es":     # with END_STREAM: already refused by
+            c.send(frame(0x01, 0x05, sid, blk))   # the generic "a 1xx cannot end
+            return                                # the stream" rule -- a control
+        else:
+            c.send(frame(0x01, 0x04, sid, blk))
+        # ...and a perfectly good final response behind it, so a refusal can
+        # only be the 101 itself
+        block = enc_status(200) + enc_header("content-type", "text/plain")
+        block += enc_header("content-length", str(len(rbody)))
+        c.send(frame(0x01, 0x04, sid, block))
+        c.send(frame(0x00, 0x01, sid, rbody))
+        return
     c.send(frame(0x01, 0x04, sid, enc_status(103) + enc_header("link", "</s.css>")))
     if path == "/interim-two":
         c.send(frame(0x01, 0x04, sid, enc_status(100)))
