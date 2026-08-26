@@ -63,6 +63,13 @@ Usage: h2c_server.py <port> [mode]
                    third frame loop, h2c_pump_window (audit-report-54). The
                    response body reports the ACK that came back, so "no ACK for
                    an ACK" is observable rather than assumed.
+  mode "dupwin"    put TWO INITIAL_WINDOW_SIZE records in ONE SETTINGS frame,
+                   1024 then 8192, and grant nothing until the sender stalls.
+                   RFC 9113 6.5 processes the values IN ORDER, so the last one
+                   stands and the body reports DUPWIN=8192. HTTP/2 has no
+                   no-duplicates rule -- that is HTTP/3 (RFC 9114 7.2.4.1) and
+                   QUIC transport parameters (RFC 9000 7.4), both of which we
+                   do enforce. See audit-report-55.
   mode "wdelta"    advertise 8192, let the client spend it, then LOWER
                    INITIAL_WINDOW_SIZE to 1024 granting nothing; the response
                    body reports how many bytes arrived afterwards (6.9.2).
@@ -252,7 +259,16 @@ def serve_one(sock, mode):
     c.pump_ack = None
     if "wdelta" in modes:
         init_win = 8192
-    c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, init_win)))
+    if "dupwin" in modes:
+        # Two records for one identifier, in ONE frame. Legal in HTTP/2, and
+        # the second must win.
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, 1024)
+                     + struct.pack(">HI", 0x04, 8192)))
+        c.granted = False
+        c.pre = 0
+        c.s.settimeout(0.8)
+    else:
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, init_win)))
 
     hdr_block = b""
     body = b""
@@ -263,6 +279,15 @@ def serve_one(sock, mode):
         try:
             ftype, flags, sid, payload = c.read_frame()
         except OSError:
+            if "dupwin" in c.modes and not c.granted:
+                # The sender has spent the window and stalled. Whatever arrived
+                # before the first grant IS the window it believed in.
+                c.pre = len(body)
+                c.granted = True
+                c.s.settimeout(15)
+                c.send(frame(0x08, 0x00, 0, struct.pack(">I", 1 << 20)))
+                c.send(frame(0x08, 0x00, 1, struct.pack(">I", 1 << 20)))
+                continue
             # wdelta: the client has (correctly) stopped sending. Report how
             # much arrived after the lowering SETTINGS.
             if "wdelta" in c.modes and c.lowered:
@@ -330,7 +355,13 @@ def serve_one(sock, mode):
                     c.send(frame(0x06, 0x01, 0, b"ABCDEFGH"))
                 else:
                     c.send(frame(0x06, 0x00, 0, b"ABCDEFGH"))
-            # grant the client more window as we drain (smallwin path)
+            # grant the client more window as we drain (smallwin path).
+            # dupwin grants NOTHING until the sender stalls: the bytes that
+            # arrive before the first grant are the window it believed in.
+            if "dupwin" in c.modes and not c.granted:
+                if flags & 0x01:
+                    end_stream = True
+                continue
             if payload:
                 inc = len(payload)
                 c.send(frame(0x08, 0x00, 0, struct.pack(">I", inc)))
@@ -342,6 +373,13 @@ def serve_one(sock, mode):
         elif ftype == 0x07:                       # GOAWAY
             return
         if got_headers and end_stream:
+            if "dupwin" in c.modes:
+                rb = ("DUPWIN=%d\n" % c.pre).encode()
+                blk = enc_status(200) + enc_header("content-type", "text/plain")
+                blk += enc_header("content-length", str(len(rb)))
+                c.send(frame(0x01, 0x04, sid, blk))
+                c.send(frame(0x00, 0x01, sid, rb))
+                continue
             if c.pump:
                 got = c.pump_ack
                 rb = ("PUMP-ACK=%s BYTES=%d\n"
@@ -611,7 +649,10 @@ def respond_settings(c, sid, path):
     """SETTINGS structure (RFC 9113 6.5): a connection frame on stream 0, an ACK
     with no payload, a non-ACK payload that is a whole number of six-octet
     records, and INITIAL_WINDOW_SIZE within 2^31-1. /set-ok is the control: a
-    perfectly legal later SETTINGS must still be applied and acknowledged."""
+    perfectly legal later SETTINGS must still be applied and acknowledged.
+
+    The /set-dup-* routes pin duplicate handling, which HTTP/2 permits: see
+    audit-report-55 and the dupwin mode, which measures which value wins."""
     if path == "/set-sid":        # naming a stream
         c.send(frame(0x04, 0x00, 1, struct.pack(">HI", 0x04, 65535)))
     elif path == "/set-acklen":   # an ACK carrying a payload
@@ -633,6 +674,19 @@ def respond_settings(c, sid, path):
     elif path == "/set-mf-ok":     # BOTH ends of the legal range -- 16777215 is
         c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x05, 16384)))    # what
         c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x05, 16777215)))  # nginx
+    elif path == "/set-dup-ok":    # TWO records for ONE identifier, one frame.
+        # HTTP/2 has no no-duplicates rule: 6.5 processes the values in order.
+        # (That rule is HTTP/3's, 9114 7.2.4.1, and QUIC's, 9000 7.4 -- both of
+        # which we do enforce. See audit-report-55.)
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x02, 0)
+                     + struct.pack(">HI", 0x02, 0)))
+    elif path == "/set-dup-unknown":   # a repeated identifier we must ignore
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0xff01, 1)
+                     + struct.pack(">HI", 0xff01, 2)))
+    elif path == "/set-dup-2ndbad":    # legal first, ILLEGAL second: every
+        # record is validated, not just the first one seen for an identifier
+        c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x05, 16384)
+                     + struct.pack(">HI", 0x05, 1)))
     elif path == "/set-ok":                                               # sends
 
         c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, 32768)))

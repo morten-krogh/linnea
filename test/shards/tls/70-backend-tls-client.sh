@@ -658,16 +658,17 @@ PY
     # Note the pre-fix body carried a literal NUL (the out-of-frame byte), which
     # makes grep treat the stream as binary and print nothing at all; the helper
     # strips NUL and CR so a check cannot silently read "no output" as a pass.
-    pump_probe() {  # $1 = fixture mode, $2.. = extra argv ("drv" for the driver)
-        local mode=$1; shift
+    up_frames() { # $1 = fixture mode, $2 = body bytes, $3.. = extra argv
+        local mode=$1 bytes=$2; shift 2
         python3 test/h2/h2c_server.py ${P61730} $mode >/dev/null 2>&1 &
         local pid=$!
         sleep 0.5
-        head -c 8192 /dev/zero | tr '\0' 'U' \
-            | timeout 20 ./bin/linnea-h2client ${P61730} /up POST 0 "$@" 2>&1 \
+        head -c $bytes /dev/zero | tr '\0' 'U' \
+            | timeout 25 ./bin/linnea-h2client ${P61730} /up POST 0 "$@" 2>&1 \
             | tr '\r\0' '  '
         kill $pid 2>/dev/null; wait $pid 2>/dev/null
     }
+    pump_probe() { local mode=$1; shift; up_frames $mode 8192 "$@"; }
     for mode in oracle driver; do
         [ "$mode" = driver ] && argv="drv" || argv=""
         # the control: a LEGAL ping read in the pump is still echoed, so this
@@ -681,6 +682,45 @@ PY
         pump_probe pumpack $argv | grep -q "PUMP-ACK=NONE"
         check "backend h2 pump ping ($mode): an ACK is consumed, never answered" $?
     done
+
+    # --- duplicate SETTINGS identifiers: LEGAL in HTTP/2 (audit-report-55) ---
+    # The report asked for a duplicate identifier in one SETTINGS frame to be a
+    # connection error, citing RFC 9113 6.5.2. That rule is HTTP/3's (RFC 9114
+    # 7.2.4.1) and QUIC transport parameters' (RFC 9000 7.4) -- both of which
+    # this server does enforce, which is very likely how the rules got crossed.
+    # HTTP/2 6.5 instead says the values are processed IN ORDER, so a repeat is
+    # legal and the LAST one stands. Measured against three implementations:
+    # nginx 1.30.4, nghttp2 1.66.0 and our own h2 front all accept it and serve.
+    #
+    # So these rows pin behaviour rather than fixing any. They are not vacuous:
+    # built with the report's rule wired into the driver's settings walk,
+    # /set-dup-ok, /set-dup-unknown and dupwin all fail, while /set-mf-ok (the
+    # same identifier in two SEPARATE frames) still passes.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for route in /set-dup-ok /set-dup-unknown; do
+            h2c_probe $route $argv | head -1 | grep -q "^HTTP/1.1 200"
+            check "backend h2 settings ($mode): $route is accepted" $?
+        done
+        # every record is validated, not just the first for an identifier
+        [ "$(h2c_probe /set-dup-2ndbad $argv | head -1)" = "H2C-FAIL" ]
+        check "backend h2 settings ($mode): a repeat with an illegal value is refused" $?
+    done
+    # ...and the value that stands is the LAST one. The fixture puts 1024 then
+    # 8192 in one frame and grants nothing until the sender stalls, so the bytes
+    # that arrive first ARE the window the client believed in: 8192 means in
+    # order, 1024 means first-wins, 9216 means summed.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="drv" || argv=""
+        up_frames dupwin 65536 $argv | grep -q "DUPWIN=8192"
+        check "backend h2 settings ($mode): a repeated value is applied in order" $?
+    done
+    for route in /set-dup-ok /set-dup-unknown; do
+        [ "$(tr_get $route $CODE1)" = 200 ]
+        check "backend h2 settings: $route is accepted end to end" $?
+    done
+    [ "$(tr_get /set-dup-2ndbad $CODE1)" = 502 ]
+    check "backend h2 settings: a repeat with an illegal value is refused e2e" $?
 
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for
