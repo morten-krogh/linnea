@@ -112,6 +112,9 @@ h2c_hdrlines_len: resq 1
 h2c_saw_pseudo: resq 1
 h2c_hdr_open:  resq 1                           ; a header block awaits its CONTINUATION
 h2c_preface_ok: resq 1                          ; the server's SETTINGS preface has arrived
+h2c_pushback:  resq 1                           ; one frame already in h2c_frame_buf,
+                                                ; read by the pump and owed to the
+                                                ; response parser (audit-report-72)
 h2c_field_seen: resq 1                          ; a field representation has been
                                                 ; decoded in THIS block (7541 4.2)
 h2c_status_seen: resq 1                         ; this block already carried a :status
@@ -875,6 +878,17 @@ h2c_read_full:
 ; h2c_next_frame() -> rax = type, or -1. Sets h2c_fr_flags/sid/len; payload at
 ; h2c_frame_buf+9.
 h2c_next_frame:
+    ; A frame the flow-control pump read but did not own. RFC 9113 8.1 lets a
+    ; server answer before the request body is finished, and the pump used to
+    ; meet that response with .err -- its own comment said "response before
+    ; END_STREAM: unsupported in v1". It now hands the frame here instead of
+    ; consuming it, so the response parser sees it exactly as if it had read it.
+    cmp qword [h2c_pushback], 0
+    je .rd_wire
+    mov qword [h2c_pushback], 0
+    movzx eax, byte [h2c_frame_buf+3]
+    ret
+.rd_wire:
     mov edi, dword [h2c_fd]
     lea rsi, [h2c_frame_buf]
     mov rdx, 9
@@ -1448,7 +1462,18 @@ h2c_pump_window:
     je .rst
     cmp eax, LINNEA_H2C_FT_GOAWAY
     je .goaway
-    jmp .err                      ; response before END_STREAM: unsupported in v1
+    ; A response may legally arrive while we still owe request DATA (8.1): the
+    ; server answered without needing the rest. Push the frame back and tell
+    ; the caller to stop sending; the response parser picks it up.
+    cmp eax, LINNEA_H2C_FT_HEADERS
+    je .resp_early
+    cmp eax, LINNEA_H2C_FT_CONT
+    je .resp_early
+    jmp .err
+.resp_early:
+    mov qword [h2c_pushback], 1
+    mov rax, LINNEA_H2C_RESP_EARLY
+    ret
 .w:
     call h2c_apply_window
     test rax, rax
@@ -1511,6 +1536,8 @@ h2c_send_body:
     call h2c_pump_window
     test rax, rax
     js .done
+    cmp rax, LINNEA_H2C_RESP_EARLY
+    je .ok                        ; the server has answered: stop sending body
     mov r13, [h2c_stream_win]      ; min SIGNED -- see d_stage_body
     mov rax, [h2c_conn_win]
     cmp rax, r13

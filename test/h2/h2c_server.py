@@ -276,12 +276,32 @@ def serve_one(sock, mode):
         init_win = 8192
     pref = ([m for m in modes if m.startswith("pref")] or [None])[0]
     c.pref = pref
+    if "earlyresp" in modes:
+        # RFC 9113 8.1: a server may complete a response before the request is
+        # finished, when the answer does not depend on the unsent part. Grant
+        # the client ZERO request credit so its body cannot move, then answer.
+        # "earlywin" is the sibling that grants NORMAL credit and answers just
+        # as early -- it separates "answered before the body" from "answered
+        # while the body is flow-control blocked".
+        c.send(frame(0x04, 0x00, 0,
+                     struct.pack(">HI", 0x04,
+                                 65535 if "earlywin" in modes else 0)))
+        if "earlyping" in modes:
+            # If the client is sitting in its flow-control pump, it must answer
+            # this. An ACK proves the pump is running; silence proves it is not.
+            c.send(frame(0x06, 0x00, 0, b"PUMPPING"))
     if "qflood" in modes:
         # One write, thousands of zero-length non-ACK SETTINGS frames. The first
         # is the required server preface (audit-report-56); the rest are legal
         # repeats, and each one obliges the client to queue a 9-byte ACK.
         c.send(frame(0x04, 0x00, 0, b"") * int(os.environ.get("LINNEA_QFLOOD", "3600")))
-    if pref:
+    if "earlyresp" in modes:
+        pass                          # its SETTINGS is already sent, above:
+                                      # falling through to the default one below
+                                      # sent a SECOND SETTINGS with the ordinary
+                                      # 65535 window, which silently undid the
+                                      # zero-credit setup this mode exists for
+    elif pref:
         # Everything here happens BEFORE the server's SETTINGS, which is the
         # whole point. prefnone sends nothing at all until the response.
         if pref == "prefping":
@@ -366,6 +386,26 @@ def serve_one(sock, mode):
                 hdrs = hpack_decode(hdr_block)
                 d = dict(hdrs)
                 method, path = d.get(":method"), d.get(":path")
+                if "earlyresp" in c.modes:
+                    # the whole response, before a single body byte can arrive
+                    code = 200 if "earlyresp200" in c.modes else 204
+                    blk = enc_status(code)
+                    if code == 200:
+                        blk += enc_header("content-length", "0")
+                    c.send(frame(0x01, 0x05, sid, blk))   # END_HEADERS|END_STREAM
+                    # Do NOT close: a real server that answers early keeps the
+                    # connection while the client stops sending. Returning here
+                    # closed the socket under a client that was still writing
+                    # its body, and the EPIPE looked exactly like the defect
+                    # being investigated.
+                    c.s.settimeout(10.0)
+                    try:
+                        while True:
+                            if not c.s.recv(65536):
+                                break
+                    except Exception:
+                        pass
+                    return
         elif ftype == 0x00:                       # DATA
             if "wdelta" in c.modes:
                 # RFC 9113 6.9.2: a change to INITIAL_WINDOW_SIZE adjusts every

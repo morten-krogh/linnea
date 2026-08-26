@@ -78,6 +78,8 @@ LINNEA_H2C_RESP_CAP     equ LINNEA_H2C_D_BODY_CAP + LINNEA_H2C_HEAD_MAX
 LINNEA_H2C_RXCHUNK      equ 65536    ; per recv() request size
 
 ; Exchange result sentinels (rax from linnea_h2c_exchange).
+LINNEA_H2C_RESP_EARLY   equ 4        ; the response began while request DATA
+                                     ; was still owed (RFC 9113 8.1)
 LINNEA_H2C_ERR          equ -1       ; wire/decode failure -> caller 502
 LINNEA_H2C_RST          equ -2       ; backend RST_STREAM  -> caller 502
 LINNEA_H2C_GOAWAY       equ -3       ; backend GOAWAY       -> caller 502

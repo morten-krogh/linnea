@@ -920,6 +920,40 @@ PY
             | tr -d '\r' | grep -aoE "QFLOOD=[0-9]+ bad=[01]|H2C-FAIL" | head -1
         kill $pid 2>/dev/null; wait $pid 2>/dev/null
     }
+    # --- a response that arrives before the request body can be sent (8.1) --
+    # RFC 9113 8.1 lets a server answer before the request is finished when the
+    # answer does not depend on the unsent part -- a 401, a 413, a redirect. The
+    # backend here grants ZERO request credit and then answers, so the body
+    # cannot move and the response is all there is.
+    #
+    # The blocking pump met that response with its error exit; its own comment
+    # said "response before END_STREAM: unsupported in v1" (audit-report-72). It
+    # now pushes the frame back and tells the sender to stop, and the response
+    # parser reads it as if it had read it itself.
+    #
+    # The DRIVER never had this and the rows prove it rather than assume it:
+    # 5 of 5 before the fix as well. earlywin is the control -- the same early
+    # answer with ordinary credit, which always worked.
+    early_probe() {  # $1 = fixture mode, $2.. = extra argv
+        local mode=$1; shift
+        python3 test/h2/h2c_server.py ${P61730} $mode >/dev/null 2>&1 &
+        local pid=$!
+        sleep 0.5
+        head -c 4096 /dev/zero | tr '\0' 'U' \
+            | timeout 20 ./bin/linnea-h2client ${P61730} /early POST "$@" 2>&1 \
+            | tr -d '\r' | head -1
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        [ "$(early_probe earlyresp $argv)" = "HTTP/1.1 204 No Content" ]
+        check "backend h2 early ($mode): a 204 answered before the body relays" $?
+        [ "$(early_probe earlyresp,earlyresp200 $argv)" = "HTTP/1.1 200 OK" ]
+        check "backend h2 early ($mode): ...and a 200 with content-length: 0" $?
+        [ "$(early_probe earlyresp,earlywin $argv)" = "HTTP/1.1 204 No Content" ]
+        check "backend h2 early ($mode): ...and the same with ordinary credit" $?
+    done
+
     for mode in oracle driver; do
         [ "$mode" = driver ] && argv="0 drv" || argv=""
         [ "$(qflood_probe 2400 $argv)" = "QFLOOD=65536 bad=0" ]
