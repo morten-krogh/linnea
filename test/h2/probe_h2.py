@@ -66,6 +66,10 @@ try:
                 blk = lit("content-type", "text/plain") + lit(":status", status)
             elif mode == "psunknown":      # an undefined pseudo-header
                 blk = lit(":status", status) + lit(":unknown", "x")
+            elif mode == "hplate":         # 7541 4.2: an update AFTER a field
+                blk = b"\x88" + b"\x20"
+            elif mode == "hpearly":        # the same update, legally placed
+                blk = b"\x20" + b"\x88"
             else:
                 blk = lit(":status", status)
             if mode == "fnupper":

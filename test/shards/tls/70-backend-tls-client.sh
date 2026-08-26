@@ -937,6 +937,42 @@ PY
     [ "$(tr_get /fn-ok $CODE1)" = 200 ]
     check "backend h2 field: an ordinary field relays end to end" $?
 
+    # --- HPACK table-size update placement (RFC 7541 4.2) -------------------
+    # An update may appear only at the BEGINNING of a field block, before any
+    # field representation; one after a field is a decoding error, which RFC
+    # 9113 4.3 makes a connection error of type COMPRESSION_ERROR. The REQUEST
+    # decoder has enforced this since its own Finding 29 -- the response-side
+    # copy of the decoder never did (audit-report-61). Sixth report running
+    # whose root is a rule this server has in one direction only.
+    #
+    # The blocks are hand-built because the point is the byte order: 0x88 is the
+    # static ":status: 200" and 0x20 is an update to a maximum of zero.
+    #
+    # /hp-late-inc is not in the report and is the row that caught my first
+    # attempt: marking only the fall-through literal form missed 0x40, literal
+    # WITH indexing, which is the form an encoder actually emits. Both literal
+    # forms share one label, so the mark belongs there.
+    #
+    # Legal placements are the controls, and there are two kinds: an update
+    # before all fields, and SEVERAL in a row before all fields -- an encoder
+    # signals a shrink and a restore that way, so the rule is bounded by the
+    # first field, not by a count.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for bad in /hp-late /hp-late-cont /hp-late-inc; do
+            [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
+            check "backend h2 hpack ($mode): $bad is refused" $?
+        done
+        for ok in /hp-none /hp-early /hp-two-early; do
+            st_probe $ok $argv | grep -q "^HTTP/1.1 200"
+            check "backend h2 hpack ($mode): $ok is accepted" $?
+        done
+    done
+    [ "$(tr_get /hp-late $CODE1)" = 502 ]
+    check "backend h2 hpack: a late table-size update is refused end to end" $?
+    [ "$(tr_get /hp-early $CODE1)" = 200 ]
+    check "backend h2 hpack: a legal one still serves end to end" $?
+
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for
     # audit-report-51: a valid reset already ends the exchange in a 502, so a

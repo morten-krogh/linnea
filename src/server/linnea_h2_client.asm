@@ -93,6 +93,8 @@ h2c_hdrlines_len: resq 1
 h2c_saw_pseudo: resq 1
 h2c_hdr_open:  resq 1                           ; a header block awaits its CONTINUATION
 h2c_preface_ok: resq 1                          ; the server's SETTINGS preface has arrived
+h2c_field_seen: resq 1                          ; a field representation has been
+                                                ; decoded in THIS block (7541 4.2)
 h2c_status_seen: resq 1                         ; this block already carried a :status
 h2c_regular_seen: resq 1                        ; ...and a regular field (8.3 ordering)
 h2c_cl_seen:   resq 1                           ; this block declared a content-length
@@ -1678,6 +1680,10 @@ h2c_decode:
     lea rbx, [h2c_carrier]
     mov r12, rsi
     lea r13, [rsi + rdx]
+    ; Per FIELD BLOCK, and this decoder runs once per completed block -- after
+    ; the HEADERS and all its CONTINUATIONs have been reassembled -- so clearing
+    ; it here is exactly the lifetime RFC 7541 4.2 describes.
+    mov qword [h2c_field_seen], 0
 .next:
     cmp r12, r13
     jae .ok
@@ -1691,6 +1697,7 @@ h2c_decode:
     mov ecx, 4
     jmp .literal
 .indexed:
+    mov qword [h2c_field_seen], 1
     mov rsi, r12
     mov rdi, r13
     mov ecx, 7
@@ -1729,6 +1736,11 @@ h2c_decode:
 .lit_inc:
     mov ecx, 6
 .literal:
+    ; both literal forms arrive here -- 0x40 with indexing and the 0x00/0x10
+    ; forms without -- so the 4.2 mark goes on the shared label. Marking only
+    ; the fall-through would have let "literal WITH indexing, then a late
+    ; update" through, which is the form an encoder actually emits.
+    mov qword [h2c_field_seen], 1
     mov [h2c_lit_form], ecx
     mov rsi, r12
     mov rdi, r13
@@ -1803,6 +1815,19 @@ h2c_decode:
     jc .err
     jmp .next
 .tsize:
+    ; RFC 7541 4.2: a dynamic table size update may only appear at the BEGINNING
+    ; of a field block, before any field representation; RFC 9113 4.3 makes a
+    ; field-block decoding error a connection error of type COMPRESSION_ERROR.
+    ; Several updates in a row at the beginning stay legal -- an encoder signals
+    ; a shrink and a restore that way -- so this is bounded by the first FIELD,
+    ; not by a count.
+    ;
+    ; The request decoder has enforced this since its own Finding 29; this is
+    ; the same rule, in the response-direction copy of the decoder, which never
+    ; had it (audit-report-61). nghttp2 answers the late update with GOAWAY
+    ; COMPRESSION_ERROR(0x09) and the legal placements with NO_ERROR.
+    cmp qword [h2c_field_seen], 0
+    jne .err
     mov rsi, r12
     mov rdi, r13
     mov ecx, 5

@@ -474,6 +474,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/fn-") or path.startswith("/fv-"):
         respond_fieldsyntax(c, sid, path)
         return
+    if path.startswith("/hp-"):
+        respond_hpack(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -574,6 +577,40 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+def respond_hpack(c, sid, path):
+    """HPACK dynamic-table-size updates (RFC 7541 4.2, 6.3). An update may only
+    appear at the BEGINNING of a field block, before any field representation;
+    one after a field is a COMPRESSION_ERROR (RFC 9113 4.3). The request decoder
+    has enforced this since its own Finding 29; the response decoder never did
+    (audit-report-61).
+
+    The blocks here are hand-built rather than composed from enc_*, because the
+    whole point is the byte ORDER: 0x88 is the static ":status: 200", 0x20 is an
+    update to a maximum of zero."""
+    body = b"hp-body\n"
+    tail = enc_header("content-type", "text/plain")
+    tail += enc_header("content-length", str(len(body)))
+    if path == "/hp-late":            # a field, THEN an update
+        blk = b"\x88" + b"\x20" + tail
+    elif path == "/hp-early":         # the control: the update comes first
+        blk = b"\x20" + b"\x88" + tail
+    elif path == "/hp-two-early":     # two updates at the beginning: legal
+        blk = b"\x20\x20" + b"\x88" + tail
+    elif path == "/hp-late-inc":      # literal WITH indexing, then an update
+        blk = b"\x88" + enc_header("x-a", "aaa", indexed=True) + b"\x20" + tail
+    elif path == "/hp-none":          # the control: no update at all
+        blk = b"\x88" + tail
+    elif path == "/hp-late-cont":
+        # The rule is about the reassembled FIELD BLOCK, not the frame that
+        # carried the bytes, so splitting after the field must not launder it.
+        c.send(frame(0x01, 0x00, sid, b"\x88"))          # HEADERS, block OPEN
+        c.send(frame(0x09, 0x04, sid, b"\x20" + tail))   # CONTINUATION
+        c.send(frame(0x00, 0x01, sid, body))
+        return
+    c.send(frame(0x01, 0x04, sid, blk))
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 FIELD_CASES = {                    # RFC 9113 8.2.1 field validity
