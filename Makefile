@@ -116,7 +116,8 @@ tlsclient: $(TLSCLIENT_BIN)
 # --- backend HTTP/2 client test harness (own _start; h2c plaintext) ---
 H2CLIENT_BIN  = bin/linnea-h2client
 H2CLIENT_OBJS = test/h2/linnea_h2client.o src/server/linnea_h2_client.o \
-                src/server/linnea_hpack.o src/lib/linnea_string.o
+                src/server/linnea_hpack.o src/lib/linnea_string.o \
+                src/lib/linnea_http_status.o
 
 test/h2/linnea_h2client.o: test/h2/linnea_h2client.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<

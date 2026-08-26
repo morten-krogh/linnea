@@ -135,6 +135,14 @@ struc linnea_h2c
     .in_len:       resq 1        ; bytes buffered in .in_buf awaiting a full frame
     ; flags
     .settled:      resq 1        ; server SETTINGS applied
+    ; The response's own content-length, kept so it can be checked against the
+    ; DATA bytes at END_STREAM (RFC 9113 8.1.1). Committed from the final head's
+    ; block, like .status -- the emitter's globals belong to whichever leg is
+    ; decoding right now, and this leg's answer must survive the gap between two
+    ; on_recv calls.
+    .cl_seen:      resq 1
+    .cl_val:       resq 1
+    .is_head:      resq 1        ; the REQUEST was HEAD: a length, and no body
     .hdr_es:       resq 1        ; END_STREAM seen on the response HEADERS
     .hdr_done:     resq 1        ; response header block decoded
     ; A header block is OPEN: a HEADERS/CONTINUATION arrived without END_HEADERS,

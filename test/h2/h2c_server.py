@@ -39,6 +39,8 @@ Routes (by :path):
   /fsz-ok /fsz-big /fsz-hdr /fsz-split -> DATA of exactly 16384, of 16385,
                    an oversized HEADERS frame, and the same head split legally
                    across HEADERS + CONTINUATION (4.2 bounds each FRAME)
+  /cl-short /cl-zero /cl-bad /cl-neg -> a content-length that does not match
+                   the DATA bytes; /cl-ok /cl-304 /cl-204 /cl-head are controls
   /st-x /st-4 /st-sp /st-2x0 /st-short /st-empty -> a :status that is not
                    three digits; /st-299 /st-200 are the legal controls
   /sid-hdr0 /sid-hdr3 /sid-data0 /sid-data3 -> a HEADERS or DATA frame on a
@@ -461,6 +463,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/st-"):
         respond_status(c, sid, path)
         return
+    if path.startswith("/cl-"):
+        respond_clen(c, sid, path, method)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -561,6 +566,46 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+def respond_clen(c, sid, path, method):
+    """content-length against the DATA bytes (RFC 9113 8.1.1): a response whose
+    content-length does not equal the sum of its DATA payloads is malformed, and
+    an intermediary must not forward it. The h2 leg dropped the field without
+    ever reading it and then wrote its OWN measurement downstream, so a
+    malformed response was repaired into a valid one (audit-report-58).
+
+    The controls are the exceptions, and they are the rows a careless fix
+    breaks: a HEAD response carries the length the body WOULD have had and no
+    body at all, and 304 may do the same. Both are legal, both look exactly
+    like the defect."""
+    body = b"body"
+    if path == "/cl-short":       # says 1, sends 4
+        blk = enc_status(200) + enc_header("content-length", "1")
+    elif path == "/cl-zero":      # says 0, sends 4
+        blk = enc_status(200) + enc_header("content-length", "0")
+    elif path == "/cl-bad":       # not a number at all
+        blk = enc_status(200) + enc_header("content-length", "abc")
+    elif path == "/cl-neg":       # a sign is not a digit
+        blk = enc_status(200) + enc_header("content-length", "-4")
+    elif path == "/cl-ok":        # the control: it matches
+        blk = enc_status(200) + enc_header("content-length", "4")
+    elif path == "/cl-304":       # CONTROL: 304 may carry it, and has no body
+        c.send(frame(0x01, 0x05, sid,
+                     enc_status(304) + enc_header("content-length", "99")))
+        return
+    elif path == "/cl-204":       # CONTROL: no content, and no DATA frame
+        c.send(frame(0x01, 0x05, sid, enc_status(204)))
+        return
+    elif path == "/cl-head":      # CONTROL: a length with no body is what a
+        # HEAD response IS. The fixture answers whatever method was asked, so
+        # driving this with GET is the negative twin of the same bytes.
+        c.send(frame(0x01, 0x05, sid,
+                     enc_status(200) + enc_header("content-length", "4")))
+        return
+    blk += enc_header("content-type", "text/plain")
+    c.send(frame(0x01, 0x04, sid, blk))
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 ST_VALUES = {                      # RFC 9110 15.1: exactly three digits

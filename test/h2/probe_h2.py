@@ -8,6 +8,9 @@ import socket, struct, sys
 PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 port, mode = int(sys.argv[1]), sys.argv[2]
 status = sys.argv[3] if len(sys.argv) > 3 else "200"
+# argv[4]: the content-length to DECLARE, independently of what is sent.
+# "auto" (the default) declares the true length.
+declare = sys.argv[4] if len(sys.argv) > 4 else "auto"
 
 
 def frame(ft, fl, sid, pay=b""):
@@ -58,7 +61,8 @@ try:
         if ft == 0x01 and not answered:                # HEADERS: answer blind
             answered = True
             blk = lit(":status", status) + lit("content-type", "text/plain")
-            blk += lit("content-length", str(len(body)))
+            blk += lit("content-length",
+                       str(len(body)) if declare == "auto" else declare)
             c.sendall(frame(0x01, 0x04, sid, blk))
             c.sendall(frame(0x00, 0x01, sid, body))
 except Exception:

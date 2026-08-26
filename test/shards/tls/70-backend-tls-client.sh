@@ -673,6 +673,18 @@ PY
         kill $pid 2>/dev/null; wait $pid 2>/dev/null
     }
     pump_probe() { local mode=$1; shift; up_frames $mode 8192 "$@"; }
+    cl_probe() {    # $1 = path, $2 = method, $3.. = extra argv; first line only
+        local path=$1 meth=$2; shift 2
+        python3 test/h2/h2c_server.py ${P61730} >/dev/null 2>&1 &
+        local pid=$!
+        sleep 0.5
+        # </dev/null: the harness reads a request body from stdin for any
+        # method that is not GET, so a HEAD probe without it inherits the
+        # shard's stdin and hangs (or sends whatever it finds there).
+        timeout 10 ./bin/linnea-h2client ${P61730} "$path" "$meth" "$@" \
+            </dev/null 2>&1 | tr '\r\0' '  ' | head -1
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
     st_probe() {    # $1 = path, $2.. = extra argv; first line only
         local path=$1; shift
         python3 test/h2/h2c_server.py ${P61730} >/dev/null 2>&1 &
@@ -806,6 +818,47 @@ PY
     check "backend h2 status: a four-digit :status is refused end to end" $?
     [ "$(tr_get /st-299 $CODE1)" = 299 ]
     check "backend h2 status: an unregistered 299 is relayed end to end" $?
+
+    # --- content-length against the DATA bytes (RFC 9113 8.1.1) -------------
+    # A response whose content-length does not equal the sum of its DATA
+    # payloads is malformed, and an intermediary must not forward it. The h2 leg
+    # dropped the field without ever reading it -- it is not relayed, the
+    # composer writes its own from the bytes it holds -- so "content-length: 1"
+    # over a four-byte body came out as "content-length: 4" and the malformed
+    # response was REPAIRED into a valid one (audit-report-58). Third report
+    # running whose root is a rule the h1 leg has and the h2 leg does not.
+    #
+    # The controls are the exceptions, and they are what a careless fix breaks:
+    # 1xx/204/205/304 carry no content whatever the head says (the shared
+    # linnea_http_status_no_content, not a fourth copy of that list), and a HEAD
+    # response carries the length a GET would have returned with no body at all.
+    #
+    # The HEAD pair is the row that proves the exception is implemented rather
+    # than the check skipped: /cl-head sends the SAME bytes both times -- 200,
+    # content-length 4, no DATA -- and it must fail for GET and serve for HEAD.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for bad in /cl-short /cl-zero /cl-bad /cl-neg; do
+            [ "$(cl_probe $bad GET $argv)" = "H2C-FAIL" ]
+            check "backend h2 clen ($mode): $bad is refused" $?
+        done
+        cl_probe /cl-ok GET $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 clen ($mode): a matching content-length relays" $?
+        cl_probe /cl-304 GET $argv | grep -q "^HTTP/1.1 304"
+        check "backend h2 clen ($mode): 304 may declare a length it does not send" $?
+        cl_probe /cl-204 GET $argv | grep -q "^HTTP/1.1 204"
+        check "backend h2 clen ($mode): 204 carries no content" $?
+        [ "$(cl_probe /cl-head GET $argv)" = "H2C-FAIL" ]
+        check "backend h2 clen ($mode): a length with no body is refused for GET" $?
+        cl_probe /cl-head HEAD $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 clen ($mode): ...and is correct for HEAD, same bytes" $?
+    done
+    [ "$(tr_get /cl-short $CODE1)" = 502 ]
+    check "backend h2 clen: a short content-length is refused end to end" $?
+    [ "$(tr_get /cl-ok $CODE1)" = 200 ]
+    check "backend h2 clen: a matching content-length relays end to end" $?
+    [ "$(tr_get /cl-head $CODE1 -I)" = 200 ]
+    check "backend h2 clen: a HEAD through the front still serves" $?
 
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for

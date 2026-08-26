@@ -69,6 +69,8 @@ hop_cl_len       equ $ - hop_cl
 pseudo_status:   db ":status"
 pseudo_status_len equ $ - pseudo_status
 
+extern linnea_http_status_no_content
+
 section .bss
 alignb 16
 linnea_h2c_resp_buf: resb LINNEA_H2C_RESP_CAP   ; synthesized h1 response (out)
@@ -91,6 +93,11 @@ h2c_hdrlines_len: resq 1
 h2c_saw_pseudo: resq 1
 h2c_hdr_open:  resq 1                           ; a header block awaits its CONTINUATION
 h2c_preface_ok: resq 1                          ; the server's SETTINGS preface has arrived
+h2c_cl_seen:   resq 1                           ; this block declared a content-length
+h2c_cl_val:    resq 1                           ; ...and its value (8.1.1)
+h2c_tr_cl_s:   resq 1                           ; held across a trailer decode
+h2c_tr_cl_v:   resq 1
+h2c_is_head:   resq 1                           ; the REQUEST was HEAD
 h2c_tr_status: resq 1                           ; status/lines held across a
 h2c_tr_lines:  resq 1                           ; trailer decode (see below)
 h2c_body_len:  resq 1
@@ -405,6 +412,16 @@ h2c_enc_str_lc:
 h2c_emit_method:
     mov rsi, [h2c_m_ptr]
     mov rdx, [h2c_m_len]
+    ; A HEAD response carries the content-length a GET would have returned and
+    ; no body at all -- legal, and byte-for-byte what a mismatch looks like. The
+    ; leg has to remember which it asked for (RFC 9110 9.3.2).
+    mov qword [h2c_is_head], 0
+    cmp rdx, 4
+    jne .nothead
+    cmp dword [rsi], 'HEAD'
+    jne .nothead
+    mov qword [h2c_is_head], 1
+.nothead:
     cmp rdx, 3
     jne .np
     cmp byte [rsi], 'G'
@@ -919,6 +936,39 @@ h2c_ping_frame:
     ret
 .bad:
     mov rax, -1
+    ret
+
+; h2c_clen_ok(rdi=status, rsi=is_head, rdx=cl_seen, rcx=cl_val, r8=body_len)
+;   -> rax = 1 well-formed, 0 malformed.
+;
+; RFC 9113 8.1.1: a content-length that does not equal the sum of the DATA
+; payloads is malformed and must not be forwarded. The exceptions are the whole
+; difficulty, and both look exactly like the defect from the outside:
+;   - a HEAD response declares what a GET would have returned and sends no body;
+;   - 1xx, 204, 205 and 304 carry no content whatever the head says.
+; The status half is linnea_http_status_no_content, the SAME predicate the h1
+; leg calls, deliberately not a copy: three copies of that list once disagreed
+; on 205 (audit-report-10 Finding 1). The method half is the caller's, exactly
+; as it is on the h1 side.
+h2c_clen_ok:
+    mov rax, 1
+    test rdx, rdx
+    jz .co_ret                     ; nothing declared: nothing to contradict
+    test rsi, rsi
+    jnz .co_ret                    ; HEAD
+    push rcx
+    push r8
+    mov edi, edi
+    call linnea_http_status_no_content   ; touches only eax
+    pop r8
+    pop rcx
+    test eax, eax
+    mov rax, 1
+    jnz .co_ret                    ; a status defined to carry no content
+    cmp rcx, r8
+    je .co_ret
+    xor eax, eax
+.co_ret:
     ret
 
 ; h2c_send_window(edi=sid, esi=inc)
@@ -1518,6 +1568,14 @@ h2c_run_response:
 .done:
     test ebx, ebx
     jz .err
+    mov rdi, [h2c_status]
+    mov rsi, [h2c_is_head]
+    mov rdx, [h2c_cl_seen]
+    mov rcx, [h2c_cl_val]
+    mov r8, [h2c_body_len]
+    call h2c_clen_ok
+    test rax, rax
+    jz .err                        ; 8.1.1, see h2c_clen_ok
     xor eax, eax
     jmp .ret
 .err:
@@ -1720,6 +1778,19 @@ h2c_emit:
     jz .ok
     cmp byte [r12], ':'
     je .pseudo                     ; unknown pseudo-header: not relayed
+    ; RFC 9113 8.1.1: a content-length that does not equal the sum of the DATA
+    ; payloads makes the response MALFORMED, and an intermediary must not
+    ; forward it. The field is still dropped here -- the composer writes its own
+    ; from the bytes it holds -- but dropping it without ever READING it turned
+    ; a malformed response into a valid one: "content-length: 1" over a 4-byte
+    ; body was relayed as "content-length: 4" (audit-report-58).
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [hop_cl]
+    mov rcx, hop_cl_len
+    call h2c_ci_eq
+    test rax, rax
+    jnz .clen
     mov rdi, r12
     mov rsi, r13
     call h2c_is_skip
@@ -1770,6 +1841,37 @@ h2c_emit:
     clc
     jmp .ret
 .badst:
+    stc
+    jmp .ret
+.clen:
+    ; A duplicate is refused outright, as the h1 leg has refused one since
+    ; report 6 -- two declarations of the same length are at best a rewrite
+    ; waiting to disagree.
+    cmp qword [h2c_cl_seen], 0
+    jne .badcl
+    test r15, r15
+    jz .badcl                      ; an empty value is not a number
+    cmp r15, 19
+    ja .badcl                      ; more digits than a u64 holds
+    xor eax, eax
+    xor ecx, ecx
+.cll:
+    cmp rcx, r15
+    jae .cldone
+    movzx edx, byte [r14 + rcx]
+    sub edx, '0'
+    cmp edx, 9
+    ja .badcl                      ; a sign, a space or a letter: not DIGITs
+    imul rax, rax, 10
+    add rax, rdx
+    inc rcx
+    jmp .cll
+.cldone:
+    mov [h2c_cl_val], rax
+    mov qword [h2c_cl_seen], 1
+    clc
+    jmp .ret
+.badcl:
     stc
     jmp .ret
 .of:
@@ -2301,6 +2403,12 @@ h2c_classify_block:
     mov [h2c_tr_status], rax
     mov rax, [h2c_hdrlines_len]
     mov [h2c_tr_lines], rax
+    mov rax, [h2c_cl_seen]
+    mov [h2c_tr_cl_s], rax
+    mov rax, [h2c_cl_val]
+    mov [h2c_tr_cl_v], rax
+    mov qword [h2c_cl_seen], 0       ; ...and THIS block's content-length: a
+    mov qword [h2c_cl_val], 0        ; trailer's must never reach the assertion
     mov qword [h2c_status], 0        ; judge THIS block's :status, not a stale one
     mov qword [h2c_saw_pseudo], 0
     test rbx, rbx
@@ -2361,6 +2469,10 @@ h2c_classify_block:
     mov [h2c_status], rax
     mov rax, [h2c_tr_lines]
     mov [h2c_hdrlines_len], rax
+    mov rax, [h2c_tr_cl_s]
+    mov [h2c_cl_seen], rax
+    mov rax, [h2c_tr_cl_v]
+    mov [h2c_cl_val], rax
     ret
 .bad:
     call .restore
@@ -2398,6 +2510,12 @@ d_decode_block:
     jnz .ret                         ; -1 malformed, 1 informational, 2 trailer
     mov rax, [h2c_status]            ; the final head: commit it to the leg
     mov [rbx + linnea_h2c.status], rax
+    mov rax, [h2c_cl_seen]
+    mov [rbx + linnea_h2c.cl_seen], rax
+    mov rax, [h2c_cl_val]
+    mov [rbx + linnea_h2c.cl_val], rax
+    mov rax, [h2c_is_head]
+    mov [rbx + linnea_h2c.is_head], rax
     mov rcx, [h2c_hdrlines_len]
     mov [rbx + linnea_h2c.hdrlines_len], rcx
     lea rsi, [h2c_hdrlines]
@@ -3012,6 +3130,14 @@ d_dispatch:
     xor eax, eax
     ret
 .complete:
+    mov rdi, [rbx + linnea_h2c.status]
+    mov rsi, [rbx + linnea_h2c.is_head]
+    mov rdx, [rbx + linnea_h2c.cl_seen]
+    mov rcx, [rbx + linnea_h2c.cl_val]
+    mov r8, [rbx + linnea_h2c.body_len]
+    call h2c_clen_ok
+    test rax, rax
+    jz .bad                        ; 8.1.1, see h2c_clen_ok
     mov qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_DONE
     xor eax, eax
     ret
