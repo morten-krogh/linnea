@@ -353,6 +353,8 @@ hdr_close_len   equ $ - hdr_close
 ; rewriter has accepted it.
 hdr_via_11:     db "Via: 1.1 linnea", 13, 10
 hdr_via_11_len  equ $ - hdr_via_11
+hdr_host_up:    db "Host: "
+hdr_host_up_len equ $ - hdr_host_up
 hdr_cl_up:      db "Content-Length: "
 hdr_cl_up_len   equ $ - hdr_cl_up
 hdr_crlf_up:    db 13, 10
@@ -692,6 +694,76 @@ section .text
 ;
 ; Touches neither r10 nor r13 — the two rewriters keep their colon offset in
 ; those across the comparisons, and linnea_string_iequal leaves them alone.
+; proxy_abs_authority(rdi = head base, rsi = method length)
+;   -> rdx = authority length (0 when the target is not absolute-form),
+;      rax = authority pointer.
+;
+; RFC 9112 3.2.2: with an absolute-form request-target, a proxy MUST ignore the
+; received Host and forward the target's authority instead. The parser already
+; ROUTES on that authority, but its routing slot holds the host with the PORT
+; STRIPPED -- correct for vhost selection, wrong for a Host line -- so this
+; re-reads the authority from the original request line, which is still intact
+; in the head buffer (audit-report-75; the first attempt reused the routing slot
+; and quietly dropped ":8080" from every proxied request).
+;
+; Touches rax/rcx/rdx/r8/r9 only.
+proxy_abs_authority:
+    lea r8, [rdi + rsi + 1]           ; the target, past "METHOD "
+    xor edx, edx
+    movzx eax, byte [r8]
+    or al, 0x20
+    cmp al, 'h'
+    jne .paa_no
+    movzx eax, byte [r8+1]
+    or al, 0x20
+    cmp al, 't'
+    jne .paa_no
+    movzx eax, byte [r8+2]
+    or al, 0x20
+    cmp al, 't'
+    jne .paa_no
+    movzx eax, byte [r8+3]
+    or al, 0x20
+    cmp al, 'p'
+    jne .paa_no
+    lea r9, [r8+4]                    ; after "http"
+    movzx eax, byte [r9]
+    or al, 0x20
+    cmp al, 's'
+    jne .paa_colon
+    inc r9                            ; "https"
+.paa_colon:
+    cmp byte [r9], ':'
+    jne .paa_no
+    cmp byte [r9+1], '/'
+    jne .paa_no
+    cmp byte [r9+2], '/'
+    jne .paa_no
+    add r9, 3                         ; the authority starts here
+    mov rax, r9
+.paa_scan:
+    movzx ecx, byte [r9]
+    cmp cl, '/'
+    je .paa_end
+    cmp cl, '?'
+    je .paa_end
+    cmp cl, '#'
+    je .paa_end
+    cmp cl, ' '
+    je .paa_end
+    cmp cl, 13
+    je .paa_end
+    inc r9
+    jmp .paa_scan
+.paa_end:
+    mov rdx, r9
+    sub rdx, rax                      ; authority length, port included
+    ret
+.paa_no:
+    xor edx, edx
+    ret
+
+
 http_hop_by_hop:
     push rbx
     push r12
@@ -2761,6 +2833,28 @@ linnea_http_handle:
     lea rdi, [req_version]
     mov esi, req_version_len
     call .append
+    ; RFC 9112 3.2.2: an absolute-form target's authority REPLACES the received
+    ; Host. The parser routes on it already; the rewrite forwarded the client's
+    ; Host line verbatim, so a request that selected this vhost as target.test
+    ; reached the backend as other.test -- and on the proxy_h2 leg that field
+    ; becomes the sole :authority (audit-report-75).
+    mov rdi, r14
+    mov rsi, [rsp + 104]
+    call proxy_abs_authority          ; rdx = 0 unless absolute-form
+    test rdx, rdx
+    jz .proxy_no_host_repl
+    push rax
+    push rdx
+    lea rdi, [hdr_host_up]
+    mov esi, hdr_host_up_len
+    call .append
+    pop rsi
+    pop rdi
+    call .append
+    lea rdi, [hdr_crlf_up]
+    mov esi, 2
+    call .append
+.proxy_no_host_repl:
     ; header lines, verbatim except Connection (we send our own)
     mov r13, [rbx + linnea_connection.head_len]
     sub r13, [rsp + 128]       ; head_len covers the body too
@@ -2888,6 +2982,25 @@ linnea_http_handle:
     jnz .proxy_next_line             ; ours to answer: not forwarded
     jmp .proxy_copy_line             ; any other expectation goes upstream
 .not_expect_line:
+    ; the received Host, when it has been replaced above
+    mov rcx, [rsp + 56]
+    mov rax, r10
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_host]
+    mov ecx, 4
+    call linnea_string_iequal
+    test eax, eax
+    jz .proxy_not_host
+    push r10
+    mov rdi, r14
+    mov rsi, [rsp + 104 + 8]
+    call proxy_abs_authority
+    pop r10
+    test rdx, rdx
+    jnz .proxy_next_line              ; absolute-form: ours replaced it
+.proxy_not_host:
     ; Transfer-Encoding never goes upstream: the body was decoded on the way in,
     ; so forwarding the header would promise the backend a framing that is no
     ; longer there. A Content-Length describing the decoded body is emitted with

@@ -386,6 +386,7 @@ def serve_one(sock, mode):
                 hdrs = hpack_decode(hdr_block)
                 d = dict(hdrs)
                 method, path = d.get(":method"), d.get(":path")
+                c.authority = d.get(":authority")
                 if "credpart" in c.modes:
                     # ONE write: enough zero-length SETTINGS that their ACKs
                     # nearly fill the client's 32 KiB output queue, then a
@@ -586,6 +587,16 @@ def respond(c, sid, method, path, body):
         return
     if path.startswith("/pri-"):
         respond_priority(c, sid, path)
+        return
+    if path == "/authority":
+        # what :authority the leg built. For an absolute-form h1 request the
+        # control data is the TARGET's authority, not the Host field
+        # (RFC 9112 3.2.2, RFC 9113 8.3.1) -- audit-report-75.
+        rb = ("AUTHORITY=%s\n" % getattr(c, "authority", "?")).encode()
+        blk = enc_status(200) + enc_header("content-type", "text/plain")
+        blk += enc_header("content-length", str(len(rb)))
+        c.send(frame(0x01, 0x04, sid, blk))
+        c.send(frame(0x00, 0x01, sid, rb))
         return
     if path.startswith("/post-"):
         respond_postend(c, sid, path)

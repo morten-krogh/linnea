@@ -268,11 +268,17 @@ check "the upload capture file is created under spill_dir ($out)" $?
 # RAM path and the middle case had been testing the control's path while saying
 # "capture-file". h3_upload_big.py now reads the gate out of the header, and
 # 3000 is under it (LINNEA_QUIC_RA_REGION_MIN, 4096).
+# NOT "set --": it overwrites the SHARD's positional parameters, and the runner
+# still uses them -- this loop was rewriting the suite footer into
+# "run_tests.sh 16000000 file" (found while adding the absolute-form check,
+# audit-report-75; the same trap audit-report-70 hit).
 for spec in "3000 ram" "200000 file" "16000000 file"; do
-    set -- $spec
-    out2=$(timeout 120 python3 test/quic/h3_upload_big.py localhost $1 ${P61498} --path $2 2>&1)
+    up_bytes=${spec% *}
+    up_path=${spec#* }
+    out2=$(timeout 120 python3 test/quic/h3_upload_big.py localhost $up_bytes \
+           ${P61498} --path $up_path 2>&1)
     case "$out2" in ok*) true ;; *) false ;; esac
-    check "h3 upload of $1 bytes echoes back byte-exact ($out2)" $?
+    check "h3 upload of $up_bytes bytes echoes back byte-exact ($out2)" $?
 done
 # A stream ENDED at exactly the flow-control limit, in an empty frame of its
 # own, while a gap remains in the payload. Inside a payload the limit we grant

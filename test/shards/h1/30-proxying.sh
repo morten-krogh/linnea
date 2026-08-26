@@ -39,6 +39,17 @@ fi
 timeout 60 python3 test/tls/proxy_via.py ${P61080} >/dev/null 2>&1
 check "proxy adds Via to the request and the response" $?
 
+# RFC 9112 3.2.2 MUST: with an absolute-form target, a proxy ignores the received
+# Host and replaces it with the target's authority. The parser already ROUTED on
+# the target -- that half was right -- but the rewrite copied the client's Host
+# line verbatim, so a request that selected this vhost as one.test reached the
+# backend claiming other.test (audit-report-75). On the proxy_h2 leg that field
+# becomes the sole :authority, which RFC 9113 8.3.1 requires to come from the
+# request's control data. The origin-form row is the control: there the
+# effective authority IS the Host value, so nothing changes.
+timeout 60 python3 test/tls/h1_absolute_form.py ${P61080} >/dev/null 2>&1
+check "proxy replaces Host from an absolute-form target" $?
+
 # RFC 9110 5.6.7 MUST: all three HTTP-date formats parse. Only IMF-fixdate did,
 # so a conditional request carrying an obsolete form was answered
 # unconditionally — the client got the whole body instead of its 304.
