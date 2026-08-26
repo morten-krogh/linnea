@@ -384,13 +384,17 @@ EOF
 
     # the fixture serves one connection at a time, and a TLS leg is never
     # pooled, so every request below is its own backend connection
-    tr_get() {   # $1 = path, $2.. = the client command (headers on stdout)
-        local path=$1; shift
-        python3 test/h2/h2c_server.py ${P61724} tls >$RUNDIR/bt_tr.log 2>&1 &
+    tr_get_m() { # $1 = fixture mode, $2 = path, $3.. = the client command
+        local mode=$1 path=$2; shift 2
+        python3 test/h2/h2c_server.py ${P61724} $mode >$RUNDIR/bt_tr.log 2>&1 &
         local pid=$!
         sleep 0.5
         "$@" "https://localhost:${P61725}$path" 2>/dev/null
         kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
+    tr_get() {   # $1 = path, $2.. = the client command (headers on stdout)
+        local path=$1; shift
+        tr_get_m tls "$path" "$@"
     }
     H1="curl -s -D- --max-time 10 --http1.1 --cacert $PWD/test/tls/server.crt \
         --resolve localhost:${P61725}:127.0.0.1"
@@ -669,6 +673,15 @@ PY
         kill $pid 2>/dev/null; wait $pid 2>/dev/null
     }
     pump_probe() { local mode=$1; shift; up_frames $mode 8192 "$@"; }
+    pref_probe() {  # $1 = fixture mode, $2.. = extra argv; first line only
+        local mode=$1; shift
+        python3 test/h2/h2c_server.py ${P61730} $mode >/dev/null 2>&1 &
+        local pid=$!
+        sleep 0.5
+        timeout 10 ./bin/linnea-h2client ${P61730} /hello GET "$@" 2>&1 \
+            | tr '\r\0' '  ' | head -1
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
     for mode in oracle driver; do
         [ "$mode" = driver ] && argv="drv" || argv=""
         # the control: a LEGAL ping read in the pump is still echoed, so this
@@ -721,6 +734,33 @@ PY
     done
     [ "$(tr_get /set-dup-2ndbad $CODE1)" = 502 ]
     check "backend h2 settings: a repeat with an illegal value is refused e2e" $?
+
+    # --- the SERVER connection preface (RFC 9113 3.4) -----------------------
+    # The server's preface is a SETTINGS frame and it MUST be the first frame it
+    # sends. We required that of CLIENTS in the frontend from the beginning and
+    # never asked it of a BACKEND, so an upstream could answer before it had
+    # said what it supports (audit-report-56). Each fixture mode still sends a
+    # perfectly good response behind the offending frame, so a refusal can only
+    # be the missing preface.
+    #
+    # prefempty is the control, and it is the row a careless gate breaks: 3.4
+    # allows a "potentially empty" SETTINGS, so a preface with no records at all
+    # is legal and must be accepted. nghttp2 1.66.0 as a client agrees on every
+    # row here -- it refuses the other four with "Remote peer returned
+    # unexpected data while we expected SETTINGS frame" and accepts this one.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for bad in prefnone prefping prefwin prefack; do
+            [ "$(pref_probe $bad $argv)" = "H2C-FAIL" ]
+            check "backend h2 preface ($mode): $bad is refused" $?
+        done
+        [ "$(pref_probe prefempty $argv)" != "H2C-FAIL" ]
+        check "backend h2 preface ($mode): an EMPTY SETTINGS preface is accepted" $?
+    done
+    [ "$(tr_get_m tls,prefnone /hello $CODE1)" = 502 ]
+    check "backend h2 preface: a response before SETTINGS is refused end to end" $?
+    [ "$(tr_get_m tls,prefempty /hello $CODE1)" = 200 ]
+    check "backend h2 preface: an empty SETTINGS preface serves end to end" $?
 
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for

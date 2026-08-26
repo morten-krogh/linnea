@@ -63,6 +63,14 @@ Usage: h2c_server.py <port> [mode]
                    third frame loop, h2c_pump_window (audit-report-54). The
                    response body reports the ACK that came back, so "no ACK for
                    an ACK" is observable rather than assumed.
+  mode "prefnone" / "prefping" / "prefwin" / "prefack" / "prefempty"
+                   the SERVER connection preface (RFC 9113 3.4): a SETTINGS
+                   frame that MUST be the first frame the server sends. These
+                   put a response, a PING, a WINDOW_UPDATE or a SETTINGS ACK in
+                   front of it -- and prefempty sends the legal empty SETTINGS,
+                   which "potentially empty" in 3.4 requires us to accept. Each
+                   still sends a perfectly good response afterwards, so a
+                   refusal can only be the missing preface (audit-report-56).
   mode "dupwin"    put TWO INITIAL_WINDOW_SIZE records in ONE SETTINGS frame,
                    1024 then 8192, and grant nothing until the sender stalls.
                    RFC 9113 6.5 processes the values IN ORDER, so the last one
@@ -259,7 +267,22 @@ def serve_one(sock, mode):
     c.pump_ack = None
     if "wdelta" in modes:
         init_win = 8192
-    if "dupwin" in modes:
+    pref = ([m for m in modes if m.startswith("pref")] or [None])[0]
+    c.pref = pref
+    if pref:
+        # Everything here happens BEFORE the server's SETTINGS, which is the
+        # whole point. prefnone sends nothing at all until the response.
+        if pref == "prefping":
+            c.send(frame(0x06, 0x00, 0, b"ABCDEFGH"))
+        elif pref == "prefwin":
+            c.send(frame(0x08, 0x00, 0, struct.pack(">I", 1024)))
+        elif pref == "prefack":
+            c.send(frame(0x04, 0x01, 0, b""))     # ACKing a preface we never sent
+        if pref == "prefempty":
+            c.send(frame(0x04, 0x00, 0, b""))     # legal: a potentially empty one
+        elif pref != "prefnone":
+            c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, 65535)))
+    elif "dupwin" in modes:
         # Two records for one identifier, in ONE frame. Legal in HTTP/2, and
         # the second must win.
         c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, 1024)
@@ -373,6 +396,15 @@ def serve_one(sock, mode):
         elif ftype == 0x07:                       # GOAWAY
             return
         if got_headers and end_stream:
+            if c.pref == "prefnone":
+                # the response IS the first frame the client ever sees
+                rb = b"pref-none\n"
+                blk = enc_status(200) + enc_header("content-type", "text/plain")
+                blk += enc_header("content-length", str(len(rb)))
+                c.send(frame(0x01, 0x04, sid, blk))
+                c.send(frame(0x00, 0x01, sid, rb))
+                c.send(frame(0x04, 0x00, 0, struct.pack(">HI", 0x04, 65535)))
+                continue
             if "dupwin" in c.modes:
                 rb = ("DUPWIN=%d\n" % c.pre).encode()
                 blk = enc_status(200) + enc_header("content-type", "text/plain")

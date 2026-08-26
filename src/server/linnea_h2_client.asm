@@ -90,6 +90,7 @@ h2c_hdrlines_len: resq 1
 ; place it is read. Cleared before every decode.
 h2c_saw_pseudo: resq 1
 h2c_hdr_open:  resq 1                           ; a header block awaits its CONTINUATION
+h2c_preface_ok: resq 1                          ; the server's SETTINGS preface has arrived
 h2c_tr_status: resq 1                           ; status/lines held across a
 h2c_tr_lines:  resq 1                           ; trailer decode (see below)
 h2c_body_len:  resq 1
@@ -152,6 +153,7 @@ linnea_h2c_exchange:
 
     ; init the decoder carrier + its dynamic table
     call h2c_init_carrier
+    mov qword [h2c_preface_ok], 0     ; a new connection owes us its preface
 
     ; --- build the outbound preface + SETTINGS + HEADERS into h2c_out_buf ---
     lea rdi, [h2c_out_buf]
@@ -836,6 +838,26 @@ h2c_next_frame:
     js .eof
 .nopay:
     movzx eax, byte [h2c_frame_buf+3]     ; type
+    ; RFC 9113 3.4: the server connection preface is a SETTINGS frame, and it
+    ; MUST be the first frame the server sends -- an empty one is explicitly
+    ; allowed, an ACK is not one. We enforced this for CLIENTS in the frontend
+    ; from the start and never asked it of a BACKEND, so a server could answer
+    ; before it had ever said what it supported (audit-report-56).
+    ;
+    ; It lives here, in the one reader that settle, the flow-control pump and
+    ; the response loop all share, rather than in each of them: three copies of
+    ; the PING rule is how audit-report-54 happened.
+    cmp qword [h2c_preface_ok], 0
+    jne .ret
+    mov qword [h2c_preface_ok], 1
+    cmp eax, LINNEA_H2C_FT_SETTINGS
+    jne .eof
+    cmp qword [h2c_fr_sid], 0
+    jne .eof
+    mov rcx, [h2c_fr_flags]
+    test rcx, LINNEA_H2C_FL_ACK
+    jnz .eof
+.ret:
     ret
 .eof:
     mov rax, -1
@@ -2718,6 +2740,21 @@ linnea_h2c_drv_on_recv:
 ; d_dispatch() — process one parsed frame. rbx=ctx, eax=type, r12=payload ptr,
 ; r15=payload len, [d_fr_flags]/[d_fr_sid] set. Returns rax=0 ok, or -1/-2/-3.
 d_dispatch:
+    ; RFC 9113 3.4: nothing may precede the server's SETTINGS preface -- not a
+    ; PING, not a WINDOW_UPDATE, not a response, and not an ACK of ours. See
+    ; h2c_next_frame for the same rule on the blocking side. .settled is exactly
+    ; "a non-ACK SETTINGS has been applied", which is what the preface is, so
+    ; the state this needed was already here and simply unused.
+    cmp qword [rbx+linnea_h2c.settled], 0
+    jne .prefaced
+    cmp eax, LINNEA_H2C_FT_SETTINGS
+    jne .bad
+    cmp qword [d_fr_sid], 0
+    jne .bad
+    mov rdx, [d_fr_flags]
+    test rdx, LINNEA_H2C_FL_ACK
+    jnz .bad
+.prefaced:
     ; RFC 9113 6.10: a CONTINUATION may only follow a HEADERS or CONTINUATION
     ; whose block is still open, on the same stream, with NO frame of any kind
     ; in between -- not a PING, not a SETTINGS, not one for another stream. The
