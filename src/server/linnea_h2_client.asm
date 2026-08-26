@@ -517,6 +517,37 @@ h2c_is_host:
     xor eax, eax
     ret
 
+; h2c_eq(rdi=ptr, rsi=len, rdx=lit, rcx=litlen) -> rax=1 equal, byte for byte.
+;
+; For a PSEUDO-HEADER name, case-insensitive matching is not a convenience, it
+; is a bug: RFC 9113 8.2.1 forbids uppercase in a field name, and a
+; pseudo-header name is a field name. ":Status" is not another spelling of
+; ":status" -- it is malformed, and matching it here let it past the validity
+; gate that only the ordinary-field branch reaches (audit-report-65). nghttp2
+; refuses it as an invalid field.
+;
+; The ci comparisons that remain are for ORDINARY field names, and they are
+; reached only after h2c_field_ok has already refused every uppercase byte, so
+; by then both sides are lowercase and the fold is a no-op.
+h2c_eq:
+    cmp rsi, rcx
+    jne .ne
+    xor r8, r8
+.el:
+    cmp r8, rsi
+    jae .eq
+    mov al, [rdi + r8]
+    cmp al, [rdx + r8]
+    jne .ne
+    inc r8
+    jmp .el
+.eq:
+    mov rax, 1
+    ret
+.ne:
+    xor eax, eax
+    ret
+
 ; h2c_ci_eq(rdi=ptr, rsi=len, rdx=lit, rcx=litlen) -> rax=1 equal (ci).
 ; Uses only rax/r8/r9; preserves rdi/rsi/rdx/rcx and r12-r15/rbp/rbx.
 h2c_ci_eq:
@@ -1991,11 +2022,14 @@ h2c_emit:
     mov rsi, r13
     lea rdx, [pseudo_status]
     mov rcx, pseudo_status_len
-    call h2c_ci_eq
+    call h2c_eq                      ; EXACT, deliberately -- see h2c_eq
     test rax, rax
     jnz .status
+    test r13, r13
+    jz .badfield                     ; an empty name owns no byte to inspect,
+                                     ; and is not a field name either way
     cmp byte [r12], ':'
-    je .pseudo_maybe
+    je .pseudo
     mov qword [h2c_regular_seen], 1  ; 8.3: every pseudo-header comes BEFORE
                                      ; the regular fields, so this closes them
     ; 8.2.1, and BEFORE the skip table below: a name we would have dropped is
@@ -2046,9 +2080,6 @@ h2c_emit:
 .ok:
     clc
     jmp .ret
-.pseudo_maybe:
-    test r13, r13
-    jz .badfield                   ; an empty name is not a pseudo-header either
 .pseudo:
     ; RFC 9113 8.3: a field block containing an UNDEFINED pseudo-header is
     ; malformed, and :status is the only one defined for a response. Recording

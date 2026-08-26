@@ -66,6 +66,8 @@ try:
                 blk = lit("content-type", "text/plain") + lit(":status", status)
             elif mode == "psunknown":      # an undefined pseudo-header
                 blk = lit(":status", status) + lit(":unknown", "x")
+            elif mode == "psupper":        # 8.2.1: uppercase in a field name
+                blk = lit(":Status", status)
             elif mode == "tetr":
                 blk = lit(":status", status) + lit("te", "trailers")
             elif mode == "tegz":

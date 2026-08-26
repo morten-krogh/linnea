@@ -790,6 +790,15 @@ def respond_pseudo(c, sid, path):
         blk = ct + enc_header(":status", "200")
     elif path == "/ps-unknown":       # 8.3: an undefined pseudo-header
         blk = enc_header(":status", "200") + enc_header(":unknown", "x") + ct
+    elif path in ("/ps-upper", "/ps-UPPER", "/ps-mixed"):
+        # RFC 9113 8.2.1 forbids uppercase in a field NAME, and a pseudo-header
+        # name is a field name. ":Status" is not another spelling of ":status",
+        # it is malformed -- and for a response :status is the only pseudo-header
+        # there is, so anything that is not exactly it is malformed anyway
+        # (audit-report-65).
+        name = {"/ps-upper": ":Status", "/ps-UPPER": ":STATUS",
+                "/ps-mixed": ":StAtUs"}[path]
+        blk = enc_header(name, "200") + ct
     elif path == "/ps-one":           # the control: exactly one, spelled out
         blk = enc_header(":status", "200") + ct
     elif path == "/ps-dup-cont":

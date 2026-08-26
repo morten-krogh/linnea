@@ -888,7 +888,8 @@ PY
     # each, and /trailers-frag is a legal block split across a CONTINUATION.
     for mode in oracle driver; do
         [ "$mode" = driver ] && argv="0 drv" || argv=""
-        for bad in /ps-dup /ps-dup-rev /ps-dup-cont /ps-after /ps-unknown; do
+        for bad in /ps-dup /ps-dup-rev /ps-dup-cont /ps-after /ps-unknown \
+                   /ps-upper /ps-UPPER /ps-mixed; do
             [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
             check "backend h2 pseudo ($mode): $bad is refused" $?
         done
@@ -903,6 +904,15 @@ PY
     check "backend h2 pseudo: an undefined pseudo-header is refused end to end" $?
     [ "$(tr_get /ps-one $CODE1)" = 200 ]
     check "backend h2 pseudo: a single :status relays end to end" $?
+    # RFC 9113 8.2.1 forbids uppercase in a field NAME, and a pseudo-header name
+    # is one. ":Status" is not another spelling of ":status" -- and it reached
+    # the status arm through a CASE-INSENSITIVE comparison that ran BEFORE the
+    # validity gate, which only the ordinary-field branch calls
+    # (audit-report-65). The comparison is exact now; the ci ones that remain
+    # are for ordinary names, reached only after every uppercase byte has
+    # already been refused. nghttp2 rejects :Status as an invalid field.
+    [ "$(tr_get /ps-upper $CODE1)" = 502 ]
+    check "backend h2 pseudo: an uppercase :Status is refused end to end" $?
 
     # --- field NAME and VALUE syntax (RFC 9113 8.2.1) -----------------------
     # A name may not be empty or carry 0x00-0x20, uppercase, 0x7f-0xff or a
