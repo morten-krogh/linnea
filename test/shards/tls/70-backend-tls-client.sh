@@ -860,6 +860,41 @@ PY
     [ "$(tr_get /cl-head $CODE1 -I)" = 200 ]
     check "backend h2 clen: a HEAD through the front still serves" $?
 
+    # --- response pseudo-headers (RFC 9113 8.3) -----------------------------
+    # Three rules, all of which the REQUEST side has enforced for a long time
+    # ("pseudo-header placement and repetition" in linnea_hpack.asm) and the
+    # response side had none of: at most one of each name per field block, all
+    # of them ahead of the regular fields, and none undefined -- :status being
+    # the only one defined for a response.
+    #
+    # /ps-dup and /ps-dup-rev are the pair that shows what last-wins costs: the
+    # SAME two values in opposite orders relayed 500 and 200 respectively, so
+    # the malformed field order chose the status the client saw. /ps-dup-cont
+    # splits the duplicate across HEADERS + CONTINUATION, because the field
+    # block is the two COMBINED (audit-report-59; -after and -unknown were found
+    # beside the filed finding, which named only the duplicate).
+    #
+    # The legal neighbours are the controls, and they are already above: an
+    # interim 1xx followed by a final response is TWO blocks with one :status
+    # each, and /trailers-frag is a legal block split across a CONTINUATION.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for bad in /ps-dup /ps-dup-rev /ps-dup-cont /ps-after /ps-unknown; do
+            [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
+            check "backend h2 pseudo ($mode): $bad is refused" $?
+        done
+        st_probe /ps-one $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 pseudo ($mode): a single literal :status relays" $?
+        st_probe /interim $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 pseudo ($mode): 1xx then final is two blocks, both legal" $?
+    done
+    [ "$(tr_get /ps-dup $CODE1)" = 502 ]
+    check "backend h2 pseudo: a repeated :status is refused end to end" $?
+    [ "$(tr_get /ps-unknown $CODE1)" = 502 ]
+    check "backend h2 pseudo: an undefined pseudo-header is refused end to end" $?
+    [ "$(tr_get /ps-one $CODE1)" = 200 ]
+    check "backend h2 pseudo: a single :status relays end to end" $?
+
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for
     # audit-report-51: a valid reset already ends the exchange in a 502, so a

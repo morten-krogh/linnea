@@ -60,7 +60,15 @@ try:
             c.sendall(frame(0x04, 0x01, 0, b""))       # ACK theirs
         if ft == 0x01 and not answered:                # HEADERS: answer blind
             answered = True
-            blk = lit(":status", status) + lit("content-type", "text/plain")
+            if mode == "psdup":            # two :status in one field block
+                blk = lit(":status", "200") + lit(":status", "500")
+            elif mode == "psafter":        # a pseudo-header behind a regular one
+                blk = lit("content-type", "text/plain") + lit(":status", status)
+            elif mode == "psunknown":      # an undefined pseudo-header
+                blk = lit(":status", status) + lit(":unknown", "x")
+            else:
+                blk = lit(":status", status)
+            blk += lit("content-type", "text/plain")
             blk += lit("content-length",
                        str(len(body)) if declare == "auto" else declare)
             c.sendall(frame(0x01, 0x04, sid, blk))

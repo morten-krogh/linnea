@@ -93,6 +93,8 @@ h2c_hdrlines_len: resq 1
 h2c_saw_pseudo: resq 1
 h2c_hdr_open:  resq 1                           ; a header block awaits its CONTINUATION
 h2c_preface_ok: resq 1                          ; the server's SETTINGS preface has arrived
+h2c_status_seen: resq 1                         ; this block already carried a :status
+h2c_regular_seen: resq 1                        ; ...and a regular field (8.3 ordering)
 h2c_cl_seen:   resq 1                           ; this block declared a content-length
 h2c_cl_val:    resq 1                           ; ...and its value (8.1.1)
 h2c_tr_cl_s:   resq 1                           ; held across a trailer decode
@@ -1777,7 +1779,9 @@ h2c_emit:
     test r13, r13
     jz .ok
     cmp byte [r12], ':'
-    je .pseudo                     ; unknown pseudo-header: not relayed
+    je .pseudo
+    mov qword [h2c_regular_seen], 1  ; 8.3: every pseudo-header comes BEFORE
+                                     ; the regular fields, so this closes them
     ; RFC 9113 8.1.1: a content-length that does not equal the sum of the DATA
     ; payloads makes the response MALFORMED, and an intermediary must not
     ; forward it. The field is still dropped here -- the composer writes its own
@@ -1802,11 +1806,28 @@ h2c_emit:
     clc
     jmp .ret
 .pseudo:
+    ; RFC 9113 8.3: a field block containing an UNDEFINED pseudo-header is
+    ; malformed, and :status is the only one defined for a response. Recording
+    ; it and dropping the field made an undefined one ordinary; the flag it set
+    ; belongs to a different rule -- pseudo-headers in a TRAILER -- and covering
+    ; one is not covering the other (audit-report-59, found beside its filed
+    ; finding). The request side has refused all of this for a long time; see
+    ; "pseudo-header placement and repetition" in linnea_hpack.asm.
     mov qword [h2c_saw_pseudo], 1
-    clc
+    stc
     jmp .ret
 .status:
     mov qword [h2c_saw_pseudo], 1
+    ; 8.3: at most one :status per field block, and it precedes every regular
+    ; field. Neither was checked, so two of them overwrote each other silently:
+    ; the same pair of values relayed 500 in one order and 200 in the other, and
+    ; the field block is the HEADERS and its CONTINUATIONs COMBINED, so the
+    ; duplicate could even be split across frames (audit-report-59).
+    cmp qword [h2c_regular_seen], 0
+    jne .badst
+    cmp qword [h2c_status_seen], 0
+    jne .badst
+    mov qword [h2c_status_seen], 1
     ; RFC 9110 15.1: a status code is EXACTLY three digits, and 9113 8.3.2 says
     ; :status carries that code. This stopped at the first byte that was not a
     ; digit and kept whatever it had accumulated, so the value was never
@@ -2409,6 +2430,8 @@ h2c_classify_block:
     mov [h2c_tr_cl_v], rax
     mov qword [h2c_cl_seen], 0       ; ...and THIS block's content-length: a
     mov qword [h2c_cl_val], 0        ; trailer's must never reach the assertion
+    mov qword [h2c_status_seen], 0   ; 8.3 is per FIELD BLOCK: an interim
+    mov qword [h2c_regular_seen], 0  ; response and the final one each get one
     mov qword [h2c_status], 0        ; judge THIS block's :status, not a stale one
     mov qword [h2c_saw_pseudo], 0
     test rbx, rbx

@@ -39,6 +39,8 @@ Routes (by :path):
   /fsz-ok /fsz-big /fsz-hdr /fsz-split -> DATA of exactly 16384, of 16385,
                    an oversized HEADERS frame, and the same head split legally
                    across HEADERS + CONTINUATION (4.2 bounds each FRAME)
+  /ps-dup /ps-dup-rev /ps-dup-cont /ps-after /ps-unknown -> a repeated,
+                   misplaced or undefined response pseudo-header; /ps-one legal
   /cl-short /cl-zero /cl-bad /cl-neg -> a content-length that does not match
                    the DATA bytes; /cl-ok /cl-304 /cl-204 /cl-head are controls
   /st-x /st-4 /st-sp /st-2x0 /st-short /st-empty -> a :status that is not
@@ -466,6 +468,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/cl-"):
         respond_clen(c, sid, path, method)
         return
+    if path.startswith("/ps-"):
+        respond_pseudo(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -566,6 +571,40 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+def respond_pseudo(c, sid, path):
+    """Pseudo-header placement and repetition in a RESPONSE (RFC 9113 8.3): the
+    same pseudo-header name must not appear twice in a field block, one may not
+    follow a regular field, and an undefined one is malformed. The request side
+    has enforced all three for a long time (linnea_hpack.asm, "the h2/h3 twin of
+    a repeated Host"); the response side had none of them (audit-report-59).
+
+    /ps-dup and /ps-dup-rev carry the SAME two values in opposite orders, so a
+    build that keeps the last relays 500 for one and 200 for the other -- the
+    difference is caused by the duplicate, not by any range check."""
+    body = b"ps-body\n"
+    ct = enc_header("content-type", "text/plain")
+    if path == "/ps-dup":             # 200 then 500: last-wins relays 500
+        blk = enc_header(":status", "200") + enc_header(":status", "500") + ct
+    elif path == "/ps-dup-rev":       # 500 then 200: last-wins relays 200
+        blk = enc_header(":status", "500") + enc_header(":status", "200") + ct
+    elif path == "/ps-after":         # a pseudo-header behind a regular field
+        blk = ct + enc_header(":status", "200")
+    elif path == "/ps-unknown":       # 8.3: an undefined pseudo-header
+        blk = enc_header(":status", "200") + enc_header(":unknown", "x") + ct
+    elif path == "/ps-one":           # the control: exactly one, spelled out
+        blk = enc_header(":status", "200") + ct
+    elif path == "/ps-dup-cont":
+        # The field block is the HEADERS and its CONTINUATIONs COMBINED, so a
+        # duplicate split across the two must be refused just the same.
+        c.send(frame(0x01, 0x00, sid, enc_header(":status", "200") + ct))
+        c.send(frame(0x09, 0x04, sid, enc_header(":status", "500")))
+        c.send(frame(0x00, 0x01, sid, body))
+        return
+    blk += enc_header("content-length", str(len(body)))
+    c.send(frame(0x01, 0x04, sid, blk))
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 def respond_clen(c, sid, path, method):
