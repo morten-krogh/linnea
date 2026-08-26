@@ -3171,6 +3171,21 @@ linnea_h2c_drv_on_recv:
     call d_dispatch                    ; rax: 0 ok, negative sentinel to return
     test rax, rax
     js .propagate
+    ; RFC 9113 5.1: the response's END_STREAM CLOSED the stream, so nothing
+    ; further in this chunk belongs to it. Parsing carried on regardless, and
+    ; the DATA arm's only lifecycle gate was hdr_done -- so a DATA frame
+    ; coalesced into the same read was appended AFTER h2c_body_ok had already
+    ; passed on the body it validated. Measured: a declared content-length of 4
+    ; relayed 8 bytes as "bodyEVIL", and a 204 acquired a 4-byte body, both
+    ; reaching real clients through proxy_h2 (audit-report-69).
+    ;
+    ; Stopping here rather than failing the exchange: the response is complete
+    ; and validated, and a backend may legitimately coalesce a GOAWAY or
+    ; SETTINGS behind it. What must never happen is the BODY changing after the
+    ; completion predicate ran. The blocking oracle has always returned at the
+    ; first END_STREAM, which is why only the driver had this.
+    cmp qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_DONE
+    je .compact
     jmp .parse
 .compact:
     ; move the unparsed tail [r13 .. in_len) to the front

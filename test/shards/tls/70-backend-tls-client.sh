@@ -822,6 +822,44 @@ PY
     [ "$(tr_get /pri-ok $CODE1)" = 200 ]
     check "backend h2 priority: a legal one still serves end to end" $?
 
+    # --- a frame AFTER the response's END_STREAM (RFC 9113 5.1) -------------
+    # END_STREAM closes the stream, so nothing further belongs to it. The
+    # resumable driver kept parsing the rest of the receive chunk, and the DATA
+    # arm's only lifecycle gate was hdr_done -- so a DATA frame coalesced into
+    # the same read was appended AFTER h2c_body_ok had passed on the body it
+    # validated (audit-report-69). Measured, reaching real clients:
+    #
+    #   /post-data    declared 4, relayed 8 as "bodyEVIL"
+    #   /post-hdr-es  a 204 acquired a 4-byte body, content-length: 4
+    #
+    # The frames must be COALESCED into one read; /post-split sends the same
+    # legal response across two reads and is the control that misses it
+    # entirely. /post-ok is the same legal response in one write.
+    #
+    # These rows assert the BYTES. A status check sees 200 either way -- that is
+    # exactly how audit-report-64's boundary row missed audit-report-67.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        pe=$(st_probe_body /post-data $argv)
+        printf '%s' "$pe" | grep -q "^content-length: 4" \
+            && ! printf '%s' "$pe" | grep -q "EVIL"
+        check "backend h2 post-end ($mode): DATA after END_STREAM is not appended" $?
+        pe=$(st_probe_body /post-hdr-es $argv)
+        printf '%s' "$pe" | grep -q "^HTTP/1.1 204" \
+            && printf '%s' "$pe" | grep -q "^content-length: 0" \
+            && ! printf '%s' "$pe" | grep -q "EVIL"
+        check "backend h2 post-end ($mode): ...nor after a head that ended the stream" $?
+        for ok in /post-ok /post-split; do
+            st_probe_body $ok $argv | grep -q "^content-length: 4"
+            check "backend h2 post-end ($mode): $ok relays normally" $?
+        done
+    done
+    pe=$(tr_get /post-data $H1)
+    printf '%s' "$pe" | grep -qi "^content-length: 4" && ! printf '%s' "$pe" | grep -q "EVIL"
+    check "backend h2 post-end: the extra bytes never reach a client" $?
+    [ "$(tr_get /post-ok $CODE1)" = 200 ]
+    check "backend h2 post-end: a coalesced legal response still serves" $?
+
     # --- the :status GRAMMAR (RFC 9113 8.3.2, RFC 9110 15.1) ----------------
     # A status code is EXACTLY three digits. The h2 leg stopped at the first
     # byte that was not a digit and kept what it had, so the value was mined

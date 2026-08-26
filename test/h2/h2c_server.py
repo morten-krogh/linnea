@@ -490,6 +490,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/pri-"):
         respond_priority(c, sid, path)
         return
+    if path.startswith("/post-"):
+        respond_postend(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -590,6 +593,41 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+def respond_postend(c, sid, path):
+    """A frame AFTER the response's END_STREAM, in the SAME write so the client
+    reads them together (RFC 9113 5.1: the stream is closed; 8.1: the response
+    is complete). The resumable driver validated the body at END_STREAM and then
+    kept parsing the rest of the chunk, so the extra DATA was appended after its
+    own content-length check had passed (audit-report-69).
+
+    Everything goes out in ONE sendall: the defect needs the frames coalesced
+    into a single read, and sending them separately is the control that misses
+    it."""
+    body = b"body"
+    blk = enc_status(200) + enc_header("content-type", "text/plain")
+    blk += enc_header("content-length", str(len(body)))
+    if path == "/post-data":          # DATA after the final DATA
+        buf = frame(0x01, 0x04, sid, blk)
+        buf += frame(0x00, 0x01, sid, body)
+        buf += frame(0x00, 0x00, sid, b"EVIL")
+        c.send(buf)
+        return
+    if path == "/post-hdr-es":        # the head itself ended the stream
+        blk2 = enc_status(204)
+        buf = frame(0x01, 0x05, sid, blk2)
+        buf += frame(0x00, 0x00, sid, b"EVIL")
+        c.send(buf)
+        return
+    if path == "/post-split":         # the CONTROL: a legal response whose
+        c.send(frame(0x01, 0x04, sid, blk))   # frames arrive in separate reads
+        time.sleep(0.15)
+        c.send(frame(0x00, 0x01, sid, body))
+        return
+    # /post-ok: the same legal response, coalesced into one write
+    buf = frame(0x01, 0x04, sid, blk) + frame(0x00, 0x01, sid, body)
+    c.send(buf)
 
 
 def respond_priority(c, sid, path):
