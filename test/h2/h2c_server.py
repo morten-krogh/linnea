@@ -662,8 +662,11 @@ def respond_sweep(c, sid, path):
         "/sw-pconn":  ("proxy-connection", "close"),
         "/sw-tenc":   ("transfer-encoding", "chunked"),
         "/sw-upg":    ("upgrade", "websocket"),
-        "/sw-te-tr":  ("te", "trailers"),          # the one permitted value
-        "/sw-te-gz":  ("te", "gzip"),              # ...and any other is not
+        # 8.2.2's TE exception is scoped to a REQUEST ("MAY be present in an
+        # HTTP/2 request"), so neither of these belongs in a response
+        # (audit-report-66). trailers is the value that LOOKS legal.
+        "/sw-te-tr":  ("te", "trailers"),
+        "/sw-te-gz":  ("te", "gzip"),
     }
     if path in conn:
         n, v = conn[path]

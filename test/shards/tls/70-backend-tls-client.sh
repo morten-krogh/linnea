@@ -1039,12 +1039,16 @@ PY
     # nghttp2 agrees on every row here.
     for mode in oracle driver; do
         [ "$mode" = driver ] && argv="0 drv" || argv=""
-        for bad in /sw-conn /sw-ka /sw-pconn /sw-tenc /sw-upg /sw-te-gz; do
+        # TE is here too, and by DIRECTION: 8.2.2's only exception is "the TE
+        # header field, which MAY be present in an HTTP/2 REQUEST". A response
+        # has none, so both values are malformed (audit-report-66, which
+        # corrected this sweep -- it had kept te: trailers as an allowed value).
+        # A deliberate divergence from nghttp2, which serves it.
+        for bad in /sw-conn /sw-ka /sw-pconn /sw-tenc /sw-upg \
+                   /sw-te-gz /sw-te-tr; do
             [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
             check "backend h2 sweep ($mode): $bad is refused (8.2.2)" $?
         done
-        st_probe /sw-te-tr $argv | grep -q "^HTTP/1.1 200"
-        check "backend h2 sweep ($mode): te: trailers is the one allowed value" $?
 
         # RFC 9110: 1xx, 204, 205 and 304 carry no content whatever the head
         # says. A 204 whose backend sent DATA was relayed as "204 No Content"

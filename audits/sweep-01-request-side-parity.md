@@ -53,8 +53,10 @@ in as many words since its own sweep: *"stripping them stopped the smuggle into
 an h1 upstream; it did not make the request the malformed one the RFC says it
 is."*
 
-`te: trailers` is the one exception the section allows and stays accepted — it
-is the control, and nghttp2 agrees on all seven rows.
+`te: trailers` was kept accepted here as "the one exception the section
+allows". **That was wrong, and audit-report-66 corrected it**: the exception is
+scoped to a *request* ("the TE header field, which MAY be present in an HTTP/2
+request"), so a response has none. Both TE values are refused now.
 
 ### RFC 9110 — content on a status defined to carry none (three rows)
 
@@ -100,8 +102,11 @@ made above.
   block's declaration away from the assertion: `/interim-clen` relays the final
   response's own length. No consequence, and refusing it would break a backend
   that attaches a harmless length to a 103. Pinned as a fixture route.
-- **`te: trailers` in a response.** Odd but permitted, and the reference client
-  serves it.
+- ~~**`te: trailers` in a response.**~~ **Withdrawn by audit-report-66.** I wrote
+  "odd but permitted"; it is not permitted, it is *tolerated by nghttp2*. RFC
+  9113 8.2.2 scopes its only exception to a request, so a response carrying TE is
+  malformed and 8.1.1 forbids forwarding it. Refusing it is now a deliberate
+  divergence from the reference, named in `h2c_conn_specific`.
 
 ## Coverage
 

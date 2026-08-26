@@ -68,9 +68,6 @@ hop_cl_len       equ $ - hop_cl
 
 hop_tefield:     db "te"
 hop_tefield_len  equ $ - hop_tefield
-val_trailers:    db "trailers"
-val_trailers_len equ $ - val_trailers
-
 pseudo_status:   db ":status"
 pseudo_status_len equ $ - pseudo_status
 
@@ -992,11 +989,22 @@ h2c_ping_frame:
 ;   -> rax = 1 when this field makes the message malformed (RFC 9113 8.2.2).
 ;
 ; Connection, Keep-Alive, Proxy-Connection, Transfer-Encoding and Upgrade are
-; forbidden outright. TE is the single exception the section allows, and only
-; for one value: it "MUST NOT contain any value other than trailers", compared
-; case-insensitively because it is a token. nghttp2 as a client agrees on every
-; one of these in a RESPONSE -- it refuses connection, transfer-encoding and
-; "te: gzip", and serves "te: trailers".
+; forbidden outright. So is TE, and the reason is DIRECTION: 8.2.2's single
+; exception is "the TE header field, which MAY be present in an HTTP/2
+; REQUEST". A response has no exception, so TE there is an ordinary
+; connection-specific field and 8.1.1 forbids forwarding the message
+; (audit-report-66).
+;
+; The request-side rule lives in linnea_hpack.asm's emit_field, which allows TE
+; with the value "trailers"; this helper has exactly ONE caller, the response
+; emitter, so the two directions cannot be confused as long as that stays true.
+;
+; A DELIBERATE divergence from the reference, named rather than buried: nghttp2
+; as a client serves "te: trailers" in a response. It refuses everything else
+; here -- connection, transfer-encoding, "te: gzip" -- so this is the one row
+; where we are stricter, and the text is why. A server that sends TE in a
+; response is sending a request header backwards; the interop cost is a peer
+; that is already broken.
 h2c_conn_specific:
     push rbx
     push r12
@@ -1034,20 +1042,11 @@ h2c_conn_specific:
     test rax, rax
     jnz .cs_bad
     mov rdi, rbx
-    lea rdx, [hop_tefield]          ; "te": allowed, but only as "trailers"
+    lea rdx, [hop_tefield]          ; "te": request-only, so never here
     mov rcx, hop_tefield_len
     call h2c_ci_eq
     test rax, rax
-    jz .cs_ok
-    cmp r13, val_trailers_len
-    jne .cs_bad
-    mov rdi, r12
-    mov rsi, r13
-    lea rdx, [val_trailers]
-    mov rcx, val_trailers_len
-    call h2c_ci_eq
-    test rax, rax
-    jz .cs_bad
+    jnz .cs_bad
 .cs_ok:
     xor eax, eax
     jmp .cs_ret
