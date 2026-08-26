@@ -3249,6 +3249,18 @@ linnea_h2c_drv_on_recv:
     ; WINDOW_UPDATEs for the whole read instead of a pair per DATA frame. The
     ; result IS checked -- if the queue is full the credit stays pending and is
     ; staged on the next pass, so it can never be dropped (audit-report-70).
+    ; BOTH updates or neither. Staging the connection update and then failing
+    ; on the stream one left credit_pend intact with the first frame already
+    ; queued, so the retry sent a SECOND connection update for the same bytes:
+    ; the stream credited N, the connection 2N (audit-report-73, in the
+    ; audit-report-70 flush this replaces).
+    ;
+    ; Reserve the pair up front, the same whole-or-nothing rule audit-report-71
+    ; put on request DATA. 26 = two 13-byte WINDOW_UPDATE frames.
+    mov rax, [rbx+linnea_h2c.out_len]
+    add rax, 26
+    cmp rax, LINNEA_H2C_D_OUT_CAP
+    ja .no_credit                      ; no room for both: stay pending
     mov rax, [rbx+linnea_h2c.credit_pend]
     test rax, rax
     jz .no_credit

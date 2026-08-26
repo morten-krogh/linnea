@@ -888,8 +888,9 @@ PY
         sleep 1.5                      # the fixture drains, THEN reports
         kill $pid 2>/dev/null; wait $pid 2>/dev/null
         awk '/^FCX /{for(i=1;i<=NF;i++){split($i,a,"=");v[a[1]]=a[2]}}
-             END{print v["conn_credit"] > "'"$RUNDIR"'/fcx.cred"; print v["sent"]}' \
-            $RUNDIR/fcx.log
+             END{print v["conn_credit"] > "'"$RUNDIR"'/fcx.cred";
+                 print v["stream_credit"] > "'"$RUNDIR"'/fcx.scred";
+                 print v["sent"]}' $RUNDIR/fcx.log
     }
     # NOT "set --": that overwrites the SHARD's positional parameters, and the
     # runner still uses them -- the first version of this check corrupted the
@@ -971,6 +972,18 @@ PY
         check "backend h2 credit ($mode): a one-byte-frame body is credited back ($fcred/$fsent)" $?
         grep -q "^HTTP/1.1 200" $RUNDIR/fcx.out
         check "backend h2 credit ($mode): ...and the response relays" $?
+        # The connection and stream credit must MATCH. The flush stages one
+        # update for each, and staging the first and failing the second left the
+        # amount pending with the first frame already queued -- so the retry
+        # sent a second CONNECTION update for the same bytes: stream N,
+        # connection 2N (audit-report-73). The pair is reserved together now.
+        #
+        # This row is an invariant, not a reproduction: that partial state needs
+        # the queue left with 13..25 bytes free at the flush, and no arrangement
+        # of legal traffic reached it -- see the report. It fails loudly if it
+        # ever does.
+        [ "$fcred" = "$(cat $RUNDIR/fcx.scred)" ]
+        check "backend h2 credit ($mode): connection and stream credit match" $?
     done
 
     # --- the :status GRAMMAR (RFC 9113 8.3.2, RFC 9110 15.1) ----------------

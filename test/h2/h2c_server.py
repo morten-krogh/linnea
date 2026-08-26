@@ -386,6 +386,49 @@ def serve_one(sock, mode):
                 hdrs = hpack_decode(hdr_block)
                 d = dict(hdrs)
                 method, path = d.get(":method"), d.get(":path")
+                if "credpart" in c.modes:
+                    # ONE write: enough zero-length SETTINGS that their ACKs
+                    # nearly fill the client's 32 KiB output queue, then a
+                    # response whose DATA earns credit. The flush then finds
+                    # room for the CONNECTION update and not the STREAM one --
+                    # the partial state audit-report-73 describes. It needs a
+                    # 32 KiB read, so only the production path can reach it; the
+                    # harness reads 20480 and always has room for both.
+                    n = int(os.environ.get("LINNEA_QFLOOD", "3638"))
+                    buf = frame(0x04, 0x00, 0, b"") * n
+                    blk = enc_status(200) + enc_header("content-type", "text/plain")
+                    buf += frame(0x01, 0x04, sid, blk)
+                    buf += frame(0x00, 0x00, sid, b"X")
+                    c.send(buf)
+                    time.sleep(0.3)
+                    c.send(frame(0x00, 0x01, sid, b""))   # END_STREAM
+                    c.s.settimeout(3.0)
+                    try:
+                        while True:
+                            d = c.s.recv(1 << 20)
+                            if not d:
+                                break
+                            pend = getattr(c, "cp_pend", b"") + d
+                            while len(pend) >= 9:
+                                ln = int.from_bytes(pend[0:3], "big")
+                                if len(pend) < 9 + ln:
+                                    break
+                                ft = pend[3]
+                                fsid = struct.unpack(">I", pend[5:9])[0] & 0x7fffffff
+                                pay, pend = pend[9:9+ln], pend[9+ln:]
+                                if ft == 0x08:
+                                    inc = struct.unpack(">I", pay)[0] & 0x7fffffff
+                                    if fsid == 0:
+                                        c.cp_conn = getattr(c, "cp_conn", 0) + inc
+                                    else:
+                                        c.cp_stream = getattr(c, "cp_stream", 0) + inc
+                            c.cp_pend = pend
+                    except Exception:
+                        pass
+                    print("CREDPART conn=%d stream=%d"
+                          % (getattr(c, "cp_conn", 0), getattr(c, "cp_stream", 0)),
+                          file=sys.stderr, flush=True)
+                    return
                 if "earlyresp" in c.modes:
                     # the whole response, before a single body byte can arrive
                     code = 200 if "earlyresp200" in c.modes else 204
@@ -770,6 +813,11 @@ def respond_tinyframes(c, sid, path):
     # back is not visible in the response: the body IS the payload. A shard
     # captures this.
     base = c.peer_initwin if getattr(c, "peer_initwin", None) else 65535
+    if cwin - 65535 + sent != swin - base + sent:
+        print("FCX-MISMATCH conn=%d stream=%d  (connection credited more than "
+              "the stream: a duplicated WINDOW_UPDATE)"
+              % (cwin - 65535 + sent, swin - base + sent),
+              file=sys.stderr, flush=True)
     print("FCX sent=%d conn_credit=%d stream_credit=%d wu_frames=%d stalled=%s"
           % (sent, cwin - 65535 + sent, swin - base + sent,
              getattr(c, "wu_frames", 0), stalled),
