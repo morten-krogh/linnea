@@ -2982,6 +2982,7 @@ linnea_h2c_drv_start:
     mov qword [rbx+linnea_h2c.hdr_big], 0
     mov qword [rbx+linnea_h2c.hdrlines_len], 0
     mov qword [rbx+linnea_h2c.body_len], 0
+    mov qword [rbx+linnea_h2c.credit_pend], 0
     mov [rbx+linnea_h2c.req_body], rcx
     mov [rbx+linnea_h2c.req_body_len], r8
     mov qword [rbx+linnea_h2c.body_sent], 0
@@ -3200,6 +3201,26 @@ linnea_h2c_drv_on_recv:
     rep movsb
 .no_move:
     mov [rbx+linnea_h2c.in_len], r14
+    ; Return the response credit accrued while parsing this chunk: one pair of
+    ; WINDOW_UPDATEs for the whole read instead of a pair per DATA frame. The
+    ; result IS checked -- if the queue is full the credit stays pending and is
+    ; staged on the next pass, so it can never be dropped (audit-report-70).
+    mov rax, [rbx+linnea_h2c.credit_pend]
+    test rax, rax
+    jz .no_credit
+    cmp rax, 0x7fffffff
+    ja .no_credit                      ; absurd; leave it pending
+    mov esi, eax
+    xor edi, edi                       ; the connection
+    call d_stage_window
+    jc .no_credit                      ; no room: still owed, try next read
+    mov rax, [rbx+linnea_h2c.credit_pend]
+    mov esi, eax
+    mov edi, 1                         ; ...and the stream
+    call d_stage_window
+    jc .no_credit
+    mov qword [rbx+linnea_h2c.credit_pend], 0
+.no_credit:
     ; mid-upload with the window reopened (or just settled): stage the next DATA
     cmp qword [rbx+linnea_h2c.state], LINNEA_H2C_ST_SEND_BODY
     jne .chk_done
@@ -3508,12 +3529,13 @@ d_dispatch:
     ; return flow-control credit for the whole frame payload
     test r15, r15
     jz .d_es
-    mov esi, r15d
-    xor edi, edi
-    call d_stage_window
-    mov esi, r15d
-    mov edi, 1
-    call d_stage_window
+    ; Credit accrues; it is staged once per read at .compact. Two 13-byte
+    ; updates per DATA frame is 26 bytes of output for a frame that may be 10
+    ; bytes on the wire, and the staging result was ignored -- so a burst of
+    ; tiny frames overran the 32 KiB queue and the excess credit was dropped
+    ; silently. Measured on the audited build: a 20000-byte body sent as
+    ; one-byte frames got credit for 10086 of them (audit-report-70).
+    add [rbx + linnea_h2c.credit_pend], r15
 .d_es:
     mov rax, [d_fr_flags]
     test rax, LINNEA_H2C_FL_END_STREAM

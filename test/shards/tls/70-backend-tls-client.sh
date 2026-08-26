@@ -860,6 +860,51 @@ PY
     [ "$(tr_get /post-ok $CODE1)" = 200 ]
     check "backend h2 post-end: a coalesced legal response still serves" $?
 
+    # --- response flow-control credit is not dropped (RFC 9113 6.9) ---------
+    # The driver staged TWO 13-byte WINDOW_UPDATEs per response DATA frame and
+    # ignored whether either fitted in its 32 KiB queue. A frame carrying one
+    # byte is 10 bytes on the wire, so a burst of them asks for 2.6x more output
+    # queue than input, the queue fills, and the excess credit was dropped
+    # silently (audit-report-70). Credit now accrues and is staged ONCE per
+    # read, with the result CHECKED: if the queue is full it stays pending.
+    #
+    # The backend reports its own accounting on stderr, because the credit it
+    # was given back is not visible in the response -- the body IS the payload.
+    # It also tracks the connection and stream windows SEPARATELY: a fixture
+    # that adds both updates to one counter grants itself double credit and
+    # cannot see the loss at all, which is what the first version of this route
+    # did and why it reported nothing wrong.
+    #
+    # Measured on the audited build: 200000 bytes sent as one-byte frames were
+    # credited 136680 (68%); after the fix, 196608 (98%). The remainder is
+    # credit still in flight when the exchange ends, so the row asserts 90%.
+    fcx_credit() {   # $1 = body size, $2.. = extra argv; echoes "sent credit"
+        local n=$1; shift
+        python3 test/h2/h2c_server.py ${P61730} 2>$RUNDIR/fcx.log >/dev/null &
+        local pid=$!
+        sleep 0.5
+        timeout 60 ./bin/linnea-h2client ${P61730} /fcx-$n GET "$@" \
+            </dev/null >$RUNDIR/fcx.out 2>&1
+        sleep 1.5                      # the fixture drains, THEN reports
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+        awk '/^FCX /{for(i=1;i<=NF;i++){split($i,a,"=");v[a[1]]=a[2]}}
+             END{print v["conn_credit"] > "'"$RUNDIR"'/fcx.cred"; print v["sent"]}' \
+            $RUNDIR/fcx.log
+    }
+    # NOT "set --": that overwrites the SHARD's positional parameters, and the
+    # runner still uses them -- the first version of this check corrupted the
+    # suite footer into "run_tests.sh 200000 136680".
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        fsent=$(fcx_credit 200000 $argv | cut -d' ' -f1)
+        fcred=$(cat $RUNDIR/fcx.cred)
+        [ "$fsent" = 200000 ] && [ -n "$fcred" ] \
+            && [ $(( fcred * 100 )) -ge $(( fsent * 90 )) ]
+        check "backend h2 credit ($mode): a one-byte-frame body is credited back ($fcred/$fsent)" $?
+        grep -q "^HTTP/1.1 200" $RUNDIR/fcx.out
+        check "backend h2 credit ($mode): ...and the response relays" $?
+    done
+
     # --- the :status GRAMMAR (RFC 9113 8.3.2, RFC 9110 15.1) ----------------
     # A status code is EXACTLY three digits. The h2 leg stopped at the first
     # byte that was not a digit and kept what it had, so the value was mined

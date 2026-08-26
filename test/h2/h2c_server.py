@@ -332,6 +332,7 @@ def serve_one(sock, mode):
                     ident, val = struct.unpack(">HI", payload[off:off+6])
                     if ident == 0x04:             # INITIAL_WINDOW_SIZE
                         c.adv_win = val
+                        c.peer_initwin = val          # the STREAM window it grants
                 c.send(frame(0x04, 0x01, 0, b""))  # ACK
         elif ftype == 0x08:                       # WINDOW_UPDATE (ignore)
             pass
@@ -493,6 +494,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/post-"):
         respond_postend(c, sid, path)
         return
+    if path.startswith("/fcx-"):
+        respond_tinyframes(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -593,6 +597,105 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+def respond_tinyframes(c, sid, path):
+    """A legal body split into ONE-BYTE DATA frames, sent by a backend that
+    OBEYS its windows -- the only way the stall in audit-report-70 can show.
+    Each 1-byte DATA is 10 bytes on the wire and makes the client stage 26 bytes
+    of WINDOW_UPDATE (two 13-byte frames), so a burst inside one read can ask
+    for more output queue than the driver has; those staging calls ignored their
+    failure and the credit was silently lost.
+
+    The CONNECTION and STREAM windows are tracked SEPARATELY, which is the whole
+    point: the client returns credit for each on its own frame, and a fixture
+    that adds both to one counter grants itself double credit and cannot see the
+    loss at all. The first version of this route did exactly that and reported
+    no stall.
+
+    Every other fixture ignores flow control entirely, which is why this class
+    was invisible."""
+    total = int(path.rsplit("-", 1)[1])
+    blk = enc_status(200) + enc_header("content-type", "text/plain")
+    blk += enc_header("content-length", str(total))
+    c.send(frame(0x01, 0x04, sid, blk))
+    cwin = 65535                      # RFC 9113 6.9.2: the connection default
+    swin = 65535                      # the stream's, until SETTINGS says other
+    if getattr(c, "peer_initwin", None):
+        swin = c.peer_initwin
+    sent, pend, stalled = 0, b"", False
+
+    def credit(buf):
+        nonlocal cwin, swin
+        while len(buf) >= 9:
+            ln = int.from_bytes(buf[0:3], "big")
+            if len(buf) < 9 + ln:
+                break
+            ft = buf[3]
+            fsid = struct.unpack(">I", buf[5:9])[0] & 0x7fffffff
+            pay, buf = buf[9:9+ln], buf[9+ln:]
+            if ft == 0x08:
+                inc = struct.unpack(">I", pay)[0] & 0x7fffffff
+                c.wu_frames = getattr(c, "wu_frames", 0) + 1
+                if fsid == 0:
+                    cwin += inc
+                else:
+                    swin += inc
+        return buf
+
+    while sent < total:
+        room = min(cwin, swin)
+        if room <= 0:
+            try:
+                c.s.settimeout(4.0)
+                d = c.s.recv(1 << 20)
+            except Exception:
+                stalled = True
+                break                 # no credit ever arrived: the stall
+            if not d:
+                stalled = True
+                break
+            pend = credit(pend + d)
+            continue
+        n = min(room, total - sent, 4096)
+        buf = b""
+        for _ in range(n):
+            sent += 1
+            buf += frame(0x00, 0x01 if sent >= total else 0x00, sid, b"F")
+        c.send(buf)
+        cwin -= n
+        swin -= n
+        try:
+            c.s.settimeout(0.02)
+            pend = credit(pend + c.s.recv(1 << 20))
+        except Exception:
+            pass
+    # Drain to completion BEFORE reporting. Without this the number conflates
+    # "credit never sent" with "credit still in the socket buffer, unread": the
+    # blocking oracle writes its updates synchronously as it goes, so a large
+    # backlog accumulates that this fixture only sipped at, and it looked like a
+    # 30% loss it does not have.
+    c.s.settimeout(1.0)
+    try:
+        while True:
+            d = c.s.recv(1 << 20)
+            if not d:
+                break
+            pend = credit(pend + d)
+    except Exception:
+        pass
+
+    # The backend's own accounting, on stderr, because the credit it was given
+    # back is not visible in the response: the body IS the payload. A shard
+    # captures this.
+    base = c.peer_initwin if getattr(c, "peer_initwin", None) else 65535
+    print("FCX sent=%d conn_credit=%d stream_credit=%d wu_frames=%d stalled=%s"
+          % (sent, cwin - 65535 + sent, swin - base + sent,
+             getattr(c, "wu_frames", 0), stalled),
+          file=sys.stderr, flush=True)
+    if stalled:
+        return                        # leave the client waiting, as a real
+                                      # backend out of credit would
 
 
 def respond_postend(c, sid, path):

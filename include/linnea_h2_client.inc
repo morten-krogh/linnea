@@ -146,6 +146,14 @@ struc linnea_h2c
     .scheme:       resq 1
     .stream_win:   resq 1        ; our stream-1 SEND window
     .conn_win:     resq 1        ; connection SEND window
+    ; Response credit owed back to the peer, in bytes, not yet staged. The DATA
+    ; arm used to stage TWO 13-byte WINDOW_UPDATEs per frame and ignore whether
+    ; either fitted -- 26 bytes of output for a frame that can be 10 bytes on
+    ; the wire, so a burst of tiny frames inside one read asked for more queue
+    ; than exists and the excess was silently dropped (audit-report-70). Credit
+    ; accrues here and is staged ONCE per read instead, which is both lossless
+    ; and the end of that expansion ratio.
+    .credit_pend:  resq 1
     .status:       resq 1        ; decoded response :status
     .hdrblk_len:   resq 1        ; reassembled response header block length
     .hdrlines_len: resq 1        ; synthesized "name: value\r\n" bytes
