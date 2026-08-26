@@ -1147,8 +1147,27 @@ PY
         adv=$(st_probe_body /fc-adv $argv | awk -F= '/^ADVWIN=/{print $2}')
         [ "$adv" = 1048576 ]
         check "backend h2 window ($mode): the backend is promised 1 MiB ($adv)" $?
-        st_probe_body /fc-size-1048576 $argv | grep -q "^HTTP/1.1 200"
+        # ...and the boundary body is checked by its BYTES, not its status line.
+        #
+        # These rows are REGRESSION coverage, not evidence for audit-report-67,
+        # and the difference is worth stating. That report's overflow -- the
+        # composers writing head+body into a buffer sized for the body alone,
+        # 1048646 bytes into 1048576 -- has NO black-box signature here: the
+        # copy runs off the end into the very buffer it is reading from, writing
+        # the correct tail there, and the caller then reads those same bytes
+        # back. Byte-correct output, past the end of the object. I added distinct
+        # end markers to the fixture expecting them to expose it; they do not,
+        # and the pre-fix control said so by passing.
+        #
+        # The evidence for that fix is arithmetic (returned length > buffer size)
+        # and an assembly-time guard. What these rows buy is the ability to
+        # notice a future TRUNCATION, which a status-line check cannot see.
+        fcout=$(st_probe_body /fc-size-1048576 $argv)
+        printf '%s' "$fcout" | grep -q "^HTTP/1.1 200"
         check "backend h2 window ($mode): a body of exactly that size relays" $?
+        fctail=$(printf '%s' "$fcout" | tail -c 70 | tr -d 'Z' | wc -c)
+        [ "$fctail" = 0 ]
+        check "backend h2 window ($mode): ...and its last bytes are its own ($fctail stray)" $?
         [ "$(st_probe /fc-huge $argv)" = "H2C-FAIL" ]
         check "backend h2 window ($mode): twice that size is refused, not truncated" $?
     done

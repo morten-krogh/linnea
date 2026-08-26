@@ -59,7 +59,21 @@ LINNEA_H2C_SCRATCH_CAP  equ 32768    ; hpack scratch (Huffman expansion + dyn co
                                      ; -- kept equal to HDRBLK_CAP: a single
                                      ; literal may be as long as the block that
                                      ; carries it, and must still expand
-LINNEA_H2C_RESP_CAP     equ 1048576  ; synthesized h1 response (head + body)
+; The response body either path will buffer. ONE policy for both, so the
+; blocking oracle and the resumable driver cannot disagree about what fits.
+LINNEA_H2C_D_BODY_CAP   equ 1048576  ; buffered response body (v1; stream later)
+
+; The largest synthesized response HEAD: a status line, every relayed field
+; line (bounded by HDRBLK_CAP), our own content-length, and the blank line.
+LINNEA_H2C_HEAD_MAX     equ LINNEA_H2C_HDRBLK_CAP + 128
+
+; The one-buffer response output. It must hold a MAXIMUM BODY *plus* a head:
+; the body cap admits exactly 1 MiB and the composers then wrote the head in
+; front of it, so a legal 1 MiB response returned 1048646 bytes from a 1048576
+; byte buffer -- 70 bytes past the end, into whatever .bss followed
+; (audit-report-67). Sized by construction now, asserted in
+; linnea_h2_client.asm, and the composers check as well.
+LINNEA_H2C_RESP_CAP     equ LINNEA_H2C_D_BODY_CAP + LINNEA_H2C_HEAD_MAX
 LINNEA_H2C_RXCHUNK      equ 65536    ; per recv() request size
 
 ; Exchange result sentinels (rax from linnea_h2c_exchange).
@@ -67,7 +81,6 @@ LINNEA_H2C_ERR          equ -1       ; wire/decode failure -> caller 502
 LINNEA_H2C_RST          equ -2       ; backend RST_STREAM  -> caller 502
 LINNEA_H2C_GOAWAY       equ -3       ; backend GOAWAY       -> caller 502
 
-LINNEA_H2C_D_BODY_CAP   equ 1048576  ; buffered response body (v1; stream later)
 
 ; The client's advertised receive window: exactly what we can actually TAKE.
 ;

@@ -79,14 +79,21 @@ extern linnea_http_status_no_content
 %if LINNEA_H2C_INITWIN > LINNEA_H2C_D_BODY_CAP
 %error "advertised stream window exceeds the response body the driver retains"
 %endif
-%if LINNEA_H2C_INITWIN > LINNEA_H2C_RESP_CAP
-%error "advertised stream window exceeds the blocking oracle's response buffer"
+%if LINNEA_H2C_INITWIN > LINNEA_H2C_D_BODY_CAP
+%error "advertised stream window exceeds the blocking oracle's body buffer"
+%endif
+; A maximum body must still fit once the head is written IN FRONT of it. This is
+; the relationship audit-report-67 found broken: the body cap admitted exactly
+; 1 MiB and the composers then wrote 70 bytes past a 1 MiB output buffer.
+%if LINNEA_H2C_RESP_CAP < LINNEA_H2C_D_BODY_CAP + LINNEA_H2C_HEAD_MAX
+%error "the response buffer cannot hold a maximum body plus its head"
 %endif
 
 section .bss
 alignb 16
 linnea_h2c_resp_buf: resb LINNEA_H2C_RESP_CAP   ; synthesized h1 response (out)
-h2c_body_buf:  resb LINNEA_H2C_RESP_CAP         ; response body accumulation
+h2c_body_buf:  resb LINNEA_H2C_D_BODY_CAP       ; response body accumulation
+                                                ; (the SAME policy the driver uses)
 h2c_out_buf:   resb LINNEA_H2C_OUT_CAP          ; outbound frame staging
 h2c_frame_buf: resb 20480                       ; one inbound frame (hdr+payload)
 h2c_hdrblk:    resb LINNEA_H2C_HDRBLK_CAP       ; reassembled response header block
@@ -1575,8 +1582,8 @@ h2c_body_append:
     jz .ok
     mov rax, [h2c_body_len]
     lea rcx, [rax + rdx]
-    cmp rcx, LINNEA_H2C_RESP_CAP
-    ja .of
+    cmp rcx, LINNEA_H2C_D_BODY_CAP   ; the body policy, not the output buffer:
+    ja .of                           ; the head goes in front of this
     push rcx
     lea rdi, [h2c_body_buf]
     add rdi, rax
@@ -2231,6 +2238,15 @@ h2c_hdrline_append:
 ; h2c_compose() -> rax = total length written to linnea_h2c_resp_buf.
 h2c_compose:
     push rbx
+    ; Preflight. The constants make this unreachable -- RESP_CAP is sized as
+    ; body + HEAD_MAX and asserted at assembly time -- but the composer is what
+    ; actually writes, so it is what checks. An upper bound on the head: the
+    ; status line, every relayed field line, our content-length, the blank line.
+    mov rax, [h2c_hdrlines_len]
+    add rax, [h2c_body_len]
+    add rax, 128
+    cmp rax, LINNEA_H2C_RESP_CAP
+    ja .co_too_big
     lea rdi, [linnea_h2c_resp_buf]
     lea rsi, [http11]
     mov rcx, http11_len
@@ -2283,6 +2299,10 @@ h2c_compose:
     lea rax, [linnea_h2c_resp_buf]
     sub rdi, rax
     mov rax, rdi                  ; length, not the buffer address
+    pop rbx
+    ret
+.co_too_big:
+    mov rax, -1
     pop rbx
     ret
 
@@ -3540,9 +3560,24 @@ d_body_append:
     mov rax, -1
     ret
 
-; linnea_h2c_drv_compose(rdi=ctx, rsi=out) -> rax = length. Writes the h1
-; response (status line + headers + content-length + body) to `out`.
+; linnea_h2c_drv_compose(rdi=ctx, rsi=out, rdx=cap) -> rax = length, or -1 if
+; the response does not fit. Writes the h1 response (status line + headers +
+; content-length + body) to `out`.
+;
+; The capacity is a PARAMETER because the pointer is: no assembly-time assert
+; can bound a buffer the caller owns. The sibling that production uses,
+; linnea_h2c_drv_head, has taken one since audit-report-52 -- this one had not,
+; and wrote 70 bytes past a 1 MiB output for a legal 1 MiB body
+; (audit-report-67).
 linnea_h2c_drv_compose:
+    ; Preflight BEFORE the prologue: nothing is pushed yet, so the refusal is a
+    ; bare ret. An upper bound on the head -- the status line, every relayed
+    ; field line, our content-length, the blank line -- then the body.
+    mov rax, [rdi+linnea_h2c.hdrlines_len]
+    add rax, [rdi+linnea_h2c.body_len]
+    add rax, 128
+    cmp rax, rdx
+    ja .dco_too_big
     push rbx
     push r12
     push r13
@@ -3593,6 +3628,9 @@ linnea_h2c_drv_compose:
     pop r13
     pop r12
     pop rbx
+    ret
+.dco_too_big:
+    mov rax, -1
     ret
 
 ; linnea_h2c_drv_head(rdi=ctx, rsi=out, rdx=cap) -> rax = head length, or -1
@@ -3747,6 +3785,7 @@ linnea_h2c_drv_blocking:
 .done:
     lea rdi, [h2c_drv_ctx]
     lea rsi, [linnea_h2c_resp_buf]
+    mov rdx, LINNEA_H2C_RESP_CAP
     call linnea_h2c_drv_compose
     jmp .ret
 .fail:

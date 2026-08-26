@@ -608,14 +608,24 @@ def respond_flow(c, sid, path):
         return
     if path.startswith("/fc-size-"):
         total = int(path.rsplit("-", 1)[1])
+        # The first and last 70 bytes DIFFER, deliberately. The composers wrote
+        # head+body into a buffer sized for body alone, so the tail of the
+        # response landed in the .bss object that followed -- and the caller
+        # then read those 70 bytes back from there. The output stayed
+        # byte-correct only because every byte was the same character. With
+        # distinct ends, the overflow is visible from outside: the last 70 bytes
+        # come back as the FIRST 70 (audit-report-67).
+        MARK = 70
         blk = enc_status(200) + enc_header("content-type", "text/plain")
         blk += enc_header("content-length", str(total))
         c.send(frame(0x01, 0x04, sid, blk))
+        payload = b"A" * MARK + b"H" * (total - 2 * MARK) + b"Z" * MARK
         sent = 0
         while sent < total:
             n = min(16384, total - sent)
+            c.send(frame(0x00, 0x01 if sent + n >= total else 0x00, sid,
+                         payload[sent:sent + n]))
             sent += n
-            c.send(frame(0x00, 0x01 if sent >= total else 0x00, sid, b"H" * n))
         return
     if path == "/fc-huge":
         # Larger than the 1 MiB the leg can retain, but well inside the 4 MiB
