@@ -1736,18 +1736,29 @@ h2c_emit:
     jmp .ret
 .status:
     mov qword [h2c_saw_pseudo], 1
+    ; RFC 9110 15.1: a status code is EXACTLY three digits, and 9113 8.3.2 says
+    ; :status carries that code. This stopped at the first byte that was not a
+    ; digit and kept whatever it had accumulated, so the value was never
+    ; checked, only mined: "200x" and "200 " became 200, and "2000" became 200
+    ; by truncation -- a four-digit status turned into a legal one and relayed
+    ; as a clean response (audit-report-57).
+    ;
+    ; The h1 leg has rejected exactly this for a long time ("HTTP/1.1 2000" is
+    ; not a status line, see linnea_http_check_response_head). This is the same
+    ; rule finally asked of the h2 leg. The RANGE stays where it is, in the
+    ; classifier: three digits is necessary, not sufficient.
+    cmp r15, 3
+    jne .badst
     xor eax, eax
     xor ecx, ecx
 .psl:
-    cmp rcx, r15
-    jae .psd
     cmp rcx, 3
     jae .psd
     mov dl, [r14 + rcx]
     cmp dl, '0'
-    jb .psd
+    jb .badst
     cmp dl, '9'
-    ja .psd
+    ja .badst
     imul eax, eax, 10
     movzx edx, dl
     sub edx, '0'
@@ -1757,6 +1768,9 @@ h2c_emit:
 .psd:
     mov [h2c_status], rax
     clc
+    jmp .ret
+.badst:
+    stc
     jmp .ret
 .of:
     stc

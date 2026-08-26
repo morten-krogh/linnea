@@ -673,6 +673,15 @@ PY
         kill $pid 2>/dev/null; wait $pid 2>/dev/null
     }
     pump_probe() { local mode=$1; shift; up_frames $mode 8192 "$@"; }
+    st_probe() {    # $1 = path, $2.. = extra argv; first line only
+        local path=$1; shift
+        python3 test/h2/h2c_server.py ${P61730} >/dev/null 2>&1 &
+        local pid=$!
+        sleep 0.5
+        timeout 10 ./bin/linnea-h2client ${P61730} "$path" GET "$@" 2>&1 \
+            | tr '\r\0' '  ' | head -1
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
     pref_probe() {  # $1 = fixture mode, $2.. = extra argv; first line only
         local mode=$1; shift
         python3 test/h2/h2c_server.py ${P61730} $mode >/dev/null 2>&1 &
@@ -761,6 +770,42 @@ PY
     check "backend h2 preface: a response before SETTINGS is refused end to end" $?
     [ "$(tr_get_m tls,prefempty /hello $CODE1)" = 200 ]
     check "backend h2 preface: an empty SETTINGS preface serves end to end" $?
+
+    # --- the :status GRAMMAR (RFC 9113 8.3.2, RFC 9110 15.1) ----------------
+    # A status code is EXACTLY three digits. The h2 leg stopped at the first
+    # byte that was not a digit and kept what it had, so the value was mined
+    # rather than checked: "200x" and "200 " became 200, and "2000" became 200
+    # by TRUNCATION -- a four-digit status relayed as a clean response
+    # (audit-report-57). The h1 leg has refused "HTTP/1.1 2000" for a long time;
+    # this is the same rule finally asked of h2, the one-direction-only shape
+    # that also produced audit-report-56.
+    #
+    # /st-2x0, /st-short and /st-empty were already refused before the fix, but
+    # only incidentally: they parsed to a number below 200 and died on the RANGE
+    # check. Right outcome, wrong reason -- they are controls, and the rows that
+    # prove the fix are the three that used to succeed.
+    #
+    # /st-299 is the other control: in range and unregistered, and it must still
+    # be relayed. This is a grammar check, not an allowlist. nghttp2 1.66.0 as a
+    # client agrees on every row -- it rejects the six with "Invalid HTTP header
+    # field ... name: [:status]" and serves 200 and 299.
+    for mode in oracle driver; do
+        [ "$mode" = driver ] && argv="0 drv" || argv=""
+        for bad in /st-x /st-4 /st-sp /st-2x0 /st-short /st-empty; do
+            [ "$(st_probe $bad $argv)" = "H2C-FAIL" ]
+            check "backend h2 status ($mode): $bad is refused" $?
+        done
+        st_probe /st-200 $argv | grep -q "^HTTP/1.1 200"
+        check "backend h2 status ($mode): a literal 200 still relays" $?
+        st_probe /st-299 $argv | grep -q "^HTTP/1.1 299"
+        check "backend h2 status ($mode): an unregistered 299 still relays" $?
+    done
+    [ "$(tr_get /st-x $CODE1)" = 502 ]
+    check "backend h2 status: a :status of \"200x\" is refused end to end" $?
+    [ "$(tr_get /st-4 $CODE1)" = 502 ]
+    check "backend h2 status: a four-digit :status is refused end to end" $?
+    [ "$(tr_get /st-299 $CODE1)" = 299 ]
+    check "backend h2 status: an unregistered 299 is relayed end to end" $?
 
     # --- terminal frames: RST_STREAM (6.4) and GOAWAY (6.8) -----------------
     # These do NOT discriminate the length/stream validation added for

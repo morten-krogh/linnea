@@ -39,6 +39,8 @@ Routes (by :path):
   /fsz-ok /fsz-big /fsz-hdr /fsz-split -> DATA of exactly 16384, of 16385,
                    an oversized HEADERS frame, and the same head split legally
                    across HEADERS + CONTINUATION (4.2 bounds each FRAME)
+  /st-x /st-4 /st-sp /st-2x0 /st-short /st-empty -> a :status that is not
+                   three digits; /st-299 /st-200 are the legal controls
   /sid-hdr0 /sid-hdr3 /sid-data0 /sid-data3 -> a HEADERS or DATA frame on a
                    stream this leg never opened, before/inside a good response
   /term-rstok /term-rst3 /term-rst0 -> RST_STREAM: legal, short, stream 0
@@ -456,6 +458,9 @@ def respond(c, sid, method, path, body):
     if path.startswith("/sid-"):
         respond_wrongstream(c, sid, path)
         return
+    if path.startswith("/st-"):
+        respond_status(c, sid, path)
+        return
     if path.startswith("/term"):
         respond_terminal(c, sid, path)
         return
@@ -556,6 +561,36 @@ def respond_framesize(c, sid, path):
         return
     c.send(frame(0x01, 0x04, sid, blk))
     c.send(frame(0x00, 0x01, sid, b"U" * (16384 if path == "/fsz-ok" else 16385)))
+
+
+ST_VALUES = {                      # RFC 9110 15.1: exactly three digits
+    "/st-x":     "200x",           # a trailing byte
+    "/st-4":     "2000",           # four digits
+    "/st-sp":    "200 ",           # a trailing space
+    "/st-2x0":   "2x0",            # a non-digit inside
+    "/st-short": "20",             # two digits
+    "/st-empty": "",               # no digits at all
+    "/st-299":   "299",            # legal: in range, unregistered -- a CONTROL
+    "/st-200":   "200",            # legal, spelled as a literal not a static id
+}
+
+
+def respond_status(c, sid, path):
+    """The :status value's GRAMMAR (RFC 9113 8.3.2, RFC 9110 15.1). The h1 leg
+    has checked this for a long time -- "HTTP/1.1 2000" is not a status line --
+    while the h2 leg parsed at most three digits, stopped at the first byte that
+    was not one, and kept whatever it had accumulated. So "200x" became a clean
+    200 (audit-report-57).
+
+    /st-299 and /st-200 are the controls: an in-range unregistered code must
+    still be relayed, and this must be a check on the grammar rather than on
+    which helper the fixture used to encode the field."""
+    body = b"st-body\n"
+    blk = enc_header(":status", ST_VALUES[path])
+    blk += enc_header("content-type", "text/plain")
+    blk += enc_header("content-length", str(len(body)))
+    c.send(frame(0x01, 0x04, sid, blk))
+    c.send(frame(0x00, 0x01, sid, body))
 
 
 def respond_wrongstream(c, sid, path):

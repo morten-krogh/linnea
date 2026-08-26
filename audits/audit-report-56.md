@@ -141,17 +141,27 @@ PROTOCOL_ERROR. Our own frontend has enforced the mirror image since the
 beginning — `test/tls/h2_error_codes.py` asserts that a client preface not
 followed by SETTINGS is refused. We simply never asked it of a backend.
 
-nghttp2 1.66.0's client, against the same four fixtures:
+nghttp2 1.66.0's client, against the same fixtures:
 
 ```
-prefnone / prefping / prefack:
+prefnone / prefping / prefwin / prefack:
   [ERROR] Remote peer returned unexpected data while we expected SETTINGS frame.
   send GOAWAY frame
-prefempty:  served normally
+normal / prefempty:  recv :status: 200
 ```
 
 The reference implementation refuses exactly the rows we now refuse and accepts
 exactly the one we still accept.
+
+**Correction (2026-08-26, while auditing report 57).** That table originally
+listed three refusals and claimed `prefempty` was "served normally". The
+refusals were real, but the `prefempty` row was read off an ABSENCE of error
+output — and nghttp2 could not have been served by that fixture at all: it
+huffman-codes its request headers, which the fixture's HPACK decoder cannot
+read, so it gets no response from any route. `prefwin` was never run. Both rows
+above were re-measured against a minimal probe server that answers the first
+HEADERS frame without decoding it (`probe_h2.py`, written for report 57). The
+conclusion held, but it had been asserted on evidence that did not support it.
 
 ### The fix, in two places rather than five
 
