@@ -251,6 +251,36 @@ prio_umlist: db "u=7,zz=(1 2);p=3"   ; an inner list: skipped, never refused
 prio_umlist_len equ $ - prio_umlist
 prio_umi:   db "u=7,zz=?1,i"         ; ...and the member after it still applies
 prio_umi_len equ $ - prio_umi
+; audit-report-87: an unknown member's INNER LIST is walked now, not skipped.
+; inner-list = "(" *SP [ sf-item *( 1*SP sf-item ) *SP ] ")" parameters.
+prio_ilunt: db "u=7,zz=(1 ", 34, "unterminated"   ; the report's own case
+prio_ilunt_len equ $ - prio_ilunt
+prio_ilnoc: db "u=7,zz=(1 2"         ; no closing paren
+prio_ilnoc_len equ $ - prio_ilnoc
+prio_ilcom: db "u=7,zz=(1,2)"        ; items are separated by SP, not commas
+prio_ilcom_len equ $ - prio_ilcom
+prio_ilbad: db "u=7,zz=(?2)"         ; an item that is not a bare-item
+prio_ilbad_len equ $ - prio_ilbad
+prio_ilnest: db "u=7,zz=((1))"       ; 8941 has no list inside a list
+prio_ilnest_len equ $ - prio_ilnest
+prio_ilpbad: db "u=7,zz=(1;a=?2)"    ; an item parameter that does not parse
+prio_ilpbad_len equ $ - prio_ilpbad
+prio_ilok:  db "u=7,zz=(1 2)"        ; ...and the legal shapes
+prio_ilok_len equ $ - prio_ilok
+prio_ilempty: db "u=7,zz=()"         ; an empty list is legal
+prio_ilempty_len equ $ - prio_ilempty
+prio_ilpad: db "u=7,zz=( 1 2 )"      ; *SP inside the parens
+prio_ilpad_len equ $ - prio_ilpad
+prio_il2sp: db "u=7,zz=(1  2)"       ; more than one space between items
+prio_il2sp_len equ $ - prio_il2sp
+prio_ilipar: db "u=7,zz=(1;a=2 3)"   ; an item carrying parameters
+prio_ilipar_len equ $ - prio_ilipar
+prio_ilstr: db "u=7,zz=(", 34, "a b", 34, " 2)"  ; a string item with a space
+prio_ilstr_len equ $ - prio_ilstr
+prio_illpar: db "u=7,zz=(1 2);p=3"   ; parameters on the LIST
+prio_illpar_len equ $ - prio_illpar
+prio_ilnext: db "u=7,zz=(1 2),i"     ; and the member after it still applies
+prio_ilnext_len equ $ - prio_ilnext
 
 ; --- frame-length table fixtures (RFC 9000 19) ---
 fk_pad:     db 0x00
@@ -1063,6 +1093,80 @@ _start:
     lea rdi, [prio_umi]
     mov esi, prio_umi_len
     call linnea_quic_parse_priority     ; a member after an unknown one still applies
+    EXPECT rax, 7
+    EXPECT rdx, 1
+
+    ; audit-report-87: the last construct that was skipped rather than parsed.
+    lea rdi, [prio_ilunt]
+    mov esi, prio_ilunt_len
+    call linnea_quic_parse_priority     ; an unterminated string inside a list
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_ilnoc]
+    mov esi, prio_ilnoc_len
+    call linnea_quic_parse_priority     ; a list with no closing paren
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_ilcom]
+    mov esi, prio_ilcom_len
+    call linnea_quic_parse_priority     ; items separated by a comma, not SP
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_ilbad]
+    mov esi, prio_ilbad_len
+    call linnea_quic_parse_priority     ; an item that is not a bare-item
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_ilnest]
+    mov esi, prio_ilnest_len
+    call linnea_quic_parse_priority     ; a list inside a list
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_ilpbad]
+    mov esi, prio_ilpbad_len
+    call linnea_quic_parse_priority     ; an item parameter that does not parse
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    ; ...and every legal shape, which must go on costing nothing. Refusing one
+    ; of these is how this fix fails.
+    lea rdi, [prio_ilok]
+    mov esi, prio_ilok_len
+    call linnea_quic_parse_priority     ; a plain inner list
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_ilempty]
+    mov esi, prio_ilempty_len
+    call linnea_quic_parse_priority     ; an empty inner list
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_ilpad]
+    mov esi, prio_ilpad_len
+    call linnea_quic_parse_priority     ; *SP inside the parens
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_il2sp]
+    mov esi, prio_il2sp_len
+    call linnea_quic_parse_priority     ; more than one space between items
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_ilipar]
+    mov esi, prio_ilipar_len
+    call linnea_quic_parse_priority     ; an item carrying its own parameters
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_ilstr]
+    mov esi, prio_ilstr_len
+    call linnea_quic_parse_priority     ; a string item containing a space
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_illpar]
+    mov esi, prio_illpar_len
+    call linnea_quic_parse_priority     ; parameters on the list itself
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_ilnext]
+    mov esi, prio_ilnext_len
+    call linnea_quic_parse_priority     ; the member after the list still applies
     EXPECT rax, 7
     EXPECT rdx, 1
 

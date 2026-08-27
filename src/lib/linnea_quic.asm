@@ -2193,16 +2193,15 @@ linnea_quic_tp_parse:
 ; comes from RFC 7230, so it is SP *or HTAB*. A tab beside a comma is ordinary
 ; legal whitespace and must not cost the member beside it.
 ;
-; This is a two-key scanner rather than a general Structured Fields parser, and
-; one construct is left unvalidated: an unknown member whose value is an INNER
-; LIST is skipped to the next comma, because each of its items carries its own
-; parameters and validating that needs a nested walk nothing here would use. It
-; is skipped rather than refused, so a legal inner list still costs nothing.
-; Everything else -- both keys, every member, every parameter and every
-; bare-item -- is parsed, and a value that does not parse is ignored whole.
+; Every part of the dictionary is now parsed -- both keys, every member known or
+; not, every parameter, every bare-item and an unknown member's inner list -- and
+; a value that does not parse is ignored whole. What it still does NOT do is
+; interpret: an unknown member's meaning, and every parameter's, is discarded
+; once its syntax has been checked, which is what 9218 4 asks for.
 linnea_quic_parse_priority:
     mov r8d, 3                       ; default urgency
     xor r9d, r9d                     ; default incremental = false
+    xor r11d, r11d                   ; member level, not inside an inner list
     lea r10, [rdi + rsi]             ; end
     ; 8941 4.2 step 2 discards leading *SP*, not OWS -- the edges of a field
     ; value and the space beside a comma are different rules, and only the
@@ -2398,7 +2397,7 @@ linnea_quic_parse_priority:
 .pp_unk_more:
     inc rdi
     cmp rdi, r10
-    jae .pp_done                     ; a bare member ending the value
+    jae .pp_cont_end                 ; a bare member ending the value
     movzx eax, byte [rdi]
     cmp al, 'a'
     jb .pp_unk_notlc
@@ -2420,21 +2419,78 @@ linnea_quic_parse_priority:
     je .pp_unk_more
     cmp al, '='
     je .pp_unk_val
-    jmp .pp_after_value              ; a bare member: parameters, comma, or end
+    jmp .pp_cont                     ; a bare member: parameters, comma, or end
 .pp_unk_val:
     inc rdi                          ; past the "="
     cmp rdi, r10
     jae .pp_fail                     ; "zz=" with no value behind it
     cmp byte [rdi], '('
-    je .pp_adv                       ; an INNER LIST. Its items each carry their
-                                     ; own parameters, so validating one needs a
-                                     ; nested walk this two-key scanner has no
-                                     ; use for. Skipped as before rather than
-                                     ; refused: a legal inner list must not
-                                     ; become a parse failure, and no priority
-                                     ; value has ever carried one.
+    je .pp_ilist                     ; an inner list, walked below
     jmp .pp_bare_item                ; anything else is a bare-item, and there
                                      ; is already a parser for those
+
+.pp_cont:
+    ; Where a parsed item or parameter goes next. At member level that is
+    ; .pp_after_value; inside an inner list the items belong to the list, and it
+    ; decides. r11 says which, and it is the only state the nesting needs --
+    ; 8941 has no inner list inside an inner list.
+    test r11, r11
+    jz .pp_after_value
+    jmp .pp_ilist_item_done
+.pp_cont_end:
+    ; ...and the same question when the input simply ran out. At member level
+    ; that ends the value; inside a list it means no ")" ever came.
+    test r11, r11
+    jnz .pp_fail
+    jmp .pp_done
+
+.pp_ilist:
+    ; inner-list = "(" *SP [ sf-item *( 1*SP sf-item ) *SP ] ")" parameters,
+    ; and sf-item = bare-item parameters. An unknown member may carry one, and
+    ; 8941 4.2 still requires it to parse even though 9218 4 ignores what it
+    ; means (audit-report-87). It used to be skipped to the next comma.
+    inc rdi                          ; past the "("
+    mov r11d, 1                      ; items come back to this walk, not to
+                                     ; .pp_after_value
+.pp_ilist_lead:
+    cmp rdi, r10
+    jae .pp_fail                     ; unterminated
+    movzx eax, byte [rdi]
+    cmp al, ' '
+    je .pp_ilist_lead_sp
+    cmp al, ')'
+    je .pp_ilist_close               ; "()" is an empty list, which is legal
+    jmp .pp_bare_item                ; an item: parsed, then .pp_cont
+.pp_ilist_lead_sp:
+    inc rdi
+    jmp .pp_ilist_lead
+.pp_ilist_item_done:
+    ; after an item: its parameters, a space before the next one, or the close
+    cmp rdi, r10
+    jae .pp_fail                     ; unterminated
+    movzx eax, byte [rdi]
+    cmp al, ';'
+    je .pp_params                    ; the ITEM's parameters -- r11 stays set,
+                                     ; so they come back here too
+    cmp al, ' '
+    je .pp_ilist_sp
+    cmp al, ')'
+    je .pp_ilist_close
+    jmp .pp_fail                     ; items are separated by spaces, nothing else
+.pp_ilist_sp:
+    inc rdi
+    cmp rdi, r10
+    jae .pp_fail
+    movzx eax, byte [rdi]
+    cmp al, ' '
+    je .pp_ilist_sp                  ; *SP is allowed before the ")"
+    cmp al, ')'
+    je .pp_ilist_close
+    jmp .pp_bare_item                ; another item
+.pp_ilist_close:
+    inc rdi                          ; past the ")"
+    xor r11d, r11d                   ; back to member level
+    jmp .pp_after_value              ; the list itself may carry parameters
 
 .pp_params:
     ; RFC 8941: parameters = *( ";" *SP parameter ), parameter = param-key
@@ -2467,7 +2523,7 @@ linnea_quic_parse_priority:
 .pp_par_more:
     inc rdi
     cmp rdi, r10
-    jae .pp_done                     ; a bare parameter ending the value
+    jae .pp_cont_end                 ; a bare parameter ending the value
     movzx eax, byte [rdi]
     cmp al, 'a'
     jb .pp_par_notlc
@@ -2489,7 +2545,7 @@ linnea_quic_parse_priority:
     je .pp_par_more
     cmp al, '='
     je .pp_par_val
-    jmp .pp_after_value              ; the key ended: another ";", a comma, OWS
+    jmp .pp_cont                     ; the key ended: another ";", a comma, OWS
                                      ; then a comma, or the end -- or a failure
 .pp_par_val:
     ; RFC 8941 3.3: a parameter's value is a bare-item, and there are six of
@@ -2531,7 +2587,7 @@ linnea_quic_parse_priority:
     movzx eax, byte [rdi]
     inc rdi
     cmp al, '"'
-    je .pp_after_value               ; closed
+    je .pp_cont               ; closed
     cmp al, 92                       ; a backslash escapes only " and itself
     je .pp_b_str_esc
     cmp al, 0x20
@@ -2558,9 +2614,9 @@ linnea_quic_parse_priority:
     movzx eax, byte [rdi]
     inc rdi
     cmp al, '0'
-    je .pp_after_value
+    je .pp_cont
     cmp al, '1'
-    je .pp_after_value
+    je .pp_cont
     jmp .pp_fail
 
     ; sf-binary = ":" *( ALPHA / DIGIT / "+" / "/" / "=" ) ":"
@@ -2572,7 +2628,7 @@ linnea_quic_parse_priority:
     movzx eax, byte [rdi]
     inc rdi
     cmp al, ':'
-    je .pp_after_value
+    je .pp_cont
     cmp al, '+'
     je .pp_b_bin_c
     cmp al, '/'
@@ -2637,13 +2693,13 @@ linnea_quic_parse_priority:
 .pp_b_num_fend:
     test ecx, ecx
     jz .pp_fail                      ; "1." with nothing behind the dot
-    jmp .pp_after_value
+    jmp .pp_cont
 .pp_b_num_end:
     test ecx, ecx
     jz .pp_fail                      ; "-" alone
     cmp ecx, 15
     ja .pp_fail                      ; an integer takes at most 15
-    jmp .pp_after_value
+    jmp .pp_cont
 
     ; sf-token = ( ALPHA / "*" ) *( tchar / ":" / "/" )
 .pp_b_tok:
@@ -2661,7 +2717,7 @@ linnea_quic_parse_priority:
 .pp_b_tok_more:
     inc rdi
     cmp rdi, r10
-    jae .pp_done                     ; the token ends the value
+    jae .pp_cont_end                     ; the token ends the value
     movzx eax, byte [rdi]
     cmp al, ':'
     je .pp_b_tok_more
@@ -2711,7 +2767,7 @@ linnea_quic_parse_priority:
     je .pp_b_tok_more
     cmp al, '~'
     je .pp_b_tok_more
-    jmp .pp_after_value              ; the token ended here
+    jmp .pp_cont              ; the token ended here
 .pp_fail:
     ; RFC 8941 4.2: "If parsing fails ... the entire field value MUST be ignored
     ; (i.e., treated as if the field were not present)". Not the member -- the
@@ -2721,7 +2777,7 @@ linnea_quic_parse_priority:
     jmp .pp_done
 .pp_adv:
     cmp rdi, r10                     ; advance to the next comma
-    jae .pp_done
+    jae .pp_cont_end
     cmp byte [rdi], ','
     je .pp_next
     inc rdi
