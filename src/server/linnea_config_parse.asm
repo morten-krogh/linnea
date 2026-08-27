@@ -1441,7 +1441,7 @@ linnea_parse_location:
     jz .bad_proxy
     ; prebuild this backend's sockaddr_in
     mov r14, [rbx + linnea_config_location.proxy_count]
-    shl r14, 4                         ; * sizeof(sockaddr_in slot)
+    imul r14, r14, LINNEA_PROXY_ADDR_SIZE
     lea rdi, [rbx + linnea_config_location.proxy_addr]
     add rdi, r14
     mov word [rdi], LINNEA_AF_INET
@@ -1449,6 +1449,9 @@ linnea_parse_location:
     mov [rdi + 2], ax
     mov [rdi + 4], r15d
     mov qword [rdi + 8], 0
+    ; the slot is wider than the address in it: say how much of it to send
+    mov r14, [rbx + linnea_config_location.proxy_count]
+    mov qword [rbx + linnea_config_location.proxy_addrlen + r14 * 8], LINNEA_SOCKADDR_IN_SIZE
     inc qword [rbx + linnea_config_location.proxy_count]
     pop r15
     pop r14

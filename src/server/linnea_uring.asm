@@ -68,6 +68,7 @@ extern linnea_upstream_open
 extern linnea_upstream_park
 extern linnea_upstream_closed
 extern linnea_upstream_addr
+extern linnea_upstream_addrlen
 extern linnea_upstream_pick
 extern linnea_upstream_mark_ok
 extern linnea_upstream_mark_fail
@@ -4248,10 +4249,14 @@ linnea_uring_arm_connect:
     mov rdi, [rbx + linnea_connection.location]
     mov rsi, [rbx + linnea_connection.up_backend]
     call linnea_upstream_addr          ; the CHOSEN backend, not the first
-    mov rcx, rax
+    mov rcx, rax                       ; (addrlen does not touch rcx)
+    mov rdi, [rbx + linnea_connection.location]
+    mov rsi, [rbx + linnea_connection.up_backend]
+    call linnea_upstream_addrlen       ; the slot is wider than the address in it
+    mov rdx, rax
     pop rax
     mov [rax + LINNEA_SQE_ADDR], rcx
-    mov qword [rax + LINNEA_SQE_OFF], LINNEA_SOCKADDR_IN_SIZE
+    mov [rax + LINNEA_SQE_OFF], rdx
     mov rcx, [rbx + linnea_connection.index]
     shl rcx, 8
     or rcx, LINNEA_UD_CONNECT
@@ -4514,10 +4519,14 @@ linnea_uring_arm_h2p_ops:
     mov rdi, [r12 + linnea_h2p.location]
     mov rsi, [r12 + linnea_h2p.backend]
     call linnea_upstream_addr
-    mov rcx, rax
+    mov rcx, rax                       ; (addrlen does not touch rcx)
+    mov rdi, [r12 + linnea_h2p.location]
+    mov rsi, [r12 + linnea_h2p.backend]
+    call linnea_upstream_addrlen       ; the slot is wider than the address in it
+    mov rdx, rax
     pop rax
     mov [rax + LINNEA_SQE_ADDR], rcx
-    mov qword [rax + LINNEA_SQE_OFF], LINNEA_SOCKADDR_IN_SIZE
+    mov [rax + LINNEA_SQE_OFF], rdx
     mov edx, LINNEA_UD_H2UP_CONNECT
     jmp .ao_finish
 

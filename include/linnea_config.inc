@@ -6,13 +6,26 @@ LINNEA_MAX_HOST         equ 63       ; max host string length (buffer +1 for NUL
 LINNEA_MAX_HOSTNAME     equ 255      ; max hostname string length (DNS limit)
 LINNEA_MAX_PREFIX       equ 255      ; max location prefix length
 LINNEA_MAX_ROOT         equ 255      ; max document root path length
-LINNEA_MAX_PROXY_STR    equ 63       ; max proxy "ip:port" string length
+LINNEA_MAX_PROXY_STR    equ 127      ; max proxy address string length. 63 held
+                                     ; "ip:port" with room to spare; a Unix-socket
+                                     ; backend spells "unix:" plus a sun_path of up
+                                     ; to 107, so 112 is the real requirement.
 ; Backends one proxy location may name. A location used to hold exactly one
 ; upstream; naming several is what lets a dead one be stepped over instead of
-; answered with a 502. Eight is generous for this server's shape and costs
-; ~66 KB of .bss across every location of every server, against a 238 MB total.
+; answered with a 502. Eight is generous for this server's shape. Six arrays
+; are strided by this: proxy_addr(112) + proxy_addrlen(8) + proxy_str(128) +
+; proxy_str_len(8) + bk_dead_at(8) + bk_fails(8) = 272 B per backend, so
+; naming eight rather than one costs 1904 B per location -- 238 KB across
+; every location of every server, against a 231 MB .bss total. It was ~91 KB
+; before the address slot widened to hold a sockaddr_un; recompute this line
+; rather than trusting it if any of the six change again.
 LINNEA_MAX_BACKENDS     equ 8
 LINNEA_MAX_SNI          equ 255      ; max backend SNI hostname length
+; One backend address slot. Holds a sockaddr_in (16) or a sockaddr_un (110:
+; u16 family + 108 sun_path); 112 keeps the slot 8-byte aligned. Deliberately
+; a literal rather than derived from LINNEA_SOCKADDR_*_SIZE: this header has no
+; includes of its own and is included BEFORE linnea_syscall.inc in some files.
+LINNEA_PROXY_ADDR_SIZE  equ 112
 LINNEA_MAX_LOG          equ 255      ; max log file path length
 LINNEA_MAX_CONFIG_FILE  equ 1 << 20  ; sanity cap on config file size
 
@@ -89,7 +102,12 @@ struc linnea_config_location
     ; Each sockaddr_in is prebuilt at parse time and lives in the parsed config,
     ; so it outlives any SQE that points at it.
     .proxy_count:   resq 1                        ; 1..LINNEA_MAX_BACKENDS
-    .proxy_addr:    resb 16 * LINNEA_MAX_BACKENDS ; upstream sockaddr_in[]
+    .proxy_addr:    resb LINNEA_PROXY_ADDR_SIZE * LINNEA_MAX_BACKENDS
+    ; The bytes of .proxy_addr that are actually the address: sizeof(sockaddr_in)
+    ; for an AF_INET backend. Stored rather than derived, so the connect path
+    ; never walks a path to measure it -- and so the rule about what a family's
+    ; addrlen is lives at the one place that built the address.
+    .proxy_addrlen: resq LINNEA_MAX_BACKENDS
     .proxy_str:     resb (LINNEA_MAX_PROXY_STR + 1) * LINNEA_MAX_BACKENDS
     .proxy_str_len: resq LINNEA_MAX_BACKENDS      ; "ip:port" each, for dump/log
     ; --- backend TLS (roadmap #1 Tier 0): connect to the backends over TLS 1.3

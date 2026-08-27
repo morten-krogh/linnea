@@ -56,6 +56,7 @@ global linnea_upstream_reap_one
 global linnea_upstream_pool_close
 global linnea_upstream_pick
 global linnea_upstream_addr
+global linnea_upstream_addrlen
 global linnea_upstream_mark_ok
 global linnea_upstream_mark_fail
 global linnea_upstream_log_oversize
@@ -131,8 +132,16 @@ up_log:
 ; The address lives in the parsed config, so it outlives any SQE pointing at it.
 linnea_upstream_addr:
     mov rax, rsi
-    shl rax, 4
+    imul rax, rax, LINNEA_PROXY_ADDR_SIZE
     lea rax, [rdi + rax + linnea_config_location.proxy_addr]
+    ret
+
+; linnea_upstream_addrlen(rdi = location, rsi = backend index) -> rax = addrlen
+; How many bytes of the slot linnea_upstream_addr returned are the address.
+; The slot is sized for the largest family; connect(2) must be told the size of
+; the one actually in it.
+linnea_upstream_addrlen:
+    mov rax, [rdi + linnea_config_location.proxy_addrlen + rsi * 8]
     ret
 
 ; linnea_upstream_pick(rdi = location) -> rax = backend index
