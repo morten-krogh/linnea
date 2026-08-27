@@ -445,15 +445,35 @@ kill $au_pid 2>/dev/null
 # rather than the real backend, which is why both ends are asserted here.
 apidir="$PWD/$RUNDIR/pathmax"; mkdir -p "$apidir"
 while [ ${#apidir} -lt 92 ]; do apidir="$apidir/dddddddd"; mkdir -p "$apidir"; done
+# A SENTINEL with the same executable name, started before the loop and required
+# to survive it. This block used `pkill -x linnea-api` to clean up, which matches
+# the executable name GLOBALLY: on this host it matched both production backends
+# and spared them only because they run as linnea-svc and the suite runs as
+# linnea, so the kernel refused the signal. That is an accident of user
+# separation, not a safeguard -- as root, or beside a second suite run, the kill
+# lands (audit-report-94). Each listener is now signalled by its own PID, and
+# this sentinel is what keeps it that way.
+sentinel_sock="$PWD/$RUNDIR/sentinel.sock"
+./bin/linnea-api "unix:$sentinel_sock" "$PWD/$RUNDIR" >/dev/null 2>&1 &
+sentinel_pid=$!
+for _ in $(seq 1 50); do [ -S "$sentinel_sock" ] && break; sleep 0.1; done
 for want in 107 108; do
     n=$(( want - ${#apidir} - 1 ))
     sk="$apidir/$(printf "%${n}s" | tr " " "s")"
-    out=$(timeout 5 ./bin/linnea-api "unix:$sk" "$PWD/$RUNDIR" 2>&1 | head -1)
+    of="$RUNDIR/pathmax-$want.out"; : > "$of"
+    ./bin/linnea-api "unix:$sk" "$PWD/$RUNDIR" > "$of" 2>&1 &
+    ap_pid=$!
+    for _ in $(seq 1 50); do [ -s "$of" ] && break; sleep 0.1; done
+    out=$(head -1 "$of")
     case "$want:$out" in
         107:*"listening on unix"*) r=0 ;;   # the maximum must START
         108:*"cannot bind"*)       r=0 ;;   # one past it must NOT
         *)                         r=1 ;;
     esac
     check "linnea-api: a ${want}-byte socket path (len ${#sk}) is handled" $r
-    pkill -x linnea-api 2>/dev/null
+    kill "$ap_pid" 2>/dev/null            # only the one THIS loop started
+    wait "$ap_pid" 2>/dev/null
 done
+kill -0 "$sentinel_pid" 2>/dev/null
+check "linnea-api: the boundary checks kill only their own process" $?
+kill "$sentinel_pid" 2>/dev/null; wait "$sentinel_pid" 2>/dev/null
