@@ -152,6 +152,34 @@ prio_range: db "u=1,u=9"              ; a repeated key takes the LAST value
 prio_range_len equ $ - prio_range
 prio_trail: db "u=1,"                 ; a trailing comma is a parse failure
 prio_trail_len equ $ - prio_trail
+; audit-report-83: a ";" introduces PARAMETERS, and they have a grammar too --
+; ";" *SP key [ "=" bare-item ]. The key is checked; the value is skipped.
+prio_pareq: db "u=7;="                ; "=" is not a key
+prio_pareq_len equ $ - prio_pareq
+prio_parq:  db "i;", 34               ; nor is a quote
+prio_parq_len equ $ - prio_parq
+prio_parsp: db "u=7;bad space"        ; a key, then a word with no separator
+prio_parsp_len equ $ - prio_parsp
+prio_parno: db "u=7;"                 ; a ";" with no parameter behind it
+prio_parno_len equ $ - prio_parno
+prio_pardup: db "u=7;;q=1"            ; an empty parameter
+prio_pardup_len equ $ - prio_pardup
+prio_parup: db "u=5;Q=1"              ; 8941 keys are lcalpha: "Q" is not one
+prio_parup_len equ $ - prio_parup
+prio_parnov: db "u=5;q="              ; "=" with no bare-item after it
+prio_parnov_len equ $ - prio_parnov
+prio_parok: db "u=5;q=1"              ; ...and the legal shapes
+prio_parok_len equ $ - prio_parok
+prio_parsp2: db "u=5; q=1"            ; 8941 allows SP after the ";"
+prio_parsp2_len equ $ - prio_parsp2
+prio_partwo: db "u=5;q=1;r=2"         ; two parameters
+prio_partwo_len equ $ - prio_partwo
+prio_parstar: db "u=5;*k=1"           ; a key may start with "*"
+prio_parstar_len equ $ - prio_parstar
+prio_parbare: db "u=5;a;b"            ; parameters with no value
+prio_parbare_len equ $ - prio_parbare
+prio_parstr: db "u=5;q=", 34, "x", 34 ; a value we do not interpret
+prio_parstr_len equ $ - prio_parstr
 
 ; --- frame-length table fixtures (RFC 9000 19) ---
 fk_pad:     db 0x00
@@ -725,6 +753,77 @@ _start:
     mov esi, prio_unk_len
     call linnea_quic_parse_priority     ; "u=1,zz=3" -> the 1 stands
     EXPECT rax, 1
+    EXPECT rdx, 0
+
+    ; audit-report-83: the ";" branch was the one door left open by the rule
+    ; above -- it ended the member and sent the rest away unread, so a value
+    ; whose PARAMETERS do not parse still applied its urgency.
+    lea rdi, [prio_pareq]
+    mov esi, prio_pareq_len
+    call linnea_quic_parse_priority     ; "u=7;=" -> "=" is not a key
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_parq]
+    mov esi, prio_parq_len
+    call linnea_quic_parse_priority     ; 'i;"' -> nor is a quote
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_parsp]
+    mov esi, prio_parsp_len
+    call linnea_quic_parse_priority     ; "u=7;bad space" -> no separator
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_parno]
+    mov esi, prio_parno_len
+    call linnea_quic_parse_priority     ; "u=7;" -> a ";" behind nothing
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_pardup]
+    mov esi, prio_pardup_len
+    call linnea_quic_parse_priority     ; "u=7;;q=1" -> an empty parameter
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_parup]
+    mov esi, prio_parup_len
+    call linnea_quic_parse_priority     ; "u=5;Q=1" -> 8941 keys are lcalpha
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_parnov]
+    mov esi, prio_parnov_len
+    call linnea_quic_parse_priority     ; "u=5;q=" -> no bare-item
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    ; the controls: every legal parameter shape must still leave its member
+    ; applied. This fix fails by refusing them.
+    lea rdi, [prio_parok]
+    mov esi, prio_parok_len
+    call linnea_quic_parse_priority     ; "u=5;q=1"
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_parsp2]
+    mov esi, prio_parsp2_len
+    call linnea_quic_parse_priority     ; "u=5; q=1" -- SP after the ";"
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_partwo]
+    mov esi, prio_partwo_len
+    call linnea_quic_parse_priority     ; "u=5;q=1;r=2"
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_parstar]
+    mov esi, prio_parstar_len
+    call linnea_quic_parse_priority     ; "u=5;*k=1" -- a key may start with *
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_parbare]
+    mov esi, prio_parbare_len
+    call linnea_quic_parse_priority     ; "u=5;a;b" -- parameters with no value
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_parstr]
+    mov esi, prio_parstr_len
+    call linnea_quic_parse_priority     ; a quoted value we never interpret
+    EXPECT rax, 5
     EXPECT rdx, 0
 
     ; --- reset_scan captures a PATH_CHALLENGE bundled behind other frames, so the

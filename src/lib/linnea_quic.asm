@@ -2195,9 +2195,11 @@ linnea_quic_tp_parse:
 ;
 ; This is a two-key scanner, not a general Structured Fields parser: an unknown
 ; member's VALUE is skipped rather than validated, so a syntax error inside one
-; ("zz=?9") is not detected, and a comma inside a quoted string is read as a
-; separator. Neither can change scheduling, which is what the failure rule above
-; exists to protect, and priority is advisory (9218 2).
+; ("zz=?9") is not detected; a PARAMETER's key is checked but its value is
+; likewise skipped rather than typed (";q=@"); and a comma or semicolon inside a
+; quoted string is read as a delimiter. None of them can change scheduling,
+; which is what the failure rule above exists to protect, and priority is
+; advisory (9218 2).
 linnea_quic_parse_priority:
     mov r8d, 3                       ; default urgency
     xor r9d, r9d                     ; default incremental = false
@@ -2369,7 +2371,7 @@ linnea_quic_parse_priority:
     jae .pp_done                     ; the value ends here: nothing to separate
     movzx eax, byte [rdi]
     cmp al, ';'
-    je .pp_adv                       ; parameters: legal, and not ours to read
+    je .pp_params                    ; parameters: legal, but they must BE some
     cmp al, ','
     je .pp_next                      ; on to the next member
     cmp al, ' '
@@ -2380,6 +2382,88 @@ linnea_quic_parse_priority:
 .pp_av_ows:
     inc rdi
     jmp .pp_after_value
+.pp_params:
+    ; RFC 8941: parameters = *( ";" *SP parameter ), parameter = param-key
+    ; [ "=" param-value ], param-key = key. A ";" used to end the member and
+    ; send the rest to the skip-to-the-next-comma path unread, so "u=7;=",
+    ; "u=7;" and "u=7;;q=1" kept their urgency although none of them parses
+    ; (audit-report-83) -- the one door left open by audit-report-82's rule that
+    ; a value which does not parse is ignored whole.
+    ;
+    ; The KEY is checked here. The value is a bare-item we never interpret, so
+    ; it is skipped to the next delimiter rather than typed; see the header note
+    ; on what that cannot see.
+    inc rdi                          ; past the ';'
+.pp_par_sp:
+    cmp rdi, r10
+    jae .pp_fail                     ; a ";" with no parameter behind it
+    cmp byte [rdi], ' '
+    jne .pp_par_first
+    inc rdi                          ; 8941 allows SP after the ";"
+    jmp .pp_par_sp
+.pp_par_first:
+    ; key = ( lcalpha / "*" ) *( lcalpha / DIGIT / "_" / "-" / "." / "*" )
+    movzx eax, byte [rdi]
+    cmp al, '*'
+    je .pp_par_more
+    cmp al, 'a'
+    jb .pp_fail
+    cmp al, 'z'
+    ja .pp_fail
+.pp_par_more:
+    inc rdi
+    cmp rdi, r10
+    jae .pp_done                     ; a bare parameter ending the value
+    movzx eax, byte [rdi]
+    cmp al, 'a'
+    jb .pp_par_notlc
+    cmp al, 'z'
+    jbe .pp_par_more
+.pp_par_notlc:
+    cmp al, '0'
+    jb .pp_par_punct
+    cmp al, '9'
+    jbe .pp_par_more
+.pp_par_punct:
+    cmp al, '_'
+    je .pp_par_more
+    cmp al, '-'
+    je .pp_par_more
+    cmp al, '.'
+    je .pp_par_more
+    cmp al, '*'
+    je .pp_par_more
+    cmp al, '='
+    je .pp_par_val
+    jmp .pp_after_value              ; the key ended: another ";", a comma, OWS
+                                     ; then a comma, or the end -- or a failure
+.pp_par_val:
+    inc rdi                          ; past the "="
+    cmp rdi, r10
+    jae .pp_fail                     ; "q=" with no bare-item after it
+    movzx eax, byte [rdi]
+    cmp al, ';'
+    je .pp_fail
+    cmp al, ','
+    je .pp_fail
+    cmp al, ' '
+    je .pp_fail
+    cmp al, 9
+    je .pp_fail
+.pp_par_vskip:
+    inc rdi
+    cmp rdi, r10
+    jae .pp_done                     ; the value ends with this parameter
+    movzx eax, byte [rdi]
+    cmp al, ';'
+    je .pp_after_value
+    cmp al, ','
+    je .pp_after_value
+    cmp al, ' '
+    je .pp_after_value
+    cmp al, 9
+    je .pp_after_value
+    jmp .pp_par_vskip
 .pp_fail:
     ; RFC 8941 4.2: "If parsing fails ... the entire field value MUST be ignored
     ; (i.e., treated as if the field were not present)". Not the member -- the
