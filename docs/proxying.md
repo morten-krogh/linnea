@@ -7,24 +7,42 @@ connections are reused. The configuration keys themselves are in
 
 ## Backends
 
-Backends are **HTTP/1.1 over loopback** — `IPv4:port`, e.g. `127.0.0.1:8080`. A
-location names one backend, or an array of them:
+A backend is either a TCP address — `IPv4:port`, e.g. `127.0.0.1:8080` — or a
+**Unix domain socket**, written `unix:` followed by an absolute path. A location
+names one backend, or an array of them, and an array may mix the two:
 
 ```json
 { "prefix": "/api", "proxy": "127.0.0.1:8080" }
 { "prefix": "/api", "proxy": ["127.0.0.1:8080", "127.0.0.1:8081"] }
+{ "prefix": "/api", "proxy": "unix:/run/linnea/api.sock" }
+{ "prefix": "/api", "proxy": ["unix:/run/a.sock", "127.0.0.1:8080"] }
 ```
+
+A Unix socket is reached over the filesystem rather than the loopback TCP
+stack, so **who may reach it is a file permission** rather than "anything on
+this host". That is the reason to prefer one for a local backend. The path must
+be absolute and at most 107 bytes — `sun_path` is 108 including its NUL — and
+the abstract namespace (`unix:@name`) is deliberately not supported, since it
+has no filesystem permissions and that is the whole point.
+
+**A `unix:` backend is HTTP/1.1 cleartext only.** `proxy_tls` is refused on a
+location naming one, and `proxy_h2` with it, because backend TLS is kTLS and
+the kernel's TLS ULP does not exist for `AF_UNIX`. The config is rejected
+rather than every request failing at runtime. Nothing is lost by it: for a
+socket on the same machine the file permission *is* the boundary.
+
+linnea only ever **connects** to the socket. It never creates or unlinks one —
+that belongs to the backend.
 
 Routing to the location is by **longest matching prefix**, so `/api` and `/`
 coexist and `/api/x` goes to `/api`. The client's protocol is independent of the
 backend's: an HTTP/1.1, HTTP/2 or HTTP/3 client is served by the same HTTP/1.1
 backend, with linnea translating.
 
-> **Scope.** Backends are plaintext HTTP/1.1 on loopback. There is no backend
-> TLS, no HTTP/2 or gRPC to upstreams, and no service discovery — a location
-> names its backends literally. This is deliberate for linnea's role as an edge
-> server in front of local services; it is also the first thing to grow if that
-> role widens.
+> **Scope.** A location names its backends literally: there is no service
+> discovery. Backend TLS (`proxy_tls`, pinned by SPKI) and HTTP/2 to a backend
+> (`proxy_h2`) both exist for TCP backends; gRPC to upstreams does not. This is
+> deliberate for linnea's role as an edge server in front of local services.
 
 ## Choosing a backend
 

@@ -120,6 +120,7 @@ LINNEA_STAT_SIZE     equ 144  ; sizeof(struct stat), x86-64
 LINNEA_S_IFMT        equ 0xF000
 LINNEA_S_IFREG       equ 0x8000
 
+LINNEA_AF_UNIX       equ 1
 LINNEA_AF_INET       equ 2
 LINNEA_AF_INET6      equ 10
 LINNEA_SOCK_STREAM   equ 1
@@ -145,6 +146,9 @@ LINNEA_SO_SNDTIMEO   equ 21
 LINNEA_IPPROTO_IPV6  equ 41
 LINNEA_IPV6_V6ONLY   equ 26
 LINNEA_SOCKADDR_IN_SIZE equ 16  ; struct sockaddr_in: family u16, port u16 (BE), addr u32 (BE), zero[8]
+; struct sockaddr_un: family u16 + sun_path[108]. The path is 108 INCLUDING
+; its NUL, so 107 is the longest one that can be stored.
+LINNEA_SUN_PATH_MAX  equ 107
 LINNEA_SOCKADDR_IN6_SIZE equ 28 ; struct sockaddr_in6: family u16, port u16 (BE), flowinfo u32, addr[16], scope_id u32
 LINNEA_BACKLOG       equ 128
 LINNEA_ENOSPC   equ 28

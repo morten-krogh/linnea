@@ -101,6 +101,51 @@ test(PROXY_ARR % '["127.0.0.1:8080","127.0.0.1:8081"]',
 test(PROXY_ARR % '[ "127.0.0.1:8080" , "127.0.0.1:8081" ]',
      "proxy array: whitespace around the comma accepted", True)
 test(PROXY_ARR % '"127.0.0.1:8080"', "proxy: the bare-string form accepted", True)
+
+# --- unix: backends (docs/config.md `proxy`, docs/proxying.md "Backends") ----
+# The length rule is asserted from BOTH sides: one value at the limit tests one
+# comparison, not the boundary. sun_path is 108 including its NUL, so 107 is the
+# longest storable path and 108 must be refused.
+U107 = "/" + "a" * 106
+U108 = "/" + "a" * 107
+test(PROXY_ARR % '"unix:/run/linnea/api.sock"', "proxy: a unix: path accepted", True)
+test(PROXY_ARR % '["unix:/run/a.sock","unix:/run/b.sock"]',
+     "proxy array: two unix: backends accepted", True)
+# The doc says an array MAY mix the two; both orders, because the parser walks
+# them one at a time and a fall-through would only show up in one order.
+test(PROXY_ARR % '["unix:/run/a.sock","127.0.0.1:8080"]',
+     "proxy array: unix: then tcp accepted", True)
+test(PROXY_ARR % '["127.0.0.1:8080","unix:/run/a.sock"]',
+     "proxy array: tcp then unix: accepted", True)
+test(PROXY_ARR % ('"unix:%s"' % U107), "proxy: a 107-byte unix: path accepted", True)
+test(PROXY_ARR % ('"unix:%s"' % U108), "proxy: a 108-byte unix: path rejected",
+     False, "path too long")
+test(PROXY_ARR % '"unix:run/a.sock"', "proxy: a relative unix: path rejected",
+     False, "must be absolute")
+test(PROXY_ARR % '"unix:@name"', "proxy: the abstract namespace rejected",
+     False, "must be absolute")
+test(PROXY_ARR % '"unix:"', "proxy: unix: with no path rejected", False,
+     "invalid proxy address")
+# ...and the TCP form still parses, which the unix: branch broke once by being
+# spliced into its fall-through.
+test(PROXY_ARR % '"127.0.0.1:8080"', "proxy: tcp still accepted beside unix:", True)
+
+# proxy_tls (and so proxy_h2) is refused on a location naming a unix: backend:
+# backend TLS is kTLS, and the TLS ULP does not exist for AF_UNIX.
+PIN = "ab" * 32
+UNIX_TLS = ('{"log":"/tmp/l","servers":[{"host":"127.0.0.1","port":8443,'
+            '"hostname":"x.test","locations":[{"prefix":"/","proxy":"unix:/run/a.sock"'
+            ',%s}]}]}')
+test(UNIX_TLS % ('"proxy_tls":1,"proxy_pin":"%s"' % PIN),
+     "proxy_tls with a unix: backend rejected", False, "cannot be used with a unix:")
+test(UNIX_TLS % ('"proxy_tls":1,"proxy_h2":1,"proxy_pin":"%s"' % PIN),
+     "proxy_h2 with a unix: backend rejected", False, "cannot be used with a unix:")
+# ...and proxy_tls on a TCP backend is still fine, so the rule is not too wide.
+TCP_TLS = ('{"log":"/tmp/l","servers":[{"host":"127.0.0.1","port":8443,'
+           '"hostname":"x.test","locations":[{"prefix":"/","proxy":"127.0.0.1:8080"'
+           ',%s}]}]}')
+test(TCP_TLS % ('"proxy_tls":1,"proxy_pin":"%s"' % PIN),
+     "proxy_tls with a tcp backend still accepted", True)
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

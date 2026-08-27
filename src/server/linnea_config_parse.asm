@@ -138,7 +138,7 @@ msg_missing_key:        db "server requires host, port, hostname and locations"
 msg_missing_key_len     equ $ - msg_missing_key
 msg_location_keys:      db "location requires prefix and exactly one of root, proxy or redirect"
 msg_location_keys_len   equ $ - msg_location_keys
-msg_bad_proxy:          db "invalid proxy address (IPv4:port required)"
+msg_bad_proxy:          db "invalid proxy address (IPv4:port or unix:/path required)"
 msg_bad_proxy_len       equ $ - msg_bad_proxy
 msg_bad_proxy_list:     db "proxy list must be an array of ip:port strings"
 msg_bad_proxy_list_len  equ $ - msg_bad_proxy_list
@@ -222,6 +222,12 @@ msg_prefix_long:        db "prefix too long"
 msg_prefix_long_len     equ $ - msg_prefix_long
 msg_proxy_long:         db "proxy address too long"
 msg_proxy_long_len      equ $ - msg_proxy_long
+msg_unix_abs:           db "proxy unix: path must be absolute (start with /)"
+msg_unix_abs_len        equ $ - msg_unix_abs
+msg_unix_long:          db "proxy unix: path too long (107 bytes max)"
+msg_unix_long_len       equ $ - msg_unix_long
+msg_unix_tls:           db "proxy_tls (and so proxy_h2) cannot be used with a unix: backend: backend TLS is kTLS and the TLS ULP does not exist for AF_UNIX"
+msg_unix_tls_len        equ $ - msg_unix_tls
 msg_errlog_bad:         db "error_log must not be empty"
 msg_errlog_bad_len      equ $ - msg_errlog_bad
 msg_log_long:           db "log too long"
@@ -1393,6 +1399,15 @@ linnea_parse_location:
     mov r14, [rbx + linnea_config_location.proxy_count]
     imul r14, r14, LINNEA_MAX_PROXY_STR + 1
     add r13, r14                       ; r13 = this backend's string
+    ; "unix:" selects a Unix-domain backend. An IPv4:port can never begin with
+    ; it, so the prefix needs no new key and the array form is unchanged.
+    cmp rdx, 5
+    jbe .proxy_inet                    ; "unix:" alone is a prefix with no path
+    cmp dword [r13], 'unix'
+    jne .proxy_inet
+    cmp byte [r13 + 4], ':'
+    je .proxy_unix
+.proxy_inet:
     xor ecx, ecx
 .proxy_colon_scan:
     cmp rcx, rdx
@@ -1458,6 +1473,48 @@ linnea_parse_location:
     pop r13
     ret
 
+.proxy_unix:
+    ; sockaddr_un. The slot is the same one an AF_INET backend uses, zeroed
+    ; first: linnea_config_instance is one .bss buffer, so a slot can still hold
+    ; a previous parse's path. connect(2) only reads addrlen bytes, so stale
+    ; tail bytes would be harmless today -- zeroing is so that stays true after
+    ; the next edit rather than resting on it.
+    lea rsi, [r13 + 5]                 ; the path
+    mov rcx, rdx
+    sub rcx, 5                         ; its length
+    cmp byte [rsi], '/'
+    jne .bad_unix_abs                  ; relative, and "@" (abstract), refused
+    cmp rcx, LINNEA_SUN_PATH_MAX
+    ja .bad_unix_long
+    mov r14, [rbx + linnea_config_location.proxy_count]
+    imul r14, r14, LINNEA_PROXY_ADDR_SIZE
+    lea rdi, [rbx + linnea_config_location.proxy_addr]
+    add rdi, r14
+    push rdi
+    push rsi
+    push rcx
+    mov rcx, LINNEA_PROXY_ADDR_SIZE    ; zero the whole slot
+    xor eax, eax
+    rep stosb                          ; advances rdi, which is why it is saved
+    pop rcx
+    pop rsi
+    pop rdi
+    mov word [rdi], LINNEA_AF_UNIX
+    push rcx
+    lea rdi, [rdi + 2]                 ; sun_path
+    mov rdx, rcx
+    call linnea_string_copy            ; copies len and NUL-terminates
+    pop rcx
+    ; addrlen counts the family, the path and its NUL -- not the whole slot
+    mov r14, [rbx + linnea_config_location.proxy_count]
+    lea rax, [rcx + 3]
+    mov [rbx + linnea_config_location.proxy_addrlen + r14 * 8], rax
+    inc qword [rbx + linnea_config_location.proxy_count]
+    pop r15
+    pop r14
+    pop r13
+    ret
+
 .member_sep:
     call linnea_parse_skip_ws
     call linnea_parse_peek
@@ -1496,6 +1553,25 @@ linnea_parse_location:
     test r12d, 64
     jz .h2_needs_tls
 .h2opt_ok:
+    ; A unix: backend cannot be TLS. Backend TLS is kTLS -- setsockopt TCP_ULP
+    ; "tls" -- and that ULP does not exist for AF_UNIX: it returns ENOTSUP,
+    ; where a TCP socket in the same state returns ENOTCONN. Refused here so it
+    ; is a config error rather than every request 502-ing at runtime. proxy_h2
+    ; requires proxy_tls, so this closes that combination too.
+    test r12d, 64                      ; proxy_tls
+    jz .unixtls_ok
+    xor ecx, ecx
+.utls_scan:
+    cmp rcx, [rbx + linnea_config_location.proxy_count]
+    jae .unixtls_ok
+    mov rax, rcx
+    imul rax, rax, LINNEA_PROXY_ADDR_SIZE
+    lea rax, [rbx + rax + linnea_config_location.proxy_addr]
+    cmp word [rax], LINNEA_AF_UNIX
+    je .unix_no_tls
+    inc rcx
+    jmp .utls_scan
+.unixtls_ok:
     and r12d, ~(16 | 32 | 64 | 128 | 256 | 512)   ; strip optional keys
     cmp r12d, 3                ; prefix + root
     je .done
@@ -1541,6 +1617,18 @@ linnea_parse_location:
 .bad_proxy:
     lea rdi, [msg_bad_proxy]
     mov esi, msg_bad_proxy_len
+    jmp linnea_parse_fail
+.unix_no_tls:
+    lea rdi, [msg_unix_tls]
+    mov esi, msg_unix_tls_len
+    jmp linnea_parse_fail
+.bad_unix_abs:
+    lea rdi, [msg_unix_abs]
+    mov esi, msg_unix_abs_len
+    jmp linnea_parse_fail
+.bad_unix_long:
+    lea rdi, [msg_unix_long]
+    mov esi, msg_unix_long_len
     jmp linnea_parse_fail
 ; These three jump out of .proxy_one without unwinding its pushes. That is safe
 ; only because linnea_parse_fail ends at linnea_error_die and the process never
