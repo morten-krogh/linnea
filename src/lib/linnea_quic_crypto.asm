@@ -21,6 +21,7 @@ global linnea_quic_hs_secrets
 global linnea_quic_app_secrets
 global linnea_quic_ku_next
 global linnea_quic_reset_secret_init
+extern linnea_random_bytes
 global linnea_quic_retry_secret_init
 global linnea_quic_retry_token_make
 global linnea_quic_retry_token_check
@@ -200,13 +201,15 @@ linnea_quic_ku_next:
 ; linnea_quic_reset_secret_init() — fill the stateless-reset key from getrandom(2).
 ; Must run once before the workers fork so they share it (a token computed after a
 ; connection's state is gone must match the one advertised at handshake).
+; -> rax = 0 seeded, -1 could not: an all-zero key here would be a FORGEABLE
+; token for the life of the process, so the caller must not start on -1.
 linnea_quic_reset_secret_init:
-    mov eax, LINNEA_SYS_GETRANDOM
+    ; Checked, and fatal. This runs once before the workers fork; an all-zero
+    ; key here would be a FORGEABLE token for the life of the process, and the
+    ; result was discarded (audit-report-96).
     lea rdi, [linnea_quic_reset_secret]
     mov esi, 32
-    xor edx, edx
-    syscall
-    ret
+    jmp linnea_random_bytes            ; its 0/-1 IS our result
 
 ; linnea_quic_reset_token(rdi = connection id (8 bytes), rsi = out 16 bytes) —
 ; the stateless-reset token for a connection id: the first 16 bytes of
@@ -603,7 +606,8 @@ linnea_quic_ticket_setup:
     lea rsi, [q_ticket_key]
     jmp linnea_aesgcm_init
 
-; linnea_quic_ticket_seal(rdi=pt, esi=pt_len, rdx=out) -> rax = sealed length.
+; linnea_quic_ticket_seal(rdi=pt, esi=pt_len, rdx=out) -> rax = sealed length,
+; or 0 if no entropy was available for the nonce: issue no ticket in that case.
 ; Writes nonce(12) || AES-GCM(pt) [ct || tag(16)] to out. No AAD.
 linnea_quic_ticket_seal:
     push rbx
@@ -612,11 +616,15 @@ linnea_quic_ticket_seal:
     mov rbx, rdi                     ; pt
     mov r12d, esi                    ; pt_len (zero-extended)
     mov r13, rdx                     ; out
+    ; The AEAD NONCE. Checked: the result was discarded, so a failure left the
+    ; PREVIOUS ticket's nonce in place and resealed under the same key -- nonce
+    ; reuse in AES-GCM, which is catastrophic rather than cosmetic
+    ; (audit-report-96). 0 tells the caller to issue no ticket at all.
     lea rdi, [r13]                   ; nonce -> out[0..11]
     mov esi, 12
-    xor edx, edx
-    mov eax, LINNEA_SYS_GETRANDOM
-    syscall
+    call linnea_random_bytes
+    test eax, eax
+    js .seal_no_entropy
     lea rdi, [q_ticket_ctx]
     mov rsi, r13                     ; nonce
     xor edx, edx                     ; aad
@@ -629,6 +637,13 @@ linnea_quic_ticket_seal:
     call linnea_aesgcm_seal
     add rsp, 16
     lea rax, [r12 + 28]              ; 12 nonce + pt_len + 16 tag
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.seal_no_entropy:
+    ; reached BEFORE the sub rsp,16 below, so only the three pushes are live
+    xor eax, eax                     ; 0 = no ticket
     pop r13
     pop r12
     pop rbx
@@ -942,13 +957,14 @@ section .text
 
 ; linnea_quic_retry_secret_init() — fill the Retry token key from getrandom(2).
 ; Must run before the workers fork, like the stateless-reset secret.
+; -> rax = 0 seeded, -1 could not; see above.
 linnea_quic_retry_secret_init:
-    mov eax, LINNEA_SYS_GETRANDOM
+    ; Checked, and fatal. This runs once before the workers fork; an all-zero
+    ; key here would be a FORGEABLE token for the life of the process, and the
+    ; result was discarded (audit-report-96).
     lea rdi, [linnea_quic_retry_secret]
     mov esi, 32
-    xor edx, edx
-    syscall
-    ret
+    jmp linnea_random_bytes            ; its 0/-1 IS our result
 
 ; retry_addr_canon(rdi = sockaddr, rsi = out, 20 bytes) — the peer address in a
 ; fixed shape: family, port, and the address bytes. The fields that can differ

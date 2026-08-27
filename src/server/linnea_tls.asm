@@ -111,6 +111,8 @@ ticket_ctx:   resb linnea_aesgcm_ctx_size
 nst_pt:       resb 48                    ; ticket plaintext: psk|issued|sni
 nst_msg:      resb 128                   ; the NewSessionTicket message
 
+extern linnea_random_bytes
+
 section .text
 
 ; ---- linnea_tls_ticket_setup() — generate the per-run ticket key and
@@ -1457,11 +1459,15 @@ build_nst:
     lea rdx, [nst_pt + 40]
     call sni_hash8
     ; ticket = nonce(12) || GCM-seal(plaintext) into the NST message body
+    ; The ticket's AEAD NONCE. Checked: the result was discarded, so a failure
+    ; left whatever the buffer held -- the PREVIOUS ticket's nonce -- and
+    ; reusing a nonce under one AES-GCM key is catastrophic, not cosmetic
+    ; (audit-report-96). No ticket at all merely costs the client resumption.
     lea rdi, [nst_msg + 17]
     mov esi, 12
-    xor edx, edx
-    mov eax, LINNEA_SYS_GETRANDOM
-    syscall
+    call linnea_random_bytes
+    test eax, eax
+    js .nst_no_entropy
     lea rdi, [ticket_ctx]
     lea rsi, [nst_msg + 17]     ; nonce
     xor edx, edx               ; no AAD
@@ -1480,6 +1486,10 @@ build_nst:
     mov eax, LINNEA_TLS_TICKET_LIFETIME
     bswap eax
     mov [nst_msg + 4], eax      ; ticket_lifetime, big-endian
+    ; Deliberately unchecked, and reachable only when entropy is working: the
+    ; nonce read above returns on failure, so getting here means getrandom
+    ; answered moments ago. ticket_age_add is anti-correlation padding, not key
+    ; material -- a stale value costs nothing (audit-report-96 sweep).
     lea rdi, [nst_msg + 8]      ; ticket_age_add: 4 random bytes
     mov esi, 4
     xor edx, edx
@@ -1497,6 +1507,15 @@ build_nst:
     mov r8, r14
     call linnea_tls_seal
     mov [rbx + linnea_tls_hs.out_len], rax
+    add rsp, 128
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.nst_no_entropy:
+    mov qword [rbx + linnea_tls_hs.out_len], 0   ; send nothing
     add rsp, 128
     pop r15
     pop r14

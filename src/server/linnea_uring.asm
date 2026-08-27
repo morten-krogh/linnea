@@ -2289,6 +2289,8 @@ linnea_uring_run:
     lea rdx, [r8 + linnea_config_location.proxy_sni]
     mov rcx, [r8 + linnea_config_location.proxy_sni_len]
     call linnea_tls_client_start          ; builds the ClientHello into hs.out
+    test eax, eax                         ; ...or could not get entropy for it
+    js .tls_hs_eof                        ; 502; nothing was sent to the backend
     mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_TLS_HS
     mov qword [r12 + linnea_connection.up_ktls], 0
     mov rdi, [r12 + linnea_connection.index]

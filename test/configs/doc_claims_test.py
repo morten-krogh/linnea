@@ -169,6 +169,18 @@ for sni_bad, why in [("", "empty"), ("127.0.0.1", "an IPv4 literal"),
                      ("l" * 64 + ".test", "a 64-byte label")]:
     test(TLSLOC % (',"proxy_sni":"%s"' % sni_bad),
          "proxy_sni rejects %s" % why, False, "must be a DNS hostname")
+# The DNS TOTAL limit, both sides. A name encodes as a length byte per label
+# plus its bytes plus a root byte -- len + 2 for the textual no-trailing-dot
+# form -- so RFC 1035's 255 octets puts the textual maximum at 253. Four
+# 63-byte labels and three dots is 255 characters: inside the buffer, and not a
+# name any resolver can represent (audit-report-96 F2).
+test(TLSLOC % (',"proxy_sni":"%s"' % ".".join(["a" * 62] * 4)[:253]),
+     "proxy_sni accepts 253 characters", True)
+test(TLSLOC % (',"proxy_sni":"%s"' % ".".join(["a" * 62] * 5)[:254]),
+     "proxy_sni rejects 254 characters", False, "must be a DNS hostname")
+test(TLSLOC % (',"proxy_sni":"%s"' % ".".join(["a" * 63] * 4)),
+     "proxy_sni rejects 4x63 labels (255 chars, 257 encoded)", False,
+     "must be a DNS hostname")
 for sni_ok in ["localhost", "api.example.com", "x1-2.test", "1a.test", "l" * 63 + ".test"]:
     test(TLSLOC % (',"proxy_sni":"%s"' % sni_ok),
          "proxy_sni accepts %s" % sni_ok[:24], True)

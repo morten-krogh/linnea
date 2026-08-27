@@ -1336,6 +1336,8 @@ linnea_parse_location:
     ; rax = the string, rdx = its length. r8/r9/r10/r11 are scratch here.
     test rdx, rdx
     jz .sni_bad                        ; empty: a zero-length HostName is illegal
+    cmp rdx, LINNEA_MAX_SNI_TEXT
+    ja .sni_bad                        ; longer than any encodable DNS name
     xor r8, r8                         ; index
     xor r9, r9                         ; current label length
     mov r11b, 1                        ; 1 = every label so far is all-digits

@@ -38,6 +38,7 @@ global cli_chunk_cap                   ; test knob: cap the blocking recv chunk
 ; in linnea_tls_client_pool.asm so this object stays free of linnea_memory_map,
 ; which the standalone harness cannot link.
 extern linnea_x25519
+extern linnea_random_bytes
 extern linnea_sha256
 extern linnea_hmac_sha256
 extern linnea_hkdf_extract
@@ -916,12 +917,18 @@ linnea_tls_client_start:
     mov qword [rbx + linnea_tls_client_hs.hs_plain_len], 0
     mov qword [rbx + linnea_tls_client_hs.parse_off], 0
     mov qword [rbx + linnea_tls_client_hs.out_len], 0
-    ; x25519 keypair
-    mov eax, LINNEA_SYS_GETRANDOM
+    ; x25519 keypair. Every entropy read is CHECKED: the arena is a reusable
+    ; per-connection slot and the pool relies on this function "fully
+    ; reinitializing" it, so a getrandom that quietly fails leaves the PREVIOUS
+    ; handshake's private key, ClientHello random and session id in place and
+    ; the leg would go on to build a ClientHello out of them. Reusing an
+    ; ephemeral private key destroys the per-connection forward-secrecy
+    ; boundary, so the leg is abandoned instead (audit-report-96).
     lea rdi, [rbx + linnea_tls_client_hs.priv]
     mov esi, 32
-    xor edx, edx
-    syscall
+    call linnea_random_bytes
+    test eax, eax
+    js .entropy_failed
     and byte [rbx + linnea_tls_client_hs.priv], 248
     and byte [rbx + linnea_tls_client_hs.priv + 31], 127
     or byte [rbx + linnea_tls_client_hs.priv + 31], 64
@@ -929,20 +936,31 @@ linnea_tls_client_start:
     lea rsi, [rbx + linnea_tls_client_hs.priv]
     lea rdx, [x25519_base]
     call linnea_x25519
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [rbx + linnea_tls_client_hs.random]
     mov esi, 32
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call linnea_random_bytes
+    test eax, eax
+    js .entropy_failed
     lea rdi, [rbx + linnea_tls_client_hs.sessid]
     mov esi, 32
-    xor edx, edx
-    syscall
+    call linnea_random_bytes
+    test eax, eax
+    js .entropy_failed
     call build_clienthello
     mov rax, [rbx + linnea_tls_client_hs.tr_len]
     mov [rbx + linnea_tls_client_hs.tr_ch_len], rax
     mov qword [rbx + linnea_tls_client_hs.state], LINNEA_CLIENT_HS_WAIT_FLIGHT
+    xor eax, eax                      ; 0 = a ClientHello is in hs.out
+    lea rsp, [rbp - 8]
+    pop rbx
+    pop rbp
+    ret
+.entropy_failed:
+    ; Nothing has been sent: out_len is still 0 and the caller has not been told
+    ; to write. Leave the state where it is and report failure -- the leg is the
+    ; caller's to abandon.
+    mov qword [rbx + linnea_tls_client_hs.out_len], 0
+    mov eax, -1
     lea rsp, [rbp - 8]
     pop rbx
     pop rbp

@@ -6091,6 +6091,8 @@ linnea_quic_server_datagram:
     mov esi, 48
     lea rdx, [q_nst_msg + 17]
     call linnea_quic_ticket_seal     ; writes 76 bytes at q_nst_msg+17
+    test rax, rax
+    jz .nst_none                     ; no entropy for the nonce: no ticket
     ; NewSessionTicket message fields
     mov byte [q_nst_msg], 0x04       ; type new_session_ticket
     mov byte [q_nst_msg + 1], 0
@@ -6121,6 +6123,14 @@ linnea_quic_server_datagram:
     mov ecx, 103
     rep movsb
     mov eax, 107                     ; 4-byte frame header + 103-byte message
+    pop r14
+    pop r12
+    pop rbx
+    ret
+.nst_none:
+    ; A ticket the client cannot use is worse than none: it costs a resumption,
+    ; where a reused nonce costs the key. 0 = emit no frame.
+    xor eax, eax
     pop r14
     pop r12
     pop rbx

@@ -23,7 +23,7 @@ QUICP256 = src/lib/linnea_p256_ecdsa.o src/lib/linnea_p256_mont.o src/lib/linnea
 # product in its own right (installed alongside the server), NOT test code — it
 # has its own _start and links only the subset of server objects it reuses.
 PROBE_BIN  = bin/linnea-probe
-PROBE_OBJS = src/probe/linnea_probe.o src/lib/linnea_print.o src/lib/linnea_string.o \
+PROBE_OBJS = src/probe/linnea_probe.o src/lib/linnea_print.o src/lib/linnea_random.o src/lib/linnea_string.o \
              src/lib/linnea_tls_kdf.o src/lib/linnea_tls_record.o src/lib/linnea_aesgcm.o \
              src/lib/linnea_sha256.o src/lib/linnea_x25519.o src/lib/linnea_fe25519.o \
              src/lib/linnea_quic.o src/lib/linnea_quic_crypto.o $(QUICP256)
@@ -64,7 +64,7 @@ SELFTEST_OBJS = test/crypto/linnea_selftest.o src/lib/linnea_sha256.o \
                 src/lib/linnea_p256_ecdsa.o src/lib/linnea_aesgcm.o src/lib/linnea_tls_kdf.o \
                 src/lib/linnea_tls_record.o src/server/linnea_tls.o src/server/linnea_pem.o \
                 src/server/linnea_tls_client.o \
-                src/lib/linnea_print.o src/lib/linnea_string.o
+                src/lib/linnea_print.o src/lib/linnea_random.o src/lib/linnea_string.o
 CRYPTO_VECS   = test/crypto/sha256_vectors.inc
 
 $(CRYPTO_VECS): test/crypto/gen_vectors.py
@@ -116,7 +116,7 @@ tlsclient: $(TLSCLIENT_BIN)
 # --- backend HTTP/2 client test harness (own _start; h2c plaintext) ---
 H2CLIENT_BIN  = bin/linnea-h2client
 H2CLIENT_OBJS = test/h2/linnea_h2client.o src/server/linnea_h2_client.o \
-                src/server/linnea_hpack.o src/lib/linnea_string.o \
+                src/server/linnea_hpack.o src/lib/linnea_random.o src/lib/linnea_string.o \
                 src/lib/linnea_http_status.o
 
 test/h2/linnea_h2client.o: test/h2/linnea_h2client.asm $(INCS)
@@ -132,7 +132,7 @@ QUICTEST_BIN  = bin/linnea-quictest
 QUICTEST_OBJS = test/quic/linnea_quictest.o src/lib/linnea_quic_crypto.o \
                 src/lib/linnea_quic.o src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o \
                 src/lib/linnea_tls_kdf.o src/lib/linnea_x25519.o src/lib/linnea_fe25519.o \
-                src/lib/linnea_print.o src/lib/linnea_string.o $(QUICP256)
+                src/lib/linnea_print.o src/lib/linnea_random.o src/lib/linnea_string.o $(QUICP256)
 
 test/quic/linnea_quictest.o: test/quic/linnea_quictest.asm test/quic/quic_vectors.inc test/quic/quic_hs_vectors.inc $(INCS)
 	$(NASM) $(NASMFLAGS) -I test/quic/ -o $@ $<
@@ -147,7 +147,7 @@ quictest: $(QUICTEST_BIN)
 NETTEST_BIN  = bin/linnea-nettest
 NETTEST_OBJS = test/net/linnea_nettest.o src/server/linnea_network.o \
                src/server/linnea_log.o src/server/linnea_error.o src/server/linnea_time.o \
-               src/lib/linnea_string.o src/lib/linnea_print.o \
+               src/lib/linnea_random.o src/lib/linnea_string.o src/lib/linnea_print.o \
                src/server/linnea_config.o src/server/linnea_config_parse.o
 
 test/net/linnea_nettest.o: test/net/linnea_nettest.asm $(INCS)
@@ -163,7 +163,7 @@ nettest: $(NETTEST_BIN)
 # The one parser every Content-Length now goes through, so the boundary it gets
 # wrong is the boundary every protocol gets wrong (audit-report-5 Finding 1).
 STRTEST_BIN  = bin/linnea-strtest
-STRTEST_OBJS = test/str/linnea_strtest.o src/lib/linnea_string.o src/lib/linnea_print.o
+STRTEST_OBJS = test/str/linnea_strtest.o src/lib/linnea_random.o src/lib/linnea_string.o src/lib/linnea_print.o
 
 test/str/linnea_strtest.o: test/str/linnea_strtest.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -179,7 +179,7 @@ QUICSRV_BIN  = bin/linnea-quicserver
 QUICSRV_OBJS = test/quic/linnea_quicserver.o src/lib/linnea_quic.o \
                src/lib/linnea_quic_crypto.o src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o \
                src/lib/linnea_tls_kdf.o src/lib/linnea_x25519.o src/lib/linnea_fe25519.o \
-               src/lib/linnea_print.o src/lib/linnea_string.o $(QUICP256)
+               src/lib/linnea_print.o src/lib/linnea_random.o src/lib/linnea_string.o $(QUICP256)
 
 test/quic/linnea_quicserver.o: test/quic/linnea_quicserver.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -269,7 +269,7 @@ test/quic/linnea_quichs.o: test/quic/linnea_quichs.asm $(INCS)
 
 bin/linnea-quichs: test/quic/linnea_quichs.o $(QUICMSG_OBJS) \
                    src/server/linnea_http3.o src/server/linnea_qpack.o src/server/linnea_hpack.o \
-                   src/server/linnea_static.o src/lib/linnea_string.o src/server/linnea_time.o \
+                   src/server/linnea_static.o src/lib/linnea_random.o src/lib/linnea_string.o src/server/linnea_time.o \
                    src/server/linnea_quic_conn.o src/server/linnea_quic_rtx.o src/server/linnea_quic_server.o \
                    src/server/linnea_quic_debug.o src/server/linnea_log.o src/server/linnea_error.o src/lib/linnea_print.o \
                    src/server/linnea_config.o src/server/linnea_config_parse.o src/server/linnea_network.o \
@@ -283,7 +283,7 @@ RTXTEST_BIN  = bin/linnea-rtxtest
 RTXTEST_OBJS = test/quic/linnea_rtxtest.o src/server/linnea_quic_rtx.o src/lib/linnea_quic.o \
                src/lib/linnea_quic_crypto.o src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o \
                src/lib/linnea_tls_kdf.o src/lib/linnea_x25519.o src/lib/linnea_fe25519.o \
-               src/lib/linnea_print.o src/lib/linnea_string.o $(QUICP256)
+               src/lib/linnea_print.o src/lib/linnea_random.o src/lib/linnea_string.o $(QUICP256)
 
 test/quic/linnea_rtxtest.o: test/quic/linnea_rtxtest.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -299,7 +299,7 @@ rtxtest: $(RTXTEST_BIN)
 # uploads the index page sends and answers with their size and checksum.
 # API_BIN is defined up beside `all`, which needs it before this point.
 API_OBJS        = test/api/linnea_api.o src/lib/linnea_sha256.o src/lib/linnea_print.o \
-                  src/lib/linnea_string.o
+                  src/lib/linnea_random.o src/lib/linnea_string.o
 
 test/api/linnea_api.o: test/api/linnea_api.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -314,7 +314,7 @@ api: $(API_BIN)
 # here — including the SHA-1 and base64 the accept token is made of.
 # WS_BIN, likewise, is defined up beside `all`.
 WS_OBJS         = test/api/linnea_ws.o src/lib/linnea_sha1.o \
-                  src/lib/linnea_base64.o src/lib/linnea_print.o src/lib/linnea_string.o
+                  src/lib/linnea_base64.o src/lib/linnea_print.o src/lib/linnea_random.o src/lib/linnea_string.o
 
 test/api/linnea_ws.o: test/api/linnea_ws.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -334,7 +334,7 @@ ws: $(WS_BIN)
 # build ran last to both.
 WS_FAST_BIN     = bin/linnea-ws-fast
 WS_FAST_OBJS    = test/api/linnea_ws_fast.o src/lib/linnea_sha1.o \
-                  src/lib/linnea_base64.o src/lib/linnea_print.o src/lib/linnea_string.o
+                  src/lib/linnea_base64.o src/lib/linnea_print.o src/lib/linnea_random.o src/lib/linnea_string.o
 
 test/api/linnea_ws_fast.o: test/api/linnea_ws.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -DPING_EVERY_MS=3000 -DPONG_WITHIN_MS=1500 -o $@ $<
@@ -349,7 +349,7 @@ REPLAYTEST_OBJS = test/quic/linnea_replaytest.o src/lib/linnea_quic_crypto.o \
                   src/lib/linnea_quic.o \
                   src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o src/lib/linnea_tls_kdf.o \
                   src/lib/linnea_x25519.o src/lib/linnea_fe25519.o src/lib/linnea_print.o \
-                  src/lib/linnea_string.o $(QUICP256)
+                  src/lib/linnea_random.o src/lib/linnea_string.o $(QUICP256)
 
 test/quic/linnea_replaytest.o: test/quic/linnea_replaytest.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -363,7 +363,7 @@ replaytest: $(REPLAYTEST_BIN)
 # --- test-only: QUIC connection pool (allocation, exhaustion, idle sweep) ---
 POOLTEST_BIN  = bin/linnea-pooltest
 POOLTEST_OBJS = test/quic/linnea_pooltest.o src/server/linnea_quic_conn.o \
-                src/lib/linnea_print.o src/lib/linnea_string.o
+                src/lib/linnea_print.o src/lib/linnea_random.o src/lib/linnea_string.o
 
 test/quic/linnea_pooltest.o: test/quic/linnea_pooltest.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -377,7 +377,7 @@ pooltest: $(POOLTEST_BIN)
 # --- test-only: io_uring submission accounting, against the real kernel ---
 RINGTEST_BIN  = bin/linnea-ringtest
 RINGTEST_OBJS = test/uring/linnea_ringtest.o src/server/linnea_ring.o \
-                src/lib/linnea_print.o src/lib/linnea_string.o
+                src/lib/linnea_print.o src/lib/linnea_random.o src/lib/linnea_string.o
 
 test/uring/linnea_ringtest.o: test/uring/linnea_ringtest.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -391,7 +391,7 @@ ringtest: $(RINGTEST_BIN)
 # --- test-only: QPACK decoder (reads a field section on stdin) ---
 QPACKTEST_BIN  = bin/linnea-qpacktest
 QPACKTEST_OBJS = test/quic/linnea_qpacktest.o src/server/linnea_qpack.o src/server/linnea_hpack.o \
-                 src/server/linnea_static.o src/lib/linnea_string.o src/server/linnea_time.o \
+                 src/server/linnea_static.o src/lib/linnea_random.o src/lib/linnea_string.o src/server/linnea_time.o \
                  src/server/linnea_network.o src/server/linnea_config.o \
                  src/server/linnea_config_parse.o src/server/linnea_log.o \
                  src/server/linnea_error.o src/lib/linnea_print.o
@@ -410,7 +410,7 @@ H3TEST_OBJS = test/quic/linnea_h3test.o src/server/linnea_http3.o src/server/lin
               src/server/linnea_hpack.o src/lib/linnea_quic.o src/lib/linnea_quic_crypto.o \
               src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o src/lib/linnea_tls_kdf.o \
               src/lib/linnea_x25519.o src/lib/linnea_fe25519.o src/server/linnea_static.o \
-              src/lib/linnea_string.o src/server/linnea_time.o src/server/linnea_log.o \
+              src/lib/linnea_random.o src/lib/linnea_string.o src/server/linnea_time.o src/server/linnea_log.o \
               src/lib/linnea_print.o src/server/linnea_error.o src/server/linnea_config.o \
               src/server/linnea_config_parse.o src/server/linnea_network.o \
               src/server/linnea_quic_server.o src/server/linnea_quic_conn.o \
@@ -431,7 +431,7 @@ H3RESP_OBJS = test/quic/linnea_h3resp.o src/server/linnea_http3.o src/server/lin
               src/server/linnea_hpack.o src/lib/linnea_quic.o src/lib/linnea_quic_crypto.o \
               src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o src/lib/linnea_tls_kdf.o \
               src/lib/linnea_x25519.o src/lib/linnea_fe25519.o src/server/linnea_static.o \
-              src/lib/linnea_string.o src/server/linnea_time.o src/server/linnea_log.o \
+              src/lib/linnea_random.o src/lib/linnea_string.o src/server/linnea_time.o src/server/linnea_log.o \
               src/lib/linnea_print.o src/server/linnea_error.o src/server/linnea_config.o \
               src/server/linnea_config_parse.o src/server/linnea_network.o \
               src/server/linnea_quic_server.o src/server/linnea_quic_conn.o \

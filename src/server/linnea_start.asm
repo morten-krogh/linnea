@@ -108,6 +108,8 @@ env_prefix_len  equ $ - env_prefix
 
 msg_fork:       db "cannot fork worker"
 msg_fork_len    equ $ - msg_fork
+msg_no_entropy: db "cannot seed the QUIC token keys: getrandom failed", 10
+msg_no_entropy_len equ $ - msg_no_entropy
 msg_wait:       db "wait4 failed in the master"
 msg_wait_len    equ $ - msg_wait
 msg_storm:      db "worker died within a second of starting; giving up"
@@ -329,8 +331,16 @@ _start:
 .bpf_ready:
     ; derive the stateless-reset key once, here in the master, so every forked
     ; worker inherits the same secret and computes matching reset tokens (RFC 9000 10.3)
+    ; Both are one-shot pre-fork key material. getrandom's result used to be
+    ; discarded, so a failure would have left an all-zero key -- a forgeable
+    ; stateless-reset or Retry token for the life of the process. Refusing to
+    ; start is the only safe answer (audit-report-96).
     call linnea_quic_reset_secret_init
+    test eax, eax
+    js .no_entropy
     call linnea_quic_retry_secret_init
+    test eax, eax
+    js .no_entropy
 
     xor r12d, r12d             ; worker slot
 .spawn_loop:
@@ -441,6 +451,10 @@ _start:
 .usage:
     jmp linnea_error_usage
 
+.no_entropy:
+    lea rdi, [msg_no_entropy]
+    mov esi, msg_no_entropy_len
+    jmp linnea_error_exit
 .wait_fail:
     lea rdi, [msg_wait]
     mov esi, msg_wait_len

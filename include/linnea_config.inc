@@ -20,7 +20,13 @@ LINNEA_MAX_PROXY_STR    equ 127      ; max proxy address string length. 63 held
 ; before the address slot widened to hold a sockaddr_un; recompute this line
 ; rather than trusting it if any of the six change again.
 LINNEA_MAX_BACKENDS     equ 8
-LINNEA_MAX_SNI          equ 255      ; max backend SNI hostname length
+LINNEA_MAX_SNI          equ 255      ; the proxy_sni BUFFER
+; ...but a DNS name encodes as, per label, a length byte plus its bytes, and
+; then a root byte: for the textual no-trailing-dot form that is len + 2, so
+; RFC 1035's 255-octet ceiling puts the TEXTUAL maximum at 253. Four 63-byte
+; labels and three dots is 255 characters -- inside the buffer, and not a name
+; any resolver can represent (audit-report-96).
+LINNEA_MAX_SNI_TEXT     equ 253
 ; One backend address slot. Holds a sockaddr_in (16) or a sockaddr_un (110:
 ; u16 family + 108 sun_path); 112 keeps the slot 8-byte aligned. Deliberately
 ; a literal rather than derived from LINNEA_SOCKADDR_*_SIZE: this header has no

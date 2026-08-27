@@ -3674,6 +3674,9 @@ linnea_h2p_event:
     lea rdx, [r8 + linnea_config_location.proxy_sni]
     mov rcx, [r8 + linnea_config_location.proxy_sni_len]
     call linnea_tls_client_start      ; ClientHello into hs.out
+    test eax, eax                     ; ...or could not get entropy for it
+    js .ev_conn_giveup                ; 502, entering past the health counter:
+                                      ; our entropy, not the backend's health
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_TLS
     mov qword [rbx + linnea_h2p.leg_sent], 0
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
