@@ -370,7 +370,14 @@ build_clienthello:
     rep movsb
     mov r14, rdi
     add rdi, 2
-    ; SNI
+    ; SNI -- OMITTED ENTIRELY when there is none. RFC 6066 3 defines HostName as
+    ; opaque HostName<1..2^16-1>, so a zero-length name is not a legal encoding;
+    ; this emitted one whenever sni_len was 0, which is the DEFAULT for a
+    ; proxy_tls location with no proxy_sni, not some exotic setting
+    ; (audit-report-95). The extensions length below is backpatched from the
+    ; cursor, so leaving the block out needs nothing else.
+    test r12, r12
+    jz .no_sni
     mov byte [rdi], 0x00
     mov byte [rdi + 1], 0x00
     lea rax, [r12 + 5]
@@ -387,6 +394,7 @@ build_clienthello:
     mov rsi, [rbx + linnea_tls_client_hs.sni_ptr]
     mov rcx, r12
     rep movsb
+.no_sni:
     ; supported_versions
     mov byte [rdi], 0x00
     mov byte [rdi + 1], 0x2b

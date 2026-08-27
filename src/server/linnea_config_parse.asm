@@ -232,6 +232,8 @@ msg_pin_no_tls:         db "proxy_pin without proxy_tls: the connection would be
 msg_pin_no_tls_len      equ $ - msg_pin_no_tls
 msg_sni_no_tls:         db "proxy_sni without proxy_tls: there is no ClientHello to put a server name in"
 msg_sni_no_tls_len      equ $ - msg_sni_no_tls
+msg_sni_bad:            db "proxy_sni must be a DNS hostname (RFC 6066): ASCII letters, digits and hyphens in labels of 1-63, no empty or hyphen-edged label, no trailing dot, and not an IP literal"
+msg_sni_bad_len         equ $ - msg_sni_bad
 msg_errlog_bad:         db "error_log must not be empty"
 msg_errlog_bad_len      equ $ - msg_errlog_bad
 msg_log_long:           db "log too long"
@@ -1324,6 +1326,74 @@ linnea_parse_location:
     call linnea_parse_string
     cmp rdx, LINNEA_MAX_SNI
     ja .sni_long
+    ; RFC 6066 3: HostName is a fully qualified DNS hostname in ASCII, with no
+    ; trailing dot, and an IP literal is NOT permitted. Only the 255-byte cap
+    ; was checked, so "", "127.0.0.1", "api.internal.", "a b.test", "-x.test"
+    ; and "a..b" all reached the wire unchanged (audit-report-95). Validated
+    ; HERE so it is a startup diagnostic rather than a request-time 502 or a
+    ; backend quietly picking a different vhost.
+    ;
+    ; rax = the string, rdx = its length. r8/r9/r10/r11 are scratch here.
+    test rdx, rdx
+    jz .sni_bad                        ; empty: a zero-length HostName is illegal
+    xor r8, r8                         ; index
+    xor r9, r9                         ; current label length
+    mov r11b, 1                        ; 1 = every label so far is all-digits
+    mov r10b, 1                        ; 1 = this label is all-digits
+.sni_ch:
+    cmp r8, rdx
+    jae .sni_end
+    movzx ecx, byte [rax + r8]
+    cmp cl, '.'
+    je .sni_dot
+    ; the label character set: A-Z a-z 0-9 '-'
+    cmp cl, '-'
+    je .sni_hyphen
+    cmp cl, '0'
+    jb .sni_alpha_chk
+    cmp cl, '9'
+    jbe .sni_ok_ch
+.sni_alpha_chk:
+    xor r10b, r10b                     ; not a digit -> label is not all-digits
+    or cl, 0x20                        ; fold case
+    cmp cl, 'a'
+    jb .sni_bad
+    cmp cl, 'z'
+    ja .sni_bad
+.sni_ok_ch:
+    test r9, r9
+    jnz .sni_adv
+    cmp byte [rax + r8], '-'
+    je .sni_bad                        ; a label may not start with '-'
+.sni_adv:
+    inc r9
+    cmp r9, 63
+    ja .sni_bad                        ; a label is 1..63 octets
+    inc r8
+    jmp .sni_ch
+.sni_hyphen:
+    test r9, r9
+    jz .sni_bad                        ; leading '-'
+    xor r10b, r10b
+    jmp .sni_adv
+.sni_dot:
+    test r9, r9
+    jz .sni_bad                        ; empty label: leading dot or ".."
+    cmp byte [rax + r8 - 1], '-'
+    je .sni_bad                        ; a label may not end with '-'
+    and r11b, r10b                     ; remember whether EVERY label was digits
+    mov r10b, 1
+    xor r9, r9
+    inc r8
+    jmp .sni_ch
+.sni_end:
+    test r9, r9
+    jz .sni_bad                        ; trailing dot -> empty final label
+    cmp byte [rax + r8 - 1], '-'
+    je .sni_bad
+    and r11b, r10b
+    test r11b, r11b
+    jnz .sni_bad                       ; every label numeric -> an IPv4 literal
     mov [rbx + linnea_config_location.proxy_sni_len], rdx
     lea rdi, [rbx + linnea_config_location.proxy_sni]
     mov rsi, rax
@@ -1651,6 +1721,10 @@ linnea_parse_location:
 .unix_no_tls:
     lea rdi, [msg_unix_tls]
     mov esi, msg_unix_tls_len
+    jmp linnea_parse_fail
+.sni_bad:
+    lea rdi, [msg_sni_bad]
+    mov esi, msg_sni_bad_len
     jmp linnea_parse_fail
 .bad_unix_abs:
     lea rdi, [msg_unix_abs]

@@ -152,6 +152,28 @@ test(LOC % ('"proxy_tls":1,"proxy_pin":"%s","proxy_sni":"x.test"' % PIN0),
      "proxy_tls + proxy_pin + proxy_sni accepted", True)
 test(LOC % '"proxy_keepalive":1', "a plain proxy with keepalive still accepted", True)
 
+# proxy_sni is a DNS hostname (RFC 6066 3), validated at parse time so a bad one
+# is a startup diagnostic and not a request-time 502. The empty value mattered
+# most: HostName is opaque HostName<1..2^16-1>, so zero length is not a legal
+# encoding -- and the builder used to emit exactly that whenever no SNI was
+# configured, which is the DEFAULT for a proxy_tls location (audit-report-95).
+TLSLOC = ('{"log":"/tmp/l","servers":[{"host":"127.0.0.1","port":8443,'
+          '"hostname":"x.test","locations":[{"prefix":"/","proxy":"127.0.0.1:8080"'
+          ',"proxy_tls":1,"proxy_pin":"' + "ab" * 32 + '"%s}]}]}')
+# NB: not `bad` -- that is this file's own failure accumulator, and shadowing it
+# turns its `+=` into a character-by-character extend.
+for sni_bad, why in [("", "empty"), ("127.0.0.1", "an IPv4 literal"),
+                     ("api.internal.", "a trailing dot"), (".api.test", "a leading dot"),
+                     ("a..b", "an empty label"), ("-x.test", "a label starting with -"),
+                     ("x-.test", "a label ending with -"), ("a b.test", "a space"),
+                     ("l" * 64 + ".test", "a 64-byte label")]:
+    test(TLSLOC % (',"proxy_sni":"%s"' % sni_bad),
+         "proxy_sni rejects %s" % why, False, "must be a DNS hostname")
+for sni_ok in ["localhost", "api.example.com", "x1-2.test", "1a.test", "l" * 63 + ".test"]:
+    test(TLSLOC % (',"proxy_sni":"%s"' % sni_ok),
+         "proxy_sni accepts %s" % sni_ok[:24], True)
+test(TLSLOC % "", "proxy_sni may be omitted (no server_name extension is sent)", True)
+
 # proxy_tls (and so proxy_h2) is refused on a location naming a unix: backend:
 # backend TLS is kTLS, and the TLS ULP does not exist for AF_UNIX.
 PIN = "ab" * 32
