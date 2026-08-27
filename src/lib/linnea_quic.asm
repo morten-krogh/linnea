@@ -2171,35 +2171,78 @@ linnea_quic_tp_parse:
 ; Parses an RFC 9218 priority field value, an RFC 8941 dictionary of members
 ; separated by commas, e.g. "u=1, i" or "u=5" or "i=?0". Recognises the two keys
 ; that matter: u=<0..7> (urgency; default 3) and i (incremental boolean; bare or
-; "i=?1" is true, "i=?0" false; default false). Unknown members and malformed
-; values are ignored, leaving the defaults — a request with no priority header
-; (ptr callers pass len 0) gets urgency 3, non-incremental.
+; "i=?1" is true, "i=?0" false; default false). A request with no priority
+; header (ptr callers pass len 0) gets urgency 3, non-incremental.
+;
+; Three RFC rules decide what happens to anything else, and they are NOT the
+; same rule (audit-report-82):
+;
+;   an UNKNOWN member          ignored, the rest of the value still applies
+;                              (9218 4: "unknown priority parameters ... MUST be
+;                              ignored")
+;   a known key, valid value,  the member is ignored and the key goes back to
+;   out of range ("u=9")       its DEFAULT -- 8941 dictionary semantics make a
+;                              repeated key take the last value, so "u=1,u=9"
+;                              is the dictionary {u:9}, and 9218 4.1 then
+;                              ignores that 9. It does not fall back to the 1.
+;   a value that does not      the ENTIRE field value is ignored (8941 4.2: "If
+;   PARSE ("u=7x", "i=?2",     parsing fails ... the entire field value MUST be
+;   "u=7 i" with no comma)     ignored"), so no member of it changes anything.
+;
+; Whitespace: 8941's ABNF is `dict-member *( OWS "," OWS dict-member )` and OWS
+; comes from RFC 7230, so it is SP *or HTAB*. A tab beside a comma is ordinary
+; legal whitespace and must not cost the member beside it.
+;
+; This is a two-key scanner, not a general Structured Fields parser: an unknown
+; member's VALUE is skipped rather than validated, so a syntax error inside one
+; ("zz=?9") is not detected, and a comma inside a quoted string is read as a
+; separator. Neither can change scheduling, which is what the failure rule above
+; exists to protect, and priority is advisory (9218 2).
 linnea_quic_parse_priority:
     mov r8d, 3                       ; default urgency
     xor r9d, r9d                     ; default incremental = false
     lea r10, [rdi + rsi]             ; end
-.pp_member:
+    ; 8941 4.2 step 2 discards leading *SP*, not OWS -- the edges of a field
+    ; value and the space beside a comma are different rules, and only the
+    ; latter admits HTAB. An empty value is an empty dictionary, which is legal
+    ; and simply means the defaults.
+.pp_lead:
     cmp rdi, r10
     jae .pp_done
+    cmp byte [rdi], ' '
+    jne .pp_member
+    inc rdi
+    jmp .pp_lead
+.pp_member:
+    ; a member starts HERE: 8941 has no empty members and no stray separator,
+    ; so anything that is not a key is a parse failure for the whole value
+    cmp rdi, r10
+    jae .pp_fail                     ; a trailing comma left nothing behind it
     movzx eax, byte [rdi]
-    cmp al, ' '                      ; skip spaces and empty members
-    je .pp_skip
-    cmp al, ','
-    je .pp_skip
     cmp al, 'u'
     je .pp_u
     cmp al, 'i'
     je .pp_i
-    jmp .pp_adv                      ; unknown key: skip to the next member
-.pp_skip:
-    inc rdi
-    jmp .pp_member
+    ; an 8941 key is lcalpha / "*" to start; anything else never was a member
+    cmp al, 'a'
+    jb .pp_key_star
+    cmp al, 'z'
+    jbe .pp_adv                      ; some other key: skip the whole member
+    jmp .pp_fail
+.pp_key_star:
+    cmp al, '*'
+    je .pp_adv
+    jmp .pp_fail
 .pp_u:
+    ; "u" must be the whole key: "urgent=1" is a different, unknown member
+    lea rcx, [rdi + 1]
+    cmp rcx, r10
+    jae .pp_adv                      ; a bare "u" is not a boolean key: unknown
+    cmp byte [rdi + 1], '='
+    jne .pp_adv                      ; a longer key that merely starts with u
     lea rcx, [rdi + 3]               ; need "u=" then a digit: 3 bytes
     cmp rcx, r10
-    ja .pp_adv
-    cmp byte [rdi + 1], '='
-    jne .pp_adv
+    ja .pp_fail                      ; "u=" with nothing after it: not a value
     ; An RFC 8941 integer may carry leading zeros ("u=07" is the number 7) and
     ; may run to more digits than 0-7 uses ("u=10"). Reading exactly one digit
     ; got both wrong: 07 became 0 — the OPPOSITE end of the urgency scale —
@@ -2226,10 +2269,10 @@ linnea_quic_parse_priority:
     jmp .pp_u_digit
 .pp_u_end:
     test ecx, ecx
-    jz .pp_adv                       ; "u=" with no digits: not a number
+    jz .pp_fail                      ; "u=" with no digits: not an sf-integer
     cmp eax, 7
-    ja .pp_adv                       ; out of range: ignored, the default stands
-    ; the digits must end the member — end of value, a separator, or an RFC
+    ja .pp_u_range                   ; a NUMBER, but not an urgency
+    ; the digits must end the member — end of value, OWS, a comma, or an RFC
     ; 8941 parameter ("u=3;x") — else this was never a number ("u=3x")
     cmp rdi, r10
     jae .pp_u_set
@@ -2238,12 +2281,20 @@ linnea_quic_parse_priority:
     je .pp_u_set
     cmp dl, ' '
     je .pp_u_set
+    cmp dl, 9
+    je .pp_u_set
     cmp dl, ';'
     je .pp_u_set
-    jmp .pp_adv
+    jmp .pp_fail                     ; "u=3x": not an sf-integer at all
+.pp_u_range:
+    ; 8941 gives a repeated key its LAST value, so the member that named this
+    ; out-of-range number REPLACED any earlier "u". 9218 4.1 then ignores the
+    ; value — leaving the default, not whatever the earlier member said.
+    mov r8d, 3
+    jmp .pp_after_value
 .pp_u_set:
     mov r8d, eax
-    jmp .pp_adv
+    jmp .pp_after_value
 .pp_i:
     ; RFC 9218 4.2: incremental is an RFC 8941 Boolean, default false. A BARE
     ; "i" is the dictionary shorthand for "i=?1" (8941 3.2), so it is true;
@@ -2267,41 +2318,75 @@ linnea_quic_parse_priority:
     je .pp_i_true                    ; "i," : bare
     cmp dl, ' '
     je .pp_i_true
+    cmp dl, 9
+    je .pp_i_true                    ; "i<TAB>," : OWS is SP or HTAB
     cmp dl, ';'
     je .pp_i_true                    ; "i;q=1": bare, with an 8941 parameter
     jmp .pp_adv                      ; a longer key that merely starts with i
 .pp_i_true:
     mov r9d, 1
-    jmp .pp_adv
+    inc rdi                          ; past the key, to whatever follows it
+    jmp .pp_after_value
 .pp_i_eq:
     lea rcx, [rdi + 4]               ; "i=?0" needs four bytes
     cmp rcx, r10
-    ja .pp_adv                       ; too short to hold a boolean: ignored
+    ja .pp_fail                      ; too short to hold a boolean: not one
     cmp byte [rdi + 2], '?'
-    jne .pp_adv                      ; "i=1", "i=x": not a boolean
+    jne .pp_fail                     ; "i=1", "i=x": not a boolean
     movzx edx, byte [rdi + 3]
     cmp dl, '0'
     je .pp_i_ends
     cmp dl, '1'
-    jne .pp_adv                      ; "i=?2": not a boolean
+    jne .pp_fail                     ; "i=?2": not a boolean
 .pp_i_ends:
     ; ...and the boolean must END the member, as the urgency digits must
-    lea rcx, [rdi + 4]
-    cmp rcx, r10
+    add rdi, 4
+    cmp rdi, r10
     jae .pp_i_apply
-    movzx eax, byte [rcx]
+    movzx eax, byte [rdi]
     cmp al, ','
     je .pp_i_apply
     cmp al, ' '
     je .pp_i_apply
+    cmp al, 9
+    je .pp_i_apply
     cmp al, ';'
     je .pp_i_apply
-    jmp .pp_adv                      ; "i=?1x": never a boolean
+    jmp .pp_fail                     ; "i=?1x": never a boolean
 .pp_i_apply:
     xor r9d, r9d
     cmp dl, '1'
-    jne .pp_adv
+    jne .pp_after_value
     mov r9d, 1
+    jmp .pp_after_value
+.pp_after_value:
+    ; what may follow a member: OWS then a comma, or the end of the value
+    ; A member we UNDERSTOOD has been applied; 8941 says what may follow it is
+    ; OWS and then a comma, or the end of the value. "u=7 i" satisfies neither
+    ; -- two members with no separator -- and 4.2 makes that a parse failure for
+    ; the whole field, not a free urgency (audit-report-82).
+    cmp rdi, r10
+    jae .pp_done                     ; the value ends here: nothing to separate
+    movzx eax, byte [rdi]
+    cmp al, ';'
+    je .pp_adv                       ; parameters: legal, and not ours to read
+    cmp al, ','
+    je .pp_next                      ; on to the next member
+    cmp al, ' '
+    je .pp_av_ows
+    cmp al, 9
+    je .pp_av_ows
+    jmp .pp_fail
+.pp_av_ows:
+    inc rdi
+    jmp .pp_after_value
+.pp_fail:
+    ; RFC 8941 4.2: "If parsing fails ... the entire field value MUST be ignored
+    ; (i.e., treated as if the field were not present)". Not the member -- the
+    ; VALUE, including members already applied from it.
+    mov r8d, 3
+    xor r9d, r9d
+    jmp .pp_done
 .pp_adv:
     cmp rdi, r10                     ; advance to the next comma
     jae .pp_done
@@ -2310,8 +2395,18 @@ linnea_quic_parse_priority:
     inc rdi
     jmp .pp_adv
 .pp_next:
+    inc rdi                          ; past the comma
+.pp_next_ows:
+    cmp rdi, r10
+    jae .pp_fail                     ; 8941 4.2.2 step 9: a trailing comma
+    movzx eax, byte [rdi]
+    cmp al, ' '
+    je .pp_next_skip
+    cmp al, 9                        ; OWS after a comma IS SP or HTAB
+    jne .pp_member
+.pp_next_skip:
     inc rdi
-    jmp .pp_member
+    jmp .pp_next_ows
 .pp_done:
     mov eax, r8d
     mov edx, r9d

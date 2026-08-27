@@ -127,6 +127,31 @@ prio_ipar: db "i;q=1"                 ; bare i carrying an 8941 parameter
 prio_ipar_len equ $ - prio_ipar
 prio_i1par: db "i=?1;q=2"             ; ...and the same on the explicit form
 prio_i1par_len equ $ - prio_i1par
+; audit-report-82: OWS beside a comma is SP *or HTAB* (8941's ABNF imports OWS
+; from 7230), while the edges of the value take SP only, and a value that does
+; not parse is ignored WHOLE (8941 4.2).
+prio_tabsep: db "u=7", 9, "i"         ; two members, no comma: a parse failure
+prio_tabsep_len equ $ - prio_tabsep
+prio_tabows: db "u=7", 9, ",i"        ; HTAB before the comma: legal OWS
+prio_tabows_len equ $ - prio_tabows
+prio_owstab: db "u=7,", 9, "i"        ; HTAB after the comma: legal OWS
+prio_owstab_len equ $ - prio_owstab
+prio_tablead: db 9, "u=7"             ; a leading HTAB: the edges take SP only
+prio_tablead_len equ $ - prio_tablead
+prio_splead: db " u=7"                ; ...and a leading SP is fine
+prio_splead_len equ $ - prio_splead
+prio_spsep: db "u=7 i"                ; the same failure with a space
+prio_spsep_len equ $ - prio_spsep
+prio_part:  db "u=1,u=7x"             ; a valid member, then a broken one
+prio_part_len equ $ - prio_part
+prio_parti: db "u=1,i=?2"             ; ...and with the boolean broken instead
+prio_parti_len equ $ - prio_parti
+prio_unk:   db "u=1,zz=3"             ; an UNKNOWN member leaves the rest alone
+prio_unk_len equ $ - prio_unk
+prio_range: db "u=1,u=9"              ; a repeated key takes the LAST value
+prio_range_len equ $ - prio_range
+prio_trail: db "u=1,"                 ; a trailing comma is a parse failure
+prio_trail_len equ $ - prio_trail
 
 ; --- frame-length table fixtures (RFC 9000 19) ---
 fk_pad:     db 0x00
@@ -637,6 +662,70 @@ _start:
     call linnea_quic_parse_priority     ; "i=?1;q=2" -> true
     EXPECT rax, 3
     EXPECT rdx, 1
+
+    ; audit-report-82. Three different rules, and the point is that they differ:
+    ; an unknown member is ignored, a known key with an out-of-range value goes
+    ; back to the DEFAULT (8941 gives a repeated key its last value), and a
+    ; value that does not parse is ignored ENTIRELY -- members already applied
+    ; from it included.
+    lea rdi, [prio_tabsep]
+    mov esi, prio_tabsep_len
+    call linnea_quic_parse_priority     ; "u=7<TAB>i": two members, no comma
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_spsep]
+    mov esi, prio_spsep_len
+    call linnea_quic_parse_priority     ; "u=7 i": the same, with a space
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_tablead]
+    mov esi, prio_tablead_len
+    call linnea_quic_parse_priority     ; a leading HTAB: the edge takes SP only
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_part]
+    mov esi, prio_part_len
+    call linnea_quic_parse_priority     ; "u=1,u=7x": the 1 must NOT survive
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_parti]
+    mov esi, prio_parti_len
+    call linnea_quic_parse_priority     ; "u=1,i=?2": nor here
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_trail]
+    mov esi, prio_trail_len
+    call linnea_quic_parse_priority     ; "u=1,": a trailing comma
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_range]
+    mov esi, prio_range_len
+    call linnea_quic_parse_priority     ; "u=1,u=9": last wins, then ignored
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    ; the controls: HTAB beside a comma is ordinary whitespace and must cost
+    ; nothing, a leading SP is legal, and an unknown member is still just
+    ; ignored -- this fix fails by refusing values that are perfectly fine.
+    lea rdi, [prio_tabows]
+    mov esi, prio_tabows_len
+    call linnea_quic_parse_priority     ; "u=7<TAB>,i" -> both members apply
+    EXPECT rax, 7
+    EXPECT rdx, 1
+    lea rdi, [prio_owstab]
+    mov esi, prio_owstab_len
+    call linnea_quic_parse_priority     ; "u=7,<TAB>i" -> both members apply
+    EXPECT rax, 7
+    EXPECT rdx, 1
+    lea rdi, [prio_splead]
+    mov esi, prio_splead_len
+    call linnea_quic_parse_priority     ; " u=7" -> a leading SP is discarded
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_unk]
+    mov esi, prio_unk_len
+    call linnea_quic_parse_priority     ; "u=1,zz=3" -> the 1 stands
+    EXPECT rax, 1
+    EXPECT rdx, 0
 
     ; --- reset_scan captures a PATH_CHALLENGE bundled behind other frames, so the
     ; receive path can echo it in a PATH_RESPONSE (RFC 9000 8.2) ---
