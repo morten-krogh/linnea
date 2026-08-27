@@ -228,6 +228,10 @@ msg_unix_long:          db "proxy unix: path too long (107 bytes max)"
 msg_unix_long_len       equ $ - msg_unix_long
 msg_unix_tls:           db "proxy_tls (and so proxy_h2) cannot be used with a unix: backend: backend TLS is kTLS and the TLS ULP does not exist for AF_UNIX"
 msg_unix_tls_len        equ $ - msg_unix_tls
+msg_pin_no_tls:         db "proxy_pin without proxy_tls: the connection would be PLAINTEXT and the pin would authenticate nothing"
+msg_pin_no_tls_len      equ $ - msg_pin_no_tls
+msg_sni_no_tls:         db "proxy_sni without proxy_tls: there is no ClientHello to put a server name in"
+msg_sni_no_tls_len      equ $ - msg_sni_no_tls
 msg_errlog_bad:         db "error_log must not be empty"
 msg_errlog_bad_len      equ $ - msg_errlog_bad
 msg_log_long:           db "log too long"
@@ -1547,6 +1551,24 @@ linnea_parse_location:
     test r12d, 128
     jz .tls_needs_pin
 .tls_ok:
+    ; ...and the SAME RULE IN THE OTHER DIRECTION, which is where it was
+    ; missing. A pin without proxy_tls is not merely unenforced: the connection
+    ; is plaintext, so the location promises an authenticated backend and
+    ; delivers neither authentication nor TLS, silently. Measured before the
+    ; fix: a deliberately WRONG pin with no proxy_tls served 200, where the same
+    ; pin with proxy_tls gives 502. "Both-or-neither, like cert/key" is what the
+    ; comment above already claimed; only one half was ever checked.
+    test r12d, 128                     ; proxy_pin
+    jz .pin_ok
+    test r12d, 64                      ; proxy_tls
+    jz .pin_needs_tls
+.pin_ok:
+    ; proxy_sni likewise -- a server name for a ClientHello that is never sent.
+    test r12d, 256                     ; proxy_sni
+    jz .sni_ok
+    test r12d, 64
+    jz .sni_needs_tls
+.sni_ok:
     ; h2 to a backend runs over TLS (ALPN): proxy_h2 requires proxy_tls
     test r12d, 512
     jz .h2opt_ok
@@ -1617,6 +1639,14 @@ linnea_parse_location:
 .bad_proxy:
     lea rdi, [msg_bad_proxy]
     mov esi, msg_bad_proxy_len
+    jmp linnea_parse_fail
+.pin_needs_tls:
+    lea rdi, [msg_pin_no_tls]
+    mov esi, msg_pin_no_tls_len
+    jmp linnea_parse_fail
+.sni_needs_tls:
+    lea rdi, [msg_sni_no_tls]
+    mov esi, msg_sni_no_tls_len
     jmp linnea_parse_fail
 .unix_no_tls:
     lea rdi, [msg_unix_tls]

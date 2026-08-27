@@ -32,6 +32,41 @@ if [ "$ktls" = 1 ]; then
     check_http "tls static body"   "hello from linnea" "$resp"
     check_http "tls static status" "200 OK" "$resp"
 
+    # --- a UNIX-socket backend, driven by all three CLIENT protocols ---------
+    # h2 and h3 clients are served through the h2p leg since e78b131, whatever
+    # the backend speaks, so they reach a backend socket by a DIFFERENT path
+    # than an h1 client does. The unix: rows in the h1 shard drive h1 only, so
+    # nothing pinned the other two -- the shape upstream_failover.py's own
+    # header warns about: "h2 and h3 passed without executing a line of the
+    # paths they were meant to cover".
+    usock2="$PWD/$RUNDIR/tls-be.sock"
+    LINNEA_BACKEND_UNIX="$usock2" python3 test/proxy_backend.py >/dev/null 2>&1 &
+    ub2_pid=$!
+    for _ in $(seq 1 50); do [ -S "$usock2" ] && break; sleep 0.1; done
+    cat > $CFG/tls-unix.json <<EOF
+{ "log": "$PWD/$RUNDIR/tls-unix.log",
+  "servers": [ { "host": "127.0.0.1", "port": ${P61734}, "hostname": "localhost",
+    "cert": "$PWD/test/tls/server.crt", "key": "$PWD/test/tls/server.key",
+    "locations": [ { "prefix": "/api", "proxy": "unix:$usock2" },
+                   { "prefix": "/", "root": "$PWD/$WWW" } ] } ] }
+EOF
+    start_server $CFG/tls-unix.json
+    UU=https://localhost:${P61734}
+    for proto in --http1.1 --http2; do
+        body=$(curl -s $proto --max-time 8 --cacert $CA $UU/api/simple)
+        [ "$body" = "backend body" ]
+        check "unix backend over TLS: a ${proto#--} client is served" $?
+    done
+    if [ -n "$CURLH3" ] && [ -x "$CURLH3" ]; then
+        body=$("$CURLH3" -s --http3-only --max-time 10 --cacert $CA $UU/api/simple)
+        [ "$body" = "backend body" ]
+        check "unix backend over TLS: an h3 client is served" $?
+    fi
+    # nothing may have fallen back to a TCP connect: there is no TCP backend
+    ! grep -q "connect failed" "$RUNDIR/tls-unix.log" 2>/dev/null
+    check "unix backend over TLS: no connect failed on any leg" $?
+    kill $ub2_pid 2>/dev/null
+
     # If-Match and If-None-Match are entity-tag LISTS, so repeated field lines
     # are the comma-joined value (RFC 9110 5.3). h1 kept the FIRST occurrence
     # and h2/h3 the LAST, so the same legal request got different answers from

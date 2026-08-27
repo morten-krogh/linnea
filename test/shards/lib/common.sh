@@ -143,6 +143,9 @@ P61732=$((PORTBASE + 732))   # backend-h2 failover: DELIBERATELY UNBOUND. Nothin
                              # ever listen here -- it is the dead first backend
                              # that drives h2p_reconnect.
 P61733=$((PORTBASE + 733))   # backend-h2 failover: the proxy_h2 front naming it
+P61734=$((PORTBASE + 734))   # a TLS front whose /api is a UNIX socket, driven by
+                             # h1, h2 and h3 CLIENTS (they reach a backend by
+                             # different legs, so one protocol proves nothing)
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 # What actually reached a proxy backend, appended to by test/proxy_backend.py.

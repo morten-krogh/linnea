@@ -130,6 +130,28 @@ test(PROXY_ARR % '"unix:"', "proxy: unix: with no path rejected", False,
 # spliced into its fall-through.
 test(PROXY_ARR % '"127.0.0.1:8080"', "proxy: tcp still accepted beside unix:", True)
 
+# proxy_pin and proxy_tls are BOTH-OR-NEITHER. The tls->pin half was enforced
+# from the start; the pin->tls half was not, and a pin without proxy_tls is not
+# merely unenforced -- the connection is plaintext, so the location promised an
+# authenticated backend and delivered neither authentication nor TLS. Measured
+# before the fix: a deliberately WRONG pin with no proxy_tls served 200.
+PIN0 = "ab" * 32
+LOC = ('{"log":"/tmp/l","servers":[{"host":"127.0.0.1","port":8443,'
+       '"hostname":"x.test","locations":[{"prefix":"/","proxy":"127.0.0.1:8080"'
+       ',%s}]}]}')
+test(LOC % ('"proxy_pin":"%s"' % PIN0), "proxy_pin without proxy_tls rejected",
+     False, "would authenticate nothing")
+test(LOC % '"proxy_sni":"x.test"', "proxy_sni without proxy_tls rejected",
+     False, "no ClientHello")
+test(LOC % ('"proxy_tls":1'), "proxy_tls without proxy_pin rejected (the half that always was)",
+     False, "requires proxy_pin")
+# ...and every legitimate combination still parses, so the rule cannot widen
+test(LOC % ('"proxy_tls":1,"proxy_pin":"%s"' % PIN0),
+     "proxy_tls + proxy_pin accepted", True)
+test(LOC % ('"proxy_tls":1,"proxy_pin":"%s","proxy_sni":"x.test"' % PIN0),
+     "proxy_tls + proxy_pin + proxy_sni accepted", True)
+test(LOC % '"proxy_keepalive":1', "a plain proxy with keepalive still accepted", True)
+
 # proxy_tls (and so proxy_h2) is refused on a location naming a unix: backend:
 # backend TLS is kTLS, and the TLS ULP does not exist for AF_UNIX.
 PIN = "ab" * 32
