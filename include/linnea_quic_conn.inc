@@ -419,6 +419,11 @@ LINNEA_QUIC_MS_INIT     equ 100     ; initial_max_streams_bidi we advertise
 ; two QPACK streams) and opens no more — so the value the transport parameter
 ; carries is also the value linnea_quic_stream_limit enforces. Both now read
 ; this constant, so the granted limit and the enforced one cannot drift apart.
+; Extension and GREASE transport-parameter ids (>= 64) remembered per
+; ClientHello, so a repeat can be spotted (RFC 9000 7.4). The standardised ids
+; below 64 use a bitmap; this space is 62 bits wide and cannot. A conforming
+; peer sends one or two, and the ClientHello is bounded, so this is generous.
+LINNEA_QUIC_TP_HI       equ 32
 LINNEA_QUIC_MSU_INIT    equ 100
 LINNEA_QUIC_MS_WINDOW   equ 128     ; streams granted ahead of the peer's highest
 LINNEA_QUIC_MS_THRESH   equ 64      ; regrant when the peer is within this of the limit

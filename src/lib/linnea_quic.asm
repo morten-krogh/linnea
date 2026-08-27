@@ -1975,7 +1975,10 @@ linnea_quic_tp_parse:
     push r14
     push r15
     push rbp
-    sub rsp, 8
+    ; [rsp] the seen-id bitmap for ids below 64, [rsp+8] how many higher ids are
+    ; recorded, [rsp+16...] the ids themselves. 280 keeps rsp 16-aligned for the
+    ; varint calls below, as the 8 it replaces did.
+    sub rsp, 280
     mov rbx, rdi                     ; cursor
     lea r12, [rdi + rsi]             ; end
     xor r13d, r13d                   ; initial_max_data
@@ -1989,6 +1992,7 @@ linnea_quic_tp_parse:
     mov qword [linnea_quic_tp_error], 0       ; connection-id limit
     mov qword [linnea_quic_tp_iscid_len], -1  ; absent until seen
     mov qword [rsp], 0                         ; seen-id bitmap for duplicate detection
+    mov qword [rsp + 8], 0                     ; ...and no extension ids yet
 .tp_next:
     cmp rbx, r12
     jae .tp_done                     ; the whole extension consumed: success
@@ -2010,13 +2014,43 @@ linnea_quic_tp_parse:
     sub rcx, rbx
     cmp rbp, rcx
     ja .tp_bad                        ; the payload runs past the extension
-    ; every id may appear at most once (RFC 9000 7.4.1). Track the standard range
-    ; in a bitmap; ids at or above 64 (grease) are not tracked (unbounded).
+    ; RFC 9000 7.4: "An endpoint MUST NOT send a parameter more than once in a
+    ; given transport parameters extension. An endpoint SHOULD treat receipt of
+    ; duplicate transport parameters as a connection error of type
+    ; TRANSPORT_PARAMETER_ERROR." Ids below 64 are the standardised ones and a
+    ; bitmap covers them exactly.
     cmp r15, 64
-    jae .tp_after_dup
+    jae .tp_dup_hi
     bt [rsp], r15
     jc .tp_bad                        ; a repeated parameter
     bts [rsp], r15
+    jmp .tp_after_dup
+.tp_dup_hi:
+    ; Extension and GREASE ids. No bitmap can span a 62-bit space, but the ids a
+    ; peer actually SENDS are another matter: the ClientHello is bounded, so the
+    ; parameters in it are, and remembering the first LINNEA_QUIC_TP_HI distinct
+    ; ones catches every duplicate a real peer can produce (audit-report-88 --
+    ; "not tracked (unbounded)" was true of the space, never of the traffic).
+    ;
+    ; Past that the checking stops rather than the connection. The table is
+    ; bounded because this runs before the handshake completes, and a peer with
+    ; 33 distinct extension parameters gains nothing by a duplicate: an unknown
+    ; parameter is ignored either way, so nothing it could contradict is stored.
+    mov rcx, [rsp + 8]
+    xor edx, edx
+.tp_hi_scan:
+    cmp rdx, rcx
+    jae .tp_hi_add
+    cmp [rsp + 16 + rdx * 8], r15
+    je .tp_bad                        ; a repeated extension parameter
+    inc rdx
+    jmp .tp_hi_scan
+.tp_hi_add:
+    cmp rcx, LINNEA_QUIC_TP_HI
+    jae .tp_after_dup                 ; full: remember no more
+    mov [rsp + 16 + rcx * 8], r15
+    inc rcx
+    mov [rsp + 8], rcx
 .tp_after_dup:
     ; parameters only a server may send; a client sending one is an error (18.2)
     cmp r15, 0x00                     ; original_destination_connection_id
@@ -2157,7 +2191,7 @@ linnea_quic_tp_parse:
     mov rax, r13
     mov rdx, r14
     mov r8, r9                       ; initial_max_streams_uni
-    add rsp, 8
+    add rsp, 280
     pop rbp
     pop r15
     pop r14

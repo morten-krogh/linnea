@@ -20,6 +20,8 @@ extern linnea_quic_txchunk_ack
 extern linnea_quic_txchunk_clear
 extern linnea_quic_flow_scan
 extern linnea_quic_parse_priority
+extern linnea_quic_tp_parse
+extern linnea_quic_tp_error
 extern linnea_quic_ack_ranges
 extern linnea_quic_ack_record
 extern linnea_quic_ack_seen
@@ -281,6 +283,24 @@ prio_illpar: db "u=7,zz=(1 2);p=3"   ; parameters on the LIST
 prio_illpar_len equ $ - prio_illpar
 prio_ilnext: db "u=7,zz=(1 2),i"     ; and the member after it still applies
 prio_ilnext_len equ $ - prio_ilnext
+
+; audit-report-88: RFC 9000 7.4 -- a parameter may not appear twice, and a
+; receiver SHOULD close on one that does. Ids below 64 had a bitmap; the
+; extension/GREASE space above it was not tracked at all. Each blob below is a
+; transport-parameters extension: id varint, length varint, payload.
+; 0x4040 is the two-byte varint for id 64, 0x4041 for 65.
+tp_lowdup:  db 0x04, 0x01, 0x0f, 0x04, 0x01, 0x0f     ; 0x04 twice
+tp_lowdup_len equ $ - tp_lowdup
+tp_hidup:   db 0x04, 0x01, 0x0f, 0x40, 0x40, 0x01, 0xaa, 0x40, 0x40, 0x01, 0xaa
+tp_hidup_len equ $ - tp_hidup                          ; id 64 twice
+tp_hidup2:  db 0x40, 0x40, 0x01, 0xaa, 0x40, 0x41, 0x01, 0xbb, 0x40, 0x40, 0x01, 0xcc
+tp_hidup2_len equ $ - tp_hidup2                        ; 64, 65, then 64 again
+tp_hiok:    db 0x04, 0x01, 0x0f, 0x40, 0x40, 0x01, 0xaa, 0x40, 0x41, 0x01, 0xbb
+tp_hiok_len equ $ - tp_hiok                            ; 64 and 65: different ids
+tp_hione:   db 0x04, 0x01, 0x0f, 0x40, 0x40, 0x01, 0xaa
+tp_hione_len equ $ - tp_hione                          ; one extension parameter
+tp_plain:   db 0x04, 0x01, 0x0f, 0x05, 0x01, 0x0f
+tp_plain_len equ $ - tp_plain                          ; two different low ids
 
 ; --- frame-length table fixtures (RFC 9000 19) ---
 fk_pad:     db 0x00
@@ -1169,6 +1189,40 @@ _start:
     call linnea_quic_parse_priority     ; the member after the list still applies
     EXPECT rax, 7
     EXPECT rdx, 1
+
+    ; audit-report-88: a repeated transport parameter, in both id ranges.
+    mov qword [linnea_quic_tp_error], 0
+    lea rdi, [tp_lowdup]
+    mov esi, tp_lowdup_len
+    call linnea_quic_tp_parse           ; id 0x04 twice: the bitmap caught this already
+    EXPECT qword [linnea_quic_tp_error], 1
+    mov qword [linnea_quic_tp_error], 0
+    lea rdi, [tp_hidup]
+    mov esi, tp_hidup_len
+    call linnea_quic_tp_parse           ; id 64 twice: the extension range was not tracked
+    EXPECT qword [linnea_quic_tp_error], 1
+    mov qword [linnea_quic_tp_error], 0
+    lea rdi, [tp_hidup2]
+    mov esi, tp_hidup2_len
+    call linnea_quic_tp_parse           ; ...and with a different id between them
+    EXPECT qword [linnea_quic_tp_error], 1
+    ; the controls: distinct ids must go on parsing cleanly, or a peer's
+    ; GREASE parameter would start killing handshakes.
+    mov qword [linnea_quic_tp_error], 0
+    lea rdi, [tp_hiok]
+    mov esi, tp_hiok_len
+    call linnea_quic_tp_parse           ; ids 64 and 65 are two parameters, not one
+    EXPECT qword [linnea_quic_tp_error], 0
+    mov qword [linnea_quic_tp_error], 0
+    lea rdi, [tp_hione]
+    mov esi, tp_hione_len
+    call linnea_quic_tp_parse           ; a single extension parameter
+    EXPECT qword [linnea_quic_tp_error], 0
+    mov qword [linnea_quic_tp_error], 0
+    lea rdi, [tp_plain]
+    mov esi, tp_plain_len
+    call linnea_quic_tp_parse           ; two different standardised ids
+    EXPECT qword [linnea_quic_tp_error], 0
 
     ; --- reset_scan captures a PATH_CHALLENGE bundled behind other frames, so the
     ; receive path can echo it in a PATH_RESPONSE (RFC 9000 8.2) ---
