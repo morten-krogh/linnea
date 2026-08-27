@@ -245,6 +245,54 @@ if _os.path.exists(_CRT):
     open(_nokey, "w").write(_kbody + "=\n")
     test(_tls_cfg(_CRT, _nokey), "a key with no END boundary is rejected", False)
 
+    # --- audit-report-100: the leaf must be a COMPLETE certificate, every
+    # chain entry must parse, and padding is decided by the final quantum ----
+    import base64 as _b64, textwrap as _tw
+
+    def _wrap(der, path):
+        body = "\n".join(_tw.wrap(_b64.b64encode(der).decode(), 64))
+        open(path, "w").write(
+            "-----BEGIN CERTIFICATE-----\n" + body + "\n-----END CERTIFICATE-----\n")
+        return path
+
+    _pem = open(_CRT).read()
+    _der = _b64.b64decode("".join(
+        l for l in _pem.splitlines() if "-----" not in l))
+    # F1: corrupt the OUTER signatureAlgorithm tag. TBSCertificate and its SPKI
+    # are untouched, so a check that merely FINDS an SPKI still passes.
+    if len(_der) > 327 and _der[327] == 0x30:
+        _m = bytearray(_der)
+        _m[327] = 0x31
+        test(_tls_cfg(_wrap(bytes(_m), _os.path.join(_TD, "badleaf.crt")), _KEY),
+             "a certificate with a corrupt outer field is rejected", False)
+    # F2: a VALID leaf followed by a malformed issuer. The leaf pairs with the
+    # key, so only per-entry validation can catch the second block -- and a
+    # half-written intermediate is exactly what a renewal produces.
+    _bc = _os.path.join(_TD, "badchain.crt")
+    open(_bc, "w").write(
+        _pem + "-----BEGIN CERTIFICATE-----\nQQ==\n-----END CERTIFICATE-----\n")
+    test(_tls_cfg(_bc, _KEY), "a valid leaf with a malformed issuer is rejected", False)
+    # F3: padding is what the final quantum requires, not decoration
+    _xp = _os.path.join(_TD, "excesspad.crt")
+    open(_xp, "w").write(_pem.replace("-----END", "====\n-----END"))
+    test(_tls_cfg(_xp, _KEY), "excess base64 padding is rejected", False)
+
+    # --- audit-report-101: the field TYPES, and the declared curve ----------
+    # A bounded TLV of ANY tag advances a cursor, so counting six elements
+    # accepted a serialNumber retagged as an OCTET STRING. And the positional
+    # SPKI walk had DROPPED the id-ecPublicKey/prime256v1 comparison that the
+    # peer-key extractor always made -- a regression introduced by report 100's
+    # own fix, which is why both directions are pinned here.
+    if len(_der) > 145 and _der[13] == 0x02 and _der[145] == 0x07:
+        _t = bytearray(_der)
+        _t[13] = 0x04                      # INTEGER -> OCTET STRING
+        test(_tls_cfg(_wrap(bytes(_t), _os.path.join(_TD, "badtbs.crt")), _KEY),
+             "a retagged serialNumber is rejected", False)
+        _c = bytearray(_der)
+        _c[145] = 0x08                     # prime256v1 -> another curve OID
+        test(_tls_cfg(_wrap(bytes(_c), _os.path.join(_TD, "badcurve.crt")), _KEY),
+             "a certificate declaring a non-P-256 curve is rejected", False)
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

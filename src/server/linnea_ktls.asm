@@ -42,7 +42,7 @@ extern linnea_quic_ticket_setup
 extern linnea_p256_scalar_is_valid
 extern linnea_tls_hkdf_expand_label
 extern linnea_error_exit
-extern linnea_x509_find_spki
+extern linnea_x509_leaf_spki
 extern linnea_x509_spki_point
 extern linnea_p256_ecdsa_sign
 extern linnea_p256_ecdsa_verify_der
@@ -221,9 +221,9 @@ linnea_tls_setup:
     or edi, ecx                        ; edi = leaf DER length
     mov rsi, rdi
     lea rdi, [rax + 3]                 ; the DER itself
-    call linnea_x509_find_spki         ; rax = SPKI, rdx = its length
+    call linnea_x509_leaf_spki         ; rax = SPKI, rdx = its length
     test rax, rax
-    jz .bad_cert                       ; not a parseable X.509 with a P-256 SPKI
+    jz .bad_cert                       ; no SPKI in the field where one belongs
     mov rdi, rax
     mov rsi, rdx
     lea rdx, [leaf_pub]

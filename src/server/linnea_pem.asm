@@ -21,6 +21,8 @@ global linnea_pem_decode
 global linnea_pem_cert_list
 global linnea_pem_p256_key
 global linnea_x509_find_spki
+global linnea_x509_cert_wellformed
+global linnea_x509_leaf_spki
 global linnea_x509_spki_point
 
 section .rodata
@@ -140,19 +142,46 @@ linnea_pem_decode:
 ; compared: RFC 7468's lax grammar tolerates a mismatched END label, and
 ; tightening that would reject files other tools accept.
 .pad:
+    ; How much padding is legal is decided by the FINAL QUANTUM, not by taste.
+    ; r9d holds the leftover bits: 4 after two data symbols (so "==" follows),
+    ; 2 after three (so "="), and 0 or 6 mean the quantum cannot take padding
+    ; at all. My report-99 fix skipped every '=' unconditionally, so four of
+    ; them before the END line were accepted on a body needing none
+    ; (audit-report-100 F3). rbx is already past the first '='.
+    cmp r9d, 4
+    je .pad_need2
+    cmp r9d, 2
+    jne .bad                 ; 0 or 6 leftover bits: no padding belongs here
+    jmp .pad_tail            ; exactly one '=', and it is consumed
+.pad_need2:
+    ; the second '=' is required; a line break may separate them
+    cmp rbx, r13
+    jae .bad
+    movzx eax, byte [rbx]
+    cmp al, '='
+    je .pad_two
+    movzx ecx, byte [b64_table + rax]
+    cmp cl, 0xff
+    jne .bad
+    inc rbx
+    jmp .pad_need2
+.pad_two:
+    inc rbx
+.pad_tail:
+    ; only whitespace, then the boundary. A further '=' is more padding than
+    ; the quantum can justify.
     cmp rbx, r13
     jae .bad
     movzx eax, byte [rbx]
     cmp al, '-'
     je .at_dash
     cmp al, '='
-    je .pad_skip
+    je .bad
     movzx ecx, byte [b64_table + rax]
     cmp cl, 0xff
     jne .bad                 ; base64 payload after the padding
-.pad_skip:
     inc rbx
-    jmp .pad
+    jmp .pad_tail
 .at_dash:
     lea rax, [rbx + end_len]
     cmp rax, r13
@@ -241,6 +270,21 @@ linnea_pem_cert_list:
     test rax, rax
     js .no_more
     jz .bad                   ; an empty CERTIFICATE block: malformed (-2)
+    ; EVERY entry must be a structurally complete Certificate, not just the
+    ; leaf. Only the leaf gets the key-pairing check, so a malformed
+    ; INTERMEDIATE used to be framed and sent unexamined -- and the
+    ; intermediate is exactly what a renewal half-writes
+    ; (audit-report-100 F2). Issuers may use other algorithms and have no
+    ; configured key, so this is syntax only.
+    push rax
+    push rdx
+    lea rdi, [r14 + rbx + 3]  ; the DER: recomputed, because linnea_pem_decode
+    mov rsi, rax              ; takes r8 as its own out pointer and clobbers it
+    call linnea_x509_cert_wellformed
+    test eax, eax
+    pop rdx
+    pop rax
+    jz .bad
     mov r12, rdx              ; resume past this block
     mov ecx, eax              ; u24 DER length, big-endian
     shr ecx, 16
@@ -497,6 +541,194 @@ der_any:
     mov rax, -1
     xor ecx, ecx
     xor edx, edx
+    pop rbx
+    ret
+
+; ---- tbs_walk(rdi=der, rsi=len) -> rax = the SubjectPublicKeyInfo element,
+;      rdx = its length; rax = 0 if these bytes are not a structurally valid
+;      X.509 Certificate. File-local; the two public entry points below share it
+;      so they cannot drift apart (audit-report-101).
+;
+;      RFC 5280 4.1: Certificate ::= SEQUENCE { tbsCertificate, AlgorithmIdentifier,
+;      BIT STRING }, and 4.1.2: TBSCertificate ::= SEQUENCE { [0] version OPTIONAL,
+;      INTEGER serialNumber, SEQUENCE signature, SEQUENCE issuer, SEQUENCE
+;      validity, SEQUENCE subject, SEQUENCE subjectPublicKeyInfo, ... }.
+;
+;      The TYPES are checked, not just the count: stepping over six anonymous
+;      TLVs accepted a serialNumber retagged as an OCTET STRING, because a
+;      bounded TLV of any tag still advances the cursor (audit-report-101 F1).
+;      Algorithm-independent on purpose -- issuers need not be P-256, so the
+;      key-algorithm check belongs to the leaf entry point, not here.
+tbs_walk:
+    push rbx
+    push r12
+    push r13
+    push r14
+    lea r13, [rdi + rsi]             ; entry end
+    mov rsi, r13
+    call der_any                     ; Certificate
+    cmp rax, -1
+    je .tw_no
+    cmp dl, 0x30
+    jne .tw_no
+    lea rbx, [rax + rcx]
+    cmp rbx, r13
+    jne .tw_no                       ; trailing bytes after the Certificate
+    mov rdi, rax
+    mov rsi, rbx
+    call der_any                     ; tbsCertificate
+    cmp rax, -1
+    je .tw_no
+    cmp dl, 0x30
+    jne .tw_no
+    mov r12, rax                     ; TBS content
+    mov r14, rcx                     ; TBS length
+    ; --- the outer signatureAlgorithm and signatureValue -------------------
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; signatureAlgorithm
+    cmp rax, -1
+    je .tw_no
+    cmp dl, 0x30
+    jne .tw_no
+    test rcx, rcx
+    jz .tw_no                        ; an empty AlgorithmIdentifier
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; signatureValue
+    cmp rax, -1
+    je .tw_no
+    cmp dl, 0x03                     ; BIT STRING
+    jne .tw_no
+    test rcx, rcx
+    jz .tw_no                        ; no unused-bits octet at all
+    cmp byte [rax], 8                ; that octet must be 0..7
+    jae .tw_no
+    cmp rcx, 1
+    jbe .tw_no                       ; unused-bits octet and nothing signed
+    lea rdi, [rax + rcx]
+    cmp rdi, rbx
+    jne .tw_no                       ; a fourth element: not a Certificate
+    ; --- the TBSCertificate fields, by type -------------------------------
+    lea rbx, [r12 + r14]             ; TBS content end
+    mov rdi, r12
+    mov rsi, rbx
+    call der_any
+    cmp rax, -1
+    je .tw_no
+    cmp dl, 0xa0                     ; [0] EXPLICIT version, optional
+    jne .tw_serial                   ; absent: this element IS serialNumber
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any
+    cmp rax, -1
+    je .tw_no
+.tw_serial:
+    cmp dl, 0x02                     ; serialNumber: INTEGER
+    jne .tw_no
+    mov r12d, 4                      ; signature, issuer, validity, subject
+.tw_seq:
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any
+    cmp rax, -1
+    je .tw_no
+    cmp dl, 0x30                     ; each of the four is a SEQUENCE
+    jne .tw_no
+    dec r12d
+    jnz .tw_seq
+    lea r14, [rax + rcx]             ; subjectPublicKeyInfo begins here
+    mov rdi, r14
+    mov rsi, rbx
+    call der_any
+    cmp rax, -1
+    je .tw_no
+    cmp dl, 0x30
+    jne .tw_no
+    lea rdx, [rax + rcx]
+    sub rdx, r14                     ; its full length, header included
+    mov rax, r14
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.tw_no:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- linnea_x509_cert_wellformed(rdi=der, rsi=len) -> rax = 1 if the bytes are
+;      a structurally complete X.509 Certificate, else 0. Applied to EVERY chain
+;      entry, so it is algorithm-agnostic: an issuer may be RSA, or any curve.
+;
+;      Deliberately separate from linnea_x509_find_spki, which searches
+;      untrusted PEER input for a pinned key and is right to be permissive about
+;      everything else. This validates a LOCAL credential we are about to send
+;      to every client, where "some child looked like an SPKI" is not evidence
+;      that the surrounding bytes are a certificate (audit-report-100 F1). It
+;      does no trust or hostname validation -- only syntax, which is all a
+;      preflight can honestly promise.
+linnea_x509_cert_wellformed:
+    call tbs_walk
+    test rax, rax
+    jz .cw_no
+    mov eax, 1
+    ret
+.cw_no:
+    xor eax, eax
+    ret
+
+; ---- linnea_x509_leaf_spki(rdi=der, rsi=len) -> rax = SubjectPublicKeyInfo
+;      pointer, rdx = its length; rax = 0 on failure.
+;
+;      POSITIONAL, not a search: the SPKI is the field RFC 5280 puts it in, so
+;      an SPKI-shaped object sitting in another field is not mistaken for one.
+;      And the declared algorithm MUST be id-ecPublicKey + prime256v1 -- the
+;      first positional version dropped that comparison, which
+;      linnea_x509_find_spki had always made, so a certificate declaring a
+;      different curve over a P-256-sized point was accepted
+;      (audit-report-101 F2). RFC 5280 4.1.2.7 binds the key to its algorithm;
+;      the bytes are not ignorable metadata.
+linnea_x509_leaf_spki:
+    push rbx
+    push r12
+    call tbs_walk
+    test rax, rax
+    jz .ls_no
+    mov rbx, rax                     ; SPKI element
+    mov r12, rdx                     ; its length
+    lea rsi, [rax + rdx]
+    mov rdi, rax
+    call der_any                     ; the SPKI SEQUENCE
+    cmp rax, -1
+    je .ls_no
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call der_any                     ; its AlgorithmIdentifier
+    cmp rax, -1
+    je .ls_no
+    cmp dl, 0x30
+    jne .ls_no
+    cmp rcx, alg_ec_len
+    jne .ls_no                       ; not exactly id-ecPublicKey + prime256v1
+    mov rdi, rax
+    lea rsi, [alg_ec]
+    mov rcx, alg_ec_len
+    call bytes_eq
+    test eax, eax
+    jz .ls_no
+    mov rax, rbx
+    mov rdx, r12
+    pop r12
+    pop rbx
+    ret
+.ls_no:
+    xor eax, eax
+    pop r12
     pop rbx
     ret
 
