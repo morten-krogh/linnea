@@ -552,6 +552,11 @@ def respond(c, sid, method, path, body):
         c.send(frame(0x03, 0x00, sid, struct.pack(">I", 8)))  # CANCEL
         return
 
+    # the :path exactly as the leg built it, kept BEFORE the query is split off
+    # -- a route that is asked what :path arrived must not be handed the half of
+    # it this fixture happens to dispatch on (audit-report-76: the first version
+    # of /?-echo reported "/" for every query and looked like a server defect)
+    raw_path = path
     q = ""
     if path and "?" in path:
         path, q = path.split("?", 1)
@@ -587,6 +592,19 @@ def respond(c, sid, method, path, body):
         return
     if path.startswith("/pri-"):
         respond_priority(c, sid, path)
+        return
+    if path == "/":                  # the query, if any, is already in q
+        # what :path the leg built for a target with an EMPTY path. RFC 9110
+        # 4.2.1 lets an absolute-form target be authority + query with no path
+        # at all, and its query has to survive normalisation to "/" --
+        # answering "/" and dropping the query is a wrong resource, not a fix
+        # (audit-report-76). Only the h2 leg can be asked this: the h1 leg is
+        # asked the same question by test/tls/h1_absolute_form.py.
+        rb = ("PATH=%s\n" % raw_path).encode()
+        blk = enc_status(200) + enc_header("content-type", "text/plain")
+        blk += enc_header("content-length", str(len(rb)))
+        c.send(frame(0x01, 0x04, sid, blk))
+        c.send(frame(0x00, 0x01, sid, rb))
         return
     if path == "/authority":
         # what :authority the leg built. For an absolute-form h1 request the

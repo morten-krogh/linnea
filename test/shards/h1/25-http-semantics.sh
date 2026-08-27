@@ -222,6 +222,24 @@ resp=$(raw_http 'GET https://one.test/hello.txt HTTP/1.1\r\nHost: one.test\r\n\r
 check_http "target: absolute-form (https scheme) served" "hello from linnea" "$resp"
 resp=$(raw_http 'GET http://one.test HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "target: absolute-form with no path is the root" "200 OK" "$resp"
+# RFC 9110 4.2.1 makes the path OPTIONAL, so authority + query with no path at
+# all is a valid absolute URI. The authority scan ended only at "/", so the
+# query was read as part of the authority, which the authority validator then
+# refused: 400 for a request that must be served (audit-report-76). Here the
+# route is a plain static one -- the query is not used to select the file, but
+# it must not stop the file being served either.
+resp=$(raw_http 'GET http://one.test/hello.txt?x=1 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: absolute-form with a path and a query" "hello from linnea" "$resp"
+resp=$(raw_http 'GET http://one.test?x=1 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: absolute-form with an empty path and a query" "200 OK" "$resp"
+# three.test has its own root, so WHICH index comes back says which authority
+# was used -- "sub index" is three.test's, and one.test's is a full document
+resp=$(raw_http 'GET http://three.test?x=1 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: an empty path with a query still routes by authority" "sub index" "$resp"
+# ...and a slash inside query DATA is not a path delimiter: were it read as one,
+# the authority would end at "three.test?next=" and routing would fail
+resp=$(raw_http 'GET http://three.test?next=/hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: a slash inside the query is not a path delimiter" "sub index" "$resp"
 # the target's authority wins over Host: three.test has its own root, which
 # holds no hello.txt, so routing by it is visible as a 404
 resp=$(raw_http 'GET http://three.test/hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')

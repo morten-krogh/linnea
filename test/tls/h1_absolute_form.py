@@ -19,6 +19,14 @@ The origin-form row is the control: there the effective authority IS the Host
 value, so the replacement is byte-identical and nothing changes. The query and
 no-path rows keep target normalisation coupled to the authority replacement.
 
+The empty-path rows are audit-report-76: RFC 9110 4.2.1 makes the path optional
+in an http-URI, so "http://host?x=1" is a legal target whose path is empty and
+whose query is "x=1". The authority ended only at "/", so the query was eaten by
+the authority, which then failed validation -- 400 for a request that must be
+served. They run against qroot.test, whose "/" is PROXIED, because the fix is
+only half done if the empty path becomes "/" and the query is dropped on the
+way: that is a wrong answer where the 400 was at least an honest refusal.
+
 usage: h1_absolute_form.py <front port>
 """
 import socket
@@ -70,6 +78,18 @@ cases = [
     (b"GET /api/headers", AUTH,
      "/api/headers", "origin-form (control)"),
 ]
+# ...and the empty-path forms, on the vhost whose "/" is proxied
+QROOT = b"qroot.test"
+cases += [
+    (b"GET http://" + QROOT + b"?x=1", b"other.test",
+     "GET /?x=1 ", "empty path with a query"),
+    (b"GET http://" + QROOT + b"?next=/api/headers", b"other.test",
+     "GET /?next=/api/headers ", "a query containing a slash"),
+    (b"GET http://" + QROOT, b"other.test",
+     "GET / ", "empty path, no query (control)"),
+    (b"GET http://" + QROOT + b"/?x=1", b"other.test",
+     "GET /?x=1 ", "explicit / with a query (control)"),
+]
 for line, host, want_target, label in cases:
     resp, seen = exchange(line, host)
     if not resp.startswith("HTTP/1.1 200"):
@@ -78,7 +98,7 @@ for line, host, want_target, label in cases:
         continue
     got_host = field(seen, "host")
     got_line = first_line(seen)
-    want_host = AUTH.decode()
+    want_host = (QROOT if QROOT in line else AUTH).decode()
     if got_host != want_host or want_target not in got_line:
         print("FAIL %-34s backend saw %r / Host: %s (want %s / %s)"
               % (label, got_line, got_host, want_target, want_host))

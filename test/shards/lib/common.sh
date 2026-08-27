@@ -136,6 +136,8 @@ P61728=$((PORTBASE + 728))   # backend-h2 upload: the flow-controlled h2 BACKEND
 P61729=$((PORTBASE + 729))   # backend-h2 upload: the proxy_h2 front in front of it
 P61730=$((PORTBASE + 730))   # backend-h2 frame size: a PLAINTEXT h2 fixture, driven
                              # by bin/linnea-h2client directly (both parsers)
+P61731=$((PORTBASE + 731))   # backend-h2 :path: a PLAINTEXT front over proxy_h2, so
+                             # an absolute-form request line can be sent raw
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 # What actually reached a proxy backend, appended to by test/proxy_backend.py.

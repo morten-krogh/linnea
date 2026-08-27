@@ -4,7 +4,7 @@
 # --- config parsing and validation ---
 run_test "good config"     124 stdout "server 1: host=127.0.0.1 port=${P61090} hostname=two.test locations=3" \
     timeout 0.5 $BIN --config $CFG/listen.json
-run_test "config dump"     124 stdout "config: 3 servers timeout=2 max_connections=64" \
+run_test "config dump"     124 stdout "config: 4 servers timeout=2 max_connections=64" \
     timeout 0.5 $BIN --config $CFG/listen.json
 # the dump prints the config verbatim, and the generated configs carry
 # ABSOLUTE paths so a server started in its own run directory still finds

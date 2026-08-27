@@ -1526,6 +1526,49 @@ PY
     fi
     rm -f $RUNDIR/bt_tr.log
 
+    # --- an absolute-form EMPTY path keeps its query on the h2 leg ----------
+    # RFC 9110 4.2.1: an http-URI may be authority + query with no path at all.
+    # "http://front.test?x=1" was answered 400 because the authority scan ended
+    # only at "/" and swallowed the query (audit-report-76). Half a fix is
+    # worse than the 400: normalising the empty path to "/" and dropping the
+    # query is a successful request for the WRONG resource. The h1 leg is
+    # asserted by test/tls/h1_absolute_form.py; this is the same question put
+    # to the h2 leg, where the target becomes the :path pseudo-header.
+    #
+    # The front is PLAINTEXT so the request line can be written raw -- curl
+    # sends absolute-form only to a proxy, and not at all through TLS.
+    cat > $CFG/bt-fe-h2p.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-h2p.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61731}, "hostname": "front.test",
+    "locations": [ { "prefix": "/", "proxy": "127.0.0.1:${P61724}",
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost",
+      "proxy_h2": 1 } ] } ] }
+EOF
+    start_server $CFG/bt-fe-h2p.json
+    abs_path() {   # $1 = request-target -> the :path the backend reports
+        python3 test/h2/h2c_server.py ${P61724} tls >$RUNDIR/bt_tr.log 2>&1 &
+        local pid=$!
+        sleep 0.5
+        timeout 20 python3 test/raw_http.py \
+            "GET $1 HTTP/1.1\r\nHost: other.test\r\nConnection: close\r\n\r\n" \
+            ${P61731} 2>/dev/null
+        kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    }
+    out=$(abs_path "http://front.test?x=1")
+    printf '%s' "$out" | grep -q "PATH=/?x=1"
+    check "backend h2 :path: an empty path keeps its query (/?x=1)" $?
+
+    # a slash inside query DATA is not a path delimiter
+    out=$(abs_path "http://front.test?next=/api/headers")
+    printf '%s' "$out" | grep -q "PATH=/?next=/api/headers"
+    check "backend h2 :path: a slash in the query is not a delimiter" $?
+
+    # the control: no query at all is still exactly "/", with no stray "?"
+    out=$(abs_path "http://front.test")
+    printf '%s' "$out" | grep -q "PATH=/$"
+    check "backend h2 :path: an empty path with no query is / (control)" $?
+    rm -f $RUNDIR/bt_tr.log
+
     rm -f $RUNDIR/bt_conc.txt $RUNDIR/h2_conc.txt $RUNDIR/tls_h2_conc.txt \
           "$btw/probe.txt" "$btw/big.bin"
 else

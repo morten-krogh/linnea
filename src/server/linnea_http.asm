@@ -353,6 +353,7 @@ hdr_close_len   equ $ - hdr_close
 ; rewriter has accepted it.
 hdr_via_11:     db "Via: 1.1 linnea", 13, 10
 hdr_via_11_len  equ $ - hdr_via_11
+qmark_lit:      db "?"
 hdr_host_up:    db "Host: "
 hdr_host_up_len equ $ - hdr_host_up
 hdr_cl_up:      db "Content-Length: "
@@ -809,7 +810,7 @@ linnea_http_handle:
     push r13
     push r14
     push r15
-    sub rsp, 544               ; +32 for the two precondition fields, +64 for the
+    sub rsp, 560               ; +32 for the two precondition fields, +64 for the
                                ; Accept-Encoding span array (h1-14): [352] holds
                                ; three (ptr,len) pairs, [400] the scan index, and
                                ; [416]/[424] the version token as the client wrote
@@ -817,7 +818,14 @@ linnea_http_handle:
                                ; (ptr,len) spans each for If-None-Match and
                                ; If-Match, counted at [176] and [312], and
                                ; [528] the Max-Forwards value (bit 64 of the
-                               ; framing flags says whether one was sent)
+                               ; framing flags says whether one was sent), and
+                               ; [536]/[544] an absolute-form empty path's query
+                               ; (audit-report-76)
+    ; Cleared per request: this frame is reused for every request on a
+    ; keep-alive connection, and a stale query would be appended to the next
+    ; request's target. Only the absolute-form branch below ever sets them.
+    mov qword [rsp + 536], 0
+    mov qword [rsp + 544], 0
     mov rbx, rdi
     lea r14, [rbx + linnea_connection.in_buf]
     mov r12, [rbx + linnea_connection.in_len]
@@ -1036,6 +1044,8 @@ linnea_http_handle:
     mov [rsp + 144], rdx
     mov [rsp + 88], rcx        ; routing follows the target's authority
     mov [rsp + 96], r8
+    mov [rsp + 536], r10       ; an empty path's query, appended by the proxy
+    mov [rsp + 544], r11       ; rewrite; zero for every other target form
 .target_form_done:
 
     ; --- version: HTTP/1.x CRLF -----------------------------------
@@ -2830,6 +2840,19 @@ linnea_http_handle:
     mov rdi, [rsp + 8]
     mov rsi, [rsp + 144]
     call .append
+    ; An absolute-form target with an EMPTY path carries its query separately:
+    ; "/?x=1" is not contiguous in the head buffer, so the target above is the
+    ; canned "/" and the query is appended here (audit-report-76). Dropping it
+    ; would turn a 400 into a successful request for the WRONG resource.
+    cmp qword [rsp + 536], 0   ; the POINTER, not the length: "http://host?"
+    je .proxy_no_qs            ; is an empty query, which is not no query
+    lea rdi, [qmark_lit]
+    mov esi, 1
+    call .append
+    mov rdi, [rsp + 536]
+    mov rsi, [rsp + 544]
+    call .append
+.proxy_no_qs:
     lea rdi, [req_version]
     mov esi, req_version_len
     call .append
@@ -3372,7 +3395,7 @@ linnea_http_handle:
     jmp .ret
 
 .ret:
-    add rsp, 544
+    add rsp, 560
     pop r15
     pop r14
     pop r13
@@ -3677,9 +3700,13 @@ target_absolute:
     jae .ta_root                     ; no path at all: the root
     cmp byte [r8], '/'
     je .ta_path
+    cmp byte [r8], '?'
+    je .ta_query                     ; an empty path, then a query
     inc r8
     jmp .ta_auth
 .ta_path:
+    xor r10d, r10d               ; no query of its own
+    xor r11d, r11d
     mov rax, r8                      ; the path begins at that '/'
     mov rdx, r9
     sub rdx, r8                      ; its length
@@ -3688,7 +3715,31 @@ target_absolute:
     jz .ta_no                        ; "http:///path" names nothing
     pop rbx
     ret
+.ta_query:
+    ; RFC 9110 4.2.1: http-URI is authority path-abempty [ "?" query ], so an
+    ; EMPTY path may be followed by a query -- "http://host?x=1" is authority
+    ; "host", path "", query "x=1". Scanning only for '/' swallowed the query
+    ; into the authority, which the authority validator then rejected: a valid
+    ; request was answered 400, and a query CONTAINING a slash split at that
+    ; slash instead (audit-report-76).
+    ;
+    ; The path normalises to "/" and the query comes back separately in
+    ; r10/r11, because "/?x=1" does not exist contiguously in the head buffer;
+    ; the caller keeps it and the proxy rewrite appends it behind the target.
+    mov r10, r8                      ; at the '?'
+    inc r10                          ; the query itself
+    mov r11, r9
+    sub r11, r10                     ; its length
+    sub r8, rcx                      ; authority length
+    test r8, r8
+    jz .ta_no
+    lea rax, [slash_target]
+    mov rdx, 1
+    pop rbx
+    ret
 .ta_root:
+    xor r10d, r10d               ; no query of its own
+    xor r11d, r11d
     sub r8, rcx                      ; authority length
     test r8, r8
     jz .ta_no
@@ -3697,6 +3748,8 @@ target_absolute:
     pop rbx
     ret
 .ta_no:
+    xor r10d, r10d               ; no query of its own
+    xor r11d, r11d
     xor eax, eax
     pop rbx
     ret

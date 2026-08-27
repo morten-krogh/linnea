@@ -58,6 +58,17 @@
           "root": "test/www/sub"
         }
       ]
+    },
+    {
+      "host": "127.0.0.1",
+      "port": 61080,
+      "hostname": "qroot.test",
+      "locations": [
+        {
+          "prefix": "/",
+          "proxy": "127.0.0.1:61100"
+        }
+      ]
     }
   ]
 }

@@ -142,6 +142,15 @@ def respond(conn, head, body, extra=b""):
     elif path.endswith(b"/echo"):
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
                      % (len(body), body))
+    elif path == b"/":
+        # An absolute-form target with an EMPTY path normalises to "/", and its
+        # query has to survive that normalisation -- answering "/" and dropping
+        # the query is a worse failure than the 400 it replaced
+        # (audit-report-76). Echo the whole head, so the request line carries
+        # the query AND the replaced Host is visible in the same answer; no
+        # other location proxied here has a bare "/" target.
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
+                     % (len(head), head))
     elif path.endswith(b"/target"):
         # Echo the request target, to prove the query string is forwarded.
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
