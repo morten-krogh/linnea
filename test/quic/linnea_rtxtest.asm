@@ -106,6 +106,27 @@ prio_bare_i: db "i"
 prio_bare_i_len equ $ - prio_bare_i
 prio_bad:  db "u=9"                   ; out of range: falls back to the default
 prio_bad_len equ $ - prio_bad
+; audit-report-81's three examples, measured rather than assumed
+prio_7x:   db "u=7x"                  ; digits that do not end the member
+prio_7x_len equ $ - prio_7x
+prio_dup:  db "u=1,u=5"               ; a repeated key: RFC 8941 4.2.2, last wins
+prio_dup_len equ $ - prio_dup
+prio_i2:   db "i=?2"                  ; ?2 is not an RFC 8941 boolean
+prio_i2_len equ $ - prio_i2
+prio_dupi: db "i,i=?0"                ; ...and the same for the boolean key
+prio_dupi_len equ $ - prio_dupi
+prio_ikey: db "important=1"           ; an unknown key that merely starts with i
+prio_ikey_len equ $ - prio_ikey
+prio_ix:   db "i=x"                   ; not a boolean at all
+prio_ix_len equ $ - prio_ix
+prio_i1x:  db "i=?1x"                 ; a boolean that does not end the member
+prio_i1x_len equ $ - prio_i1x
+prio_i0i2: db "i=?0,i=?2"             ; an explicit off, then an invalid member
+prio_i0i2_len equ $ - prio_i0i2
+prio_ipar: db "i;q=1"                 ; bare i carrying an 8941 parameter
+prio_ipar_len equ $ - prio_ipar
+prio_i1par: db "i=?1;q=2"             ; ...and the same on the explicit form
+prio_i1par_len equ $ - prio_i1par
 
 ; --- frame-length table fixtures (RFC 9000 19) ---
 fk_pad:     db 0x00
@@ -551,6 +572,71 @@ _start:
     call linnea_quic_parse_priority
     EXPECT rax, 3
     EXPECT rdx, 0
+
+    ; audit-report-81: the three values that report calls malformed. RFC 9218 4
+    ; is explicit -- "unknown priority parameters, priority parameters with
+    ; out-of-range values, or values of unexpected types MUST be ignored" -- so
+    ; falling back to the default is the REQUIRED handling for the first and the
+    ; third, not leniency. The middle one is not malformed at all: RFC 8941 4.2.2
+    ; makes a repeated dictionary key legal, with the LAST value winning, and
+    ; getting that backwards would be a real defect.
+    lea rdi, [prio_7x]
+    mov esi, prio_7x_len
+    call linnea_quic_parse_priority     ; "u=7x" -> not a number: ignored
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_dup]
+    mov esi, prio_dup_len
+    call linnea_quic_parse_priority     ; "u=1,u=5" -> the LAST u wins
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_i2]
+    mov esi, prio_i2_len
+    call linnea_quic_parse_priority     ; "i=?2" -> not a boolean: ignored
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_dupi]
+    mov esi, prio_dupi_len
+    call linnea_quic_parse_priority     ; "i,i=?0" -> the LAST i wins: false
+    EXPECT rax, 3
+    EXPECT rdx, 0
+
+    ; ...and the class the report's "i=?2" belongs to. RFC 9218 4 again: an
+    ; unknown member, or one whose value is of an unexpected type, MUST be
+    ; ignored -- so none of these may reach incremental. Every one of them
+    ; turned it ON, because the branch set true before it validated anything:
+    ; "important=1" is not even this key.
+    lea rdi, [prio_ikey]
+    mov esi, prio_ikey_len
+    call linnea_quic_parse_priority     ; an unknown key beginning with 'i'
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_ix]
+    mov esi, prio_ix_len
+    call linnea_quic_parse_priority     ; "i=x": not a boolean
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_i1x]
+    mov esi, prio_i1x_len
+    call linnea_quic_parse_priority     ; "i=?1x": a boolean that never ends
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_i0i2]
+    mov esi, prio_i0i2_len
+    call linnea_quic_parse_priority     ; an invalid member must not undo "?0"
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    ; the controls: the legal spellings must still be read, parameters included
+    lea rdi, [prio_ipar]
+    mov esi, prio_ipar_len
+    call linnea_quic_parse_priority     ; "i;q=1" -> bare i is true
+    EXPECT rax, 3
+    EXPECT rdx, 1
+    lea rdi, [prio_i1par]
+    mov esi, prio_i1par_len
+    call linnea_quic_parse_priority     ; "i=?1;q=2" -> true
+    EXPECT rax, 3
+    EXPECT rdx, 1
 
     ; --- reset_scan captures a PATH_CHALLENGE bundled behind other frames, so the
     ; receive path can echo it in a PATH_RESPONSE (RFC 9000 8.2) ---

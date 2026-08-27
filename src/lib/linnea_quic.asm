@@ -2245,19 +2245,63 @@ linnea_quic_parse_priority:
     mov r8d, eax
     jmp .pp_adv
 .pp_i:
-    ; bare 'i' (or 'i' ending the string) is true; only "i=?0" is false
-    mov r9d, 1
+    ; RFC 9218 4.2: incremental is an RFC 8941 Boolean, default false. A BARE
+    ; "i" is the dictionary shorthand for "i=?1" (8941 3.2), so it is true;
+    ; anything else must be an actual boolean, "?0" or "?1" and nothing more.
+    ;
+    ; The member is validated BEFORE it is applied, exactly as the urgency
+    ; branch above validates its digits. Setting true first and clearing it only
+    ; for "i=?0" made every malformed or unrelated member true (audit-report-81):
+    ; "i=?2" and "i=x" are not booleans and 9218 4 says a value of an unexpected
+    ; type MUST be ignored, and "important=1" is not this key at all -- an
+    ; unknown member, which the same sentence says to ignore. Both turned
+    ; incremental ON, and "i=?0,i=?2" turned it back on after the peer had
+    ; explicitly said off.
     lea rcx, [rdi + 1]
     cmp rcx, r10
-    jae .pp_adv                      ; 'i' at end: bare, true
-    cmp byte [rdi + 1], '='
-    jne .pp_adv                      ; 'i' then ',' or ' ': bare, true
-    lea rcx, [rdi + 4]               ; "i=?0" needs 4 bytes
+    jae .pp_i_true                   ; "i" ends the value: bare
+    movzx edx, byte [rdi + 1]
+    cmp dl, '='
+    je .pp_i_eq
+    cmp dl, ','
+    je .pp_i_true                    ; "i," : bare
+    cmp dl, ' '
+    je .pp_i_true
+    cmp dl, ';'
+    je .pp_i_true                    ; "i;q=1": bare, with an 8941 parameter
+    jmp .pp_adv                      ; a longer key that merely starts with i
+.pp_i_true:
+    mov r9d, 1
+    jmp .pp_adv
+.pp_i_eq:
+    lea rcx, [rdi + 4]               ; "i=?0" needs four bytes
     cmp rcx, r10
-    ja .pp_adv
-    cmp byte [rdi + 3], '0'
+    ja .pp_adv                       ; too short to hold a boolean: ignored
+    cmp byte [rdi + 2], '?'
+    jne .pp_adv                      ; "i=1", "i=x": not a boolean
+    movzx edx, byte [rdi + 3]
+    cmp dl, '0'
+    je .pp_i_ends
+    cmp dl, '1'
+    jne .pp_adv                      ; "i=?2": not a boolean
+.pp_i_ends:
+    ; ...and the boolean must END the member, as the urgency digits must
+    lea rcx, [rdi + 4]
+    cmp rcx, r10
+    jae .pp_i_apply
+    movzx eax, byte [rcx]
+    cmp al, ','
+    je .pp_i_apply
+    cmp al, ' '
+    je .pp_i_apply
+    cmp al, ';'
+    je .pp_i_apply
+    jmp .pp_adv                      ; "i=?1x": never a boolean
+.pp_i_apply:
+    xor r9d, r9d
+    cmp dl, '1'
     jne .pp_adv
-    xor r9d, r9d                     ; i=?0 → false
+    mov r9d, 1
 .pp_adv:
     cmp rdi, r10                     ; advance to the next comma
     jae .pp_done
