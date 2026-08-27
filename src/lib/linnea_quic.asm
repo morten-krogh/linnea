@@ -2438,32 +2438,225 @@ linnea_quic_parse_priority:
     jmp .pp_after_value              ; the key ended: another ";", a comma, OWS
                                      ; then a comma, or the end -- or a failure
 .pp_par_val:
+    ; RFC 8941 3.3: a parameter's value is a bare-item, and there are six of
+    ; them. Skipping to the next delimiter instead of parsing one accepted
+    ; things that are not items at all -- an unterminated string, a lone
+    ; backslash, "?2", "1." (audit-report-84) -- and REFUSED things that are:
+    ; a string may hold a space, a comma or a semicolon, and stopping at those
+    ; tore the value in half. Parsing it settles both.
+    ;
+    ; Each form below either leaves rdi one past the item and rejoins
+    ; .pp_after_value, which decides what may follow it, or fails the value.
     inc rdi                          ; past the "="
     cmp rdi, r10
     jae .pp_fail                     ; "q=" with no bare-item after it
     movzx eax, byte [rdi]
-    cmp al, ';'
-    je .pp_fail
-    cmp al, ','
-    je .pp_fail
-    cmp al, ' '
-    je .pp_fail
-    cmp al, 9
-    je .pp_fail
-.pp_par_vskip:
+    cmp al, '"'
+    je .pp_b_str
+    cmp al, ':'
+    je .pp_b_bin
+    cmp al, '?'
+    je .pp_b_bool
+    cmp al, '-'
+    je .pp_b_num
+    cmp al, '0'
+    jb .pp_b_tok
+    cmp al, '9'
+    jbe .pp_b_num
+    jmp .pp_b_tok
+
+    ; sf-string = DQUOTE *( unescaped / "\" ( DQUOTE / "\" ) ) DQUOTE, where
+    ; unescaped is %x20-21 / %x23-5B / %x5D-7E -- printable ASCII less the two
+    ; characters that have to be escaped. A control byte is not one of them.
+.pp_b_str:
+    inc rdi                          ; past the opening quote
+.pp_b_str_c:
+    cmp rdi, r10
+    jae .pp_fail                     ; unterminated
+    movzx eax, byte [rdi]
+    inc rdi
+    cmp al, '"'
+    je .pp_after_value               ; closed
+    cmp al, 92                       ; a backslash escapes only " and itself
+    je .pp_b_str_esc
+    cmp al, 0x20
+    jb .pp_fail
+    cmp al, 0x7e
+    ja .pp_fail
+    jmp .pp_b_str_c
+.pp_b_str_esc:
+    cmp rdi, r10
+    jae .pp_fail
+    movzx eax, byte [rdi]
+    inc rdi
+    cmp al, '"'
+    je .pp_b_str_c
+    cmp al, 92
+    je .pp_b_str_c
+    jmp .pp_fail
+
+    ; sf-boolean = "?" ( "0" / "1" ) -- the same shape the "i" member takes
+.pp_b_bool:
     inc rdi
     cmp rdi, r10
-    jae .pp_done                     ; the value ends with this parameter
+    jae .pp_fail
     movzx eax, byte [rdi]
-    cmp al, ';'
+    inc rdi
+    cmp al, '0'
     je .pp_after_value
-    cmp al, ','
+    cmp al, '1'
     je .pp_after_value
-    cmp al, ' '
+    jmp .pp_fail
+
+    ; sf-binary = ":" *( ALPHA / DIGIT / "+" / "/" / "=" ) ":"
+.pp_b_bin:
+    inc rdi                          ; past the opening colon
+.pp_b_bin_c:
+    cmp rdi, r10
+    jae .pp_fail                     ; unterminated
+    movzx eax, byte [rdi]
+    inc rdi
+    cmp al, ':'
     je .pp_after_value
+    cmp al, '+'
+    je .pp_b_bin_c
+    cmp al, '/'
+    je .pp_b_bin_c
+    cmp al, '='
+    je .pp_b_bin_c
+    cmp al, '0'
+    jb .pp_fail
+    cmp al, '9'
+    jbe .pp_b_bin_c
+    cmp al, 'A'
+    jb .pp_fail
+    cmp al, 'Z'
+    jbe .pp_b_bin_c
+    cmp al, 'a'
+    jb .pp_fail
+    cmp al, 'z'
+    jbe .pp_b_bin_c
+    jmp .pp_fail
+
+    ; sf-integer = ["-"] 1*15DIGIT, sf-decimal = ["-"] 1*12DIGIT "." 1*3DIGIT.
+    ; The two digit limits differ, and so does what "no digits" means: "-" on
+    ; its own and "1." are both failures.
+.pp_b_num:
+    cmp byte [rdi], '-'
+    jne .pp_b_num_int
+    inc rdi
+.pp_b_num_int:
+    xor ecx, ecx
+.pp_b_num_d:
+    cmp rdi, r10
+    jae .pp_b_num_end
+    movzx eax, byte [rdi]
+    sub al, '0'
     cmp al, 9
-    je .pp_after_value
-    jmp .pp_par_vskip
+    ja .pp_b_num_dot
+    inc rdi
+    inc ecx
+    jmp .pp_b_num_d
+.pp_b_num_dot:
+    add al, '0'
+    cmp al, '.'
+    jne .pp_b_num_end
+    test ecx, ecx
+    jz .pp_fail                      ; ".5" has no integer part
+    cmp ecx, 12
+    ja .pp_fail                      ; a decimal takes at most 12 before the dot
+    inc rdi                          ; past the '.'
+    xor ecx, ecx
+.pp_b_num_f:
+    cmp rdi, r10
+    jae .pp_b_num_fend
+    movzx eax, byte [rdi]
+    sub al, '0'
+    cmp al, 9
+    ja .pp_b_num_fend
+    inc rdi
+    inc ecx
+    cmp ecx, 3
+    ja .pp_fail                      ; at most three after it
+    jmp .pp_b_num_f
+.pp_b_num_fend:
+    test ecx, ecx
+    jz .pp_fail                      ; "1." with nothing behind the dot
+    jmp .pp_after_value
+.pp_b_num_end:
+    test ecx, ecx
+    jz .pp_fail                      ; "-" alone
+    cmp ecx, 15
+    ja .pp_fail                      ; an integer takes at most 15
+    jmp .pp_after_value
+
+    ; sf-token = ( ALPHA / "*" ) *( tchar / ":" / "/" )
+.pp_b_tok:
+    movzx eax, byte [rdi]
+    cmp al, '*'
+    je .pp_b_tok_more
+    cmp al, 'A'
+    jb .pp_fail
+    cmp al, 'Z'
+    jbe .pp_b_tok_more
+    cmp al, 'a'
+    jb .pp_fail
+    cmp al, 'z'
+    ja .pp_fail
+.pp_b_tok_more:
+    inc rdi
+    cmp rdi, r10
+    jae .pp_done                     ; the token ends the value
+    movzx eax, byte [rdi]
+    cmp al, ':'
+    je .pp_b_tok_more
+    cmp al, '/'
+    je .pp_b_tok_more
+    cmp al, '0'
+    jb .pp_b_tok_punct
+    cmp al, '9'
+    jbe .pp_b_tok_more
+    cmp al, 'A'
+    jb .pp_b_tok_punct
+    cmp al, 'Z'
+    jbe .pp_b_tok_more
+    cmp al, 'a'
+    jb .pp_b_tok_punct
+    cmp al, 'z'
+    jbe .pp_b_tok_more
+.pp_b_tok_punct:
+    ; tchar's punctuation (RFC 9110): ! # $ % & ' * + - . ^ _ ` | ~
+    cmp al, '!'
+    je .pp_b_tok_more
+    cmp al, '#'
+    je .pp_b_tok_more
+    cmp al, '$'
+    je .pp_b_tok_more
+    cmp al, '%'
+    je .pp_b_tok_more
+    cmp al, '&'
+    je .pp_b_tok_more
+    cmp al, 39
+    je .pp_b_tok_more
+    cmp al, '*'
+    je .pp_b_tok_more
+    cmp al, '+'
+    je .pp_b_tok_more
+    cmp al, '-'
+    je .pp_b_tok_more
+    cmp al, '.'
+    je .pp_b_tok_more
+    cmp al, '^'
+    je .pp_b_tok_more
+    cmp al, '_'
+    je .pp_b_tok_more
+    cmp al, '`'
+    je .pp_b_tok_more
+    cmp al, '|'
+    je .pp_b_tok_more
+    cmp al, '~'
+    je .pp_b_tok_more
+    jmp .pp_after_value              ; the token ended here
 .pp_fail:
     ; RFC 8941 4.2: "If parsing fails ... the entire field value MUST be ignored
     ; (i.e., treated as if the field were not present)". Not the member -- the

@@ -180,6 +180,50 @@ prio_parbare: db "u=5;a;b"            ; parameters with no value
 prio_parbare_len equ $ - prio_parbare
 prio_parstr: db "u=5;q=", 34, "x", 34 ; a value we do not interpret
 prio_parstr_len equ $ - prio_parstr
+; audit-report-84: a parameter's value is an RFC 8941 bare-item, and there are
+; six forms. Skipping to a delimiter instead of parsing one accepted what is not
+; an item AND refused what is: a string may hold a space, comma or semicolon.
+prio_bunterm: db "u=7;foo=", 34, "unterminated"
+prio_bunterm_len equ $ - prio_bunterm
+prio_bslash: db "u=7;foo=", 92      ; a lone backslash is not an item
+prio_bslash_len equ $ - prio_bslash
+prio_bbool2: db "u=7;q=?2"          ; nor is "?2" a boolean
+prio_bbool2_len equ $ - prio_bbool2
+prio_bdot:  db "u=7;q=1."           ; a decimal needs digits after the dot
+prio_bdot_len equ $ - prio_bdot
+prio_bnodot: db "u=7;q=.5"          ; ...and before it
+prio_bnodot_len equ $ - prio_bnodot
+prio_b1a:   db "u=7;q=1a"           ; a number does not continue into a token
+prio_b1a_len equ $ - prio_b1a
+prio_bctl:  db "u=5;q=", 34, "a", 9, "b", 34   ; a control byte is not unescaped
+prio_bctl_len equ $ - prio_bctl
+prio_b16:   db "u=5;q=1234567890123456"        ; 16 digits: an integer takes 15
+prio_b16_len equ $ - prio_b16
+prio_bd13:  db "u=5;q=1234567890123.5"         ; a decimal takes 12 before the dot
+prio_bd13_len equ $ - prio_bd13
+prio_bf4:   db "u=5;q=1.2345"                  ; ...and 3 after it
+prio_bf4_len equ $ - prio_bf4
+; ...and the legal items, one of every form
+prio_bsp:   db "u=5;q=", 34, "a b", 34         ; a STRING may hold a space
+prio_bsp_len equ $ - prio_bsp
+prio_bcomma: db "u=5;q=", 34, "a,b", 34, ",i"  ; ...or a comma, which is not a
+prio_bcomma_len equ $ - prio_bcomma             ; separator inside one
+prio_bsemi: db "u=5;q=", 34, "a;b", 34         ; ...or a semicolon
+prio_bsemi_len equ $ - prio_bsemi
+prio_besc:  db "u=5;q=", 34, "a", 92, 34, "b", 34   ; an escaped quote
+prio_besc_len equ $ - prio_besc
+prio_bempty: db "u=5;q=", 34, 34               ; the empty string
+prio_bempty_len equ $ - prio_bempty
+prio_bneg:  db "u=5;q=-0.5"                    ; a negative decimal
+prio_bneg_len equ $ - prio_bneg
+prio_b15:   db "u=5;q=123456789012345"         ; exactly 15 digits
+prio_b15_len equ $ - prio_b15
+prio_btok:  db "u=5;q=a:b/c"                   ; a token takes ":" and "/"
+prio_btok_len equ $ - prio_btok
+prio_bbin:  db "u=5;q=:aGVsbG8=:"              ; a byte sequence
+prio_bbin_len equ $ - prio_bbin
+prio_bbin0: db "u=5;q=::"                      ; ...which may be empty
+prio_bbin0_len equ $ - prio_bbin0
 
 ; --- frame-length table fixtures (RFC 9000 19) ---
 fk_pad:     db 0x00
@@ -823,6 +867,112 @@ _start:
     lea rdi, [prio_parstr]
     mov esi, prio_parstr_len
     call linnea_quic_parse_priority     ; a quoted value we never interpret
+    EXPECT rax, 5
+    EXPECT rdx, 0
+
+    ; audit-report-84: the six bare-item forms. These fail the WHOLE value --
+    ; none of them is an item at all.
+    lea rdi, [prio_bunterm]
+    mov esi, prio_bunterm_len
+    call linnea_quic_parse_priority     ; an unterminated string
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_bslash]
+    mov esi, prio_bslash_len
+    call linnea_quic_parse_priority     ; a lone backslash
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_bbool2]
+    mov esi, prio_bbool2_len
+    call linnea_quic_parse_priority     ; "?2" is not a boolean
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_bdot]
+    mov esi, prio_bdot_len
+    call linnea_quic_parse_priority     ; "1." has no fraction
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_bnodot]
+    mov esi, prio_bnodot_len
+    call linnea_quic_parse_priority     ; ".5" has no integer part
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_b1a]
+    mov esi, prio_b1a_len
+    call linnea_quic_parse_priority     ; a number does not run into a token
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_bctl]
+    mov esi, prio_bctl_len
+    call linnea_quic_parse_priority     ; a control byte inside a string
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_b16]
+    mov esi, prio_b16_len
+    call linnea_quic_parse_priority     ; 16 digits: an integer takes 15
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_bd13]
+    mov esi, prio_bd13_len
+    call linnea_quic_parse_priority     ; 13 digits before a decimal point
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_bf4]
+    mov esi, prio_bf4_len
+    call linnea_quic_parse_priority     ; four digits after one
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    ; ...and the legal items. THREE of these were refused before, because a
+    ; string may hold the very characters the old skip stopped at -- which is
+    ; how tightening a parser breaks what was working.
+    lea rdi, [prio_bsp]
+    mov esi, prio_bsp_len
+    call linnea_quic_parse_priority     ; a string containing a space
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_bcomma]
+    mov esi, prio_bcomma_len
+    call linnea_quic_parse_priority     ; a string containing a comma, then a member
+    EXPECT rax, 5
+    EXPECT rdx, 1
+    lea rdi, [prio_bsemi]
+    mov esi, prio_bsemi_len
+    call linnea_quic_parse_priority     ; a string containing a semicolon
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_besc]
+    mov esi, prio_besc_len
+    call linnea_quic_parse_priority     ; an escaped quote
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_bempty]
+    mov esi, prio_bempty_len
+    call linnea_quic_parse_priority     ; the empty string
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_bneg]
+    mov esi, prio_bneg_len
+    call linnea_quic_parse_priority     ; a negative decimal
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_b15]
+    mov esi, prio_b15_len
+    call linnea_quic_parse_priority     ; exactly 15 integer digits
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_btok]
+    mov esi, prio_btok_len
+    call linnea_quic_parse_priority     ; a token with ":" and "/"
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_bbin]
+    mov esi, prio_bbin_len
+    call linnea_quic_parse_priority     ; a byte sequence
+    EXPECT rax, 5
+    EXPECT rdx, 0
+    lea rdi, [prio_bbin0]
+    mov esi, prio_bbin0_len
+    call linnea_quic_parse_priority     ; an empty byte sequence
     EXPECT rax, 5
     EXPECT rdx, 0
 
