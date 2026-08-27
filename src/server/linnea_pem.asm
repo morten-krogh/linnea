@@ -544,6 +544,37 @@ der_any:
     pop rbx
     ret
 
+; ---- der_tiles(rdi=content, rsi=end) -> rax = 1 when the range is exactly
+;      covered by complete TLVs, else 0. A SEQUENCE whose tag and length are
+;      right can still hold rubbish; this is what makes "it is a SEQUENCE" into
+;      "it is a well-formed container" (audit-report-102). Preserves rbx/r12+.
+der_tiles:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
+.dt_next:
+    cmp rbx, r12
+    je .dt_yes                       ; landed exactly on the end
+    ja .dt_no                        ; a child overran it
+    mov rdi, rbx
+    mov rsi, r12
+    call der_any
+    cmp rax, -1
+    je .dt_no
+    lea rbx, [rax + rcx]
+    jmp .dt_next
+.dt_yes:
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.dt_no:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
 ; ---- tbs_walk(rdi=der, rsi=len) -> rax = the SubjectPublicKeyInfo element,
 ;      rdx = its length; rax = 0 if these bytes are not a structurally valid
 ;      X.509 Certificate. File-local; the two public entry points below share it
@@ -618,6 +649,28 @@ tbs_walk:
     je .tw_no
     cmp dl, 0xa0                     ; [0] EXPLICIT version, optional
     jne .tw_serial                   ; absent: this element IS serialNumber
+    ; Open it. RFC 5280 4.1.2.1: [0] EXPLICIT Version, an INTEGER of v1/v2/v3.
+    ; The wrapper's content used to be skipped unopened, so a version retagged
+    ; as an OCTET STRING -- or holding 9 -- passed (audit-report-102).
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call der_any                     ; the Version itself
+    cmp rax, -1
+    je .tw_no_pop2
+    cmp dl, 0x02                     ; INTEGER
+    jne .tw_no_pop2
+    cmp rcx, 1                       ; one byte: v1/v2/v3 all fit
+    jne .tw_no_pop2
+    cmp byte [rax], 2                ; 0, 1 or 2
+    ja .tw_no_pop2
+    lea rdi, [rax + rcx]
+    pop rcx
+    pop rax
+    lea rsi, [rax + rcx]
+    cmp rdi, rsi
+    jne .tw_no                       ; trailing bytes inside the [0] wrapper
     lea rdi, [rax + rcx]
     mov rsi, rbx
     call der_any
@@ -626,7 +679,9 @@ tbs_walk:
 .tw_serial:
     cmp dl, 0x02                     ; serialNumber: INTEGER
     jne .tw_no
-    mov r12d, 4                      ; signature, issuer, validity, subject
+    ; signature, issuer, validity, subject -- each a SEQUENCE, and each opened.
+    ; A right tag over rubbish is not a field (audit-report-102).
+    mov r12d, 4
 .tw_seq:
     lea rdi, [rax + rcx]
     mov rsi, rbx
@@ -635,6 +690,50 @@ tbs_walk:
     je .tw_no
     cmp dl, 0x30                     ; each of the four is a SEQUENCE
     jne .tw_no
+    cmp r12d, 2
+    je .tw_validity                  ; the third is Validity: two Times
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call der_tiles                   ; its children must tile it exactly
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .tw_no
+    jmp .tw_seq_next
+.tw_validity:
+    ; RFC 5280 4.1.2.5: exactly notBefore and notAfter, each UTCTime (0x17) or
+    ; GeneralizedTime (0x18), filling the SEQUENCE.
+    push rax
+    push rcx
+    lea r14, [rax + rcx]             ; validity end
+    mov rdi, rax
+    mov rsi, r14
+    call der_any
+    cmp rax, -1
+    je .tw_no_pop2
+    cmp dl, 0x17
+    je .tw_v2
+    cmp dl, 0x18
+    jne .tw_no_pop2
+.tw_v2:
+    lea rdi, [rax + rcx]
+    mov rsi, r14
+    call der_any
+    cmp rax, -1
+    je .tw_no_pop2
+    cmp dl, 0x17
+    je .tw_vend
+    cmp dl, 0x18
+    jne .tw_no_pop2
+.tw_vend:
+    lea rdi, [rax + rcx]
+    cmp rdi, r14
+    jne .tw_no_pop2                  ; a third element in Validity
+    pop rcx
+    pop rax
+.tw_seq_next:
     dec r12d
     jnz .tw_seq
     lea r14, [rax + rcx]             ; subjectPublicKeyInfo begins here
@@ -653,6 +752,8 @@ tbs_walk:
     pop r12
     pop rbx
     ret
+.tw_no_pop2:
+    add rsp, 16                      ; drop the two saved words
 .tw_no:
     xor eax, eax
     pop r14

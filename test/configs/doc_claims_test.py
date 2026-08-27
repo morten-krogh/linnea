@@ -293,6 +293,62 @@ if _os.path.exists(_CRT):
         test(_tls_cfg(_wrap(bytes(_c), _os.path.join(_TD, "badcurve.crt")), _KEY),
              "a certificate declaring a non-P-256 curve is rejected", False)
 
+    # --- audit-report-102: the nested mandatory fields, not just their tags --
+    # The [0] version wrapper was skipped unopened, so a Version retagged as an
+    # OCTET STRING -- or holding 9 -- passed. RFC 5280 4.1.2.1: [0] EXPLICIT
+    # Version, an INTEGER of v1/v2/v3.
+    # Locate the [0] wrapper rather than hardcoding an offset: my first attempt
+    # guarded on the wrong bytes, so BOTH of these silently did not run and the
+    # suite still said "all claims hold" -- a skipped check reads as a pass.
+    _vi = _der.find(b"\xa0\x03\x02\x01", 4, 20)
+    if _vi < 0:
+        _bad_guard = "could not locate the [0] version wrapper to mutate"
+        bad.append(_bad_guard)
+        print("FAIL " + _bad_guard)
+    else:
+        _v = bytearray(_der)
+        _v[_vi + 2] = 0x04                 # INTEGER -> OCTET STRING
+        test(_tls_cfg(_wrap(bytes(_v), _os.path.join(_TD, "badver.crt")), _KEY),
+             "a retagged certificate version is rejected", False)
+        _n = bytearray(_der)
+        _n[_vi + 4] = 0x09                 # v3 -> an undefined version number
+        test(_tls_cfg(_wrap(bytes(_n), _os.path.join(_TD, "badvernum.crt")), _KEY),
+             "an out-of-range certificate version is rejected", False)
+
+    # ...and the CONTROL that matters for that check: a v1 certificate omits the
+    # version field entirely (DEFAULT v1), so the absent-[0] path must still
+    # load. Nothing in the tree was v1, so this is built by stripping the
+    # wrapper and re-encoding the lengths.
+    def _mk_v1(der):
+        def _tlv(b, i):
+            n, j = b[i + 1], i + 2
+            if n & 0x80:
+                k = n & 0x7f
+                n = int.from_bytes(b[j:j + k], "big")
+                j += k
+            return j, n
+
+        def _len(n):
+            if n < 0x80:
+                return bytes([n])
+            b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+            return bytes([0x80 | len(b)]) + b
+
+        cs, cl = _tlv(der, 0)
+        ts, tl = _tlv(der, cs)
+        if der[ts] != 0xa0:
+            return None
+        vs, vl = _tlv(der, ts)
+        tbs_c = der[vs + vl:ts + tl]
+        tbs = b"\x30" + _len(len(tbs_c)) + tbs_c
+        body = tbs + der[ts + tl:cs + cl]
+        return b"\x30" + _len(len(body)) + body
+
+    _v1 = _mk_v1(_der)
+    if _v1:
+        test(_tls_cfg(_wrap(_v1, _os.path.join(_TD, "v1.crt")), _KEY),
+             "a v1 certificate (no version field) is accepted", True)
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",
