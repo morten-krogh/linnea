@@ -52,6 +52,8 @@ lbl_traffic_upd_len equ $ - lbl_traffic_upd
 
 msg_no_aesni: db "TLS requires a CPU with AES-NI, PCLMULQDQ and SSSE3"
 msg_no_aesni_len equ $ - msg_no_aesni
+msg_no_entropy: db "cannot seed the session-ticket keys: getrandom failed", 10
+msg_no_entropy_len equ $ - msg_no_entropy
 msg_bad_cert: db "cannot load TLS certificate chain (not PEM CERTIFICATEs?)"
 msg_bad_cert_len equ $ - msg_bad_cert
 msg_bad_key:  db "cannot load TLS key (not a PKCS#8 P-256 key in [1, n-1]?)"
@@ -109,10 +111,17 @@ linnea_tls_setup:
     ; one stateless-ticket key for the whole run, generated here in the
     ; master before the workers fork so every worker resumes every
     ; worker's sessions (the key is inherited copy-on-write).
+    ; Both results are checked: these used to retry a failed getrandom forever,
+    ; hanging the master here with no diagnostic (audit-report-97). Refusing to
+    ; start is the only safe answer for pre-fork key material.
     call linnea_tls_ticket_setup
+    test eax, eax
+    js .no_entropy
     ; the QUIC session-ticket key shares the same pre-fork lifetime (its own key,
     ; since a QUIC session never resumes a TCP one)
     call linnea_quic_ticket_setup
+    test eax, eax
+    js .no_entropy
 
     ; load each TLS server's cert and key
     xor r12d, r12d
@@ -185,6 +194,10 @@ linnea_tls_setup:
     pop r12
     pop rbx
     ret
+.no_entropy:
+    lea rdi, [msg_no_entropy]
+    mov esi, msg_no_entropy_len
+    jmp linnea_error_exit
 .bad_cert:
     lea rdi, [msg_bad_cert]
     mov esi, msg_bad_cert_len

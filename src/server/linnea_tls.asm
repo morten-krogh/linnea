@@ -121,18 +121,32 @@ section .text
 ; tickets and any worker can resume any worker's session. A process
 ; that never calls it has an uninitialized (zero) schedule and would
 ; neither issue nor accept real tickets — the test harnesses call it.
+; -> rax = 0 seeded, -1 could not.
+;
+; This RETRIED on any result that was not 16. That covers a short read and
+; SPINS FOREVER at 100% CPU on a persistent error: a denied getrandom would
+; have hung the master before any worker forked, with no diagnostic and no
+; return to the caller (audit-report-97). The helper retries the partial read;
+; a real error stops.
 linnea_tls_ticket_setup:
-.again:
     lea rdi, [ticket_key]
     mov esi, 16
-    xor edx, edx
-    mov eax, LINNEA_SYS_GETRANDOM
-    syscall
-    cmp rax, 16
-    jne .again
+    call linnea_random_bytes
+    test eax, eax
+    js .no_entropy
     lea rdi, [ticket_ctx]
     lea rsi, [ticket_key]
-    jmp linnea_aesgcm_init
+    ; sub rsp,8 because this was a TAIL CALL: jmp left the callee seeing the
+    ; entry alignment, call does not, and AES-GCM reads movdqa from the stack --
+    ; an 8-misaligned rsp faults there as a NULL SIGSEGV.
+    sub rsp, 8
+    call linnea_aesgcm_init
+    add rsp, 8
+    xor eax, eax
+    ret
+.no_entropy:
+    mov eax, -1
+    ret
 
 ; ===================================================================
 ; helpers

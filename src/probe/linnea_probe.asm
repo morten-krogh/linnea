@@ -34,6 +34,7 @@ extern linnea_tls_keys_init
 extern linnea_tls_seal
 extern linnea_tls_open
 extern linnea_x25519
+extern linnea_random_bytes
 extern linnea_sha256
 extern linnea_hkdf_extract
 extern linnea_hmac_sha256
@@ -607,6 +608,10 @@ h3_bytes_s0: resq 1                     ; urgency probe: bytes seen on stream 0
 h3_bytes_s4: resq 1                     ; urgency probe: bytes seen on stream 4
 big_ptr:    resq 1                      ; urgency probe: path to fetch (a large file)
 big_len:    resq 1
+
+section .rodata
+msg_probe_entropy: db "linnea-probe: getrandom failed; refusing to probe with stale key material", 10
+msg_probe_entropy_len equ $ - msg_probe_entropy
 
 section .text
 
@@ -2396,11 +2401,9 @@ dns_query:
     mov r14, rdi                          ; hostname
     mov r15d, esi                         ; nameserver
     ; --- build the query in dnsbuf ---
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [dnsbuf]
     mov esi, 2                            ; a random 16-bit id
-    xor edx, edx
-    syscall
+    call probe_rand
     mov byte [dnsbuf + 2], 0x01           ; flags: recursion desired
     mov byte [dnsbuf + 3], 0x00
     mov byte [dnsbuf + 4], 0x00           ; qdcount = 1
@@ -2696,11 +2699,9 @@ tls_handshake:
     mov r15d, edi                         ; fd
 
     ; --- x25519 keypair ---
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [tls_priv]
     mov esi, 32
-    xor edx, edx
-    syscall
+    call probe_rand
     and byte [tls_priv], 248              ; clamp
     and byte [tls_priv + 31], 127
     or byte [tls_priv + 31], 64
@@ -2709,16 +2710,12 @@ tls_handshake:
     lea rdx, [x25519_base]
     call linnea_x25519
     ; client random + legacy session id
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [tls_random]
     mov esi, 32
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call probe_rand
     lea rdi, [tls_sessid]
     mov esi, 32
-    xor edx, edx
-    syscall
+    call probe_rand
     mov qword [tr_len], 0
 
     ; --- build + send ClientHello ---
@@ -6123,11 +6120,9 @@ quic_h3_open:
     mov qword [q_req_sid], 0              ; a fresh connection requests on stream 0
                                           ; unless a probe says otherwise, so a probe
                                           ; that used another id cannot strand the next
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [tls_priv]
     mov esi, 32
-    xor edx, edx
-    syscall
+    call probe_rand
     and byte [tls_priv], 248
     and byte [tls_priv + 31], 127
     or byte [tls_priv + 31], 64
@@ -6135,26 +6130,18 @@ quic_h3_open:
     lea rsi, [tls_priv]
     lea rdx, [x25519_base]
     call linnea_x25519
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [tls_random]
     mov esi, 32
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call probe_rand
     lea rdi, [tls_sessid]
     mov esi, 32
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call probe_rand
     lea rdi, [q_dcid]
     mov esi, 8
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call probe_rand
     lea rdi, [q_scid]
     mov esi, 8
-    xor edx, edx
-    syscall
+    call probe_rand
     call udp_connect
     test rax, rax
     js .fail
@@ -6502,13 +6489,36 @@ probe_h3_badqpack:
     call report_plain
     ret
 
+; probe_rand(rdi = dest, rsi = len) — fill from getrandom(2), or STOP.
+;
+; Every one of these reads was an unchecked syscall (audit-report-97). The
+; buffers are globals reused across the whole probe battery, so a failure did
+; not merely yield zeros on first use: a later probe could repeat the previous
+; handshake's ephemeral x25519 key, client random and connection ids.
+;
+; A prober that continues with stale key material reports the WRONG THING --
+; a local entropy failure dressed up as target noncompliance -- so this stops
+; and says which it was. That is the whole value of a compliance tool.
+probe_rand:
+    call linnea_random_bytes
+    test eax, eax
+    js .no_entropy
+    ret
+.no_entropy:
+    mov eax, LINNEA_SYS_WRITE
+    mov edi, 2
+    lea rsi, [msg_probe_entropy]
+    mov edx, msg_probe_entropy_len
+    syscall
+    mov eax, LINNEA_SYS_EXIT
+    mov edi, 3
+    syscall
+
 ; quic_fresh_ids(): a fresh x25519 keypair, client random, session id, DCID, SCID.
 quic_fresh_ids:
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [tls_priv]
     mov esi, 32
-    xor edx, edx
-    syscall
+    call probe_rand
     and byte [tls_priv], 248
     and byte [tls_priv + 31], 127
     or byte [tls_priv + 31], 64
@@ -6516,26 +6526,18 @@ quic_fresh_ids:
     lea rsi, [tls_priv]
     lea rdx, [x25519_base]
     call linnea_x25519
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [tls_random]
     mov esi, 32
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call probe_rand
     lea rdi, [tls_sessid]
     mov esi, 32
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call probe_rand
     lea rdi, [q_dcid]
     mov esi, 8
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call probe_rand
     lea rdi, [q_scid]
     mov esi, 8
-    xor edx, edx
-    syscall
+    call probe_rand
     ret
 
 ; quic_recv_initial_verdict(edi=fd) -> rax: 1 = the server's Initial carried a
@@ -8895,11 +8897,9 @@ probe_h3_handshake:
     push rbx
     push r12
     ; fresh x25519 keypair, client random, session id, DCID and SCID
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [tls_priv]
     mov esi, 32
-    xor edx, edx
-    syscall
+    call probe_rand
     and byte [tls_priv], 248
     and byte [tls_priv + 31], 127
     or byte [tls_priv + 31], 64
@@ -8907,26 +8907,18 @@ probe_h3_handshake:
     lea rsi, [tls_priv]
     lea rdx, [x25519_base]
     call linnea_x25519
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [tls_random]
     mov esi, 32
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call probe_rand
     lea rdi, [tls_sessid]
     mov esi, 32
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call probe_rand
     lea rdi, [q_dcid]
     mov esi, 8
-    xor edx, edx
-    syscall
-    mov eax, LINNEA_SYS_GETRANDOM
+    call probe_rand
     lea rdi, [q_scid]
     mov esi, 8
-    xor edx, edx
-    syscall
+    call probe_rand
     call udp_connect
     test rax, rax
     js .fail

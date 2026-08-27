@@ -593,18 +593,32 @@ linnea_quic_resumption_psk:
 ; worker seals and opens the same tickets (the key is inherited copy-on-write).
 ; Separate from the TLS-over-TCP ticket key: a QUIC session never resumes a TCP
 ; one (different transport, different ALPN), so they need not share a key.
+; -> rax = 0 seeded, -1 could not.
+;
+; This RETRIED on any result that was not 16. That covers a short read and
+; SPINS FOREVER at 100% CPU on a persistent error: a denied getrandom would
+; have hung the master before any worker forked, with no diagnostic and no
+; return to the caller (audit-report-97). The helper retries the partial read;
+; a real error stops.
 linnea_quic_ticket_setup:
-.again:
     lea rdi, [q_ticket_key]
     mov esi, 16
-    xor edx, edx
-    mov eax, LINNEA_SYS_GETRANDOM
-    syscall
-    cmp rax, 16
-    jne .again
+    call linnea_random_bytes
+    test eax, eax
+    js .no_entropy
     lea rdi, [q_ticket_ctx]
     lea rsi, [q_ticket_key]
-    jmp linnea_aesgcm_init
+    ; sub rsp,8 because this was a TAIL CALL: jmp left the callee seeing the
+    ; entry alignment, call does not, and AES-GCM reads movdqa from the stack --
+    ; an 8-misaligned rsp faults there as a NULL SIGSEGV.
+    sub rsp, 8
+    call linnea_aesgcm_init
+    add rsp, 8
+    xor eax, eax
+    ret
+.no_entropy:
+    mov eax, -1
+    ret
 
 ; linnea_quic_ticket_seal(rdi=pt, esi=pt_len, rdx=out) -> rax = sealed length,
 ; or 0 if no entropy was available for the nonce: issue no ticket in that case.
