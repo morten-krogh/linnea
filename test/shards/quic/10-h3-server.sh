@@ -334,6 +334,18 @@ EOF
         skip "h3 (io_uring): critical stream closed before typing -- 8s"
     fi
 
+    # ...and TWO such streams closed before either types. The memory of a
+    # closure was one slot, so the second overwrote the first and the earlier
+    # stream typed as though it had never been closed (audit-report-78). The
+    # rows type the stream whose record was overwritten -- the LAST one closed
+    # was caught all along, which is why the test above passes either way.
+    if extensive; then
+        timeout 240 python3 test/quic/h3_critical_reset_multi.py ${P61452} >/dev/null 2>&1
+        check "h3 (io_uring): two critical streams closed before typing (audit-report-78)" $?
+    else
+        skip "h3 (io_uring): two critical streams closed before typing -- 40s"
+    fi
+
     # h3-8: the QPACK encoder stream must be read, not ignored. We advertise
     # capacity 0, so the only legal instruction is Set Dynamic Table Capacity
     # to 0; an insert or another capacity means the peer's table state and

@@ -692,9 +692,14 @@ struc linnea_quic_conn
     ; the closure was taken for an ordinary teardown and, once the late type frame
     ; registered the stream as the control or a QPACK stream, the connection carried
     ; on as though that critical stream were still open. Reconciled when the type
-    ; arrives. One slot (0 = none): a conforming client closes no uni stream, so a
-    ; closed one is already anomalous, and the connection ends the moment it types.
-    .uni_closed_sid: resq 1
+    ; arrives. A BIT PER STREAM rather than one slot: with a single slot a second
+    ; closure overwrote the first, and the earlier stream then typed as though it
+    ; had never been closed (audit-report-78). Client uni ids are 4k+2 and the
+    ; per-packet STREAM_LIMIT_ERROR gate refuses k >= LINNEA_QUIC_MSU_INIT before
+    ; either site runs, so one bit per POSSIBLE such stream covers every id the
+    ; peer can legally use, for the life of the connection -- nothing to evict,
+    ; and 16 bytes rather than a ring. The same reasoning sizes fc_uni_sid below.
+    .uni_closed_bits: resq (LINNEA_QUIC_MSU_INIT + 63) / 64
     ; A PRIORITY_UPDATE may name a request stream whose response has not opened
     ; yet: the control stream and the request stream are separate, so the update
     ; can overtake the request that it reprioritises. RFC 9218 7 says to keep the

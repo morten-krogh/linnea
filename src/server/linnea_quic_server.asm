@@ -2392,7 +2392,7 @@ linnea_quic_server_datagram:
     and eax, 3
     cmp eax, 2
     jne .reset_teardown_go
-    mov [rdi + linnea_quic_conn.uni_closed_sid], rsi
+    call uni_closed_mark             ; rdi = conn, rsi = the reset id, both kept
 .reset_teardown_go:
     call reset_teardown
     inc rbp
@@ -4517,10 +4517,11 @@ linnea_quic_server_datagram:
     jne .uni_critical_closed         ; a QPACK stream must not be closed
     ; ...nor closed BEFORE this type frame arrived: a FIN or reset that reached an
     ; untyped continuation was remembered against its id (Finding 9)
-    mov rax, [cur_conn]
-    mov rax, [rax + linnea_quic_conn.uni_closed_sid]
-    cmp rax, [s_sid]
-    je .uni_critical_closed
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    call uni_closed_known
+    test eax, eax
+    jnz .uni_critical_closed
     ; Remember which stream this is, so a reset of it can be recognised later.
     ; Nothing here reads the stream's contents — our QPACK capacity is 0, so a
     ; conforming encoder sends none — but 6.2 forbids closing it by any means,
@@ -4618,10 +4619,11 @@ linnea_quic_server_datagram:
     ; ...including a FIN or reset that closed it while it was still untyped, which
     ; a reordered type frame would otherwise have registered as a live stream
     ; (Finding 9)
-    mov rax, [cur_conn]
-    mov rax, [rax + linnea_quic_conn.uni_closed_sid]
-    cmp rax, [s_sid]
-    je .uni_critical_closed
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    call uni_closed_known
+    test eax, eax
+    jnz .uni_critical_closed
     ; reject a second control stream on a different id
     mov rdx, [cur_conn]
     mov rax, [rdx + linnea_quic_conn.ctrl_id]
@@ -4661,9 +4663,9 @@ linnea_quic_server_datagram:
     ; type, and grease never reaches one.
     cmp qword [s_sfin], 0
     jz .uc_untyped_hold
-    mov rdx, [cur_conn]
-    mov rax, [s_sid]
-    mov [rdx + linnea_quic_conn.uni_closed_sid], rax
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    call uni_closed_mark
 .uc_untyped_hold:
     call .ctrl_ro_capture
     jmp .stream_scan
@@ -7882,6 +7884,37 @@ tx_rs_common:
     pop r14
     pop r13
     pop rbx
+    ret
+
+; uni_closed_mark(rdi = conn, rsi = a client unidirectional stream id) — note
+; that this stream was CLOSED (FIN or RESET_STREAM) while still untyped, so a
+; reordered type frame naming it as critical can be refused (RFC 9114 6.2).
+; One bit per possible client uni stream: ids are 4k+2, and k is bounded by the
+; STREAM_LIMIT_ERROR gate that runs on the whole packet before either caller.
+; Clobbers rax only -- the reset loop's rdi/rsi have to survive it.
+uni_closed_mark:
+    mov rax, rsi
+    shr rax, 2                       ; 2,6,10,... -> 0,1,2,...
+    cmp rax, LINNEA_QUIC_MSU_INIT
+    jae .ucm_done                    ; past the limit: refused before this runs
+    bts [rdi + linnea_quic_conn.uni_closed_bits], rax
+.ucm_done:
+    ret
+
+; uni_closed_known(rdi = conn, rsi = stream id) -> eax = 1 if it was closed while
+; untyped. Clobbers rax only: cl carries the stream type across this call.
+uni_closed_known:
+    mov rax, rsi
+    shr rax, 2
+    cmp rax, LINNEA_QUIC_MSU_INIT
+    jae .uck_no
+    bt [rdi + linnea_quic_conn.uni_closed_bits], rax
+    jc .uck_yes
+.uck_no:
+    xor eax, eax
+    ret
+.uck_yes:
+    mov eax, 1
     ret
 
 ; rst_remember(rdi = conn, rsi = stream id) — note that this stream is finished
