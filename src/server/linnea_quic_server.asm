@@ -4876,9 +4876,20 @@ linnea_quic_server_datagram:
 .cw_prio:
     mov rcx, [rbx + linnea_quic_conn.ctrl_skip]      ; the declared payload length
     test rcx, rcx
-    jz .cw_loop                       ; no element id can fit: not a priority frame
+    jz .cw_frame_err                  ; RFC 9114 7.1: a payload that ends before
+                                      ; its fields. PRIORITY_UPDATE's first field
+                                      ; is the element id, so an EMPTY payload
+                                      ; cannot hold one -- this was ignored as
+                                      ; "not a priority frame" (audit-report-79),
+                                      ; and it never reached .pu_apply to be
+                                      ; judged there.
     cmp rcx, LINNEA_QUIC_PU_BUF
-    ja .cw_loop                       ; far too long to be one either
+    ja .cw_loop                       ; Deliberately still ignored: too long to
+                                      ; parse against this buffer, and we cannot
+                                      ; call a payload truncated without reading
+                                      ; it. Priority is advisory (RFC 9218 2), so
+                                      ; dropping one costs nothing; refusing a
+                                      ; LEGAL frame for being large would not.
     mov [rbx + linnea_quic_conn.ctrl_pucap], rbp     ; capture, remembering which type
     mov qword [rbx + linnea_quic_conn.ctrl_pulen], 0
     jmp .cw_loop
@@ -5241,7 +5252,9 @@ linnea_quic_server_datagram:
     add rsi, rdi
     call linnea_quic_varint_decode    ; rax = element id, rdx = its length
     test rdx, rdx
-    jz .pu_ok                         ; a truncated id: nothing to act on
+    jz .pu_frame_err                  ; the payload ends inside the element id:
+                                      ; H3_FRAME_ERROR (RFC 9114 7.1), not a
+                                      ; success with nothing to do
     mov r13, rax                      ; the element id
     ; the rest of the payload is the priority field value; an empty one is legal
     ; and simply means the defaults
@@ -5309,6 +5322,11 @@ linnea_quic_server_datagram:
     mov [rbx + linnea_quic_conn.pu_val + rcx * 8], r14
 .pu_ok:
     xor eax, eax
+    jmp .pu_ret
+.pu_frame_err:
+    ; before .pu_id_error below, deliberately: a frame we could not PARSE is a
+    ; frame error, whatever the id it failed to carry would have meant
+    mov eax, LINNEA_H3_ERR_FRAME
     jmp .pu_ret
 .pu_id_error:
     mov eax, LINNEA_H3_ERR_ID

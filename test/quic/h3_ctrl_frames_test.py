@@ -183,6 +183,33 @@ CASES = [
     ("GOAWAY id split across frames",
      [SETTINGS + b"\x07\x02\x40", b"\x64"], None),
 
+    # audit-report-79: PRIORITY_UPDATE carries an element id varint and then the
+    # priority field value (RFC 9218 7.2). A payload ending inside that id is a
+    # payload that terminates before its fields, which RFC 9114 7.1 makes
+    # H3_FRAME_ERROR -- the same rule the three frames above already enforce.
+    # It was the one frame on this walk whose truncated varint returned success.
+    ("PRIORITY_UPDATE ending inside its id",
+     [SETTINGS + vlq(0xF0700) + vlq(1) + b"\x40"], FRAME_ERROR),
+    ("PRIORITY_UPDATE with an empty payload",
+     [SETTINGS + vlq(0xF0700) + vlq(0)], FRAME_ERROR),
+    ("PRIORITY_UPDATE ending inside a 4-byte id",
+     [SETTINGS + vlq(0xF0700) + vlq(2) + b"\x80\x00"], FRAME_ERROR),
+    # the push variant takes the same payload, so it is truncated the same way.
+    # A WELL-FORMED one is H3_ID_ERROR (we never promise a push), so this row
+    # also fixes the order: a frame that cannot be parsed is a frame error
+    # before it is an id error.
+    ("PRIORITY_UPDATE_PUSH ending inside its id",
+     [SETTINGS + vlq(0xF0701) + vlq(1) + b"\x40"], FRAME_ERROR),
+    # ...and the controls: a multi-byte id of the declared length is legal,
+    # with or without a priority field value after it, and so is one split
+    # across STREAM frames (the capture path)
+    ("PRIORITY_UPDATE with a 2-byte id",
+     [SETTINGS + vlq(0xF0700) + vlq(2) + b"\x40\x64"], None),
+    ("PRIORITY_UPDATE with a 2-byte id and a value",
+     [SETTINGS + vlq(0xF0700) + vlq(6) + b"\x40\x64u=3,i"], None),
+    ("PRIORITY_UPDATE id split across frames",
+     [SETTINGS + vlq(0xF0700) + vlq(2) + b"\x40", b"\x64"], None),
+
     # request-stream frames have no business here (7.2.1, 7.2.2)
     ("DATA on the control stream", [SETTINGS + b"\x00\x01\x41"], UNEXPECTED),
     ("HEADERS on the control stream", [SETTINGS + b"\x01\x01\x41"], UNEXPECTED),
