@@ -1385,19 +1385,17 @@ linnea_quic_server_datagram:
     ; advertised values, and a peer that omits it (or sends 0) imposes none. We
     ; advertise LINNEA_QUIC_IDLE_SECS; a client that will forget us sooner gets
     ; its slot reclaimed at its number instead of ours. The peer's milliseconds
-    ; round UP to whole seconds, the sweep's granularity — holding a slot for
-    ; the remainder of a second is not a violation of anything, and the floor
-    ; below is larger than the rounding either way (audit-report-90).
+    ; round UP to whole seconds, the sweep's granularity -- holding a slot for
+    ; the remainder of a second is not a violation of anything (audit-report-90
+    ; argued it was; see that report).
     ;
-    ; That floor is the rule the old "never below one" was reaching for without
-    ; naming it. 10.1, same section: "To avoid excessively small idle timeout
-    ; periods, endpoints MUST increase the idle timeout period to be at least
-    ; three times the current Probe Timeout (PTO). This allows for multiple PTOs
-    ; to expire, and therefore multiple probes to be sent and lost, prior to
-    ; idle timeout." One second was an invented number and, on a connection with
-    ; no RTT sample yet, well under three PTOs — so a peer asking for a short
-    ; idle timeout could lose its connection while it was still probing, which
-    ; is the exact thing that MUST exists to prevent.
+    ; 10.1's other rule -- "endpoints MUST increase the idle timeout period to
+    ; be at least three times the current Probe Timeout" -- is NOT applied here,
+    ; deliberately. "Current" means the live PTO, and at this moment there is no
+    ; RTT sample, so the only PTO available is the initial-RTT one: about 1s,
+    ; which on a fast path overstates the real figure roughly fortyfold and
+    ; would freeze that overstatement for the connection's life. The floor is
+    ; applied in the sweep instead, against the PTO the connection actually has.
     mov rax, [linnea_quic_tp_idle_ms]
     test rax, rax
     jz .idle_done                    ; absent or 0: ours stands
@@ -1405,22 +1403,10 @@ linnea_quic_server_datagram:
     xor edx, edx
     mov rcx, 1000
     div rcx                          ; -> seconds, rounded up
-    push rax
-    push rax                         ; twice, so the call below stays 16-aligned
-    mov rdi, rbx
-    mov esi, 1                       ; application space: adds the peer's
-                                     ; max_ack_delay, stored a few lines above
-    call linnea_quic_pto_ms          ; -> rax = the current PTO in ms
-    lea rax, [rax + rax * 2]         ; three of them
-    add rax, 999
-    xor edx, edx
-    mov rcx, 1000
-    div rcx                          ; -> seconds, rounded up
-    pop rcx
-    pop rcx                          ; the peer's seconds
-    cmp rcx, rax
-    jb .idle_floor                   ; below three PTOs: the floor stands
-    mov rax, rcx
+    test rax, rax
+    jnz .idle_floor
+    mov eax, 1                       ; a sub-second value still occupies a whole
+                                     ; sweep tick; the real floor is in the sweep
 .idle_floor:
     cmp rax, LINNEA_QUIC_IDLE_SECS
     jae .idle_done                   ; longer than ours: the minimum is ours

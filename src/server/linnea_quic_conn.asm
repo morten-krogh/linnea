@@ -43,6 +43,7 @@ section .data
 ; configurable, and is what linnea-pooltest keeps -- that harness links this
 ; file with no config and no src/lib/linnea_quic.o, so the value lives here
 ; rather than being read across from the transport parameter beside it.
+extern linnea_quic_pto_ms
 global linnea_quic_conn_idle_secs
 linnea_quic_conn_idle_secs: dq LINNEA_QUIC_IDLE_SECS
 
@@ -287,6 +288,44 @@ linnea_quic_conn_sweep:
     jae .sw_have_window
     mov rdx, r8
 .sw_have_window:
+    ; RFC 9000 10.1 MUST: "endpoints MUST increase the idle timeout period to be
+    ; at least three times the current Probe Timeout (PTO). This allows for
+    ; multiple PTOs to expire, and therefore multiple probes to be sent and
+    ; lost, prior to idle timeout." CURRENT is the word that decides where this
+    ; belongs: the PTO falls by orders of magnitude once the connection has an
+    ; RTT sample, so a floor computed while parsing transport parameters would
+    ; be the initial-RTT one -- about a second -- frozen for the connection's
+    ; life (audit-report-90). Here it is the figure the connection actually has,
+    ; which on a fast path is tens of milliseconds and changes nothing, and on a
+    ; slow one is seconds and is exactly when the rule matters.
+    ; rcx is the slot counter of the walk this sits inside, so it is saved with
+    ; the rest; the result comes back in r9, which the walk does not use, since
+    ; every register it does use has to be restored before the comparison.
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8                          ; six: rsp stays 16-aligned for the call
+    mov rdi, rbx
+    mov esi, 1                       ; application space: the peer's max_ack_delay
+    call linnea_quic_pto_ms
+    lea rax, [rax + rax * 2]         ; three of them, in ms
+    add rax, 999
+    xor edx, edx
+    mov ecx, 1000
+    div rcx                          ; -> seconds, rounded up
+    mov r9, rax
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    cmp rdx, r9
+    jae .sw_pto_ok
+    mov rdx, r9                      ; the window is below three PTOs: raise it
+.sw_pto_ok:
     cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CONNECTED
     je .sw_window
     cmp rdx, LINNEA_QUIC_HS_IDLE_SECS

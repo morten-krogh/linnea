@@ -346,14 +346,6 @@ EOF
         skip "h3 (io_uring): two critical streams closed before typing -- 40s"
     fi
 
-    # RFC 9000 10.1 MUST: the idle period is raised to at least three PTOs, so a
-    # peer asking for a short max_idle_timeout does not lose its connection
-    # while it could still be probing. The floor was a flat second, which on a
-    # connection with no RTT sample is a third of three PTOs (audit-report-90 --
-    # which arrived arguing the opposite, that ROUNDING UP held slots too long).
-    timeout 60 python3 test/quic/h3_idle_floor.py ${P61452} >/dev/null 2>&1
-    check "h3 (io_uring): a short idle timeout still clears three PTOs" $?
-
     # h3-8: the QPACK encoder stream must be read, not ignored. We advertise
     # capacity 0, so the only legal instruction is Set Dynamic Table Capacity
     # to 0; an insert or another capacity means the peer's table state and

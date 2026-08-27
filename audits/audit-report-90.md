@@ -90,12 +90,55 @@ A peer asking for longer than three PTOs is unaffected: 10 s stays 10 s, and
 Chrome's 30 s still meets ours at 30. Only the short values move, and they move
 to the number the RFC names.
 
-### Coverage
+### Correction — the first version of this fix was wrong, and the suite caught it
 
-`test/quic/h3_idle_floor.py`, wired into the quic shard. It fails on the audited
-binary and passes after — the A/B above is the test. It asserts the connection
-is still *there*, which is the only way to see this from outside: the peer's
-advertised value is not something the server echoes anywhere.
+The change above computed the floor while parsing transport parameters. RFC 9000
+says three times the **current** PTO, and at that moment the connection has no
+RTT sample, so the only PTO available is the initial-RTT one — about 1022 ms.
+That number was then frozen for the connection's life, making the floor 4 s on
+every connection including a loopback one whose real PTO is roughly 28 ms. It
+overstated the requirement by about fortyfold.
 
-No full-suite run for this report, as instructed; the change is three lines in
-the transport-parameter path and the new test exercises exactly them.
+The full suite failed one check:
+
+```
+FAIL: h3 (io_uring): the client's max_idle_timeout is honoured (and only it)
+```
+
+`h3_idle_tp_test.py` has a client advertise 1 s, stay quiet 4 s, and asserts the
+slot is gone — with a generous-value control beside it so the row cannot pass by
+coincidence. That test is right: on loopback three PTOs is about 90 ms, so a
+one-second window already clears the floor comfortably, and reclaiming at one
+second is conformant. The pre-existing behaviour was not a violation there at
+all.
+
+Which makes the A/B above **circular**: `h3_idle_floor.py` asserted the
+behaviour my patch produced rather than the rule the RFC states, and it
+contradicted a test that encodes the rule properly. It has been deleted, along
+with its shard row. A test whose expected value comes from the implementation
+under test measures nothing.
+
+### Where the floor actually belongs
+
+In the sweep, against the PTO the connection has at the moment it is considered
+for reclamation — which is what "current" means, and where the figure has
+dropped to whatever the path really costs. On a fast path it is tens of
+milliseconds and changes nothing; on a slow path it is seconds, which is exactly
+when the rule matters, and it now tracks that path instead of a guess made
+before the first round trip.
+
+`rcx` is the sweep's slot counter, so the call saves it with the rest and returns
+the floor in `r9`, which the walk does not use — the comparison happens after
+every register the walk owns is back.
+
+### What remains true, and what cannot be shown here
+
+The finding is still rejected: rounding the peer's milliseconds up to the
+sweep's granularity is not a violation, because the three-PTO floor is larger
+than the rounding in every case where the rounding could matter.
+
+The floor's effect is **not observable on loopback** — that is the point of the
+correction above — so no test in this suite demonstrates it, and none is added
+pretending to. What is asserted is that it changes nothing where it should
+change nothing: `h3_idle_tp_test.py` passes in both of its cases, as do the
+multi-request and multi-connection tests that exercise the same sweep.
