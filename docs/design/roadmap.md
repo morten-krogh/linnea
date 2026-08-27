@@ -38,6 +38,12 @@ probably the wrong change:
   consistent-hash or EWMA; no sticky sessions.
 - **Health is passive only.** No active health checks, no outlier detection, no
   circuit breaking.
+- **TCP backends only — no Unix-domain sockets.** A `proxy` location names an
+  `IPv4:port`, so a local backend is reached over loopback TCP and is dialable
+  by anything else on the box. Planned: [`unix-backend-plan.md`](unix-backend-plan.md).
+  Connect side only, and **h1 cleartext only** — backend TLS is kTLS, and the
+  TLS ULP does not exist for `AF_UNIX` (measured), so `proxy_tls` and therefore
+  `proxy_h2` cannot ride a Unix socket.
 
 ### Traffic features
 
