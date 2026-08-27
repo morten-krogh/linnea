@@ -146,6 +146,8 @@ section .rodata
 
 msg_listen:     db "linnea-api listening on 127.0.0.1:"
 msg_listen_len  equ $ - msg_listen
+msg_listen_un:  db "linnea-api listening on unix:"
+msg_listen_un_len equ $ - msg_listen_un
 msg_nl:         db 10
 msg_bind_fail:  db "linnea-api: cannot bind", 10
 msg_bind_fail_len equ $ - msg_bind_fail
@@ -272,7 +274,8 @@ port:           resq 1
 ; Children currently serving a connection. The parent's copy is the only one
 ; that means anything — a child inherits the value and never looks at it again.
 children:       resq 1
-sockaddr:       resb 16
+sockaddr:       resb 112       ; sockaddr_in (16) or sockaddr_un (110)
+unix_path:      resq 1         ; argv[1] as unix:<path>, else 0
 headbuf:        resb HEAD_BUF
 head_len:       resq 1            ; bytes up to and including the blank line
 in_len:         resq 1            ; everything read so far (head + body prefix)
@@ -300,6 +303,20 @@ _start:
     mov rax, [rsp]                 ; argc
     cmp rax, 2
     jb .default_port
+    ; argv[1] may be "unix:" + an absolute path instead of a port. A port is
+    ; digits, so the two can never be confused; the prefix matches the spelling
+    ; a linnea proxy location uses for the same socket.
+    mov rdi, [rsp + 16]            ; argv[1]
+    cmp dword [rdi], 'unix'
+    jne .not_unix
+    cmp byte [rdi + 4], ':'
+    jne .not_unix
+    cmp byte [rdi + 5], '/'
+    jne .not_unix                  ; relative, or the abstract namespace
+    add rdi, 5
+    mov [unix_path], rdi
+    jmp .have_port
+.not_unix:
     mov rdi, [rsp + 16]            ; argv[1]
     call cstr_len
     mov rsi, rax
@@ -324,11 +341,27 @@ _start:
 .have_dir:
     call setup_listener
     call install_sigchld
+    ; Say where it ACTUALLY listens. In unix mode [port] was never set, so the
+    ; shared line printed "127.0.0.1:0" -- a startup log naming an address
+    ; nothing is bound to, which is worse than no line at all.
+    cmp qword [unix_path], 0
+    jne .say_unix
     lea rdi, [msg_listen]
     mov esi, msg_listen_len
     call linnea_print_stdout
     mov rdi, [port]
     call linnea_print_u64_stdout
+    jmp .say_done
+.say_unix:
+    lea rdi, [msg_listen_un]
+    mov esi, msg_listen_un_len
+    call linnea_print_stdout
+    mov rdi, [unix_path]
+    call cstr_len
+    mov rsi, rax
+    mov rdi, [unix_path]
+    call linnea_print_stdout
+.say_done:
     lea rdi, [msg_nl]
     mov esi, 1
     call linnea_print_stdout
@@ -1565,6 +1598,8 @@ cstr_len:
 ; never from outside the box.
 setup_listener:
     push rbx
+    cmp qword [unix_path], 0
+    jne .unix
     mov eax, LINNEA_SYS_SOCKET
     mov edi, LINNEA_AF_INET
     mov esi, LINNEA_SOCK_STREAM
@@ -1596,6 +1631,61 @@ setup_listener:
     syscall
     test rax, rax
     js .fail
+    mov eax, LINNEA_SYS_LISTEN
+    mov rdi, rbx
+    mov esi, LINNEA_BACKLOG
+    syscall
+    test rax, rax
+    js .fail
+    pop rbx
+    ret
+
+    ; A Unix-domain listener. THIS program owns the socket file: it removes a
+    ; stale one and creates the new one. linnea only ever connects to it and
+    ; never unlinks one, so if this did not clean up, a restart would fail with
+    ; EADDRINUSE against its own leftover.
+.unix:
+    mov eax, LINNEA_SYS_SOCKET
+    mov edi, LINNEA_AF_UNIX
+    mov esi, LINNEA_SOCK_STREAM
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .fail
+    mov [listen_fd], rax
+    mov rbx, rax
+    mov eax, LINNEA_SYS_UNLINK     ; a stale socket from a previous run
+    mov rdi, [unix_path]
+    syscall                        ; ENOENT is the normal case: ignored
+    mov word [sockaddr], LINNEA_AF_UNIX
+    mov rsi, [unix_path]
+    lea rdi, [sockaddr + 2]
+    xor ecx, ecx
+.u_copy:
+    cmp ecx, LINNEA_SUN_PATH_MAX
+    jae .fail                      ; longer than sun_path can hold
+    mov dl, [rsi + rcx]
+    mov [rdi + rcx], dl
+    test dl, dl
+    jz .u_bound
+    inc ecx
+    jmp .u_copy
+.u_bound:
+    lea rdx, [rcx + 3]             ; family + path + its NUL
+    push rdx
+    mov eax, LINNEA_SYS_BIND
+    mov rdi, rbx
+    lea rsi, [sockaddr]
+    pop rdx
+    syscall
+    test rax, rax
+    js .fail
+    ; 0660: the socket is the access boundary now, so it is not world-writable.
+    ; linnea runs as the same user, which is what makes this enough.
+    mov eax, LINNEA_SYS_CHMOD
+    mov rdi, [unix_path]
+    mov esi, 0o660
+    syscall
     mov eax, LINNEA_SYS_LISTEN
     mov rdi, rbx
     mov esi, LINNEA_BACKLOG

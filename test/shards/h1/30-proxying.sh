@@ -410,3 +410,28 @@ grep -q "connect failed (no such socket path)" "$ulog"
 check "unix backend: ...logged as 'no such socket path', not a bare failure" $?
 
 kill $ub_pid 2>/dev/null
+
+# ...and the REAL backend, not only the fixture: linnea-api itself can listen on
+# a socket, which is what makes any of this usable in production rather than
+# only in this suite. It also owns the socket FILE -- it unlinks a stale one
+# before binding -- so a restart onto its own leftover must work, which is the
+# case a service restart actually hits.
+apisock="$PWD/$RUNDIR/api-unix.sock"
+: > "$RUNDIR/api-unix.out"
+./bin/linnea-api "unix:$apisock" "$PWD/$RUNDIR" > "$RUNDIR/api-unix.out" 2>&1 &
+au_pid=$!
+for _ in $(seq 1 50); do [ -S "$apisock" ] && break; sleep 0.1; done
+check "linnea-api: listens on a unix socket" $([ -S "$apisock" ] && echo 0 || echo 1)
+# the startup line named "127.0.0.1:0" in unix mode until it was taught not to:
+# a log naming an address nothing is bound to is worse than no line at all.
+grep -q "listening on unix:$apisock" "$RUNDIR/api-unix.out"
+check "linnea-api: ...and says where, not '127.0.0.1:0'" $?
+kill $au_pid 2>/dev/null; wait $au_pid 2>/dev/null
+# the socket file outlives the process; the restart must bind over it
+: > "$RUNDIR/api-unix.out"
+./bin/linnea-api "unix:$apisock" "$PWD/$RUNDIR" > "$RUNDIR/api-unix.out" 2>&1 &
+au_pid=$!
+for _ in $(seq 1 50); do grep -q "listening on unix:" "$RUNDIR/api-unix.out" && break; sleep 0.1; done
+grep -q "listening on unix:$apisock" "$RUNDIR/api-unix.out"
+check "linnea-api: restarts over its own stale socket file" $?
+kill $au_pid 2>/dev/null
