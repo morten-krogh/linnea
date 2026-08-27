@@ -68,6 +68,24 @@ def upstream_failures():
         return 0
 
 
+def failures_naming_cause():
+    """...and how many of those connect failures NAMED their cause.
+
+    "connect failed" alone is reached from three different mistakes -- nothing
+    listening, no such socket path, no permission to open it -- and sends an
+    operator to the same place for all three. A dead TCP backend is always
+    ECONNREFUSED, so every line counted by upstream_failures() must also carry
+    that cause; the two counts agreeing is the assertion. Before the cause was
+    carried, this count was 0 while the other was not.
+    """
+    try:
+        with open(logpath, "rb") as f:
+            return f.read().count(
+                b"connect failed (connection refused")
+    except FileNotFoundError:
+        return 0
+
+
 def unanswered():
     """...and how many backends accepted and then failed to answer. Reported
     with different words on purpose: "connect failed" sends an operator to look
@@ -104,12 +122,19 @@ for p in protos:
     # contacted, three times, which is what makes this a test of failover
     # rather than of the location happening to name a live backend first.
     before = upstream_failures()
+    named_before = failures_naming_cause()
     served = [get(p, dead) for _ in range(3)]
     tried = upstream_failures() - before
     check(f"{p}: a dead first backend is stepped over ({''.join(served)})",
           served == ["A", "A", "A"])
     check(f"{p}: ...having actually been contacted ({tried} connect failures)",
           tried == 3)
+    # Every one of those is a refused TCP connect, so every logged line must say
+    # so. Asserting only the COUNT would pass on a build that logs three
+    # identical causeless lines -- which is exactly what it used to do.
+    named = failures_naming_cause() - named_before
+    check(f"{p}: ...and each failure names its cause ({named} named of {tried})",
+          named == tried)
 
     # 3. ...and it stops being contacted. The three requests above were the
     # three failures that fail it out, so the count must now be frozen: any

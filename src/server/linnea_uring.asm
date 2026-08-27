@@ -2240,6 +2240,7 @@ linnea_uring_run:
     ; slow backend, not an absent one, and belongs to proxy_timeout.
     mov rdi, [r12 + linnea_connection.location]
     mov rsi, [r12 + linnea_connection.up_backend]
+    mov edx, r15d                     ; the cause, while we still have it
     call linnea_upstream_mark_fail
     cmp r15d, -LINNEA_ECANCELED
     je .connect_timeout

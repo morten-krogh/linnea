@@ -3689,6 +3689,7 @@ linnea_h2p_event:
     push r14
     mov rdi, [rbx + linnea_h2p.location]
     mov rsi, [rbx + linnea_h2p.backend]
+    mov edx, r14d                     ; the cause, while we still have it
     call linnea_upstream_mark_fail
     pop r14
     mov rax, [rbx + linnea_h2p.location]

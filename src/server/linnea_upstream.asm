@@ -67,6 +67,7 @@ extern linnea_uring_now
 extern linnea_upstream_closed
 extern linnea_log_stamp
 extern linnea_log_write
+extern linnea_log_u64
 
 section .rodata
 ; A failover is invisible in the access log by construction: the client is
@@ -76,7 +77,11 @@ section .rodata
 ; observed from outside — which is what makes it testable.
 log_up_pre:     db "upstream "
 log_up_pre_len  equ $ - log_up_pre
-log_up_fail:    db " connect failed", 10
+; No newline: up_log_reason appends the cause and ends the line. "connect
+; failed" alone reaches an operator from three different mistakes -- nothing
+; listening, no such socket path, and no permission to open it -- and sends
+; them to the same place for all three. Which one it was IS the diagnosis.
+log_up_fail:    db " connect failed"
 log_up_fail_len equ $ - log_up_fail
 ; Said differently on purpose. "connect failed" sends an operator looking at
 ; listeners and firewalls; a backend that ACCEPTED and then went quiet is a
@@ -96,6 +101,24 @@ log_up_out:     db " failed out of rotation", 10
 log_up_out_len  equ $ - log_up_out
 log_up_back:    db " back in rotation", 10
 log_up_back_len equ $ - log_up_back
+rsn_open:       db " ("
+rsn_open_len    equ $ - rsn_open
+rsn_refused:    db "connection refused -- nothing is listening there"
+rsn_refused_len equ $ - rsn_refused
+rsn_noent:      db "no such socket path"
+rsn_noent_len   equ $ - rsn_noent
+rsn_acces:      db "permission denied -- the backend is fine, its socket is not ours to open"
+rsn_acces_len   equ $ - rsn_acces
+rsn_timedout:   db "timed out"
+rsn_timedout_len equ $ - rsn_timedout
+rsn_hostunr:    db "host unreachable"
+rsn_hostunr_len equ $ - rsn_hostunr
+rsn_netunr:     db "network unreachable"
+rsn_netunr_len  equ $ - rsn_netunr
+rsn_errno:      db "errno "
+rsn_errno_len   equ $ - rsn_errno
+rsn_close:      db ")", 10
+rsn_close_len   equ $ - rsn_close
 
 section .text
 
@@ -257,13 +280,82 @@ linnea_upstream_mark_ok:
     mov qword [rdi + linnea_config_location.bk_dead_at + rsi * 8], 0
     ret
 
-; linnea_upstream_mark_fail(rdi = location, rsi = backend index)
+; linnea_upstream_mark_fail(rdi = location, rsi = backend index,
+;                           edx = the connect result, a NEGATIVE errno)
 ; A connect did not complete. With one backend there is nothing to step over, so
 ; the bookkeeping is skipped entirely rather than kept and ignored.
+;
+; The result is carried in rather than collapsed at the call site: the caller is
+; the only one that still has it, and it is the difference between "start the
+; backend", "fix the path" and "fix the ownership".
 linnea_upstream_mark_fail:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13d, edx                     ; the result, before up_log clobbers rdx
     lea rdx, [log_up_fail]
     mov ecx, log_up_fail_len
-    jmp mark_fail_common
+    call up_log                       ; "upstream <addr> connect failed"
+    mov edi, r13d
+    call up_log_reason                ; " (<cause>)" and the newline
+    mov rdi, rbx
+    mov rsi, r12
+    pop r13
+    pop r12
+    pop rbx
+    jmp mark_fail_count
+
+; up_log_reason(edi = a negative errno) -- appends " (<cause>)" and the newline
+; that ends the line. Named for the causes where the name changes where an
+; operator looks, and the bare number otherwise, which is still better than the
+; nothing this line used to carry.
+up_log_reason:
+    push rbx
+    mov ebx, edi
+    neg ebx                           ; -errno -> errno
+    lea rdi, [rsn_open]
+    mov esi, rsn_open_len
+    call linnea_log_write
+    lea rdi, [rsn_refused]
+    mov esi, rsn_refused_len
+    cmp ebx, LINNEA_ECONNREFUSED
+    je .named
+    lea rdi, [rsn_noent]
+    mov esi, rsn_noent_len
+    cmp ebx, LINNEA_ENOENT
+    je .named
+    lea rdi, [rsn_acces]
+    mov esi, rsn_acces_len
+    cmp ebx, LINNEA_EACCES
+    je .named
+    lea rdi, [rsn_timedout]
+    mov esi, rsn_timedout_len
+    cmp ebx, LINNEA_ETIMEDOUT
+    je .named
+    lea rdi, [rsn_hostunr]
+    mov esi, rsn_hostunr_len
+    cmp ebx, LINNEA_EHOSTUNREACH
+    je .named
+    lea rdi, [rsn_netunr]
+    mov esi, rsn_netunr_len
+    cmp ebx, LINNEA_ENETUNREACH
+    je .named
+    lea rdi, [rsn_errno]              ; no words for it: the number
+    mov esi, rsn_errno_len
+    call linnea_log_write
+    mov edi, ebx
+    call linnea_log_u64
+    jmp .close
+.named:
+    call linnea_log_write
+.close:
+    lea rdi, [rsn_close]
+    mov esi, rsn_close_len
+    call linnea_log_write
+    pop rbx
+    ret
 
 ; linnea_upstream_log_oversize(rdi = location, rsi = backend index)
 ; Log only. See log_up_big: this is our limit, not a backend fault, so it must
@@ -277,17 +369,34 @@ linnea_upstream_log_oversize:
 ; The backend accepted and then failed to answer -- a timeout, a closed
 ; connection, framing we will not relay. Counted identically; reported
 ; differently, because the two faults are looked for in different places.
+;
+; It logs its own line and JUMPS. It used to reach the logging by falling
+; through into mark_fail_common, whose first act was the call to up_log --
+; so splitting that function in two silently took this line away, and
+; "counted as unanswered, not as a connect failure" went from 3 to 0. An
+; implicit fall-through is a call site that no grep for the callee finds.
 linnea_upstream_mark_unanswered:
-    lea rdx, [log_up_noans]
-    mov ecx, log_up_noans_len
-mark_fail_common:
     push rbx
     push r12
     mov rbx, rdi
     mov r12, rsi
-    call up_log                       ; rdx/rcx already carry the suffix
+    lea rdx, [log_up_noans]
+    mov ecx, log_up_noans_len
+    call up_log
     mov rdi, rbx
     mov rsi, r12
+    pop r12
+    pop rbx
+    jmp mark_fail_count
+
+; mark_fail_count(rdi = location, rsi = backend index) -- the health half of
+; mark_fail, split out so the logging half can own the cause. Its own two
+; pushes are what the alignment of the linnea_uring_now call below counts on.
+mark_fail_count:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
     cmp qword [rdi + linnea_config_location.proxy_count], 2
     jb .done
     inc qword [rdi + linnea_config_location.bk_fails + rsi * 8]

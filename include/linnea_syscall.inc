@@ -148,3 +148,12 @@ LINNEA_SOCKADDR_IN_SIZE equ 16  ; struct sockaddr_in: family u16, port u16 (BE),
 LINNEA_SOCKADDR_IN6_SIZE equ 28 ; struct sockaddr_in6: family u16, port u16 (BE), flowinfo u32, addr[16], scope_id u32
 LINNEA_BACKLOG       equ 128
 LINNEA_ENOSPC   equ 28
+; The connect(2) failures worth naming in a log line. ENOENT and EACCES are
+; rare for a TCP backend and are the two a Unix-socket backend produces most:
+; a socket path that is not there, and one whose mode or owner shuts us out.
+LINNEA_ENOENT        equ 2
+LINNEA_EACCES        equ 13
+LINNEA_ENETUNREACH   equ 101
+LINNEA_ETIMEDOUT     equ 110
+LINNEA_ECONNREFUSED  equ 111
+LINNEA_EHOSTUNREACH  equ 113
