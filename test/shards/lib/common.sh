@@ -139,6 +139,10 @@ P61730=$((PORTBASE + 730))   # backend-h2 frame size: a PLAINTEXT h2 fixture, dr
                              # by bin/linnea-h2client directly (both parsers)
 P61731=$((PORTBASE + 731))   # backend-h2 :path: a PLAINTEXT front over proxy_h2, so
                              # an absolute-form request line can be sent raw
+P61732=$((PORTBASE + 732))   # backend-h2 failover: DELIBERATELY UNBOUND. Nothing may
+                             # ever listen here -- it is the dead first backend
+                             # that drives h2p_reconnect.
+P61733=$((PORTBASE + 733))   # backend-h2 failover: the proxy_h2 front naming it
 # -----------------------------------------------------------------------------
 LOG=$RUNDIR/linnea.log
 # What actually reached a proxy backend, appended to by test/proxy_backend.py.

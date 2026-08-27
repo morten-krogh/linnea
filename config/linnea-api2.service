@@ -26,8 +26,16 @@
 #   make && sudo make install
 #   sudo systemctl restart linnea-api  && sleep 2 && sudo systemctl restart linnea-api2
 #
-# It differs from linnea-api.service in exactly two places: the port (7702) and
-# the scratch directory (linnea-api-2). Everything else is identical on purpose.
+# It differs from linnea-api.service in three places: it listens on a UNIX SOCKET
+# rather than a port, it uses the linnea-api-2 scratch directory, and it needs a
+# RuntimeDirectory to have somewhere to put the socket. Everything else is
+# identical on purpose.
+#
+# Instance 1 deliberately stays on TCP 7700. Keeping the two on DIFFERENT
+# transports is what makes this reversible: if the socket is unreachable for any
+# reason, linnea's connect-failure failover serves /api from 7700 and the error
+# log names the cause rather than saying "connect failed" and leaving you to
+# guess which of three mistakes it was.
 
 [Unit]
 Description=Linnea /api backend, instance 2 (upload checksum + random number)
@@ -39,8 +47,14 @@ Type=simple
 User=linnea-svc
 Group=linnea-svc
 WorkingDirectory=/
-ExecStart=/usr/local/bin/linnea-api 7702 /var/lib/linnea-api-2
+ExecStart=/usr/local/bin/linnea-api unix:/run/linnea-api-2/api.sock /var/lib/linnea-api-2
 StateDirectory=linnea-api-2
+# ProtectSystem=strict leaves the whole hierarchy read-only, so there is nowhere
+# to CREATE a socket without this: RuntimeDirectory gives the unit /run/linnea-api-2
+# owned by its own User/Group, and systemd removes it when the service stops.
+# linnea connects as the same user; the socket itself is 0660, so no other uid
+# can reach the backend at all -- which is the reason for using one.
+RuntimeDirectory=linnea-api-2
 Restart=on-failure
 RestartSec=1
 TimeoutStopSec=10

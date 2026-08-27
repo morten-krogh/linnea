@@ -135,6 +135,36 @@ EOF
     [ "$body" = "BACKEND-OK" ]
     check "backend h2 e2e: h1 client -> front -> TLS+h2 -> linnea (body relayed)" $?
 
+    # --- proxy_h2 failover: two backends, the first one dead ----------------
+    # The ONLY thing that drives h2p_reconnect. upstream_failover.py gives each
+    # CLIENT protocol its own dead-first location, but every one of them is a
+    # plain `proxy` (h1-backend) location, so the proxy_h2 leg's own reconnect
+    # path had no coverage at all -- and the reorder in b4bc758 (choose the
+    # backend BEFORE opening the socket, because the family is a property of
+    # the backend) rested on reading rather than on a test. Nothing listens on
+    # P61732, by construction.
+    cat > $CFG/bt-fe-h2-fo.json <<EOF
+{ "log": "$PWD/$RUNDIR/bt-fe-h2-fo.log", "workers": 1,
+  "servers": [ { "host": "127.0.0.1", "port": ${P61733}, "hostname": "front.test",
+    "locations": [ { "prefix": "/",
+      "proxy": ["127.0.0.1:${P61732}", "127.0.0.1:${P61712}"],
+      "proxy_tls": 1, "proxy_pin": "$PIN", "proxy_sni": "localhost",
+      "proxy_h2": 1 } ] } ] }
+EOF
+    start_server $CFG/bt-fe-h2-fo.json
+    body=$(curl -s --max-time 10 http://127.0.0.1:${P61733}/probe.txt)
+    [ "$body" = "BACKEND-OK" ]
+    check "backend h2 failover: a dead first backend is stepped over (proxy_h2)" $?
+    # ...and it was actually CONTACTED. Asserting only the body would pass on a
+    # build that never tried the first backend at all, which is exactly the
+    # thing a failover test exists to rule out.
+    grep -q "upstream 127.0.0.1:${P61732} connect failed" "$RUNDIR/bt-fe-h2-fo.log"
+    check "backend h2 failover: ...having actually been tried" $?
+    # and the h2 leg's own call site carries the cause, not just the h1/h3 one
+    grep -q "upstream 127.0.0.1:${P61732} connect failed (connection refused" \
+         "$RUNDIR/bt-fe-h2-fo.log"
+    check "backend h2 failover: ...and names its cause on the h2 leg too" $?
+
     # a large response must relay intact over the h2 leg (spans DATA frames)
     python3 -c "open('$btw/big.bin','w').write('B'*200000)"
     n=$(curl -s --max-time 12 http://127.0.0.1:${P61715}/big.bin | wc -c)
