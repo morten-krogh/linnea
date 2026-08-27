@@ -54,6 +54,7 @@ python3 test/configs/genports.py "$PORTBASE" "$CFG" "$RUNDIR" >/dev/null || {
 }
 P61000=$((PORTBASE + 0))
 P61080=$((PORTBASE + 80))
+P61081=$((PORTBASE + 81))
 P61090=$((PORTBASE + 90))
 P61100=$((PORTBASE + 100))
 P61466=$((PORTBASE + 466))

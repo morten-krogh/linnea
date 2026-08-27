@@ -89,6 +89,12 @@ for name in sorted(os.listdir(srcdir)):
         out = re.sub(r'("error_log": ")test/([^"]*)"', r'\1%s/\2"' % rundir, out)
         out = re.sub(r'("port_file": ")test/([^"]*)"', r'\1%s/\2"' % rundir, out)
         out = re.sub(r'("root": ")test/www', r'\1%s/www' % rundir, out)
+        # A unix: backend is a path a server CONNECTS to, and two concurrent
+        # runs sharing one socket file would have the second bind over the
+        # first. It is not a key of its own -- it is a value inside "proxy",
+        # which may be a string OR an array -- so it moves by its prefix
+        # rather than by its key, the way every other run-local path does.
+        out = out.replace('"unix:test/', '"unix:%s/' % rundir)
         # Every path a server reads or writes becomes ABSOLUTE, because the
         # server is then started with its own run directory as its working
         # directory -- and that is the only way to give each run its own
@@ -101,6 +107,7 @@ for name in sorted(os.listdir(srcdir)):
         # qdbg lines before a neighbouring run touched the file, 4 after.
     out = re.sub(r'("(?:log|error_log|root|cert|key|spill_dir|port_file)": ")(test/)',
                  r'\1%s/\2' % REPO, out)
+    out = out.replace('"unix:test/', '"unix:%s/test/' % REPO)
     open(dst, "w", errors="surrogateescape").write(out)
     n += 1
 

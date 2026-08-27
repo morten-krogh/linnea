@@ -803,9 +803,23 @@ def respond(conn, head, body, extra=b""):
 
 
 def main():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
+    # LINNEA_BACKEND_UNIX makes this a Unix-domain backend at that path. The
+    # BACKEND owns the socket file -- it unlinks a stale one and creates it.
+    # linnea only ever connects; nothing in the server removes one, which is
+    # why the unlink lives here and not there.
+    unix_path = os.environ.get("LINNEA_BACKEND_UNIX")
+    if unix_path:
+        try:
+            os.unlink(unix_path)
+        except FileNotFoundError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(unix_path)
+        os.chmod(unix_path, 0o660)
+    else:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((HOST, PORT))
     srv.listen(16)
     while True:
         conn, _ = srv.accept()

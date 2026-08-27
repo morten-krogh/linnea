@@ -1,0 +1,13 @@
+{
+  "log": "test/unix-backend.log",
+  "servers": [
+    {
+      "host": "127.0.0.1", "port": 61081, "hostname": "localhost",
+      "locations": [
+        { "prefix": "/api",  "proxy": "unix:test/be.sock" },
+        { "prefix": "/gone", "proxy": "unix:test/absent.sock" },
+        { "prefix": "/", "root": "test/www" }
+      ]
+    }
+  ]
+}

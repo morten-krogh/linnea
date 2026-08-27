@@ -373,3 +373,40 @@ curl -s --max-time 3 http://127.0.0.1:${P61080}/api/truncated >/dev/null 2>&1
 grep -qF ': upstream closed early' "$LOG"
 check "proxy truncated body" $?
 
+# --- a Unix-domain backend (docs/design/unix-backend-plan.md) -----------
+# The whole point is that reachability is a FILE PERMISSION rather than "any
+# process on this host", so the socket lives in the run's own directory: two
+# concurrent shard jobs must not share one, which is why genports.py moves it
+# the way it moves every other run-local path.
+usock="$PWD/$RUNDIR/be.sock"
+LINNEA_BACKEND_UNIX="$usock" python3 test/proxy_backend.py >/dev/null 2>&1 &
+ub_pid=$!
+for _ in $(seq 1 50); do [ -S "$usock" ] && break; sleep 0.1; done
+check "unix backend: the fixture created its socket" $([ -S "$usock" ] && echo 0 || echo 1)
+# sun_path is 108 including its NUL. Assert the path we actually generated
+# fits, or a failure below would be about the run directory, not the feature.
+check "unix backend: the generated path fits sun_path (${#usock} <= 107)" \
+      $([ ${#usock} -le 107 ] && echo 0 || echo 1)
+
+start_server $CFG/unix-backend.json
+resp=$(curl -si --max-time 3 http://127.0.0.1:${P61081}/api/simple)
+check_http "unix backend: proxied GET"            "backend body" "$resp"
+check_http "unix backend: ...with the real status" "200 OK" "$resp"
+resp=$(curl -s --max-time 3 "http://127.0.0.1:${P61081}/api/target?x=1&y=2")
+check_http "unix backend: target and query forwarded" "/api/target?x=1&y=2" "$resp"
+resp=$(curl -s --max-time 3 -d 'hello over a socket' http://127.0.0.1:${P61081}/api/echo)
+check_http "unix backend: request body forwarded" "hello over a socket" "$resp"
+# the control: a static location on the same server is untouched by any of it
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:${P61081}/hello.txt)
+check_http "unix backend: static location still served" "200" "$code"
+
+# A socket path with nothing at it is a 502, and the log must say WHICH of the
+# three connect failures it was -- naming it is the reason the errno is carried
+# at all. Asserting only the 502 would pass on a build that says nothing.
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:${P61081}/gone)
+check_http "unix backend: an absent socket is 502" "502" "$code"
+ulog="$RUNDIR/unix-backend.log"
+grep -q "connect failed (no such socket path)" "$ulog"
+check "unix backend: ...logged as 'no such socket path', not a bare failure" $?
+
+kill $ub_pid 2>/dev/null
