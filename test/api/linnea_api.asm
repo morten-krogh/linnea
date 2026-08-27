@@ -1661,15 +1661,25 @@ setup_listener:
     mov rsi, [unix_path]
     lea rdi, [sockaddr + 2]
     xor ecx, ecx
+    ; sun_path is 108 bytes INCLUDING its NUL, so a 107-byte path occupies
+    ; indices 0..106 and its NUL sits at 107. Bounding the loop before LOADING
+    ; the byte at index 107 rejected the NUL rather than a 108th character, so
+    ; this accepted 106 bytes while linnea's own parser accepts 107 -- the same
+    ; documented limit, two implementations, one of them off by one
+    ; (audit-report-93). The test is on the CHARACTER now: a NUL is stored at
+    ; any index up to and including 107; a non-NUL at 107 is the 108th byte and
+    ; is what cannot fit.
 .u_copy:
-    cmp ecx, LINNEA_SUN_PATH_MAX
-    jae .fail                      ; longer than sun_path can hold
     mov dl, [rsi + rcx]
-    mov [rdi + rcx], dl
     test dl, dl
-    jz .u_bound
+    jz .u_term                     ; the NUL fits wherever we are
+    cmp ecx, LINNEA_SUN_PATH_MAX
+    jae .fail                      ; a 108th character has nowhere to go
+    mov [rdi + rcx], dl
     inc ecx
     jmp .u_copy
+.u_term:
+    mov byte [rdi + rcx], 0
 .u_bound:
     lea rdx, [rcx + 3]             ; family + path + its NUL
     push rdx

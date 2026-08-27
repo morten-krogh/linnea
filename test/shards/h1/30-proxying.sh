@@ -435,3 +435,25 @@ for _ in $(seq 1 50); do grep -q "listening on unix:" "$RUNDIR/api-unix.out" && 
 grep -q "listening on unix:$apisock" "$RUNDIR/api-unix.out"
 check "linnea-api: restarts over its own stale socket file" $?
 kill $au_pid 2>/dev/null
+
+# The path-length boundary on the LISTENER side, from both sides. sun_path is
+# 108 including its NUL, so 107 is the longest storable path -- and the copy
+# loop bounded itself before LOADING index 107, rejecting the NUL rather than a
+# 108th character. It accepted 106 while linnea's parser accepted 107: the same
+# documented limit, two implementations, one off by one (audit-report-93).
+# My own audit missed it by testing the boundary against the PYTHON fixture
+# rather than the real backend, which is why both ends are asserted here.
+apidir="$PWD/$RUNDIR/pathmax"; mkdir -p "$apidir"
+while [ ${#apidir} -lt 92 ]; do apidir="$apidir/dddddddd"; mkdir -p "$apidir"; done
+for want in 107 108; do
+    n=$(( want - ${#apidir} - 1 ))
+    sk="$apidir/$(printf "%${n}s" | tr " " "s")"
+    out=$(timeout 5 ./bin/linnea-api "unix:$sk" "$PWD/$RUNDIR" 2>&1 | head -1)
+    case "$want:$out" in
+        107:*"listening on unix"*) r=0 ;;   # the maximum must START
+        108:*"cannot bind"*)       r=0 ;;   # one past it must NOT
+        *)                         r=1 ;;
+    esac
+    check "linnea-api: a ${want}-byte socket path (len ${#sk}) is handled" $r
+    pkill -x linnea-api 2>/dev/null
+done
