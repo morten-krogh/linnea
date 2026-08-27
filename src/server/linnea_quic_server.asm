@@ -5275,6 +5275,23 @@ linnea_quic_server_datagram:
     ; bits 00) — any other id does not name a request, whatever it names
     test r13, 3
     jnz .pu_id_error
+    ; ...and it must be WITHIN the bidi stream limit we granted (RFC 9218 7.2:
+    ; "The stream ID MUST be within the client-initiated bidirectional stream
+    ; limit"). A higher id names a stream the peer may not open, so no request
+    ; can ever arrive to claim the update -- it would sit in the pending ring
+    ; until evicted (audit-report-80). The ordinal is computed exactly as
+    ; linnea_quic_stream_limit computes it for the transport, against the same
+    ; ms_bidi_max, so the two cannot drift into disagreeing about the same id.
+    ;
+    ; 7.2 makes the error a SHOULD, excusing implementations that "might have
+    ; practical barriers to determining the active stream concurrency limit that
+    ; is applied by the QUIC layer". We have no such barrier: the QUIC layer is
+    ; this one, and ms_bidi_max is the live grant, MAX_STREAMS regrants included.
+    mov rax, r13
+    shr rax, 2
+    inc rax                           ; this stream's ordinal
+    cmp rax, [rbx + linnea_quic_conn.ms_bidi_max]
+    ja .pu_id_error
     ; an open response slot for that stream takes the new values at once: the
     ; pump reads urgency and incremental afresh every time it picks a stream, so
     ; nothing else has to be resorted

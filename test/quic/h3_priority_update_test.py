@@ -278,6 +278,32 @@ code = close_code(lambda c, ctrl: c.send_stream_data(
 report("push element id is H3_ID_ERROR", code == 0x108,
        f"close={code and hex(code)}")
 
+# RFC 9218 7.2: "The stream ID MUST be within the client-initiated
+# bidirectional stream limit." We advertise LINNEA_QUIC_MS_INIT = 100 bidi
+# streams, so ordinals 1..100 -- ids 0, 4, ... 396 -- are the ones the peer may
+# open. An id above that names a stream that can never arrive, so the update
+# would sit in the pending ring until evicted (audit-report-80).
+LIMIT = 100                       # LINNEA_QUIC_MS_INIT
+LAST_LEGAL = (LIMIT - 1) * 4      # ordinal == the limit exactly: 396
+code = close_code(lambda c, ctrl: c.send_stream_data(
+    ctrl, priority_update(LAST_LEGAL + 4, b"u=0")))
+report("an id one past the bidi stream limit is H3_ID_ERROR", code == 0x108,
+       f"close={code and hex(code)}")
+
+code = close_code(lambda c, ctrl: c.send_stream_data(
+    ctrl, priority_update(4000000, b"u=7")))
+report("a far out-of-limit id is H3_ID_ERROR", code == 0x108,
+       f"close={code and hex(code)}")
+
+# THE control: the last id the limit allows must still be accepted. An
+# off-by-one here would refuse a legal PRIORITY_UPDATE, which is the way this
+# check fails -- and the ordinal is computed the same way the transport's own
+# stream-limit test computes it, so the two cannot drift apart.
+code = close_code(lambda c, ctrl: c.send_stream_data(
+    ctrl, priority_update(LAST_LEGAL, b"u=0")))
+report("the last id within the limit is accepted", code is None,
+       f"close={code and hex(code)}")
+
 # and the frame belongs on the control stream and nowhere else
 def on_request_stream(c, ctrl):
     sid = c.get_next_available_stream_id()
