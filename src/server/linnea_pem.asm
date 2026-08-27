@@ -108,12 +108,12 @@ linnea_pem_decode:
     mov rcx, end_len
     call bytes_eq
     test eax, eax
-    jnz .done
+    jnz .end_boundary
 .decode:
     movzx eax, byte [rbx]
     inc rbx
     cmp al, '='
-    je .done                 ; padding: the data is complete
+    je .pad                  ; padding ends the DATA, not the encapsulation
     movzx eax, byte [b64_table + rax]
     cmp al, 0xff
     je .loop                 ; whitespace / newline
@@ -131,6 +131,62 @@ linnea_pem_decode:
     mov [rbp + r10], al
     inc r10
     jmp .loop
+; RFC 7468 2-3: the encapsulated text is followed by a post-encapsulation
+; boundary -- "-----END ", a label, and exactly five dashes. Neither half of the
+; old completion checked for one: the first '=' returned success outright, and
+; the nine-byte "-----END " prefix was accepted with no closing dashes. So a
+; file whose END line was replaced by "=", or truncated to "-----END PRIVATE
+; KEY", decoded as a complete credential (audit-report-99 F3). The label is NOT
+; compared: RFC 7468's lax grammar tolerates a mismatched END label, and
+; tightening that would reject files other tools accept.
+.pad:
+    cmp rbx, r13
+    jae .bad
+    movzx eax, byte [rbx]
+    cmp al, '-'
+    je .at_dash
+    cmp al, '='
+    je .pad_skip
+    movzx ecx, byte [b64_table + rax]
+    cmp cl, 0xff
+    jne .bad                 ; base64 payload after the padding
+.pad_skip:
+    inc rbx
+    jmp .pad
+.at_dash:
+    lea rax, [rbx + end_len]
+    cmp rax, r13
+    ja .bad
+    mov rdi, rbx
+    lea rsi, [end_pfx]
+    mov rcx, end_len
+    call bytes_eq
+    test eax, eax
+    jz .bad
+.end_boundary:
+    ; past "-----END ", skip the label and require its five closing dashes
+    lea rdi, [rbx + end_len]
+    xor ecx, ecx
+.eb_scan:
+    cmp ecx, 80              ; longest label we will look past
+    ja .bad
+    lea rax, [rdi + 5]
+    cmp rax, r13
+    ja .bad                  ; no room for "-----": a truncated boundary
+    cmp byte [rdi], 10       ; a line end before the dashes: truncated
+    je .bad
+    push rdi
+    push rcx
+    lea rsi, [dashes5]
+    mov rcx, 5
+    call bytes_eq
+    pop rcx
+    pop rdi
+    test eax, eax
+    jnz .done
+    inc rdi
+    inc ecx
+    jmp .eb_scan
 .done:
     mov rax, r10
     mov rdx, rbx             ; resume point for the next block

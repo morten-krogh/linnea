@@ -21,6 +21,7 @@ default rel
 
 %include "linnea_syscall.inc"
 %include "linnea_config.inc"
+%include "linnea_p256_ecdsa.inc"
 %include "linnea_tls.inc"
 
 global linnea_tls_setup
@@ -41,8 +42,14 @@ extern linnea_quic_ticket_setup
 extern linnea_p256_scalar_is_valid
 extern linnea_tls_hkdf_expand_label
 extern linnea_error_exit
+extern linnea_x509_find_spki
+extern linnea_x509_spki_point
+extern linnea_p256_ecdsa_sign
+extern linnea_p256_ecdsa_verify_der
 
 section .rodata
+pair_digest: times 32 db 0x5a       ; any fixed digest; only the pairing matters
+
 
 ulp_tls:    db "tls", 0
 lbl_key:    db "key"
@@ -52,6 +59,8 @@ lbl_traffic_upd_len equ $ - lbl_traffic_upd
 
 msg_no_aesni: db "TLS requires a CPU with AES-NI, PCLMULQDQ and SSSE3"
 msg_no_aesni_len equ $ - msg_no_aesni
+msg_key_mismatch: db "certificate and key are different identities: the key does not sign for this certificate", 10
+msg_key_mismatch_len equ $ - msg_key_mismatch
 msg_no_entropy: db "cannot seed the session-ticket keys: getrandom failed", 10
 msg_no_entropy_len equ $ - msg_no_entropy
 msg_bad_cert: db "cannot load TLS certificate chain (not PEM CERTIFICATEs?)"
@@ -67,6 +76,10 @@ msg_cert_big_len equ $ - msg_cert_big
 MAX_CERT_LIST equ 8192
 
 section .bss
+; the cert/key pairing self-check (audit-report-99 F2)
+leaf_pub:    resb 64
+pair_sig:    resb LINNEA_P256_ECDSA_MAX_SIG
+
 
 alignb 8
 cert_pool:  resb LINNEA_MAX_SERVERS * MAX_CERT_LIST
@@ -184,6 +197,53 @@ linnea_tls_setup:
     mov rdi, r14
     mov rsi, r15
     call linnea_file_unmap
+
+    ; ---- prove the certificate and the key are ONE identity -----------------
+    ; Both files parsed on their own; nothing tied them together. A renewal
+    ; that updates the chain and the key as separate files could land half of a
+    ; pair, pass this preflight, and retire a working generation for one that
+    ; cannot authenticate any fresh client -- TLS 1.3 defines CertificateVerify
+    ; as proof of possession of the key matching the certificate (RFC 8446
+    ; 4.4.3), so a signature from an unrelated key is guaranteed to be rejected
+    ; (audit-report-99 F2).
+    ;
+    ; Parsing the leaf's SPKI is also what makes an arbitrary byte string stop
+    ; being a "certificate": the loader used to accept any nonempty body and
+    ; frame it (F1). The leaf DER sits behind the u24 CertificateEntry length
+    ; that linnea_pem_cert_list wrote.
+    mov rax, [r13 + linnea_config_server.cert_list]
+    movzx edi, byte [rax]
+    shl edi, 16
+    movzx ecx, byte [rax + 1]
+    shl ecx, 8
+    or edi, ecx
+    movzx ecx, byte [rax + 2]
+    or edi, ecx                        ; edi = leaf DER length
+    mov rsi, rdi
+    lea rdi, [rax + 3]                 ; the DER itself
+    call linnea_x509_find_spki         ; rax = SPKI, rdx = its length
+    test rax, rax
+    jz .bad_cert                       ; not a parseable X.509 with a P-256 SPKI
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [leaf_pub]
+    call linnea_x509_spki_point        ; -> 64-byte X||Y
+    test eax, eax
+    jz .bad_cert
+    ; sign a fixed digest with the configured key and verify it under the
+    ; certificate's point: equality of identity, proven through the very
+    ; primitive the handshake will use.
+    lea rdi, [pair_sig]
+    lea rsi, [pair_digest]
+    mov rdx, [r13 + linnea_config_server.key_priv]
+    call linnea_p256_ecdsa_sign        ; rax = DER length
+    lea rsi, [pair_sig]
+    mov rdx, rax
+    lea rdi, [pair_digest]
+    lea rcx, [leaf_pub]
+    call linnea_p256_ecdsa_verify_der
+    test eax, eax
+    jz .key_mismatch
 .load_next:
     inc r12
     jmp .load
@@ -197,6 +257,10 @@ linnea_tls_setup:
 .no_entropy:
     lea rdi, [msg_no_entropy]
     mov esi, msg_no_entropy_len
+    jmp linnea_error_exit
+.key_mismatch:
+    lea rdi, [msg_key_mismatch]
+    mov esi, msg_key_mismatch_len
     jmp linnea_error_exit
 .bad_cert:
     lea rdi, [msg_bad_cert]

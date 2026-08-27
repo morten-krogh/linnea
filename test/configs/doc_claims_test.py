@@ -202,6 +202,49 @@ TCP_TLS = ('{"log":"/tmp/l","servers":[{"host":"127.0.0.1","port":8443,'
            ',%s}]}]}')
 test(TCP_TLS % ('"proxy_tls":1,"proxy_pin":"%s"' % PIN),
      "proxy_tls with a tcp backend still accepted", True)
+# --- TLS credentials: --test must not bless an unusable pair ---------------
+# docs say --test "check[s] the configuration and certificates", and the hot
+# upgrade runs it against the NEW binary before committing. All of these used
+# to exit 0 (audit-report-99).
+import os as _os
+_CRT, _KEY = "test/tls/server.crt", "test/tls/server.key"
+_ALT = "test/tls/sni.key"
+_TD = tempfile.mkdtemp()
+
+
+def _tls_cfg(cert, key):
+    return json.dumps({"log": _os.path.join(_TD, "l.log"), "servers": [
+        {"host": "127.0.0.1", "port": 8443, "hostname": "localhost",
+         "cert": cert, "key": key,
+         "locations": [{"prefix": "/", "root": "test/www"}]}]})
+
+
+if _os.path.exists(_CRT):
+    test(_tls_cfg(_CRT, _KEY), "a matching certificate and key are accepted", True)
+    # F2: two individually valid files that are different identities
+    test(_tls_cfg(_CRT, _ALT), "a certificate with an unrelated key is rejected",
+         False, "different identities")
+    # ...and the leaf of a MULTI-cert chain is what gets compared, not an issuer
+    if _os.path.exists("test/tls/bigchain.crt"):
+        test(_tls_cfg("test/tls/bigchain.crt", _KEY),
+             "a multi-cert chain is paired by its LEAF", True)
+    # F1: a body that decodes but is not an X.509 certificate
+    _one = _os.path.join(_TD, "onebyte.crt")
+    open(_one, "w").write("-----BEGIN CERTIFICATE-----\nQQ==\n-----END CERTIFICATE-----\n")
+    test(_tls_cfg(_one, _KEY), "a one-byte certificate body is rejected", False)
+    # F3: a body whose post-encapsulation boundary is missing or truncated
+    _body = open(_CRT).read().split("-----END")[0]
+    _noend = _os.path.join(_TD, "noend.crt")
+    open(_noend, "w").write(_body + "=\n")
+    test(_tls_cfg(_noend, _KEY), "a certificate with no END boundary is rejected", False)
+    _trunc = _os.path.join(_TD, "trunc.crt")
+    open(_trunc, "w").write(_body + "-----END PRIVATE KEY")
+    test(_tls_cfg(_trunc, _KEY), "a truncated END boundary is rejected", False)
+    _kbody = open(_KEY).read().split("-----END")[0]
+    _nokey = _os.path.join(_TD, "noend.key")
+    open(_nokey, "w").write(_kbody + "=\n")
+    test(_tls_cfg(_CRT, _nokey), "a key with no END boundary is rejected", False)
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",
