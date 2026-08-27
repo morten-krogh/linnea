@@ -400,6 +400,14 @@ LINNEA_QUIC_TX_HDR      equ 1024
 LINNEA_QUIC_TXSTREAMS   equ 100     ; = advertised initial_max_streams_bidi
 LINNEA_QUIC_RST_SEEN    equ 32      ; cancelled stream ids remembered per connection
 LINNEA_QUIC_SERVED_SEEN equ 32      ; out-of-order served request-stream ids (a ring)
+; Completed request streams whose FINAL SIZE is still remembered, so a frame
+; arriving after the stream is done can be checked against it (RFC 9000 4.5).
+; A ring, and deliberately not "all of them": that section makes generating
+; these errors a SHOULD rather than a MUST precisely because the alternative is
+; keeping final-size state for every closed stream, "which could mean a
+; significant state commitment". This is the bounded version of that -- the most
+; recent streams are checked, older ones are acked as before.
+LINNEA_QUIC_FINAL_SEEN  equ 16
 ; Bidi-stream flow control (RFC 9000 4.6). We advertise this many streams up front,
 ; then raise the peer's limit with MAX_STREAMS as it opens streams, so a long-lived
 ; (reused) connection never runs out — without this a browser that refreshes enough
@@ -830,6 +838,14 @@ struc linnea_quic_conn
     .req_served_lo:     resq 1        ; every client-bidi id < this is served
     .req_served_ids:    resq LINNEA_QUIC_SERVED_SEEN   ; out-of-order tail, id+1, 0=empty
     .req_served_cursor: resq 1
+    ; ...and the final size each of the most recent completed streams declared,
+    ; which the served ring above cannot hold: its watermark absorbs an id and
+    ; keeps no size, and after a stream is served the reassembly context that
+    ; DID hold the size is released (audit-report-77). Written once per stream,
+    ; when it is dispatched; read before a later frame on that stream is ignored.
+    .fin_sid:    resq LINNEA_QUIC_FINAL_SEEN    ; id + 1, 0 = empty
+    .fin_size:   resq LINNEA_QUIC_FINAL_SEEN
+    .fin_cursor: resq 1
     .ra_ctx:     resb LINNEA_QUIC_RA_CTXS * linnea_quic_ra_size
     ; the open response streams (up to LINNEA_QUIC_TXSTREAMS at once): each slot
     ; holds one large response's mapping, head and progress; the pump interleaves

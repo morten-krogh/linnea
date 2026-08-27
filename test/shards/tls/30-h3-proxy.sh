@@ -300,6 +300,16 @@ EOF
         n=$(grep -c 'dedup11probe' "$RUNDIR/h3-smallbody.log")
         [ "$n" = "1" ]
         check "h3 does not re-dispatch a completed request on retransmission ($n dispatch)" $?
+        # RFC 9000 4.5: a stream's final size is fixed by the first FIN. Once a
+        # request was SERVED, nothing remembered its size -- the copy-free path
+        # never had a reassembly context and a reassembled one is released at
+        # dispatch -- so a later FIN naming a different size, or data past it,
+        # was acked in silence (audit-report-77). Twelve rows: three violations
+        # and three legal retransmissions, each on both receive paths. The
+        # controls are the point: a partial retransmission of a completed
+        # request is LEGAL and must still be acked, not closed on.
+        timeout 180 python3 test/quic/h3_final_size_closed.py ${P61470} >/dev/null 2>&1
+        check "h3 holds a completed stream's final size (RFC 9000 4.5)" $?
         kill $sfb_pid 2>/dev/null
         wait $sfb_pid 2>/dev/null
         rm -f "$sfb"

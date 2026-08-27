@@ -2652,6 +2652,21 @@ linnea_quic_server_datagram:
     call rst_known
     test eax, eax
     jnz .stream_scan
+    ; ...and neither does a stream that is already COMPLETE. Its frames arrive
+    ; here rather than at .serve_bidi whenever they are not offset 0 with FIN --
+    ; which is exactly the shape of "data past the final size". A contradiction
+    ; closes the connection; a legal partial retransmission is acked without
+    ; claiming a context it would never be able to finish (audit-report-77).
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    mov rdx, [s_soff]
+    mov rcx, [s_slen]
+    mov r8, [s_sfin]
+    call req_final_check
+    cmp eax, 2
+    je .final_size_conn_err
+    test eax, eax
+    jnz .stream_scan
     mov rax, [cur_conn]
     lea rax, [rax + linnea_quic_conn.ra_ctx]
     mov rdx, LINNEA_QUIC_RA_CTXS
@@ -3352,6 +3367,13 @@ linnea_quic_server_datagram:
     mov edi, 0x03                               ; FLOW_CONTROL_ERROR
     mov esi, 0x08                               ; a STREAM frame triggered it
     jmp .transport_close
+.final_size_conn_err:
+    ; The same error as .ra_final_size_error below, for the two sites that reach
+    ; it with no reassembly context to release: the stream they are complaining
+    ; about finished, and its context (if it ever had one) is long gone.
+    mov edi, 0x06                               ; FINAL_SIZE_ERROR
+    mov esi, 0x08                               ; a STREAM frame triggered it
+    jmp .transport_close
 .ra_final_size_error:
     ; RFC 9000 4.5 (Finding 12): a FIN whose final size conflicts with one
     ; already learned, that is below the highest byte received, or data that
@@ -3456,6 +3478,18 @@ linnea_quic_server_datagram:
     mov qword [linnea_h3_body_fd], -1
     jmp .ra_hold_done
 .serve_bidi:
+    ; A frame on a stream we have already FINISHED with is checked against the
+    ; final size that stream declared, before any of the exits below quietly ack
+    ; it (RFC 9000 4.5, audit-report-77). On the first pass -- the request itself
+    ; -- nothing is remembered yet and this is a no-op.
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    mov rdx, [s_soff]
+    mov rcx, [s_slen]
+    mov r8, [s_sfin]
+    call req_final_check
+    cmp eax, 2
+    je .final_size_conn_err
     ; Already answering this stream? Then this is a RETRANSMITTED request: the peer
     ; resent it because our ack of the original was lost (which happens exactly
     ; during a loss burst). Serving it again would open a second response slot for
@@ -3511,6 +3545,27 @@ linnea_quic_server_datagram:
     mov rdi, [cur_conn]
     mov rsi, [s_sid]
     call req_served_mark             ; committing to dispatch it now (once)
+    ; ...and remember the size the stream declared. The inline path has it in
+    ; this very frame (offset 0 + FIN); a reassembled one has it in the context,
+    ; which is released moments from now -- taking the only copy with it, which
+    ; is why a completed MULTI-frame request had the same hole as the copy-free
+    ; one (audit-report-77). A context that somehow reached here without a FIN
+    ; records nothing rather than a size it is guessing at.
+    mov rdx, [s_ra_ctx]
+    test rdx, rdx
+    jz .fs_inline
+    cmp qword [rdx + linnea_quic_ra.fin], 0
+    je .fs_marked
+    mov rdx, [rdx + linnea_quic_ra.final]
+    jmp .fs_mark
+.fs_inline:
+    mov rdx, [s_soff]
+    add rdx, [s_slen]
+.fs_mark:
+    mov rdi, [cur_conn]
+    mov rsi, [s_sid]
+    call req_final_mark
+.fs_marked:
     mov rdi, [s_sid]
     call linnea_quic_dbg_serve
     ; zero the request struct and point the QPACK scratch at h3scratch
@@ -7914,6 +7969,61 @@ req_served_mark:
     xor eax, eax
 .rsm_wrapped:
     mov [rdi + linnea_quic_conn.req_served_cursor], rax
+    ret
+
+; req_final_mark(rdi = conn, rsi = stream id, rdx = the stream's final size) —
+; remember what size a COMPLETED stream declared, so a frame arriving afterwards
+; can be checked against it (RFC 9000 4.5, audit-report-77). A ring: the oldest
+; entry is forgotten, and a frame on a stream that has aged out is treated as it
+; was before -- acked, not an error. Called once per stream, at dispatch.
+req_final_mark:
+    mov rax, [rdi + linnea_quic_conn.fin_cursor]
+    lea rcx, [rsi + 1]                        ; stored as id + 1, so 0 means empty
+    mov [rdi + linnea_quic_conn.fin_sid + rax * 8], rcx
+    mov [rdi + linnea_quic_conn.fin_size + rax * 8], rdx
+    inc rax
+    cmp rax, LINNEA_QUIC_FINAL_SEEN
+    jb .rfm_wrapped
+    xor eax, eax
+.rfm_wrapped:
+    mov [rdi + linnea_quic_conn.fin_cursor], rax
+    ret
+
+; req_final_check(rdi = conn, rsi = stream id, rdx = frame offset, rcx = frame
+; length, r8 = its FIN bit) -> eax: 0 = this stream's final size is not
+; remembered (nothing to say), 1 = remembered and this frame agrees with it,
+; 2 = it CONTRADICTS it and the connection must close FINAL_SIZE_ERROR.
+;
+; RFC 9000 4.5: a final size is fixed once learned. Data at or beyond it, or a
+; second FIN naming a different one, is the error. A frame that merely repeats
+; bytes at or below the final size is a legal retransmission of a stream whose
+; ack was lost -- verdict 1, and the caller acks it exactly as it always did.
+req_final_check:
+    xor r9d, r9d
+    lea r10, [rsi + 1]
+.rfc_scan:
+    cmp [rdi + linnea_quic_conn.fin_sid + r9 * 8], r10
+    je .rfc_found
+    inc r9d
+    cmp r9d, LINNEA_QUIC_FINAL_SEEN
+    jb .rfc_scan
+    xor eax, eax                              ; aged out, or never completed
+    ret
+.rfc_found:
+    mov r11, [rdi + linnea_quic_conn.fin_size + r9 * 8]
+    add rdx, rcx                              ; the offset one past this frame
+    jc .rfc_bad                               ; an offset that wraps 2^64 is no offset
+    cmp rdx, r11
+    ja .rfc_bad                               ; bytes past the final size
+    test r8, r8
+    jz .rfc_ok                                ; no FIN: a partial retransmission
+    cmp rdx, r11
+    jne .rfc_bad                              ; a second FIN naming a different size
+.rfc_ok:
+    mov eax, 1
+    ret
+.rfc_bad:
+    mov eax, 2
     ret
 
 ; reset_teardown(rdi=conn, rsi=stream id) — the peer cancelled this stream
