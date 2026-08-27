@@ -2193,13 +2193,13 @@ linnea_quic_tp_parse:
 ; comes from RFC 7230, so it is SP *or HTAB*. A tab beside a comma is ordinary
 ; legal whitespace and must not cost the member beside it.
 ;
-; This is a two-key scanner, not a general Structured Fields parser: an unknown
-; member's VALUE is skipped rather than validated, so a syntax error inside one
-; ("zz=?9") is not detected; a PARAMETER's key is checked but its value is
-; likewise skipped rather than typed (";q=@"); and a comma or semicolon inside a
-; quoted string is read as a delimiter. None of them can change scheduling,
-; which is what the failure rule above exists to protect, and priority is
-; advisory (9218 2).
+; This is a two-key scanner rather than a general Structured Fields parser, and
+; one construct is left unvalidated: an unknown member whose value is an INNER
+; LIST is skipped to the next comma, because each of its items carries its own
+; parameters and validating that needs a nested walk nothing here would use. It
+; is skipped rather than refused, so a legal inner list still costs nothing.
+; Everything else -- both keys, every member, every parameter and every
+; bare-item -- is parsed, and a value that does not parse is ignored whole.
 linnea_quic_parse_priority:
     mov r8d, 3                       ; default urgency
     xor r9d, r9d                     ; default incremental = false
@@ -2229,19 +2229,19 @@ linnea_quic_parse_priority:
     cmp al, 'a'
     jb .pp_key_star
     cmp al, 'z'
-    jbe .pp_adv                      ; some other key: skip the whole member
+    jbe .pp_unk                      ; some other key: check it, then ignore it
     jmp .pp_fail
 .pp_key_star:
     cmp al, '*'
-    je .pp_adv
+    je .pp_unk
     jmp .pp_fail
 .pp_u:
     ; "u" must be the whole key: "urgent=1" is a different, unknown member
     lea rcx, [rdi + 1]
     cmp rcx, r10
-    jae .pp_adv                      ; a bare "u" is not a boolean key: unknown
+    jae .pp_unk                      ; a bare "u" is not a boolean key: unknown
     cmp byte [rdi + 1], '='
-    jne .pp_adv                      ; a longer key that merely starts with u
+    jne .pp_unk                      ; a longer key that merely starts with u
     lea rcx, [rdi + 3]               ; need "u=" then a digit: 3 bytes
     cmp rcx, r10
     ja .pp_fail                      ; "u=" with nothing after it: not a value
@@ -2324,7 +2324,7 @@ linnea_quic_parse_priority:
     je .pp_i_true                    ; "i<TAB>," : OWS is SP or HTAB
     cmp dl, ';'
     je .pp_i_true                    ; "i;q=1": bare, with an 8941 parameter
-    jmp .pp_adv                      ; a longer key that merely starts with i
+    jmp .pp_unk                      ; a longer key that merely starts with i
 .pp_i_true:
     mov r9d, 1
     inc rdi                          ; past the key, to whatever follows it
@@ -2382,6 +2382,60 @@ linnea_quic_parse_priority:
 .pp_av_ows:
     inc rdi
     jmp .pp_after_value
+.pp_unk:
+    ; An UNKNOWN member. 9218 4 says to ignore it, and 8941 4.2 says the value
+    ; it sits in must still PARSE -- two different rules, and skipping to the
+    ; next comma honoured only the first, so `u=7,unknown="unterminated` kept
+    ; its urgency (audit-report-86 Finding 2). Check the member's shape, then
+    ; ignore what it means: key [ "=" member-value ] parameters.
+    movzx eax, byte [rdi]
+    cmp al, '*'
+    je .pp_unk_more
+    cmp al, 'a'
+    jb .pp_fail
+    cmp al, 'z'
+    ja .pp_fail
+.pp_unk_more:
+    inc rdi
+    cmp rdi, r10
+    jae .pp_done                     ; a bare member ending the value
+    movzx eax, byte [rdi]
+    cmp al, 'a'
+    jb .pp_unk_notlc
+    cmp al, 'z'
+    jbe .pp_unk_more
+.pp_unk_notlc:
+    cmp al, '0'
+    jb .pp_unk_punct
+    cmp al, '9'
+    jbe .pp_unk_more
+.pp_unk_punct:
+    cmp al, '_'
+    je .pp_unk_more
+    cmp al, '-'
+    je .pp_unk_more
+    cmp al, '.'
+    je .pp_unk_more
+    cmp al, '*'
+    je .pp_unk_more
+    cmp al, '='
+    je .pp_unk_val
+    jmp .pp_after_value              ; a bare member: parameters, comma, or end
+.pp_unk_val:
+    inc rdi                          ; past the "="
+    cmp rdi, r10
+    jae .pp_fail                     ; "zz=" with no value behind it
+    cmp byte [rdi], '('
+    je .pp_adv                       ; an INNER LIST. Its items each carry their
+                                     ; own parameters, so validating one needs a
+                                     ; nested walk this two-key scanner has no
+                                     ; use for. Skipped as before rather than
+                                     ; refused: a legal inner list must not
+                                     ; become a parse failure, and no priority
+                                     ; value has ever carried one.
+    jmp .pp_bare_item                ; anything else is a bare-item, and there
+                                     ; is already a parser for those
+
 .pp_params:
     ; RFC 8941: parameters = *( ";" *SP parameter ), parameter = param-key
     ; [ "=" param-value ], param-key = key. A ";" used to end the member and
@@ -2450,6 +2504,7 @@ linnea_quic_parse_priority:
     inc rdi                          ; past the "="
     cmp rdi, r10
     jae .pp_fail                     ; "q=" with no bare-item after it
+.pp_bare_item:
     movzx eax, byte [rdi]
     cmp al, '"'
     je .pp_b_str

@@ -224,6 +224,33 @@ prio_bbin:  db "u=5;q=:aGVsbG8=:"              ; a byte sequence
 prio_bbin_len equ $ - prio_bbin
 prio_bbin0: db "u=5;q=::"                      ; ...which may be empty
 prio_bbin0_len equ $ - prio_bbin0
+; audit-reports 85/86: a repeated key is LEGAL -- 8941 4.2.3.2 step 7 overwrites
+; it, exactly as 4.2.2 does for a repeated dictionary member. These are controls
+; against a "fix" that would refuse them.
+prio_dpar:  db "u=7;foo=1;foo=2"
+prio_dpar_len equ $ - prio_dpar
+prio_dpar2: db "u=7;foo=1;bar=2;foo=3"
+prio_dpar2_len equ $ - prio_dpar2
+; ...and an unknown MEMBER still has to parse, even though its meaning is
+; ignored (audit-report-86 Finding 2).
+prio_umbad: db "u=7,unknown=", 34, "unterminated"
+prio_umbad_len equ $ - prio_umbad
+prio_um1a:  db "u=7,zz=1a"           ; not a bare-item
+prio_um1a_len equ $ - prio_um1a
+prio_umno:  db "u=7,zz="             ; "=" with no value
+prio_umno_len equ $ - prio_umno
+prio_umb2:  db "u=7,zz=?2"           ; not a boolean
+prio_umb2_len equ $ - prio_umb2
+prio_umbare: db "u=7,zz"             ; ...and the legal shapes
+prio_umbare_len equ $ - prio_umbare
+prio_umpar: db "u=7,zz;a=1"          ; a bare member with parameters
+prio_umpar_len equ $ - prio_umpar
+prio_umstr: db "u=7,zz=", 34, "a,b", 34   ; a string holding a comma
+prio_umstr_len equ $ - prio_umstr
+prio_umlist: db "u=7,zz=(1 2);p=3"   ; an inner list: skipped, never refused
+prio_umlist_len equ $ - prio_umlist
+prio_umi:   db "u=7,zz=?1,i"         ; ...and the member after it still applies
+prio_umi_len equ $ - prio_umi
 
 ; --- frame-length table fixtures (RFC 9000 19) ---
 fk_pad:     db 0x00
@@ -975,6 +1002,69 @@ _start:
     call linnea_quic_parse_priority     ; an empty byte sequence
     EXPECT rax, 5
     EXPECT rdx, 0
+
+    ; audit-reports 85 and 86 Finding 1 say a repeated parameter key is
+    ; malformed. It is not: 8941 4.2.3.2 step 7 says "If parameters already
+    ; contains a key param_key ... overwrite its value". These two rows are
+    ; controls against implementing that finding.
+    lea rdi, [prio_dpar]
+    mov esi, prio_dpar_len
+    call linnea_quic_parse_priority     ; a repeated parameter key: legal
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_dpar2]
+    mov esi, prio_dpar2_len
+    call linnea_quic_parse_priority     ; ...with another key between them
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    ; audit-report-86 Finding 2: an unknown member is IGNORED (9218 4) but the
+    ; value it sits in must still PARSE (8941 4.2). Two rules, not one.
+    lea rdi, [prio_umbad]
+    mov esi, prio_umbad_len
+    call linnea_quic_parse_priority     ; an unterminated string in an unknown member
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_um1a]
+    mov esi, prio_um1a_len
+    call linnea_quic_parse_priority     ; "1a" is not a bare-item
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_umno]
+    mov esi, prio_umno_len
+    call linnea_quic_parse_priority     ; "zz=" has no value
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    lea rdi, [prio_umb2]
+    mov esi, prio_umb2_len
+    call linnea_quic_parse_priority     ; "?2" is not a boolean
+    EXPECT rax, 3
+    EXPECT rdx, 0
+    ; ...and the legal unknown members, which must still cost nothing
+    lea rdi, [prio_umbare]
+    mov esi, prio_umbare_len
+    call linnea_quic_parse_priority     ; a bare unknown member
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_umpar]
+    mov esi, prio_umpar_len
+    call linnea_quic_parse_priority     ; a bare unknown member with parameters
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_umstr]
+    mov esi, prio_umstr_len
+    call linnea_quic_parse_priority     ; a string holding a comma
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_umlist]
+    mov esi, prio_umlist_len
+    call linnea_quic_parse_priority     ; an inner list: skipped, not refused
+    EXPECT rax, 7
+    EXPECT rdx, 0
+    lea rdi, [prio_umi]
+    mov esi, prio_umi_len
+    call linnea_quic_parse_priority     ; a member after an unknown one still applies
+    EXPECT rax, 7
+    EXPECT rdx, 1
 
     ; --- reset_scan captures a PATH_CHALLENGE bundled behind other frames, so the
     ; receive path can echo it in a PATH_RESPONSE (RFC 9000 8.2) ---
