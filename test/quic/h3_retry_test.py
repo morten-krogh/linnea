@@ -118,7 +118,44 @@ if retries is not None:
         "the client completed without a Retry: address validation never engaged "
         "under a flood that should have tripped it")
 
+# ...and the Retry's SOURCE CONNECTION ID must be freshly minted each time.
+# The check above proves a Retry happened; it says nothing about what is IN it.
+# linnea builds that id as worker || 0xff || six random bytes, and the six used
+# to come from an unchecked getrandom into a worker-global buffer: on failure it
+# reissued the PREVIOUS Retry's tail, or zeros on the first one (audit-report-98).
+# RFC 9000 17.2.5.1 requires the id to differ from the Initial's destination id,
+# which a repeating tail makes selectable by anyone who has seen it.
+def retry_scid():
+    """Send one raw Initial into the still-full pool; return the Retry's SCID."""
+    q = client()                                  # the file's own helper
+    q.connect((HOST, port), now=0.0)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((HOST, 0))
+    s.settimeout(3)
+    try:
+        for data, _ in q.datagrams_to_send(now=0.0):
+            s.sendto(data, (HOST, port))
+        try:
+            r, _ = s.recvfrom(2048)
+        except socket.timeout:
+            return None
+        if not (r[0] & 0x80) or ((r[0] >> 4) & 0x03) != 3:   # long header, Retry
+            return None
+        i = 6 + r[5]                                          # past the DCID
+        return r[i + 1:i + 1 + r[i]]
+    finally:
+        s.close()
+
+
+tails = [t[2:] for t in (retry_scid() for _ in range(4)) if t is not None]
+assert len(tails) == 4, f"expected four Retries, got {len(tails)}"
+assert all(any(b for b in t) for t in tails), \
+    f"a Retry source id had an all-zero random tail: {[t.hex() for t in tails]}"
+assert len(set(tails)) == len(tails), \
+    f"Retry source ids repeated: {[t.hex() for t in tails]}"
+
 for s in socks:
     s.close()
 sock.close()
-print(f"ok (served through a {FLOOD}-Initial flood; retries seen: {retries})")
+print(f"ok (served through a {FLOOD}-Initial flood; retries seen: {retries}; "
+      f"{len(set(tails))} distinct Retry source ids)")

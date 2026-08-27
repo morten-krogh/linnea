@@ -201,6 +201,7 @@ extern linnea_quic_reset_scan
 extern linnea_quic_path_seen
 extern linnea_quic_path_data
 extern linnea_quic_reset_token
+extern linnea_random_bytes
 extern linnea_worker_index
 extern linnea_network_addr_format
 extern linnea_log_acc_host
@@ -6100,6 +6101,9 @@ linnea_quic_server_datagram:
     mov eax, LINNEA_QUIC_TICKET_LIFETIME   ; advertised == enforced (tls-7)
     bswap eax
     mov [q_nst_msg + 4], eax         ; ticket_lifetime, big-endian
+    ; Deliberately unchecked, and reachable only when entropy works: the seal
+    ; above returns 0 on failure and this path returns before here. age_add is
+    ; anti-correlation padding, not key material (audit-report-98 sweep).
     lea rdi, [q_nst_msg + 8]         ; ticket_age_add: 4 random bytes
     mov esi, 4
     xor edx, edx
@@ -6537,12 +6541,11 @@ send_stateless_reset:
     mov eax, LINNEA_QUIC_SRST_MAX
 .ssr_len:
     mov [srst_len], rax
-    mov r10, rax                     ; getrandom clobbers rax
-    mov eax, LINNEA_SYS_GETRANDOM
     lea rdi, [srst_buf]
-    mov rsi, r10
-    xor edx, edx
-    syscall                          ; random-fill the whole packet
+    mov rsi, rax
+    call linnea_random_bytes         ; random-fill the whole packet -- CHECKED:
+    test eax, eax                    ; the result used to be discarded
+    js .ssr_no_entropy
     mov cl, [srst_buf]               ; first byte -> short-header form: fixed bit set,
     and cl, 0x3f                     ; long-header bit clear, rest random
     or cl, 0x40
@@ -6559,6 +6562,13 @@ send_stateless_reset:
     lea r8, [sa]
     mov r9, [salen]
     syscall
+    ret
+.ssr_no_entropy:
+    ; Send NOTHING. RFC 9000 10.3 wants a reset indistinguishable from an
+    ; ordinary protected short-header packet; an unfilled srst_buf sends 0x40
+    ; then zeros on first use, or the previous reset's bytes after that -- a
+    ; recognisable fingerprint arriving exactly when the entropy source is
+    ; failing, which is the worst moment to advertise it (audit-report-98).
     ret
 
 ; --- Connection-ID lifecycle (Finding 21, RFC 9000 5.1) ----------------------
@@ -7124,8 +7134,10 @@ send_retry:
     push rdi
     lea rdi, [rdi + 2]
     mov esi, 6
-    call getrandom_bytes
-    pop rdi
+    call linnea_random_bytes          ; CHECKED: a Retry id that was not freshly
+    pop rdi                           ; minted must not go on the wire
+    test eax, eax
+    js .rt_no_entropy
     mov r14, rdi                      ; keep our new id for the token binding
     add rdi, LINNEA_QUIC_SCID_LEN
     ; --- token ---
@@ -7201,26 +7213,16 @@ send_retry:
     pop r12
     pop rbx
     ret
-
-; getrandom_bytes(rdi = destination, esi = count) — fill from getrandom(2),
-; retrying a short read. Used for the ids a Retry hands out.
-getrandom_bytes:
-    push rbx
-    push r12
-    mov rbx, rdi
-    mov r12d, esi
-.gr_more:
-    mov eax, LINNEA_SYS_GETRANDOM
-    mov rdi, rbx
-    mov esi, r12d
-    xor edx, edx
-    syscall
-    test rax, rax
-    jle .gr_ret                       ; a failing getrandom is fatal for secrecy,
-    add rbx, rax                      ; but the caller's ids are still unguessable
-    sub r12d, eax                     ; enough: retry what is left
-    jnz .gr_more
-.gr_ret:
+.rt_no_entropy:
+    ; Send NOTHING. A Retry whose source id was not freshly minted is worse than
+    ; no Retry: RFC 9000 17.2.5.1 requires that id to DIFFER from the Initial's
+    ; destination id, and a stale tail makes that collision selectable by any
+    ; peer that has seen the value -- a strict client then discards the Retry.
+    ; Dropping the Initial is safe; QUIC clients retransmit unanswered Initials.
+    ; The `push rdi` above was already popped, so only the five remain.
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
