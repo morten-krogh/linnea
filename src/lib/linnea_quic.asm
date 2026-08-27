@@ -1976,9 +1976,9 @@ linnea_quic_tp_parse:
     push r15
     push rbp
     ; [rsp] the seen-id bitmap for ids below 64, [rsp+8] how many higher ids are
-    ; recorded, [rsp+16...] the ids themselves. 280 keeps rsp 16-aligned for the
-    ; varint calls below, as the 8 it replaces did.
-    sub rsp, 280
+    ; recorded; the ids themselves live in tp_hi_ids, which is too large for a
+    ; frame. 24 keeps rsp 16-aligned for the varint calls below.
+    sub rsp, 24
     mov rbx, rdi                     ; cursor
     lea r12, [rdi + rsi]             ; end
     xor r13d, r13d                   ; initial_max_data
@@ -2028,27 +2028,28 @@ linnea_quic_tp_parse:
 .tp_dup_hi:
     ; Extension and GREASE ids. No bitmap can span a 62-bit space, but the ids a
     ; peer actually SENDS are another matter: the ClientHello is bounded, so the
-    ; parameters in it are, and remembering the first LINNEA_QUIC_TP_HI distinct
-    ; ones catches every duplicate a real peer can produce (audit-report-88 --
-    ; "not tracked (unbounded)" was true of the space, never of the traffic).
+    ; parameters in it are (audit-report-88 -- "not tracked (unbounded)" was true
+    ; of the space, never of the traffic).
     ;
-    ; Past that the checking stops rather than the connection. The table is
-    ; bounded because this runs before the handshake completes, and a peer with
-    ; 33 distinct extension parameters gains nothing by a duplicate: an unknown
-    ; parameter is ignored either way, so nothing it could contradict is stored.
+    ; The table is sized so it cannot fill for anything a ClientHello can hold,
+    ; which is what makes this exact rather than best-effort: a table with a
+    ; smaller cap is one a peer steps around by spending distinct ids first
+    ; (audit-report-89). Saturation therefore means the caller handed us more
+    ; than a ClientHello could carry, and that is refused rather than waved
+    ; through -- it is not input this parser is defined over.
     mov rcx, [rsp + 8]
     xor edx, edx
 .tp_hi_scan:
     cmp rdx, rcx
     jae .tp_hi_add
-    cmp [rsp + 16 + rdx * 8], r15
+    cmp [tp_hi_ids + rdx * 8], r15
     je .tp_bad                        ; a repeated extension parameter
     inc rdx
     jmp .tp_hi_scan
 .tp_hi_add:
     cmp rcx, LINNEA_QUIC_TP_HI
-    jae .tp_after_dup                 ; full: remember no more
-    mov [rsp + 16 + rcx * 8], r15
+    jae .tp_bad                       ; more high ids than a ClientHello can hold
+    mov [tp_hi_ids + rcx * 8], r15
     inc rcx
     mov [rsp + 8], rcx
 .tp_after_dup:
@@ -2191,7 +2192,7 @@ linnea_quic_tp_parse:
     mov rax, r13
     mov rdx, r14
     mov r8, r9                       ; initial_max_streams_uni
-    add rsp, 280
+    add rsp, 24
     pop rbp
     pop r15
     pop r14
@@ -4536,6 +4537,11 @@ linnea_quic_tp_iscid_len: resq 1   ; its length, or -1 when the peer sent none â
                                    ; RFC 9000 7.3 makes absence itself an error
 linnea_quic_tp_max_udp: resq 1     ; peer's max_udp_payload_size (default 65527)
 linnea_quic_tp_cid_lim: resq 1     ; peer's active_connection_id_limit (default 2)
+; The extension/GREASE ids seen in the ClientHello being parsed. Static like
+; every other transport-parameter output beside it: one ClientHello is parsed at
+; a time per worker, and the count that indexes this lives on the parser's frame
+; so nothing survives a call.
+tp_hi_ids:              resq LINNEA_QUIC_TP_HI
 linnea_quic_tp_error:   resq 1     ; 1 when a parameter carried a value RFC 9000
                                    ; 18.2 declares invalid, which 7.4 makes a
                                    ; connection error of type

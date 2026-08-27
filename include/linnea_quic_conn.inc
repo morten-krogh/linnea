@@ -421,9 +421,15 @@ LINNEA_QUIC_MS_INIT     equ 100     ; initial_max_streams_bidi we advertise
 ; this constant, so the granted limit and the enforced one cannot drift apart.
 ; Extension and GREASE transport-parameter ids (>= 64) remembered per
 ; ClientHello, so a repeat can be spotted (RFC 9000 7.4). The standardised ids
-; below 64 use a bitmap; this space is 62 bits wide and cannot. A conforming
-; peer sends one or two, and the ClientHello is bounded, so this is generous.
-LINNEA_QUIC_TP_HI       equ 32
+; below 64 use a bitmap; this space is 62 bits wide and cannot.
+;
+; Sized so it CANNOT fill for any input a ClientHello can hold, rather than to a
+; round number: an id at or above 64 needs a two-byte varint and its length
+; needs one more, so three bytes is the cheapest such parameter and a bounded
+; ClientHello holds at most CH_BUF/3 of them (audit-report-89 -- a table that
+; can fill is a table a peer can step around). It follows the buffer, so raising
+; one raises the other.
+LINNEA_QUIC_TP_HI       equ (LINNEA_QUIC_CH_BUF / 3) + 1
 LINNEA_QUIC_MSU_INIT    equ 100
 LINNEA_QUIC_MS_WINDOW   equ 128     ; streams granted ahead of the peer's highest
 LINNEA_QUIC_MS_THRESH   equ 64      ; regrant when the peer is within this of the limit
