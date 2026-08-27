@@ -57,6 +57,7 @@ global linnea_upstream_pool_close
 global linnea_upstream_pick
 global linnea_upstream_addr
 global linnea_upstream_addrlen
+global linnea_upstream_socket
 global linnea_upstream_mark_ok
 global linnea_upstream_mark_fail
 global linnea_upstream_log_oversize
@@ -142,6 +143,26 @@ linnea_upstream_addr:
 ; the one actually in it.
 linnea_upstream_addrlen:
     mov rax, [rdi + linnea_config_location.proxy_addrlen + rsi * 8]
+    ret
+
+; linnea_upstream_socket(rdi = location, rsi = backend index) -> rax = fd, or
+; -errno from socket(2). Test it the way every caller does: cmp rax, -4095/jae.
+;
+; One place opens every upstream socket. The family is a property of the BACKEND
+; being dialled rather than a constant, and seven copies of that decision would
+; be six chances to miss one -- the shape that made report 54 a report. The
+; family is read back out of the sockaddr the parser prebuilt, so exactly one
+; place decides what family a backend is, and it is the place that built it.
+;
+; Callers must have CHOSEN the backend first: which family to open is not
+; knowable before which backend it is being opened to.
+linnea_upstream_socket:
+    call linnea_upstream_addr          ; rdi/rsi are its arguments; clobbers rax
+    movzx edi, word [rax]              ; sa_family, exactly as the parser wrote it
+    mov esi, LINNEA_SOCK_STREAM
+    xor edx, edx
+    mov eax, LINNEA_SYS_SOCKET
+    syscall
     ret
 
 ; linnea_upstream_pick(rdi = location) -> rax = backend index

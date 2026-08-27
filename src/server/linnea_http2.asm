@@ -101,6 +101,7 @@ global linnea_h2_busy
 extern linnea_spill_open_fd
 extern linnea_upstream_count
 extern linnea_upstream_open
+extern linnea_upstream_socket
 extern linnea_ratelimit_take
 extern linnea_ratelimit_on
 extern linnea_uring_now
@@ -3403,13 +3404,11 @@ h2p_open_upstream:
     jnz .ou_ceiling                    ; freed one: re-check the ceiling
     jmp .ou_busy                       ; genuinely at capacity with live requests
 .ou_room:
-    mov edi, LINNEA_AF_INET
-    mov esi, LINNEA_SOCK_STREAM
-    xor edx, edx
-    mov eax, LINNEA_SYS_SOCKET
-    syscall
-    test eax, eax
-    js .ou_nosock
+    mov rdi, [rbx + linnea_h2p.location]
+    mov rsi, [rbx + linnea_h2p.backend]
+    call linnea_upstream_socket
+    cmp rax, -4095
+    jae .ou_nosock
     mov [rbx + linnea_h2p.fd], eax
     call linnea_upstream_open
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_CONNECTING
@@ -3443,18 +3442,17 @@ h2p_reconnect:
     call linnea_upstream_closed
     mov dword [rbx + linnea_h2p.fd], -1
 .rc_nofd:
-    mov edi, LINNEA_AF_INET
-    mov esi, LINNEA_SOCK_STREAM
-    xor edx, edx
-    mov eax, LINNEA_SYS_SOCKET
-    syscall
-    test eax, eax
-    js .rc_fail
-    mov [rbx + linnea_h2p.fd], eax
-    call linnea_upstream_open
+    ; the backend BEFORE the socket, as in linnea_uring_up_reconnect
     mov rdi, [rbx + linnea_h2p.location]
     call linnea_upstream_pick
     mov [rbx + linnea_h2p.backend], rax
+    mov rdi, [rbx + linnea_h2p.location]
+    mov rsi, rax
+    call linnea_upstream_socket
+    cmp rax, -4095
+    jae .rc_fail
+    mov [rbx + linnea_h2p.fd], eax
+    call linnea_upstream_open
     inc qword [rbx + linnea_h2p.tries]
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_CONNECTING
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_CONN
@@ -3485,13 +3483,11 @@ h2p_retry_pooled:
     call linnea_upstream_closed
     mov dword [rbx + linnea_h2p.fd], -1
 .rt_nofd:
-    mov edi, LINNEA_AF_INET
-    mov esi, LINNEA_SOCK_STREAM
-    xor edx, edx
-    mov eax, LINNEA_SYS_SOCKET
-    syscall
-    test eax, eax
-    js .rt_fail
+    mov rdi, [rbx + linnea_h2p.location]
+    mov rsi, [rbx + linnea_h2p.backend]     ; the SAME backend
+    call linnea_upstream_socket
+    cmp rax, -4095
+    jae .rt_fail
     mov [rbx + linnea_h2p.fd], eax
     call linnea_upstream_open
     mov qword [rbx + linnea_h2p.pooled], 0     ; a fresh leg now: no second retry

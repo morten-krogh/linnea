@@ -69,6 +69,7 @@ extern linnea_upstream_park
 extern linnea_upstream_closed
 extern linnea_upstream_addr
 extern linnea_upstream_addrlen
+extern linnea_upstream_socket
 extern linnea_upstream_pick
 extern linnea_upstream_mark_ok
 extern linnea_upstream_mark_fail
@@ -4157,18 +4158,19 @@ linnea_uring_up_reconnect:
     call linnea_upstream_closed
     mov dword [rbx + linnea_connection.up_fd], -1
 .no_old:
-    mov eax, LINNEA_SYS_SOCKET
-    mov edi, LINNEA_AF_INET
-    mov esi, LINNEA_SOCK_STREAM
-    xor edx, edx
-    syscall
+    ; The backend is chosen BEFORE the socket: which family to open is not
+    ; knowable before which backend it is being opened to. It used to be picked
+    ; just after, which was fine only while every backend was AF_INET.
+    mov rdi, [rbx + linnea_connection.location]
+    call linnea_upstream_pick
+    mov [rbx + linnea_connection.up_backend], rax
+    mov rdi, [rbx + linnea_connection.location]
+    mov rsi, rax
+    call linnea_upstream_socket
     cmp rax, -4095
     jae .no_socket
     mov [rbx + linnea_connection.up_fd], eax
     call linnea_upstream_open
-    mov rdi, [rbx + linnea_connection.location]
-    call linnea_upstream_pick
-    mov [rbx + linnea_connection.up_backend], rax
     inc qword [rbx + linnea_connection.up_tries]
     mov rdi, rbx
     call linnea_uring_arm_connect
@@ -4205,11 +4207,9 @@ linnea_uring_up_retry_pooled:
     call linnea_upstream_closed
     mov dword [rbx + linnea_connection.up_fd], -1
 .rp_no_old:
-    mov eax, LINNEA_SYS_SOCKET
-    mov edi, LINNEA_AF_INET
-    mov esi, LINNEA_SOCK_STREAM
-    xor edx, edx
-    syscall
+    mov rdi, [rbx + linnea_connection.location]
+    mov rsi, [rbx + linnea_connection.up_backend]   ; the SAME backend
+    call linnea_upstream_socket
     cmp rax, -4095
     jae .rp_no_socket
     mov [rbx + linnea_connection.up_fd], eax

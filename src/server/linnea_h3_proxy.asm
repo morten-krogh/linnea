@@ -49,6 +49,7 @@ extern linnea_connection_at
 extern linnea_connection_alloc
 extern linnea_connection_free
 extern linnea_upstream_open
+extern linnea_upstream_socket
 extern linnea_upstream_closed
 extern linnea_upstream_method_safe
 extern linnea_upstream_mark_ok
@@ -537,11 +538,9 @@ linnea_h3_proxy_start:
     jnz .st_fresh                      ; freed one: re-check the ceiling
     jmp .st_busy                       ; genuinely at capacity: a leg is live, give it back
 .st_room:
-    mov eax, LINNEA_SYS_SOCKET
-    mov edi, LINNEA_AF_INET
-    mov esi, LINNEA_SOCK_STREAM
-    xor edx, edx
-    syscall
+    mov rdi, [r12 + linnea_connection.location]
+    mov rsi, [r12 + linnea_connection.up_backend]
+    call linnea_upstream_socket
     cmp rax, -4095
     jae .st_nosock
     mov [r12 + linnea_connection.up_fd], eax

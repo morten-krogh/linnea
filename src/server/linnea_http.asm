@@ -135,6 +135,7 @@ extern linnea_log_access_begin
 
 extern linnea_upstream_count
 extern linnea_upstream_open
+extern linnea_upstream_socket
 extern linnea_ratelimit_take
 extern linnea_ratelimit_on
 extern linnea_uring_now
@@ -3221,11 +3222,9 @@ linnea_http_handle:
     jnz .up_fresh                      ; freed one: re-check the ceiling
     jmp .resp_503                      ; genuinely at capacity with live requests
 .up_fresh_room:
-    mov eax, LINNEA_SYS_SOCKET
-    mov edi, LINNEA_AF_INET
-    mov esi, LINNEA_SOCK_STREAM
-    xor edx, edx
-    syscall
+    mov rdi, [rbx + linnea_connection.location]
+    mov rsi, [rbx + linnea_connection.up_backend]
+    call linnea_upstream_socket
     cmp rax, -4095
     jae .resp_502
     mov [rbx + linnea_connection.up_fd], eax
