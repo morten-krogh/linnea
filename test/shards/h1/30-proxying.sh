@@ -39,6 +39,17 @@ fi
 timeout 60 python3 test/tls/proxy_via.py ${P61080} >/dev/null 2>&1
 check "proxy adds Via to the request and the response" $?
 
+# RFC 9112 6: Content-Length is framing, so a proxy synthesizes one only when it
+# owes one -- after decoding a chunked body whose Transfer-Encoding it removed.
+# That state shared a bit with "the client spoke HTTP/1.0" (audit-report-128), so
+# every proxied 1.0 request was rewritten as though it had been de-chunked: a
+# counted POST reached the backend with its own Content-Length and a second,
+# identical copy, and a bodyless request gained "Content-Length: 0". The chunked
+# rows are the control that a blanket "never append" cannot pass -- it delivers a
+# de-chunked body with no length at all, and the backend sees none of it.
+timeout 60 python3 test/tls/h1_proxy_content_length.py ${P61080} >/dev/null 2>&1
+check "proxy synthesizes Content-Length only for a de-chunked body" $?
+
 # RFC 9112 3.2.2 MUST: with an absolute-form target, a proxy ignores the received
 # Host and replaces it with the target's authority. The parser already ROUTED on
 # the target -- that half was right -- but the rewrite copied the client's Host

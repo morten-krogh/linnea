@@ -667,7 +667,12 @@ section .text
 ;   [rsp+64] name len       [rsp+72] value ptr    [rsp+80] value len
 ;   [rsp+88] Host value ptr (0 = absent)          [rsp+96] Host value len
 ;   [rsp+104] method len    [rsp+112] status      [rsp+120] server* (for log)
-;   [rsp+128] Content-Length value                [rsp+136] flags: 1=CL, 2=TE
+;   [rsp+128] Content-Length value                [rsp+136] flags: 1=CL, 2=TE,
+;             4=TE names chunked, 8=the client spoke HTTP/1.0, 16=Connection
+;             said close, 32=chunked listed twice, 64=Max-Forwards present,
+;             128=a chunked body was decoded, so the proxy rewrite owes the
+;             backend a synthesized Content-Length (128 and 8 were one bit,
+;             audit-report-128)
 ;   [rsp+144] raw target len, query included (the target len at [rsp+16]
 ;             is truncated at '?' for routing)  [rsp+152] location*
 ;   [rsp+160] best prefix len (location match scratch)
@@ -1872,7 +1877,7 @@ linnea_http_handle:
     sub [rbx + linnea_connection.in_len], rcx
     mov [rsp + 128], rax             ; the decoded length IS the Content-Length
     and qword [rsp + 136], ~4        ; and it is an ordinary body from here on
-    or qword [rsp + 136], 8          ; ...but the proxy still owes it a length
+    or qword [rsp + 136], 128        ; ...but the proxy still owes it a length
     jmp .not_chunked                 ; the two capture arms below are not ours
 .chunked_capture:
     ; The buffer is full and the body is not finished, so it never will fit:
@@ -1892,7 +1897,7 @@ linnea_http_handle:
     ; same shape a chunked body small enough to buffer has always been given.
     mov qword [rsp + 128], 0
     and qword [rsp + 136], ~4
-    or qword [rsp + 136], 8          ; and the proxy owes it a length
+    or qword [rsp + 136], 128        ; and the proxy owes it a length
     mov rax, [rbx + linnea_connection.in_len]
     jmp .body_ready
 .not_chunked:
@@ -3179,7 +3184,17 @@ linnea_http_handle:
     ; A body that arrived chunked has been decoded, and its Transfer-Encoding
     ; was dropped above — so the backend needs a length, and the client sent no
     ; Content-Length header for the copy loop to forward.
-    test qword [rsp + 136], 8
+    ;
+    ; Bit 128, NOT bit 8. This asked bit 8, which the version branch sets for
+    ; every HTTP/1.0 request (audit-report-128): a 1.0 POST that already
+    ; carried a Content-Length had the copy loop forward it and then had a
+    ; SECOND, identical one appended, and a 1.0 request with no body at all was
+    ; given an unsolicited "Content-Length: 0". Duplicate framing fields are
+    ; exactly what an intermediary must not manufacture (RFC 9112 6), and a
+    ; strict backend answers the pair with 400. The two states are unrelated —
+    ; one is the client's version, the other is a debt this rewrite owes — so
+    ; they get a bit each.
+    test qword [rsp + 136], 128
     jz .proxy_no_clen
     lea rdi, [hdr_cl_up]
     mov esi, hdr_cl_up_len
