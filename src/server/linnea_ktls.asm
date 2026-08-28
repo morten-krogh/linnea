@@ -85,6 +85,8 @@ msg_no_entropy: db "cannot seed the session-ticket keys: getrandom failed", 10
 msg_no_entropy_len equ $ - msg_no_entropy
 msg_bad_cert: db "cannot load TLS certificate chain (not PEM CERTIFICATEs?)"
 msg_bad_cert_len equ $ - msg_bad_cert
+msg_crit_ext: db "the certificate chain carries a CRITICAL X.509 extension this build does not implement: RFC 5280 4.2 requires clients to reject it, so serving it would fail every handshake"
+msg_crit_ext_len equ $ - msg_crit_ext
 msg_bad_key:  db "cannot load TLS key (not a PKCS#8 P-256 key in [1, n-1]?)"
 msg_bad_key_len equ $ - msg_bad_key
 msg_cert_big: db "TLS certificate chain too large to fit the handshake flight"
@@ -295,6 +297,8 @@ linnea_tls_setup:
     mov rdx, [r13 + linnea_config_server.cert_list]
     mov ecx, MAX_CERT_LIST
     call linnea_pem_cert_list
+    cmp rax, -3
+    je .bad_crit_ext           ; named, not folded into the generic message
     cmp rax, 0
     jle .bad_cert
     cmp rax, LINNEA_TLS_MAX_CERT_LIST  ; must leave room for the rest of
@@ -562,6 +566,10 @@ linnea_tls_setup:
 .bad_cert:
     lea rdi, [msg_bad_cert]
     mov esi, msg_bad_cert_len
+    jmp linnea_error_exit
+.bad_crit_ext:
+    lea rdi, [msg_crit_ext]
+    mov esi, msg_crit_ext_len
     jmp linnea_error_exit
 .cert_big:
     lea rdi, [msg_cert_big]

@@ -123,6 +123,30 @@ cert_name_out=$($BIN --config $CFG/tls.json --test 2>&1)
 check "a matching cert name warns about nothing" \
     "$(printf '%s' "$cert_name_out" | grep -qF 'presents no name' && echo 1 || echo 0)"
 
+# RFC 5280 4.2: a critical extension this build cannot process must be REFUSED,
+# because every conforming client refuses it -- so accepting one only moves the
+# failure from --test to the handshake, which is the outage a preflight exists
+# to catch (audit-report-120). The fixtures carry the private arc 1.2.3.4, which
+# can never become something this build implements, and are signed by
+# server.key so a refusal cannot be the pairing check firing instead:
+#   openssl req -new -x509 -key test/tls/server.key -subj /CN=localhost \
+#     -days 3650 -addext '1.2.3.4=critical,DER:05:00' -out unknown-critical.crt
+run_test "unknown critical extension refused" 1 stderr "CRITICAL X.509 extension this build does not implement" \
+    $BIN --config $CFG/cert-unknown-critical.json --test
+# ACCEPTANCE CONTROL, and the one that matters most here. The SAME unknown OID,
+# marked non-critical, MUST still load: RFC 5280 says an unrecognised extension
+# is only fatal when it is critical, so a build that refused unknown extensions
+# outright would pass the check above while rejecting certificates the whole
+# world ships.
+$BIN --config $CFG/cert-unknown-noncritical.json --test >/dev/null 2>&1
+check "the same OID non-critical still loads" $?
+# The second control is basicConstraints, which is critical on EVERY certificate
+# in this tree and on every real one -- leaf, intermediate and root. It had to
+# join the recognised set in the same change; a set without it would refuse the
+# entire corpus, which is the report-114 shape of a preflight turning a legal
+# file into an outage. cert-bigext.json below and prod_cert_check.sh are what
+# would catch that, so both run after this.
+
 # A REAL certificate's extensions run to hundreds of bytes, so their SEQUENCE
 # carries a two-byte (0x82) DER length -- and der_any clobbers r8 in exactly
 # that path, which is where the [3] wrapper's end was being kept. Every fixture

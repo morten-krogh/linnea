@@ -309,6 +309,20 @@ linnea_pem_cert_list:
     pop rdx
     pop rax
     jz .bad
+    ; ...and RFC 5280 4.2: no critical extension this build cannot process.
+    ; Separate from the syntax check above, and reported separately, because
+    ; "this file is not a certificate" and "this certificate asks for something
+    ; we do not implement" send an operator to two different places
+    ; (audit-report-120).
+    push rax
+    push rdx
+    lea rdi, [r14 + rbx + 3]
+    mov rsi, rax
+    call ext_critical_ok
+    test eax, eax
+    pop rdx
+    pop rax
+    jz .bad_crit
     mov r12, rdx              ; resume past this block
     mov ecx, eax              ; u24 DER length, big-endian
     shr ecx, 16
@@ -330,6 +344,9 @@ linnea_pem_cert_list:
     jmp .ret
 .bad:
     mov rax, -2
+    jmp .ret
+.bad_crit:
+    mov rax, -3
 .ret:
     pop r15
     pop r14
@@ -2105,6 +2122,254 @@ ext_value_of:
     pop rbx
     ret
 
+; ---- ext_is_critical(rdi=extension content, rsi=end) -> rax = 1 when the
+;      optional critical BOOLEAN is present and TRUE.
+;
+;      DER says FALSE is the default and MUST then be omitted, but the value is
+;      tested rather than the field's presence: a non-conforming encoder that
+;      writes an explicit 00 means non-critical, and refusing on it would be
+;      refusing a certificate every client accepts.
+ext_is_critical:
+    push rbx
+    mov rbx, rsi
+    call der_any                     ; extnID
+    cmp rax, -1
+    je .ic_no
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any
+    cmp rax, -1
+    je .ic_no
+    cmp dl, 0x01                     ; critical BOOLEAN, optional
+    jne .ic_no
+    test rcx, rcx
+    jz .ic_no                        ; present but empty: no value to believe
+    cmp byte [rax], 0
+    je .ic_no                        ; explicit FALSE
+    mov eax, 1
+    pop rbx
+    ret
+.ic_no:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ---- ext_oid_known(rdi=extension content, rsi=end) -> rax = 0 when extnID is
+;      an OID this build does not act on, 1 when it does, 2 for
+;      basicConstraints, whose content the caller then parses.
+;
+;      The set is exactly what is processed elsewhere in this file: keyUsage and
+;      extKeyUsage in linnea_x509_leaf_usage_ok, subjectAltName in
+;      linnea_x509_leaf_host_ok, basicConstraints in bc_value_ok. Listing an OID
+;      here that nothing reads would be exactly the lie RFC 5280 4.2 is about.
+ext_oid_known:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rsi
+    call der_any                     ; extnID
+    cmp rax, -1
+    je .ok_no
+    lea r12, [rax - 2]               ; the OID element, tag included
+    lea r13, [rcx + 2]               ; ...and its total length
+    cmp r13, oid_ku_len
+    jne .ok_try_eku
+    mov rdi, r12
+    lea rsi, [oid_ku]
+    mov rcx, oid_ku_len
+    call bytes_eq
+    test eax, eax
+    jnz .ok_yes
+.ok_try_eku:
+    cmp r13, oid_eku_len
+    jne .ok_try_san
+    mov rdi, r12
+    lea rsi, [oid_eku]
+    mov rcx, oid_eku_len
+    call bytes_eq
+    test eax, eax
+    jnz .ok_yes
+.ok_try_san:
+    cmp r13, oid_san_len
+    jne .ok_try_bc
+    mov rdi, r12
+    lea rsi, [oid_san]
+    mov rcx, oid_san_len
+    call bytes_eq
+    test eax, eax
+    jnz .ok_yes
+.ok_try_bc:
+    cmp r13, oid_bc_len
+    jne .ok_no
+    mov rdi, r12
+    lea rsi, [oid_bc]
+    mov rcx, oid_bc_len
+    call bytes_eq
+    test eax, eax
+    jz .ok_no
+    mov eax, 2
+    jmp .ok_ret
+.ok_yes:
+    mov eax, 1
+    jmp .ok_ret
+.ok_no:
+    xor eax, eax
+.ok_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- bc_value_ok(rdi=extension content, rsi=end) -> rax = 1 when the
+;      BasicConstraints value parses: a SEQUENCE holding at most the optional
+;      cA BOOLEAN and pathLenConstraint INTEGER, in that order's tags.
+;
+;      SYNTAX ONLY, deliberately. cA TRUE on a leaf is not an error -- every
+;      self-signed fixture in this tree is its own CA and OpenSSL's sslserver
+;      purpose accepts them -- and pathLenConstraint constrains a chain this
+;      build never assembles, so there is nothing here it could honestly
+;      enforce. Recognising the extension is what RFC 5280 4.2 asks for; the
+;      parse is what makes "recognised" mean we looked.
+bc_value_ok:
+    push rbx
+    push r12
+    call ext_value_of                ; skips extnID and the critical BOOLEAN
+    test rax, rax
+    jz .bc_no
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call der_any                     ; BasicConstraints
+    cmp rax, -1
+    je .bc_no
+    cmp dl, 0x30
+    jne .bc_no
+    mov rbx, rax
+    lea r12, [rax + rcx]
+.bc_field:
+    cmp rbx, r12
+    jae .bc_yes                      ; an empty SEQUENCE is the default, legal
+    mov rdi, rbx
+    mov rsi, r12
+    call der_any
+    cmp rax, -1
+    je .bc_no
+    cmp dl, 0x01                     ; cA BOOLEAN
+    je .bc_step
+    cmp dl, 0x02                     ; pathLenConstraint INTEGER
+    jne .bc_no
+.bc_step:
+    lea rbx, [rax + rcx]
+    jmp .bc_field
+.bc_yes:
+    mov eax, 1
+    jmp .bc_ret
+.bc_no:
+    xor eax, eax
+.bc_ret:
+    pop r12
+    pop rbx
+    ret
+
+; ---- ext_critical_ok(rdi=der, rsi=len) -> rax = 1 when every critical
+;      extension this certificate carries is one this build recognises.
+;
+;      RFC 5280 4.2: an implementation MUST reject a certificate carrying a
+;      critical extension it cannot process, because conforming clients do. A
+;      preflight that accepts one is worse than no preflight: --test goes green
+;      and the handshake goes red, which is the outage the check exists to catch
+;      (audit-report-120).
+;
+;      basicConstraints had to join the recognised set in the same change. It is
+;      critical on every certificate in this tree and on every real one --
+;      leaf, intermediate and root of the production chain all carry it -- so a
+;      set without it would refuse the entire corpus and production with it.
+;      That is the report-114 shape: a preflight turning a legal file into an
+;      outage.
+;
+;      EVERY entry, not just the leaf, because the client refuses either.
+ext_critical_ok:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    lea r13, [rdi + rsi]
+    mov rsi, r13
+    call der_any                     ; Certificate
+    cmp rax, -1
+    je .ec_no
+    mov rdi, rax
+    lea rbx, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; tbsCertificate
+    cmp rax, -1
+    je .ec_no
+    mov r14, rax                     ; TBS content
+    lea r15, [rax + rcx]             ; TBS end
+    mov rbx, r14
+.ec_scan:
+    cmp rbx, r15
+    jae .ec_yes                      ; no extensions at all: nothing to refuse
+    mov rdi, rbx
+    mov rsi, r15
+    call der_any
+    cmp rax, -1
+    je .ec_no
+    cmp dl, 0xa3
+    je .ec_exts
+    lea rbx, [rax + rcx]
+    jmp .ec_scan
+.ec_exts:
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call der_any                     ; the Extensions SEQUENCE
+    cmp rax, -1
+    je .ec_no
+    mov rbx, rax
+    lea r15, [rax + rcx]
+.ec_each:
+    cmp rbx, r15
+    jae .ec_yes
+    mov rdi, rbx
+    mov rsi, r15
+    call der_any                     ; one Extension
+    cmp rax, -1
+    je .ec_no
+    mov r14, rax                     ; its content
+    lea r12, [rax + rcx]             ; its end
+    mov rdi, r14
+    mov rsi, r12
+    call ext_is_critical
+    test eax, eax
+    jz .ec_next                      ; not critical: unknown is fine, skip it
+    mov rdi, r14
+    mov rsi, r12
+    call ext_oid_known
+    test eax, eax
+    jz .ec_no                        ; critical AND unrecognised: refuse
+    cmp eax, 2
+    jne .ec_next
+    mov rdi, r14
+    mov rsi, r12
+    call bc_value_ok
+    test eax, eax
+    jz .ec_no
+.ec_next:
+    mov rbx, r12
+    jmp .ec_each
+.ec_yes:
+    mov eax, 1
+    jmp .ec_ret
+.ec_no:
+    xor eax, eax
+.ec_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; ---- eku_has_server(rdi=content, rsi=end) -> rax = 1 when the KeyPurposeId list
 ;      contains id-kp-serverAuth or anyExtendedKeyUsage.
 eku_has_server:
@@ -2873,6 +3138,8 @@ oid_any:    db 0x06,0x04,0x55,0x1d,0x25,0x00     ; anyExtendedKeyUsage
 oid_any_len equ $ - oid_any
 oid_san:    db 0x06,0x03,0x55,0x1d,0x11          ; 2.5.29.17  subjectAltName
 oid_san_len equ $ - oid_san
+oid_bc:     db 0x06,0x03,0x55,0x1d,0x13          ; 2.5.29.19  basicConstraints
+oid_bc_len  equ $ - oid_bc
 oid_cn:     db 0x06,0x03,0x55,0x04,0x03          ; 2.5.4.3    id-at-commonName
 oid_cn_len  equ $ - oid_cn
 ; 1.2.840.10045.4.3.2  ecdsa-with-SHA256 -- the only certificate signature this
