@@ -591,6 +591,24 @@ if _os.path.exists(_CRT):
         bad.append("could not locate the issuer CN attribute OID to mutate")
         print("FAIL could not locate the issuer CN attribute OID to mutate")
 
+    # --- audit-report-111: an attribute VALUE must be a string --------------
+    # Report 108 accepted any bounded element here, reasoning that enumerating
+    # string types risks refusing a legal certificate. That let a commonName
+    # carry an INTEGER, which OpenSSL refuses. The allow-list is the
+    # DirectoryString family plus the other string types that appear in DNs.
+    _cnv = 58                           # the issuer commonName's value tag
+    if _der[_cnv] == 0x0c:
+        for _tag, _what in ((0x02, "an INTEGER"), (0x05, "NULL"),
+                            (0x30, "a SEQUENCE")):
+            _v = bytearray(_der)
+            _v[_cnv] = _tag
+            test(_tls_cfg(_wrap(bytes(_v), _os.path.join(_TD, "cn%02x.crt" % _tag)),
+                          _KEY),
+                 "a commonName whose value is %s is rejected" % _what, False)
+    else:
+        bad.append("could not locate the commonName value tag to mutate")
+        print("FAIL could not locate the commonName value tag to mutate")
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

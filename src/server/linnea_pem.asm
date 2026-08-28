@@ -883,9 +883,33 @@ attr_ok:
     jz .at_no
     lea rdi, [rax + rcx]
     mov rsi, rbx
-    call der_any                     ; the value: one element, any string type
+    call der_any                     ; the value
     cmp rax, -1
     je .at_no
+    ; ...and it must be a string. Report 108 accepted ANY bounded element here,
+    ; on the reasoning that enumerating string types risks refusing a legal
+    ; certificate -- but that let a commonName carry an INTEGER, which OpenSSL
+    ; refuses (audit-report-111). The list below is the DirectoryString family
+    ; plus the other string types that appear in distinguished names; it is an
+    ; ALLOW-LIST, so widening it is a one-line change if a real certificate ever
+    ; needs a type that is missing.
+    cmp dl, 0x0c                     ; UTF8String
+    je .at_value_ok
+    cmp dl, 0x13                     ; PrintableString
+    je .at_value_ok
+    cmp dl, 0x14                     ; TeletexString / T61String
+    je .at_value_ok
+    cmp dl, 0x16                     ; IA5String
+    je .at_value_ok
+    cmp dl, 0x12                     ; NumericString
+    je .at_value_ok
+    cmp dl, 0x1a                     ; VisibleString / ISO646String
+    je .at_value_ok
+    cmp dl, 0x1c                     ; UniversalString
+    je .at_value_ok
+    cmp dl, 0x1e                     ; BMPString
+    jne .at_no                       ; INTEGER, NULL, constructed, anything else
+.at_value_ok:
     lea rdi, [rax + rcx]
     cmp rdi, rbx
     jne .at_no                       ; a second value, or trailing bytes
