@@ -575,6 +575,44 @@ der_tiles:
     pop rbx
     ret
 
+; ---- alg_id_ok(rdi=content, rsi=end) -> rax = 1 when the range is an
+;      AlgorithmIdentifier: an OBJECT IDENTIFIER, then optional parameters,
+;      filling it exactly. RFC 5280 4.1.1.2. "A nonempty SEQUENCE" is not an
+;      AlgorithmIdentifier -- retagging the OID to NULL used to pass
+;      (audit-report-103 F1). Preserves rbx/r12+.
+alg_id_ok:
+    push rbx
+    push r12
+    mov rbx, rsi                     ; end
+    call der_any                     ; the algorithm OID
+    cmp rax, -1
+    je .ai_no
+    cmp dl, 0x06                     ; OBJECT IDENTIFIER
+    jne .ai_no
+    test rcx, rcx
+    jz .ai_no                        ; an empty OID
+    lea r12, [rax + rcx]
+    cmp r12, rbx
+    je .ai_yes                       ; absent parameters: legal
+    mov rdi, r12
+    mov rsi, rbx
+    call der_any                     ; the parameters, whatever they are
+    cmp rax, -1
+    je .ai_no
+    lea r12, [rax + rcx]
+    cmp r12, rbx
+    jne .ai_no                       ; a third element
+.ai_yes:
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.ai_no:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
 ; ---- tbs_walk(rdi=der, rsi=len) -> rax = the SubjectPublicKeyInfo element,
 ;      rdx = its length; rax = 0 if these bytes are not a structurally valid
 ;      X.509 Certificate. File-local; the two public entry points below share it
@@ -595,6 +633,8 @@ tbs_walk:
     push r12
     push r13
     push r14
+    push r15
+    push rbp
     lea r13, [rdi + rsi]             ; entry end
     mov rsi, r13
     call der_any                     ; Certificate
@@ -624,6 +664,17 @@ tbs_walk:
     jne .tw_no
     test rcx, rcx
     jz .tw_no                        ; an empty AlgorithmIdentifier
+    push rax                         ; keep its span: RFC 5280 4.1.1.2 requires
+    push rcx                         ; it to EQUAL the TBS signature field
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call alg_id_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .tw_no
+    mov r15, rax                     ; the outer AlgorithmIdentifier's span,
+    mov rbp, rcx                     ; to compare with the TBS signature field
     lea rdi, [rax + rcx]
     mov rsi, rbx
     call der_any                     ; signatureValue
@@ -690,6 +741,8 @@ tbs_walk:
     je .tw_no
     cmp dl, 0x30                     ; each of the four is a SEQUENCE
     jne .tw_no
+    cmp r12d, 4
+    je .tw_tbssig                    ; the first is `signature`
     cmp r12d, 2
     je .tw_validity                  ; the third is Validity: two Times
     push rax
@@ -697,6 +750,32 @@ tbs_walk:
     mov rdi, rax
     lea rsi, [rax + rcx]
     call der_tiles                   ; its children must tile it exactly
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .tw_no
+    jmp .tw_seq_next
+.tw_tbssig:
+    ; RFC 5280 4.1.1.2: this field MUST contain the same algorithm identifier as
+    ; the Certificate's signatureAlgorithm. Both are validated as
+    ; AlgorithmIdentifiers, then compared whole -- two DIFFERENT algorithm
+    ; identifiers is a malformed certificate, not a stylistic variation.
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call alg_id_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .tw_no
+    cmp rcx, rbp                     ; same content length as the outer one?
+    jne .tw_no
+    push rax
+    push rcx
+    mov rdi, rax
+    mov rsi, r15
+    call bytes_eq                    ; ...and the same bytes
     test eax, eax
     pop rcx
     pop rax
@@ -747,6 +826,8 @@ tbs_walk:
     lea rdx, [rax + rcx]
     sub rdx, r14                     ; its full length, header included
     mov rax, r14
+    pop rbp
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -756,6 +837,8 @@ tbs_walk:
     add rsp, 16                      ; drop the two saved words
 .tw_no:
     xor eax, eax
+    pop rbp
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -940,6 +1023,13 @@ linnea_x509_spki_point:
     cmp byte [rax], 0x00
     jne .fail
     cmp byte [rax + 1], 0x04       ; uncompressed point only
+    jne .fail
+    ; RFC 5280 4.1.2.7: SubjectPublicKeyInfo is EXACTLY an AlgorithmIdentifier
+    ; and a BIT STRING. The key was copied out of the second child without
+    ; checking that it ended the SEQUENCE, so a third child went unseen
+    ; (audit-report-103 F2). rbx is the SPKI content end.
+    lea rdx, [rax + rcx]
+    cmp rdx, rbx
     jne .fail
     lea rsi, [rax + 2]
     mov rdi, r12

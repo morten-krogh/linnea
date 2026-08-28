@@ -349,6 +349,57 @@ if _os.path.exists(_CRT):
         test(_tls_cfg(_wrap(_v1, _os.path.join(_TD, "v1.crt")), _KEY),
              "a v1 certificate (no version field) is accepted", True)
 
+    # --- audit-report-103: AlgorithmIdentifier contents, and SPKI child count -
+    # The outer signatureAlgorithm was only checked for non-emptiness, so its
+    # OID could be retagged; and the SPKI's key was copied from the second child
+    # without requiring it to END the sequence, so a third child went unseen.
+    _oid = _der.rfind(b"\x06", 300, 340)
+    if _oid < 0:
+        bad.append("could not locate the outer signatureAlgorithm OID")
+        print("FAIL could not locate the outer signatureAlgorithm OID")
+    else:
+        _a = bytearray(_der)
+        _a[_oid] = 0x05                # OBJECT IDENTIFIER -> NULL
+        test(_tls_cfg(_wrap(bytes(_a), _os.path.join(_TD, "badalg.crt")), _KEY),
+             "a non-AlgorithmIdentifier signatureAlgorithm is rejected", False)
+
+    def _spki_plus_null(der):
+        """Re-encode the certificate with a third child inside its SPKI."""
+        def _tlv(b, i):
+            n, j = b[i + 1], i + 2
+            if n & 0x80:
+                k = n & 0x7f
+                n = int.from_bytes(b[j:j + k], "big")
+                j += k
+            return j, n
+
+        def _enc(tag, c):
+            n = len(c)
+            if n < 0x80:
+                L = bytes([n])
+            else:
+                w = (n.bit_length() + 7) // 8
+                L = bytes([0x80 | w]) + n.to_bytes(w, "big")
+            return bytes([tag]) + L + c
+
+        cs, cl = _tlv(der, 0)
+        ts, tl = _tlv(der, cs)
+        i = ts
+        if der[i] == 0xa0:
+            vs, vl = _tlv(der, i)
+            i = vs + vl
+        for _ in range(5):
+            s2, l2 = _tlv(der, i)
+            i = s2 + l2
+        ss, sl = _tlv(der, i)
+        spki = _enc(0x30, der[ss:ss + sl] + b"\x05\x00")
+        tbs = _enc(0x30, der[ts:i] + spki + der[ss + sl:ts + tl])
+        return _enc(0x30, tbs + der[ts + tl:cs + cl])
+
+    test(_tls_cfg(_wrap(_spki_plus_null(_der), _os.path.join(_TD, "badspki.crt")),
+                  _KEY),
+         "an SPKI with a third child is rejected", False)
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",
