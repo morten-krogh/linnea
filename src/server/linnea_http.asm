@@ -1163,6 +1163,19 @@ linnea_http_handle:
     jmp .ows_loop
 .value_start:
     mov r9, r15                ; value start
+    ; RFC 9110 5.5: field-vchar is VCHAR (0x21-0x7e) or obs-text (0x80-0xff),
+    ; so DEL is not a legal field-value byte. The RFC lets a recipient KEEP an
+    ; invalid CTL "within a safe context (e.g. ... will not be processed by any
+    ; downstream HTTP parser)" -- which is exactly what a proxy is not. We
+    ; forward these bytes to a backend that parses them again, so the exemption
+    ; does not cover us and the differential is the whole risk.
+    ;
+    ; This is deliberately STRICTER THAN NGINX, which answers 200 to
+    ; `X-Test: before<DEL>after` and forwards it (measured, audit-report-121).
+    ; Refusing is the fail-closed direction on a byte no legal client sends,
+    ; and it makes this loop agree with the two trailer parsers that already
+    ; reject DEL -- .cd_trailer_val_scan below and the h2 proxy leg's
+    ; .dec_trail_value. The inconsistency was the defect, not the strictness.
 .value_loop:
     movzx eax, byte [r14 + r15]
     cmp al, 13
@@ -1171,6 +1184,8 @@ linnea_http_handle:
     je .value_ok
     cmp al, 0x20
     jb .resp_400
+    cmp al, 0x7f
+    je .resp_400               ; DEL: not field-vchar, and we forward this
 .value_ok:
     inc r15
     cmp r15, r13

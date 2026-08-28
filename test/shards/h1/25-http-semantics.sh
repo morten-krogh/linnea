@@ -98,6 +98,27 @@ check_http "encoded traversal" "400 Bad Request" "$(raw_http 'GET /%2e%2e/secret
 check_http "bad escape"        "400 Bad Request" "$(raw_http 'GET /%zz HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
 check_http "encoded NUL"       "400 Bad Request" "$(raw_http 'GET /%00 HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
 
+# --- field-value bytes (audit-report-121) ---
+
+# RFC 9110 5.5: field-vchar is VCHAR (0x21-0x7e) or obs-text (0x80-0xff), so DEL
+# is not legal in a field value. The RFC lets a recipient keep an invalid CTL
+# only "within a safe context ... not processed by any downstream HTTP parser",
+# which a proxy is the opposite of: it was reaching the backend verbatim, so
+# linnea and the backend could disagree about whether the request was valid.
+# Checked on a PROXY route for that reason, not a static one.
+check_http "DEL in a field value is refused" "400 Bad Request" \
+    "$(raw_http 'GET /api/simple HTTP/1.1\r\nHost: one.test\r\nX-Test: before\x7fafter\r\nConnection: close\r\n\r\n')"
+# ACCEPTANCE CONTROL. Without it a parser that refused every field value -- or
+# every request -- would pass the check above. Same route, same header, one
+# byte different.
+check_http "...and the same header without it still passes" "200 OK" \
+    "$(raw_http 'GET /api/simple HTTP/1.1\r\nHost: one.test\r\nX-Test: before-after\r\nConnection: close\r\n\r\n')"
+# The two bytes on either side of the hole stay legal: 0x7e closes VCHAR and
+# 0x80 opens obs-text, so a fix that clamped at "anything above 0x7e" would
+# refuse obs-text the grammar allows and this control would catch it.
+check_http "...and 0x7e and 0x80 around it are still legal" "200 OK" \
+    "$(raw_http 'GET /api/simple HTTP/1.1\r\nHost: one.test\r\nX-Test: a\x7eb\x80c\r\nConnection: close\r\n\r\n')"
+
 # --- path normalization (raw, curl normalizes dot segments itself) ---
 check_http "double slash"   "hello from linnea" "$(raw_http 'GET //hello.txt HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
 check_http "dot segment"    "hello from linnea" "$(raw_http 'GET /./hello.txt HTTP/1.1\r\nHost: one.test\r\nConnection: close\r\n\r\n')"
