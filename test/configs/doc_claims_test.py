@@ -609,6 +609,25 @@ if _os.path.exists(_CRT):
         bad.append("could not locate the commonName value tag to mutate")
         print("FAIL could not locate the commonName value tag to mutate")
 
+    # --- audit-report-112: a string's CONTENT must match its tag ------------
+    # Report 111 admitted a set of tags without looking at the bytes, so a
+    # UTF8String holding 0xFF passed while OpenSSL refused the certificate.
+    # These four mutate the first content byte of the issuer commonName.
+    _cnb = 60                           # first content byte of "localhost"
+    if _der[_cnv] == 0x0c and _der[_cnb] == ord("l"):
+        for _b, _what in ((0xff, "0xFF, never valid UTF-8"),
+                          (0x80, "a lone continuation byte"),
+                          (0xc0, "an overlong lead byte"),
+                          (0xe2, "a truncated multi-byte sequence")):
+            _u = bytearray(_der)
+            _u[_cnb] = _b
+            test(_tls_cfg(_wrap(bytes(_u), _os.path.join(_TD, "u%02x.crt" % _b)),
+                          _KEY),
+                 "a UTF8String containing %s is rejected" % _what, False)
+    else:
+        bad.append("could not locate the commonName content to mutate")
+        print("FAIL could not locate the commonName content to mutate")
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

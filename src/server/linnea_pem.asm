@@ -861,6 +861,258 @@ name_ok:
     pop rbx
     ret
 
+; ---- utf8_ok(rdi=ptr, rsi=len) -> rax = 1 when the bytes are well-formed
+;      UTF-8 (RFC 3629 3): no 0xC0/0xC1 overlong leads, no 0xF5-0xFF, correct
+;      continuation counts, and the E0/ED/F0/F4 guards that exclude overlongs,
+;      UTF-16 surrogates and anything past U+10FFFF. Preserves rbx/r12+.
+utf8_ok:
+    push rbx
+    push r12
+    mov rbx, rdi
+    lea r12, [rdi + rsi]
+.u8:
+    cmp rbx, r12
+    jae .u8_yes
+    movzx eax, byte [rbx]
+    cmp al, 0x80
+    jb .u8_1                         ; ASCII
+    cmp al, 0xc2
+    jb .u8_no                        ; a lone continuation, or an overlong lead
+    cmp al, 0xdf
+    jbe .u8_2
+    cmp al, 0xef
+    jbe .u8_3
+    cmp al, 0xf4
+    jbe .u8_4
+    jmp .u8_no                       ; 0xF5-0xFF are never valid
+.u8_1:
+    inc rbx
+    jmp .u8
+.u8_2:
+    lea rcx, [rbx + 2]
+    cmp rcx, r12
+    ja .u8_no
+    movzx edx, byte [rbx + 1]
+    sub edx, 0x80
+    cmp edx, 0x3f
+    ja .u8_no
+    mov rbx, rcx
+    jmp .u8
+.u8_3:
+    lea rcx, [rbx + 3]
+    cmp rcx, r12
+    ja .u8_no
+    movzx edx, byte [rbx + 1]
+    cmp al, 0xe0
+    jne .u8_3b
+    cmp dl, 0xa0                     ; E0 A0..BF: below this is overlong
+    jb .u8_no
+    cmp dl, 0xbf
+    ja .u8_no
+    jmp .u8_3tail
+.u8_3b:
+    cmp al, 0xed
+    jne .u8_3any
+    cmp dl, 0x80                     ; ED 80..9F: above this is a surrogate
+    jb .u8_no
+    cmp dl, 0x9f
+    ja .u8_no
+    jmp .u8_3tail
+.u8_3any:
+    sub edx, 0x80
+    cmp edx, 0x3f
+    ja .u8_no
+.u8_3tail:
+    movzx edx, byte [rbx + 2]
+    sub edx, 0x80
+    cmp edx, 0x3f
+    ja .u8_no
+    mov rbx, rcx
+    jmp .u8
+.u8_4:
+    lea rcx, [rbx + 4]
+    cmp rcx, r12
+    ja .u8_no
+    movzx edx, byte [rbx + 1]
+    cmp al, 0xf0
+    jne .u8_4b
+    cmp dl, 0x90                     ; F0 90..BF: below this is overlong
+    jb .u8_no
+    cmp dl, 0xbf
+    ja .u8_no
+    jmp .u8_4tail
+.u8_4b:
+    cmp al, 0xf4
+    jne .u8_4any
+    cmp dl, 0x80                     ; F4 80..8F: above this exceeds U+10FFFF
+    jb .u8_no
+    cmp dl, 0x8f
+    ja .u8_no
+    jmp .u8_4tail
+.u8_4any:
+    sub edx, 0x80
+    cmp edx, 0x3f
+    ja .u8_no
+.u8_4tail:
+    movzx edx, byte [rbx + 2]
+    sub edx, 0x80
+    cmp edx, 0x3f
+    ja .u8_no
+    movzx edx, byte [rbx + 3]
+    sub edx, 0x80
+    cmp edx, 0x3f
+    ja .u8_no
+    mov rbx, rcx
+    jmp .u8
+.u8_yes:
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.u8_no:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+; ---- str_ok(dil=tag, rsi=ptr, rdx=len) -> rax = 1 when the content matches the
+;      character set its tag promises. Report 111 admitted these tags without
+;      looking at the bytes, so a UTF8String holding 0xFF was accepted while
+;      OpenSSL refused the certificate (audit-report-112).
+;
+;      TeletexString (0x14) is NOT here: its real-world contents are a mess of
+;      T.61 and Latin-1 and cannot be validated correctly, so following report
+;      112's second option it is dropped from the allow-list rather than
+;      admitted unchecked. Re-adding it is one line, if a real certificate ever
+;      needs it.
+str_ok:
+    push rbx
+    push r12
+    mov r12, rsi
+    lea rbx, [rsi + rdx]
+    cmp dil, 0x0c                    ; UTF8String
+    je .s_utf8
+    cmp dil, 0x13                    ; PrintableString
+    je .s_print
+    cmp dil, 0x16                    ; IA5String: 7-bit
+    je .s_ia5
+    cmp dil, 0x1a                    ; VisibleString: 0x20..0x7E
+    je .s_vis
+    cmp dil, 0x12                    ; NumericString: digits and space
+    je .s_num
+    cmp dil, 0x1e                    ; BMPString: UCS-2 pairs
+    je .s_bmp
+    cmp dil, 0x1c                    ; UniversalString: UCS-4 quads
+    je .s_uni
+    jmp .s_no
+.s_utf8:
+    mov rdi, r12
+    mov rsi, rbx
+    sub rsi, r12
+    call utf8_ok
+    test eax, eax
+    jz .s_no
+    jmp .s_yes
+.s_bmp:
+    mov rax, rbx
+    sub rax, r12
+    test al, 1
+    jnz .s_no
+    jmp .s_yes
+.s_uni:
+    mov rax, rbx
+    sub rax, r12
+    test al, 3
+    jnz .s_no
+    jmp .s_yes
+.s_ia5:
+    cmp r12, rbx
+    jae .s_yes
+    cmp byte [r12], 0x80
+    jae .s_no
+    inc r12
+    jmp .s_ia5
+.s_vis:
+    cmp r12, rbx
+    jae .s_yes
+    movzx eax, byte [r12]
+    cmp al, 0x20
+    jb .s_no
+    cmp al, 0x7e
+    ja .s_no
+    inc r12
+    jmp .s_vis
+.s_num:
+    cmp r12, rbx
+    jae .s_yes
+    movzx eax, byte [r12]
+    cmp al, ' '
+    je .s_num_next
+    cmp al, '0'
+    jb .s_no
+    cmp al, '9'
+    ja .s_no
+.s_num_next:
+    inc r12
+    jmp .s_num
+.s_print:
+    ; A-Z a-z 0-9 and  ' ( ) + , - . / : = ?  and space (X.680)
+    cmp r12, rbx
+    jae .s_yes
+    movzx eax, byte [r12]
+    cmp al, 'A'
+    jb .s_p_punct
+    cmp al, 'Z'
+    jbe .s_p_next
+    cmp al, 'a'
+    jb .s_p_punct
+    cmp al, 'z'
+    jbe .s_p_next
+    jmp .s_p_punct
+.s_p_punct:
+    cmp al, '0'
+    jb .s_p_sym
+    cmp al, '9'
+    jbe .s_p_next
+.s_p_sym:
+    cmp al, ' '
+    je .s_p_next
+    cmp al, 0x27                     ; '
+    je .s_p_next
+    cmp al, '('
+    je .s_p_next
+    cmp al, ')'
+    je .s_p_next
+    cmp al, '+'
+    je .s_p_next
+    cmp al, ','
+    je .s_p_next
+    cmp al, '-'
+    je .s_p_next
+    cmp al, '.'
+    je .s_p_next
+    cmp al, '/'
+    je .s_p_next
+    cmp al, ':'
+    je .s_p_next
+    cmp al, '='
+    je .s_p_next
+    cmp al, '?'
+    jne .s_no
+.s_p_next:
+    inc r12
+    jmp .s_print
+.s_yes:
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.s_no:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
 ; ---- attr_ok(rdi=content, rsi=end) -> rax = 1 when the range is an
 ;      AttributeTypeAndValue: an OBJECT IDENTIFIER then exactly one value,
 ;      filling it. Preserves rbx/r12+.
@@ -886,30 +1138,20 @@ attr_ok:
     call der_any                     ; the value
     cmp rax, -1
     je .at_no
-    ; ...and it must be a string. Report 108 accepted ANY bounded element here,
-    ; on the reasoning that enumerating string types risks refusing a legal
-    ; certificate -- but that let a commonName carry an INTEGER, which OpenSSL
-    ; refuses (audit-report-111). The list below is the DirectoryString family
-    ; plus the other string types that appear in distinguished names; it is an
-    ; ALLOW-LIST, so widening it is a one-line change if a real certificate ever
-    ; needs a type that is missing.
-    cmp dl, 0x0c                     ; UTF8String
-    je .at_value_ok
-    cmp dl, 0x13                     ; PrintableString
-    je .at_value_ok
-    cmp dl, 0x14                     ; TeletexString / T61String
-    je .at_value_ok
-    cmp dl, 0x16                     ; IA5String
-    je .at_value_ok
-    cmp dl, 0x12                     ; NumericString
-    je .at_value_ok
-    cmp dl, 0x1a                     ; VisibleString / ISO646String
-    je .at_value_ok
-    cmp dl, 0x1c                     ; UniversalString
-    je .at_value_ok
-    cmp dl, 0x1e                     ; BMPString
-    jne .at_no                       ; INTEGER, NULL, constructed, anything else
-.at_value_ok:
+    ; ...and it must be a string whose CONTENT matches its tag. Report 111
+    ; admitted a fixed set of tags without looking at the bytes, so a
+    ; UTF8String holding 0xFF was accepted while OpenSSL refused the
+    ; certificate (audit-report-112). str_ok owns both halves of that rule.
+    push rax
+    push rcx
+    movzx edi, dl                    ; the tag
+    mov rsi, rax                     ; content
+    mov rdx, rcx                     ; length
+    call str_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .at_no
     lea rdi, [rax + rcx]
     cmp rdi, rbx
     jne .at_no                       ; a second value, or trailing bytes
