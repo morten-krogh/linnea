@@ -1484,28 +1484,39 @@ tbs_suffix_ok:
     jmp .ts_order
 .ts_three:
     mov edi, 3
-    ; [3] is EXPLICIT: exactly one Extensions SEQUENCE filling the wrapper
+    ; [3] is EXPLICIT: exactly one Extensions SEQUENCE filling the wrapper.
     push rax
     push rcx
     push rdi
-    mov rdi, rax
     lea rsi, [rax + rcx]
-    mov r8, rsi                      ; the wrapper's end
+    push rsi                         ; the wrapper's end, kept on the STACK.
+                                     ; It lived in r8, which der_any DOCUMENTS
+                                     ; that it clobbers -- and does, but only in
+                                     ; its 0x82 two-byte length path. So an
+                                     ; extensions block under 256 bytes kept r8
+                                     ; and worked, and one at 256 or more lost
+                                     ; it and the certificate was refused. Every
+                                     ; fixture here is under the line; every
+                                     ; real certificate is over it, which is how
+                                     ; this reached production and rejected the
+                                     ; live Let's Encrypt leaf.
+    mov rdi, rax
     call der_any
     cmp rax, -1
-    je .ts_no_pop3
+    je .ts_no_pop4
     cmp dl, 0x30
-    jne .ts_no_pop3
+    jne .ts_no_pop4
     lea rdx, [rax + rcx]
-    cmp rdx, r8
-    jne .ts_no_pop3                  ; a second child in the wrapper
+    cmp rdx, [rsp]
+    jne .ts_no_pop4                  ; a second child in the wrapper
     mov rdi, rax
     lea rsi, [rax + rcx]
     call exts_ok
-    test eax, eax
-    pop rdi
+    pop rsi                          ; the pops leave eax and the flags alone,
+    pop rdi                          ; so exts_ok's verdict survives to the jz
     pop rcx
     pop rax
+    test eax, eax
     jz .ts_no
 .ts_order:
     cmp edi, r13d
@@ -1519,8 +1530,8 @@ tbs_suffix_ok:
     pop r12
     pop rbx
     ret
-.ts_no_pop3:
-    add rsp, 24                      ; drop the three saved words
+.ts_no_pop4:
+    add rsp, 32                      ; drop the four saved words
 .ts_no:
     xor eax, eax
     pop r13

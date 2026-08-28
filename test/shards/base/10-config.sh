@@ -123,6 +123,15 @@ cert_name_out=$($BIN --config $CFG/tls.json --test 2>&1)
 check "a matching cert name warns about nothing" \
     "$(printf '%s' "$cert_name_out" | grep -qF 'presents no name' && echo 1 || echo 0)"
 
+# A REAL certificate's extensions run to hundreds of bytes, so their SEQUENCE
+# carries a two-byte (0x82) DER length -- and der_any clobbers r8 in exactly
+# that path, which is where the [3] wrapper's end was being kept. Every fixture
+# in this tree had extensions under 256 bytes and passed; the live Let's Encrypt
+# leaf is over the line, so it was refused and a production reload rejected the
+# upgrade. bigext.crt carries a 497-byte extensions block to hold that line.
+$BIN --config $CFG/cert-bigext.json --test >/dev/null 2>&1
+check "a 0x82-length extensions block loads (real-certificate size)" $?
+
 # Listener identity is the CANONICAL endpoint, not the host text (audit-report-2
 # Finding 1). "::" and "0.0.0.0" are one in6addr_any endpoint, so the same
 # hostname on both is a duplicate on the shared listener...

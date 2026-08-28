@@ -411,6 +411,14 @@ if _os.path.exists(_CRT):
         test(_tls_cfg("test/tls/wrongname.crt", _KEY),
              "a certificate naming no matching host still LOADS (warned)", True)
 
+    # An extensions SEQUENCE of 256 bytes or more takes DER's two-byte (0x82)
+    # length form -- the one path in which der_any clobbers r8. The [3]
+    # wrapper's end was kept there, so every real certificate was refused while
+    # every fixture, all of them smaller, loaded. Found deploying report 119.
+    if _os.path.exists("test/tls/bigext.crt"):
+        test(_tls_cfg("test/tls/bigext.crt", _KEY),
+             "a 0x82-length extensions block is accepted", True)
+
     # --- audit-report-103: AlgorithmIdentifier contents, and SPKI child count -
     # The outer signatureAlgorithm was only checked for non-emptiness, so its
     # OID could be retagged; and the SPKI's key was copied from the second child
