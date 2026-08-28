@@ -427,6 +427,61 @@ if _os.path.exists(_CRT):
         test(_tls_cfg(_CRT, _wrap_key(bytes(_k2), _os.path.join(_TD, "badinner.key"))),
              "a malformed [1] publicKey body is rejected", False)
 
+        # --- audit-report-105 ------------------------------------------------
+        # [0] ECParameters was skipped unopened, so a BIT STRING retagged from
+        # [1] to [0] was waved through; and a well-shaped [1] was never tied to
+        # the scalar, so a point that contradicts the private key passed.
+        _k3 = bytearray(_kder)
+        _k3[_p1] = 0xa0                   # [1] -> [0], its BIT STRING intact
+        test(_tls_cfg(_CRT, _wrap_key(bytes(_k3), _os.path.join(_TD, "badparam.key"))),
+             "a BIT STRING retagged as [0] parameters is rejected", False)
+        _k4 = bytearray(_kder)
+        _k4[_p1 + 6] ^= 0x01              # flip a bit of the embedded point
+        test(_tls_cfg(_CRT, _wrap_key(bytes(_k4), _os.path.join(_TD, "badpub.key"))),
+             "an embedded public key the scalar does not sign for is rejected",
+             False, "does not sign for")
+
+    # ...and the CONTROLS for [0], which no real key carries: PKCS#8 pins the
+    # curve in the outer AlgorithmIdentifier, so generators omit the inner one.
+    # Both branches are therefore reachable only from a hand-built key.
+    def _with_params(der, oid):
+        def _tlv(b, i):
+            n, j = b[i + 1], i + 2
+            if n & 0x80:
+                k = n & 0x7f
+                n = int.from_bytes(b[j:j + k], "big")
+                j += k
+            return j, n
+
+        def _enc(tag, c):
+            n = len(c)
+            if n < 0x80:
+                L = bytes([n])
+            else:
+                w = (n.bit_length() + 7) // 8
+                L = bytes([0x80 | w]) + n.to_bytes(w, "big")
+            return bytes([tag]) + L + c
+
+        ps, _ = _tlv(der, 0)
+        i = ps
+        vs, vl = _tlv(der, i); i = vs + vl
+        as_, al = _tlv(der, i); i = as_ + al
+        os_, ol = _tlv(der, i)
+        ec = der[os_:os_ + ol]
+        es, el = _tlv(ec, 0); j = es
+        v2, l2 = _tlv(ec, j); j = v2 + l2
+        k2, kl = _tlv(ec, j); j = k2 + kl
+        inner = _enc(0x30, ec[es:j] + _enc(0xa0, oid) + ec[j:es + el])
+        return _enc(0x30, der[ps:as_ + al] + _enc(0x04, inner))
+
+    _P256 = bytes.fromhex("06082a8648ce3d030107")
+    test(_tls_cfg(_CRT, _wrap_key(_with_params(_kder, _P256),
+                                  _os.path.join(_TD, "params.key"))),
+         "a valid [0] prime256v1 parameters field is accepted", True)
+    test(_tls_cfg(_CRT, _wrap_key(_with_params(_kder, bytes.fromhex("06082a8648ce3d030108")),
+                                  _os.path.join(_TD, "wrongcurve.key"))),
+         "a [0] naming a different curve is rejected", False)
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

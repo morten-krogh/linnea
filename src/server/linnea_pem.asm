@@ -20,6 +20,7 @@ default rel
 global linnea_pem_decode
 global linnea_pem_cert_list
 global linnea_pem_p256_key
+global linnea_pem_key_pub
 global linnea_x509_find_spki
 global linnea_x509_cert_wellformed
 global linnea_x509_leaf_spki
@@ -39,6 +40,13 @@ alignb 8
 b64_table:  resb 256          ; ASCII -> 6-bit value, 0xff for non-alphabet
 key_buf:    resb 256          ; decoded PKCS#8 EC key; the real thing is
 key_buf_cap equ 256           ; ~138 bytes with the optional public key
+
+section .bss
+; An optional SEC1 [1] publicKey, when the key file carries one. RFC 5915 3
+; calls it "the EC public key associated with the private key in question", so
+; it is not advisory: ktls proves the scalar signs for it (audit-report-105 F2).
+key_pub:      resb 64
+key_pub_set:  resq 1
 
 section .text
 
@@ -481,6 +489,8 @@ linnea_pem_p256_key:
     ; field is not the same as accepting an ill-formed one.
     push rax                        ; the scalar, to return
     push rcx
+    mov qword [key_pub_set], 0      ; no [1] seen yet for THIS key
+    xor r12d, r12d                  ; bit 0 = [0] seen, bit 1 = [1] seen
     lea rbx, [rax + rcx]
 .pk_tail:
     cmp rbx, r13
@@ -491,9 +501,12 @@ linnea_pem_p256_key:
     cmp rax, -1
     je .pk_bad
     cmp dl, 0xa0
-    je .pk_next                     ; [0] parameters: a named curve, skipped
+    je .pk_params
     cmp dl, 0xa1
     jne .pk_bad                     ; nothing else belongs in ECPrivateKey
+    test r12d, 2
+    jnz .pk_bad                     ; a second [1]
+    or r12d, 2
     ; [1] wraps a BIT STRING holding an uncompressed P-256 point. Accepting it
     ; unexamined is what the report objected to; it is checked structurally
     ; here, and the ktls pairing then proves the SCALAR signs for the
@@ -513,8 +526,38 @@ linnea_pem_p256_key:
     jne .pk_bad2
     cmp byte [rax + 1], 0x04        ; uncompressed only
     jne .pk_bad2
+    push rdi
+    push rsi
+    lea rsi, [rax + 2]              ; X||Y, for ktls to tie to the scalar
+    lea rdi, [key_pub]
+    mov ecx, 64
+    rep movsb
+    mov qword [key_pub_set], 1
+    pop rsi
+    pop rdi
     pop rcx
     pop rax
+    jmp .pk_next                    ; NOT a fall-through: .pk_params follows
+.pk_params:
+    ; RFC 5915 3: [0] ECParameters, i.e. a named-curve OID. It was skipped
+    ; unopened, so a BIT STRING retagged from [1] to [0] was waved through
+    ; (audit-report-105 F1). Real PKCS#8 keys omit it -- the curve is pinned by
+    ; the outer AlgorithmIdentifier -- but when present it must agree.
+    test r12d, 1
+    jnz .pk_bad                     ; a second [0]
+    or r12d, 1
+    cmp rcx, alg_ec_curve_len
+    jne .pk_bad
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [alg_ec_curve]
+    mov rcx, alg_ec_curve_len
+    call bytes_eq
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .pk_bad
 .pk_next:
     lea rbx, [rax + rcx]
     jmp .pk_tail
@@ -911,6 +954,17 @@ tbs_walk:
 ;      that the surrounding bytes are a certificate (audit-report-100 F1). It
 ;      does no trust or hostname validation -- only syntax, which is all a
 ;      preflight can honestly promise.
+; ---- linnea_pem_key_pub() -> rax = the optional SEC1 [1] public point from the
+;      last key parsed (64 bytes X||Y), or 0 if that key carried none.
+linnea_pem_key_pub:
+    cmp qword [key_pub_set], 0
+    je .kp_none
+    lea rax, [key_pub]
+    ret
+.kp_none:
+    xor eax, eax
+    ret
+
 linnea_x509_cert_wellformed:
     call tbs_walk
     test rax, rax
@@ -1105,6 +1159,9 @@ section .rodata
 alg_ec:     db 0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01
             db 0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07
 alg_ec_len  equ $ - alg_ec
+; ...and its curve half alone, for the optional SEC1 [0] parameters field
+alg_ec_curve     equ alg_ec + 9
+alg_ec_curve_len equ 10
 section .text
 
 section .rodata

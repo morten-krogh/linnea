@@ -43,6 +43,7 @@ extern linnea_p256_scalar_is_valid
 extern linnea_tls_hkdf_expand_label
 extern linnea_error_exit
 extern linnea_x509_leaf_spki
+extern linnea_pem_key_pub
 extern linnea_x509_spki_point
 extern linnea_p256_ecdsa_sign
 extern linnea_p256_ecdsa_verify_der
@@ -59,6 +60,8 @@ lbl_traffic_upd_len equ $ - lbl_traffic_upd
 
 msg_no_aesni: db "TLS requires a CPU with AES-NI, PCLMULQDQ and SSSE3"
 msg_no_aesni_len equ $ - msg_no_aesni
+msg_key_selfcontra: db "the key file embeds a public key that its own private scalar does not sign for", 10
+msg_key_selfcontra_len equ $ - msg_key_selfcontra
 msg_key_mismatch: db "certificate and key are different identities: the key does not sign for this certificate", 10
 msg_key_mismatch_len equ $ - msg_key_mismatch
 msg_no_entropy: db "cannot seed the session-ticket keys: getrandom failed", 10
@@ -237,6 +240,7 @@ linnea_tls_setup:
     lea rsi, [pair_digest]
     mov rdx, [r13 + linnea_config_server.key_priv]
     call linnea_p256_ecdsa_sign        ; rax = DER length
+    mov r14, rax                      ; keep it for the second verify below
     lea rsi, [pair_sig]
     mov rdx, rax
     lea rdi, [pair_digest]
@@ -244,6 +248,23 @@ linnea_tls_setup:
     call linnea_p256_ecdsa_verify_der
     test eax, eax
     jz .key_mismatch
+    ; ...and if the key file carried its own SEC1 [1] publicKey, the same
+    ; signature must verify under THAT point too. RFC 5915 3 calls it "the EC
+    ; public key associated with the private key in question", so a point that
+    ; disagrees with the scalar is a self-contradictory file, not a harmless
+    ; annotation -- and it was accepted unchecked (audit-report-105 F2).
+    ; Reusing pair_sig means no second signing and no base-point multiply.
+    call linnea_pem_key_pub
+    test rax, rax
+    jz .pair_done                     ; the key carried none: nothing to tie
+    mov rcx, rax
+    lea rsi, [pair_sig]
+    mov rdx, r14                      ; the DER length kept from the sign
+    lea rdi, [pair_digest]
+    call linnea_p256_ecdsa_verify_der
+    test eax, eax
+    jz .key_selfcontradictory
+.pair_done:
 .load_next:
     inc r12
     jmp .load
@@ -257,6 +278,10 @@ linnea_tls_setup:
 .no_entropy:
     lea rdi, [msg_no_entropy]
     mov esi, msg_no_entropy_len
+    jmp linnea_error_exit
+.key_selfcontradictory:
+    lea rdi, [msg_key_selfcontra]
+    mov esi, msg_key_selfcontra_len
     jmp linnea_error_exit
 .key_mismatch:
     lea rdi, [msg_key_mismatch]
