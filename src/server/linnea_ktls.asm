@@ -51,6 +51,9 @@ extern linnea_pem_key_pub
 extern linnea_x509_spki_point
 extern linnea_p256_ecdsa_sign
 extern linnea_p256_ecdsa_verify_der
+extern linnea_x509_leaf_host_ok
+extern linnea_x509_leaf_selfsig
+extern linnea_sha256
 
 section .rodata
 pair_digest: times 32 db 0x5a       ; any fixed digest; only the pairing matters
@@ -72,6 +75,10 @@ msg_bad_usage: db "the certificate does not permit TLS server authentication (ke
 msg_bad_usage_len equ $ - msg_bad_usage
 msg_key_selfcontra: db "the key file embeds a public key that its own private scalar does not sign for", 10
 msg_key_selfcontra_len equ $ - msg_key_selfcontra
+msg_cert_name: db "WARNING: the TLS certificate presents no name matching this server's hostname -- clients will refuse it unless they reach this vhost over a connection authenticated for another of its names", 10
+msg_cert_name_len equ $ - msg_cert_name
+msg_bad_sig: db "the certificate is self-signed but its signature does not verify under its own public key: the file is corrupt or has been tampered with", 10
+msg_bad_sig_len equ $ - msg_bad_sig
 msg_key_mismatch: db "certificate and key are different identities: the key does not sign for this certificate", 10
 msg_key_mismatch_len equ $ - msg_key_mismatch
 msg_no_entropy: db "cannot seed the session-ticket keys: getrandom failed", 10
@@ -94,6 +101,11 @@ val_times:   resq 6      ; notBefore ptr/len/tag, notAfter ptr/len/tag
 ; the cert/key pairing self-check (audit-report-99 F2)
 leaf_pub:    resb 64
 pair_sig:    resb LINNEA_P256_ECDSA_MAX_SIG
+
+; the leaf's own signature check (audit-report-119 F2)
+leaf_der:    resq 2      ; the leaf DER pointer and its length
+sig_parts:   resq 6      ; tbs ptr/len, sig ptr/len, self-issued, sha256-ecdsa
+tbs_hash:    resb 32
 
 
 alignb 8
@@ -409,6 +421,40 @@ linnea_tls_setup:
 .val_done:
     pop rsi
     pop rdi
+    mov [leaf_der], rdi                ; kept for the signature check below
+    mov [leaf_der + 8], rsi
+    ; ...and WARN when the certificate does not speak for the name this server
+    ; answers to. RFC 6125: the SAN dNSNames decide, and only a certificate
+    ; without any of them falls back to the CN. A warning for the same reason
+    ; the expiry check is one -- and for one more: a name the certificate omits
+    ; is legitimate when a client reaches this vhost over a connection
+    ; authenticated for another name, which is exactly what HTTP/2 connection
+    ; coalescing does (test/configs/tls-coalesce.json serves alias.test from a
+    ; localhost certificate on purpose). Refusing would break that
+    ; (audit-report-119 F1).
+    push rdi
+    push rsi
+    mov rcx, [r13 + linnea_config_server.hostname_len]
+    test rcx, rcx
+    jz .host_done                      ; a server with no name to check
+    lea rdi, [r13 + linnea_config_server.hostname]
+    mov rsi, rcx
+    call host_is_ip
+    test eax, eax
+    jnz .host_done                     ; an IP literal is never a dNSName
+    mov rdi, [rsp + 8]                 ; the leaf DER, read back off the stack
+    mov rsi, [rsp]
+    lea rdx, [r13 + linnea_config_server.hostname]
+    mov rcx, [r13 + linnea_config_server.hostname_len]
+    call linnea_x509_leaf_host_ok
+    test eax, eax
+    jnz .host_done
+    lea rdi, [msg_cert_name]
+    mov esi, msg_cert_name_len
+    call linnea_print_stderr
+.host_done:
+    pop rsi
+    pop rdi
     call linnea_x509_leaf_spki         ; rax = SPKI, rdx = its length
     test rax, rax
     jz .bad_cert                       ; no SPKI in the field where one belongs
@@ -450,6 +496,39 @@ linnea_tls_setup:
     test eax, eax
     jz .key_selfcontradictory
 .pair_done:
+    ; ---- and when the certificate signs for ITSELF, check that signature.
+    ; A self-issued leaf carries the very key that signed it, so this needs no
+    ; trust store and no chain: it catches a corrupted or tampered certificate
+    ; (openssl x509 -badsig) that every check above still calls well-formed.
+    ;
+    ; Scope is deliberate. An issued leaf is signed by a key we do not have --
+    ; and would mostly be RSA or P-384, which this build cannot verify at all --
+    ; so it is left UNVERIFIED rather than refused, and rather than warned about
+    ; on every boot of a perfectly good Let's Encrypt certificate. A check that
+    ; runs and fails is fatal; a check that cannot run says nothing
+    ; (audit-report-119 F2).
+    mov rdi, [leaf_der]
+    mov rsi, [leaf_der + 8]
+    lea rdx, [sig_parts]
+    call linnea_x509_leaf_selfsig
+    test eax, eax
+    jz .sig_done
+    cmp qword [sig_parts + 32], 0      ; issuer == subject?
+    je .sig_done
+    cmp qword [sig_parts + 40], 0      ; ecdsa-with-SHA256?
+    je .sig_done
+    mov rdi, [sig_parts]
+    mov rsi, [sig_parts + 8]
+    lea rdx, [tbs_hash]
+    call linnea_sha256                 ; over the whole tbsCertificate element
+    lea rdi, [tbs_hash]
+    mov rsi, [sig_parts + 16]
+    mov rdx, [sig_parts + 24]
+    lea rcx, [leaf_pub]
+    call linnea_p256_ecdsa_verify_der
+    test eax, eax
+    jz .bad_sig
+.sig_done:
 .load_next:
     inc r12
     jmp .load
@@ -476,6 +555,10 @@ linnea_tls_setup:
     lea rdi, [msg_key_mismatch]
     mov esi, msg_key_mismatch_len
     jmp linnea_error_exit
+.bad_sig:
+    lea rdi, [msg_bad_sig]
+    mov esi, msg_bad_sig_len
+    jmp linnea_error_exit
 .bad_cert:
     lea rdi, [msg_bad_cert]
     mov esi, msg_bad_cert_len
@@ -488,6 +571,35 @@ linnea_tls_setup:
     lea rdi, [msg_bad_key]
     mov esi, msg_bad_key_len
     jmp linnea_error_exit
+
+; host_is_ip(rdi=name, rsi=len) -> eax = 1 when the text is an IP literal and
+; not a DNS name: any ':' makes it IPv6, and digits-and-dots throughout makes
+; it IPv4. Such a name cannot appear as a dNSName at all, so a certificate that
+; omits it is not evidence of anything and must not draw a warning.
+host_is_ip:
+    xor eax, eax
+    test rsi, rsi
+    jz .hi_ret
+    xor ecx, ecx
+.hi_scan:
+    cmp rcx, rsi
+    jae .hi_yes                ; ran off the end having seen only digits/dots
+    movzx edx, byte [rdi + rcx]
+    cmp dl, ':'
+    je .hi_yes
+    cmp dl, '.'
+    je .hi_next
+    cmp dl, '0'
+    jb .hi_ret
+    cmp dl, '9'
+    ja .hi_ret
+.hi_next:
+    inc rcx
+    jmp .hi_scan
+.hi_yes:
+    mov eax, 1
+.hi_ret:
+    ret
 
 ; cpuid_check_aesni — abort unless CPUID leaf 1 reports everything
 ; linnea_aesgcm.asm actually uses: AES-NI (ECX bit 25) for the block

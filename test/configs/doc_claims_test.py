@@ -315,6 +315,39 @@ if _os.path.exists(_CRT):
         test(_tls_cfg(_wrap(bytes(_n), _os.path.join(_TD, "badvernum.crt")), _KEY),
              "an out-of-range certificate version is rejected", False)
 
+
+    def _unself(der):
+        """`der` with the ISSUER name altered so issuer != subject.
+
+        The fixtures below re-encode the tbsCertificate, so the original signature
+        cannot survive them -- and nothing here can re-sign spliced DER. Since
+        audit-report-119 F2 the loader verifies a SELF-SIGNED leaf's own signature,
+        which would then reject these for their signature rather than for the
+        structure each claim is actually about, turning two acceptance controls
+        into passes for the wrong reason. Making them issued-by-someone-else puts
+        the signature out of scope (that issuer's key is not here, so there is
+        nothing to check it with) and leaves the structure as the thing under test.
+        One content byte changes case, so no length needs re-encoding.
+        """
+        def _tlv(b, i):
+            n, j = b[i + 1], i + 2
+            if n & 0x80:
+                k = n & 0x7f
+                n = int.from_bytes(b[j:j + k], "big")
+                j += k
+            return j, n
+        cs, _ = _tlv(der, 0)
+        ts, _ = _tlv(der, cs)
+        i = ts
+        if der[i] == 0xa0:                       # [0] version, optional
+            j, n = _tlv(der, i); i = j + n
+        j, n = _tlv(der, i); i = j + n           # serialNumber
+        j, n = _tlv(der, i); i = j + n           # signature AlgorithmIdentifier
+        j, n = _tlv(der, i)                      # issuer
+        out = bytearray(der)
+        out[j + n - 1] ^= 0x20                   # its last content byte, case-flipped
+        return bytes(out)
+
     # ...and the CONTROL that matters for that check: a v1 certificate omits the
     # version field entirely (DEFAULT v1), so the absent-[0] path must still
     # load. Nothing in the tree was v1, so this is built by stripping the
@@ -344,10 +377,39 @@ if _os.path.exists(_CRT):
         body = tbs + der[ts + tl:cs + cl]
         return b"\x30" + _len(len(body)) + body
 
-    _v1 = _mk_v1(_der)
+    _v1 = _mk_v1(_unself(_der))
     if _v1:
         test(_tls_cfg(_wrap(_v1, _os.path.join(_TD, "v1.crt")), _KEY),
              "a v1 certificate (no version field) is accepted", True)
+
+    # --- audit-report-119 F2: a SELF-SIGNED leaf carries the very key that
+    # signed it, so its own signature is checkable with no trust store and no
+    # chain. The last DER byte lives inside the ECDSA s value, so flipping it
+    # leaves the structure intact and only the signature wrong -- every other
+    # check here, the key/certificate pairing included, still passes.
+    _bs = bytearray(_der)
+    _bs[-1] ^= 0xff
+    test(_tls_cfg(_wrap(bytes(_bs), _os.path.join(_TD, "badsig.crt")), _KEY),
+         "a self-signed certificate with a broken signature is rejected",
+         False, "does not verify under its own public key")
+    # ...and the SCOPE control. The same broken signature on a certificate
+    # issued by SOMEONE ELSE is left alone: that issuer's key is not here, and
+    # in the real world is usually RSA or P-384, which this build cannot verify
+    # at all -- so it is left unverified rather than refused. Without this
+    # control a build that rejected every certificate outright would sail
+    # through the claim above.
+    _bi = bytearray(_unself(_der))
+    _bi[-1] ^= 0xff
+    test(_tls_cfg(_wrap(bytes(_bi), _os.path.join(_TD, "badsigissued.crt")), _KEY),
+         "an issued certificate's signature is left unverified, not refused", True)
+
+    # --- audit-report-119 F1: the certificate must also speak for the name
+    # this server answers to -- but as a WARNING, not a refusal, because
+    # serving a vhost over a connection authenticated for another of its names
+    # is exactly what HTTP/2 connection coalescing does.
+    if _os.path.exists("test/tls/wrongname.crt"):
+        test(_tls_cfg("test/tls/wrongname.crt", _KEY),
+             "a certificate naming no matching host still LOADS (warned)", True)
 
     # --- audit-report-103: AlgorithmIdentifier contents, and SPKI child count -
     # The outer signatureAlgorithm was only checked for non-emptiness, so its
@@ -735,7 +797,7 @@ if _os.path.exists(_CRT):
             tbs = tbs[:i] + bytearray(blob) + tbs[i:]
         return _enc(0x30, _enc(0x30, bytes(tbs)) + der[ts + tl:cs + cl])
 
-    _ok81 = _tbs_insert(_der, True, blob=b"\x81\x01\x00")
+    _ok81 = _tbs_insert(_unself(_der), True, blob=b"\x81\x01\x00")
     if _ok81:
         test(_tls_cfg(_wrap(_ok81, _os.path.join(_TD, "uid81.crt")), _KEY),
              "a conformant [1] IMPLICIT issuerUniqueID is ACCEPTED", True)

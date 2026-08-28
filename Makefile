@@ -87,7 +87,7 @@ TLSTEST_OBJS = test/tls/linnea_tlstest.o src/server/linnea_tls.o \
                src/lib/linnea_x25519.o src/server/linnea_pem.o \
                src/lib/linnea_p256_mont.o src/lib/linnea_p256_fe.o \
                src/lib/linnea_p256_scalar.o src/lib/linnea_p256_point.o \
-               src/lib/linnea_p256_ecdsa.o
+               src/lib/linnea_p256_ecdsa.o src/lib/linnea_random.o
 
 test/tls/linnea_tlstest.o: test/tls/linnea_tlstest.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -103,7 +103,8 @@ TLSCLIENT_OBJS = test/tls/linnea_tlsclient.o src/server/linnea_tls_client.o \
                  src/lib/linnea_x25519.o src/lib/linnea_fe25519.o src/lib/linnea_sha256.o \
                  src/lib/linnea_tls_kdf.o src/lib/linnea_tls_record.o src/lib/linnea_aesgcm.o \
                  src/lib/linnea_p256_ecdsa.o src/lib/linnea_p256_mont.o src/lib/linnea_p256_fe.o \
-                 src/lib/linnea_p256_scalar.o src/lib/linnea_p256_point.o src/server/linnea_pem.o
+                 src/lib/linnea_p256_scalar.o src/lib/linnea_p256_point.o src/server/linnea_pem.o \
+                 src/lib/linnea_random.o
 
 test/tls/linnea_tlsclient.o: test/tls/linnea_tlsclient.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -235,7 +236,8 @@ quicee: $(QUICEE_BIN)
 QUICCERT_BIN  = bin/linnea-quiccert
 QUICCERT_OBJS = test/quic/linnea_quiccert.o src/lib/linnea_quic.o src/lib/linnea_quic_crypto.o \
                 src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o src/lib/linnea_tls_kdf.o \
-                src/lib/linnea_x25519.o src/lib/linnea_fe25519.o src/server/linnea_pem.o $(QUICP256)
+                src/lib/linnea_x25519.o src/lib/linnea_fe25519.o src/server/linnea_pem.o \
+                src/lib/linnea_random.o $(QUICP256)
 
 test/quic/linnea_quiccert.o: test/quic/linnea_quiccert.asm test/tls/server.crt $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -248,7 +250,8 @@ quiccert: $(QUICCERT_BIN)
 # --- test-only: CertificateVerify (signed) and Finished for aioquic ---
 QUICMSG_OBJS = src/lib/linnea_quic.o src/lib/linnea_quic_crypto.o src/lib/linnea_aesgcm.o \
                src/lib/linnea_sha256.o src/lib/linnea_tls_kdf.o src/lib/linnea_x25519.o \
-               src/lib/linnea_fe25519.o src/server/linnea_pem.o $(QUICP256)
+               src/lib/linnea_fe25519.o src/server/linnea_pem.o \
+               src/lib/linnea_random.o $(QUICP256)
 
 test/quic/linnea_quiccv.o: test/quic/linnea_quiccv.asm test/tls/server.key $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<

@@ -97,6 +97,32 @@ run_test "tls cert without key" 1 stderr "server needs both cert and key, or nei
 run_test "tls listener mismatch" 1 stderr "servers sharing a listener must all set TLS or none" \
     $BIN --config $CFG/bad-tls-mismatch.json
 
+# --- the certificate must be the one it claims to be, and must speak for this
+# --- server's name (audit-report-119)
+
+# A self-signed leaf carries the very key that signed it, so its own signature
+# is checkable with no trust store and no chain. `openssl x509 -badsig` makes a
+# file that every other check here still calls well-formed, and that the
+# key/certificate pairing check still passes -- the SPKI is untouched.
+run_test "cert with a forged signature" 1 stderr "signature does not verify under its own public key" \
+    $BIN --config $CFG/cert-badsig.json --test
+# A certificate signed by SOMEONE ELSE is left UNVERIFIED rather than refused:
+# the issuer's key is not here, and is usually RSA or P-384 which this build
+# cannot check at all. Deliberately silent rather than warned about -- a warning
+# would fire on every boot of a perfectly good Let's Encrypt certificate.
+
+# The name check is a WARNING, not a refusal, because serving a vhost over a
+# connection authenticated for another of its names is legitimate: that is
+# exactly what HTTP/2 coalescing does, and what tls-coalesce.json exercises.
+run_test "cert name mismatch warns" 0 stderr "presents no name matching this server's hostname" \
+    $BIN --config $CFG/cert-wrong-name.json --test
+# ACCEPTANCE CONTROL. Without it a build that warned about EVERY certificate
+# would sail through the check above -- the failure mode that made a green
+# suite miss a constant HTTP/1.1 in the access log.
+cert_name_out=$($BIN --config $CFG/tls.json --test 2>&1)
+check "a matching cert name warns about nothing" \
+    "$(printf '%s' "$cert_name_out" | grep -qF 'presents no name' && echo 1 || echo 0)"
+
 # Listener identity is the CANONICAL endpoint, not the host text (audit-report-2
 # Finding 1). "::" and "0.0.0.0" are one in6addr_any endpoint, so the same
 # hostname on both is a duplicate on the shared listener...

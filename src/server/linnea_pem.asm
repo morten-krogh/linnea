@@ -25,6 +25,8 @@ global linnea_x509_find_spki
 global linnea_x509_cert_wellformed
 global linnea_x509_leaf_spki
 global linnea_x509_leaf_usage_ok
+global linnea_x509_leaf_host_ok
+global linnea_x509_leaf_selfsig
 global linnea_x509_leaf_validity_times
 global linnea_x509_spki_point
 
@@ -2334,6 +2336,515 @@ linnea_x509_spki_point:
     pop rbx
     ret
 
+; ---- host_match(rdi=pattern, rsi=patlen, rdx=host, rcx=hostlen) -> eax = 1 when
+;      the presented name covers the host. ASCII case-insensitive (RFC 4343:
+;      DNS names compare without regard to case).
+;
+;      A leading "*." matches exactly ONE leftmost label, and only when what
+;      follows still contains a dot -- so "*.com" cannot cover "example.com"
+;      and "*.example.com" cannot cover "a.b.example.com". The wildcard must be
+;      the whole leftmost label: "f*.example.com" is not honoured, matching what
+;      browsers actually do rather than the looser grammar of RFC 6125 6.4.3.
+;      File-local: pure text over bytes the caller already bounded.
+host_match:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    test rsi, rsi
+    jz .no
+    test rcx, rcx
+    jz .no
+    mov rbx, rdi                     ; pattern
+    mov r12, rsi                     ; its length
+    mov r13, rdx                     ; host
+    mov r14, rcx                     ; its length
+    cmp r12, 2
+    jb .exact
+    cmp byte [rbx], '*'
+    jne .exact
+    cmp byte [rbx + 1], '.'
+    jne .exact
+    add rbx, 2                       ; the pattern past "*."
+    sub r12, 2
+    jz .no
+    xor r15, r15                     ; the remainder must still hold a dot
+.pdot:
+    cmp r15, r12
+    jae .no
+    cmp byte [rbx + r15], '.'
+    je .pdot_ok
+    inc r15
+    jmp .pdot
+.pdot_ok:
+    xor r15, r15                     ; consume the host's leftmost label
+.hdot:
+    cmp r15, r14
+    jae .no                          ; no dot: there is no label to absorb
+    cmp byte [r13 + r15], '.'
+    je .hdot_ok
+    inc r15
+    jmp .hdot
+.hdot_ok:
+    test r15, r15
+    jz .no                           ; an empty leftmost label matches nothing
+    inc r15                          ; step over the dot itself
+    add r13, r15
+    sub r14, r15
+    ; deliberate fall-through: what is left of both sides now compares exactly
+.exact:
+    cmp r12, r14
+    jne .no
+    xor r15, r15
+.cmp:
+    cmp r15, r12
+    jae .yes
+    movzx eax, byte [rbx + r15]
+    movzx ecx, byte [r13 + r15]
+    cmp al, 'A'
+    jb .alow
+    cmp al, 'Z'
+    ja .alow
+    add al, 32
+.alow:
+    cmp cl, 'A'
+    jb .blow
+    cmp cl, 'Z'
+    ja .blow
+    add cl, 32
+.blow:
+    cmp al, cl
+    jne .no
+    inc r15
+    jmp .cmp
+.yes:
+    mov eax, 1
+    jmp .ret
+.no:
+    xor eax, eax
+.ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- linnea_x509_leaf_host_ok(rdi=der, rsi=len, rdx=host, rcx=hostlen)
+;      -> rax = 1 when the certificate presents a name covering `host`.
+;
+;      RFC 6125 6.4.4 / RFC 2818: when the certificate carries a
+;      subjectAltName with at least one dNSName, the CN is IGNORED entirely --
+;      a certificate that lists other names does not get to fall back on a CN
+;      it also happens to carry. Only a certificate with no dNSName at all
+;      falls back to the subject's commonName.
+;
+;      Parse only. It reports what the certificate says; whether a mismatch is
+;      fatal is the caller's policy (audit-report-118's split).
+linnea_x509_leaf_host_ok:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 64
+    mov [rsp + 0], rdx               ; host
+    mov [rsp + 8], rcx               ; its length
+    mov qword [rsp + 32], 0          ; no dNSName seen yet
+    mov qword [rsp + 40], 0          ; and nothing has matched
+    test rcx, rcx
+    jz .no                           ; an empty hostname is covered by nothing
+    lea r13, [rdi + rsi]
+    mov rsi, r13
+    call der_any                     ; Certificate
+    cmp rax, -1
+    je .no
+    mov rdi, rax
+    lea r13, [rax + rcx]
+    mov rsi, r13
+    call der_any                     ; tbsCertificate
+    cmp rax, -1
+    je .no
+    mov [rsp + 16], rax
+    lea rcx, [rax + rcx]
+    mov [rsp + 24], rcx
+    mov rbx, [rsp + 16]
+    mov r13, [rsp + 24]
+.scan:
+    cmp rbx, r13
+    jae .cn                          ; no extensions block at all
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any
+    cmp rax, -1
+    je .no
+    cmp dl, 0xa3
+    je .exts
+    lea rbx, [rax + rcx]
+    jmp .scan
+.exts:
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call der_any                     ; the Extensions SEQUENCE
+    cmp rax, -1
+    je .no
+    mov rbx, rax
+    lea r13, [rax + rcx]
+.each:
+    cmp rbx, r13
+    jae .decide
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; one Extension
+    cmp rax, -1
+    je .no
+    mov r14, rax
+    lea r12, [rax + rcx]
+    mov rdi, r14
+    mov rsi, r12
+    call der_any                     ; extnID
+    cmp rax, -1
+    je .no
+    lea rdi, [rax - 2]
+    mov rsi, rcx
+    add rsi, 2
+    cmp rsi, oid_san_len
+    jne .next
+    lea rsi, [oid_san]
+    mov rcx, oid_san_len
+    call bytes_eq
+    test eax, eax
+    jz .next
+    mov rdi, r14
+    mov rsi, r12
+    call ext_value_of
+    test rax, rax
+    jz .no
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call der_any                     ; GeneralNames
+    cmp rax, -1
+    je .no
+    cmp dl, 0x30
+    jne .no
+    mov rbx, rax
+    lea r12, [rax + rcx]
+.gn:
+    cmp rbx, r12
+    jae .decide
+    mov rdi, rbx
+    mov rsi, r12
+    call der_any
+    cmp rax, -1
+    je .no
+    lea r15, [rax + rcx]             ; the next GeneralName
+    ; dNSName is [2] IMPLICIT IA5String: PRIMITIVE 0x82. Reading it as the
+    ; constructed 0xa2 is the mistake audit-report-114 made in the other
+    ; direction -- an IMPLICIT tag replaces the base tag, it does not wrap it.
+    cmp dl, 0x82
+    jne .gn_adv
+    mov qword [rsp + 32], 1
+    mov rdi, rax
+    mov rsi, rcx
+    mov rdx, [rsp + 0]
+    mov rcx, [rsp + 8]
+    call host_match
+    test eax, eax
+    jz .gn_adv
+    mov qword [rsp + 40], 1
+.gn_adv:
+    mov rbx, r15
+    jmp .gn
+.next:
+    mov rbx, r12
+    jmp .each
+.decide:
+    cmp qword [rsp + 32], 0
+    je .cn                           ; no dNSName anywhere: the CN may speak
+    mov rax, [rsp + 40]
+    jmp .ret
+.cn:
+    mov rbx, [rsp + 16]
+    mov r13, [rsp + 24]
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; [0] version, or the serialNumber
+    cmp rax, -1
+    je .no
+    cmp dl, 0xa0
+    jne .cn_serial
+    lea rbx, [rax + rcx]
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; serialNumber
+    cmp rax, -1
+    je .no
+.cn_serial:
+    lea rbx, [rax + rcx]
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; signature AlgorithmIdentifier
+    cmp rax, -1
+    je .no
+    lea rbx, [rax + rcx]
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; issuer
+    cmp rax, -1
+    je .no
+    lea rbx, [rax + rcx]
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; validity
+    cmp rax, -1
+    je .no
+    lea rbx, [rax + rcx]
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; subject
+    cmp rax, -1
+    je .no
+    cmp dl, 0x30
+    jne .no
+    mov rbx, rax
+    lea r13, [rax + rcx]
+.rdn:
+    cmp rbx, r13
+    jae .no                          ; the subject carries no commonName
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; RelativeDistinguishedName SET
+    cmp rax, -1
+    je .no
+    mov r14, rax
+    lea rcx, [rax + rcx]
+    mov [rsp + 48], rcx              ; this SET's end
+    mov [rsp + 56], rcx              ; ...which is where the next RDN begins
+.atv:
+    mov rax, [rsp + 48]
+    cmp r14, rax
+    jae .rdn_adv
+    mov rdi, r14
+    mov rsi, rax
+    call der_any                     ; AttributeTypeAndValue
+    cmp rax, -1
+    je .no
+    lea r12, [rax + rcx]             ; its end
+    mov rdi, rax
+    mov rsi, r12
+    mov r14, r12                     ; the next attribute
+    call der_any                     ; its type OID
+    cmp rax, -1
+    je .no
+    lea rdi, [rax - 2]
+    mov rsi, rcx
+    add rsi, 2
+    lea r15, [rax + rcx]             ; where the value begins
+    cmp rsi, oid_cn_len
+    jne .atv
+    lea rsi, [oid_cn]
+    mov rcx, oid_cn_len
+    call bytes_eq
+    test eax, eax
+    jz .atv
+    mov rdi, r15
+    mov rsi, r12
+    call der_any                     ; the DirectoryString
+    cmp rax, -1
+    je .no
+    mov rdi, rax
+    mov rsi, rcx
+    mov rdx, [rsp + 0]
+    mov rcx, [rsp + 8]
+    call host_match
+    test eax, eax
+    jnz .yes
+    jmp .atv
+.rdn_adv:
+    mov rbx, [rsp + 56]
+    jmp .rdn
+.yes:
+    mov eax, 1
+    jmp .ret
+.no:
+    xor eax, eax
+.ret:
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- linnea_x509_leaf_selfsig(rdi=der, rsi=len, rdx=out) -> rax = 1 when the
+;      certificate parsed. Writes six qwords at `out`:
+;        [0] tbsCertificate element pointer -- WITH its tag and length, because
+;            the signature covers the whole DER element, not its content
+;        [1] that element's total length
+;        [2] signatureValue: the BIT STRING's content past the unused-bits
+;            octet, i.e. a bare ECDSA-Sig-Value SEQUENCE
+;        [3] its length
+;        [4] 1 when issuer and subject are byte-identical (self-issued)
+;        [5] 1 when signatureAlgorithm is ecdsa-with-SHA256
+;
+;      Parse only -- it neither hashes nor verifies. Two harnesses (QUICCERT,
+;      QUICMSG) link this object WITHOUT linnea_p256_ecdsa.o, so calling the
+;      verifier from here would break their link exactly as report 96's
+;      lib-calling-a-server-symbol broke linnea-probe. The caller owns the
+;      crypto.
+linnea_x509_leaf_selfsig:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 32
+    mov [rsp + 0], rdx
+    xor eax, eax
+    mov [rdx + 0], rax
+    mov [rdx + 8], rax
+    mov [rdx + 16], rax
+    mov [rdx + 24], rax
+    mov [rdx + 32], rax
+    mov [rdx + 40], rax
+    lea r13, [rdi + rsi]
+    mov rsi, r13
+    call der_any                     ; Certificate
+    cmp rax, -1
+    je .no
+    cmp dl, 0x30
+    jne .no
+    mov r14, rax                     ; == where tbsCertificate's tag sits
+    lea r13, [rax + rcx]             ; the certificate's end
+    mov rdi, r14
+    mov rsi, r13
+    call der_any                     ; tbsCertificate
+    cmp rax, -1
+    je .no
+    cmp dl, 0x30
+    jne .no
+    mov r12, rax                     ; its content
+    lea r15, [rax + rcx]             ; and its end
+    mov rbx, [rsp + 0]
+    mov [rbx + 0], r14
+    mov rax, r15
+    sub rax, r14
+    mov [rbx + 8], rax
+    mov rdi, r15
+    mov rsi, r13
+    call der_any                     ; signatureAlgorithm
+    cmp rax, -1
+    je .no
+    cmp dl, 0x30
+    jne .no
+    mov r14, rax
+    lea rcx, [rax + rcx]
+    mov [rsp + 8], rcx
+    mov rdi, r14
+    mov rsi, [rsp + 8]
+    call der_any                     ; its OID
+    cmp rax, -1
+    je .sig                          ; unknown shape: the flag simply stays 0
+    lea rdi, [rax - 2]
+    mov rsi, rcx
+    add rsi, 2
+    cmp rsi, oid_ecdsa_sha256_len
+    jne .sig
+    lea rsi, [oid_ecdsa_sha256]
+    mov rcx, oid_ecdsa_sha256_len
+    call bytes_eq
+    test eax, eax
+    jz .sig
+    mov rbx, [rsp + 0]
+    mov qword [rbx + 40], 1
+.sig:
+    mov rdi, [rsp + 8]
+    mov rsi, r13
+    call der_any                     ; signatureValue
+    cmp rax, -1
+    je .no
+    cmp dl, 0x03
+    jne .no
+    test rcx, rcx
+    jz .no
+    cmp byte [rax], 0
+    jne .no                          ; a signature is whole octets: 0 unused
+    inc rax
+    dec rcx
+    mov rbx, [rsp + 0]
+    mov [rbx + 16], rax
+    mov [rbx + 24], rcx
+    mov rbx, r12
+    mov rdi, rbx
+    mov rsi, r15
+    call der_any                     ; [0] version, or the serialNumber
+    cmp rax, -1
+    je .no
+    cmp dl, 0xa0
+    jne .ss_serial
+    lea rbx, [rax + rcx]
+    mov rdi, rbx
+    mov rsi, r15
+    call der_any                     ; serialNumber
+    cmp rax, -1
+    je .no
+.ss_serial:
+    lea rbx, [rax + rcx]
+    mov rdi, rbx
+    mov rsi, r15
+    call der_any                     ; signature AlgorithmIdentifier
+    cmp rax, -1
+    je .no
+    lea rbx, [rax + rcx]             ; the issuer element starts here
+    mov rdi, rbx
+    mov rsi, r15
+    call der_any                     ; issuer
+    cmp rax, -1
+    je .no
+    lea r14, [rax + rcx]
+    mov [rsp + 16], rbx
+    mov rax, r14
+    sub rax, rbx
+    mov [rsp + 24], rax
+    mov rdi, r14
+    mov rsi, r15
+    call der_any                     ; validity
+    cmp rax, -1
+    je .no
+    lea rbx, [rax + rcx]             ; the subject element starts here
+    mov rdi, rbx
+    mov rsi, r15
+    call der_any                     ; subject
+    cmp rax, -1
+    je .no
+    lea rax, [rax + rcx]
+    sub rax, rbx
+    cmp rax, [rsp + 24]
+    jne .done                        ; different sizes: not self-issued
+    mov rdi, [rsp + 16]
+    mov rsi, rbx
+    mov rcx, rax
+    call bytes_eq
+    test eax, eax
+    jz .done
+    mov rbx, [rsp + 0]
+    mov qword [rbx + 32], 1
+.done:
+    mov eax, 1
+    jmp .ret
+.no:
+    xor eax, eax
+.ret:
+    add rsp, 32
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 section .rodata
 ; The AlgorithmIdentifier content for a prime256v1 key: OID id-ecPublicKey
 ; (1.2.840.10045.2.1) then OID prime256v1 (1.2.840.10045.3.1.7).
@@ -2349,6 +2860,14 @@ oid_srv:    db 0x06,0x08,0x2b,0x06,0x01,0x05,0x05,0x07,0x03,0x01  ; id-kp-server
 oid_srv_len equ $ - oid_srv
 oid_any:    db 0x06,0x04,0x55,0x1d,0x25,0x00     ; anyExtendedKeyUsage
 oid_any_len equ $ - oid_any
+oid_san:    db 0x06,0x03,0x55,0x1d,0x11          ; 2.5.29.17  subjectAltName
+oid_san_len equ $ - oid_san
+oid_cn:     db 0x06,0x03,0x55,0x04,0x03          ; 2.5.4.3    id-at-commonName
+oid_cn_len  equ $ - oid_cn
+; 1.2.840.10045.4.3.2  ecdsa-with-SHA256 -- the only certificate signature this
+; build can actually check; anything else is left unverified, not accepted.
+oid_ecdsa_sha256: db 0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x04,0x03,0x02
+oid_ecdsa_sha256_len equ $ - oid_ecdsa_sha256
 alg_ec_curve     equ alg_ec + 9
 alg_ec_curve_len equ 10
 section .text
