@@ -410,6 +410,49 @@ emit_field:
     inc rcx
     jmp .ef_name_scan
 .ef_name_ok:
+    ; ...and the scan above is only 8.2.1's MINIMAL validation. A field name is
+    ; a TOKEN (RFC 9110 5.1, 5.6.2), and 8.2.1 opens by asking for exactly that:
+    ; "HTTP/2 implementations SHOULD validate field names and values according
+    ; to their definitions in Sections 5.1 and 5.5 of [HTTP] ... and treat
+    ; messages that contain prohibited characters as malformed", with the note
+    ; that such an implementation "only needs an additional check that field
+    ; names do not include uppercase characters" — which is the loop above.
+    ; RFC 9114 4.2 sends HTTP/3 to the same 5.1 for what a field name is.
+    ;
+    ; The character ranges alone let every delimiter but ':' through — @ ( ) ,
+    ; " / [ ] { } \ = — and the proxy rebuild below writes the name straight
+    ; into the HTTP/1.1 head sent upstream, so "x@test" over h2 or h3 became an
+    ; h1 request line our OWN h1 door answers 400 to — linnea_http.asm has held
+    ; h1 field names to this same helper. Two protocols, two verdicts, one
+    ; backend:
+    ; the parser differential the h1 check exists to prevent, reached by the
+    ; other door (audit-report-123).
+    ;
+    ; Unlike DEL in a VALUE (report 122), which h2 permits and only h1 forbids —
+    ; hence .h1_unsafe, a flag the proxy paths read — a non-token NAME is
+    ; prohibited by the definition 8.2.1 points at, so it is malformed wherever
+    ; the request is going and is refused here, static request included.
+    push rax
+    push rdx
+    push rsi
+    push rdi
+    mov rdi, rax
+    mov rsi, rdx
+    cmp byte [rdi], ':'
+    jne .ef_name_token
+    inc rdi                          ; a pseudo-header: ':' is not a tchar, and
+    dec rsi                          ; the loop above already held it to the
+                                     ; first byte. ":" alone leaves nothing,
+                                     ; which is not a token either.
+.ef_name_token:
+    call linnea_string_is_token      ; the one tchar bitmap h1 has always used
+    mov r8d, eax                     ; the verdict, before the pops put the name
+    pop rdi                          ; pointer back into rax
+    pop rsi
+    pop rdx
+    pop rax
+    test r8d, r8d
+    jz .ef_bad
     xor ecx, ecx
 .ef_val_scan:
     cmp rcx, rdi

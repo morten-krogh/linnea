@@ -39,6 +39,21 @@ if [ "$ktls" = 1 ]; then
     timeout 120 python3 test/proxy_del_field.py $CA ${P61462} >/dev/null 2>&1
     check "proxy: h1/h2/h3 agree on refusing DEL in a forwarded field value" $?
 
+    # audit-report-123: an HTTP field name is a token (RFC 9110 5.1, 5.6.2), and
+    # h1 has always been held to that -- h2 and h3 were held only to RFC 9113
+    # 8.2.1's MINIMAL list (no 0x00-0x20, no uppercase, no 0x7f-0xff, no
+    # non-leading colon), which lets every delimiter but ':' through. "x@test"
+    # was therefore served over h2/h3 and written verbatim into the HTTP/1.1
+    # head sent upstream -- an h1 request our own h1 door answers 400 to. All
+    # three must refuse it now, with the echoed head proving the backend never
+    # heard of it. The controls that keep the refusal honest: every tchar
+    # punctuation mark 5.6.2 allows, in one name, still served and echoed -- a
+    # fix that refused punctuation wholesale would pass every rejection row here
+    # and fail that one -- and the four pseudo-headers, whose leading ':' is not
+    # a tchar, ride on every request in the file.
+    timeout 120 python3 test/proxy_field_name.py $CA ${P61462} >/dev/null 2>&1
+    check "proxy: h1/h2/h3 agree on refusing a non-token field name" $?
+
     # The h3 half of /api/bigearly, which that matrix cannot judge: six 103
     # Early Hints whose ENCODED sum overran the one buffer the interim frames
     # share, so h3 answered 502 to an exchange h1 and h2 served (audit-report-8
