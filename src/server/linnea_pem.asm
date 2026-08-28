@@ -473,10 +473,65 @@ linnea_pem_p256_key:
     je .fail
     cmp rcx, 32                     ; SEC1 fixes this at ceil(log2 n / 8)
     jne .fail
+    ; --- and the rest of ECPrivateKey, to its exact end -------------------
+    ; RFC 5915 3: version, privateKey, [0] parameters OPTIONAL, [1] publicKey
+    ; OPTIONAL. This returned the moment it had the scalar, so everything after
+    ; it went unexamined and a [1] retagged as an OCTET STRING passed while
+    ; OpenSSL refuses the file (audit-report-104). Ignoring an ABSENT optional
+    ; field is not the same as accepting an ill-formed one.
+    push rax                        ; the scalar, to return
+    push rcx
+    lea rbx, [rax + rcx]
+.pk_tail:
+    cmp rbx, r13
+    jae .pk_end
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any
+    cmp rax, -1
+    je .pk_bad
+    cmp dl, 0xa0
+    je .pk_next                     ; [0] parameters: a named curve, skipped
+    cmp dl, 0xa1
+    jne .pk_bad                     ; nothing else belongs in ECPrivateKey
+    ; [1] wraps a BIT STRING holding an uncompressed P-256 point. Accepting it
+    ; unexamined is what the report objected to; it is checked structurally
+    ; here, and the ktls pairing then proves the SCALAR signs for the
+    ; certificate, which is the property that actually matters.
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call der_any
+    cmp rax, -1
+    je .pk_bad2
+    cmp dl, 0x03                    ; BIT STRING
+    jne .pk_bad2
+    cmp rcx, 66                     ; 00 unused-bits + 04 + X(32) + Y(32)
+    jne .pk_bad2
+    cmp byte [rax], 0x00
+    jne .pk_bad2
+    cmp byte [rax + 1], 0x04        ; uncompressed only
+    jne .pk_bad2
+    pop rcx
+    pop rax
+.pk_next:
+    lea rbx, [rax + rcx]
+    jmp .pk_tail
+.pk_end:
+    cmp rbx, r13
+    jne .pk_bad                     ; a child overran ECPrivateKey
+    pop rcx
+    pop rax
     pop r13
     pop r12
     pop rbx
     ret
+.pk_bad2:
+    add rsp, 16                     ; drop the inner save
+.pk_bad:
+    add rsp, 16                     ; drop the scalar save
+    jmp .fail
 .fail:
     mov rax, -1
     pop r13

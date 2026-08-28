@@ -400,6 +400,33 @@ if _os.path.exists(_CRT):
                   _KEY),
          "an SPKI with a third child is rejected", False)
 
+    # --- audit-report-104: ECPrivateKey is parsed to its end ----------------
+    # RFC 5915 3: version, privateKey, [0] parameters OPTIONAL, [1] publicKey
+    # OPTIONAL. The parser returned as soon as it had the scalar, so anything
+    # after it went unexamined. Ignoring an ABSENT optional field is not the
+    # same as accepting an ill-formed one.
+    def _wrap_key(der, path):
+        body = "\n".join(_tw.wrap(_b64.b64encode(der).decode(), 64))
+        open(path, "w").write(
+            "-----BEGIN PRIVATE KEY-----\n" + body + "\n-----END PRIVATE KEY-----\n")
+        return path
+
+    _kder = _b64.b64decode("".join(
+        l for l in open(_KEY).read().splitlines() if "-----" not in l))
+    _p1 = _kder.find(b"\xa1", 60, 80)
+    if _p1 < 0:
+        bad.append("could not locate the [1] publicKey field in the test key")
+        print("FAIL could not locate the [1] publicKey field in the test key")
+    else:
+        _k = bytearray(_kder)
+        _k[_p1] = 0x04                    # [1] -> OCTET STRING
+        test(_tls_cfg(_CRT, _wrap_key(bytes(_k), _os.path.join(_TD, "badopt.key"))),
+             "a retagged [1] publicKey is rejected", False)
+        _k2 = bytearray(_kder)
+        _k2[_p1 + 2] = 0x04               # its inner BIT STRING -> OCTET STRING
+        test(_tls_cfg(_CRT, _wrap_key(bytes(_k2), _os.path.join(_TD, "badinner.key"))),
+             "a malformed [1] publicKey body is rejected", False)
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",
