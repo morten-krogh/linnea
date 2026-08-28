@@ -628,6 +628,72 @@ if _os.path.exists(_CRT):
         bad.append("could not locate the commonName content to mutate")
         print("FAIL could not locate the commonName content to mutate")
 
+    # --- audit-report-113 ---------------------------------------------------
+    # F1: tbs_walk RETURNED at the SPKI, so anything appended after it inside
+    # the TBS was never seen. RFC 5280 4.1.2 allows only [1] issuerUniqueID,
+    # [2] subjectUniqueID and [3] extensions there.
+    def _reenc(der, mutate):
+        def _tlv(b, i):
+            n, j = b[i + 1], i + 2
+            if n & 0x80:
+                k = n & 0x7f
+                n = int.from_bytes(b[j:j + k], "big")
+                j += k
+            return j, n
+
+        def _enc(tag, c):
+            n = len(c)
+            if n < 0x80:
+                L = bytes([n])
+            else:
+                w = (n.bit_length() + 7) // 8
+                L = bytes([0x80 | w]) + n.to_bytes(w, "big")
+            return bytes([tag]) + L + c
+
+        cs, cl = _tlv(der, 0)
+        ts, tl = _tlv(der, cs)
+        return _enc(0x30, mutate(_enc, der, ts, tl) + der[ts + tl:cs + cl])
+
+    _tail = _reenc(_der, lambda e, d, ts, tl: e(0x30, d[ts:ts + tl] + b"\x05\x00"))
+    test(_tls_cfg(_wrap(_tail, _os.path.join(_TD, "tbstail.crt")), _KEY),
+         "an untagged element after the SPKI is rejected", False)
+
+    # F2: only the LEAF reached an SPKI check, so a malformed INTERMEDIATE was
+    # framed and transmitted. Every entry is validated now -- generically, since
+    # an issuer need not be P-256.
+    def _spki_alg_at(der):
+        def _tlv(b, i):
+            n, j = b[i + 1], i + 2
+            if n & 0x80:
+                k = n & 0x7f
+                n = int.from_bytes(b[j:j + k], "big")
+                j += k
+            return j, n
+        cs, _ = _tlv(der, 0)
+        ts, _ = _tlv(der, cs)
+        i = ts
+        if der[i] == 0xa0:
+            vs, vl = _tlv(der, i); i = vs + vl
+        for _ in range(5):
+            s2, l2 = _tlv(der, i); i = s2 + l2
+        ss, _ = _tlv(der, i)
+        return ss
+
+    _alg = _spki_alg_at(_der)
+    if _der[_alg] == 0x30:
+        _bi = bytearray(_der)
+        _bi[_alg] = 0x05                # the intermediate's SPKI AlgId -> NULL
+        _chain = _os.path.join(_TD, "badchain2.crt")
+        open(_chain, "w").write(_pem + "-----BEGIN CERTIFICATE-----\n" +
+                                "\n".join(_tw.wrap(_b64.b64encode(bytes(_bi)).decode(), 64)) +
+                                "\n-----END CERTIFICATE-----\n")
+        test(_tls_cfg(_chain, _KEY),
+             "a valid leaf with a structurally invalid intermediate SPKI is rejected",
+             False)
+    else:
+        bad.append("could not locate the SPKI AlgorithmIdentifier to mutate")
+        print("FAIL could not locate the SPKI AlgorithmIdentifier to mutate")
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

@@ -1163,6 +1163,106 @@ attr_ok:
     pop rbx
     ret
 
+; ---- spki_ok(rdi=content, rsi=end) -> rax = 1 when the range is a
+;      SubjectPublicKeyInfo: SEQUENCE { AlgorithmIdentifier, BIT STRING },
+;      filling it exactly. GENERIC on purpose -- it runs on every chain entry
+;      and an issuer need not be P-256; the leaf's curve requirement lives in
+;      linnea_x509_leaf_spki. Only the LEAF used to reach any SPKI check at all,
+;      so a malformed intermediate was framed and sent (audit-report-113 F2).
+spki_ok:
+    push rbx
+    mov rbx, rsi
+    call der_any                     ; AlgorithmIdentifier
+    cmp rax, -1
+    je .sp_no
+    cmp dl, 0x30
+    jne .sp_no
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call alg_id_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .sp_no
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; subjectPublicKey
+    cmp rax, -1
+    je .sp_no
+    cmp dl, 0x03                     ; BIT STRING
+    jne .sp_no
+    test rcx, rcx
+    jz .sp_no
+    cmp byte [rax], 8                ; the unused-bits octet is 0..7
+    jae .sp_no
+    lea rdi, [rax + rcx]
+    cmp rdi, rbx
+    jne .sp_no                       ; a third child
+    mov eax, 1
+    pop rbx
+    ret
+.sp_no:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ---- tbs_suffix_ok(rdi=from, rsi=end) -> rax = 1 when what follows the SPKI is
+;      a legal TBSCertificate tail: nothing, or [1] issuerUniqueID, [2]
+;      subjectUniqueID, [3] extensions -- each at most once, in ascending order,
+;      ending exactly at the TBS end. The walk used to RETURN at the SPKI, so an
+;      untagged NULL appended after it was never seen (audit-report-113 F1).
+tbs_suffix_ok:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    xor r13d, r13d                   ; highest optional tag accepted so far
+.ts_next:
+    cmp rbx, r12
+    je .ts_yes
+    ja .ts_no                        ; a child overran the TBS
+    mov rdi, rbx
+    mov rsi, r12
+    call der_any
+    cmp rax, -1
+    je .ts_no
+    cmp dl, 0xa1
+    je .ts_one
+    cmp dl, 0xa2
+    je .ts_two
+    cmp dl, 0xa3
+    je .ts_three
+    jmp .ts_no                       ; nothing else may follow the SPKI
+.ts_one:
+    mov edi, 1
+    jmp .ts_order
+.ts_two:
+    mov edi, 2
+    jmp .ts_order
+.ts_three:
+    mov edi, 3
+.ts_order:
+    cmp edi, r13d
+    jbe .ts_no                       ; repeated, or out of order
+    mov r13d, edi
+    lea rbx, [rax + rcx]
+    jmp .ts_next
+.ts_yes:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ts_no:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; ---- tbs_walk(rdi=der, rsi=len) -> rax = the SubjectPublicKeyInfo element,
 ;      rdx = its length; rax = 0 if these bytes are not a structurally valid
 ;      X.509 Certificate. File-local; the two public entry points below share it
@@ -1384,6 +1484,26 @@ tbs_walk:
     je .tw_no
     cmp dl, 0x30
     jne .tw_no
+    ; the SPKI's own shape, for EVERY entry
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call spki_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .tw_no
+    ; ...and whatever follows it must be a legal TBS tail, ending exactly
+    push rax
+    push rcx
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call tbs_suffix_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .tw_no
     lea rdx, [rax + rcx]
     sub rdx, r14                     ; its full length, header included
     mov rax, r14
