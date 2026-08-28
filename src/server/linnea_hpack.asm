@@ -51,9 +51,12 @@ extern linnea_string_iequal
 
 section .rodata
 
-; reg-name allowlist (RFC 3986 unreserved + sub-delims; pct-encoding is not
-; supported so "%" is not set). Bit (c & 7) of byte (c >> 3) is set for an
-; allowed ASCII byte; every byte >= 0x80 is rejected outright.
+; reg-name allowlist (RFC 3986 unreserved + sub-delims). Bit (c & 7) of byte
+; (c >> 3) is set for an allowed ASCII byte; every byte >= 0x80 is rejected
+; outright. "%" is deliberately NOT set here: pct-encoded is a three-byte unit,
+; not a byte class, so .ah_u_scan handles it and this table stays the single
+; byte rule -- which is what lets IPvFuture (unreserved / sub-delims / ":",
+; with no pct-encoded alternative) share it unchanged.
 ah_regname_tab: db 0x00,0x00,0x00,0x00,0xd2,0x7f,0xff,0x2b,0xfe,0xff,0xff,0x87,0xfe,0xff,0xff,0x47
 pseudo_method:  db ":method"
 pseudo_path:    db ":path"
@@ -1916,9 +1919,38 @@ linnea_http_authority_host:
     movzx eax, byte [r12 + rcx]
     cmp al, ':'
     je .ah_u_port
+    cmp al, '%'
+    je .ah_u_pct
     call .ah_regname_ok               ; CF set if not an RFC 3986 reg-name byte
     jc .ah_bad                        ; "/", "?", "#", "@", ... are not a host
     inc rcx
+    jmp .ah_u_scan
+    ; RFC 3986 3.2.2 gives reg-name three alternatives and only two were here:
+    ;   reg-name = *( unreserved / pct-encoded / sub-delims )
+    ; so "alpha%2Etest" -- a legal uri-host, and therefore a legal Host,
+    ; :authority and CONNECT target -- was answered 400, indistinguishable from
+    ; the malformed "alpha%ZZ.test" (report 127). pct-encoded is one unit of
+    ; exactly three bytes, "%" HEXDIG HEXDIG (RFC 3986 2.1), and both digits
+    ; must be present: a truncated escape at the end of the authority
+    ; ("alpha%", "alpha%2") is still malformed, and so is a non-hex one.
+    ;
+    ; Nothing is decoded. The host comes back as an offset and a length into
+    ; the caller's buffer -- there is nowhere to put a decoded copy without
+    ; changing that contract -- so "alpha%2Etest" matches no configured
+    ; hostname and falls through to the default vhost, exactly as "[::1]" and
+    ; "[v1.fe80]" do. That is also what nginx does with it. See report 127's
+    ; Resolution for why normalizing was declined rather than deferred.
+.ah_u_pct:
+    lea rax, [rcx + 2]
+    cmp rax, r13
+    jae .ah_bad                       ; fewer than two bytes follow the "%"
+    movzx eax, byte [r12 + rcx + 1]
+    call .ah_hexdig_ok
+    jc .ah_bad
+    movzx eax, byte [r12 + rcx + 2]
+    call .ah_hexdig_ok
+    jc .ah_bad
+    add rcx, 3                        ; past the whole pct-encoded unit
     jmp .ah_u_scan
 .ah_u_hostonly:
     test rcx, rcx
@@ -2083,6 +2115,28 @@ linnea_http_authority_host:
     clc
     ret
 .rn_no:
+    stc
+    ret
+
+; .ah_hexdig_ok(al = byte) -> CF clear iff al is a HEXDIG (RFC 3986 2.1 takes
+; ABNF's, and an ABNF string literal is case-insensitive, so "a" and "A" both
+; count -- "%2e" and "%2E" are the same octet). Internal to
+; linnea_http_authority_host; clobbers r8 only (not rax/rbx/rcx).
+.ah_hexdig_ok:
+    mov r8d, eax
+    cmp r8b, '0'
+    jb .hx_no
+    cmp r8b, '9'
+    jbe .hx_yes
+    or r8b, 0x20                      ; fold: "A".."F" and "a".."f" alike
+    cmp r8b, 'a'
+    jb .hx_no
+    cmp r8b, 'f'
+    ja .hx_no
+.hx_yes:
+    clc
+    ret
+.hx_no:
     stc
     ret
 

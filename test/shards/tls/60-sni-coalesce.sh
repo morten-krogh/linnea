@@ -75,7 +75,14 @@
     # chose, and answers a name this connection's certificate does not cover
     # with 421 rather than the other vhost's page.
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
-        timeout 90 python3 test/quic/h3_authority_test.py ${P61444} >/dev/null 2>&1
+        # 150, not 90. Every malformed authority in that file waits out a full
+        # five-second read for a response its reset stream will never send, so
+        # the runtime is set by how many rejections it checks. Measured: the
+        # report-126 set was ~83s against a 90s budget -- an 8% margin -- and
+        # report 127's two added rejections take it to 93s, so the check failed
+        # on the timeout rather than on the server. (Six added rejections, the
+        # set h1 and h2 carry, measured 113s; that is why h3 carries two.)
+        timeout 150 python3 test/quic/h3_authority_test.py ${P61444} >/dev/null 2>&1
         check "h3 authority selects the vhost; cross-cert gets 421" $?
     else
         check "h3 authority test (skipped: deps unavailable)" 0

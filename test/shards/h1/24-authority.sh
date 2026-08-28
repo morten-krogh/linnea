@@ -88,5 +88,55 @@ check "authority: an out-of-range port after an IPvFuture rejected (400)" $?
 [ "$(hc '[v1.fe80]x')" = 400 ]
 check "authority: junk after an IPvFuture literal rejected (400)" $?
 
+# report 127: reg-name has THREE alternatives and only two were implemented --
+#   reg-name = *( unreserved / pct-encoded / sub-delims )   RFC 3986 3.2.2
+# -- so "alpha%2Etest", a legal uri-host and therefore a legal Host, was 400,
+# indistinguishable from the malformed "alpha%ZZ.test" below. Two independent
+# parsers were asked before this changed: nginx 1.30.4 answers every line in
+# this block 200, and curl 8.x's URL parser calls "%2E"/"%41" well formed and
+# "%ZZ", "%2" and a trailing "%" malformed (exit 3). We take the strict half
+# from curl and the acceptance from both.
+[ "$(hc 'alpha%2Etest')" = 200 ]
+check "authority: a pct-encoded reg-name is accepted (200)" $?
+[ "$(hc 'alpha%41.test')" = 200 ]
+check "authority: a pct-encoded letter in a reg-name is accepted (200)" $?
+[ "$(hc 'alpha%2Etest:8080')" = 200 ]
+check "authority: a pct-encoded reg-name with a port is accepted (200)" $?
+# lower-case hex is the same octet: HEXDIG comes from ABNF, whose string
+# literals are case-insensitive (RFC 5234 2.3)
+[ "$(hc 'alpha%2etest')" = 200 ]
+check "authority: lower-case pct-encoding hex is accepted (200)" $?
+# NOT decoded, and that is the point of this line rather than an omission.
+# "beta%2Etest" is not normalized to "beta.test": it matches no configured
+# hostname and falls to the default vhost (alpha's root), which is the same
+# answer nginx gives it and the same answer "[::1]" and "[v1.fe80]" get above.
+# A build that decoded before vhost selection would serve beta's "sub index"
+# here and pass every other line in this block.
+case "$(hb 'beta%2Etest')" in *"sub index"*) false ;; *doctype*) true ;; *) false ;; esac
+check "authority: a pct-encoded name is not decoded for vhost selection" $?
+# ...and the near-misses. pct-encoded is exactly "%" HEXDIG HEXDIG (RFC 3986
+# 2.1): both digits must be present and both must be hex, or the escape is
+# malformed and the authority with it. A build that simply added "%" to the
+# reg-name byte table would pass the four acceptance lines above and fail every
+# line below -- which is what separates the fix from a hole.
+[ "$(hc 'alpha%ZZ.test')" = 400 ]
+check "authority: non-hex pct-encoding rejected (400)" $?
+[ "$(hc 'alpha%2.test')" = 400 ]
+check "authority: one hex digit then a non-hex byte rejected (400)" $?
+[ "$(hc 'alpha%2')" = 400 ]
+check "authority: a pct-escape truncated to one digit rejected (400)" $?
+[ "$(hc 'alpha%')" = 400 ]
+check "authority: a bare '%' ending the authority rejected (400)" $?
+[ "$(hc '%')" = 400 ]
+check "authority: an authority that is only '%' rejected (400)" $?
+# the escape may not run into the port either: ':' is not a hex digit, and the
+# scan must not treat "reached a delimiter" as "escape complete"
+[ "$(hc 'alpha%2:8080')" = 400 ]
+check "authority: a pct-escape cut short by ':port' rejected (400)" $?
+# the rest of the grammar is unchanged by pct-encoding: the port is still
+# judged, and a pct-encoded name does not buy an unjudged one
+[ "$(hc 'alpha%2Etest:99999')" = 400 ]
+check "authority: an out-of-range port after a pct-encoded name rejected (400)" $?
+
 kill $auth_pid 2>/dev/null
 wait $auth_pid 2>/dev/null

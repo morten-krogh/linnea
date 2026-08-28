@@ -78,13 +78,28 @@ assert served(b"[::1]"), "valid IPv6-literal :authority was not served over h2"
 # this file exists to catch.
 assert served(b"[v1.fe80]"), "valid IPvFuture :authority was not served over h2"
 assert served(b"[V9.x]:443"), "upper-case IPvFuture flag was not served over h2"
+# report 127: reg-name's third alternative, pct-encoded, was missing too, so a
+# legal percent-encoded registered name was refused on h2 exactly as on h1. One
+# parser serves all three protocols, and a spelling legal on one and not the
+# other is the divergence this file exists to catch. Nothing is decoded: the
+# name simply matches no vhost and is served by the connection's own, the way
+# "[::1]" above is.
+assert served(b"alpha%2Etest"), "pct-encoded :authority was not served over h2"
+assert served(b"alpha%41.test:443"), "pct-encoded :authority with a port not served over h2"
+assert served(b"alpha%2etest"), "lower-case hex pct-encoding was not served over h2"
 # structural AND semantic malformed authorities are refused (audit-report-3 F2:
 # out-of-range port, non-reg-name char, bracket contents that are not IPv6;
 # report 126: contents that open with "v" but are not an IPvFuture either)
 for bad in (b"localhost:garbage", b"localhost:80:bad", b"[::1", b"[::1]x",
             b"localhost:", b"localhost:65536", b"localhost:99999",
             b"localhost/foo", b"[deadbeef]", b"[gggg::1]",
-            b"[v.fe80]", b"[v1.]", b"[v1]", b"[vg.x]", b"[v1.a/b]"):
+            b"[v.fe80]", b"[v1.]", b"[v1]", b"[vg.x]", b"[v1.a/b]",
+            # report 127: pct-encoded is "%" HEXDIG HEXDIG and nothing looser --
+            # both digits present, both hex, and the ':port' may not stand in
+            # for the second one. Without these, adding "%" to the byte table
+            # would pass the acceptance lines above.
+            b"localhost%ZZ", b"localhost%2z", b"localhost%2", b"localhost%",
+            b"%", b"localhost%2:443", b"localhost%:443"):
     if served(bad):
         print(f"FAIL: malformed :authority {bad!r} was served over h2")
         sys.exit(1)

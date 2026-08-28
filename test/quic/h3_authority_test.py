@@ -122,7 +122,15 @@ assert b"sub index" not in body and b"doctype" not in body, \
 for bad in (b"sni.test:garbage", b"sni.test:80:bad", b"[::1", b"[::1]x", b"sni.test:",
             b"sni.test:65536", b"sni.test:99999", b"sni.test/foo",
             b"[deadbeef]", b"[gggg::1]",
-            b"[v.fe80]", b"[v1.]", b"[v1]", b"[vg.x]", b"[v1.a/b]"):
+            b"[v.fe80]", b"[v1.]", b"[v1]", b"[vg.x]", b"[v1.a/b]",
+            # report 127: pct-encoded is "%" HEXDIG HEXDIG exactly -- neither
+            # digit may be non-hex, and neither may be missing. Two entries,
+            # not the six h1 and h2 carry: every miss in this loop costs a full
+            # five-second wait for a response that never comes (the stream is
+            # reset), and this file was already 83s against a 90s budget before
+            # report 127 touched it. The near-miss battery lives where it is
+            # cheap; what h3 is here to say is that it reaches the same parser.
+            b"sni.test%ZZ", b"sni.test%2"):
     body = request("sni.test", [M, S, (b":authority", bad), P])
     assert b"sub index" not in body and b"doctype" not in body and b"421" not in body, \
         f"malformed authority {bad!r} was served: {body[:60]}"
@@ -138,4 +146,23 @@ assert b"sub index" in body, f"bracketed authority not served locally: {body[:60
 # is the line that says the three protocols still agree on what an authority is.
 body = request("sni.test", [M, S, (b":authority", b"[v1.fe80]:%d" % port), P])
 assert b"sub index" in body, f"IPvFuture authority not served locally: {body[:60]}"
+
+# report 127: and so is reg-name's third alternative, pct-encoded, which was
+# refused on all three protocols. An unknown percent-encoded name is served by
+# the connection's own vhost, like any other name we do not host.
+body = request("sni.test", [M, S, (b":authority", b"alpha%2Etest"), P])
+assert b"sub index" in body, f"pct-encoded authority not served locally: {body[:60]}"
+body = request("sni.test", [M, S, (b":authority", b"alpha%41.test:" + str(port).encode()), P])
+assert b"sub index" in body, f"pct-encoded authority with a port refused: {body[:60]}"
+
+# ...and it is NOT decoded before vhost selection. h3 is where that has teeth:
+# "%6Cocalhost" is "localhost" with one letter escaped, and "localhost" is a
+# vhost THIS connection's certificate does not cover -- so a build that
+# normalized would answer 421 Misdirected Request here. Undecoded it is simply
+# a name we do not host, served locally like "[::1]". This one line separates
+# "accept pct-encoded" from "accept and decode pct-encoded"; every other
+# assertion in this block passes either way.
+body = request("sni.test", [M, S, (b":authority", b"%6Cocalhost"), P])
+assert b"421" not in body, f"pct-encoded name was decoded for vhost selection: {body[:60]}"
+assert b"sub index" in body, f"pct-encoded unknown name not served locally: {body[:60]}"
 print("ok")

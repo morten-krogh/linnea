@@ -331,6 +331,16 @@ resp=$(raw_http 'CONNECT [v1.]:443 HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "target: CONNECT to an empty-value IPvFuture is 400" "400 Bad Request" "$resp"
 resp=$(raw_http 'CONNECT [v1.fe80] HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "target: an IPvFuture CONNECT without a port is 400" "400 Bad Request" "$resp"
+# report 127: reg-name's pct-encoded alternative, missing here too -- so a
+# legal "CONNECT alpha%2Etest:443" was told its syntax was wrong. The escape is
+# still exactly "%" HEXDIG HEXDIG, so the malformed spelling keeps its 400 and
+# the two answers stay distinguishable, which is the whole complaint.
+resp=$(raw_http 'CONNECT alpha%2Etest:443 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: a pct-encoded CONNECT authority is 405" "405 Method Not Allowed" "$resp"
+resp=$(raw_http 'CONNECT alpha%ZZ.test:443 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: a bad pct-escape in a CONNECT authority is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT alpha%2:443 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: a truncated pct-escape in a CONNECT authority is 400" "400 Bad Request" "$resp"
 # the other three target forms are not open to CONNECT, and were the shape that
 # used to reach a 405 by matching a location
 resp=$(raw_http 'CONNECT /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
