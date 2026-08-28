@@ -537,6 +537,21 @@ if _os.path.exists(_CRT):
         bad.append("could not locate the issuer Name structure to mutate")
         print("FAIL could not locate the issuer Name structure to mutate")
 
+    # --- audit-report-109: the SAME OID rule for Name attributes ------------
+    # attr_ok tested only the final byte, a weaker copy of the check alg_id_ok
+    # already had -- so "55 80 03" (a non-minimal leading zero) passed there
+    # while it was refused in a signature AlgorithmIdentifier. One rule in two
+    # places is how they drift; there is one implementation now.
+    _cn = 56                            # last byte of the issuer CN OID 55 04 03
+    if _der[53] == 0x06 and _der[_cn] == 0x04:
+        _a = bytearray(_der)
+        _a[_cn] = 0x80
+        test(_tls_cfg(_wrap(bytes(_a), _os.path.join(_TD, "attroid.crt")), _KEY),
+             "a non-minimal Name attribute OID is rejected", False)
+    else:
+        bad.append("could not locate the issuer CN attribute OID to mutate")
+        print("FAIL could not locate the issuer CN attribute OID to mutate")
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

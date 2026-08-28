@@ -685,6 +685,53 @@ der_tiles:
     pop rbx
     ret
 
+; ---- oid_ok(rdi=content, rsi=len) -> rax = 1 when the bytes are the content
+;      of a DER OBJECT IDENTIFIER: base-128 subidentifiers, the final one
+;      terminated (continuation bit clear), and none beginning 0x80, which is a
+;      leading zero and not the minimal encoding.
+;
+;      ONE implementation, deliberately. Report 107 put this check inside
+;      alg_id_ok; report 108 then wrote a WEAKER copy in attr_ok that tested
+;      only the final byte -- and report 109 is that copy being wrong. Two
+;      partial implementations of one rule is exactly how they drift, so both
+;      callers now share this. Preserves rbx/r12+.
+oid_ok:
+    push rbx
+    push r12
+    test rsi, rsi
+    jz .oid_no                       ; an empty OID names nothing
+    cmp byte [rdi + rsi - 1], 0x80
+    jae .oid_no                      ; the final subidentifier never terminated
+    mov r12, rdi
+    lea rbx, [rdi + rsi]
+    mov r8b, 1                       ; 1 = at a subidentifier's first byte
+.oid_scan:
+    cmp r12, rbx
+    jae .oid_yes
+    mov r9b, [r12]
+    test r8b, r8b
+    jz .oid_mid
+    cmp r9b, 0x80
+    je .oid_no                       ; a leading 0x80: non-minimal
+.oid_mid:
+    xor r8b, r8b
+    test r9b, 0x80
+    jnz .oid_next                    ; a continuation byte
+    mov r8b, 1                       ; this subidentifier ended here
+.oid_next:
+    inc r12
+    jmp .oid_scan
+.oid_yes:
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.oid_no:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
 ; ---- alg_id_ok(rdi=content, rsi=end) -> rax = 1 when the range is an
 ;      AlgorithmIdentifier: an OBJECT IDENTIFIER, then optional parameters,
 ;      filling it exactly. RFC 5280 4.1.1.2. "A nonempty SEQUENCE" is not an
@@ -699,36 +746,15 @@ alg_id_ok:
     je .ai_no
     cmp dl, 0x06                     ; OBJECT IDENTIFIER
     jne .ai_no
-    test rcx, rcx
-    jz .ai_no                        ; an empty OID
-    ; ...and it has to BE one. A DER OID is base-128 subidentifiers, each ending
-    ; on a byte with the continuation bit clear, and none starting with 0x80 (a
-    ; leading zero, which is not the minimal encoding). Only the tag and a
-    ; nonzero length were checked, so an OID whose last byte still carried the
-    ; continuation bit passed -- unterminated, naming no algorithm, and equal to
-    ; its twin so the cross-field comparison agreed too (audit-report-107).
-    cmp byte [rax + rcx - 1], 0x80
-    jae .ai_no                       ; the final subidentifier never terminated
-    mov r12, rax                     ; cursor over the OID content
-    lea rdx, [rax + rcx]             ; its end
-    mov r8b, 1                       ; 1 = at a subidentifier's first byte
-.ai_oid:
-    cmp r12, rdx
-    jae .ai_oid_ok
-    mov r9b, [r12]
-    test r8b, r8b
-    jz .ai_oid_mid
-    cmp r9b, 0x80
-    je .ai_no                        ; a leading 0x80: non-minimal
-.ai_oid_mid:
-    xor r8b, r8b
-    test r9b, 0x80
-    jnz .ai_oid_next                 ; continuation byte
-    mov r8b, 1                       ; this subidentifier ended here
-.ai_oid_next:
-    inc r12
-    jmp .ai_oid
-.ai_oid_ok:
+    push rax
+    push rcx
+    mov rdi, rax
+    mov rsi, rcx
+    call oid_ok                      ; the shared DER OID rule
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .ai_no
     lea r12, [rax + rcx]
     cmp r12, rbx
     je .ai_yes                       ; absent parameters: legal
@@ -838,10 +864,15 @@ attr_ok:
     je .at_no
     cmp dl, 0x06                     ; OBJECT IDENTIFIER
     jne .at_no
-    test rcx, rcx
+    push rax
+    push rcx
+    mov rdi, rax
+    mov rsi, rcx
+    call oid_ok                      ; the SAME rule alg_id_ok uses
+    test eax, eax
+    pop rcx
+    pop rax
     jz .at_no
-    cmp byte [rax + rcx - 1], 0x80
-    jae .at_no                       ; an unterminated OID, as in report 107
     lea rdi, [rax + rcx]
     mov rsi, rbx
     call der_any                     ; the value: one element, any string type
