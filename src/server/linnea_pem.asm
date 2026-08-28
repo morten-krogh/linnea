@@ -25,6 +25,7 @@ global linnea_x509_find_spki
 global linnea_x509_cert_wellformed
 global linnea_x509_leaf_spki
 global linnea_x509_leaf_usage_ok
+global linnea_x509_leaf_validity_times
 global linnea_x509_spki_point
 
 section .rodata
@@ -1818,6 +1819,89 @@ linnea_x509_cert_wellformed:
     ret
 .cw_no:
     xor eax, eax
+    ret
+
+; ---- linnea_x509_leaf_validity_times(rdi=der, rsi=len, rdx=out) -> rax = 1 on
+;      success. Writes six qwords at `out`: notBefore ptr/len/tag then notAfter
+;      ptr/len/tag. It does NOT compare them with the clock.
+;
+;      The split is deliberate: five test harnesses link this object without
+;      linnea_time.o, so doing the epoch arithmetic here would break them the way
+;      report 96's lib-calling-a-server-symbol broke linnea-probe. pem parses
+;      DER; linnea_ktls.asm owns the clock and the policy (audit-report-118).
+linnea_x509_leaf_validity_times:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r14, rdx                     ; out
+    lea r13, [rdi + rsi]
+    mov rsi, r13
+    call der_any                     ; Certificate
+    cmp rax, -1
+    je .vt_no
+    mov rdi, rax
+    lea rbx, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; tbsCertificate
+    cmp rax, -1
+    je .vt_no
+    mov rdi, rax
+    lea r13, [rax + rcx]             ; TBS end
+    mov rsi, r13
+    call der_any
+    cmp rax, -1
+    je .vt_no
+    cmp dl, 0xa0                     ; optional version
+    jne .vt_serial
+    lea rdi, [rax + rcx]
+    mov rsi, r13
+    call der_any
+    cmp rax, -1
+    je .vt_no
+.vt_serial:
+    mov r12d, 3                      ; step over serial, signature, issuer
+.vt_skip:
+    lea rdi, [rax + rcx]
+    mov rsi, r13
+    call der_any
+    cmp rax, -1
+    je .vt_no
+    dec r12d
+    jnz .vt_skip
+    cmp dl, 0x30                     ; Validity
+    jne .vt_no
+    mov rdi, rax
+    lea rbx, [rax + rcx]             ; its end
+    mov rsi, rbx
+    call der_any                     ; notBefore
+    cmp rax, -1
+    je .vt_no
+    mov [r14], rax
+    mov [r14 + 8], rcx
+    movzx edx, dl
+    mov [r14 + 16], rdx
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; notAfter
+    cmp rax, -1
+    je .vt_no
+    mov [r14 + 24], rax
+    mov [r14 + 32], rcx
+    movzx edx, dl
+    mov [r14 + 40], rdx
+    mov eax, 1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.vt_no:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ---- linnea_x509_leaf_usage_ok(rdi=der, rsi=len) -> rax = 1 when this leaf may

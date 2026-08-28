@@ -837,6 +837,29 @@ if _os.path.exists(_CRT):
     test(_tls_cfg("test/tls/bigchain.crt", _KEY),
          "the usage check is leaf-only (a 7-cert chain still loads)", True)
 
+    # --- audit-report-118: the validity window is REPORTED, not enforced -----
+    # Deliberately a warning: nginx and Apache both start on an expired
+    # certificate, and refusing would turn a silently-failed renewal into a
+    # total outage the operator cannot restart out of. So these assert the
+    # certificate still LOADS, and a separate check reads the warning text.
+    _exp = _os.path.join(_TD, "expired.crt")
+    _sp.run(["openssl", "x509", "-new", "-key", _KEY, "-subj", "/CN=localhost",
+             "-set_serial", "1", "-not_before", "20200101000000Z",
+             "-not_after", "20200102000000Z", "-out", _exp], capture_output=True)
+    if _os.path.exists(_exp) and _os.path.getsize(_exp):
+        test(_tls_cfg(_exp, _KEY),
+             "an expired certificate still LOADS (warned, not refused)", True)
+        _cfgp = _os.path.join(_TD, "expcfg.json")
+        open(_cfgp, "w").write(_tls_cfg(_exp, _KEY))
+        _r = _sp.run([BIN, "--test", "--config", _cfgp], capture_output=True, text=True)
+        _saw = "EXPIRED" in (_r.stderr or "") + (_r.stdout or "")
+        print(("ok   " if _saw else "FAIL ") + "an expired certificate is WARNED about")
+        if not _saw:
+            bad.append("an expired certificate is WARNED about")
+    else:
+        bad.append("could not generate the expired fixture")
+        print("FAIL could not generate the expired fixture")
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

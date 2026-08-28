@@ -44,6 +44,9 @@ extern linnea_tls_hkdf_expand_label
 extern linnea_error_exit
 extern linnea_x509_leaf_spki
 extern linnea_x509_leaf_usage_ok
+extern linnea_x509_leaf_validity_times
+extern linnea_time_days_from_civil
+extern linnea_print_stderr
 extern linnea_pem_key_pub
 extern linnea_x509_spki_point
 extern linnea_p256_ecdsa_sign
@@ -61,6 +64,10 @@ lbl_traffic_upd_len equ $ - lbl_traffic_upd
 
 msg_no_aesni: db "TLS requires a CPU with AES-NI, PCLMULQDQ and SSSE3"
 msg_no_aesni_len equ $ - msg_no_aesni
+msg_cert_expired: db "WARNING: the TLS certificate has EXPIRED -- clients will refuse it; serving anyway", 10
+msg_cert_expired_len equ $ - msg_cert_expired
+msg_cert_future: db "WARNING: the TLS certificate is NOT YET VALID -- clients will refuse it; serving anyway", 10
+msg_cert_future_len equ $ - msg_cert_future
 msg_bad_usage: db "the certificate does not permit TLS server authentication (keyUsage lacks digitalSignature, or extendedKeyUsage lacks serverAuth)", 10
 msg_bad_usage_len equ $ - msg_bad_usage
 msg_key_selfcontra: db "the key file embeds a public key that its own private scalar does not sign for", 10
@@ -82,6 +89,8 @@ msg_cert_big_len equ $ - msg_cert_big
 MAX_CERT_LIST equ 8192
 
 section .bss
+val_times:   resq 6      ; notBefore ptr/len/tag, notAfter ptr/len/tag
+
 ; the cert/key pairing self-check (audit-report-99 F2)
 leaf_pub:    resb 64
 pair_sig:    resb LINNEA_P256_ECDSA_MAX_SIG
@@ -101,6 +110,114 @@ linnea_ktls_fail_errno: resq 1     ; the negative errno the syscall returned
 section .text
 
 ; ---- linnea_tls_setup(rdi=config*) ----------------------------------
+
+; ---- x509_time_epoch(rdi=digits, rsi=len, rdx=tag) -> rax = POSIX seconds, or -1
+; RFC 5280 4.1.2.5: UTCTime is YYMMDDHHMMSSZ with YY >= 50 meaning 19YY;
+; GeneralizedTime is YYYYMMDDHHMMSSZ. Only the Zulu forms the RFC mandates.
+x509_time_epoch:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    mov r14, rsi
+    cmp rdx, 0x18
+    je .xt_gen
+    cmp rdx, 0x17
+    jne .xt_no
+    cmp r14, 13
+    jne .xt_no
+    mov r13d, 2                      ; two year digits
+    jmp .xt_year
+.xt_gen:
+    cmp r14, 15
+    jne .xt_no
+    mov r13d, 4
+.xt_year:
+    cmp byte [rbx + r14 - 1], 'Z'
+    jne .xt_no
+    xor r12, r12
+    xor ecx, ecx
+.xt_yd:
+    cmp ecx, r13d
+    jae .xt_ydone
+    movzx eax, byte [rbx + rcx]
+    sub eax, '0'
+    cmp eax, 9
+    ja .xt_no
+    imul r12, r12, 10
+    add r12, rax
+    inc ecx
+    jmp .xt_yd
+.xt_ydone:
+    cmp r13d, 4
+    je .xt_have_year
+    cmp r12, 50                      ; UTCTime pivot
+    jb .xt_20
+    add r12, 1900
+    jmp .xt_have_year
+.xt_20:
+    add r12, 2000
+.xt_have_year:
+    mov r13d, ecx                    ; cursor
+    call xt_two                      ; month
+    cmp rax, -1
+    je .xt_no
+    mov r14, rax
+    call xt_two                      ; day
+    cmp rax, -1
+    je .xt_no
+    mov rdi, r12
+    mov rsi, r14
+    mov rdx, rax
+    call linnea_time_days_from_civil
+    imul r12, rax, 86400
+    call xt_two                      ; hour
+    cmp rax, -1
+    je .xt_no
+    imul rax, rax, 3600
+    add r12, rax
+    call xt_two                      ; minute
+    cmp rax, -1
+    je .xt_no
+    imul rax, rax, 60
+    add r12, rax
+    call xt_two                      ; second
+    cmp rax, -1
+    je .xt_no
+    add r12, rax
+    mov rax, r12
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.xt_no:
+    mov rax, -1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; xt_two -> rax = the two decimal digits at [rbx + r13d], advancing r13d.
+xt_two:
+    movzx eax, byte [rbx + r13]
+    sub eax, '0'
+    cmp eax, 9
+    ja .x2_no
+    movzx edx, byte [rbx + r13 + 1]
+    sub edx, '0'
+    cmp edx, 9
+    ja .x2_no
+    imul eax, eax, 10
+    add eax, edx
+    add r13d, 2
+    ret
+.x2_no:
+    mov rax, -1
+    ret
+
 linnea_tls_setup:
     push rbx
     push r12
@@ -240,6 +357,58 @@ linnea_tls_setup:
     pop rsi
     pop rdi
     jz .bad_usage
+    ; ...and WARN if the validity window does not contain now. Deliberately a
+    ; warning and not a refusal: nginx and Apache both start on an expired
+    ; certificate, and refusing would turn a renewal that silently failed --
+    ; a degraded state clients merely complain about -- into a total outage the
+    ; operator cannot restart out of, while also blocking the hot upgrade that
+    ; might carry the fix. --test exits 0 for the same reason, and because a
+    ; config check whose verdict changes with the clock is not a config check.
+    ; Making this fatal is a one-line change if that trade is ever wanted
+    ; (audit-report-118).
+    push rdi
+    push rsi
+    lea rdx, [val_times]
+    call linnea_x509_leaf_validity_times
+    test eax, eax
+    jz .val_done
+    mov rdi, [val_times]
+    mov rsi, [val_times + 8]
+    mov rdx, [val_times + 16]
+    call x509_time_epoch
+    cmp rax, -1
+    je .val_done
+    mov r15, rax                     ; notBefore
+    mov rdi, [val_times + 24]
+    mov rsi, [val_times + 32]
+    mov rdx, [val_times + 40]
+    call x509_time_epoch
+    cmp rax, -1
+    je .val_done
+    mov r14, rax                     ; notAfter
+    sub rsp, 16
+    mov eax, LINNEA_SYS_CLOCK_GETTIME
+    xor edi, edi                     ; CLOCK_REALTIME
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    add rsp, 16
+    cmp rax, r15
+    jb .val_future
+    cmp rax, r14
+    jbe .val_done
+    lea rdi, [msg_cert_expired]
+    mov esi, msg_cert_expired_len
+    call linnea_print_stderr         ; --test never opens the log, and this is
+                                     ; exactly when the operator must see it
+    jmp .val_done
+.val_future:
+    lea rdi, [msg_cert_future]
+    mov esi, msg_cert_future_len
+    call linnea_print_stderr
+.val_done:
+    pop rsi
+    pop rdi
     call linnea_x509_leaf_spki         ; rax = SPKI, rdx = its length
     test rax, rax
     jz .bad_cert                       ; no SPKI in the field where one belongs
