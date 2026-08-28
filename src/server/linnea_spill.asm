@@ -142,11 +142,20 @@ linnea_spill_write:
 ; rcx is a struc linnea_chunk the caller owns; the connection carries two, one
 ; for the request capture and one for the HTTP/1 response relay, because a
 ; chunked upload and a chunked response can be in flight on the same connection.
-; r8d is LINNEA_CHUNK_CAPTURE or LINNEA_CHUNK_VALIDATE. Validate mode judges and
+; r8d is LINNEA_CHUNK_CAPTURE, _VALIDATE or _DECHUNK. Validate mode judges and
 ; nothing else: no spill file, no max_body (that bounds a request, not a relayed
 ; response), and no pipelined-suffix stash. It exists so the HTTP/1 relay can
 ; apply THIS grammar to the bytes it is about to forward instead of a second
 ; transcription of it -- one decoder, two directions (audit-report-24).
+;
+; Dechunk mode is validate plus one thing: each chunk's DATA is moved down over
+; the framing that preceded it, in the caller's own buffer, and rdx comes back
+; holding how many decoded bytes now sit at buf. The destination is always at or
+; behind the source -- framing only ever shrinks a message -- so the copy is a
+; forward one and never overruns bytes it has not read yet. The HTTP/1 relay
+; uses it to strip a transfer coding an HTTP/1.0 client must not be sent
+; (RFC 9112 7.1, audit-report-130); the message is close-delimited either way,
+; so nothing else about the relay changes.
 ;
 ; On completion any bytes left in buf after the terminal chunk are the NEXT
 ; request, pipelined in the same recv. They are copied to in_buf[head_len] (free
@@ -179,9 +188,12 @@ linnea_spill_chunked:
     mov r12, rsi                   ; read cursor
     lea r13, [rsi + rdx]           ; end of what arrived
     mov r15, rcx                   ; the decode state, struc linnea_chunk
-    mov ebp, r8d                   ; LINNEA_CHUNK_CAPTURE or _VALIDATE
-    cmp ebp, LINNEA_CHUNK_VALIDATE
-    je .step                       ; judging only: no sink, and no cap either
+    mov ebp, r8d                   ; LINNEA_CHUNK_CAPTURE, _VALIDATE or _DECHUNK
+    sub rsp, 16
+    mov [rsp], rsi                 ; dechunk's write cursor, starting at buf...
+    mov [rsp + 8], rsi             ; ...and where it started, for the count
+    cmp ebp, LINNEA_CHUNK_CAPTURE
+    jne .step                      ; judging only: no sink, and no cap either
     ; Encoded bytes are capped as well as decoded ones. A client can send
     ; empty chunks and trailer lines forever without the decoded length ever
     ; growing, so a cap on the decoded body alone would never fire.
@@ -313,6 +325,8 @@ linnea_spill_chunked:
     jbe .data_take                 ; the rest of the chunk is here
     mov rcx, rax                   ; take what there is
 .data_take:
+    cmp ebp, LINNEA_CHUNK_DECHUNK
+    je .data_move
     cmp ebp, LINNEA_CHUNK_VALIDATE
     je .data_skip                  ; judging only: the bytes go nowhere here
     push rcx
@@ -327,6 +341,17 @@ linnea_spill_chunked:
     mov rax, [rax + linnea_config.max_body]
     cmp [rbx + linnea_connection.spill_len], rax
     ja .too_large
+    jmp .data_skip
+.data_move:
+    ; The decoded run moves down over the framing already consumed. rcx is the
+    ; run length and is still needed below, so it rides in rdx across the copy;
+    ; rdx is dead here (the size-overflow mask is the only thing that used it).
+    mov rdx, rcx
+    mov rdi, [rsp]                 ; write cursor
+    mov rsi, r12                   ; read cursor, always at or ahead of it
+    rep movsb
+    mov [rsp], rdi
+    mov rcx, rdx
 .data_skip:
     add r12, rcx
     sub [r15 + linnea_chunk.rem], rcx
@@ -418,8 +443,8 @@ linnea_spill_chunked:
     inc r12
     mov qword [r15 + linnea_chunk.state], LINNEA_CHUNK_DONE
 .complete:
-    cmp ebp, LINNEA_CHUNK_VALIDATE
-    je .complete_nostash           ; a relayed response has nothing pipelined
+    cmp ebp, LINNEA_CHUNK_CAPTURE
+    jne .complete_nostash          ; a relayed response has nothing pipelined
                                    ; behind it: the caller forwards the bytes
                                    ; itself and owns whatever follows
     ; The body is whole. Whatever remains in this buffer after the cursor (r12)
@@ -459,6 +484,9 @@ linnea_spill_chunked:
 .too_large:
     mov eax, -2
 .ret:
+    mov rdx, [rsp]                 ; decoded bytes now at buf; zero in the two
+    sub rdx, [rsp + 8]             ; modes that never move the write cursor
+    add rsp, 16
     pop rbp
     pop r15
     pop r14

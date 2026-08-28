@@ -98,6 +98,7 @@ linnea_connection_alloc:
     mov qword [rdx + linnea_connection.resp_chunk_ext], LINNEA_CHUNK_EXT_START
     mov qword [rdx + linnea_connection.resp_chunk_raw], 0
     mov qword [rdx + linnea_connection.resp_chunked], 0
+    mov qword [rdx + linnea_connection.req_http_10], 0
     mov qword [rdx + linnea_connection.capture_chunked], 0
     mov qword [rdx + linnea_connection.capture_done], 0
     mov qword [rdx + linnea_connection.pend_len], 0

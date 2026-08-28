@@ -206,6 +206,15 @@ struc linnea_connection
                                    ; never get to read the answer
     .up_status:     resq 1         ; upstream status code, for the log
     .is_head:       resq 1         ; 1 = the client sent HEAD (no body relay)
+    ; 1 = the request being proxied arrived as HTTP/1.0. Written on every
+    ; proxied HTTP/1 request, because a connection slot outlives one request
+    ; and a 1.0 request can be followed by a 1.1 one on it. RFC 9112 7.1: a
+    ; server MUST NOT send Transfer-Encoding unless the corresponding REQUEST
+    ; was 1.1 or later, so a chunked upstream response is de-chunked on the way
+    ; out to a 1.0 client rather than relayed with its framing intact
+    ; (audit-report-130). The version we write in the RESPONSE line is not the
+    ; version that was asked for, which is what made this look conformant.
+    .req_http_10:   resq 1
     ; --- an upstream leg owned by an HTTP/3 request -------------------
     ; A proxied h3 request has no client socket of its own: the answer is owed
     ; to one stream of a QUIC connection, which lives in a different pool. So
@@ -421,7 +430,12 @@ endstruc
   %error "linnea_connection.resp_chunk_* has drifted from struc linnea_chunk"
 %endif
 
-; linnea_spill_chunked's two modes: capture writes the decoded body to the
-; spill file and stashes anything pipelined behind it; validate only judges.
+; linnea_spill_chunked's three modes: capture writes the decoded body to the
+; spill file and stashes anything pipelined behind it; validate only judges;
+; dechunk judges AND compacts the decoded data down over the framing in the
+; caller's own buffer, reporting the decoded length in rdx. Only the HTTP/1
+; response relay uses the third, and only for an HTTP/1.0 client, which RFC
+; 9112 7.1 forbids sending a transfer coding to (audit-report-130).
 LINNEA_CHUNK_CAPTURE  equ 0
 LINNEA_CHUNK_VALIDATE equ 1
+LINNEA_CHUNK_DECHUNK  equ 2

@@ -142,6 +142,16 @@ check_http "proxy chunked body"  "chunked body" "$resp"
 check_http "proxy chunked framing" "Transfer-Encoding: chunked" "$resp"
 check_http "proxy chunked closes" "Connection: close" "$resp"
 
+# ...but only to a client that asked in HTTP/1.1. RFC 9112 7.1: a server MUST
+# NOT send Transfer-Encoding unless the corresponding REQUEST indicates 1.1 or
+# later. The head appended it from the upstream's framing alone and the relay
+# forwarded the chunk lines with it, so a 1.0 client read "7", "chunked", "5",
+# " body", "0" as content (audit-report-130). The 1.1 rows in that file are the
+# control a blanket de-chunking build cannot pass, and the counted and
+# close-delimited 1.0 rows are the framings this rule never touched.
+timeout 60 python3 test/tls/h1_proxy_http10_chunked.py ${P61080} >/dev/null 2>&1
+check "proxy de-chunks for HTTP/1.0 and only for it" $?
+
 # ...and that relay judges the framing it forwards. The cross-protocol matrix
 # covers the case where head and body arrive together, which is a 502 like h2
 # and h3 give; this is the other half, where the head has already gone out and

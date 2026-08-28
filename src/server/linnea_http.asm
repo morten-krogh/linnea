@@ -2893,7 +2893,16 @@ linnea_http_handle:
     ; loop cannot make this call — it runs before the location is matched, and
     ; the same 1.0 request on a static prefix is served by us as the origin,
     ; where the persistence IS permitted and is kept (audit-report-129).
+    ; ...and the same bit is recorded on the connection, because the RESPONSE
+    ; side needs it too and this stack frame is long gone by then: RFC 9112 7.1
+    ; forbids sending Transfer-Encoding to a request that was not 1.1 or later
+    ; (audit-report-130). Written unconditionally, not only when set -- a slot
+    ; serves many requests and a 1.0 one may be followed by a 1.1 one.
+    xor eax, eax
     test qword [rsp + 136], 8         ; the client spoke HTTP/1.0
+    setnz al
+    mov [rbx + linnea_connection.req_http_10], rax
+    test eax, eax
     jz .proxy_ka_kept
     xor ecx, ecx
 .proxy_ka_kept:
@@ -5083,9 +5092,22 @@ linnea_http_proxy_head:
     ; must not claim a framing it is not sending.
     test qword [rsp + 16], 2
     jz .conn_hdr
+    ; ...unless the request was HTTP/1.0. RFC 9112 7.1: a server MUST NOT send
+    ; a response containing Transfer-Encoding unless the corresponding request
+    ; indicates HTTP/1.1 or later. The response line we write says 1.1, but the
+    ; version we ANSWER IN is not the version that was ASKED IN, and it is the
+    ; request that decides this -- so the field was going out to clients that by
+    ; definition cannot read chunk framing, along with the framing itself, which
+    ; they read as content (audit-report-130). The body is de-chunked as it is
+    ; relayed instead. Nothing else has to change: this branch is already the
+    ; close-delimited one, so the close that ends a 1.0 message is already
+    ; there, and the decoder below already runs over these exact bytes.
+    cmp qword [rbx + linnea_connection.req_http_10], 0
+    jne .te_relay_state
     lea rdi, [hdr_te_chunked]
     mov esi, hdr_te_chunked_len
     call .append
+.te_relay_state:
     ; ...and the relay is told, so it can run the chunk grammar over the bytes
     ; it forwards. HTTP/1 relays this body verbatim -- it has already sent this
     ; head -- so it cannot answer 502 the way h2 and h3 do. What it can do is
@@ -5184,9 +5206,22 @@ linnea_http_proxy_head:
     mov rsi, [rbx + linnea_connection.file_ptr]
     lea rcx, [rbx + linnea_connection.resp_chunk_state]
     mov r8d, LINNEA_CHUNK_VALIDATE
+    cmp qword [rbx + linnea_connection.req_http_10], 0
+    je .leftover_judge
+    mov r8d, LINNEA_CHUNK_DECHUNK   ; the head just promised no transfer coding
+.leftover_judge:
     call linnea_spill_chunked
     cmp eax, -1
     je .bad                    ; malformed framing: 502, head not yet sent
+    cmp qword [rbx + linnea_connection.req_http_10], 0
+    je .leftover_ok
+    ; De-chunked in place: what goes out is the decoded run, not the encoded
+    ; one, and the access log's byte count follows it. rdx is the decoded
+    ; length; the encoded length was added to .relayed just above.
+    mov rax, [rbx + linnea_connection.file_rem]
+    sub [rbx + linnea_connection.relayed], rax
+    add [rbx + linnea_connection.relayed], rdx
+    mov [rbx + linnea_connection.file_rem], rdx
 .leftover_ok:
     lea rax, [rbx + linnea_connection.out_buf]
     mov [rbx + linnea_connection.out_ptr], rax

@@ -2953,10 +2953,28 @@ linnea_uring_run:
     mov edx, r15d
     lea rcx, [r12 + linnea_connection.resp_chunk_state]
     mov r8d, LINNEA_CHUNK_VALIDATE
+    ; ...and for an HTTP/1.0 client the same decoder also strips the framing,
+    ; because the head it was promised carries no Transfer-Encoding: RFC 9112
+    ; 7.1 forbids sending one to a request that was not 1.1 (audit-report-130).
+    cmp qword [r12 + linnea_connection.req_http_10], 0
+    je .relay_chunk_judge
+    mov r8d, LINNEA_CHUNK_DECHUNK
+.relay_chunk_judge:
     call linnea_spill_chunked
     pop r15
     cmp eax, -1
     je .relay_chunk_bad
+    cmp qword [r12 + linnea_connection.req_http_10], 0
+    je .relay_framed
+    mov r15d, edx              ; only the decoded bytes are the body now
+    test r15d, r15d
+    jnz .relay_framed
+    ; A read that was ALL framing -- the terminal chunk and its trailers, most
+    ; often -- decodes to nothing. There is no send to arm for it, so take the
+    ; path a completed send takes: finish if the terminal chunk has been seen,
+    ; read on if it has not. Arming a zero-length send here would be a send
+    ; completion of 0 bytes, which the drain reads as a closed peer.
+    jmp .relay_next
 .relay_framed:
     mov eax, r15d              ; bytes read
     mov rcx, [r12 + linnea_connection.body_rem]
