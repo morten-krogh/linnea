@@ -44,6 +44,35 @@ check_http "other unit 200"      "200 OK" "$resp"
 resp=$(curl -si --max-time 2 -H 'Range: bytes=0-1,3-4' http://127.0.0.1:${P61080}/hello.txt)
 check_http "several ranges 200"  "200 OK" "$resp"
 check_http "several ranges full" "Content-Length: 18" "$resp"
+# A position too big for 64 bits must not wrap. The accumulator saturated at
+# 2^62 but the check ran AFTER the multiply, so 2^62 * 10 wrapped back under
+# the limit and 18446744073709551616 (2^64) read as 0: an out-of-range start
+# served byte zero as a 206 (audit 131). The digit below the wrap, 2^64-1, is
+# the control that says the 416s below are not "every long number is refused":
+# it took the same path before the fix and already answered 416.
+U64=18446744073709551616
+resp=$(curl -si --max-time 2 -H "Range: bytes=$U64-" http://127.0.0.1:${P61080}/hello.txt)
+check_http "overflow first 416"  "416 Range Not Satisfiable" "$resp"
+resp=$(curl -si --max-time 2 -H 'Range: bytes=18446744073709551615-' http://127.0.0.1:${P61080}/hello.txt)
+check_http "2^64-1 first 416"    "416 Range Not Satisfiable" "$resp"
+resp=$(curl -si --max-time 2 -H 'Range: bytes=99999999999999999999999999999999-' http://127.0.0.1:${P61080}/hello.txt)
+check_http "32-digit first 416"  "416 Range Not Satisfiable" "$resp"
+# saturation is sticky, so an oversized last still means "to the end" -- the
+# same answer bytes=6-9999 gets above, not a one-byte slice and not a 416
+resp=$(curl -si --max-time 2 -H "Range: bytes=0-$U64" http://127.0.0.1:${P61080}/hello.txt)
+check_http "overflow last 206"   "206 Partial Content" "$resp"
+check_http "overflow last to EOF" "Content-Range: bytes 0-17/18" "$resp"
+resp=$(curl -si --max-time 2 -H "Range: bytes=-$U64" http://127.0.0.1:${P61080}/hello.txt)
+check_http "overflow suffix all" "Content-Range: bytes 0-17/18" "$resp"
+# and an oversized first with a smaller last is first > last: ignored, a 200,
+# exactly as bytes=5-2 is -- the huge number gets no special treatment
+resp=$(curl -si --max-time 2 -H "Range: bytes=$U64-0" http://127.0.0.1:${P61080}/hello.txt)
+check_http "overflow backwards 200" "200 OK" "$resp"
+check_http "overflow backwards full" "Content-Length: 18" "$resp"
+# the acceptance control: an ordinary range still slices, so none of the above
+# is satisfied by a build that refused or ignored every Range field
+resp=$(curl -si --max-time 2 -H 'Range: bytes=2-5' http://127.0.0.1:${P61080}/hello.txt)
+check_http "plain range still 206" "Content-Range: bytes 2-5/18" "$resp"
 # Range is defined for GET alone
 resp=$(curl -si --max-time 2 -I -H 'Range: bytes=0-4' http://127.0.0.1:${P61080}/hello.txt)
 check_http "HEAD ignores range"  "200 OK" "$resp"

@@ -994,7 +994,10 @@ linnea_http_ifrange_match:
 ; (another unit, several ranges, malformed) or -2 when the single range
 ; is valid but unsatisfiable (a 416). Absurdly long numbers saturate at
 ; 2^62, far past any file size, and fall out as unsatisfiable or as a
-; last clamped to the end. No calls, caller-saved registers only.
+; last clamped to the end. Saturation is sticky and is decided BEFORE the
+; multiply: a saturated value multiplied again wraps 64 bits and comes
+; back under the limit, which is how 18446744073709551616 once parsed as
+; 0. No calls, caller-saved registers only.
 linnea_http_range_parse:
     mov r10, rdx               ; file size
     cmp rsi, 7                 ; "bytes=" and at least one spec byte
@@ -1025,12 +1028,16 @@ linnea_http_range_parse:
     sub r8d, '0'
     cmp r8d, 9
     ja .rp_ignore
+    mov r11, (1 << 62) / 10    ; one more digit would pass 2^62, so
+    cmp rax, r11               ; saturate without multiplying: 2^62 * 10
+    ja .rp_first_sat           ; wraps 64 bits back under the limit
     imul rax, rax, 10
     add rax, r8
     mov r11, 1 << 62
     cmp rax, r11
     jbe .rp_first_next
-    mov rax, r11               ; saturate
+.rp_first_sat:
+    mov rax, 1 << 62           ; saturate; sticky from here on
 .rp_first_next:
     inc rcx
     jmp .rp_first_loop
@@ -1047,12 +1054,16 @@ linnea_http_range_parse:
     sub r8d, '0'
     cmp r8d, 9
     ja .rp_ignore              ; a ',' (several ranges) lands here too
+    mov r11, (1 << 62) / 10
+    cmp r9, r11
+    ja .rp_last_sat
     imul r9, r9, 10
     add r9, r8
     mov r11, 1 << 62
     cmp r9, r11
     jbe .rp_last_next
-    mov r9, r11                ; saturate
+.rp_last_sat:
+    mov r9, 1 << 62            ; saturate; sticky from here on
 .rp_last_next:
     inc rcx
     jmp .rp_last_loop
@@ -1088,12 +1099,16 @@ linnea_http_range_parse:
     sub r8d, '0'
     cmp r8d, 9
     ja .rp_ignore
+    mov r11, (1 << 62) / 10
+    cmp rax, r11
+    ja .rp_suffix_sat
     imul rax, rax, 10
     add rax, r8
     mov r11, 1 << 62
     cmp rax, r11
     jbe .rp_suffix_next
-    mov rax, r11               ; saturate
+.rp_suffix_sat:
+    mov rax, 1 << 62           ; saturate; sticky from here on
 .rp_suffix_next:
     inc r9d
     inc rcx
