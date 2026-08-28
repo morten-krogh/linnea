@@ -132,6 +132,22 @@ check "a matching cert name warns about nothing" \
 $BIN --config $CFG/cert-bigext.json --test >/dev/null 2>&1
 check "a 0x82-length extensions block loads (real-certificate size)" $?
 
+# ...and the same property against a REAL, externally issued chain. bigext.crt
+# holds the SIZE line synthetically; only a genuinely issued certificate carries
+# the rest of what the world ships -- SCT lists, certificatePolicies, AIA, CRL
+# distribution points, an issuer DN that is not ours, and a signature algorithm
+# this build cannot verify. It is loaded against a key that deliberately does
+# NOT match, so no private key is ever needed: reaching "different identities"
+# proves every certificate in the chain parsed. SKIPPED, loudly, where no such
+# chain is readable -- a skip that read as a pass is what let this ship.
+prod_cert_out=$(./test/tls/prod_cert_check.sh 2>&1); prod_cert_rc=$?
+if [ "$prod_cert_rc" -eq 3 ]; then
+    skip "a real issued certificate chain loads (none readable on this machine)"
+else
+    check "a real issued certificate chain loads" "$prod_cert_rc"
+    [ "$prod_cert_rc" -eq 0 ] || printf '%s\n' "$prod_cert_out"
+fi
+
 # Listener identity is the CANONICAL endpoint, not the host text (audit-report-2
 # Finding 1). "::" and "0.0.0.0" are one in6addr_any endpoint, so the same
 # hostname on both is a duplicate on the shared listener...
