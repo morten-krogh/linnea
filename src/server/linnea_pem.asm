@@ -381,6 +381,102 @@ p256_der_open:
     pop rbx
     ret
 
+; ---- pk_attrs_ok(rdi=content, rsi=end) -> rax = 1 when the range is a PKCS#8
+;      Attributes payload: zero or more Attribute ::= SEQUENCE { type OBJECT
+;      IDENTIFIER, values SET OF AttributeValue }, tiling it exactly. The
+;      wrapper used to be skipped whole, so any bounded bytes inside it passed
+;      (audit-report-116).
+;
+;      The values SET is NOT required to be non-empty, though the report asks
+;      for that: OpenSSL accepts an Attribute with an empty values SET, and
+;      refusing a file the reference takes is the report-114 mistake. Measured,
+;      not assumed. Preserves rbx/r12+.
+pk_attrs_ok:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r13, rsi
+.as_next:
+    cmp rbx, r13
+    je .as_yes
+    ja .as_no
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; one Attribute
+    cmp rax, -1
+    je .as_no
+    cmp dl, 0x30
+    jne .as_no
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call pk_attr_one
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .as_no
+    lea rbx, [rax + rcx]
+    jmp .as_next
+.as_yes:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.as_no:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- pk_attr_one(rdi=content, rsi=end) -> rax = 1 for one Attribute's body.
+pk_attr_one:
+    push rbx
+    mov rbx, rsi
+    call der_any                     ; type
+    cmp rax, -1
+    je .a1_no
+    cmp dl, 0x06
+    jne .a1_no
+    push rax
+    push rcx
+    mov rdi, rax
+    mov rsi, rcx
+    call oid_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .a1_no
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; values
+    cmp rax, -1
+    je .a1_no
+    cmp dl, 0x31                     ; SET OF
+    jne .a1_no
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call der_tiles                   ; its values must be complete elements
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .a1_no
+    lea rdi, [rax + rcx]
+    cmp rdi, rbx
+    jne .a1_no                       ; trailing bytes inside the Attribute
+    mov eax, 1
+    pop rbx
+    ret
+.a1_no:
+    xor eax, eax
+    pop rbx
+    ret
+
 ; ---- linnea_pem_p256_key(rdi=src, rsi=srclen) -> rax = pointer to the
 ;      32-byte private scalar, or -1. The pointer is into a static buffer.
 ;
@@ -605,6 +701,15 @@ linnea_pem_p256_key:
     je .pk_bad
     cmp dl, 0xa0                    ; [0] IMPLICIT Attributes
     jne .pk_bad
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call pk_attrs_ok                ; ...and its CONTENT, not just its wrapper
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .pk_bad
     lea rdi, [rax + rcx]
     cmp rdi, r14
     jne .pk_bad                     ; something after the attributes

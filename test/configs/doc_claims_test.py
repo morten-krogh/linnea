@@ -783,6 +783,22 @@ if _os.path.exists(_CRT):
                                   _os.path.join(_TD, "pkiattrs.key"))),
          "a trailing [0] Attributes is ACCEPTED", True)
 
+    # --- audit-report-116: the attributes CONTENT, not just its wrapper -----
+    # OpenSSL was consulted for each shape rather than assumed. It accepts an
+    # empty set AND an Attribute whose values SET is empty -- so requiring a
+    # non-empty SET, as the report suggests, would refuse a file the reference
+    # takes. Only the NULL is malformed.
+    _fn = bytes.fromhex("06092a864886f70d010914")      # friendlyName
+    _bmp = b"\x1e\x04" + "hi".encode("utf-16-be")
+    _attr = b"\x30" + bytes([len(_fn) + 2 + len(_bmp)]) + _fn + b"\x31" + \
+            bytes([len(_bmp)]) + _bmp
+    test(_tls_cfg(_CRT, _wrap_key(_pki(_kder, b"\xa0\x02\x05\x00"),
+                                  _os.path.join(_TD, "attrnull.key"))),
+         "a NULL inside the attributes wrapper is rejected", False)
+    test(_tls_cfg(_CRT, _wrap_key(_pki(_kder, b"\xa0" + bytes([len(_attr)]) + _attr),
+                                  _os.path.join(_TD, "attrgood.key"))),
+         "a well-formed PKCS#8 attribute is ACCEPTED", True)
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",
