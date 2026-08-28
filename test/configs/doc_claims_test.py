@@ -749,6 +749,40 @@ if _os.path.exists(_CRT):
         bad.append("could not locate the [3] extensions wrapper")
         print("FAIL could not locate the [3] extensions wrapper")
 
+    # --- audit-report-115: the OUTER PrivateKeyInfo end ---------------------
+    # The parser set its boundary to PrivateKeyInfo's content, then REPLACED it
+    # with the privateKey OCTET STRING's end, so bytes left in the outer
+    # sequence were never inspected. RFC 5208 5 allows at most an optional
+    # [0] IMPLICIT Attributes there -- and OpenSSL agrees: it accepts a trailing
+    # [0] and refuses a bare NULL, so BOTH directions are pinned.
+    def _pki(der, extra):
+        def _tlv(b, i):
+            n, j = b[i + 1], i + 2
+            if n & 0x80:
+                k = n & 0x7f
+                n = int.from_bytes(b[j:j + k], "big")
+                j += k
+            return j, n
+
+        def _enc(tag, c):
+            n = len(c)
+            if n < 0x80:
+                L = bytes([n])
+            else:
+                w = (n.bit_length() + 7) // 8
+                L = bytes([0x80 | w]) + n.to_bytes(w, "big")
+            return bytes([tag]) + L + c
+
+        ps, pl = _tlv(der, 0)
+        return _enc(0x30, der[ps:ps + pl] + extra)
+
+    test(_tls_cfg(_CRT, _wrap_key(_pki(_kder, b"\x05\x00"),
+                                  _os.path.join(_TD, "pkitail.key"))),
+         "a NULL after privateKey is rejected", False)
+    test(_tls_cfg(_CRT, _wrap_key(_pki(_kder, b"\xa0\x00"),
+                                  _os.path.join(_TD, "pkiattrs.key"))),
+         "a trailing [0] Attributes is ACCEPTED", True)
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

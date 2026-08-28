@@ -406,6 +406,7 @@ linnea_pem_p256_key:
     push rbx
     push r12
     push r13
+    push r14
     lea rdx, [pk_name]
     mov rcx, pk_name_len
     lea r8, [key_buf]
@@ -425,6 +426,11 @@ linnea_pem_p256_key:
     je .fail
     mov rbx, rax
     lea r13, [rax + rcx]
+    mov r14, r13                    ; the OUTER PrivateKeyInfo end. r13 is
+                                    ; repurposed for the privateKey OCTET STRING
+                                    ; below, so without this copy the outer
+                                    ; sequence's remaining bytes were never
+                                    ; looked at (audit-report-115).
 
     mov rdi, rbx                    ; INTEGER 0
     mov rsi, r13
@@ -584,8 +590,28 @@ linnea_pem_p256_key:
 .pk_end:
     cmp rbx, r13
     jne .pk_bad                     ; a child overran ECPrivateKey
+    ; ...and now the OUTER sequence. RFC 5208 5: PrivateKeyInfo is version,
+    ; AlgorithmIdentifier, privateKey, and at most an optional [0] IMPLICIT
+    ; Attributes. MEASURED: OpenSSL accepts a trailing [0] and refuses a bare
+    ; NULL, so this allows exactly the one and refuses the other -- rejecting
+    ; both would repeat report 114's too-strict mistake.
+    cmp r13, r14
+    je .pk_outer_done
+    ja .pk_bad
+    mov rdi, r13
+    mov rsi, r14
+    call der_any
+    cmp rax, -1
+    je .pk_bad
+    cmp dl, 0xa0                    ; [0] IMPLICIT Attributes
+    jne .pk_bad
+    lea rdi, [rax + rcx]
+    cmp rdi, r14
+    jne .pk_bad                     ; something after the attributes
+.pk_outer_done:
     pop rcx
     pop rax
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -597,6 +623,7 @@ linnea_pem_p256_key:
     jmp .fail
 .fail:
     mov rax, -1
+    pop r14
     pop r13
     pop r12
     pop rbx
