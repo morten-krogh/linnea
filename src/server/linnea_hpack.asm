@@ -340,6 +340,26 @@ linnea_hpack_decode:
     pop rbx
     ret
 
+; h1_unsafe_scan(rsi = value ptr, rdi = value len; rbx = req)
+; Marks the request when a value that is about to become part of an HTTP/1.1
+; request head carries DEL (0x7f) -- see .h1_unsafe in linnea_hpack.inc. Called
+; from the two places a value crosses that line: the rebuilt "name: value" line
+; and the joined Cookie value. The NAME needs no scan; the grammar check above
+; already refuses 0x7f there. Clobbers rcx only, which both call sites reload.
+h1_unsafe_scan:
+    xor ecx, ecx
+.hs_scan:
+    cmp rcx, rdi
+    jae .hs_done
+    cmp byte [rsi + rcx], 0x7f
+    je .hs_seen
+    inc rcx
+    jmp .hs_scan
+.hs_seen:
+    mov qword [rbx + linnea_h2_req.h1_unsafe], 1
+.hs_done:
+    ret
+
 ; emit_field(rax=name ptr, rdx=name len, rsi=value ptr, rdi=value len)
 ; Records a pseudo-header of interest into the req (rbx) and enforces the
 ; count / list-size bounds. CF=set if a bound is exceeded. Touches only
@@ -586,6 +606,7 @@ emit_field:
     ; A cookie field (RFC 9113 8.2.3, Finding 32): do not rebuild a line for it;
     ; append its value to ck_buf, joined with "; ", and let the proxy head emit
     ; one Cookie line at the end. rax=name, rdx=6, rsi=value ptr, rdi=value len.
+    call h1_unsafe_scan              ; that line is an h1 one too (.h1_unsafe)
     mov r10, [rbx + linnea_h2_req.ck_len]   ; length joined so far
     cmp r10, -1
     je .no_rebuild                   ; already overflowed: drop (head fails 431)
@@ -767,6 +788,8 @@ emit_field:
     pop rsi
     je .no_rebuild                   ; a stripped name: capture only
 .rebuild:
+    ; These bytes are about to be an HTTP/1.1 field value; DEL is not one.
+    call h1_unsafe_scan
     push rax
     push rdx
     push rsi

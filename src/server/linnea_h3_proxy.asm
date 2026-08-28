@@ -193,6 +193,13 @@ linnea_h3_proxy_start:
     mov rax, [rbx + linnea_h2_req.hb_cur]
     cmp rax, [rbx + linnea_h2_req.hb_end]
     ja .st_431
+    ; ...and what is in it has to be a legal HTTP/1.1 head. DEL is a valid byte
+    ; in an h3 field value (RFC 9114 4.2 forbids only NUL, LF and CR) and not in
+    ; an h1 one (RFC 9110 5.5), so a request carrying it is answered 400 here
+    ; rather than forwarded -- the same door h2 closes at .serve_proxy, since
+    ; both protocols rebuild their upstream head with the one emit_field.
+    cmp qword [rbx + linnea_h2_req.h1_unsafe], 0
+    jne .st_400
     ; The backend's ceiling used to be tested HERE, before a leg even existed --
     ; and therefore before the idle pool could be consulted. A parked connection
     ; is already counted against max_upstream, so that refused the pool's own
@@ -586,6 +593,9 @@ linnea_h3_proxy_start:
     mov rdi, r12
     call .st_drop
     mov eax, 431
+    jmp .st_ret
+.st_400:
+    mov eax, 400
     jmp .st_ret
 .st_431:
     mov eax, 431

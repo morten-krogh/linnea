@@ -1573,9 +1573,18 @@ linnea_h3_serve:
     jmp .ps_emit
 .ps_431:
     cmp r13d, 431
-    jne .ps_emit
+    jne .ps_400
     lea r8, [body_431]
     mov r9d, body_431_len
+    jmp .ps_emit
+.ps_400:
+    ; a head we would not forward because the CLIENT's bytes cannot be an h1
+    ; request (a DEL in a field value, .h1_unsafe): 400, and a body that says
+    ; so rather than the 502 default, which would blame a backend never asked
+    cmp r13d, 400
+    jne .ps_emit
+    lea r8, [body_400]
+    mov r9d, body_400_len
 .ps_emit:
     mov rdi, r12
     mov esi, r13d

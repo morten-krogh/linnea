@@ -200,6 +200,17 @@ struc linnea_h2_req
     ; Finding 33): the proxy path emits a local interim 100 before collecting the
     ; body, and the field is stripped from the upstream request.
     .expect_100:  resq 1
+    ; 1 when a field this request WILL forward carried DEL (0x7f) in its value.
+    ; RFC 9113 8.2.1 and RFC 9114 4.2 forbid only NUL, LF and CR in an h2/h3
+    ; field value, so DEL arrives legally and a request we answer ourselves is
+    ; free to keep it. RFC 9110 5.5 puts it in neither field-vchar nor obs-text,
+    ; though, so the moment the rebuilt head goes out as an HTTP/1.1 request it
+    ; is a byte no h1 grammar allows -- the differential report 121 closed at the
+    ; h1 door, arriving through this one. Only the proxy paths read it
+    ; (.serve_proxy here, linnea_h3_proxy_start for h3), and they answer 400;
+    ; that is why it is a flag and not .malformed, which would fail the stream
+    ; for a static request the RFC says is well-formed.
+    .h1_unsafe:   resq 1
     .dyn:         resq 1        ; *linnea_hpack_dyn for this connection, or 0
                                 ; (QPACK passes 0: HTTP/3 has its own table
                                 ; encoding, and we advertise zero capacity)

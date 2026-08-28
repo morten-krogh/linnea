@@ -26,6 +26,19 @@ if [ "$ktls" = 1 ]; then
     timeout 120 python3 test/proxy_empty_body.py $CA ${P61462} >/dev/null 2>&1
     check "proxy: an empty body forwards Content-Length: 0 on every protocol" $?
 
+    # audit-report-122: DEL (0x7f) is legal in an h2/h3 field value (RFC 9113
+    # 8.2.1, RFC 9114 4.2 forbid only NUL, LF and CR) and illegal in an h1 one
+    # (RFC 9110 5.5), so the h2/h3 proxy translated a legal request into an
+    # invalid HTTP/1.1 one and sent it upstream -- the differential report 121
+    # closed at the h1 door, reopened through this one. All three must now
+    # answer 400 with the backend never hearing the request, which is what the
+    # echoed head proves. Two acceptance controls ride along: the same header
+    # one byte different, and "a<0x7e>b<0x80>c" -- 0x7e closes VCHAR and 0x80
+    # opens obs-text, so a fix clamping above 0x7e would refuse a legal value
+    # and nothing else here would notice.
+    timeout 120 python3 test/proxy_del_field.py $CA ${P61462} >/dev/null 2>&1
+    check "proxy: h1/h2/h3 agree on refusing DEL in a forwarded field value" $?
+
     # The h3 half of /api/bigearly, which that matrix cannot judge: six 103
     # Early Hints whose ENCODED sum overran the one buffer the interim frames
     # share, so h3 answered 502 to an exchange h1 and h2 served (audit-report-8

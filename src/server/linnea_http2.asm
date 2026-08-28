@@ -2130,6 +2130,15 @@ h2_serve:
     jmp .flags
 
 .serve_proxy:
+    ; The head we are about to build is an HTTP/1.1 request, and a field value
+    ; carrying DEL cannot be one (RFC 9110 5.5: field-vchar is 0x21-0x7e or
+    ; obs-text 0x80-0xff, and 0x7f is neither). Over h2 that byte is legal --
+    ; RFC 9113 8.2.1 forbids only NUL, LF and CR -- so it is refused HERE, at
+    ; the protocol boundary, and not in emit_field: a static request keeps it.
+    ; Answered before the upstream slot is claimed, so the backend never hears
+    ; of the request at all, which is the half of report 121 that mattered.
+    cmp qword [r12 + linnea_h2_req.h1_unsafe], 0
+    jne .resp_400
     ; forward the request to the location's upstream: an h1 exchange on its
     ; own connection, driven by the io_uring loop through an upstream slot.
     ; Here the request is rewritten into the slot; the loop connects, sends,
