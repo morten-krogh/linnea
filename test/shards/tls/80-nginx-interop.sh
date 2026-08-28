@@ -20,7 +20,13 @@ import sys
 d, repo, port = sys.argv[1], sys.argv[2], sys.argv[3]
 big = "\n".join('            add_header X-Big-%02d "%s" always;' % (i, chr(97+i%26)*1000)
                 for i in range(24))
-open(d + "/nginx.conf", "w").write(f'''worker_processes 1;
+# nginx is built --user=nginx, so a master started as root drops its workers
+# to that uid -- which cannot traverse a 0750 /root to reach {d}/www. Every
+# check that reads a file there fails while the return-directive ones pass,
+# which is exactly how this looked from /root. Keep the workers privileged;
+# started unprivileged, nginx ignores the directive with a warning.
+open(d + "/nginx.conf", "w").write(f'''user root;
+worker_processes 1;
 daemon off;
 error_log {d}/logs/error.log crit;
 pid {d}/logs/nginx.pid;
