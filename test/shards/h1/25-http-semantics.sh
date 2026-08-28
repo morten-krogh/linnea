@@ -316,6 +316,21 @@ resp=$(raw_http 'CONNECT one.test HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "target: CONNECT without a port is 400" "400 Bad Request" "$resp"
 resp=$(raw_http 'CONNECT [::1] HTTP/1.1\r\nHost: one.test\r\n\r\n')
 check_http "target: a bracketed CONNECT without a port is 400" "400 Bad Request" "$resp"
+# report 126: the IP-literal grammar's other alternative, IPvFuture, was
+# refused here too -- so a legal CONNECT target was told its syntax was wrong.
+# nginx 1.30.4 answers the same three lines 405, 405, 405 (it validates nothing
+# inside the brackets); we answer 405 for the well-formed one and keep 400 for
+# the two that are not IPvFuture at all.
+resp=$(raw_http 'CONNECT [v1.fe80]:443 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: an IPvFuture authority-form CONNECT is 405" "405 Method Not Allowed" "$resp"
+resp=$(raw_http 'CONNECT [V9.x]:80 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: an upper-case IPvFuture version flag is 405" "405 Method Not Allowed" "$resp"
+resp=$(raw_http 'CONNECT [v.fe80]:443 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: CONNECT to an empty-version IPvFuture is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT [v1.]:443 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: CONNECT to an empty-value IPvFuture is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT [v1.fe80] HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: an IPvFuture CONNECT without a port is 400" "400 Bad Request" "$resp"
 # the other three target forms are not open to CONNECT, and were the shape that
 # used to reach a 405 by matching a location
 resp=$(raw_http 'CONNECT /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')

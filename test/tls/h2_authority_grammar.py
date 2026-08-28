@@ -72,11 +72,19 @@ def served(authority):
 assert served(b"localhost"), "valid :authority was not served over h2"
 # a valid IPv6 literal we do not host is served by the connection's own vhost
 assert served(b"[::1]"), "valid IPv6-literal :authority was not served over h2"
+# report 126: IPvFuture is the IP-literal grammar's other alternative and was
+# refused. It is one shared parser, so h2 has to move with h1 -- an authority
+# spelling legal on one protocol and not the other is exactly the divergence
+# this file exists to catch.
+assert served(b"[v1.fe80]"), "valid IPvFuture :authority was not served over h2"
+assert served(b"[V9.x]:443"), "upper-case IPvFuture flag was not served over h2"
 # structural AND semantic malformed authorities are refused (audit-report-3 F2:
-# out-of-range port, non-reg-name char, bracket contents that are not IPv6)
+# out-of-range port, non-reg-name char, bracket contents that are not IPv6;
+# report 126: contents that open with "v" but are not an IPvFuture either)
 for bad in (b"localhost:garbage", b"localhost:80:bad", b"[::1", b"[::1]x",
             b"localhost:", b"localhost:65536", b"localhost:99999",
-            b"localhost/foo", b"[deadbeef]", b"[gggg::1]"):
+            b"localhost/foo", b"[deadbeef]", b"[gggg::1]",
+            b"[v.fe80]", b"[v1.]", b"[v1]", b"[vg.x]", b"[v1.a/b]"):
     if served(bad):
         print(f"FAIL: malformed :authority {bad!r} was served over h2")
         sys.exit(1)

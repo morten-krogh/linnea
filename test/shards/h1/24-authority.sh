@@ -49,5 +49,44 @@ check "authority: valid IPv6 literal without a port served (200)" $?
 [ "$(hc '[::ffff:1.2.3.4]')" = 200 ]
 check "authority: valid v4-mapped IPv6 literal served (200)" $?
 
+# report 126: RFC 3986 3.2.2 gives IP-literal two alternatives --
+# "[" ( IPv6address / IPvFuture ) "]" -- and only IPv6address was implemented,
+# so "[v1.fe80]", a legal uri-host and therefore a legal Host, was 400. It is
+# served like any other name we do not host: by the default vhost, exactly as
+# "[::1]" above is. That pairing is the point. A build that simply stopped
+# validating bracket contents would pass every acceptance line here, so the
+# near-misses below and the "[deadbeef]"/"[gggg::1]" lines above are what
+# separate the fix from a hole.
+[ "$(hc '[v1.fe80]:443')" = 200 ]
+check "authority: IPvFuture literal accepted (200)" $?
+[ "$(hc '[v1.fe80]')" = 200 ]
+check "authority: IPvFuture literal without a port accepted (200)" $?
+[ "$(hc "[vF.a:b-c]:65535")" = 200 ]
+check "authority: ':' and sub-delims in an IPvFuture value accepted (200)" $?
+# ABNF string literals are case-insensitive (RFC 5234 2.3), and 3986 says so
+# again in prose. Python's urlsplit gets this wrong and refuses "V"; we do not.
+[ "$(hc '[V9.x]')" = 200 ]
+check "authority: the IPvFuture version flag is case-insensitive (200)" $?
+# ...and the near-misses, each one byte away from the accepted spelling
+[ "$(hc '[v.fe80]')" = 400 ]
+check "authority: IPvFuture with an empty version rejected (400)" $?
+[ "$(hc '[v1.]')" = 400 ]
+check "authority: IPvFuture with an empty address value rejected (400)" $?
+[ "$(hc '[v1]')" = 400 ]
+check "authority: IPvFuture with no '.' rejected (400)" $?
+[ "$(hc '[vg.x]')" = 400 ]
+check "authority: a non-hex IPvFuture version flag rejected (400)" $?
+[ "$(hc '[v1.a/b]')" = 400 ]
+check "authority: a non-reg-name byte in an IPvFuture value rejected (400)" $?
+# IPvFuture is unreserved / sub-delims / ":" -- there is no pct-encoded
+# alternative in it, the way there is in reg-name
+[ "$(hc '[v1.a%20b]')" = 400 ]
+check "authority: '%' in an IPvFuture value rejected (400)" $?
+# the port rules are the literal's, not a second set: still judged after the ']'
+[ "$(hc '[v1.fe80]:65536')" = 400 ]
+check "authority: an out-of-range port after an IPvFuture rejected (400)" $?
+[ "$(hc '[v1.fe80]x')" = 400 ]
+check "authority: junk after an IPvFuture literal rejected (400)" $?
+
 kill $auth_pid 2>/dev/null
 wait $auth_pid 2>/dev/null

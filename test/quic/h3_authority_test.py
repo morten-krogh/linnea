@@ -117,9 +117,12 @@ assert b"sub index" not in body and b"doctype" not in body, \
 # a non-numeric port, an extra port component, an unterminated bracket, or junk
 # after the IPv6 literal. Before the shared authority parser these split at the
 # first ':' and whatever followed was never looked at.
+# report 126 adds the "[v..." near-misses: contents that open with the IPvFuture
+# version flag but do not complete the production.
 for bad in (b"sni.test:garbage", b"sni.test:80:bad", b"[::1", b"[::1]x", b"sni.test:",
             b"sni.test:65536", b"sni.test:99999", b"sni.test/foo",
-            b"[deadbeef]", b"[gggg::1]"):
+            b"[deadbeef]", b"[gggg::1]",
+            b"[v.fe80]", b"[v1.]", b"[v1]", b"[vg.x]", b"[v1.a/b]"):
     body = request("sni.test", [M, S, (b":authority", bad), P])
     assert b"sub index" not in body and b"doctype" not in body and b"421" not in body, \
         f"malformed authority {bad!r} was served: {body[:60]}"
@@ -129,4 +132,10 @@ for bad in (b"sni.test:garbage", b"sni.test:80:bad", b"[::1", b"[::1]x", b"sni.t
 # the first-colon split mangled it)
 body = request("sni.test", [M, S, (b":authority", b"[::1]:%d" % port), P])
 assert b"sub index" in body, f"bracketed authority not served locally: {body[:60]}"
+
+# report 126: and so is the IP-literal grammar's other alternative. h3 reaches
+# the same parser through linnea_hpack_req_check and authority_vhost, so this
+# is the line that says the three protocols still agree on what an authority is.
+body = request("sni.test", [M, S, (b":authority", b"[v1.fe80]:%d" % port), P])
+assert b"sub index" in body, f"IPvFuture authority not served locally: {body[:60]}"
 print("ok")

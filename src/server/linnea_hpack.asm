@@ -1963,6 +1963,17 @@ linnea_http_authority_host:
     cmp rcx, 1
     jbe .ah_bad                       ; "[]" : empty literal
     mov rbx, rcx                      ; index of ']'  (host is bytes 1..rbx-1)
+    ; RFC 3986 3.2.2 gives IP-literal two alternatives and only one of them was
+    ; here: "[" ( IPv6address / IPvFuture ) "]". An IPvFuture opens with a
+    ; version flag "v" -- case-insensitive, as an ABNF string literal is -- and
+    ; "v" is not a hex digit, so the first byte inside the brackets picks the
+    ; alternative outright, with nothing to backtrack. Without this branch
+    ; "[v1.fe80]" -- a legal uri-host, and so a legal Host, :authority and
+    ; CONNECT target -- was answered 400 (report 126).
+    movzx eax, byte [r12 + 1]
+    or eax, 0x20                      ; fold: "V" and "v" are the same flag
+    cmp al, 'v'
+    je .ah_b_future
     ; the contents must be a real IPv6 address, not just non-empty printable
     ; bytes: "[deadbeef]" is hex but not an address. Copy them NUL-terminated
     ; and run them through the config's inet_pton-style parser.
@@ -1979,6 +1990,7 @@ linnea_http_authority_host:
     call linnea_network_parse_ipv6    ; rsp is 16-aligned here (3 pushes above)
     test rax, rax
     js .ah_bad                        ; not a valid IPv6 literal
+.ah_b_port:
     ; a port, if present, follows the ']'
     lea rcx, [rbx + 1]                ; byte after ']'
     cmp rcx, r13
@@ -1996,6 +2008,58 @@ linnea_http_authority_host:
     pop r12
     pop rbx
     ret
+    ; --- IPvFuture: "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" ) ---
+    ; No version flag has ever been assigned, so this literal names no address
+    ; this build could dial -- but dialling is not what is being decided here.
+    ; The one question this parser answers is whether the authority is well
+    ; formed. An origin server matches the result against its vhost names (no
+    ; match is the default vhost, exactly as an unhosted IPv6 literal is), and
+    ; a CONNECT carrying one is answered 405 because this build tunnels
+    ; nothing. Neither dereferences it, which is the case RFC 3986 3.2.2
+    ; reserves its "address mechanism not supported" error for.
+    ;
+    ; Nothing is copied out, so there is no LINNEA_MAX_IP6_LIT here: the host
+    ; comes back as an offset and a length into the caller's buffer, the way an
+    ; equally unbounded reg-name already does.
+.ah_b_future:
+    mov rcx, 2                        ; first byte past the "v"
+    xor r11d, r11d                    ; version digits seen so far
+.ah_f_ver:
+    cmp rcx, rbx
+    jae .ah_bad                       ; "[v1]" : reached the ']' with no "."
+    movzx eax, byte [r12 + rcx]
+    cmp al, '.'
+    je .ah_f_dot
+    cmp al, '0'                       ; 1*HEXDIG, and nothing else: "[vg.x]"
+    jb .ah_bad                        ; names no version
+    cmp al, '9'
+    jbe .ah_f_digit
+    or al, 0x20
+    cmp al, 'a'
+    jb .ah_bad
+    cmp al, 'f'
+    ja .ah_bad
+.ah_f_digit:
+    inc r11
+    inc rcx
+    jmp .ah_f_ver
+.ah_f_dot:
+    test r11, r11
+    jz .ah_bad                        ; "[v.fe80]" : an empty version
+    inc rcx                           ; first byte of the address value
+    cmp rcx, rbx
+    jae .ah_bad                       ; "[v1.]" : an empty address value
+.ah_f_val:
+    cmp rcx, rbx
+    jae .ah_b_port                    ; value held; the port is judged as ever
+    movzx eax, byte [r12 + rcx]
+    cmp al, ':'
+    je .ah_f_next                     ; ":" is in this production and no other
+    call .ah_regname_ok               ; unreserved / sub-delims; CF set if not
+    jc .ah_bad
+.ah_f_next:
+    inc rcx
+    jmp .ah_f_val
 .ah_bad:
     mov rax, -1
     pop r13
