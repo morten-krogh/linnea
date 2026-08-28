@@ -519,6 +519,7 @@ linnea_pem_p256_key:
     test r12d, 2
     jnz .pk_bad                     ; a second [1]
     or r12d, 2
+    lea r10, [rax + rcx]            ; the [1] wrapper's content end
     ; [1] wraps a BIT STRING holding an uncompressed P-256 point. Accepting it
     ; unexamined is what the report objected to; it is checked structurally
     ; here, and the ktls pairing then proves the SCALAR signs for the
@@ -537,6 +538,13 @@ linnea_pem_p256_key:
     cmp byte [rax], 0x00
     jne .pk_bad2
     cmp byte [rax + 1], 0x04        ; uncompressed only
+    jne .pk_bad2
+    ; RFC 5915 3: publicKey [1] BIT STRING OPTIONAL -- ONE BIT STRING, not a
+    ; container holding one plus whatever follows. The wrapper's own length was
+    ; used to advance, so a trailing TLV inside it was stepped over unseen
+    ; (audit-report-110).
+    lea rdx, [rax + rcx]
+    cmp rdx, r10
     jne .pk_bad2
     push rdi
     push rsi

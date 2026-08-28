@@ -441,6 +441,45 @@ if _os.path.exists(_CRT):
              "an embedded public key the scalar does not sign for is rejected",
              False, "does not sign for")
 
+        # --- audit-report-110: [1] is ONE BIT STRING, not a container -------
+        # The wrapper's own declared length was used to advance, so a trailing
+        # TLV inside it was stepped over unseen. RFC 5915 3: publicKey [1] BIT
+        # STRING OPTIONAL.
+        def _pub_tail(der):
+            def _tlv(b, i):
+                n, j = b[i + 1], i + 2
+                if n & 0x80:
+                    k = n & 0x7f
+                    n = int.from_bytes(b[j:j + k], "big")
+                    j += k
+                return j, n
+
+            def _enc(tag, c):
+                n = len(c)
+                if n < 0x80:
+                    L = bytes([n])
+                else:
+                    w = (n.bit_length() + 7) // 8
+                    L = bytes([0x80 | w]) + n.to_bytes(w, "big")
+                return bytes([tag]) + L + c
+
+            ps, _ = _tlv(der, 0)
+            i = ps
+            vs, vl = _tlv(der, i); i = vs + vl
+            as_, al = _tlv(der, i); i = as_ + al
+            os_, ol = _tlv(der, i)
+            ec = der[os_:os_ + ol]
+            es, el = _tlv(ec, 0); j = es
+            v2, l2 = _tlv(ec, j); j = v2 + l2
+            k2, kl = _tlv(ec, j); j = k2 + kl
+            w1, wl = _tlv(ec, j)
+            inner = _enc(0x30, ec[es:j] + _enc(0xa1, ec[w1:w1 + wl] + b"\x05\x00"))
+            return _enc(0x30, der[ps:as_ + al] + _enc(0x04, inner))
+
+        test(_tls_cfg(_CRT, _wrap_key(_pub_tail(_kder),
+                                      _os.path.join(_TD, "pubtail.key"))),
+             "a trailing TLV inside [1] publicKey is rejected", False)
+
     # ...and the CONTROLS for [0], which no real key carries: PKCS#8 pins the
     # curve in the outer AlgorithmIdentifier, so generators omit the inner one.
     # Both branches are therefore reachable only from a hand-built key.
