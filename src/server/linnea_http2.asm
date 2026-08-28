@@ -1246,6 +1246,29 @@ h2_build_request:
     jne .malformed_stream            ; :scheme is forbidden with CONNECT
     cmp qword [rsp + REQ + linnea_h2_req.path_ptr], 0
     jne .malformed_stream            ; :path is forbidden with CONNECT
+    ; ...and the value has to BE an authority. Nonempty was the whole test, so
+    ; the one branch that skips req_check also skipped the one authority
+    ; grammar every other request goes through, and "bad/path" reached .serve
+    ; as an ordinary 405 (report 124). CONNECT's :authority is the authority
+    ; form of the request target: host and port, no userinfo, no path, and --
+    ; unlike an ordinary request, which has a scheme to take a default port
+    ; from -- the port is NOT optional (RFC 9113 8.5, RFC 9110 9.3.6).
+    mov rdi, [rsp + REQ + linnea_h2_req.auth_ptr]
+    mov rsi, [rsp + REQ + linnea_h2_req.auth_len]
+    call linnea_http_authority_host  ; -> rax = host_len, rdx = host_off; rbx/r12 survive
+    cmp rax, -1
+    je .malformed_stream             ; not a host[:port] at all
+    ; end of the host token: host_len for a reg-name, one more past the ']' for
+    ; a bracketed literal. Anything after it the grammar above has already
+    ; proved to be ":" + a port in 0..65535, so all that is left to demand is
+    ; that something IS there.
+    add rax, rdx                     ; host_off is 0 or 1
+    test rdx, rdx
+    jz .connect_port
+    inc rax                          ; step over the ']'
+.connect_port:
+    cmp rax, [rsp + REQ + linnea_h2_req.auth_len]
+    jae .malformed_stream            ; a bare host: CONNECT has no default port
     cmp qword [rsp + REQ + linnea_h2_req.host_count], 1
     ja .malformed_stream             ; more than one Host
     cmp qword [rsp + REQ + linnea_h2_req.host_count], 0

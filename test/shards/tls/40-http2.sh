@@ -514,10 +514,13 @@ PY
     timeout 30 python3 test/tls/h2_frame_validation.py $CA ${P61446} >/dev/null 2>&1
     check "http2 malformed control frames draw the right GOAWAY (Findings 25/26/27/29)" $?
 
-    # RFC 9113 8.5 (Finding 28): CONNECT is unsupported (405), but one that omits
-    # :authority or carries :scheme/:path is malformed -- a stream reset, not a 405.
-    timeout 30 python3 test/tls/h2_connect.py $CA ${P61446} >/dev/null 2>&1
-    check "http2 malformed CONNECT is a stream error, not 405 (Finding 28)" $?
+    # RFC 9113 8.5 (Finding 28, report 124): CONNECT is unsupported (405), but one
+    # that omits :authority, carries :scheme/:path, or whose :authority is not the
+    # authority form -- a path, userinfo, a bad IPv6 literal, or no port at all --
+    # is malformed: a stream reset, not a 405. The well-formed CONNECTs in there
+    # must still get their 405, which is what stops "reset everything" passing.
+    timeout 60 python3 test/tls/h2_connect.py $CA ${P61446} >/dev/null 2>&1
+    check "http2 malformed CONNECT is a stream error, not 405 (Finding 28, report 124)" $?
 
     kill $h2_pid 2>/dev/null
     wait $h2_pid 2>/dev/null
