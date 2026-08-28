@@ -286,6 +286,61 @@ check_http "target: OPTIONS * with two Hosts is 400" "400 Bad Request" "$resp"
 resp=$(raw_http 'OPTIONS * HTTP/1.1\r\nHost: one.test\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n')
 check_http "target: OPTIONS * with a chunked body is answered" "200 OK" "$resp"
 
+# authority-form (RFC 9112 3.2.3), the fourth target form and CONNECT's only
+# one. It has no leading "/", so it reached the path normalizer and came back
+# 400: a legal CONNECT was told its syntax was wrong, when the truth is that
+# this build implements no tunnel (audit-report-125). nginx 1.30.4, asked the
+# same lines, answers 405 -- so does h2 here, since report 124. The ACCEPTANCE
+# half matters as much as the rejections: a build that blanket-400s CONNECT
+# passes every "is 400" line below on its own.
+resp=$(raw_http 'CONNECT one.test:443 HTTP/1.1\r\nHost: one.test:443\r\n\r\n')
+check_http "target: authority-form CONNECT is 405, not 400" "405 Method Not Allowed" "$resp"
+check_http "target: the CONNECT 405 carries Allow" "Allow: GET, HEAD" "$resp"
+resp=$(raw_http 'CONNECT [::1]:443 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: a bracketed IPv6 authority-form CONNECT is 405" "405 Method Not Allowed" "$resp"
+resp=$(raw_http 'CONNECT one.test:65535 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: the top port is accepted authority-form" "405 Method Not Allowed" "$resp"
+# ...and the rejections, all of them the shared authority grammar's, not a
+# second one written for CONNECT
+resp=$(raw_http 'CONNECT bad/path HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: CONNECT with a path in the authority is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT user@host:443 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: CONNECT with userinfo is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT one.test:99999 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: CONNECT with an out-of-range port is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT one.test:44a HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: CONNECT with a non-numeric port is 400" "400 Bad Request" "$resp"
+# CONNECT names a host AND a port: it has no scheme to take a default from
+# (RFC 9110 9.3.6), so a bare host names no destination. Same rule as h2's.
+resp=$(raw_http 'CONNECT one.test HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: CONNECT without a port is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT [::1] HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: a bracketed CONNECT without a port is 400" "400 Bad Request" "$resp"
+# the other three target forms are not open to CONNECT, and were the shape that
+# used to reach a 405 by matching a location
+resp=$(raw_http 'CONNECT /hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: origin-form CONNECT is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT http://one.test/hello.txt HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: absolute-form CONNECT is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT * HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: asterisk-form CONNECT is 400" "400 Bad Request" "$resp"
+# authority-form is CONNECT's alone: no other method may send one, or a build
+# that recognised "host:port" for everything would pass the lines above
+resp=$(raw_http 'GET one.test:443 HTTP/1.1\r\nHost: one.test\r\n\r\n')
+check_http "target: authority-form on GET is still 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'POST one.test:443 HTTP/1.1\r\nHost: one.test\r\nContent-Length: 0\r\n\r\n')
+check_http "target: authority-form on POST is still 400" "400 Bad Request" "$resp"
+# the 405 is decided after the rest of the head, so a CONNECT that also breaks
+# a Host or framing rule still gets the code naming its actual fault
+resp=$(raw_http 'CONNECT one.test:443 HTTP/1.1\r\n\r\n')
+check_http "target: CONNECT without a Host is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT one.test:443 HTTP/1.1\r\nHost: one.test\r\nHost: evil.test\r\n\r\n')
+check_http "target: CONNECT with two Hosts is 400" "400 Bad Request" "$resp"
+resp=$(raw_http 'CONNECT one.test:443 HTTP/1.1\r\nHost: one.test\r\nTransfer-Encoding: gzip\r\n\r\n')
+check_http "target: CONNECT with an unimplemented coding is 501" "501 Not Implemented" "$resp"
+resp=$(raw_http 'CONNECT one.test:443 HTTP/9.9\r\nHost: one.test\r\n\r\n')
+check_http "target: CONNECT on an unsupported version is 505" "505 HTTP Version Not Supported" "$resp"
+
 # --- the method is a token (RFC 9110 9.1). The request-line parse only bounded
 # it to printable ASCII, so every delimiter got through — including the double
 # quote, which the access line writes the method inside, splitting its own

@@ -133,19 +133,28 @@ else:
 # --- 405 for a method we know, 501 for one we do not (RFC 9110 15.6.2) -----
 # Both used to be 405 with an Allow header, which tells a client that FROB is a
 # real method simply not permitted here.
-for method, want in (("POST", 405), ("PUT", 405), ("DELETE", 405),
-                     ("OPTIONS", 405), ("TRACE", 405), ("PATCH", 405),
-                     ("CONNECT", 405),
-                     ("FROB", 501), ("get", 501), ("XYZZY", 501)):
-    status, f6, _ = send(f"{method} /hello.txt HTTP/1.1\r\nHost: one.test\r\n"
+# CONNECT is asked with the only request target it may carry: authority-form,
+# "host:port" (RFC 9112 3.2.3). It used to be asked with an origin-form path,
+# which it may not send at all -- that answered 405 only because the path
+# matched a location, and it hid the fact that a REAL CONNECT was answered 400
+# for want of a leading "/" (audit-report-125). Both halves are checked below,
+# so neither a blanket 400 nor a blanket 405 satisfies this.
+for method, target, want in (("POST", "/hello.txt", 405), ("PUT", "/hello.txt", 405),
+                     ("DELETE", "/hello.txt", 405), ("OPTIONS", "/hello.txt", 405),
+                     ("TRACE", "/hello.txt", 405), ("PATCH", "/hello.txt", 405),
+                     ("CONNECT", "one.test:443", 405),
+                     ("CONNECT", "/hello.txt", 400),
+                     ("FROB", "/hello.txt", 501), ("get", "/hello.txt", 501),
+                     ("XYZZY", "/hello.txt", 501)):
+    status, f6, _ = send(f"{method} {target} HTTP/1.1\r\nHost: one.test\r\n"
                          f"\r\n".encode())
     if status != want:
-        print(f"FAIL {method} gave {status}, want {want}")
+        print(f"FAIL {method} {target} gave {status}, want {want}")
         fails += 1
     elif want == 405 and not f6.get("allow"):
-        print(f"FAIL {method} gave 405 without an Allow header (15.5.6)")
+        print(f"FAIL {method} {target} gave 405 without an Allow header (15.5.6)")
         fails += 1
     else:
-        print(f"ok   {method} -> {status}")
+        print(f"ok   {method} {target} -> {status}")
 
 sys.exit(1 if fails else 0)

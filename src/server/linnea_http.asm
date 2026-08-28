@@ -690,6 +690,8 @@ section .text
 ;             test -- the slot immediately after that array
 ;   [rsp+304] asterisk-form: the target was "*", so the request is about the
 ;             server itself rather than any resource (OPTIONS *)
+;   [rsp+552] authority-form: the target was "host:port", which only CONNECT
+;             may send and which names no resource either (report 125)
 
 ; http_hop_by_hop(rdi = field name, rsi = name length) -> rax = 1 if the field
 ; must not cross this hop, whatever Connection says. See hop_by_hop_names.
@@ -1019,6 +1021,49 @@ linnea_http_handle:
     mov qword [rsp + 304], 0   ; not an OPTIONS * request
     mov qword [rsp + 312], 0   ; ...and no If-Match lines (also a count)
     mov qword [rsp + 328], 0   ; If-Unmodified-Since absent
+    mov qword [rsp + 552], 0   ; ...and not an authority-form CONNECT
+    ; authority-form, which belongs to CONNECT and to nothing else (RFC 9112
+    ; 3.2.3): "host:port", no scheme, no path, no "*". It is tested ahead of
+    ; the other two forms because CONNECT may not use either of them, and an
+    ; authority is not a path -- so a legal "CONNECT example.com:443" fell
+    ; through to the normalizer below and was answered 400, telling the client
+    ; its syntax was wrong when the truth is that this server does not tunnel
+    ; (report 125). h2 has validated the same target as an authority since
+    ; report 124 and answers it 405; h1 could not reach any CONNECT handler.
+    ; A well-formed one is answered 405 further down, after the rest of the
+    ; head has been judged. Only a malformed one stays a 400.
+    cmp qword [rsp + 104], 7           ; the method text sits at in_buf[0)
+    jne .not_connect
+    cmp dword [r14], 'CONN'
+    jne .not_connect
+    cmp dword [r14 + 3], 'NECT'
+    jne .not_connect
+    push r13
+    push r15
+    mov rdi, [rsp + 16 + 8]    ; target ptr (two pushes above the frame)
+    mov rsi, [rsp + 16 + 16]   ; target len
+    call linnea_http_authority_host    ; rax = host len, rdx = host offset
+    pop r15
+    pop r13
+    cmp rax, -1
+    je .resp_400               ; not a host[:port] at all: origin-form, "*",
+                               ; absolute-form, userinfo, a bad port...
+    ; the host token ends at host_off + host_len, one further past a bracketed
+    ; literal's ']'. Whatever follows it the grammar has already proved to be
+    ; ":" plus a port in 0..65535, so the only thing left to demand is that
+    ; something IS there: CONNECT carries no scheme to take a default port
+    ; from (RFC 9110 9.3.6), so a bare host names no destination. Same rule,
+    ; same derivation, as the h2 branch report 124 added.
+    add rax, rdx               ; host_off is 0 or 1
+    test rdx, rdx
+    jz .connect_port
+    inc rax                    ; step over the ']'
+.connect_port:
+    cmp rax, [rsp + 16]
+    jae .resp_400              ; a bare host, no port
+    mov qword [rsp + 552], 1
+    jmp .target_form_done
+.not_connect:
     mov rax, [rsp + 8]
     cmp qword [rsp + 16], 1
     jne .not_asterisk
@@ -1742,6 +1787,15 @@ linnea_http_handle:
     and rax, 5
     cmp rax, 5
     je .resp_400
+    ; A CONNECT whose target parsed as authority-form above. Like "OPTIONS *"
+    ; it names no resource -- there is no path to decode and no location to
+    ; match -- so it is answered in the same place and the same way. 405, not
+    ; 400: the request is well formed, this build simply implements no tunnel,
+    ; which is the answer h2 already gives it. It sits AFTER the Host, framing
+    ; and Transfer-Encoding rules so a CONNECT that also breaks one of those
+    ; still gets the code naming its actual fault.
+    cmp qword [rsp + 552], 0
+    jne .resp_405
     ; "OPTIONS *" asks about the server, not about a resource (RFC 9112
     ; 3.2.4): there is no path to route, so answer it here. Any other method
     ; with an asterisk target is nonsense and stays a 400.
