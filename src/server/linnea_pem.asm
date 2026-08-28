@@ -701,6 +701,34 @@ alg_id_ok:
     jne .ai_no
     test rcx, rcx
     jz .ai_no                        ; an empty OID
+    ; ...and it has to BE one. A DER OID is base-128 subidentifiers, each ending
+    ; on a byte with the continuation bit clear, and none starting with 0x80 (a
+    ; leading zero, which is not the minimal encoding). Only the tag and a
+    ; nonzero length were checked, so an OID whose last byte still carried the
+    ; continuation bit passed -- unterminated, naming no algorithm, and equal to
+    ; its twin so the cross-field comparison agreed too (audit-report-107).
+    cmp byte [rax + rcx - 1], 0x80
+    jae .ai_no                       ; the final subidentifier never terminated
+    mov r12, rax                     ; cursor over the OID content
+    lea rdx, [rax + rcx]             ; its end
+    mov r8b, 1                       ; 1 = at a subidentifier's first byte
+.ai_oid:
+    cmp r12, rdx
+    jae .ai_oid_ok
+    mov r9b, [r12]
+    test r8b, r8b
+    jz .ai_oid_mid
+    cmp r9b, 0x80
+    je .ai_no                        ; a leading 0x80: non-minimal
+.ai_oid_mid:
+    xor r8b, r8b
+    test r9b, 0x80
+    jnz .ai_oid_next                 ; continuation byte
+    mov r8b, 1                       ; this subidentifier ended here
+.ai_oid_next:
+    inc r12
+    jmp .ai_oid
+.ai_oid_ok:
     lea r12, [rax + rcx]
     cmp r12, rbx
     je .ai_yes                       ; absent parameters: legal
@@ -720,6 +748,113 @@ alg_id_ok:
 .ai_no:
     xor eax, eax
     pop r12
+    pop rbx
+    ret
+
+; ---- name_ok(rdi=content, rsi=end) -> rax = 1 when the range is an X.509
+;      Name. RFC 5280 4.1.2.4: Name ::= RDNSequence ::= SEQUENCE OF
+;      RelativeDistinguishedName, each a SET OF AttributeTypeAndValue, each of
+;      those a SEQUENCE { OBJECT IDENTIFIER type, ANY value }.
+;
+;      issuer and subject used to reach only der_tiles, which is satisfied by
+;      ANY bounded TLVs -- so an RDN retagged from SET to SEQUENCE tiled just as
+;      well and passed (audit-report-108). An EMPTY RDNSequence is legal and
+;      stays legal: some issuers really do have one.
+;
+;      The attribute VALUE is required to be exactly one element, but its tag is
+;      deliberately not enumerated: the string types in use are many, and
+;      refusing an unlisted-but-legal one would reject certificates every client
+;      accepts. Preserves rbx/r12+.
+name_ok:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi                     ; RDNSequence cursor
+    mov r13, rsi                     ; its end
+.no_rdn:
+    cmp rbx, r13
+    je .no_yes
+    ja .no_no
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; a RelativeDistinguishedName
+    cmp rax, -1
+    je .no_no
+    cmp dl, 0x31                     ; SET, not merely "some container"
+    jne .no_no
+    test rcx, rcx
+    jz .no_no                        ; SET OF requires at least one attribute
+    mov r12, rax                     ; walk the attributes
+    lea r14, [rax + rcx]             ; the SET's end
+.no_attr:
+    cmp r12, r14
+    je .no_rdn_done
+    ja .no_no
+    mov rdi, r12
+    mov rsi, r14
+    call der_any                     ; AttributeTypeAndValue
+    cmp rax, -1
+    je .no_no
+    cmp dl, 0x30
+    jne .no_no
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call attr_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .no_no
+    lea r12, [rax + rcx]
+    jmp .no_attr
+.no_rdn_done:
+    lea rbx, [rax + rcx]
+    jmp .no_rdn
+.no_yes:
+    mov eax, 1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.no_no:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- attr_ok(rdi=content, rsi=end) -> rax = 1 when the range is an
+;      AttributeTypeAndValue: an OBJECT IDENTIFIER then exactly one value,
+;      filling it. Preserves rbx/r12+.
+attr_ok:
+    push rbx
+    mov rbx, rsi
+    call der_any                     ; the attribute type
+    cmp rax, -1
+    je .at_no
+    cmp dl, 0x06                     ; OBJECT IDENTIFIER
+    jne .at_no
+    test rcx, rcx
+    jz .at_no
+    cmp byte [rax + rcx - 1], 0x80
+    jae .at_no                       ; an unterminated OID, as in report 107
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; the value: one element, any string type
+    cmp rax, -1
+    je .at_no
+    lea rdi, [rax + rcx]
+    cmp rdi, rbx
+    jne .at_no                       ; a second value, or trailing bytes
+    mov eax, 1
+    pop rbx
+    ret
+.at_no:
+    xor eax, eax
     pop rbx
     ret
 
@@ -855,6 +990,17 @@ tbs_walk:
     je .tw_tbssig                    ; the first is `signature`
     cmp r12d, 2
     je .tw_validity                  ; the third is Validity: two Times
+    ; the second and fourth are issuer and subject: Names, not just containers
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call name_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .tw_no
+    jmp .tw_seq_next                 ; NOT a fall-through: .tw_validity follows
     push rax
     push rcx
     mov rdi, rax

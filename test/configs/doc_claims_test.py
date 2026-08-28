@@ -493,6 +493,50 @@ if _os.path.exists(_CRT):
         test(_tls_cfg(_inc, _KEY),
              "%d stray base64 symbol(s) before END is rejected" % _n, False)
 
+    # --- audit-report-107: an AlgorithmIdentifier's OID must BE an OID -------
+    # Only the tag and a nonzero length were checked, so an OID whose last byte
+    # still carried the continuation bit passed: unterminated, naming no
+    # algorithm, and identical to its twin so the cross-field comparison agreed
+    # as well. Both edits are applied to BOTH copies to keep them equal, which
+    # is what makes this a test of the encoding rather than of the comparison.
+    _o1, _o2 = 46, 338                 # last byte of each ECDSA-SHA256 OID
+    if _der[_o1] == 0x02 and _der[_o2] == 0x02:
+        _u = bytearray(_der)
+        _u[_o1] = 0x82
+        _u[_o2] = 0x82                 # continuation bit set: never terminates
+        test(_tls_cfg(_wrap(bytes(_u), _os.path.join(_TD, "badoid.crt")), _KEY),
+             "an unterminated OID is rejected", False)
+    else:
+        bad.append("could not locate the signature OIDs to mutate")
+        print("FAIL could not locate the signature OIDs to mutate")
+    _m1, _m2 = 44, 336                 # a subidentifier's first byte
+    if _der[_m1] == 0x04 and _der[_m2] == 0x04:
+        _nm = bytearray(_der)
+        _nm[_m1] = 0x80
+        _nm[_m2] = 0x80                # leading 0x80: a non-minimal encoding
+        test(_tls_cfg(_wrap(bytes(_nm), _os.path.join(_TD, "nonminoid.crt")), _KEY),
+             "a non-minimally encoded OID is rejected", False)
+    else:
+        bad.append("could not locate the OID subidentifiers to mutate")
+        print("FAIL could not locate the OID subidentifiers to mutate")
+
+    # --- audit-report-108: issuer and subject are NAMES, not containers ------
+    # They reached only der_tiles, which any bounded TLVs satisfy, so an RDN
+    # retagged from SET to SEQUENCE tiled just as well and passed. RFC 5280
+    # 4.1.2.4: RDNSequence of SETs of AttributeTypeAndValue SEQUENCEs.
+    _rdn, _atv, _aoid = 49, 51, 53      # first RDN SET / its ATV SEQ / type OID
+    if _der[_rdn] == 0x31 and _der[_atv] == 0x30 and _der[_aoid] == 0x06:
+        for _off, _to, _what in ((_rdn, 0x30, "an RDN that is not a SET"),
+                                 (_atv, 0x31, "an attribute that is not a SEQUENCE"),
+                                 (_aoid, 0x30, "an attribute type that is not an OID")):
+            _n = bytearray(_der)
+            _n[_off] = _to
+            test(_tls_cfg(_wrap(bytes(_n), _os.path.join(_TD, "nm%d.crt" % _off)), _KEY),
+                 "%s is rejected" % _what, False)
+    else:
+        bad.append("could not locate the issuer Name structure to mutate")
+        print("FAIL could not locate the issuer Name structure to mutate")
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",
