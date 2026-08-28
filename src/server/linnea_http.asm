@@ -1355,6 +1355,10 @@ linnea_http_handle:
     ; tokens in order gives you: `Connection: close, keep-alive` would end on
     ; keep-alive and hold a socket the client said it was done with. 9.1 makes
     ; close an instruction about the connection, not a vote, so it is sticky.
+    ;
+    ; This is only half the 1.0 determination: 9.3 also asks whether we are the
+    ; recipient's origin or its proxy, and the location is not matched yet. The
+    ; proxy half is taken in .proxy_build (audit-report-129).
     test qword [rsp + 136], 16
     jnz .conn_tok_start
     mov rdi, [rsp + 344]
@@ -2881,6 +2885,18 @@ linnea_http_handle:
     mov rcx, [rsp + 120]
     mov [rbx + linnea_connection.vhost], rcx   ; the log fires on completion
     mov rcx, [rsp + 24]
+    ; RFC 9112 9.3 decides persistence from the received message, and the
+    ; HTTP/1.0 branch carries a condition the others do not: "keep-alive" is
+    ; present AND "either the recipient is not a proxy or the message is a
+    ; response". Here we ARE the proxy and this is a request, so the branch is
+    ; not available and the determination falls through to close. The token
+    ; loop cannot make this call — it runs before the location is matched, and
+    ; the same 1.0 request on a static prefix is served by us as the origin,
+    ; where the persistence IS permitted and is kept (audit-report-129).
+    test qword [rsp + 136], 8         ; the client spoke HTTP/1.0
+    jz .proxy_ka_kept
+    xor ecx, ecx
+.proxy_ka_kept:
     mov [rbx + linnea_connection.keep_alive], rcx
     xor ecx, ecx
     cmp qword [rsp], 1

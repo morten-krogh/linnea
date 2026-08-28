@@ -50,6 +50,16 @@ check "proxy adds Via to the request and the response" $?
 timeout 60 python3 test/tls/h1_proxy_content_length.py ${P61080} >/dev/null 2>&1
 check "proxy synthesizes Content-Length only for a de-chunked body" $?
 
+# RFC 9112 9.3: the HTTP/1.0 persistence branch needs "keep-alive" AND "either
+# the recipient is not a proxy or the message is a response". A 1.0 request on a
+# proxy prefix has neither, so it closes -- the token loop turned the 1.0 default
+# back on and the proxy setup copied it downstream unchanged (audit-report-129).
+# Two controls, because two different blanket builds would otherwise pass: the
+# same request on a STATIC prefix, where we are the origin and the persistence is
+# permitted, and a 1.1 request through the same proxy prefix.
+timeout 60 python3 test/tls/h1_proxy_http10_keepalive.py ${P61080} >/dev/null 2>&1
+check "proxy closes an HTTP/1.0 keep-alive; origin and 1.1 keep theirs" $?
+
 # RFC 9112 3.2.2 MUST: with an absolute-form target, a proxy ignores the received
 # Host and replaces it with the target's authority. The parser already ROUTED on
 # the target -- that half was right -- but the rewrite copied the client's Host
