@@ -694,6 +694,61 @@ if _os.path.exists(_CRT):
         bad.append("could not locate the SPKI AlgorithmIdentifier to mutate")
         print("FAIL could not locate the SPKI AlgorithmIdentifier to mutate")
 
+    # --- audit-report-114 ---------------------------------------------------
+    # [1]/[2] are IMPLICIT UniqueIdentifier, i.e. BIT STRING, so their DER tags
+    # are PRIMITIVE 81/82 -- not constructed a1/a2. Report 113 had it backwards,
+    # which REJECTED a conformant certificate and accepted a malformed one, so
+    # both directions are pinned here. And [3] is EXPLICIT Extensions: the
+    # wrapper must hold exactly one SEQUENCE of well-formed Extension values.
+    def _tbs_insert(der, before_a3, blob=None, retag=None):
+        def _tlv(b, i):
+            n, j = b[i + 1], i + 2
+            if n & 0x80:
+                k = n & 0x7f
+                n = int.from_bytes(b[j:j + k], "big")
+                j += k
+            return j, n
+
+        def _enc(tag, c):
+            n = len(c)
+            if n < 0x80:
+                L = bytes([n])
+            else:
+                w = (n.bit_length() + 7) // 8
+                L = bytes([0x80 | w]) + n.to_bytes(w, "big")
+            return bytes([tag]) + L + c
+
+        cs, cl = _tlv(der, 0)
+        ts, tl = _tlv(der, cs)
+        tbs = bytearray(der[ts:ts + tl])
+        i = 0
+        while i < len(tbs):
+            j, n = _tlv(tbs, i)
+            if tbs[i] == 0xa3:
+                break
+            i = j + n
+        else:
+            return None
+        if retag is not None:
+            tbs[i + 2] = retag
+        elif blob is not None:
+            tbs = tbs[:i] + bytearray(blob) + tbs[i:]
+        return _enc(0x30, _enc(0x30, bytes(tbs)) + der[ts + tl:cs + cl])
+
+    _ok81 = _tbs_insert(_der, True, blob=b"\x81\x01\x00")
+    if _ok81:
+        test(_tls_cfg(_wrap(_ok81, _os.path.join(_TD, "uid81.crt")), _KEY),
+             "a conformant [1] IMPLICIT issuerUniqueID is ACCEPTED", True)
+        test(_tls_cfg(_wrap(_tbs_insert(_der, True, blob=b"\xa1\x01\x00"),
+                            _os.path.join(_TD, "uida1.crt")), _KEY),
+             "a constructed a1 unique identifier is rejected", False)
+        test(_tls_cfg(_wrap(_tbs_insert(_der, True, retag=0x05),
+                            _os.path.join(_TD, "extnull.crt")), _KEY),
+             "an extensions wrapper holding a NULL is rejected", False)
+    else:
+        bad.append("could not locate the [3] extensions wrapper")
+        print("FAIL could not locate the [3] extensions wrapper")
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

@@ -1208,6 +1208,99 @@ spki_ok:
     pop rbx
     ret
 
+; ---- exts_ok(rdi=content, rsi=end) -> rax = 1 when the range is an Extensions
+;      SEQUENCE's content: zero or more Extension ::= SEQUENCE { extnID OBJECT
+;      IDENTIFIER, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING },
+;      each filling itself exactly. extnValue's bytes stay opaque -- the point
+;      is the framing, not the policy (audit-report-114 F2). Preserves rbx/r12+.
+exts_ok:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r13, rsi
+.ex_next:
+    cmp rbx, r13
+    je .ex_yes
+    ja .ex_no
+    mov rdi, rbx
+    mov rsi, r13
+    call der_any                     ; one Extension
+    cmp rax, -1
+    je .ex_no
+    cmp dl, 0x30
+    jne .ex_no
+    mov r12, rax                     ; remember where it continues
+    push rax
+    push rcx
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call ext_one_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .ex_no
+    lea rbx, [rax + rcx]
+    jmp .ex_next
+.ex_yes:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ex_no:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- ext_one_ok(rdi=content, rsi=end) -> rax = 1 for one Extension's body.
+ext_one_ok:
+    push rbx
+    mov rbx, rsi
+    call der_any                     ; extnID
+    cmp rax, -1
+    je .e1_no
+    cmp dl, 0x06
+    jne .e1_no
+    push rax
+    push rcx
+    mov rdi, rax
+    mov rsi, rcx
+    call oid_ok
+    test eax, eax
+    pop rcx
+    pop rax
+    jz .e1_no
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; critical BOOLEAN, or extnValue
+    cmp rax, -1
+    je .e1_no
+    cmp dl, 0x01                     ; BOOLEAN: present only when TRUE is meant
+    jne .e1_value
+    cmp rcx, 1
+    jne .e1_no
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; then extnValue must follow
+    cmp rax, -1
+    je .e1_no
+.e1_value:
+    cmp dl, 0x04                     ; OCTET STRING
+    jne .e1_no
+    lea rdi, [rax + rcx]
+    cmp rdi, rbx
+    jne .e1_no                       ; trailing bytes inside the Extension
+    mov eax, 1
+    pop rbx
+    ret
+.e1_no:
+    xor eax, eax
+    pop rbx
+    ret
+
 ; ---- tbs_suffix_ok(rdi=from, rsi=end) -> rax = 1 when what follows the SPKI is
 ;      a legal TBSCertificate tail: nothing, or [1] issuerUniqueID, [2]
 ;      subjectUniqueID, [3] extensions -- each at most once, in ascending order,
@@ -1229,21 +1322,55 @@ tbs_suffix_ok:
     call der_any
     cmp rax, -1
     je .ts_no
-    cmp dl, 0xa1
-    je .ts_one
-    cmp dl, 0xa2
-    je .ts_two
+    ; RFC 5280 4.1.2: [1] and [2] are IMPLICIT UniqueIdentifier, i.e. BIT
+    ; STRING, so their DER tags are PRIMITIVE 0x81/0x82 -- not the constructed
+    ; 0xa1/0xa2 this first accepted. That was wrong in both directions: a
+    ; conformant certificate carrying 81 01 00 was REJECTED, and the malformed
+    ; constructed form was accepted (audit-report-114 F1).
+    cmp dl, 0x81
+    je .ts_uid1
+    cmp dl, 0x82
+    je .ts_uid2
     cmp dl, 0xa3
     je .ts_three
     jmp .ts_no                       ; nothing else may follow the SPKI
-.ts_one:
+.ts_uid1:
     mov edi, 1
-    jmp .ts_order
-.ts_two:
+    jmp .ts_uid
+.ts_uid2:
     mov edi, 2
+.ts_uid:
+    ; an IMPLICIT BIT STRING: at least the unused-bits octet, and it is 0..7
+    test rcx, rcx
+    jz .ts_no
+    cmp byte [rax], 8
+    jae .ts_no
     jmp .ts_order
 .ts_three:
     mov edi, 3
+    ; [3] is EXPLICIT: exactly one Extensions SEQUENCE filling the wrapper
+    push rax
+    push rcx
+    push rdi
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    mov r8, rsi                      ; the wrapper's end
+    call der_any
+    cmp rax, -1
+    je .ts_no_pop3
+    cmp dl, 0x30
+    jne .ts_no_pop3
+    lea rdx, [rax + rcx]
+    cmp rdx, r8
+    jne .ts_no_pop3                  ; a second child in the wrapper
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call exts_ok
+    test eax, eax
+    pop rdi
+    pop rcx
+    pop rax
+    jz .ts_no
 .ts_order:
     cmp edi, r13d
     jbe .ts_no                       ; repeated, or out of order
@@ -1256,6 +1383,8 @@ tbs_suffix_ok:
     pop r12
     pop rbx
     ret
+.ts_no_pop3:
+    add rsp, 24                      ; drop the three saved words
 .ts_no:
     xor eax, eax
     pop r13
