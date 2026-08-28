@@ -44,6 +44,17 @@ CURLH3=${LINNEA_CURL_H3:-$HOME/curl-h3/bin/curl}
 # not exist yet -- `set -u` stops the run there, which is the good outcome;
 # without it the curl would simply have gone unverified.
 CA=test/tls/server.crt
+# Whether the kernel can take over a TLS socket, probed once for the same
+# reason as the two above: it was computed in tls/20-e2e.sh and read by
+# 30-h3-proxy, 40-http2 and 50-e2e-teardown, so those files could not run
+# unless 20-e2e had run first in the same shell -- `set -u` stopped a
+# single-file run dead on `ktls: unbound variable`. The flag is run-wide state,
+# not one file's, so it lives with the run-wide state.
+if grep -qw tls /proc/sys/net/ipv4/tcp_available_ulp 2>/dev/null; then
+    ktls=1
+else
+    ktls=0
+fi
 # test/www is a template now, like test/configs: a run copies it and is free to
 # generate into and delete from its own. 8 MB, so the copy costs nothing.
 WWW=$RUNDIR/www
@@ -244,6 +255,13 @@ SERVERS=""
 cleanup_servers() {
     local p
     for p in $SERVERS; do kill $p 2>/dev/null; done
+    # ...and anything else this run put in the background but did not register:
+    # the proxy backends are plain `python3 ... &` jobs. A single-file run stops
+    # before the teardown fragment that would have killed them, and the survivor
+    # then holds 61100 and makes the NEXT run refuse to start with "something is
+    # already listening". A full run reaches its own teardown and finds nothing
+    # left here, so this costs it nothing.
+    for p in $(jobs -p 2>/dev/null); do kill $p 2>/dev/null; done
 }
 trap cleanup_servers EXIT
 

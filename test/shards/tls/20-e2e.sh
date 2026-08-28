@@ -2,15 +2,17 @@
 # to kTLS and the rest is the ordinary HTTP path over a kernel-encrypted
 # socket. The kTLS-availability guard is a $ktls flag so the fixtures below
 # (h3 proxy, http2, slow body) can live in their own files; each gates on it.
+# The flag itself is probed in lib/common.sh, which is what lets those files be
+# run one at a time.
 
 # --- TLS end to end: the real server, handshake in userspace then kTLS ---
 # Everything past the handshake is the ordinary HTTP path over a socket the
 # kernel encrypts, so these tests are really asking whether the handoff left
 # the connection indistinguishable from a plaintext one.
-if grep -qw tls /proc/sys/net/ipv4/tcp_available_ulp 2>/dev/null; then
-    ktls=1
-else
-    ktls=0
+# $ktls is probed in lib/common.sh. Only the reporting stays here, so the check
+# count is unchanged and the message still belongs to the TLS shard rather than
+# firing in base, quic and h1 as well.
+if [ "$ktls" != 1 ]; then
     check "tls e2e (kernel tls module not loaded: modprobe tls — skipped)" 0
 fi
 if [ "$ktls" = 1 ]; then
