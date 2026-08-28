@@ -118,7 +118,7 @@ linnea_pem_decode:
     mov rcx, end_len
     call bytes_eq
     test eax, eax
-    jnz .end_boundary
+    jnz .end_unpadded
 .decode:
     movzx eax, byte [rbx]
     inc rbx
@@ -200,6 +200,18 @@ linnea_pem_decode:
     call bytes_eq
     test eax, eax
     jz .bad
+    jmp .end_boundary               ; the PADDED path: its quantum was already
+                                    ; checked, and r9d legitimately holds 2 or 4
+.end_unpadded:
+    ; Reached the boundary with NO padding, so the body must have ended on a
+    ; whole four-symbol group: r9d is the bits still held, and anything but 0
+    ; means a truncated final quantum. One stray symbol holds six bits and
+    ; emits no byte, so the DER came out identical and every later check
+    ; passed on text that is not valid Base64 (audit-report-106). Two or three
+    ; strays were already caught, but only because they corrupted the DER --
+    ; which is luck, not a check.
+    test r9d, r9d
+    jnz .bad
 .end_boundary:
     ; past "-----END ", skip the label and require its five closing dashes
     lea rdi, [rbx + end_len]

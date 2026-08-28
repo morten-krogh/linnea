@@ -482,6 +482,17 @@ if _os.path.exists(_CRT):
                                   _os.path.join(_TD, "wrongcurve.key"))),
          "a [0] naming a different curve is rejected", False)
 
+    # --- audit-report-106: the final Base64 quantum must be whole ------------
+    # One stray symbol holds six bits and emits NO byte, so the DER came out
+    # identical and every later check passed on text that is not valid Base64.
+    # Two or three strays were already refused -- but only because they
+    # corrupted the DER, which is luck rather than a check.
+    for _n in (1, 2, 3):
+        _inc = _os.path.join(_TD, "inc%d.crt" % _n)
+        open(_inc, "w").write(_pem.replace("-----END", "A" * _n + "\n-----END"))
+        test(_tls_cfg(_inc, _KEY),
+             "%d stray base64 symbol(s) before END is rejected" % _n, False)
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",
