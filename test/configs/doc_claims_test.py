@@ -799,6 +799,44 @@ if _os.path.exists(_CRT):
                                   _os.path.join(_TD, "attrgood.key"))),
          "a well-formed PKCS#8 attribute is ACCEPTED", True)
 
+    # --- audit-report-117: the leaf must permit TLS server authentication ----
+    # RFC 8446 4.4.2.2. ABSENT is fine -- every certificate in this tree has
+    # neither extension and OpenSSL's sslserver purpose check passes them --
+    # so only the PRESENT-but-wrong cases are refused. Leaf only: an issuer
+    # legitimately carries keyCertSign and no serverAuth.
+    import subprocess as _sp
+
+    def _gen(extra, path):
+        _sp.run(["openssl", "req", "-new", "-x509", "-key", _KEY,
+                 "-subj", "/CN=localhost", "-days", "1"] + extra +
+                ["-out", path], capture_output=True)
+        return path if _os.path.exists(path) and _os.path.getsize(path) else None
+
+    _bku = _gen(["-addext", "keyUsage=critical,keyCertSign",
+                 "-addext", "extendedKeyUsage=serverAuth"],
+                _os.path.join(_TD, "badku.crt"))
+    _beku = _gen(["-addext", "keyUsage=critical,digitalSignature",
+                  "-addext", "extendedKeyUsage=clientAuth"],
+                 _os.path.join(_TD, "badeku.crt"))
+    _good = _gen(["-addext", "keyUsage=critical,digitalSignature",
+                  "-addext", "extendedKeyUsage=serverAuth,clientAuth"],
+                 _os.path.join(_TD, "goodku.crt"))
+    if _bku and _beku and _good:
+        test(_tls_cfg(_bku, _KEY),
+             "a leaf whose keyUsage lacks digitalSignature is rejected", False,
+             "TLS server authentication")
+        test(_tls_cfg(_beku, _KEY),
+             "a leaf limited to clientAuth is rejected", False,
+             "TLS server authentication")
+        test(_tls_cfg(_good, _KEY),
+             "a leaf with digitalSignature and serverAuth is ACCEPTED", True)
+    else:
+        bad.append("could not generate the key-usage fixtures")
+        print("FAIL could not generate the key-usage fixtures")
+    # ...and a chain whose ISSUERS carry keyCertSign must still load
+    test(_tls_cfg("test/tls/bigchain.crt", _KEY),
+         "the usage check is leaf-only (a 7-cert chain still loads)", True)
+
 test('{"log":"/tmp/l","log":"/tmp/m","servers":[]}', "duplicate key rejected",
      False, "duplicate key")
 test(json.dumps(base()).replace('"log"', '"logg"', 1), "unknown key rejected",

@@ -43,6 +43,7 @@ extern linnea_p256_scalar_is_valid
 extern linnea_tls_hkdf_expand_label
 extern linnea_error_exit
 extern linnea_x509_leaf_spki
+extern linnea_x509_leaf_usage_ok
 extern linnea_pem_key_pub
 extern linnea_x509_spki_point
 extern linnea_p256_ecdsa_sign
@@ -60,6 +61,8 @@ lbl_traffic_upd_len equ $ - lbl_traffic_upd
 
 msg_no_aesni: db "TLS requires a CPU with AES-NI, PCLMULQDQ and SSSE3"
 msg_no_aesni_len equ $ - msg_no_aesni
+msg_bad_usage: db "the certificate does not permit TLS server authentication (keyUsage lacks digitalSignature, or extendedKeyUsage lacks serverAuth)", 10
+msg_bad_usage_len equ $ - msg_bad_usage
 msg_key_selfcontra: db "the key file embeds a public key that its own private scalar does not sign for", 10
 msg_key_selfcontra_len equ $ - msg_key_selfcontra
 msg_key_mismatch: db "certificate and key are different identities: the key does not sign for this certificate", 10
@@ -224,6 +227,19 @@ linnea_tls_setup:
     or edi, ecx                        ; edi = leaf DER length
     mov rsi, rdi
     lea rdi, [rax + 3]                 ; the DER itself
+    ; ...and the leaf must be allowed to authenticate a TLS SERVER. RFC 8446
+    ; 4.4.2.2: if Key Usage is present digitalSignature must be set, and a leaf
+    ; whose Extended Key Usage is only clientAuth cannot serve. Absent is fine
+    ; -- every certificate here has neither, and OpenSSL's sslserver purpose
+    ; check passes them. LEAF ONLY: an issuer legitimately carries keyCertSign
+    ; and no serverAuth (audit-report-117).
+    push rdi
+    push rsi
+    call linnea_x509_leaf_usage_ok
+    test eax, eax
+    pop rsi
+    pop rdi
+    jz .bad_usage
     call linnea_x509_leaf_spki         ; rax = SPKI, rdx = its length
     test rax, rax
     jz .bad_cert                       ; no SPKI in the field where one belongs
@@ -278,6 +294,10 @@ linnea_tls_setup:
 .no_entropy:
     lea rdi, [msg_no_entropy]
     mov esi, msg_no_entropy_len
+    jmp linnea_error_exit
+.bad_usage:
+    lea rdi, [msg_bad_usage]
+    mov esi, msg_bad_usage_len
     jmp linnea_error_exit
 .key_selfcontradictory:
     lea rdi, [msg_key_selfcontra]

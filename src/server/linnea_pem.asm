@@ -24,6 +24,7 @@ global linnea_pem_key_pub
 global linnea_x509_find_spki
 global linnea_x509_cert_wellformed
 global linnea_x509_leaf_spki
+global linnea_x509_leaf_usage_ok
 global linnea_x509_spki_point
 
 section .rodata
@@ -1819,6 +1820,258 @@ linnea_x509_cert_wellformed:
     xor eax, eax
     ret
 
+; ---- linnea_x509_leaf_usage_ok(rdi=der, rsi=len) -> rax = 1 when this leaf may
+;      be used for TLS SERVER authentication, else 0.
+;
+;      RFC 8446 4.4.2.2: a server certificate that signs CertificateVerify must
+;      allow signing -- if Key Usage is present, digitalSignature must be set --
+;      and a leaf whose Extended Key Usage is limited to clientAuth cannot serve.
+;      ABSENT is fine for both: every certificate in this tree has neither, and
+;      OpenSSL's sslserver purpose check passes them (audit-report-117).
+;
+;      LEAF ONLY. Intermediates keep the structural check and nothing more: an
+;      issuer legitimately carries keyCertSign and no serverAuth.
+linnea_x509_leaf_usage_ok:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    lea r13, [rdi + rsi]
+    mov rsi, r13
+    call der_any                     ; Certificate
+    cmp rax, -1
+    je .lu_no
+    mov rdi, rax
+    lea rbx, [rax + rcx]
+    mov rsi, rbx
+    call der_any                     ; tbsCertificate
+    cmp rax, -1
+    je .lu_no
+    mov r14, rax                     ; TBS content
+    lea r15, [rax + rcx]             ; TBS end
+    ; walk to the [3] extensions, if any
+    mov rbx, r14
+.lu_scan:
+    cmp rbx, r15
+    jae .lu_yes                      ; no extensions at all: nothing to forbid
+    mov rdi, rbx
+    mov rsi, r15
+    call der_any
+    cmp rax, -1
+    je .lu_no
+    cmp dl, 0xa3
+    je .lu_exts
+    lea rbx, [rax + rcx]
+    jmp .lu_scan
+.lu_exts:
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call der_any                     ; the Extensions SEQUENCE
+    cmp rax, -1
+    je .lu_no
+    mov rbx, rax
+    lea r15, [rax + rcx]
+.lu_each:
+    cmp rbx, r15
+    jae .lu_yes                      ; neither extension present
+    mov rdi, rbx
+    mov rsi, r15
+    call der_any                     ; one Extension
+    cmp rax, -1
+    je .lu_no
+    mov r14, rax                     ; its content
+    lea r12, [rax + rcx]             ; its end
+    push r12
+    mov rdi, r14
+    mov rsi, r12
+    call der_any                     ; extnID
+    cmp rax, -1
+    je .lu_no_pop
+    ; is it keyUsage or extKeyUsage?
+    lea rdi, [rax - 2]               ; the OID element, tag included
+    mov rsi, rcx
+    add rsi, 2
+    cmp rsi, oid_ku_len
+    jne .lu_try_eku
+    lea rsi, [oid_ku]
+    mov rcx, oid_ku_len
+    call bytes_eq
+    test eax, eax
+    jnz .lu_is_ku
+.lu_try_eku:
+    pop r12
+    push r12
+    mov rdi, r14
+    mov rsi, r12
+    call der_any
+    lea rdi, [rax - 2]
+    mov rsi, rcx
+    add rsi, 2
+    cmp rsi, oid_eku_len
+    jne .lu_next
+    lea rsi, [oid_eku]
+    mov rcx, oid_eku_len
+    call bytes_eq
+    test eax, eax
+    jnz .lu_is_eku
+.lu_next:
+    pop r12
+    mov rbx, r12
+    jmp .lu_each
+.lu_is_ku:
+    ; extnValue is an OCTET STRING wrapping a BIT STRING; bit 0 is
+    ; digitalSignature, i.e. 0x80 of the first data octet.
+    pop r12
+    push r12
+    mov rdi, r14
+    mov rsi, r12
+    call ext_value_of
+    test rax, rax
+    jz .lu_no_pop
+    mov rdi, rax
+    mov rsi, rcx
+    call der_any                     ; the BIT STRING
+    cmp rax, -1
+    je .lu_no_pop
+    cmp dl, 0x03
+    jne .lu_no_pop
+    cmp rcx, 2
+    jb .lu_no_pop                    ; no data octet at all
+    test byte [rax + 1], 0x80        ; digitalSignature
+    jz .lu_no_pop
+    jmp .lu_next
+.lu_is_eku:
+    pop r12
+    push r12
+    mov rdi, r14
+    mov rsi, r12
+    call ext_value_of
+    test rax, rax
+    jz .lu_no_pop
+    mov rdi, rax
+    mov rsi, rcx
+    call der_any                     ; SEQUENCE OF KeyPurposeId
+    cmp rax, -1
+    je .lu_no_pop
+    cmp dl, 0x30
+    jne .lu_no_pop
+    mov rdi, rax
+    lea rsi, [rax + rcx]
+    call eku_has_server
+    test eax, eax
+    jz .lu_no_pop
+    jmp .lu_next
+.lu_yes:
+    mov eax, 1
+    jmp .lu_ret
+.lu_no_pop:
+    pop r12
+.lu_no:
+    xor eax, eax
+.lu_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- ext_value_of(rdi=extension content, rsi=end) -> rax = the OCTET STRING's
+;      content, rcx = its length; rax = 0 on failure. Skips extnID and the
+;      optional critical BOOLEAN.
+ext_value_of:
+    push rbx
+    mov rbx, rsi
+    call der_any                     ; extnID
+    cmp rax, -1
+    je .ev_no
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any
+    cmp rax, -1
+    je .ev_no
+    cmp dl, 0x01                     ; critical BOOLEAN, optional
+    jne .ev_have
+    lea rdi, [rax + rcx]
+    mov rsi, rbx
+    call der_any
+    cmp rax, -1
+    je .ev_no
+.ev_have:
+    cmp dl, 0x04                     ; extnValue OCTET STRING
+    jne .ev_no
+    pop rbx
+    ret
+.ev_no:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ---- eku_has_server(rdi=content, rsi=end) -> rax = 1 when the KeyPurposeId list
+;      contains id-kp-serverAuth or anyExtendedKeyUsage.
+eku_has_server:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
+.ek_next:
+    cmp rbx, r12
+    jae .ek_no
+    mov rdi, rbx
+    mov rsi, r12
+    call der_any
+    cmp rax, -1
+    je .ek_no
+    lea rdi, [rax - 2]               ; the OID element with its tag
+    mov rsi, rcx
+    add rsi, 2
+    push rdi
+    push rsi
+    push rax
+    push rcx
+    cmp rsi, oid_srv_len
+    jne .ek_try_any
+    lea rsi, [oid_srv]
+    mov rcx, oid_srv_len
+    call bytes_eq
+    test eax, eax
+    jnz .ek_yes4
+.ek_try_any:
+    pop rcx
+    pop rax
+    pop rsi
+    pop rdi
+    push rdi
+    push rsi
+    push rax
+    push rcx
+    cmp rsi, oid_any_len
+    jne .ek_skip
+    lea rsi, [oid_any]
+    mov rcx, oid_any_len
+    call bytes_eq
+    test eax, eax
+    jnz .ek_yes4
+.ek_skip:
+    pop rcx
+    pop rax
+    pop rsi
+    pop rdi
+    lea rbx, [rax + rcx]
+    jmp .ek_next
+.ek_yes4:
+    add rsp, 32
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.ek_no:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
 ; ---- linnea_x509_leaf_spki(rdi=der, rsi=len) -> rax = SubjectPublicKeyInfo
 ;      pointer, rdx = its length; rax = 0 on failure.
 ;
@@ -2004,6 +2257,14 @@ alg_ec:     db 0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01
             db 0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07
 alg_ec_len  equ $ - alg_ec
 ; ...and its curve half alone, for the optional SEC1 [0] parameters field
+oid_ku:     db 0x06,0x03,0x55,0x1d,0x0f          ; 2.5.29.15  keyUsage
+oid_ku_len  equ $ - oid_ku
+oid_eku:    db 0x06,0x03,0x55,0x1d,0x25          ; 2.5.29.37  extKeyUsage
+oid_eku_len equ $ - oid_eku
+oid_srv:    db 0x06,0x08,0x2b,0x06,0x01,0x05,0x05,0x07,0x03,0x01  ; id-kp-serverAuth
+oid_srv_len equ $ - oid_srv
+oid_any:    db 0x06,0x04,0x55,0x1d,0x25,0x00     ; anyExtendedKeyUsage
+oid_any_len equ $ - oid_any
 alg_ec_curve     equ alg_ec + 9
 alg_ec_curve_len equ 10
 section .text
