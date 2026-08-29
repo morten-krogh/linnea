@@ -4891,7 +4891,31 @@ linnea_http_proxy_head:
     pop rcx
     pop rdx
     test eax, eax
-    jnz .copy_line             ; the tunnel's own Upgrade: forward it
+    jz .cn_ask
+    ; ...and while we are the one field that identifies the tunnel, note that
+    ; it was there. RFC 9110 7.8: a server sending 101 MUST send Upgrade naming
+    ; the protocol it selected. .upgrade_head used to require only that the
+    ; CLIENT asked and that the head framed no body, so a backend answering a
+    ; bare "101 + Connection: Upgrade" produced a downstream 101 naming no
+    ; protocol at all -- an invalid response, and both sockets already in
+    ; tunnel mode (audit-report-139 Finding 1). Only a NONEMPTY value counts:
+    ; "Upgrade:" followed by nothing names nothing either.
+    lea rcx, [r13 + 1]         ; just past the colon
+    mov rdx, [rsp + 32]        ; the CR that ends this line
+.up_ows:
+    cmp rcx, rdx
+    jae .copy_line             ; empty, or OWS all the way: no bit, still copied
+    movzx eax, byte [r14 + rcx]
+    cmp al, ' '
+    je .up_ows_next
+    cmp al, 9
+    jne .up_named
+.up_ows_next:
+    inc rcx
+    jmp .up_ows
+.up_named:
+    or qword [rsp + 16], 16
+    jmp .copy_line             ; the tunnel's own Upgrade: forward it
 .cn_ask:
     mov rdi, r14               ; the head it came from...
     mov rsi, [rsp]             ; ...and that head's length
@@ -5247,8 +5271,12 @@ linnea_http_proxy_head:
 .upgrade_head:
     cmp qword [rbx + linnea_connection.upgrade], 0
     je .bad
-    cmp qword [rsp + 16], 0    ; CL/TE flags
-    jne .bad
+    test qword [rsp + 16], 16  ; the backend's own Upgrade field, nonempty
+    jz .bad                    ; a 101 that names no protocol is not a 101
+    mov rax, [rsp + 16]
+    and rax, ~16               ; every other flag: CL, TE, and the two the
+    test rax, rax              ; security-header walk sets -- all nonsense here
+    jnz .bad
     lea rdi, [hdr_up_upgrade]
     mov esi, hdr_up_upgrade_len
     call .append

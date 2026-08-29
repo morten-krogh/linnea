@@ -63,6 +63,13 @@ def expect_101(head, accept):
         fail("101 head lacks Connection: upgrade: %r" % head)
     if b"sec-websocket-accept: " + accept.lower() not in lower:
         fail("101 head lacks the right Sec-WebSocket-Accept: %r" % head)
+    # The half of RFC 9110 7.8 that says WHICH protocol was selected. linnea
+    # writes Connection itself, so only Upgrade can carry that, and it has to
+    # survive the proxy's field filtering. This is the acceptance control for
+    # the two refusals below: an implementation that simply refused every 101
+    # would fail here (audit-report-139 Finding 1).
+    if b"\r\nupgrade: websocket\r\n" not in lower:
+        fail("101 head lacks Upgrade: websocket: %r" % head)
 
 
 def recv_until(sock, buf, want):
@@ -169,8 +176,36 @@ def mode_reject():
     print("OK")
 
 
+def _expect_502_no_tunnel(path):
+    """The backend agrees to switch but names no protocol: 502, and the
+    connection must never become a tunnel."""
+    sock = connect()
+    head, rest, _ = handshake(sock, path)
+    if not head.startswith(b"HTTP/1.1 502"):
+        fail("expected a 502, got: %r" % head.split(b"\r\n")[0])
+    if b"101" in head:
+        fail("the invalid 101 leaked into the error head: %r" % head)
+    # Not a tunnel: the 502 says Connection: close and nothing follows it.
+    # If linnea had entered LINNEA_PROXY_UPGRADE these bytes would be relayed
+    # to the backend and the socket would stay open until the idle timeout.
+    sock.sendall(b"tunnel-probe")
+    rest = recv_to_eof(sock, rest)
+    if rest:
+        fail("bytes after the 502 head: %r" % rest)
+    print("OK")
+
+
+def mode_noupgrade():
+    _expect_502_no_tunnel(b"/api/ws-noupgrade")
+
+
+def mode_emptyupgrade():
+    _expect_502_no_tunnel(b"/api/ws-emptyupgrade")
+
+
 MODES = {"echo": mode_echo, "pipelined": mode_pipelined, "push": mode_push,
-         "tick": mode_tick, "silent": mode_silent, "reject": mode_reject}
+         "tick": mode_tick, "silent": mode_silent, "reject": mode_reject,
+         "noupgrade": mode_noupgrade, "emptyupgrade": mode_emptyupgrade}
 
 if __name__ == "__main__":
     if len(sys.argv) != 2 or sys.argv[1] not in MODES:

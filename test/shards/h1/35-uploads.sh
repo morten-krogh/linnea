@@ -151,6 +151,16 @@ check "ws idle tunnel times out ($out)" $?
 out=$(python3 test/ws_client.py reject)
 [ "$out" = "OK" ]
 check "ws upgrade refusal passes through ($out)" $?
+# ...and a 101 the client DID ask for, but which names no protocol, must not
+# start one either (RFC 9110 7.8, audit-report-139 Finding 1). The ws echo
+# checks above are the acceptance control: a 101 carrying Upgrade: websocket
+# still tunnels, and expect_101 now asserts that field reaches the client.
+out=$(python3 test/ws_client.py noupgrade)
+[ "$out" = "OK" ]
+check "101 with no Upgrade field is 502, not a tunnel ($out)" $?
+out=$(python3 test/ws_client.py emptyupgrade)
+[ "$out" = "OK" ]
+check "101 with an empty Upgrade field is 502, not a tunnel ($out)" $?
 # a 101 the client never asked for must not start a tunnel
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/api/101)
 check_http "unrequested 101 becomes 502" "502 Bad Gateway" "$resp"

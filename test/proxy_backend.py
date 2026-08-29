@@ -127,6 +127,21 @@ def respond(conn, head, body, extra=b""):
     elif path.endswith(b"/ws-reject"):
         # the app declines the upgrade: an ordinary response instead
         conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\n\r\nno upgrade")
+    elif path.endswith(b"/ws-noupgrade"):
+        # The upgrade the client asked for is agreed to -- and the 101 names
+        # no protocol. RFC 9110 7.8: a server that sends 101 MUST send Upgrade
+        # identifying what it switched to. Relaying this would hand the client
+        # a 101 with no Upgrade field at all (linnea supplies the Connection
+        # itself) and put both sockets in a tunnel nothing can speak
+        # (audit-report-139 Finding 1). It must be a 502.
+        conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                     b"Connection: Upgrade\r\n\r\n")
+    elif path.endswith(b"/ws-emptyupgrade"):
+        # ...and a present-but-empty Upgrade names nothing either. The value is
+        # OWS only, which is a legal field value, so the head validator lets it
+        # through: this is the 101 rule refusing it, not the token check.
+        conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                     b"Upgrade:   \r\nConnection: Upgrade\r\n\r\n")
     elif path.endswith(b"/101"):
         # a 101 nobody asked for: linnea must refuse to tunnel
         conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
