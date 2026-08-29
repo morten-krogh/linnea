@@ -93,6 +93,21 @@ CASES = [
     # ordinary 200 on all three protocols, h1 even writing a real CRLF where the
     # bare CR had been (audit-report-9 Finding 1).
     ("badstatuscr",   502, None),
+    # RFC 9112 4: status-line = HTTP-version SP status-code SP [ reason-phrase ]
+    # CRLF. The SP behind the code is grammar even when the reason phrase is
+    # absent, and the gate accepted a CR in its place -- so h1, which relays the
+    # upstream line from the code onward rather than rebuilding it, wrote a
+    # first line no HTTP/1 sender may send straight to the client, while h2 and
+    # h3 normalised the same head into a plain :status 200. The three
+    # disagreeing again (audit-report-133 Finding 1). statusspempty is the
+    # acceptance control that keeps the rule "the SP is required" instead of
+    # "a reason phrase is required": an empty reason phrase is legal and its
+    # legal spelling keeps the space, so a gate demanding 1*VCHAR after it would
+    # pass every rejection row here and fail that one.
+    ("statusnosp",     502, None),
+    ("statusnosp404",  502, None),   # the rule is about the LINE, not about 200
+    ("earlynosp",      502, None),   # ...and on an INTERIM head, same gate
+    ("statusspempty",  200, b"valid"),
     # RFC 9110 8.6 forbids Content-Length on 1xx and 204. Upstreams send it
     # anyway; the proxy relayed it. These three are judged by NO_CLEN below as
     # well as by status and body (audit-report-9 Finding 2).

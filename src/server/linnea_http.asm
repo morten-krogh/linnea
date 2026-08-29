@@ -4231,12 +4231,17 @@ linnea_http_upstream_head_valid:
     jb .hv_bad
     cmp rax, 599
     ja .hv_bad
-    ; ...and the code is delimited: either the line ends, or a reason phrase
-    ; follows behind its own space. "HTTP/1.1 2000" is not a status line.
-    movzx eax, byte [r12 + 12]
-    cmp al, 13
-    je .hv_status
-    cmp al, ' '
+    ; ...and the code is delimited by the SP that RFC 9112 4 makes mandatory:
+    ; status-line = HTTP-version SP status-code SP [ reason-phrase ] CRLF. The
+    ; second SP is part of the grammar even when the reason phrase is empty, so
+    ; "HTTP/1.1 200 " is a status line and "HTTP/1.1 200" is not -- any more
+    ; than "HTTP/1.1 2000" is. A CR was accepted here, and h1 relays the
+    ; upstream line from the code onward instead of rebuilding it, so that
+    ; invalid first line went straight to the client verbatim while h2 and h3
+    ; normalised the same head into a downstream :status 200 -- the three
+    ; disagreeing again, and h1 emitting bytes no HTTP/1 sender may send
+    ; (audit-report-133 Finding 1).
+    cmp byte [r12 + 12], ' '
     jne .hv_bad
     xor rcx, rcx
 .hv_status:                           ; the reason phrase, to its CRLF

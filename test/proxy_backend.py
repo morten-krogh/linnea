@@ -762,6 +762,34 @@ def respond(conn, head, body, extra=b""):
         # (audit-report-9 Finding 1).
         conn.sendall(b"HTTP/1.1 200\rX-Fold: accepted\r\n"
                      b"Content-Length: 5\r\n\r\nvalid")
+    elif path.endswith(b"/statusnosp"):
+        # RFC 9112 4: status-line = HTTP-version SP status-code SP
+        # [ reason-phrase ] CRLF. The SP after the code is grammar, not
+        # decoration, so a line that goes straight from the third digit to the
+        # CRLF is not a status line. The shared gate accepted a CR there, and
+        # h1 -- which relays the upstream line from the code onward rather than
+        # rebuilding it -- wrote "HTTP/1.1 200\r\n" to the CLIENT, while h2 and
+        # h3 turned the same head into an ordinary :status 200
+        # (audit-report-133 Finding 1).
+        conn.sendall(b"HTTP/1.1 200\r\nContent-Length: 5\r\n\r\nvalid")
+    elif path.endswith(b"/statusnosp404"):
+        # ...and not only on the status every fixture here happens to use: the
+        # delimiter rule is about the LINE, not about 200.
+        conn.sendall(b"HTTP/1.1 404\r\nContent-Length: 5\r\n\r\nvalid")
+    elif path.endswith(b"/statusspempty"):
+        # The acceptance control for both of those, and the reason the fix is
+        # "require the SP" rather than "require a reason phrase": an ABSENT
+        # reason phrase is legal, and its legal spelling keeps the space. A gate
+        # that demanded 1*VCHAR after the space would refuse this and every
+        # rejection row above would still pass.
+        conn.sendall(b"HTTP/1.1 200 \r\nContent-Length: 5\r\n\r\nvalid")
+    elif path.endswith(b"/earlynosp"):
+        # The same missing SP on an INTERIM head, which is validated by the same
+        # gate on a separate pass and then forwarded on its own. The final 200
+        # behind it is well-formed, so a fix that only looked at the head
+        # carrying the status would serve this.
+        conn.sendall(b"HTTP/1.1 103\r\nLink: </a.css>; rel=preload\r\n\r\n"
+                     b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nvalid")
     elif path.endswith(b"/http10"):
         conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nold hi")
     elif path.endswith(b"/badversion"):
