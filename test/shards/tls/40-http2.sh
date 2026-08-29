@@ -514,6 +514,15 @@ PY
     timeout 30 python3 test/tls/h2_frame_validation.py $CA ${P61446} >/dev/null 2>&1
     check "http2 malformed control frames draw the right GOAWAY (Findings 25/26/27/29)" $?
 
+    # RFC 9113 6.3 (report 145): a wrong-length PRIORITY is a STREAM error, so
+    # it resets only the stream it names and the requests multiplexed beside it
+    # are still served -- it used to GOAWAY and take them all down. An idle
+    # target keeps the connection error (5.1 forbids the peer to accept an
+    # RST there, and curl/nghttp2 enforces it). Paired with valid-PRIORITY and
+    # plain-request controls, so resetting everything cannot pass.
+    timeout 30 python3 test/tls/h2_priority_scope.py $CA ${P61446} >/dev/null 2>&1
+    check "http2 wrong-length PRIORITY is a stream error, not a GOAWAY (report 145)" $?
+
     # RFC 9113 8.5 (Finding 28, report 124): CONNECT is unsupported (405), but one
     # that omits :authority, carries :scheme/:path, or whose :authority is not the
     # authority form -- a path, userinfo, a bad IPv6 literal, or no port at all --

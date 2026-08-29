@@ -751,15 +751,57 @@ linnea_h2_handle:
 .f_priority:
     ; RFC 9113 6.3: a PRIORITY frame is exactly 5 octets and never on stream 0.
     ; We do not act on it (RFC 9218 carries priority instead), but a malformed
-    ; one is still rejected: a wrong length is a FRAME_SIZE_ERROR (4.2 permits a
-    ; connection error for it) and stream 0 is a PROTOCOL_ERROR.
+    ; one is still rejected: stream 0 is a PROTOCOL_ERROR, and a wrong length is
+    ; a FRAME_SIZE_ERROR whose scope 6.3 makes a STREAM error -- PRIORITY alters
+    ; no connection state, so 4.2's connection-error clause does not reach it.
+    ; Taking the connection down here let a frame naming one stream abort every
+    ; other request multiplexed beside it (report 145).
     cmp r11, 14                      ; 9-byte header + 5-byte payload
-    jne .goaway_frame_size
+    jne .f_priority_size
     mov eax, [rsi + 5]
     bswap eax
     and eax, 0x7fffffff
     test eax, eax
     jz .goaway_close                 ; stream 0
+    jmp .f_ignore
+.f_priority_size:
+    ; Wrong length. The stream error 6.3 asks for is only sendable for a stream
+    ; the peer has actually opened: 5.1 says a peer receiving anything but
+    ; HEADERS or PRIORITY on an IDLE stream MUST treat it as a connection error,
+    ; and nghttp2 does exactly that -- curl aborts the connection on an
+    ; RST_STREAM naming an idle stream (measured, report 145). So an idle target
+    ; keeps the connection error it had: the blast radius is the same either way
+    ; and this way the fault stays the peer's, with the code that names it.
+    ; A closed stream is fine to reset (5.1 has the peer ignore it).
+    mov eax, [rsi + 5]               ; target stream id
+    bswap eax
+    and eax, 0x7fffffff
+    test eax, eax
+    jz .goaway_frame_size            ; stream 0
+    test al, 1
+    jz .goaway_frame_size            ; even id: idle, never opened by a client
+    cmp rax, [rbx + linnea_connection.h2_last_stream]
+    ja .goaway_frame_size            ; above the highest opened: still idle
+    ; RST_STREAM(FRAME_SIZE_ERROR) for that stream alone, then on to the next
+    ; frame. The 13 bytes fit inside the 32 the loop reserves at the top of
+    ; every iteration, as .f_window_rst relies on too.
+    mov byte [r13], 0
+    mov byte [r13 + 1], 0
+    mov byte [r13 + 2], 4
+    mov byte [r13 + 3], LINNEA_H2_FT_RST_STREAM
+    mov byte [r13 + 4], 0
+    mov ecx, eax
+    shr ecx, 24
+    mov [r13 + 5], cl
+    mov ecx, eax
+    shr ecx, 16
+    mov [r13 + 6], cl
+    mov ecx, eax
+    shr ecx, 8
+    mov [r13 + 7], cl
+    mov [r13 + 8], al
+    mov dword [r13 + 9], LINNEA_H2_FRAME_SIZE_ERROR << 24   ; big-endian
+    add r13, 13
     jmp .f_ignore
 .f_settings:
     ; RFC 9113 6.5: "If an endpoint receives a SETTINGS frame whose Stream
