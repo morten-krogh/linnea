@@ -114,6 +114,37 @@ s.sendall(fr(1, 0x05, 3, GOOD))
 check("odd but below the floor", verdict(s, 3), "GOAWAY")
 s.close()
 
+# A stream id that was USED and completed, then reused (report 146). This is
+# NOT the "odd but below the floor" case above: stream 1 was opened, served and
+# closed by END_STREAM. RFC 9113 5.1.1 covers it all the same -- "the identifier
+# of a newly established stream MUST be numerically greater than all streams
+# that the initiating endpoint has opened", and an unexpected identifier is a
+# connection error of type PROTOCOL_ERROR. 5.1's "closed" state agrees for a
+# stream closed by END_STREAM, which it makes a CONNECTION error of type
+# STREAM_CLOSED; only the post-RST_STREAM case there is scoped to the stream.
+# nginx 1.30.4, asked the same question, also answers GOAWAY(PROTOCOL_ERROR)
+# and drops the following stream 3. Report 146 recommended RST_STREAM + carry
+# on; that was declined, and this case is what would catch it being applied.
+s = connect()
+s.sendall(fr(1, 0x05, 1, GOOD))
+first = verdict(s, 1)
+s.sendall(fr(1, 0x05, 1, GOOD))
+check("a completed stream id, reused", verdict(s, 1), "GOAWAY",
+      f" (its first request: {first})")
+fails += first != "served"
+s.close()
+
+# ...and its control, which a blanket "GOAWAY on the second HEADERS" build
+# cannot pass: same connection, same completed stream 1, but a FRESH id next.
+# That one is served. The connection error above is caused by the reuse, not by
+# there being a second request on the connection at all.
+s = connect()
+s.sendall(fr(1, 0x05, 1, GOOD))
+verdict(s, 1)
+s.sendall(fr(1, 0x05, 3, GOOD))
+check("a fresh id after a completed one still serves", verdict(s, 3), "served")
+s.close()
+
 # and the guard: a malformed request on a VALID id is still only a stream error,
 # and the connection keeps serving afterwards
 s = connect()
