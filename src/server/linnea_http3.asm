@@ -59,6 +59,7 @@ extern linnea_qpack_location_ptr
 extern linnea_qpack_location_len
 extern linnea_qpack_max_fss
 extern linnea_qpack_fss_over
+extern linnea_qpack_fss_size
 extern linnea_qpack_crange_len
 extern linnea_qpack_cenc
 extern linnea_qpack_ccontrol_ptr
@@ -778,14 +779,19 @@ linnea_h3_build_headers:
     mov rbp, rax                     ; field-section length
     ; The peer's SETTINGS_MAX_FIELD_SECTION_SIZE (Finding 8): a response whose field
     ; section exceeds it may be rejected by the client, so flag it and let the serve
-    ; path reset the stream instead of sending. The encoded length is compared — a
-    ; lower bound on the uncompressed size RFC 9114 4.2.2 governs (QPACK only ever
-    ; shrinks) — so this never falsely rejects, and it catches every response that
-    ; definitely exceeds the limit. 0 = no limit advertised.
+    ; path reset the stream instead of sending. 0 = no limit advertised.
+    ;
+    ; The size compared is the one RFC 9114 4.2.2 defines — name + value + 32 per
+    ; field, uncompressed — which the encoder accumulated in linnea_qpack_fss_size.
+    ; The ENCODED length used to stand in for it, on the argument that QPACK only
+    ; shrinks so a compressed section under the limit is safe. It is not: the
+    ; setting bounds the uncompressed size, so a peer advertising 200 was sent the
+    ; static response whose fields are 626 bytes and whose encoding is under 200,
+    ; which is exactly the message it said it would not accept (audit-report-143).
     mov rax, [linnea_qpack_max_fss]
     test rax, rax
     jz .no_fss_limit
-    cmp rbp, rax
+    cmp [linnea_qpack_fss_size], rax
     jbe .no_fss_limit
     mov qword [linnea_qpack_fss_over], 1
 .no_fss_limit:

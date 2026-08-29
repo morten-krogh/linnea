@@ -102,6 +102,19 @@ if [ "$ktls" = 1 ]; then
         [ "$out" = "OK" ]
         check "h3 proxies to an HTTP/1.1 upstream ($out)" $?
 
+        # audit-report-143: the peer's SETTINGS_MAX_FIELD_SECTION_SIZE, over the
+        # responses this config actually builds. The proxy path never consulted
+        # it -- a proxied response is encoded on an upstream completion, long
+        # after the per-request globals stopped describing the connection that
+        # asked for it -- and the static path compared the ENCODED QPACK length
+        # to a limit RFC 9114 4.2.2 defines over the UNCOMPRESSED section, so
+        # /hello.txt (626 bytes of fields, under 200 encoded) was sent to a peer
+        # advertising 200. Each rejection row is paired with an acceptance row
+        # above the same response's size, and the interim chain is judged per
+        # SECTION (largest 1670) rather than by its 10397-byte sum.
+        timeout 180 python3 test/quic/h3_fss_limit.py ${P61462} >/dev/null 2>&1
+        check "h3: the peer's field-section limit is applied, proxied and static (143)" $?
+
         # How a request stream ends, and what becomes of one that never does:
         # a FIN on a frame carrying no bytes, and contexts left claimed by
         # clients that walked away. Both are consequences of consuming a stream
@@ -142,6 +155,7 @@ if [ "$ktls" = 1 ]; then
         fi
     else
         check "h3 proxying (skipped: aioquic/pylsqpack unavailable)" 0
+        check "h3 field-section limit (skipped: aioquic/pylsqpack unavailable)" 0
         check "h3 request streams end and are reclaimed (skipped)" 0
         check "h3 abandoned uploads release their capture file (skipped)" 0
     fi

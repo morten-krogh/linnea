@@ -73,6 +73,7 @@ extern linnea_spill_write
 extern linnea_spill_chunked
 extern linnea_spill_release
 extern linnea_qpack_encode_proxy
+extern linnea_qpack_fss_size
 extern linnea_qpack_hsts_ptr
 extern linnea_qpack_hsts_len
 extern linnea_qpack_nosniff
@@ -93,6 +94,7 @@ extern linnea_h3d_qgen
 extern linnea_h3d_sid
 extern linnea_h3d_hdr
 extern linnea_h3d_hlen
+extern linnea_h3d_fss
 extern linnea_h3d_base
 extern linnea_h3d_size
 extern linnea_h3d_foff
@@ -1127,7 +1129,10 @@ linnea_h3_proxy_deliver:
     push r14
     push r15
     sub rsp, 32                      ; [0] field-section length, [8] the head
-    mov rbx, rdi                     ; cursor, [16] the interim walk offset.
+    mov rbx, rdi                     ; cursor, [16] the interim walk offset,
+                                     ; [24] the largest RFC 9114 4.2.2 field-
+                                     ; section size any of its HEADERS frames
+                                     ; carries.
                                      ; 32 not 24: five pushes leave rsp 16-byte
                                      ; aligned, so an odd multiple of 8 here
                                      ; hands every callee a misaligned stack --
@@ -1157,6 +1162,7 @@ linnea_h3_proxy_deliver:
     mov [rsp + 8], rdi               ; the cursor across every frame below
     xor eax, eax
     mov [rsp + 16], rax              ; walk offset: the first interim head
+    mov [rsp + 24], rax              ; no field section measured yet
 .dl_interim:
     mov rax, [rsp + 16]
     cmp rax, [rbx + linnea_connection.h3_hoff]
@@ -1204,6 +1210,7 @@ linnea_h3_proxy_deliver:
     pop rdx                          ; this head's length, back off the stack
     cmp rax, -1
     je .dl_bad_head
+    call .dl_note_fss                ; this interim section's uncompressed size
     add [rsp + 16], rdx              ; step the walk past it
     mov rdi, [rsp + 8]
     mov rsi, rax                     ; the field-section length
@@ -1240,6 +1247,7 @@ linnea_h3_proxy_deliver:
     call linnea_qpack_encode_proxy   ; rax = field-section length, or -1 when it
     cmp rax, -1                      ; would not fit the reserve
     je .dl_bad_head
+    call .dl_note_fss                ; and the final response's own size
     mov rdi, [rsp + 8]
     mov rsi, rax
     call .dl_put_headers
@@ -1306,6 +1314,10 @@ linnea_h3_proxy_deliver:
     mov [linnea_h3d_qgen], rax
     mov rax, [rbx + linnea_connection.h3_sid]
     mov [linnea_h3d_sid], rax
+    mov rax, [rsp + 24]
+    mov [linnea_h3d_fss], rax        ; the limit is the OWNING connection's, and
+                                     ; only the delivery still knows which that
+                                     ; is (audit-report-143 Finding 1)
     ; The access line, from the facts parked when the request was forwarded.
     ; Written here rather than through the h1 proxy log: that one reads the
     ; request out of a client connection's buffers, and an h3 leg has none —
@@ -1382,6 +1394,19 @@ linnea_h3_proxy_deliver:
     pop r12
     pop rbx
     jmp linnea_h3_proxy_fail
+
+; .dl_note_fss() — keep the largest RFC 9114 4.2.2 field-section size the
+; encoder has reported so far in [rsp + 32] (the caller's [rsp + 24], one call
+; deep). The limit is per field section, so an interim chain is judged by its
+; biggest head rather than by their sum. Clobbers only rcx and flags: rax is
+; the field-section length its callers still need.
+.dl_note_fss:
+    mov rcx, [linnea_qpack_fss_size]
+    cmp rcx, [rsp + 32]
+    jbe .dnf_ret
+    mov [rsp + 32], rcx
+.dnf_ret:
+    ret
 
 ; .dl_put_headers(rdi = cursor into h3p_head, rsi = field-section length, the
 ;   section itself sitting in h3p_fs) -> rax = the cursor past the frame it
@@ -1471,6 +1496,8 @@ linnea_h3_proxy_fail:
     call linnea_h3_build_canned      ; rax = the whole response's length
     cmp rax, LINNEA_H3_HEAD_MAX
     ja .fl_free                      ; unreachable: these bodies are fixed
+    mov rcx, [linnea_qpack_fss_size] ; what the canned head's fields measure
+    mov [linnea_h3d_fss], rcx        ; under RFC 9114 4.2.2
     mov [linnea_h3d_hlen], rax
     lea rax, [h3p_head]
     mov [linnea_h3d_hdr], rax

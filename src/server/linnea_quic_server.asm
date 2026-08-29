@@ -98,6 +98,7 @@ global linnea_h3d_base
 global linnea_h3d_size
 global linnea_h3d_foff
 global linnea_h3d_flen
+global linnea_h3d_fss
 global linnea_h3_cancel_hook
 
 extern linnea_http_authority_host
@@ -444,6 +445,14 @@ linnea_h3d_base: resq 1
 linnea_h3d_size: resq 1
 linnea_h3d_foff: resq 1
 linnea_h3d_flen: resq 1
+; The largest RFC 9114 4.2.2 field-section size among the HEADERS frames of that
+; response (an interim chain contributes one section per 1xx head). The static
+; path checks its own against linnea_qpack_max_fss while it builds; a proxied
+; response is built on an upstream completion, long after the per-request
+; globals stopped describing this connection, so it carries the size here and
+; linnea_quic_h3_deliver compares it with the connection's own advertised limit
+; (audit-report-143 Finding 1).
+linnea_h3d_fss:  resq 1
 ; Called with (rdi = conn index, rsi = its connection id, rdx = stream id or -1)
 ; when nobody is waiting for a proxied answer any more, so the upstream leg can
 ; be dropped instead of running to completion. A pointer rather than a direct
@@ -8279,6 +8288,17 @@ linnea_quic_h3_deliver:
     ; The head is either held in the slot (a canned error, which needs no file)
     ; or lives at the front of the mapping with the body behind it (a relayed
     ; response, whose head is too big for the slot's fixed hdr).
+    ; The peer's SETTINGS_MAX_FIELD_SECTION_SIZE, for a response this worker
+    ; encoded outside the request that asked for it. 0 = none advertised.
+    ; Sending a field section the client said it would not accept only draws a
+    ; client-side rejection, so fail the stream cleanly instead — the same
+    ; answer the static path gives at .serve_fss_over.
+    mov rax, [rbx + linnea_quic_conn.max_fss_peer]
+    test rax, rax
+    jz .hd_fss_ok
+    cmp [linnea_h3d_fss], rax
+    ja .hd_fss_over
+.hd_fss_ok:
     mov rax, [linnea_h3d_hlen]
     cmp rax, LINNEA_QUIC_TX_HDR
     ja .hd_toolong
@@ -8306,6 +8326,20 @@ linnea_quic_h3_deliver:
     mov [cur_conn], rbx
     call tx_pump
     mov eax, 1
+    jmp .hd_ret
+.hd_fss_over:
+    ; Over the peer's limit: nothing of the response has been sent, so the
+    ; stream is reset with H3_INTERNAL_ERROR and the slot freed. -1 tells the
+    ; caller the response could not be represented, which is also what releases
+    ; the mapping it was holding for the slot.
+    mov qword [r15 + linnea_quic_txstream.pending], 0
+    mov qword [r15 + linnea_quic_txstream.active], 0
+    mov [cur_conn], rbx
+    mov rdi, r13
+    xor esi, esi                      ; nothing of it was ever sent
+    mov edx, LINNEA_H3_ERR_INTERNAL
+    call tx_reset_stream_code
+    mov eax, -1
     jmp .hd_ret
 .hd_toolong:
     ; unreachable: the caller bounds the head before it gets here. Free the slot

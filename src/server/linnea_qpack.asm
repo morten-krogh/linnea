@@ -38,6 +38,7 @@ global linnea_qpack_hsts_len
 global linnea_qpack_nosniff
 global linnea_qpack_max_fss
 global linnea_qpack_fss_over
+global linnea_qpack_fss_size
 
 extern hpack_int
 extern hpack_str
@@ -152,6 +153,15 @@ linnea_qpack_nosniff:  resq 1
 ; than sending an oversized field section (Finding 8).
 linnea_qpack_max_fss:  resq 1
 linnea_qpack_fss_over: resq 1
+; The size of the field section the last encode produced, counted the way RFC
+; 9114 4.2.2 defines it: for every field, name length + value length + 32,
+; UNCOMPRESSED. That is what SETTINGS_MAX_FIELD_SECTION_SIZE bounds. The
+; encoded QPACK length is a different and always smaller number -- 626 bytes of
+; field section for the static /hello.txt response encode to under 200 -- so
+; comparing that to the setting under-enforces the limit by whatever the
+; encoding saved, and a peer that advertised 200 was sent the 626 it said it
+; would not take (audit-report-143 Finding 1).
+linnea_qpack_fss_size: resq 1
 ; scratch for relaying an upstream response head: one field name, lowercased,
 ; and the re-derived content-length as digits
 qp_nmbuf:  resb LINNEA_HTTP_MAX_FIELD_NAME
@@ -440,6 +450,20 @@ linnea_qpack_reset_response:
     ja .too_long
 %endmacro
 
+; QFSS const[, len] — add one field's RFC 9114 4.2.2 contribution to the running
+; field-section size: the constant part (name length + 32, and the value length
+; when it is fixed) plus a register holding a variable value length. The total
+; lives in memory rather than a register because the section is built across a
+; dozen branches and both encoders have every register spoken for. It clobbers
+; flags, so it goes beside a QROOM or after a branch, never between a cmp and
+; its jcc.
+%macro QFSS 1-2
+    add qword [linnea_qpack_fss_size], %1
+%if %0 > 1
+    add qword [linnea_qpack_fss_size], %2
+%endif
+%endmacro
+
 ; linnea_qpack_encode_response(rdi=out, esi=status, rdx=ct_ptr, rcx=ct_len,
 ;   r8=clen_ptr, r9=clen_len, r10=out limit) -> rax = field-section length,
 ;   or -1 when the section would not fit under the limit.
@@ -479,6 +503,7 @@ linnea_qpack_encode_response:
     mov r14, rcx                     ; content-type len
     mov r15, r8                      ; content-length ptr
     mov rbp, r9                      ; content-length len
+    mov qword [linnea_qpack_fss_size], 0
     ; field section prefix: Required Insert Count = 0, Delta Base = 0
     QROOM 8                          ; the prefix and the longest :status
     mov word [rbx], 0x0000
@@ -487,11 +512,13 @@ linnea_qpack_encode_response:
     mov rdi, rbx
     mov esi, r12d
     call qenc_status
+    QFSS 42                          ; ":status" (7) + three digits + 32
     mov rbx, rdi
 .after_status:
     ; --- content-type: literal with name reference (static index 44) ---
     test r13, r13
     jz .no_ct
+    QFSS 44, r14                     ; "content-type" (12) + 32
     QROOM r14 + 4
     mov rdi, rbx
     mov eax, 44
@@ -507,6 +534,7 @@ linnea_qpack_encode_response:
 
     test r15, r15
     jz .no_clen
+    QFSS 46, rbp                     ; "content-length" (14) + 32
     QROOM rbp + 4
     mov rdi, rbx
     mov eax, 4
@@ -523,6 +551,7 @@ linnea_qpack_encode_response:
     cmp qword [linnea_qpack_crange_ptr], 0
     je .no_crange
     mov rax, [linnea_qpack_crange_len]
+    QFSS 45, rax                     ; "content-range" (13) + 32
     QROOM rax + 18
     mov rdi, rbx
     mov rax, crange_name_len         ; literal field line with literal name
@@ -542,6 +571,7 @@ linnea_qpack_encode_response:
     ; the name is a literal: RFC 9204's static table has no allow entry. ---
     cmp r12d, 405
     jne .no_allow
+    QFSS 46                          ; "allow" (5) + "GET, HEAD" (9) + 32
     QROOM 20
     mov rdi, rbx
     mov rax, allow_name_len          ; literal field line with literal name
@@ -566,6 +596,7 @@ linnea_qpack_encode_response:
     cmp qword [linnea_qpack_location_ptr], 0
     je .no_location
     mov rax, [linnea_qpack_location_len]
+    QFSS 40, rax                     ; "location" (8) + 32
     QROOM rax + 6
     mov rdi, rbx
     mov eax, 12                      ; location: name reference (RFC 9204 A)
@@ -584,6 +615,7 @@ linnea_qpack_encode_response:
     QROOM 3                          ; accept-ranges, vary and content-encoding
     cmp r12d, 304                    ; are one indexed byte each
     je .no_aranges                   ; a 304 restates no accept-ranges
+    QFSS 50                          ; "accept-ranges" (13) + "bytes" (5) + 32
     mov rdi, rbx
     mov al, 0xc0 | 32                ; accept-ranges: bytes — indexed, static
     mov [rdi], al
@@ -592,6 +624,7 @@ linnea_qpack_encode_response:
 .no_aranges:
     ; vary: accept-encoding (indexed 59) — a file response always varies on
     ; it, whether or not a compressed variant was found
+    QFSS 51                          ; "vary" (4) + "accept-encoding" (15) + 32
     mov rdi, rbx
     mov byte [rdi], 0xc0 | 59
     inc rdi
@@ -605,14 +638,18 @@ linnea_qpack_encode_response:
     jz .no_cenc
     mov rdi, rbx
     mov byte [rdi], 0xc0 | 43        ; content-encoding: gzip — indexed, static
+    QFSS 52                          ; "content-encoding" (16) + "gzip" (4) + 32
     cmp rax, 2
     jne .cenc_put
     mov byte [rdi], 0xc0 | 42        ; content-encoding: br
+    QFSS -2                          ; ...and "br" is two bytes shorter
 .cenc_put:
     inc rdi
     mov rbx, rdi
 .no_cenc:
     mov rax, [linnea_static_etag_len]
+    QFSS 36, rax                     ; "etag" (4) + 32
+    QFSS 45 + LINNEA_HTTP_DATE_LEN   ; "last-modified" (13) + the date + 32
     QROOM rax + LINNEA_HTTP_DATE_LEN + 8
     mov rdi, rbx
     mov eax, 7                       ; etag: literal with name reference
@@ -634,6 +671,7 @@ linnea_qpack_encode_response:
     cmp qword [linnea_qpack_ccontrol_ptr], 0
     je .no_ccontrol
     mov rax, [linnea_qpack_ccontrol_len]
+    QFSS 45, rax                     ; "cache-control" (13) + 32
     QROOM rax + 6
     mov rdi, rbx
     mov eax, 36                      ; cache-control: name reference
@@ -661,6 +699,7 @@ linnea_qpack_encode_response:
     cmp r12d, 406
     jne .no_validators
 .emit_vary_h3:
+    QFSS 51                          ; "vary" (4) + "accept-encoding" (15) + 32
     QROOM 2
     mov rdi, rbx
     mov byte [rdi], 0xc0 | 59        ; vary: accept-encoding — indexed, static
@@ -670,6 +709,7 @@ linnea_qpack_encode_response:
     ; --- the vhost's security headers, on every response ---
     cmp qword [linnea_qpack_nosniff], 0
     je .no_nosniff
+    QFSS 61                          ; the name (22) + "nosniff" (7) + 32
     QROOM 2
     mov rdi, rbx
     mov byte [rdi], 0xc0 | 61        ; x-content-type-options: nosniff —
@@ -679,6 +719,7 @@ linnea_qpack_encode_response:
     cmp qword [linnea_qpack_hsts_ptr], 0
     je .no_hsts
     mov rax, [linnea_qpack_hsts_len]
+    QFSS 57, rax                     ; "strict-transport-security" (25) + 32
     QROOM rax + 6
     mov rdi, rbx
     mov eax, 56                      ; strict-transport-security: name ref
@@ -691,6 +732,8 @@ linnea_qpack_encode_response:
     mov rbx, rdi
 .no_hsts:
     ; --- date and server, on every response ---
+    QFSS 36 + LINNEA_HTTP_DATE_LEN   ; "date" (4) + the date + 32
+    QFSS 44                          ; "server" (6) + "linnea" (6) + 32
     QROOM LINNEA_HTTP_DATE_LEN + qpack_srv_name_len + 8
     call linnea_time_http_now        ; rax = current IMF-fixdate text
     mov r13, rax
@@ -780,11 +823,13 @@ linnea_qpack_encode_proxy:
     mov [rsp + 48], rax              ; the framing added after us needs the slack
     mov r12, rdx                     ; head
     mov r13, rcx                     ; head length
+    mov qword [linnea_qpack_fss_size], 0
     ; field section prefix: Required Insert Count = 0, Delta Base = 0
     mov word [rbx], 0x0000
     add rbx, 2
     mov rdi, rbx
     call qenc_status
+    QFSS 42                          ; ":status" (7) + three digits + 32
     mov rbx, rdi
     ; --- content-length, when it is ours to state. The captured body's length
     ; is what the client will actually receive, whatever the upstream framed.
@@ -798,6 +843,7 @@ linnea_qpack_encode_proxy:
     mov rdi, rax
     lea rsi, [qp_numbuf]
     call linnea_string_from_u64      ; rax = digits written
+    QFSS 46, rax                     ; "content-length" (14) + 32
     push rax                         ; keep the digit count across the name
     mov rdi, rbx
     mov eax, 4                       ; content-length: name reference (static 4)
@@ -929,6 +975,9 @@ linnea_qpack_encode_proxy:
     add rax, rcx
     cmp rax, [rsp + 48]
     ja .ep_toolong
+    mov rax, [rsp + 32]              ; this field's name length...
+    add rax, rcx                     ; ...and its value's
+    QFSS 32, rax
     mov rdi, rbx
     lea rsi, [qp_nmbuf]
     mov r8, rcx                      ; value length
@@ -947,6 +996,7 @@ linnea_qpack_encode_proxy:
     lea rcx, [qp_via_val]
     mov r8, qp_via_val_len
     call qenc_lit
+    QFSS 32 + qp_via_name_len + qp_via_val_len
     mov rbx, rdi
     ; --- the vhost's security headers, when the backend set neither ---
     mov r14, [rsp + 16]
@@ -965,6 +1015,8 @@ linnea_qpack_encode_proxy:
     mov rdx, [r14 + linnea_config_server.hsts_len]
     call qenc_str
     mov rbx, rdi
+    mov rax, [r14 + linnea_config_server.hsts_len]
+    QFSS 57, rax                     ; "strict-transport-security" (25) + 32
 .ep_nosniff:
     test qword [rsp + 24], 8
     jnz .ep_datesrv
@@ -974,6 +1026,7 @@ linnea_qpack_encode_proxy:
     mov byte [rdi], 0xc0 | 61        ; x-content-type-options: nosniff —
     inc rdi                          ; name and value both in the static table
     mov rbx, rdi
+    QFSS 61                          ; the name (22) + "nosniff" (7) + 32
 .ep_datesrv:
     ; --- date and server, each only when the upstream sent none ---
     test qword [rsp + 24], 1
@@ -988,6 +1041,7 @@ linnea_qpack_encode_proxy:
     mov rsi, r14
     mov edx, LINNEA_HTTP_DATE_LEN
     call qenc_str
+    QFSS 36 + LINNEA_HTTP_DATE_LEN   ; "date" (4) + the date + 32
     mov rbx, rdi
 .ep_server:
     test qword [rsp + 24], 2
@@ -1000,6 +1054,7 @@ linnea_qpack_encode_proxy:
     lea rsi, [qpack_srv_name]
     mov edx, qpack_srv_name_len
     call qenc_str
+    QFSS 38 + qpack_srv_name_len     ; "server" (6) + the name + 32
     mov rbx, rdi
 .ep_fin:
     cmp rbx, [rsp + 48]
