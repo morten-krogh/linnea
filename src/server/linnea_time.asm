@@ -380,6 +380,55 @@ linnea_time_parse_http_date:
     inc ecx
     jmp .month_loop
 .month_found:
+    ; RFC 9110 gives the date components the same semantics as RFC 5322
+    ; section 3.3: the day has to exist in the named month of this year.  The
+    ; 1..31 check above is necessary but not sufficient -- passing (for
+    ; example) 29 Feb 2099 into days_from_civil turns it into a March day and
+    ; lets an invalid conditional date affect the response.
+    mov eax, 31
+    cmp ecx, 2
+    je .calendar_feb
+    cmp ecx, 4
+    je .calendar_30
+    cmp ecx, 6
+    je .calendar_30
+    cmp ecx, 9
+    je .calendar_30
+    cmp ecx, 11
+    jne .calendar_check
+.calendar_30:
+    mov eax, 30
+    jmp .calendar_check
+.calendar_feb:
+    ; Leap years are divisible by 4, except century years unless divisible by
+    ; 400.  Divide rather than rely on a table so the same small rule covers
+    ; every four-digit HTTP year.
+    mov eax, r8d
+    xor edx, edx
+    mov r9d, 4
+    div r9d
+    test edx, edx
+    jnz .calendar_28
+    mov eax, r8d
+    xor edx, edx
+    mov r9d, 100
+    div r9d
+    test edx, edx
+    jnz .calendar_29
+    mov eax, r8d
+    xor edx, edx
+    mov r9d, 400
+    div r9d
+    test edx, edx
+    jnz .calendar_28
+.calendar_29:
+    mov eax, 29
+    jmp .calendar_check
+.calendar_28:
+    mov eax, 28
+.calendar_check:
+    cmp r12d, eax
+    ja .bad
     mov edi, r8d               ; year
     mov esi, ecx               ; month
     mov edx, r12d              ; day

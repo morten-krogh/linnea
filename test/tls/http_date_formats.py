@@ -134,4 +134,26 @@ else:
     print(f"FAIL an unparsable date gave {status}, want 200")
     fails += 1
 
+# HTTP-date inherits the Internet Message Format's calendar semantics: a day
+# must exist in the named month and year.  The parser used to check only 1..31,
+# then hand February 29 in a non-leap year (and April 31) to the civil-date
+# arithmetic, which normalised it into a different real date.  A far-future
+# valid leap day is the blanket-build control: rejecting every February 29 must
+# not make the malformed cases pass.
+for label, value, want in (
+        ("IMF valid leap day", imf(datetime(2400, 2, 29, tzinfo=timezone.utc)), 304),
+        ("IMF non-leap February 29", "Sun, 29 Feb 2099 00:00:00 GMT", 200),
+        ("IMF April 31", "Sun, 31 Apr 2099 00:00:00 GMT", 200),
+        ("RFC 850 valid leap day", rfc850(datetime(2068, 2, 29, tzinfo=timezone.utc)), 304),
+        ("RFC 850 April 31", "Sunday, 31-Apr-49 00:00:00 GMT", 200),
+        ("asctime valid leap day", asctime(datetime(2400, 2, 29, tzinfo=timezone.utc)), 304),
+        ("asctime April 31", "Sun Apr 31 00:00:00 2099", 200),
+):
+    status, _ = request(f"If-Modified-Since: {value}\r\n".encode())
+    if status == want:
+        print(f"ok   {label}: {status}")
+    else:
+        print(f"FAIL {label}: {status}, want {want} ({value})")
+        fails += 1
+
 sys.exit(1 if fails else 0)
