@@ -74,6 +74,64 @@ run_test "redirect dump"   124 stdout "prefix=/old redirect=https://example.com"
     timeout 0.5 $BIN --config $CFG/listen.json
 run_test "bad redirect target" 1 stderr "redirect target must start with http:// or https://" \
     $BIN --config $CFG/bad-redirect-target.json
+
+# --- configured strings that are sent as HTTP field values (report 140) ---
+# The JSON string parser stops below 0x20 but accepts DEL, which RFC 9110 5.5
+# excludes from field-vchar. cache_control, hsts and the redirect target are
+# each written into a response field verbatim -- HTTP/1 here, the same bytes
+# through the HPACK and QPACK encoders -- so a config carrying DEL made linnea
+# author a malformed response on every protocol it speaks. Measured with the
+# byte in place: node's llhttp refuses the whole response with
+# HPE_INVALID_HEADER_TOKEN, while curl 8.15 and python http.client pass it
+# through; linnea's own request parser answers 400 to the same byte, so the
+# server held two opinions about one grammar.
+#
+# Built here rather than checked in: the byte that matters is invisible in a
+# fixture, and the one thing worse than a fixture nobody can read is one a
+# stray reformat silently repairs.
+python3 - "$CFG" <<'FVPY'
+import os, sys
+cfg = sys.argv[1]
+src = open(os.path.join(cfg, 'listen.json')).read()
+DEL = chr(0x7f)
+HOST = '"hostname": "one.test"'
+
+
+def write(name, text):
+    open(os.path.join(cfg, name), 'w').write(text)
+
+
+def with_hsts(text, value):
+    i = text.index(HOST)
+    return text[:i] + '"hsts": "%s", ' % value + text[i:]
+
+
+write('fv-cc-del.json', src.replace('"cache_control": "max-age=60"',
+                                    '"cache_control": "max-age=60' + DEL + '"'))
+write('fv-redirect-del.json', src.replace('"redirect": "https://example.com"',
+                                          '"redirect": "https://example.com' + DEL + '"'))
+write('fv-redirect-sp.json', src.replace('"redirect": "https://example.com"',
+                                         '"redirect": "https://exa mple.com"'))
+write('fv-hsts-del.json', with_hsts(src, 'max-age=31536000' + DEL))
+# The control a blanket "reject everything" cannot pass: the same three keys
+# carrying what a real deployment writes -- interior spaces, a semicolon list,
+# and a pair of obs-text bytes, every one of them legal field-content.
+ok = src.replace('"cache_control": "max-age=60"',
+                 '"cache_control": "public, max-age=600, immutable, x=\xc3\xa9"')
+write('fv-ok.json', with_hsts(ok, 'max-age=31536000; includeSubDomains; preload'))
+FVPY
+run_test "cache_control with DEL"  1 stderr "cache_control must be a valid HTTP field value" \
+    $BIN --config $CFG/fv-cc-del.json
+run_test "hsts with DEL"           1 stderr "hsts must be a valid HTTP field value" \
+    $BIN --config $CFG/fv-hsts-del.json
+run_test "redirect with DEL"       1 stderr "redirect target must be a valid HTTP field value" \
+    $BIN --config $CFG/fv-redirect-del.json
+# a URL cannot carry whitespace, so the redirect target takes none at all --
+# unlike cache_control and hsts, where a space is ordinary field-content
+run_test "redirect with a space"   1 stderr "redirect target must be a valid HTTP field value" \
+    $BIN --config $CFG/fv-redirect-sp.json
+run_test "spaces and obs-text load" 124 stdout "prefix=/old redirect=https://example.com" \
+    timeout 0.5 $BIN --config $CFG/fv-ok.json
 run_test "bad proxy address" 1 stderr "invalid proxy address" \
     $BIN --config $CFG/bad-proxy-addr.json
 run_test "prefix not absolute" 1 stderr "location prefix must start with '/'" \

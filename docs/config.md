@@ -173,7 +173,7 @@ between them. Two servers on one effective `address`/`port` must agree on
 | `locations` | array | — **required** | 1–8 | Path routing. At least one. |
 | `cert` | string | none | ≤ 255 | Path to a PEM certificate chain. Enables TLS. |
 | `key` | string | none | ≤ 255 | Path to the PEM PKCS#8 private key. |
-| `hsts` | **string** | none | ≤ 255 | **The `Strict-Transport-Security` header value**, sent verbatim — e.g. `"max-age=31536000"`. Not a flag. |
+| `hsts` | **string** | none | ≤ 255 | **The `Strict-Transport-Security` header value**, sent verbatim — e.g. `"max-age=31536000"`. Not a flag. Must be a valid HTTP field value — see **Values that become response headers**. |
 | `nosniff` | integer | `0` | 0 or 1 | Send `X-Content-Type-Options: nosniff`. |
 
 > **`hsts` is a string and `nosniff` is a flag.** They sit next to each other
@@ -236,11 +236,28 @@ coexist and `/api/x` goes to `/api`.
 | `proxy_pin` | string | none | exactly 64 hex chars | The backend certificate's identity: **SHA-256 of its SubjectPublicKeyInfo**, hex-encoded. **Both-or-neither with `proxy_tls`:** `proxy_tls` requires a pin, and a pin **requires `proxy_tls`** — without it the connection would be plaintext and the pin would authenticate nothing, so the config is rejected rather than quietly serving in the clear. Authentication is by this pin, not a CA. |
 | `proxy_sni` | string | none | ≤ 255 | The server name to send in the TLS ClientHello (SNI) to a `proxy_tls` backend. Optional — needed only if the backend selects its certificate by SNI. **Requires `proxy_tls`**: without it there is no ClientHello to put a name in. Must be a **DNS hostname** per RFC 6066 §3 — ASCII letters, digits and hyphens in labels of 1–63, no empty or hyphen-edged label, no trailing dot, **at most 253 characters** (a DNS name encodes as len + 2 octets and RFC 1035 caps that at 255), and **not an IP literal**. Omit the key to send no SNI at all; the `server_name` extension is then left out of the ClientHello entirely. |
 | `proxy_h2` | integer | `0` (off) | 0 or 1 | Speak **HTTP/2** to this location's backends (negotiated by ALPN over TLS). Only on a `proxy` location, and **requires `proxy_tls`**. See **Backend HTTP/2** below. |
-| `redirect` | string | one of three | ≤ 255 | Reply 301 to this URL prefix. **Must start with `http://` or `https://`.** |
-| `cache_control` | string | none | ≤ 255 | `Cache-Control` value for static responses. Only meaningful with `root`. |
+| `redirect` | string | one of three | ≤ 255 | Reply 301 to this URL prefix. **Must start with `http://` or `https://`.** It is a URL, so no whitespace either. |
+| `cache_control` | string | none | ≤ 255 | `Cache-Control` value for static responses. Only meaningful with `root`. Must be a valid HTTP field value — see below. |
 
 > **Exactly one of `root`, `proxy` or `redirect`.** Zero is an error and so are
 > two: *"location requires prefix and exactly one of root, proxy or redirect"*.
+
+### Values that become response headers
+
+`hsts`, `cache_control` and `redirect` are not opaque strings: each one is
+written into a response field verbatim, so each has to *be* a legal field
+value. RFC 9110 §5.5 defines that as `field-vchar` — `0x21`–`0x7e` or
+`0x80`–`0xff` — with space or tab allowed only *between* two of those, never
+at either end. DEL (`0x7f`) is excluded, and so is every control byte; the
+config parser already refuses bytes below `0x20`, DEL is refused here.
+
+`redirect` is stricter still: it is the head of a `Location` URL, which cannot
+carry whitespace at all, so a space anywhere in it is refused.
+
+This is checked by `--test` and at startup, before any listener is opened —
+a configuration that would make linnea author a malformed response never
+serves one. `"public, max-age=600"` and `"max-age=31536000; includeSubDomains"`
+are ordinary field values and load unchanged.
 
 ---
 

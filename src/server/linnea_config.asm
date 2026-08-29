@@ -99,6 +99,20 @@ msg_empty_root:         db "location root must not be empty"
 msg_empty_root_len      equ $ - msg_empty_root
 msg_bad_redirect:       db "redirect target must start with http:// or https://"
 msg_bad_redirect_len    equ $ - msg_bad_redirect
+; A configured string that is sent as an HTTP field value has to BE one.
+; RFC 9110 5.5 defines field-value as field-vchar (VCHAR 0x21-0x7e, or obs-text
+; 0x80-0xff) with SP/HTAB permitted only between two field-vchars, and says a
+; field value does not include leading or trailing whitespace. The JSON string
+; parser stops below 0x20 but accepts DEL, so `"cache_control": "max-age=60\x7f"`
+; loaded and was written verbatim into every response -- HTTP/1, and the same
+; bytes through the HTTP/2 and HTTP/3 encoders. Refused here instead, where
+; --test sees it, rather than authored onto the wire.
+msg_bad_cc:             db "cache_control must be a valid HTTP field value: 0x21-0x7e or 0x80-0xff, with space or tab only between them"
+msg_bad_cc_len          equ $ - msg_bad_cc
+msg_bad_hsts:           db "hsts must be a valid HTTP field value: 0x21-0x7e or 0x80-0xff, with space or tab only between them"
+msg_bad_hsts_len        equ $ - msg_bad_hsts
+msg_bad_redirect_val:   db "redirect target must be a valid HTTP field value: 0x21-0x7e or 0x80-0xff, and no whitespace (it is a URL)"
+msg_bad_redirect_val_len equ $ - msg_bad_redirect_val
 msg_empty_log:          db "config log must not be empty"
 msg_empty_log_len       equ $ - msg_empty_log
 msg_cert_key:           db "server needs both cert and key, or neither"
@@ -170,6 +184,42 @@ dir_exists:
     mov eax, 1
     ret
 .de_no:
+    xor eax, eax
+    ret
+
+; field_value_ok(rdi = bytes, rsi = len, edx = 1 to permit interior SP/HTAB)
+;   -> eax = 1 when the bytes are a legal HTTP field value.
+; An empty string means the key was not configured, which is always fine.
+; Clobbers rax and rcx only, so the validate loop's rdx/r8-r11 survive it.
+field_value_ok:
+    xor ecx, ecx
+.fv_loop:
+    cmp rcx, rsi
+    jae .fv_ok                 ; len 0 lands here too: nothing configured
+    movzx eax, byte [rdi + rcx]
+    cmp al, 0x7f
+    je .fv_bad                 ; DEL is neither VCHAR nor obs-text
+    cmp al, 0x20
+    ja .fv_next                ; 0x21-0x7e and 0x80-0xff: field-vchar
+    test edx, edx
+    jz .fv_bad                 ; this field takes no whitespace at all
+    cmp al, 0x20
+    je .fv_ws
+    cmp al, 9
+    jne .fv_bad                ; a control byte; the parser bars these already
+.fv_ws:
+    test rcx, rcx
+    jz .fv_bad                 ; leading whitespace is not part of a field value
+    lea rax, [rcx + 1]
+    cmp rax, rsi
+    jae .fv_bad                ; nor trailing
+.fv_next:
+    inc rcx
+    jmp .fv_loop
+.fv_ok:
+    mov eax, 1
+    ret
+.fv_bad:
     xor eax, eax
     ret
 
@@ -294,6 +344,22 @@ linnea_config_validate:
     pop rdi
     pop rax
     je .bad_host_ip
+    ; hsts is sent verbatim as Strict-Transport-Security, so it must be a
+    ; legal field value.
+    push rax
+    push rdi
+    push r8
+    push r9
+    lea rdi, [r9 + linnea_config_server.hsts]
+    mov rsi, [r9 + linnea_config_server.hsts_len]
+    mov edx, 1                 ; "max-age=31536000; includeSubDomains"
+    call field_value_ok
+    test eax, eax
+    pop r9
+    pop r8
+    pop rdi
+    pop rax
+    jz .bad_hsts
     mov r10, [r9 + linnea_config_server.location_count]
     test r10, r10
     jz .no_locations
@@ -307,6 +373,27 @@ linnea_config_validate:
     je .bad_prefix
     cmp byte [rdx + linnea_config_location.prefix], '/'
     jne .bad_prefix
+    ; cache_control is sent verbatim as Cache-Control, on 200 and 304 alike.
+    push rax
+    push rdi
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [rdx + linnea_config_location.cache_control]
+    mov rsi, [rdx + linnea_config_location.cache_control_len]
+    mov edx, 1                 ; "public, max-age=600"
+    call field_value_ok
+    test eax, eax
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rdi
+    pop rax
+    jz .bad_cc
     cmp qword [rdx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
     jne .loc_not_root
     cmp qword [rdx + linnea_config_location.root_len], 0
@@ -363,6 +450,15 @@ linnea_config_validate:
     test eax, eax
     jz .bad_redirect
 .redirect_ok:
+    ; ...and the scheme being right does not make the rest of it sendable: the
+    ; target is the head of the Location value. No whitespace here at all --
+    ; a URL cannot carry any, so interior SP would only ever be a typo.
+    lea rdi, [r10 + linnea_config_location.redirect]
+    mov rsi, [r10 + linnea_config_location.redirect_len]
+    xor edx, edx
+    call field_value_ok
+    test eax, eax
+    jz .bad_redirect_val
     pop r11
     pop r10
     pop r9
@@ -496,6 +592,18 @@ linnea_config_validate:
 .bad_redirect:
     lea rdi, [msg_bad_redirect]
     mov esi, msg_bad_redirect_len
+    jmp linnea_error_exit
+.bad_redirect_val:
+    lea rdi, [msg_bad_redirect_val]
+    mov esi, msg_bad_redirect_val_len
+    jmp linnea_error_exit
+.bad_cc:
+    lea rdi, [msg_bad_cc]
+    mov esi, msg_bad_cc_len
+    jmp linnea_error_exit
+.bad_hsts:
+    lea rdi, [msg_bad_hsts]
+    mov esi, msg_bad_hsts_len
     jmp linnea_error_exit
 .empty_root:
     lea rdi, [msg_empty_root]

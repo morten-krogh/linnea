@@ -976,6 +976,35 @@ test(loc([{"prefix": "api", "root": D}]), "prefix without a leading / rejected",
      False, "must start with '/'")
 test(loc([{"prefix": "/", "redirect": "example.com"}]),
      "redirect without a scheme rejected", False, "http:// or https://")
+
+# --- values that become response headers must be legal field values ------
+# json.dumps escapes DEL and obs-text as \u007f / \u00e9, and linnea's parser
+# supports no escapes at all -- so these go through as raw bytes, which is the
+# only way the config could carry them in the first place.
+DEL = chr(0x7f)
+def raw(c):
+    return json.dumps(c, ensure_ascii=False)
+test(srv(hsts="max-age=31536000; includeSubDomains"),
+     "hsts with interior spaces accepted", True)
+test(raw(srv(hsts="max-age=31536000" + DEL)), "hsts with DEL rejected", False,
+     "hsts must be a valid HTTP field value")
+test(srv(hsts=" max-age=31536000"), "hsts with leading space rejected", False,
+     "hsts must be a valid HTTP field value")
+test(loc([{"prefix": "/", "root": D, "cache_control": "public, max-age=600"}]),
+     "cache_control with interior spaces accepted", True)
+test(raw(loc([{"prefix": "/", "root": D, "cache_control": "max-age=60" + DEL}])),
+     "cache_control with DEL rejected", False,
+     "cache_control must be a valid HTTP field value")
+test(raw(loc([{"prefix": "/", "root": D, "cache_control": "x=" + chr(0xe9)}])),
+     "cache_control with obs-text accepted", True)
+test(loc([{"prefix": "/", "redirect": "https://example.com/new"}]),
+     "conventional redirect accepted", True)
+test(raw(loc([{"prefix": "/", "redirect": "https://example.com/" + DEL}])),
+     "redirect with DEL rejected", False,
+     "redirect target must be a valid HTTP field value")
+test(loc([{"prefix": "/", "redirect": "https://exa mple.com/"}]),
+     "redirect with a space rejected", False,
+     "redirect target must be a valid HTTP field value")
 test(loc([{"prefix": "/", "proxy": "localhost:80"}]),
      "proxy as a DNS name rejected", False, "invalid proxy address")
 
