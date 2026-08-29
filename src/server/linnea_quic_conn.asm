@@ -132,6 +132,19 @@ linnea_quic_conn_lookup_odcid:
     inc rcx
     jmp .lo_cmp
 .lo_hit:
+    ; a packet arrived for it, so it is not idle -- the same credit .match gives
+    ; a lookup by an id we issued. Without it the handshake demux was the one
+    ; demux that did not count as activity: a ClientHello too large for one
+    ; Initial, or an Initial that has to be retransmitted, is addressed to the
+    ; original DCID until the client has our ServerHello, so EVERY packet of
+    ; such a handshake routes through here and none of them touched
+    ; .last_active. The slot then aged out of the three-second handshake idle
+    ; window while its peer was still sending, and the next fragment opened a
+    ; new connection instead of completing the crypto stream (audit-report-135).
+    push rbx
+    call conn_now
+    pop rbx
+    mov [rbx + linnea_quic_conn.last_active], rax
     mov rax, rbx
     pop r14
     pop r13

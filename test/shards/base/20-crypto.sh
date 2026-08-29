@@ -198,7 +198,12 @@ if [ -x ./bin/linnea-pooltest ]; then
     rc=$?
     check "quic pool selftest ($out)" $rc
 else
-    check "quic pool selftest (skipped: binary unavailable)" 0
+    # A missing binary is a SKIP, never a pass. It read as "PASS: quic pool
+    # selftest (skipped: binary unavailable)" for 54 commits while
+    # bin/linnea-pooltest did not link at all (see the pto stub in
+    # test/quic/linnea_pooltest.asm), so the pool had no coverage and the shard
+    # said otherwise.
+    skip "quic pool selftest (binary unavailable)"
 fi
 
 # io_uring submission accounting: when the kernel consumes fewer sqes than it was
@@ -209,7 +214,7 @@ if [ -x ./bin/linnea-ringtest ]; then
     rc=$?
     check "io_uring partial-submission recovery selftest ($out)" $rc
 else
-    check "io_uring partial-submission selftest (skipped: binary unavailable)" 0
+    skip "io_uring partial-submission selftest (binary unavailable)"
 fi
 
 # QUIC 1-RTT loss recovery: the sent-packet ring (record/ack-range/inflight) and

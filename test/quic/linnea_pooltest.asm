@@ -10,9 +10,20 @@ default rel
 %include "linnea_quic_conn.inc"
 
 global _start
+; The sweep applies the RFC 9000 10.1 three-PTO floor to the idle window, so it
+; calls linnea_quic_pto_ms -- which lives in src/lib/linnea_quic.o, the transport
+; module this harness deliberately does not link (it has no config and no
+; connection state beyond the pool). From 9cf8c94 until audit-report-135 that
+; undefined reference simply broke the link: bin/linnea-pooltest stopped being
+; produced, and the base shard reported "skipped: binary unavailable" and counted
+; it as a PASS, so 54 commits ran with no pool coverage at all. Stub it here, at
+; a value whose three-PTO floor (30ms, one second rounded up) is below every
+; window this file asserts on, so the floor never decides a check.
+global linnea_quic_pto_ms
 
 extern linnea_quic_conn_alloc
 extern linnea_quic_conn_lookup
+extern linnea_quic_conn_lookup_odcid
 extern linnea_quic_conn_free
 extern linnea_quic_conn_sweep
 extern linnea_quic_conn_active
@@ -32,6 +43,10 @@ extern linnea_print_u64_stdout
 section .rodata
 peer:      db 2, 0, 0x8d, 0xb9, 127, 0, 0, 1
            times 8 db 0
+; two distinct original DCIDs: the one a second Initial is addressed to, and one
+; belonging to a slot nothing arrives for
+odcid_a:   db 0x11, 0x22, 0x33, 0x44
+odcid_b:   db 0x55, 0x66, 0x77, 0x88
 msg_head:  db "quic-pool "
 msg_head_len equ $ - msg_head
 msg_slash: db "/"
@@ -41,6 +56,10 @@ section .bss
 saved_scid: resb LINNEA_QUIC_SCID_LEN
 
 section .text
+linnea_quic_pto_ms:
+    mov eax, 10
+    ret
+
 _start:
     xor r14d, r14d                   ; total
     xor r15d, r15d                   ; pass
@@ -173,6 +192,52 @@ _start:
     mov esi, LINNEA_QUIC_IDLE_SECS
     call linnea_quic_conn_sweep
     EXPECT rax, 1
+
+    ; --- an original-DCID lookup credits the slot as active (audit-report-135) ---
+    ; A ClientHello too large for one Initial arrives as several, and until the
+    ; client has processed our ServerHello every one of them is addressed to the
+    ; original DCID it chose -- so linnea_quic_conn_lookup_odcid is the ONLY demux
+    ; those packets pass through. It used to hand back the slot without stamping
+    ; .last_active, and the slot aged out of the three-second handshake window
+    ; (both slots here are still ST_NEW) while its peer was still sending.
+    ; Paired, and swept together in one call, so neither a lookup that credits
+    ; nothing nor one that credits everything can pass: the slot the packet
+    ; reached must survive and the untouched slot beside it must be reclaimed.
+    ; Both slots are taken BEFORE either is aged: allocation sweeps first, so
+    ; back-dating A and then allocating B would have B's own sweep reclaim A and
+    ; hand the same slot straight back.
+    lea rdi, [peer]
+    mov esi, 16
+    call linnea_quic_conn_alloc
+    mov rbx, rax                     ; A -- the slot the second Initial reaches
+    lea rdi, [peer]
+    mov esi, 16
+    call linnea_quic_conn_alloc
+    mov r13, rax                     ; B -- the control, nothing arrives for it
+    mov qword [rbx + linnea_quic_conn.odcid_len], 4
+    mov eax, [odcid_a]
+    mov [rbx + linnea_quic_conn.odcid], eax
+    mov qword [rbx + linnea_quic_conn.last_active], 0
+    mov qword [r13 + linnea_quic_conn.odcid_len], 4
+    mov eax, [odcid_b]
+    mov [r13 + linnea_quic_conn.odcid], eax
+    mov qword [r13 + linnea_quic_conn.last_active], 0
+    lea rdi, [odcid_a]               ; the second Initial arrives for A
+    mov esi, 4
+    call linnea_quic_conn_lookup_odcid
+    EXPECT rax, rbx                  ; and it still routes to the right slot
+    mov rdi, LINNEA_QUIC_HS_IDLE_SECS + 1
+    mov esi, LINNEA_QUIC_IDLE_SECS
+    call linnea_quic_conn_sweep
+    EXPECT rax, 1                    ; exactly one reclaimed -- the control
+    mov rax, [rbx + linnea_quic_conn.in_use]
+    EXPECT rax, 1
+    mov rax, [r13 + linnea_quic_conn.in_use]
+    EXPECT rax, 0
+    call linnea_quic_conn_active
+    EXPECT rax, 1
+    mov rdi, rbx
+    call linnea_quic_conn_free
 
     ; print "quic-pool <pass>/<total>\n"
     lea rdi, [msg_head]
