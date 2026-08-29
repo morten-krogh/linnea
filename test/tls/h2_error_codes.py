@@ -215,6 +215,30 @@ else:
     print(f"FAIL a proper preface drew {NAMES.get(code, code)}")
     fails += 1
 
+# audit-report-144 Finding 1: the gate checked the frame TYPE only, so an empty
+# SETTINGS carrying ACK passed it -- there is nothing to acknowledge before the
+# preface -- and the request behind it was served on a connection that never had
+# one. nghttpd (nghttp2 1.66.0) answers this exact byte sequence with
+# GOAWAY(last=0, PROTOCOL_ERROR) and serves nothing.
+code = preface_then(fr(FT_SETTINGS, 0x1, 0) + fr(FT_PING, 0, 0, b"12345678"))
+if code == PROTOCOL_ERROR:
+    print("ok   a SETTINGS ACK as the preface is refused")
+else:
+    print(f"FAIL a preface SETTINGS with ACK gave {NAMES.get(code, code)}, "
+          f"want PROTOCOL_ERROR")
+    fails += 1
+
+# ...and the control the blanket fix breaks: an ACK is only illegal AS the
+# preface. After a real preface it is the ordinary answer to our own SETTINGS
+# and must still be accepted, payload-free, with the connection carrying on.
+code = preface_then(fr(FT_SETTINGS, 0, 0) + fr(FT_SETTINGS, 0x1, 0)
+                    + fr(FT_PING, 0, 0, b"12345678"))
+if code is None:
+    print("ok   ...and a SETTINGS ACK after the preface still is not")
+else:
+    print(f"FAIL a post-preface SETTINGS ACK drew {NAMES.get(code, code)}")
+    fails += 1
+
 # RFC 9113 4.2: a frame over SETTINGS_MAX_FRAME_SIZE (we advertise none, so the
 # 2^14 default) is a FRAME_SIZE_ERROR; the bound used to be the input buffer.
 # DATA, not PING: a 16385-byte PING is a FRAME_SIZE_ERROR anyway from PING's

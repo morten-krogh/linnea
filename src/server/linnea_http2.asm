@@ -298,6 +298,14 @@ linnea_h2_handle:
     jne .f_dispatch
     cmp r9d, LINNEA_H2_FT_SETTINGS
     jne .goaway_close
+    ; 3.4 again: the preface SETTINGS is the peer's own parameters, so it "MUST
+    ; NOT" be an acknowledgement — there is nothing yet to acknowledge. Only the
+    ; TYPE was checked here, so an empty SETTINGS with the ACK bit set passed the
+    ; gate and then satisfied .f_settings_ack, and the request behind it was
+    ; served on a connection whose preface never happened. Acknowledgements after
+    ; the preface stay legal and still land in .f_settings_ack.
+    test r10b, LINNEA_H2_FLAG_ACK
+    jnz .goaway_close
     mov qword [rbx + linnea_connection.h2_saw_settings], 1
 .f_dispatch:
     cmp r9d, LINNEA_H2_FT_SETTINGS
