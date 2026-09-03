@@ -194,7 +194,8 @@ quicserver: $(QUICSRV_BIN)
 QUICTP_BIN  = bin/linnea-quictp
 QUICTP_OBJS = test/quic/linnea_quictp.o src/lib/linnea_quic.o src/lib/linnea_quic_crypto.o \
               src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o src/lib/linnea_tls_kdf.o \
-              src/lib/linnea_x25519.o src/lib/linnea_fe25519.o $(QUICP256)
+              src/lib/linnea_x25519.o src/lib/linnea_fe25519.o \
+              src/lib/linnea_random.o $(QUICP256)
 
 test/quic/linnea_quictp.o: test/quic/linnea_quictp.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -208,7 +209,8 @@ quictp: $(QUICTP_BIN)
 QUICSH_BIN  = bin/linnea-quicsh
 QUICSH_OBJS = test/quic/linnea_quicsh.o src/lib/linnea_quic.o src/lib/linnea_quic_crypto.o \
               src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o src/lib/linnea_tls_kdf.o \
-              src/lib/linnea_x25519.o src/lib/linnea_fe25519.o $(QUICP256)
+              src/lib/linnea_x25519.o src/lib/linnea_fe25519.o \
+              src/lib/linnea_random.o $(QUICP256)
 
 test/quic/linnea_quicsh.o: test/quic/linnea_quicsh.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -222,7 +224,8 @@ quicsh: $(QUICSH_BIN)
 QUICEE_BIN  = bin/linnea-quicee
 QUICEE_OBJS = test/quic/linnea_quicee.o src/lib/linnea_quic.o src/lib/linnea_quic_crypto.o \
               src/lib/linnea_aesgcm.o src/lib/linnea_sha256.o src/lib/linnea_tls_kdf.o \
-              src/lib/linnea_x25519.o src/lib/linnea_fe25519.o $(QUICP256)
+              src/lib/linnea_x25519.o src/lib/linnea_fe25519.o \
+              src/lib/linnea_random.o $(QUICP256)
 
 test/quic/linnea_quicee.o: test/quic/linnea_quicee.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
