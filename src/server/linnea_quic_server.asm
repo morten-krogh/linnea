@@ -123,6 +123,8 @@ extern linnea_h3_srv
 extern linnea_h3_owner_idx
 extern linnea_h3_owner_gen
 extern linnea_h3_owner_sid
+extern linnea_h3_proxy_source_ptr
+extern linnea_h3_proxy_source_len
 extern h3_hdrs_buf
 extern h3_cookie_buf
 extern linnea_h3_body_off
@@ -4167,6 +4169,9 @@ linnea_quic_server_datagram:
     mov [linnea_h3_owner_idx], r11                      ; pool index in byte 1
     mov r11, [s_sid]
     mov [linnea_h3_owner_sid], r11
+    lea r11, [r10 + linnea_quic_conn.peer + 8]
+    mov [linnea_h3_proxy_source_ptr], r11
+    mov qword [linnea_h3_proxy_source_len], 16
     call linnea_h3_serve             ; rax = h3 response length (or the head's);
     push rax                         ; the capture file has been mapped by now
     push rdx                         ; if anyone wanted it; the mapping outlives

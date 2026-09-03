@@ -123,6 +123,18 @@ What keep-alive is worth depends on what your backend pays per connection, not o
 TCP: large against a backend that forks or spawns a thread per connection, small
 against one with a pre-forked pool.
 
+## Authenticated client source identity
+
+A proxy location may set `proxy_client_identity: 1` to replace any public
+`Linnea-Client-Identity` field with exactly one Linnea-authored value. The
+wire forms are `v1;ip4=` followed by eight lowercase network-order hex digits,
+or `v1;ip6=` followed by 32. IPv4-mapped IPv6 is rendered as IPv4.
+
+Trust comes from authenticating the backend transport, not from the field. A
+private Unix socket checked with `SO_PEERCRED` is an intended consumer; a TCP
+backend reachable by untrusted clients must treat the field as untrusted. This
+metadata is suitable for a per-source rate key and carries no authorization.
+
 ### Restarting a keep-alive backend cleanly
 
 Because failover is connect-only, a **single** backend has a sub-second window

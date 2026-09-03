@@ -92,6 +92,7 @@ extern linnea_http_status_no_content
 extern linnea_http_head_conn_named
 global linnea_http_proxy_head
 extern linnea_http_authority_host
+extern linnea_client_identity_append
 global linnea_http_proxy_log
 
 LINNEA_HTTP_MAX_METHOD  equ 32
@@ -356,6 +357,7 @@ hdr_close_len   equ $ - hdr_close
 ; rewriter has accepted it.
 hdr_via_11:     db "Via: 1.1 linnea", 13, 10
 hdr_via_11_len  equ $ - hdr_via_11
+hn_client_identity: db "linnea-client-identity"
 qmark_lit:      db "?"
 hdr_host_up:    db "Host: "
 hdr_host_up_len equ $ - hdr_host_up
@@ -2874,6 +2876,7 @@ linnea_http_handle:
     ;                  Transfer-Encoding are skipped by name, then the
     ;                  hop-by-hop list and everything Connection itself names.
     ;   Via            +17, ALWAYS, and nothing in the budget was named for it.
+    ;   Identity       +65 when opted in (the IPv6 form is the longer one).
     ;   Content-Length +16 plus digits plus CRLF, but ONLY when bit 8 is set,
     ;                  which means the body arrived chunked — so the pure head
     ;                  carried a Transfer-Encoding line (>= 27) that the copy
@@ -2882,15 +2885,14 @@ linnea_http_handle:
     ;                  ceiling, giving 29. Net over the dropped line: +2.
     ;   Connection     +23 at most (upgrade; close is 21).
     ;
-    ; Worst case is therefore 17 + 2 + 23 = 42 over the pure head, against a
-    ; budget of 23 + 11 + 32 = 66. The 24 bytes between them are the margin any
-    ; new line added here spends — lengthening Via is enough to start eating
-    ; it. h1_upbuf_test.py walks a proxied head across this boundary in both
+    ; Worst case is therefore 17 + 65 + 2 + 23 = 107 over the pure head,
+    ; against a budget of 23 + 11 + 96 = 130. h1_upbuf_test.py walks a proxied
+    ; head across this boundary in both
     ; framings and expects every size to be forwarded or refused 431.
     mov rcx, [rbx + linnea_connection.head_len]
     sub rcx, [rsp + 128]             ; buffered body bytes queued behind the head
     add rcx, hdr_up_upgrade_len
-    add rcx, req_version_len + 32
+    add rcx, req_version_len + 96
     cmp rcx, LINNEA_CONN_UP_BUF
     ja .resp_431
     mov rcx, [rsp + 120]
@@ -3041,6 +3043,18 @@ linnea_http_handle:
     call linnea_string_iequal
     test eax, eax
     jnz .proxy_next_line       ; ours replaces it
+    ; Reserved Linnea-authored metadata never comes from the client. Strip all
+    ; spellings here; the configured canonical field is synthesized below.
+    mov rcx, [rsp + 56]
+    mov rax, r10
+    sub rax, rcx
+    lea rdi, [r14 + rcx]
+    mov rsi, rax
+    lea rdx, [hn_client_identity]
+    mov ecx, 22
+    call linnea_string_iequal
+    test eax, eax
+    jnz .proxy_next_line
     ; Max-Forwards goes on with one hop taken off it (RFC 9110 7.6.2), and only
     ; for the method it counts for: OPTIONS. The zero case never reaches here --
     ; it was answered before the upstream was chosen -- so the value is at least
@@ -3252,6 +3266,14 @@ linnea_http_handle:
     lea rdi, [hdr_via_11]            ; we forwarded this hop (RFC 9110 7.6.3)
     mov esi, hdr_via_11_len
     call .append
+    mov rdi, r15
+    mov rsi, [rsp + 152]
+    lea rdx, [rbx + linnea_connection.peer_ip]
+    mov rcx, [rbx + linnea_connection.peer_ip_len]
+    call linnea_client_identity_append
+    test rax, rax
+    jz .resp_503
+    mov r15, rax
     cmp qword [rbx + linnea_connection.upgrade], 0
     jne .proxy_conn_upgrade
     ; "Connection: close" is what makes a close-delimited response terminate, so

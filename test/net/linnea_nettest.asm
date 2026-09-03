@@ -6,11 +6,14 @@
 
 default rel
 
+%include "linnea_config.inc"
+
 global _start
 
 extern linnea_network_parse_ipv6
 extern linnea_print_stdout
 extern linnea_print_u64_stdout
+extern linnea_client_identity_append
 
 section .rodata
 ; --- accepted: (string, expected 16 bytes) ---
@@ -47,6 +50,16 @@ r_zone:   db "fe80::1%eth0", 0
 r_9grp:   db "1:2:3:4:5:6:7:8:9", 0
 r_trailc: db "1:2:3:4:5:6:7:8:", 0
 
+id_ip4:   db 127,0,0,1
+id_map:   db 0,0,0,0,0,0,0,0, 0,0,0xff,0xff,1,2,3,4
+id_ip6:   db 0x20,0x01,0x0d,0xb8,0,0,0,0, 0,0,0,0,0,0,0,1
+id_e4:    db "Linnea-Client-Identity: v1;ip4=7f000001",13,10
+id_e4_len equ $ - id_e4
+id_em:    db "Linnea-Client-Identity: v1;ip4=01020304",13,10
+id_em_len equ $ - id_em
+id_e6:    db "Linnea-Client-Identity: v1;ip6=20010db8000000000000000000000001",13,10
+id_e6_len equ $ - id_e6
+
 msg:      db "net "
 msg_len   equ $ - msg
 slash:    db "/"
@@ -54,6 +67,8 @@ nl:       db 10
 
 section .bss
 out16:    resb 16
+id_out:   resb LINNEA_PROXY_CLIENT_IDENTITY_MAX
+id_loc:   resb linnea_config_location_size
 
 section .text
 ; CHECK str, expected — parse must succeed and the 16 bytes must match.
@@ -67,6 +82,26 @@ section .text
     lea rdi, [out16]
     lea rsi, [%2]
     mov ecx, 16
+    repe cmpsb
+    jne %%bad
+    inc r15d
+%%bad:
+%endmacro
+
+; ID_CHECK address, address length, expected, expected length.
+%macro ID_CHECK 4
+    lea rdi, [id_out]
+    lea rsi, [id_loc]
+    lea rdx, [%1]
+    mov ecx, %2
+    call linnea_client_identity_append
+    inc r14d
+    lea rdx, [id_out + %4]
+    cmp rax, rdx
+    jne %%bad
+    lea rdi, [id_out]
+    lea rsi, [%3]
+    mov ecx, %4
     repe cmpsb
     jne %%bad
     inc r15d
@@ -110,6 +145,34 @@ _start:
     REJECT r_zone
     REJECT r_9grp
     REJECT r_trailc
+
+    ; Disabled means no header and does not require source metadata.
+    lea rdi, [id_out]
+    lea rsi, [id_loc]
+    xor edx, edx
+    xor ecx, ecx
+    call linnea_client_identity_append
+    inc r14d
+    lea rdx, [id_out]
+    cmp rax, rdx
+    jne .id_off_bad
+    inc r15d
+.id_off_bad:
+    mov qword [id_loc + linnea_config_location.proxy_client_identity], 1
+    ID_CHECK id_ip4, 4, id_e4, id_e4_len
+    ID_CHECK id_map, 16, id_em, id_em_len
+    ID_CHECK id_ip6, 16, id_e6, id_e6_len
+    ; An enabled location fails closed when no kernel-derived address exists.
+    lea rdi, [id_out]
+    lea rsi, [id_loc]
+    lea rdx, [id_ip4]
+    mov ecx, 3
+    call linnea_client_identity_append
+    inc r14d
+    test rax, rax
+    jnz .id_bad_len
+    inc r15d
+.id_bad_len:
 
     lea rdi, [msg]
     mov esi, msg_len

@@ -85,6 +85,9 @@ extern linnea_h3_build_canned
 ; builders stay linkable without any of the upstream machinery)
 extern linnea_h3_proxy_body_ptr
 extern linnea_h3_proxy_body_len
+extern linnea_h3_proxy_source_ptr
+extern linnea_h3_proxy_source_len
+extern linnea_client_identity_append
 extern linnea_h3_body_fd
 ; the delivery parameter block and the entry point that consumes it, both in
 ; the QUIC server: the response stream slots are its to hand out
@@ -306,7 +309,7 @@ linnea_h3_proxy_start:
     mov rax, [rbx + linnea_h2_req.hb_cur]
     sub rax, [rbx + linnea_h2_req.hb_start]
     add rcx, rax
-    add rcx, http11_host_len + hdr_clen_len + hdr_via_len + hdr_keep_len + 32
+    add rcx, http11_host_len + hdr_clen_len + hdr_via_len + hdr_keep_len + 96
     ; ...and the body, when it is the in-memory kind. A captured body is mapped
     ; and queued behind the head (.st_body_file) and costs up_buf nothing, but a
     ; request that arrived whole in one datagram is COPIED in behind the head by
@@ -438,6 +441,14 @@ linnea_h3_proxy_start:
     lea rdi, [hdr_via]
     mov esi, hdr_via_len
     call .up_append
+    mov rdi, rbp
+    mov rsi, [r12 + linnea_connection.location]
+    mov rdx, [linnea_h3_proxy_source_ptr]
+    mov rcx, [linnea_h3_proxy_source_len]
+    call linnea_client_identity_append
+    test rax, rax
+    jz .st_identity_missing
+    mov rbp, rax
     ; Keep the connection when this location opted in and the method may be
     ; sent again -- the same rule and the same reasons as h1 (docs/config.md,
     ; "Upstream connections"). Otherwise close, which is also what makes a
@@ -595,6 +606,11 @@ linnea_h3_proxy_start:
     mov rdi, r12
     call .st_drop
     mov eax, 431
+    jmp .st_ret
+.st_identity_missing:
+    mov rdi, r12
+    call .st_drop
+    mov eax, 503
     jmp .st_ret
 .st_400:
     mov eax, 400

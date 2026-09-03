@@ -235,6 +235,7 @@ coexist and `/api/x` goes to `/api`.
 | `root` | string | one of three | ≤ 255 | Serve static files from this directory. Must exist. |
 | `proxy` | string or array | one of three | ≤ 127 each, ≤ 8 entries | Forward to an HTTP/1.1 backend. Either **`IPv4:port`** (e.g. `"127.0.0.1:8080"`) or a **Unix socket** as **`unix:`** plus an absolute path of at most 107 bytes (e.g. `"unix:/run/linnea/api.sock"`); `unix:@name` (abstract) is refused. An **array** names several backends and may mix the two: `["127.0.0.1:8080", "unix:/run/a.sock"]`. Requests are spread over them in turn, and one that refuses a connection is stepped over. A `unix:` backend is cleartext h1 only — **`proxy_tls` and `proxy_h2` are refused on a location naming one**, because backend TLS is kTLS and the TLS ULP does not exist for `AF_UNIX`. |
 | `proxy_keepalive` | integer | `0` (off) | 0 or 1 | Keep upstream connections open and reuse them. Only on a `proxy` location. See **Upstream connections** below. |
+| `proxy_client_identity` | integer | `0` (off) | 0 or 1 | Replace every client-supplied `Linnea-Client-Identity` field with one canonical, kernel-derived source-IP field for an authenticated backend. Only on a `proxy` location. See **Authenticated client identity** below. |
 | `proxy_tls` | integer | `0` (off) | 0 or 1 | Connect to this location's backends over **TLS 1.3** instead of plaintext. Only on a `proxy` location, and **requires `proxy_pin`**. See **Backend TLS** below. |
 | `proxy_pin` | string | none | exactly 64 hex chars | The backend certificate's identity: **SHA-256 of its SubjectPublicKeyInfo**, hex-encoded. **Both-or-neither with `proxy_tls`:** `proxy_tls` requires a pin, and a pin **requires `proxy_tls`** — without it the connection would be plaintext and the pin would authenticate nothing, so the config is rejected rather than quietly serving in the clear. Authentication is by this pin, not a CA. |
 | `proxy_sni` | string | none | ≤ 255 | The server name to send in the TLS ClientHello (SNI) to a `proxy_tls` backend. Optional — needed only if the backend selects its certificate by SNI. **Requires `proxy_tls`**: without it there is no ClientHello to put a name in. Must be a **DNS hostname** per RFC 6066 §3 — ASCII letters, digits and hyphens in labels of 1–63, no empty or hyphen-edged label, no trailing dot, **at most 253 characters** (a DNS name encodes as len + 2 octets and RFC 1035 caps that at 255), and **not an IP literal**. Omit the key to send no SNI at all; the `server_name` extension is then left out of the ClientHello entirely. |
@@ -385,6 +386,25 @@ What it is worth depends on what your backend pays per connection, not on TCP.
 Against a backend that spawns a thread or forks per connection the saving is
 large; against one with a pre-forked pool it is closer to the cost of the
 handshake alone.
+
+### Authenticated client identity
+
+`proxy_client_identity: 1` adds one private backend protocol field:
+
+```text
+Linnea-Client-Identity: v1;ip4=7f000001
+Linnea-Client-Identity: v1;ip6=20010db8000000000000000000000001
+```
+
+The value is the connection peer address in network byte order as lowercase
+hex, without a port. IPv4-mapped IPv6 is normalized to the IPv4 form. Linnea
+always strips every incoming field with this reserved name before proxying,
+whether the option is enabled or not, and emits exactly one field when enabled.
+
+The field is not authentication and is unsafe on a backend transport any
+untrusted process can reach. A consumer may trust it only after independently
+authenticating Linnea—for example, with `SO_PEERCRED` on a private Unix socket.
+It is designed as a stable per-source rate key, not as an authorization claim.
 
 ### Response head limits
 

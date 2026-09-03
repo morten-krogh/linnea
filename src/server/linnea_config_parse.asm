@@ -104,6 +104,8 @@ key_value:              db "value"
 key_value_len           equ $ - key_value
 key_proxy_keepalive:    db "proxy_keepalive"
 key_proxy_keepalive_len equ $ - key_proxy_keepalive
+key_proxy_client_identity: db "proxy_client_identity"
+key_proxy_client_identity_len equ $ - key_proxy_client_identity
 key_proxy_tls:          db "proxy_tls"
 key_proxy_tls_len       equ $ - key_proxy_tls
 key_proxy_pin:          db "proxy_pin"
@@ -205,8 +207,10 @@ msg_nosniff:            db "nosniff must be 0 or 1"
 msg_nosniff_len         equ $ - msg_nosniff
 msg_pka:                db "proxy_keepalive must be 0 or 1"
 msg_pka_len             equ $ - msg_pka
-msg_pka_kind:           db "proxy_keepalive/tls/pin/sni need a proxy location"
+msg_pka_kind:           db "proxy_keepalive/proxy_client_identity/tls/pin/sni need a proxy location"
 msg_pka_kind_len        equ $ - msg_pka_kind
+msg_pci:                db "proxy_client_identity must be 0 or 1"
+msg_pci_len             equ $ - msg_pci
 msg_ptls:               db "proxy_tls must be 0 or 1"
 msg_ptls_len            equ $ - msg_ptls
 msg_tls_needs_pin:      db "proxy_tls requires proxy_pin"
@@ -1127,7 +1131,8 @@ linnea_parse_server:
 ; Key presence tracked in a bitmask: prefix=1, root=2, proxy=4, redirect=8,
 ; cache_control=16; a location requires prefix plus exactly one of root,
 ; proxy and redirect; cache_control is optional (a Cache-Control value sent
-; on static responses). response_headers=1024 is optional on a root location.
+; on static responses). response_headers=1024 is optional on a root location;
+; proxy_client_identity=2048 is optional on a proxy location.
 ; A proxy value is validated here and prebuilt into a sockaddr_in.
 linnea_parse_location:
     push rbx
@@ -1198,6 +1203,13 @@ linnea_parse_location:
     call linnea_string_equal
     test eax, eax
     jnz .key_proxy_keepalive
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_proxy_client_identity]
+    mov ecx, key_proxy_client_identity_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_proxy_client_identity
     mov rdi, r13
     mov rsi, r14
     lea rdx, [key_proxy_tls]
@@ -1301,6 +1313,16 @@ linnea_parse_location:
     cmp rax, 1
     ja .pka_range
     mov [rbx + linnea_config_location.proxy_keepalive], rax
+    jmp .member_sep
+
+.key_proxy_client_identity:
+    test r12d, 2048
+    jnz .dup
+    or r12d, 2048
+    call linnea_parse_u64
+    cmp rax, 1
+    ja .pci_range
+    mov [rbx + linnea_config_location.proxy_client_identity], rax
     jmp .member_sep
 
 .key_proxy_tls:
@@ -1645,10 +1667,10 @@ linnea_parse_location:
     ; proxy_keepalive is optional, but unlike cache_control it is meaningless
     ; anywhere but a proxy location -- and a key that is silently ignored is a
     ; config that lies about what the server will do.
-    ; keepalive/tls/pin/sni (bits 32/64/128/256) are meaningful only on a proxy
+    ; keepalive/client_identity/tls/pin/sni are meaningful only on a proxy
     ; location -- a silently-ignored key is a config that lies.
     mov eax, r12d
-    and eax, (32 | 64 | 128 | 256 | 512)
+    and eax, (32 | 64 | 128 | 256 | 512 | 2048)
     jz .proxyopt_ok
     test r12d, 4
     jz .pka_kind
@@ -1709,7 +1731,7 @@ linnea_parse_location:
     test r12d, 2
     jz .rh_kind
 .rh_kind_ok:
-    and r12d, ~(16 | 32 | 64 | 128 | 256 | 512 | 1024) ; strip optional keys
+    and r12d, ~(16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048) ; optional keys
     cmp r12d, 3                ; prefix + root
     je .done
     cmp r12d, 5                ; prefix + proxy
@@ -1790,6 +1812,10 @@ linnea_parse_location:
 .pka_range:
     lea rdi, [msg_pka]
     mov esi, msg_pka_len
+    jmp linnea_parse_fail
+.pci_range:
+    lea rdi, [msg_pci]
+    mov esi, msg_pci_len
     jmp linnea_parse_fail
 .pka_kind:
     lea rdi, [msg_pka_kind]

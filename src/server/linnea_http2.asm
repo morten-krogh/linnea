@@ -31,6 +31,7 @@ global h2_queue_goaway_pub
 extern linnea_hpack_decode
 extern linnea_hpack_req_check
 extern linnea_http_authority_host
+extern linnea_client_identity_append
 extern hpack_dyn_reset
 extern linnea_h3_altsvc
 extern linnea_h3_altsvc_len
@@ -2332,6 +2333,12 @@ h2_serve:
     mov [r13 + linnea_h2p.gen], rcx
     mov rcx, [rsp + S_LOC]
     mov [r13 + linnea_h2p.location], rcx
+    mov rcx, [rbx + linnea_connection.peer_ip]
+    mov [r13 + linnea_h2p.source_ip], rcx
+    mov rcx, [rbx + linnea_connection.peer_ip + 8]
+    mov [r13 + linnea_h2p.source_ip + 8], rcx
+    mov rcx, [rbx + linnea_connection.peer_ip_len]
+    mov [r13 + linnea_h2p.source_ip_len], rcx
     mov rcx, [h2_cur_srv]            ; for the response's security headers,
     mov [r13 + linnea_h2p.srv], rcx  ; built long after this request returns
     mov qword [r13 + linnea_h2p.sent], 0
@@ -2396,7 +2403,7 @@ h2_serve:
     ; Nothing overflowed, because HEAD_MAX is 8192 against a 16384-byte buf --
     ; 8 KB of slack absorbed the difference. Corrected rather than left to be
     ; rediscovered by whoever adds the next field.
-    add rcx, 128                     ; literals + the Content-Length line
+    add rcx, 192                     ; literals, identity and Content-Length
     cmp rcx, LINNEA_H2P_HEAD_MAX
     ja .proxy_toobig
     lea rdi, [r13 + linnea_h2p.buf]
@@ -3383,6 +3390,13 @@ h2p_finalize:
     lea rsi, [h2p_via]                     ; RFC 9110 7.6.3: name this hop
     mov ecx, h2p_via_len
     rep movsb
+    mov rsi, [rbx + linnea_h2p.location]
+    lea rdx, [rbx + linnea_h2p.source_ip]
+    mov rcx, [rbx + linnea_h2p.source_ip_len]
+    call linnea_client_identity_append
+    test rax, rax
+    jz .fin_source_failed
+    mov rdi, rax
     ; Keep the connection when this location opted in and the method may be
     ; sent again -- the same rule and reasons as h1 and h3. The method is the
     ; first token of the head this function is finishing, which is the only
@@ -3463,6 +3477,12 @@ h2p_finalize:
     ; fine and it was us that could not carry it — 413 would blame the request
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FAILED
     mov qword [rbx + linnea_h2p.status], 500
+    pop r12
+    pop rbx
+    ret
+.fin_source_failed:
+    mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FAILED
+    mov qword [rbx + linnea_h2p.status], 503
     pop r12
     pop rbx
     ret

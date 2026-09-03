@@ -151,6 +151,16 @@ test(LOC % ('"proxy_tls":1,"proxy_pin":"%s"' % PIN0),
 test(LOC % ('"proxy_tls":1,"proxy_pin":"%s","proxy_sni":"x.test"' % PIN0),
      "proxy_tls + proxy_pin + proxy_sni accepted", True)
 test(LOC % '"proxy_keepalive":1', "a plain proxy with keepalive still accepted", True)
+test(LOC % '"proxy_client_identity":1',
+     "proxy client identity opt-in accepted", True)
+test(LOC % '"proxy_client_identity":0',
+     "proxy client identity explicit off accepted", True)
+test(LOC % '"proxy_client_identity":2',
+     "proxy client identity outside 0/1 rejected", False,
+     "proxy_client_identity must be 0 or 1")
+test(loc([{"prefix": "/", "root": D, "proxy_client_identity": 1}]),
+     "proxy client identity on root rejected", False,
+     "need a proxy location")
 
 # proxy_sni is a DNS hostname (RFC 6066 3), validated at parse time so a bad one
 # is a startup diagnostic and not a request-time 502. The empty value mattered

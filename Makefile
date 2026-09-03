@@ -147,6 +147,7 @@ quictest: $(QUICTEST_BIN)
 # --- IP-literal parser known-answer tests (own _start; parse_ipv6 vectors) ---
 NETTEST_BIN  = bin/linnea-nettest
 NETTEST_OBJS = test/net/linnea_nettest.o src/server/linnea_network.o \
+               src/server/linnea_client_identity.o \
                src/server/linnea_log.o src/server/linnea_error.o src/server/linnea_time.o \
                src/lib/linnea_random.o src/lib/linnea_string.o src/lib/linnea_print.o \
                src/server/linnea_config.o src/server/linnea_config_parse.o
@@ -477,7 +478,8 @@ clean:
 	rm -f bin/linnea bin/linnea-*
 	rm -f src/*/*.o test/*/*.o $(CRYPTO_VECS)
 
-test: $(BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) $(QUICTEST_BIN) $(QUICSRV_BIN) \
+test: $(BIN) $(PROBE_BIN) $(API_BIN) $(SELFTEST_BIN) $(TLSTEST_BIN) \
+      $(QUICTEST_BIN) $(QUICSRV_BIN) \
       $(QUICTP_BIN) $(QUICSH_BIN) $(QUICEE_BIN) $(QUICCERT_BIN) \
       bin/linnea-quiccv bin/linnea-quicfin bin/linnea-quichs $(QPACKTEST_BIN) \
       $(H3TEST_BIN) $(H3RESP_BIN) $(POOLTEST_BIN) $(RTXTEST_BIN) $(REPLAYTEST_BIN) \

@@ -38,6 +38,8 @@ global linnea_h3_owner_sid
 global linnea_h3_proxy_hook
 global linnea_h3_proxy_body_ptr
 global linnea_h3_proxy_body_len
+global linnea_h3_proxy_source_ptr
+global linnea_h3_proxy_source_len
 global linnea_h3_body_fd
 
 extern linnea_hpack_req_check
@@ -159,6 +161,9 @@ linnea_h3_proxy_hook: resq 1
 ; joined into one run.
 linnea_h3_proxy_body_ptr: resq 1
 linnea_h3_proxy_body_len: resq 1
+; Raw network-order address of the QUIC peer for the synchronous proxy hook.
+linnea_h3_proxy_source_ptr: resq 1
+linnea_h3_proxy_source_len: resq 1
 ; ...or, when the stream was consumed as it arrived, the file it was captured
 ; into (-1 = none). The bytes are too many and too long-lived to sit in the
 ; reassembly buffer: that is reused as soon as the datagram is done with, and a

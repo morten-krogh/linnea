@@ -100,6 +100,9 @@ LINNEA_MAX_RESPONSE_HEADERS      equ 8
 LINNEA_MAX_RESPONSE_HEADER_NAME  equ 63
 LINNEA_MAX_RESPONSE_HEADER_VALUE equ 255
 LINNEA_MAX_RESPONSE_HEADER_BYTES equ 512
+; Longest synthesized source-identity line:
+; "Linnea-Client-Identity: v1;ip6=" + 32 lowercase hex digits + CRLF.
+LINNEA_PROXY_CLIENT_IDENTITY_MAX equ 65
 
 struc linnea_config_response_header
     ; Names are lowercased at parse time: field names are case-insensitive on
@@ -170,6 +173,9 @@ struc linnea_config_location
     ; it. Turning this on is the operator asserting their backend delimits its
     ; responses, which HTTP/1.1 requires but does not enforce.
     .proxy_keepalive: resq 1
+    ; Synthesize one canonical client IP identity for an authenticated backend.
+    ; Client fields with the reserved name are stripped whether this is on or off.
+    .proxy_client_identity: resq 1
     .redirect:      resb LINNEA_MAX_ROOT + 1      ; URL prefix the 301 points at
     .redirect_len:  resq 1
     .cache_control: resb LINNEA_MAX_ROOT + 1      ; Cache-Control value for static

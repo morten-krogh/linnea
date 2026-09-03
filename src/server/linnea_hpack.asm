@@ -83,6 +83,7 @@ hdr_upg:        db "upgrade"
 hdr_cookie:     db "cookie"
 hdr_mf:         db "max-forwards"
 hdr_expect:     db "expect"
+hdr_client_identity: db "linnea-client-identity"
 expect_100_val: db "100-continue"
 
 section .bss
@@ -628,6 +629,8 @@ emit_field:
     je .rb_chk_pconn
     cmp rdx, 17
     je .rb_chk_tenc
+    cmp rdx, 22
+    je .rb_chk_client_identity
     jmp .rebuild
 .rb_chk_te:
     lea r9, [hdr_te]
@@ -816,6 +819,9 @@ emit_field:
     jmp .rb_probe
 .rb_chk_tenc:
     lea r9, [hdr_tenc]
+    jmp .rb_probe
+.rb_chk_client_identity:
+    lea r9, [hdr_client_identity]
     jmp .rb_probe
 .rb_chk_10:
     push rsi
