@@ -187,6 +187,12 @@ check "proxy keep-alive single accept" $?
 # --- proxy failures ---
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/down/x)
 check_http "proxy refused 502"   "502 Bad Gateway" "$resp"
+# The root location carries an arbitrary static-response policy. A proxy
+# failure is owned by the proxy location, so none of that policy may leak onto
+# this response even though both locations live in the same server block.
+printf '%s' "$resp" | grep -qi '^x-linnea-static:'
+[ $? -ne 0 ]
+check "static response headers do not leak onto a proxy error" $?
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/api/garbage)
 check_http "proxy garbage 502"   "502 Bad Gateway" "$resp"
 resp=$(curl -si --max-time 3 http://127.0.0.1:${P61080}/api/bighead)

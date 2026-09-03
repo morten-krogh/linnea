@@ -12,8 +12,12 @@
       "key": "test/tls/server.key",
       "locations": [
         { "prefix": "/api", "proxy": "127.0.0.1:61100" },
+        { "prefix": "/old", "redirect": "https://example.com" },
         { "prefix": "/", "root": "test/www",
-          "cache_control": "public, max-age=600" }
+          "cache_control": "public, max-age=600",
+          "response_headers": [
+            { "name": "X-Linnea-Static", "value": "policy" }
+          ] }
       ]
     }
   ]

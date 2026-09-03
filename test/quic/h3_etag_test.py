@@ -122,6 +122,7 @@ assert hd.get(b"server") == b"linnea", hd
 # a weak or listed candidate still matches; "*" matches anything
 hd, _ = fetch(port, "/hello.txt", [(b"if-none-match", b'W/' + etag)])
 assert hd.get(b":status") == b"304", hd
+assert hd.get(b"x-linnea-static") == b"policy", hd
 hd, _ = fetch(port, "/hello.txt", [(b"if-none-match", b'"a", ' + etag)])
 assert hd.get(b":status") == b"304", hd
 hd, _ = fetch(port, "/hello.txt", [(b"if-none-match", b"*")])
@@ -148,6 +149,8 @@ assert hd.get(b":status") == b"200", hd
 # the vhost's configured security headers ride every response
 assert hd.get(b"strict-transport-security") == b"max-age=31536000", hd
 assert hd.get(b"x-content-type-options") == b"nosniff", hd
+assert hd.get(b"x-linnea-static") == b"policy", hd
+assert hd.get(b"referrer-policy") == b"no-referrer", hd
 
 # a 404 carries date and server but no validators
 hd, _ = fetch(port, "/nope.txt")
@@ -157,5 +160,7 @@ assert re.match(DATE_RE, hd.get(b"date", b"")), hd
 assert hd.get(b"server") == b"linnea", hd
 assert hd.get(b"strict-transport-security") == b"max-age=31536000", hd
 assert hd.get(b"x-content-type-options") == b"nosniff", hd
+assert hd.get(b"x-linnea-static") == b"policy", hd
+assert hd.get(b"referrer-policy") == b"no-referrer", hd
 
 print("ok")

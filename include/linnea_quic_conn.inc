@@ -392,11 +392,15 @@ LINNEA_QUIC_TX_CHUNK    equ 1100    ; stream bytes per 1-RTT packet
 ; their own, so a vhost setting both at their documented maxima could not serve
 ; any file over LINNEA_H3_INLINE_MAX at all — the head failed this check and the
 ; stream was RESET, silently, while h1 and h2 served the same file. Worst case
-; now: 2 prefix + 5 status + 32 content-type + 22 content-length + 95
+; now before location extensions: 2 prefix + 5 status + 32 content-type + 22 content-length + 95
 ; content-range + 3 accept-ranges/vary/content-encoding + 50 etag + 31
 ; last-modified + 259 cache-control + 31 date + 8 server + 1 nosniff + 259 hsts
-; + 12 framing = 810.
-LINNEA_QUIC_TX_HDR      equ 1024
+; + 12 framing = 810.  A static location may then add at most 512 H1 wire bytes
+; of response fields; their literal QPACK form is at most 513, for 1323. Round
+; to 1536; the extra 512 bytes cost 12.5 MiB across this worker's 256 x 100
+; response-stream slots, deliberately bounded rather than silently growing
+; with config input.
+LINNEA_QUIC_TX_HDR      equ 1536
 LINNEA_QUIC_TXSTREAMS   equ 100     ; = advertised initial_max_streams_bidi
 LINNEA_QUIC_RST_SEEN    equ 32      ; cancelled stream ids remembered per connection
 LINNEA_QUIC_SERVED_SEEN equ 32      ; out-of-order served request-stream ids (a ring)

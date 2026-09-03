@@ -184,8 +184,10 @@ open(sys.argv[1], 'wb').write(bytes((i * 131 + (i >> 8) * 17) & 0xFF
     # accept-ranges + configured cache-control on the 200
     hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null "$u/hello.txt")
     echo "$hdrs" | grep -qi '^accept-ranges: bytes' \
-        && echo "$hdrs" | grep -qi '^cache-control: max-age=60'
-    check "http2 accept-ranges + cache-control headers" $?
+        && echo "$hdrs" | grep -qi '^cache-control: max-age=60' \
+        && echo "$hdrs" | grep -qi '^x-linnea-static: policy' \
+        && echo "$hdrs" | grep -qi '^referrer-policy: no-referrer'
+    check "http2 accept-ranges + configured response headers" $?
     # a single byte range: 206, the exact slice, content-range names it
     hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null -r 5-9 "$u/hello.txt")
     body=$(curl -s --http2 --cacert $CA $rl -r 5-9 "$u/hello.txt")
@@ -227,8 +229,9 @@ print(hashlib.md5(open('$WWW/h2range.bin','rb').read()[25000:75000]).hexdigest()
     hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null \
         -H "If-None-Match: $h2etag" "$u/hello.txt")
     echo "$hdrs" | grep -qi '^HTTP/2 304' \
-        && echo "$hdrs" | grep -qi '^cache-control: max-age=60'
-    check "http2 304 repeats cache-control" $?
+        && echo "$hdrs" | grep -qi '^cache-control: max-age=60' \
+        && echo "$hdrs" | grep -qi '^x-linnea-static: policy'
+    check "http2 304 repeats configured response headers" $?
     # pre-compressed variants: enc.txt has both a .br and a .gz beside it
     python3 - "$WWW" <<'PY'
 import gzip, sys

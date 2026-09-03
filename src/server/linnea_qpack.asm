@@ -36,6 +36,7 @@ global linnea_qpack_cenc
 global linnea_qpack_hsts_ptr
 global linnea_qpack_hsts_len
 global linnea_qpack_nosniff
+global linnea_qpack_response_headers_ptr
 global linnea_qpack_max_fss
 global linnea_qpack_fss_over
 global linnea_qpack_fss_size
@@ -147,6 +148,9 @@ linnea_qpack_cenc: resq 1
 linnea_qpack_hsts_ptr: resq 1
 linnea_qpack_hsts_len: resq 1
 linnea_qpack_nosniff:  resq 1
+; The matched static location whose bounded extra fields belong on this
+; response.  Zero before routing and for proxy/redirect responses.
+linnea_qpack_response_headers_ptr: resq 1
 ; The peer's SETTINGS_MAX_FIELD_SECTION_SIZE (0 = none advertised), set per request
 ; by the QUIC server from the connection, and a flag the response builder raises
 ; when a response would exceed it — the serve path then resets the stream rather
@@ -422,7 +426,7 @@ qenc_status:
 
 ; linnea_qpack_reset_response() — clobbers no register, so it can be called
 ; with a builder's arguments already live in rdi/rsi/rdx/rcx/r8/r9.
-; The five fields below describe the ENTITY of one response: the variant's
+; The fields below describe the ENTITY of one response: the variant's
 ; coding, the validators of the file it came from, its content-range, a
 ; redirect's target and the matched location's Cache-Control. They live in
 ; .bss — per WORKER, not per connection or per request — so until something
@@ -439,6 +443,7 @@ linnea_qpack_reset_response:
     mov qword [linnea_qpack_location_ptr], 0
     mov qword [linnea_qpack_cenc], 0
     mov qword [linnea_qpack_ccontrol_ptr], 0
+    mov qword [linnea_qpack_response_headers_ptr], 0
     ret
 
 ; QROOM n — refuse the whole section unless n more bytes fit before the limit.
@@ -731,6 +736,35 @@ linnea_qpack_encode_response:
     call qenc_str
     mov rbx, rdi
 .no_hsts:
+    ; --- bounded extra fields of the matched static location ---
+    mov rax, [linnea_qpack_response_headers_ptr]
+    test rax, rax
+    jz .no_response_headers
+    mov qword [rsp + 8], 0
+.response_header_loop:
+    mov rcx, [rsp + 8]
+    cmp rcx, [rax + linnea_config_location.response_header_count]
+    jae .no_response_headers
+    imul rdx, rcx, linnea_config_response_header_size
+    lea r10, [rax + rdx + linnea_config_location.response_headers]
+    ; The whole legal set's literal encoding is at most one byte longer than
+    ; its H1 wire budget (see linnea_config_response_header.wire_len).
+    mov rax, [r10 + linnea_config_response_header.wire_len]
+    inc rax
+    QROOM rax
+    mov rax, [r10 + linnea_config_response_header.field_size]
+    add [linnea_qpack_fss_size], rax
+    mov rdi, rbx
+    lea rsi, [r10 + linnea_config_response_header.name]
+    mov rdx, [r10 + linnea_config_response_header.name_len]
+    lea rcx, [r10 + linnea_config_response_header.value]
+    mov r8, [r10 + linnea_config_response_header.value_len]
+    call qenc_lit
+    mov rbx, rdi
+    inc qword [rsp + 8]
+    mov rax, [linnea_qpack_response_headers_ptr]
+    jmp .response_header_loop
+.no_response_headers:
     ; --- date and server, on every response ---
     QFSS 36 + LINNEA_HTTP_DATE_LEN   ; "date" (4) + the date + 32
     QFSS 44                          ; "server" (6) + "linnea" (6) + 32

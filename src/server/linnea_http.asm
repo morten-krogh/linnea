@@ -309,6 +309,8 @@ hdr_server:     db 13, 10, "Server: linnea"
 hdr_server_len  equ $ - hdr_server
 hdr_cache_control: db 13, 10, "Cache-Control: "
 hdr_cache_control_len equ $ - hdr_cache_control
+hdr_field_sep:    db ": "
+hdr_field_sep_len equ $ - hdr_field_sep
 hdr_hsts:       db 13, 10, "Strict-Transport-Security: "
 hdr_hsts_len    equ $ - hdr_hsts
 hdr_nosniff:    db 13, 10, "X-Content-Type-Options: nosniff"
@@ -848,6 +850,7 @@ linnea_http_handle:
     mov qword [rsp + 128], 0   ; no body
     mov qword [rsp + 136], 0   ; no Content-Length/Transfer-Encoding seen
     mov qword [rsp + 144], 0   ; no raw target yet
+    mov qword [rsp + 152], 0   ; no matched location yet
     mov qword [rsp + 416], 0   ; ...and no version token yet
     mov qword [rsp + 176], 0   ; no If-None-Match lines yet (a count)
     mov qword [rsp + 192], 0   ; no If-Modified-Since yet
@@ -2601,6 +2604,8 @@ linnea_http_handle:
     call .append_server_date
     mov rdi, [rsp + 152]       ; the matched location's Cache-Control, if set
     call .append_cache_control
+    mov rdi, [rsp + 152]
+    call .append_response_headers
     ; Alt-Svc, when a QUIC listener is up: tells the client it can reach this
     ; origin over HTTP/3 next time.
     cmp qword [linnea_h3_altsvc_len], 0
@@ -2700,6 +2705,8 @@ linnea_http_handle:
     call .append_server_date
     mov rdi, [rsp + 152]       ; the matched location's Cache-Control, if set
     call .append_cache_control
+    mov rdi, [rsp + 152]
+    call .append_response_headers
     cmp qword [rsp + 24], 0
     je .conn_close_304
     lea rdi, [hdr_keepalive]
@@ -2738,6 +2745,8 @@ linnea_http_handle:
     call .append_validators
     mov rdi, [rsp + 120]       ; the serving vhost
     call .append_server_date
+    mov rdi, [rsp + 152]
+    call .append_response_headers
     cmp qword [rsp + 24], 0
     je .conn_close_412
     lea rdi, [hdr_keepalive]
@@ -2786,6 +2795,8 @@ linnea_http_handle:
     call .append
     mov rdi, [rsp + 120]       ; the serving vhost
     call .append_server_date
+    mov rdi, [rsp + 152]
+    call .append_response_headers
     cmp qword [rsp + 24], 0
     je .conn_close_416
     lea rdi, [hdr_keepalive]
@@ -3432,6 +3443,7 @@ linnea_http_handle:
     mov rsi, rax               ; the blob
     mov rdx, rcx               ; and its length
     mov rcx, [rsp + 120]       ; the serving vhost (a default until matched)
+    mov r8, [rsp + 152]        ; custom fields only if a root location matched
     call http_error_blob       ; -> rax = ptr, rdx = length
     mov [rbx + linnea_connection.out_ptr], rax
     mov [rbx + linnea_connection.out_rem], rdx
@@ -3581,6 +3593,38 @@ linnea_http_handle:
 .acc_done:
     ret
 
+; .append_response_headers(rdi=location*, may be 0) — the bounded extra fields
+; of a matched static location.  Their names were validated and normalized to
+; lowercase at startup; H1 field names are case-insensitive.
+.append_response_headers:
+    test rdi, rdi
+    jz .arh_done
+    cmp qword [rdi + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    jne .arh_done
+    mov r8, rdi
+    xor r9d, r9d
+.arh_loop:
+    cmp r9, [r8 + linnea_config_location.response_header_count]
+    jae .arh_done
+    imul r10, r9, linnea_config_response_header_size
+    lea r10, [r8 + r10 + linnea_config_location.response_headers]
+    lea rdi, [crlf]
+    mov esi, 2
+    call .append
+    lea rdi, [r10 + linnea_config_response_header.name]
+    mov rsi, [r10 + linnea_config_response_header.name_len]
+    call .append
+    lea rdi, [hdr_field_sep]
+    mov esi, hdr_field_sep_len
+    call .append
+    lea rdi, [r10 + linnea_config_response_header.value]
+    mov rsi, [r10 + linnea_config_response_header.value_len]
+    call .append
+    inc r9
+    jmp .arh_loop
+.arh_done:
+    ret
+
 ; .append_server_date(rdi = the serving vhost, may be 0) — the Server line, a
 ; Date line naming the current time (RFC 9110 6.6.1), and whatever security
 ; headers that vhost configures. Shared by every dynamically assembled head.
@@ -3699,7 +3743,8 @@ http_send_continue:
 .sc_done:
     ret
 
-; http_error_blob(rdi=conn*, rsi=blob, rdx=blob len, rcx=server* or 0)
+; http_error_blob(rdi=conn*, rsi=blob, rdx=blob len, rcx=server* or 0,
+;   r8=matched root location* or 0)
 ;   -> rax = response ptr, rdx = response length
 ; A canned error response carrying the vhost's security headers. A browser
 ; whose first request fails should still learn the policy, and that includes
@@ -3719,9 +3764,12 @@ http_error_blob:
 .heb_copy:
     push rbx
     push r12
+    push r13
     push r15
+    sub rsp, 8                       ; keep nested call sites 16-byte aligned
     mov rbx, rcx                     ; server*, or 0 before one is matched
     mov r12, rdi                     ; conn*
+    mov r13, r8                      ; matched static location*, or 0
     lea r15, [rdi + linnea_connection.out_buf]
     mov rdi, r15                     ; the blob without its blank line
     mov rcx, rdx
@@ -3741,12 +3789,39 @@ http_error_blob:
     mov r15, rdi
 .heb_nosniff:
     cmp qword [rbx + linnea_config_server.nosniff], 0
-    je .heb_blank
+    je .heb_response_headers
     mov rdi, r15
     lea rsi, [hdr_nosniff]
     mov rcx, hdr_nosniff_len
     rep movsb
     mov r15, rdi
+.heb_response_headers:
+    test r13, r13
+    jz .heb_blank
+    cmp qword [r13 + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    jne .heb_blank
+    xor r8d, r8d
+.heb_rh_loop:
+    cmp r8, [r13 + linnea_config_location.response_header_count]
+    jae .heb_blank
+    imul rax, r8, linnea_config_response_header_size
+    lea rax, [r13 + rax + linnea_config_location.response_headers]
+    mov rdi, r15
+    lea rsi, [crlf]
+    mov ecx, 2
+    rep movsb
+    lea rsi, [rax + linnea_config_response_header.name]
+    mov rcx, [rax + linnea_config_response_header.name_len]
+    rep movsb
+    lea rsi, [hdr_field_sep]
+    mov ecx, hdr_field_sep_len
+    rep movsb
+    lea rsi, [rax + linnea_config_response_header.value]
+    mov rcx, [rax + linnea_config_response_header.value_len]
+    rep movsb
+    mov r15, rdi
+    inc r8
+    jmp .heb_rh_loop
 .heb_blank:
     mov rdi, r15
     lea rsi, [hdr_date]              ; carries its own leading CRLF
@@ -3765,7 +3840,9 @@ http_error_blob:
     lea rax, [r12 + linnea_connection.out_buf]
     mov rdx, rdi
     sub rdx, rax
+    add rsp, 8
     pop r15
+    pop r13
     pop r12
     pop rbx
     ret
@@ -4059,6 +4136,7 @@ linnea_http_proxy_error:
     mov rsi, rax
     mov rdx, rcx
     mov rcx, [rbx + linnea_connection.vhost]
+    xor r8d, r8d              ; proxy failures do not inherit static policy
     call http_error_blob       ; -> rax = ptr, rdx = length
     mov [rbx + linnea_connection.out_ptr], rax
     mov [rbx + linnea_connection.out_rem], rdx
@@ -4097,6 +4175,7 @@ linnea_http_request_timeout:
     lea rsi, [resp_408]
     mov edx, resp_408_len
     mov rcx, [rbx + linnea_connection.vhost]   ; its security headers ride this
+    xor r8d, r8d                           ; no request has routed yet
     call http_error_blob                       ; -> rax = ptr, rdx = length
     mov [rbx + linnea_connection.out_ptr], rax
     mov [rbx + linnea_connection.out_rem], rdx

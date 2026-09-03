@@ -64,6 +64,7 @@ extern linnea_qpack_crange_len
 extern linnea_qpack_cenc
 extern linnea_qpack_ccontrol_ptr
 extern linnea_qpack_ccontrol_len
+extern linnea_qpack_response_headers_ptr
 ; static-file resolution, shared with the HTTP/2 serve path
 extern linnea_config_match_location
 extern linnea_static_normalize
@@ -991,17 +992,22 @@ linnea_h3_serve:
     mov [rsp + 48], r9               ; when the request carried none)
     mov [rsp + 56], rsi              ; the caller's root, for a request that
     mov [rsp + 64], rdx              ; routes to no location of its own
+    ; Begin every in-serve response with clean worker-global entity state,
+    ; before even the first early exit. The canned builder also resets these,
+    ; but the serve boundary should establish its invariant independently.
+    mov qword [linnea_qpack_send_validators], 0
+    mov qword [linnea_qpack_crange_ptr], 0
+    mov qword [linnea_qpack_location_ptr], 0
+    mov qword [linnea_qpack_cenc], 0
+    ; Only a root match below may set this location pointer. Otherwise a later
+    ; redirect, proxy route or pre-route error can inherit the arbitrary policy
+    ; fields of the last static location this worker hit.
+    mov qword [linnea_qpack_response_headers_ptr], 0
     ; more If-Match/If-None-Match lines than can be combined: answered before
     ; anything is routed or opened, so a proxy location cannot forward a list
     ; with a member missing either (audit-report-31)
     cmp qword [rbx + linnea_h2_req.list_over], 0
     jne .list_over_431
-    ; no validators or content-range until a file is opened and the request's
-    ; conditionals and range are evaluated
-    mov qword [linnea_qpack_send_validators], 0
-    mov qword [linnea_qpack_crange_ptr], 0
-    mov qword [linnea_qpack_location_ptr], 0
-    mov qword [linnea_qpack_cenc], 0
     ; The path is normalized at a fixed offset, leaving room in front of it for
     ; a root that is not known yet: which root depends on which location the
     ; path matches, so the join happens after the routing, not before it. Same
@@ -1110,6 +1116,7 @@ linnea_h3_serve:
     xor r11d, r11d
 .cc_set:
     mov [linnea_qpack_ccontrol_ptr], r11
+    mov [linnea_qpack_response_headers_ptr], rax
     lea rsi, [rax + linnea_config_location.root]
     mov rdx, [rax + linnea_config_location.root_len]
     jmp .method_gate

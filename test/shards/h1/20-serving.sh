@@ -74,8 +74,11 @@ check_http "server header"       "Server: linnea" "$resp"
 printf '%s' "$resp" | grep -qE '^Date: [A-Z][a-z]{2}, [0-9]{2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT'
 check "date is an HTTP date" $?
 check_http "cache-control from config" "Cache-Control: max-age=60" "$resp"
+check_http "static response_headers name normalized" "x-linnea-static: policy" "$resp"
+check_http "static response_headers second field" "referrer-policy: no-referrer" "$resp"
 resp=$(curl -si --max-time 2 http://127.0.0.1:${P61080}/no-such-file)
 check_http "404 server header"   "Server: linnea" "$resp"
+check_http "matched 404 carries response_headers" "x-linnea-static: policy" "$resp"
 
 resp=$(curl -si --max-time 2 http://127.0.0.1:${P61080}/hello.txt)
 etag=$(printf '%s' "$resp" | grep -i '^etag:' | tr -d '\r' | cut -d' ' -f2)
@@ -88,6 +91,7 @@ check_http "304 keeps alive"     "Connection: keep-alive" "$resp"
 check_http "304 server header"   "Server: linnea" "$resp"
 check_http "304 date header"     "Date: " "$resp"
 check_http "304 repeats cache-control" "Cache-Control: max-age=60" "$resp"
+check_http "304 repeats response_headers" "x-linnea-static: policy" "$resp"
 printf '%s' "$resp" | grep -qF "hello from linnea"
 [ $? -ne 0 ]
 check "304 carries no body" $?
@@ -225,4 +229,3 @@ resp=$(curl -si --max-time 2 -H 'Accept-Encoding: gzip' -H "If-None-Match: $etag
 check_http "cross-variant etag 200" "200 OK" "$resp"
 resp=$(curl -si --max-time 2 -H "If-None-Match: $etag_br" http://127.0.0.1:${P61080}/enc.txt)
 check_http "variant etag vs plain 200" "plain payload" "$resp"
-

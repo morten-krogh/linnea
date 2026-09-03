@@ -16,7 +16,8 @@
 ; required exactly once. Location keys are "prefix" (string, required)
 ; plus exactly one of "root" (string), "proxy" ("ip:port" string, IPv4
 ; literal only, validated and prebuilt into a sockaddr_in here) and
-; "redirect" (URL prefix a matched request is 301'd to).
+; "redirect" (URL prefix a matched request is 301'd to). A root location may
+; also carry a bounded "response_headers" array of {"name","value"} objects.
 ; JSON subset: whitespace is space/tab/newline/carriage-return; strings
 ; have no escape sequences; numbers are non-negative decimal integers
 ; capped at 65535.
@@ -95,6 +96,12 @@ key_redirect:           db "redirect"
 key_redirect_len        equ $ - key_redirect
 key_cache_control:      db "cache_control"
 key_cache_control_len   equ $ - key_cache_control
+key_response_headers:   db "response_headers"
+key_response_headers_len equ $ - key_response_headers
+key_name:               db "name"
+key_name_len            equ $ - key_name
+key_value:              db "value"
+key_value_len           equ $ - key_value
 key_proxy_keepalive:    db "proxy_keepalive"
 key_proxy_keepalive_len equ $ - key_proxy_keepalive
 key_proxy_tls:          db "proxy_tls"
@@ -216,6 +223,18 @@ msg_v6only:             db "v6only must be 0 or 1"
 msg_v6only_len          equ $ - msg_v6only
 msg_cc_long:            db "cache_control too long"
 msg_cc_long_len         equ $ - msg_cc_long
+msg_rh_many:            db "response_headers has more than 8 fields"
+msg_rh_many_len         equ $ - msg_rh_many
+msg_rh_name_long:       db "response_headers name too long (63 bytes max)"
+msg_rh_name_long_len    equ $ - msg_rh_name_long
+msg_rh_value_long:      db "response_headers value too long (255 bytes max)"
+msg_rh_value_long_len   equ $ - msg_rh_value_long
+msg_rh_bytes:           db "response_headers exceed the 512-byte aggregate wire limit"
+msg_rh_bytes_len        equ $ - msg_rh_bytes
+msg_rh_shape:           db "each response_headers entry requires exactly name and value"
+msg_rh_shape_len        equ $ - msg_rh_shape
+msg_rh_kind:            db "response_headers need a root location"
+msg_rh_kind_len         equ $ - msg_rh_kind
 msg_path_long:          db "cert/key path too long"
 msg_path_long_len       equ $ - msg_path_long
 msg_prefix_long:        db "prefix too long"
@@ -1108,8 +1127,8 @@ linnea_parse_server:
 ; Key presence tracked in a bitmask: prefix=1, root=2, proxy=4, redirect=8,
 ; cache_control=16; a location requires prefix plus exactly one of root,
 ; proxy and redirect; cache_control is optional (a Cache-Control value sent
-; on static responses). A proxy value is validated here and prebuilt into a
-; sockaddr_in.
+; on static responses). response_headers=1024 is optional on a root location.
+; A proxy value is validated here and prebuilt into a sockaddr_in.
 linnea_parse_location:
     push rbx
     push r12
@@ -1118,6 +1137,8 @@ linnea_parse_location:
     push r15
     mov rbx, rdi               ; location*
     xor r12d, r12d             ; key mask
+    mov qword [rbx + linnea_config_location.response_header_count], 0
+    mov qword [rbx + linnea_config_location.response_header_bytes], 0
     mov edi, '{'
     call linnea_parse_expect
 .member_loop:
@@ -1163,6 +1184,13 @@ linnea_parse_location:
     call linnea_string_equal
     test eax, eax
     jnz .key_cache_control
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_response_headers]
+    mov ecx, key_response_headers_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_response_headers
     mov rdi, r13
     mov rsi, r14
     lea rdx, [key_proxy_keepalive]
@@ -1255,6 +1283,14 @@ linnea_parse_location:
     lea rdi, [rbx + linnea_config_location.cache_control]
     mov rsi, rax
     call linnea_string_copy
+    jmp .member_sep
+
+.key_response_headers:
+    test r12d, 1024
+    jnz .dup
+    or r12d, 1024
+    mov rdi, rbx
+    call linnea_parse_response_headers
     jmp .member_sep
 
 .key_proxy_keepalive:
@@ -1666,7 +1702,14 @@ linnea_parse_location:
     inc rcx
     jmp .utls_scan
 .unixtls_ok:
-    and r12d, ~(16 | 32 | 64 | 128 | 256 | 512)   ; strip optional keys
+    ; Extra response fields describe files this location itself serves.  On a
+    ; proxy or redirect they would be silently ignored, which is a lying config.
+    test r12d, 1024
+    jz .rh_kind_ok
+    test r12d, 2
+    jz .rh_kind
+.rh_kind_ok:
+    and r12d, ~(16 | 32 | 64 | 128 | 256 | 512 | 1024) ; strip optional keys
     cmp r12d, 3                ; prefix + root
     je .done
     cmp r12d, 5                ; prefix + proxy
@@ -1703,6 +1746,10 @@ linnea_parse_location:
 .cc_long:
     lea rdi, [msg_cc_long]
     mov esi, msg_cc_long_len
+    jmp linnea_parse_fail
+.rh_kind:
+    lea rdi, [msg_rh_kind]
+    mov esi, msg_rh_kind_len
     jmp linnea_parse_fail
 .proxy_long:
     lea rdi, [msg_proxy_long]
@@ -1783,6 +1830,189 @@ linnea_parse_location:
 .bad_proxy_many:
     lea rdi, [msg_bad_proxy_many]
     mov esi, msg_bad_proxy_many_len
+    jmp linnea_parse_fail
+
+; linnea_parse_response_headers(rdi=location*) — a bounded array of
+; {"name": string, "value": string} objects.  Empty is allowed and means no
+; extra fields.  A comma always obliges another object, so a trailing comma is
+; rejected by the same strict grammar as every other config array.
+linnea_parse_response_headers:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov edi, '['
+    call linnea_parse_expect
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ']'
+    jne .rh_element
+    call linnea_parse_advance
+    jmp .rh_done
+.rh_element:
+    mov r12, [rbx + linnea_config_location.response_header_count]
+    cmp r12, LINNEA_MAX_RESPONSE_HEADERS
+    jae .rh_many
+    imul r13, r12, linnea_config_response_header_size
+    lea r13, [rbx + r13 + linnea_config_location.response_headers]
+    mov rdi, r13
+    mov rsi, rbx
+    call linnea_parse_response_header
+    inc qword [rbx + linnea_config_location.response_header_count]
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ','
+    je .rh_next
+    cmp al, ']'
+    je .rh_end
+    lea rdi, [msg_sep_array]
+    mov esi, msg_sep_array_len
+    jmp linnea_parse_fail
+.rh_next:
+    call linnea_parse_advance
+    call linnea_parse_skip_ws
+    jmp .rh_element
+.rh_end:
+    call linnea_parse_advance
+.rh_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.rh_many:
+    lea rdi, [msg_rh_many]
+    mov esi, msg_rh_many_len
+    jmp linnea_parse_fail
+
+; linnea_parse_response_header(rdi=entry*, rsi=location*) — both members are
+; required and may appear in either order.  Names are stored lowercase once so
+; the same bytes are legal on H1, H2 and H3 and duplicate checks are exact.
+linnea_parse_response_header:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbx, rdi
+    mov r12, rsi
+    xor r13d, r13d                   ; name=1, value=2
+    mov edi, '{'
+    call linnea_parse_expect
+.rhe_member:
+    call linnea_parse_skip_ws
+    call linnea_parse_string
+    mov r14, rax
+    mov r15, rdx
+    mov edi, ':'
+    call linnea_parse_expect
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_name]
+    mov ecx, key_name_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .rhe_name
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_value]
+    mov ecx, key_value_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .rhe_value
+    lea rdi, [msg_unknown_key]
+    mov esi, msg_unknown_key_len
+    jmp linnea_parse_fail
+.rhe_name:
+    test r13d, 1
+    jnz .rhe_dup
+    or r13d, 1
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_RESPONSE_HEADER_NAME
+    ja .rhe_name_long
+    mov [rbx + linnea_config_response_header.name_len], rdx
+    lea rdi, [rbx + linnea_config_response_header.name]
+    mov rsi, rax
+    call linnea_string_copy
+    ; HTTP field names are case-insensitive, but H2/H3 wire names MUST be
+    ; lowercase.  Normalize here rather than carrying two representations.
+    lea rdi, [rbx + linnea_config_response_header.name]
+    mov rcx, [rbx + linnea_config_response_header.name_len]
+.rhe_lower:
+    test rcx, rcx
+    jz .rhe_sep
+    mov al, [rdi]
+    cmp al, 'A'
+    jb .rhe_lower_next
+    cmp al, 'Z'
+    ja .rhe_lower_next
+    or al, 0x20
+    mov [rdi], al
+.rhe_lower_next:
+    inc rdi
+    dec rcx
+    jmp .rhe_lower
+.rhe_value:
+    test r13d, 2
+    jnz .rhe_dup
+    or r13d, 2
+    call linnea_parse_string
+    cmp rdx, LINNEA_MAX_RESPONSE_HEADER_VALUE
+    ja .rhe_value_long
+    mov [rbx + linnea_config_response_header.value_len], rdx
+    lea rdi, [rbx + linnea_config_response_header.value]
+    mov rsi, rax
+    call linnea_string_copy
+.rhe_sep:
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ','
+    je .rhe_next
+    cmp al, '}'
+    je .rhe_end
+    lea rdi, [msg_sep_object]
+    mov esi, msg_sep_object_len
+    jmp linnea_parse_fail
+.rhe_next:
+    call linnea_parse_advance
+    jmp .rhe_member
+.rhe_end:
+    call linnea_parse_advance
+    cmp r13d, 3
+    jne .rhe_shape
+    mov rax, [rbx + linnea_config_response_header.name_len]
+    add rax, [rbx + linnea_config_response_header.value_len]
+    lea rdx, [rax + 4]
+    mov [rbx + linnea_config_response_header.wire_len], rdx
+    add [r12 + linnea_config_location.response_header_bytes], rdx
+    cmp qword [r12 + linnea_config_location.response_header_bytes], LINNEA_MAX_RESPONSE_HEADER_BYTES
+    ja .rhe_bytes
+    add rax, 32
+    mov [rbx + linnea_config_response_header.field_size], rax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.rhe_dup:
+    lea rdi, [msg_dup_key]
+    mov esi, msg_dup_key_len
+    jmp linnea_parse_fail
+.rhe_name_long:
+    lea rdi, [msg_rh_name_long]
+    mov esi, msg_rh_name_long_len
+    jmp linnea_parse_fail
+.rhe_value_long:
+    lea rdi, [msg_rh_value_long]
+    mov esi, msg_rh_value_long_len
+    jmp linnea_parse_fail
+.rhe_bytes:
+    lea rdi, [msg_rh_bytes]
+    mov esi, msg_rh_bytes_len
+    jmp linnea_parse_fail
+.rhe_shape:
+    lea rdi, [msg_rh_shape]
+    mov esi, msg_rh_shape_len
     jmp linnea_parse_fail
 
 ; --- low-level helpers -------------------------------------------------

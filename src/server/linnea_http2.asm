@@ -1609,6 +1609,7 @@ h2_serve:
     mov rbx, rdi                     ; conn
     mov qword [rsp + S_LSTAT], 0     ; paths that answer set these; a stream
     mov qword [rsp + S_LBYTES], 0    ; refused with RST logs nothing
+    mov qword [rsp + S_LOC], 0       ; no location has matched yet
     mov r12, rsi                     ; req
     mov [rsp + S_SID], r8
     mov [rsp + S_OUT], r9            ; where the response is written
@@ -2015,6 +2016,8 @@ h2_serve:
     lea rdx, [rax + linnea_config_location.cache_control]
     call h2_enc_hdr
 .no_cc_h2:
+    mov rsi, [rsp + S_LOC]
+    call h2_enc_response_headers
     ; Alt-Svc, when a QUIC listener is up (name is not in the static table)
     cmp qword [linnea_h3_altsvc_len], 0
     je .no_altsvc_h2
@@ -2605,6 +2608,8 @@ h2_serve:
     lea rdx, [rax + linnea_config_location.cache_control]
     call h2_enc_hdr
 .no_cc_304:
+    mov rsi, [rsp + S_LOC]
+    call h2_enc_response_headers
     mov esi, 59                      ; a 304 must carry the Vary of its 200
     lea rdx, [h2_ae_name]
     mov ecx, h2_ae_name_len
@@ -2642,6 +2647,8 @@ h2_serve:
     mov ecx, LINNEA_HTTP_DATE_LEN
     call h2_enc_hdr
     call h2_enc_date_server
+    mov rsi, [rsp + S_LOC]
+    call h2_enc_response_headers
     mov rbp, rdi
     sub rbp, r15                     ; payload length
     mov r8b, LINNEA_H2_FLAG_END_HEADERS | LINNEA_H2_FLAG_END_STREAM
@@ -2683,6 +2690,8 @@ h2_serve:
     mov ecx, 1
     call h2_enc_hdr
     call h2_enc_date_server
+    mov rsi, [rsp + S_LOC]
+    call h2_enc_response_headers
     mov rbp, rdi
     sub rbp, r15                     ; payload length
     mov r8b, LINNEA_H2_FLAG_END_HEADERS | LINNEA_H2_FLAG_END_STREAM
@@ -2788,6 +2797,8 @@ h2_serve:
     call h2_enc_hdr
 .no_vary_h2:
     call h2_enc_date_server
+    mov rsi, [rsp + S_LOC]
+    call h2_enc_response_headers
     mov rbp, rdi
     sub rbp, r13                     ; payload length
     ; HEADERS frame header (END_HEADERS; a DATA frame follows)
@@ -6451,6 +6462,41 @@ h2_enc_hdr_lit:
     pop r13
     pop r12
     pop rbp
+    pop rbx
+    ret
+
+; h2_enc_response_headers(rdi=dst, rsi=matched location* or 0) -> rdi advanced.
+; Only a root location owns these fields.  Names were lowercased and every
+; name/value pair was validated and aggregate-bounded before listeners opened.
+h2_enc_response_headers:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    test r12, r12
+    jz .erh_done
+    cmp qword [r12 + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    jne .erh_done
+    xor r13d, r13d
+.erh_loop:
+    cmp r13, [r12 + linnea_config_location.response_header_count]
+    jae .erh_done
+    imul rax, r13, linnea_config_response_header_size
+    lea rax, [r12 + rax + linnea_config_location.response_headers]
+    mov rdi, rbx
+    lea rsi, [rax + linnea_config_response_header.name]
+    mov rdx, [rax + linnea_config_response_header.name_len]
+    lea rcx, [rax + linnea_config_response_header.value]
+    mov r8, [rax + linnea_config_response_header.value_len]
+    call h2_enc_hdr_lit
+    mov rbx, rdi
+    inc r13
+    jmp .erh_loop
+.erh_done:
+    mov rdi, rbx
+    pop r13
+    pop r12
     pop rbx
     ret
 

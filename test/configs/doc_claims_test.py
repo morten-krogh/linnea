@@ -997,6 +997,71 @@ test(raw(loc([{"prefix": "/", "root": D, "cache_control": "max-age=60" + DEL}]))
      "cache_control must be a valid HTTP field value")
 test(raw(loc([{"prefix": "/", "root": D, "cache_control": "x=" + chr(0xe9)}])),
      "cache_control with obs-text accepted", True)
+
+# response_headers is a deliberately bounded static-location policy surface.
+# This is the complete Hjem browser policy not already owned by cache_control,
+# hsts and nosniff; keeping the real consumer here proves the limits fit it.
+HJEM_RESPONSE_HEADERS = [
+    {"name": "Content-Security-Policy",
+     "value": "default-src 'none'; script-src 'self'; style-src 'self'; "
+              "img-src 'self'; font-src 'self'; connect-src 'self'; "
+              "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; "
+              "object-src 'none'"},
+    {"name": "Cross-Origin-Opener-Policy", "value": "same-origin"},
+    {"name": "Cross-Origin-Resource-Policy", "value": "same-origin"},
+    {"name": "Permissions-Policy",
+     "value": "publickey-credentials-create=(self), "
+              "publickey-credentials-get=(self)"},
+    {"name": "Referrer-Policy", "value": "no-referrer"},
+    {"name": "X-Frame-Options", "value": "DENY"},
+]
+def rh(headers, kind="root"):
+    item = {"prefix": "/", kind: D if kind == "root" else "127.0.0.1:8080",
+            "response_headers": headers}
+    return loc([item])
+
+test(rh(HJEM_RESPONSE_HEADERS), "response_headers accepts the complete Hjem policy", True)
+test(rh([]), "response_headers accepts an empty array", True)
+test(rh([{"name": "X-Test", "value": ""}]),
+     "response_headers accepts an empty field value", True)
+test(rh([{"name": "", "value": "x"}]),
+     "response_headers rejects an empty name", False, "non-empty HTTP token")
+test(rh([{"name": "bad name", "value": "x"}]),
+     "response_headers rejects a non-token name", False, "HTTP token")
+test(raw(rh([{"name": "x-test", "value": "ok" + DEL}])) ,
+     "response_headers rejects DEL in a value", False, "valid HTTP field value")
+test(rh([{"name": "x-test", "value": " leading"}]),
+     "response_headers rejects leading value whitespace", False,
+     "valid HTTP field value")
+test(rh([{"name": "X-Test", "value": "one"},
+         {"name": "x-test", "value": "two"}]),
+     "response_headers duplicate names are case-insensitive", False,
+     "duplicate field name")
+for managed in ("Connection", "Content-Length", "Content-Type", "Cache-Control",
+                "Strict-Transport-Security", "Vary"):
+    test(rh([{"name": managed, "value": "x"}]),
+         "response_headers rejects managed field " + managed, False,
+         "Linnea-owned field")
+test(rh([{"name": "x-test", "value": "x"}], "proxy"),
+     "response_headers on a proxy location rejected", False,
+     "need a root location")
+test(rh([{"name": "x-%d" % i, "value": "x"} for i in range(9)]),
+     "response_headers rejects a ninth field", False, "more than 8")
+test(rh([{"name": "x" * 63, "value": "x"}]),
+     "response_headers accepts a 63-byte name", True)
+test(rh([{"name": "x" * 64, "value": "x"}]),
+     "response_headers rejects a 64-byte name", False, "63 bytes max")
+test(rh([{"name": "x", "value": "x" * 255}]),
+     "response_headers accepts a 255-byte value", True)
+test(rh([{"name": "x", "value": "x" * 256}]),
+     "response_headers rejects a 256-byte value", False, "255 bytes max")
+RH512 = [{"name": "X-Max-A", "value": "x" * 255},
+         {"name": "X-Max-B", "value": "y" * 235}]
+test(rh(RH512), "response_headers accepts exactly 512 serialized bytes", True)
+RH513 = [dict(RH512[0]), {"name": "X-Max-B", "value": "y" * 236}]
+test(rh(RH513), "response_headers rejects 513 serialized bytes", False,
+     "512-byte aggregate")
+
 test(loc([{"prefix": "/", "redirect": "https://example.com/new"}]),
      "conventional redirect accepted", True)
 test(raw(loc([{"prefix": "/", "redirect": "https://example.com/" + DEL}])),

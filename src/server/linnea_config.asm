@@ -17,6 +17,7 @@ extern linnea_error_exit
 extern linnea_error_duplicate_hostname
 extern linnea_string_equal
 extern linnea_string_iequal
+extern linnea_string_is_token
 extern linnea_network_fill_sockaddr6
 extern linnea_network_endpoint_cmp
 
@@ -111,6 +112,16 @@ msg_bad_cc:             db "cache_control must be a valid HTTP field value: 0x21
 msg_bad_cc_len          equ $ - msg_bad_cc
 msg_bad_hsts:           db "hsts must be a valid HTTP field value: 0x21-0x7e or 0x80-0xff, with space or tab only between them"
 msg_bad_hsts_len        equ $ - msg_bad_hsts
+msg_bad_rh_name:        db "response_headers name must be a non-empty HTTP token"
+msg_bad_rh_name_len     equ $ - msg_bad_rh_name
+msg_bad_rh_value:       db "response_headers value must be a valid HTTP field value: 0x21-0x7e or 0x80-0xff, with space or tab only between them"
+msg_bad_rh_value_len    equ $ - msg_bad_rh_value
+msg_bad_rh_reserved:    db "response_headers cannot replace a connection, framing, representation, or Linnea-owned field"
+msg_bad_rh_reserved_len equ $ - msg_bad_rh_reserved
+msg_bad_rh_duplicate:   db "response_headers contains a duplicate field name"
+msg_bad_rh_duplicate_len equ $ - msg_bad_rh_duplicate
+msg_bad_rh_bounds:      db "response_headers exceed their documented count, field, or aggregate limits"
+msg_bad_rh_bounds_len   equ $ - msg_bad_rh_bounds
 msg_bad_redirect_val:   db "redirect target must be a valid HTTP field value: 0x21-0x7e or 0x80-0xff, and no whitespace (it is a URL)"
 msg_bad_redirect_val_len equ $ - msg_bad_redirect_val
 msg_empty_log:          db "config log must not be empty"
@@ -134,6 +145,63 @@ msg_v6only_conflict_len equ $ - msg_v6only_conflict
 
 dump_tls_on:            db " tls=on cert="
 dump_tls_on_len         equ $ - dump_tls_on
+
+; Fields whose meaning Linnea already owns while constructing a static
+; response, plus connection-specific fields that H2/H3 forbid outright.
+; response_headers names are lowercased during parsing, so exact comparisons
+; here are case-insensitive in effect without three protocol-specific lists.
+rh_connection:          db "connection"
+rh_content_length:      db "content-length"
+rh_content_type:        db "content-type"
+rh_transfer_encoding:   db "transfer-encoding"
+rh_trailer:             db "trailer"
+rh_upgrade:             db "upgrade"
+rh_keep_alive:          db "keep-alive"
+rh_proxy_connection:    db "proxy-connection"
+rh_proxy_authenticate:  db "proxy-authenticate"
+rh_proxy_authorization: db "proxy-authorization"
+rh_te:                  db "te"
+rh_cache_control:       db "cache-control"
+rh_hsts:                db "strict-transport-security"
+rh_nosniff:             db "x-content-type-options"
+rh_date:                db "date"
+rh_server:              db "server"
+rh_alt_svc:             db "alt-svc"
+rh_location:            db "location"
+rh_allow:               db "allow"
+rh_etag:                db "etag"
+rh_last_modified:       db "last-modified"
+rh_accept_ranges:       db "accept-ranges"
+rh_content_range:       db "content-range"
+rh_content_encoding:    db "content-encoding"
+rh_vary:                db "vary"
+rh_forbidden:
+    dq rh_connection,          10
+    dq rh_content_length,      14
+    dq rh_content_type,        12
+    dq rh_transfer_encoding,   17
+    dq rh_trailer,              7
+    dq rh_upgrade,              7
+    dq rh_keep_alive,          10
+    dq rh_proxy_connection,    16
+    dq rh_proxy_authenticate,  18
+    dq rh_proxy_authorization, 19
+    dq rh_te,                   2
+    dq rh_cache_control,       13
+    dq rh_hsts,                25
+    dq rh_nosniff,             22
+    dq rh_date,                 4
+    dq rh_server,               6
+    dq rh_alt_svc,              7
+    dq rh_location,             8
+    dq rh_allow,                5
+    dq rh_etag,                 4
+    dq rh_last_modified,       13
+    dq rh_accept_ranges,       13
+    dq rh_content_range,       13
+    dq rh_content_encoding,    16
+    dq rh_vary,                 4
+    dq 0, 0
 
 section .bss
 log_dir_buf: resb LINNEA_MAX_ROOT + 2   ; the log path, cut at its last /
@@ -221,6 +289,141 @@ field_value_ok:
     ret
 .fv_bad:
     xor eax, eax
+    ret
+
+; response_header_forbidden(rdi=name, rsi=len) -> eax=1 when Linnea owns the
+; field or no connection-independent static response may author it.
+response_header_forbidden:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    lea r13, [rh_forbidden]
+.rhf_loop:
+    mov rdx, [r13]
+    test rdx, rdx
+    jz .rhf_no
+    mov rdi, rbx
+    mov rsi, r12
+    mov rcx, [r13 + 8]
+    call linnea_string_equal
+    test eax, eax
+    jnz .rhf_yes
+    add r13, 16
+    jmp .rhf_loop
+.rhf_yes:
+    mov eax, 1
+    jmp .rhf_ret
+.rhf_no:
+    xor eax, eax
+.rhf_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; response_headers_ok(rdi=location*) -> eax: 0 ok, 1 name, 2 value,
+; 3 reserved, 4 duplicate, 5 bounds/accounting.  Parse-time limits are checked
+; again here because --test's semantic pass is the authority that guarantees
+; every byte Linnea may later put on the wire.
+response_headers_ok:
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rbp, rdi
+    mov rax, [rbp + linnea_config_location.response_header_count]
+    cmp rax, LINNEA_MAX_RESPONSE_HEADERS
+    ja .rho_bounds
+    xor r12d, r12d                   ; header index
+    xor r14d, r14d                   ; recomputed wire total
+.rho_loop:
+    cmp r12, [rbp + linnea_config_location.response_header_count]
+    jae .rho_total
+    imul rax, r12, linnea_config_response_header_size
+    lea r13, [rbp + rax + linnea_config_location.response_headers]
+    mov rsi, [r13 + linnea_config_response_header.name_len]
+    test rsi, rsi
+    jz .rho_name
+    cmp rsi, LINNEA_MAX_RESPONSE_HEADER_NAME
+    ja .rho_bounds
+    lea rdi, [r13 + linnea_config_response_header.name]
+    call linnea_string_is_token
+    test eax, eax
+    jz .rho_name
+    mov rsi, [r13 + linnea_config_response_header.value_len]
+    cmp rsi, LINNEA_MAX_RESPONSE_HEADER_VALUE
+    ja .rho_bounds
+    lea rdi, [r13 + linnea_config_response_header.value]
+    mov edx, 1
+    call field_value_ok
+    test eax, eax
+    jz .rho_value
+    lea rdi, [r13 + linnea_config_response_header.name]
+    mov rsi, [r13 + linnea_config_response_header.name_len]
+    call response_header_forbidden
+    test eax, eax
+    jnz .rho_reserved
+    ; The stored derived sizes are part of the response-buffer proof.  Refuse a
+    ; mismatch rather than trusting parser state that the emitter cannot check.
+    mov rax, [r13 + linnea_config_response_header.name_len]
+    add rax, [r13 + linnea_config_response_header.value_len]
+    lea rdx, [rax + 4]
+    cmp rdx, [r13 + linnea_config_response_header.wire_len]
+    jne .rho_bounds
+    add r14, rdx
+    add rax, 32
+    cmp rax, [r13 + linnea_config_response_header.field_size]
+    jne .rho_bounds
+    ; Duplicate fields are ambiguous for singleton security policies and can
+    ; be combined differently by recipients.  Names are already lowercase.
+    xor r15d, r15d
+.rho_prior:
+    cmp r15, r12
+    jae .rho_next
+    imul rax, r15, linnea_config_response_header_size
+    lea rdx, [rbp + rax + linnea_config_location.response_headers]
+    lea rdi, [r13 + linnea_config_response_header.name]
+    mov rsi, [r13 + linnea_config_response_header.name_len]
+    mov rcx, [rdx + linnea_config_response_header.name_len]
+    lea rdx, [rdx + linnea_config_response_header.name]
+    call linnea_string_equal
+    test eax, eax
+    jnz .rho_duplicate
+    inc r15
+    jmp .rho_prior
+.rho_next:
+    inc r12
+    jmp .rho_loop
+.rho_total:
+    cmp r14, LINNEA_MAX_RESPONSE_HEADER_BYTES
+    ja .rho_bounds
+    cmp r14, [rbp + linnea_config_location.response_header_bytes]
+    jne .rho_bounds
+    xor eax, eax
+    jmp .rho_ret
+.rho_name:
+    mov eax, 1
+    jmp .rho_ret
+.rho_value:
+    mov eax, 2
+    jmp .rho_ret
+.rho_reserved:
+    mov eax, 3
+    jmp .rho_ret
+.rho_duplicate:
+    mov eax, 4
+    jmp .rho_ret
+.rho_bounds:
+    mov eax, 5
+.rho_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
     ret
 
 linnea_config_validate:
@@ -394,6 +597,38 @@ linnea_config_validate:
     pop rdi
     pop rax
     jz .bad_cc
+    ; The arbitrary-looking fields are bounded policy, validated as rigorously
+    ; as Cache-Control: legal token names, legal values, no duplicates, and no
+    ; attempt to replace framing or fields this response builder already owns.
+    push rax
+    push rdi
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    mov rdi, rdx
+    call response_headers_ok
+    mov ecx, eax
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rdi
+    pop rax
+    test ecx, ecx
+    jz .rh_ok
+    cmp ecx, 1
+    je .bad_rh_name
+    cmp ecx, 2
+    je .bad_rh_value
+    cmp ecx, 3
+    je .bad_rh_reserved
+    cmp ecx, 4
+    je .bad_rh_duplicate
+    jmp .bad_rh_bounds
+.rh_ok:
     cmp qword [rdx + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
     jne .loc_not_root
     cmp qword [rdx + linnea_config_location.root_len], 0
@@ -604,6 +839,26 @@ linnea_config_validate:
 .bad_hsts:
     lea rdi, [msg_bad_hsts]
     mov esi, msg_bad_hsts_len
+    jmp linnea_error_exit
+.bad_rh_name:
+    lea rdi, [msg_bad_rh_name]
+    mov esi, msg_bad_rh_name_len
+    jmp linnea_error_exit
+.bad_rh_value:
+    lea rdi, [msg_bad_rh_value]
+    mov esi, msg_bad_rh_value_len
+    jmp linnea_error_exit
+.bad_rh_reserved:
+    lea rdi, [msg_bad_rh_reserved]
+    mov esi, msg_bad_rh_reserved_len
+    jmp linnea_error_exit
+.bad_rh_duplicate:
+    lea rdi, [msg_bad_rh_duplicate]
+    mov esi, msg_bad_rh_duplicate_len
+    jmp linnea_error_exit
+.bad_rh_bounds:
+    lea rdi, [msg_bad_rh_bounds]
+    mov esi, msg_bad_rh_bounds_len
     jmp linnea_error_exit
 .empty_root:
     lea rdi, [msg_empty_root]

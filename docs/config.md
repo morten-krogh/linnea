@@ -79,7 +79,10 @@ place.
       "locations": [
         {                     ← LOCATION: one path prefix
           "prefix": "/",
-          "root": "/var/www"
+          "root": "/var/www",
+          "response_headers": [
+            {"name": "Referrer-Policy", "value": "no-referrer"}
+          ]
         }
       ]
     }
@@ -238,13 +241,57 @@ coexist and `/api/x` goes to `/api`.
 | `proxy_h2` | integer | `0` (off) | 0 or 1 | Speak **HTTP/2** to this location's backends (negotiated by ALPN over TLS). Only on a `proxy` location, and **requires `proxy_tls`**. See **Backend HTTP/2** below. |
 | `redirect` | string | one of three | ≤ 255 | Reply 301 to this URL prefix. **Must start with `http://` or `https://`.** It is a URL, so no whitespace either. |
 | `cache_control` | string | none | ≤ 255 | `Cache-Control` value for static responses. Only meaningful with `root`. Must be a valid HTTP field value — see below. |
+| `response_headers` | array of `{name,value}` | none | ≤ 8 fields; name ≤ 63, value ≤ 255; ≤ 512 serialized bytes total | Extra fields on responses owned by a `root` location. Names are normalized to lowercase. Only valid with `root`; see **Static response headers** below. |
 
 > **Exactly one of `root`, `proxy` or `redirect`.** Zero is an error and so are
 > two: *"location requires prefix and exactly one of root, proxy or redirect"*.
 
+### Static response headers
+
+`response_headers` lets a static application state a small fixed response
+policy without moving its HTML through a backend. Each array member has exactly
+two string members, `name` and `value`:
+
+```json
+"response_headers": [
+  {"name": "Content-Security-Policy", "value": "default-src 'none'; script-src 'self'"},
+  {"name": "Referrer-Policy", "value": "no-referrer"},
+  {"name": "X-Frame-Options", "value": "DENY"}
+]
+```
+
+The fields are emitted over HTTP/1.1, HTTP/2 and HTTP/3 on every response that
+belongs to the matched static location: ordinary and range responses,
+conditional responses, and errors such as a missing file. They are not added
+before routing has identified a location, and they never leak onto a `proxy` or
+`redirect` response. A `response_headers` key on either of those location kinds
+is therefore rejected instead of being silently ignored.
+
+The bounds are part of the wire-safety contract, not suggestions:
+
+- At most 8 fields.
+- A field name is a non-empty RFC 9110 token of at most 63 bytes. Input case is
+  accepted, then normalized to lowercase because HTTP/2 and HTTP/3 require it.
+- A value is at most 255 bytes and follows the field-value rules below. An empty
+  value is legal.
+- The HTTP/1 wire forms together — `CRLF + name + ": " + value` for each field
+  — total at most 512 bytes. That implies at most 513 bytes in Linnea's literal
+  HPACK/QPACK encodings and sizes the HTTP/3 streamed-head buffer.
+- Names may not repeat, case-insensitively.
+
+Linnea refuses fields it must construct itself: connection-specific and
+framing fields (`connection`, `keep-alive`, `te`, `trailer`,
+`transfer-encoding`, `upgrade`, proxy connection/authentication fields), and
+its own status, representation, validator, routing and policy fields such as
+`content-length`, `content-type`, `content-encoding`, `content-range`,
+`cache-control`, `vary`, `etag`, `last-modified`, `location`, `allow`, `date`,
+`server`, `alt-svc`, `strict-transport-security` and
+`x-content-type-options`. Use `cache_control`, `hsts` and `nosniff` for the last
+three configured policies.
+
 ### Values that become response headers
 
-`hsts`, `cache_control` and `redirect` are not opaque strings: each one is
+`hsts`, `cache_control`, `response_headers` values and `redirect` are not opaque strings: each one is
 written into a response field verbatim, so each has to *be* a legal field
 value. RFC 9110 §5.5 defines that as `field-vchar` — `0x21`–`0x7e` or
 `0x80`–`0xff` — with space or tab allowed only *between* two of those, never

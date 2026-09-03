@@ -90,6 +90,33 @@ LINNEA_BPF_STEER_HALF           equ 128
 ; where the longest names in use are well under 50 bytes.
 LINNEA_HTTP_MAX_FIELD_NAME      equ 256
 
+; Extra response fields a static location may add.  This is intentionally a
+; small policy surface, not an unbounded generic header buffer: the aggregate
+; H1 wire form (CRLF + name + ": " + value for every field) is capped at 512
+; bytes, which also bounds the literal HPACK/QPACK encodings.  Eight fields fit
+; the complete browser policy of a strict application while keeping every
+; protocol's response head derivable from the config limits.
+LINNEA_MAX_RESPONSE_HEADERS      equ 8
+LINNEA_MAX_RESPONSE_HEADER_NAME  equ 63
+LINNEA_MAX_RESPONSE_HEADER_VALUE equ 255
+LINNEA_MAX_RESPONSE_HEADER_BYTES equ 512
+
+struc linnea_config_response_header
+    ; Names are lowercased at parse time: field names are case-insensitive on
+    ; H1, while H2/H3 require lowercase on the wire.
+    .name:          resb LINNEA_MAX_RESPONSE_HEADER_NAME + 1
+    .name_len:      resq 1
+    .value:         resb LINNEA_MAX_RESPONSE_HEADER_VALUE + 1
+    .value_len:     resq 1
+    ; name + value + 4: the exact H1 bytes (leading CRLF and ": ").  Across a
+    ; whole legal set the literal HPACK/QPACK form is at most one byte longer:
+    ; only a 255-byte value needs the third length byte, and two such values
+    ; cannot fit the 512-byte wire budget.
+    .wire_len:      resq 1
+    ; RFC 9113 6.5.2 / RFC 9114 4.2.2 accounting: name + value + 32.
+    .field_size:    resq 1
+endstruc
+
 ; what a location routes to
 LINNEA_LOC_KIND_ROOT     equ 0       ; serve files from .root
 LINNEA_LOC_KIND_PROXY    equ 1       ; forward to the upstream in .proxy_addr
@@ -147,6 +174,9 @@ struc linnea_config_location
     .redirect_len:  resq 1
     .cache_control: resb LINNEA_MAX_ROOT + 1      ; Cache-Control value for static
     .cache_control_len: resq 1                    ; responses (0 = header not sent)
+    .response_header_count: resq 1                ; extra fields on static responses
+    .response_header_bytes: resq 1                ; sum of their H1 wire lengths
+    .response_headers: resb linnea_config_response_header_size * LINNEA_MAX_RESPONSE_HEADERS
 endstruc
 
 struc linnea_config_server

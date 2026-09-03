@@ -50,8 +50,8 @@ what that process is good and bad at, and where the real risks are.
   `TLS_AES_128_GCM_SHA256`, X25519 key exchange, an ECDSA P-256 certificate.
   No TLS 1.2, no RSA — see [Scope](#scope).
 - **Static files** with precompressed `.br`/`.gzip` variant selection, byte-range
-  requests, conditional requests (ETag, Last-Modified, `If-*`), and per-location
-  `Cache-Control`.
+  requests, conditional requests (ETag, Last-Modified, `If-*`), per-location
+  `Cache-Control`, and bounded fixed response headers for browser policy.
 - **Reverse proxy** to HTTP/1.1 backends: several backends per location with
   round-robin and passive health/failover, and optional upstream keep-alive —
   reused across HTTP/1, HTTP/2 and HTTP/3 clients alike. See

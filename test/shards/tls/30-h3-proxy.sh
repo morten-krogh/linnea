@@ -530,7 +530,7 @@ EOF
     rm -f "$vp"
 
 
-    # A canned h3 error must describe ITSELF. The QPACK encoder reads
+    # Every h3 response must describe ITSELF. The QPACK encoder reads
     # content-encoding, the validators, content-range, location and
     # cache-control out of .bss globals that only linnea_h3_serve clears — and
     # they are per WORKER, so every connection it holds shares them. Responses
@@ -543,7 +543,10 @@ EOF
     # Cache-Control, which made a transient failure storable for as long as the
     # static content was. A separate fixture because it needs workers:1, an
     # upstream timeout short enough to fire while a second request runs, and a
-    # location carrying a cache_control.
+    # location carrying cache_control and arbitrary response_headers. The same
+    # harness also follows that static hit with a redirect on the same QUIC
+    # connection, proving the in-serve per-request state is cleared before a
+    # non-root route is answered.
     if python3 -c 'import aioquic, pylsqpack' 2>/dev/null; then
         rm -f $RUNDIR/linnea-h3canned.log
         start_server $CFG/tls-h3-canned.json
@@ -558,7 +561,7 @@ with gzip.open(sys.argv[1], 'wb') as f:
     f.write(b'canned gzip payload')" "$WWW/canned.txt.gz"
         out=$(timeout 90 python3 test/quic/h3_canned_fields_test.py ${P61464} 2>&1)
         [ "$out" = "OK" ]
-        check "h3 canned errors carry no other request's field section ($out)" $?
+        check "h3 responses carry no other request's field section ($out)" $?
         rm -f $WWW/canned.txt $WWW/canned.txt.gz
         kill $h3cn_pid 2>/dev/null
         wait $h3cn_pid 2>/dev/null
@@ -568,12 +571,9 @@ with gzip.open(sys.argv[1], 'wb') as f:
 
     # The response buffers must fit the LARGEST head the documented config can
     # produce, not a typical one. hsts and cache_control are each up to 255
-    # bytes, which is 510 of the old 512-byte per-connection head buffer on
-    # their own — so a vhost setting both at their documented maxima could not
-    # serve ANY file over LINNEA_H3_INLINE_MAX over h3: the head failed the
-    # bound and the stream was RESET, with no status and no body, while h1 and
-    # h2 served the same file normally. Silent, and invisible to every other
-    # check here because they all use short header values.
+    # bytes, and response_headers adds an exact 512-byte aggregate budget. The
+    # old 1024-byte per-stream head could not carry that documented maximum: it
+    # RESET a large static response while h1/h2 served it normally.
     rm -f $RUNDIR/linnea-h3maxhdr.log
     start_server $CFG/tls-h3-maxhdr.json
     P61465=$SRV_PORT
@@ -625,11 +625,13 @@ open(sys.argv[1],'wb').write(bytes(range(256))*40)" "$WWW/maxhdr.bin"     # 1024
     if [ -x "$CURLH3" ] && "$CURLH3" -V 2>/dev/null | grep -q HTTP3; then
         got=$("$CURLH3" --http3-only -s --max-time 20 --cacert $CA \
               --resolve localhost:${P61465}:127.0.0.1 \
-              -o $RUNDIR/maxhdr.out -w '%{http_code}' \
+              -D $RUNDIR/maxhdr.hdr -o $RUNDIR/maxhdr.out -w '%{http_code}' \
               https://localhost:${P61465}/maxhdr.bin)
-        [ "$got" = "200" ] && cmp -s $RUNDIR/maxhdr.out "$WWW/maxhdr.bin"
-        check "h3 serves a chunked response with max-length hsts+cache_control ($got)" $?
-        rm -f $RUNDIR/maxhdr.out
+        [ "$got" = "200" ] && cmp -s $RUNDIR/maxhdr.out "$WWW/maxhdr.bin" \
+            && grep -qi '^x-max-a: x' $RUNDIR/maxhdr.hdr \
+            && grep -qi '^x-max-b: y' $RUNDIR/maxhdr.hdr
+        check "h3 serves max hsts+cache_control+response_headers ($got)" $?
+        rm -f $RUNDIR/maxhdr.out $RUNDIR/maxhdr.hdr
     else
         check "h3 max-length header response (skipped: no HTTP/3 curl)" 0
     fi
@@ -637,11 +639,13 @@ open(sys.argv[1],'wb').write(bytes(range(256))*40)" "$WWW/maxhdr.bin"     # 1024
     # and not the config being rejected somewhere earlier.
     g2=$(curl -s --http2 --max-time 20 --cacert $CA \
          --resolve localhost:${P61465}:127.0.0.1 \
-         -o $RUNDIR/maxhdr2.out -w '%{http_code}' \
+         -D $RUNDIR/maxhdr2.hdr -o $RUNDIR/maxhdr2.out -w '%{http_code}' \
          https://localhost:${P61465}/maxhdr.bin)
-    [ "$g2" = "200" ] && cmp -s $RUNDIR/maxhdr2.out "$WWW/maxhdr.bin"
+    [ "$g2" = "200" ] && cmp -s $RUNDIR/maxhdr2.out "$WWW/maxhdr.bin" \
+        && grep -qi '^x-max-a: x' $RUNDIR/maxhdr2.hdr \
+        && grep -qi '^x-max-b: y' $RUNDIR/maxhdr2.hdr
     check "h2 serves the same max-length-header response ($g2)" $?
-    rm -f $RUNDIR/maxhdr2.out $WWW/maxhdr.bin
+    rm -f $RUNDIR/maxhdr2.out $RUNDIR/maxhdr2.hdr $WWW/maxhdr.bin
     kill $h3mx_pid 2>/dev/null
     wait $h3mx_pid 2>/dev/null
 

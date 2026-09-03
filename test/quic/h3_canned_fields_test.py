@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# A canned HTTP/3 error must describe ITSELF, not the last thing this worker
-# served.
+# An HTTP/3 response must describe ITSELF, not the last thing this worker
+# served. This covers both builders outside linnea_h3_serve and a later routed
+# response within it.
 #
 # The QPACK encoder takes content-encoding, the validators, content-range,
 # location and cache-control from globals in .bss -- per WORKER, so shared by
@@ -19,8 +20,8 @@
 # location's Cache-Control -- the last making a transient failure storable for
 # as long as the static content was.
 #
-# Needs workers:1 (or which worker answers is luck) and a location with a
-# cache_control, which tls-h3-canned.json has.
+# Needs workers:1 (or which worker answers is luck) and a location with
+# cache_control plus response_headers, which tls-h3-canned.json has.
 #
 # Usage: h3_canned_fields_test.py <port>
 import socket, ssl, sys, time
@@ -35,7 +36,8 @@ ADDR = ("127.0.0.1", PORT)
 # Everything a canned error must not have picked up from somebody else. Only
 # content-type, content-length, date and server belong on one.
 LEAKY = ("content-encoding", "etag", "last-modified", "content-range",
-         "location", "cache-control", "vary", "accept-ranges")
+         "location", "cache-control", "vary", "accept-ranges",
+         "x-linnea-static")
 
 
 class Conn:
@@ -161,9 +163,21 @@ want("armed content-encoding", hd.get("content-encoding") == "gzip", str(hd))
 want("armed etag", "etag" in hd, str(hd))
 want("armed cache-control", hd.get("cache-control") == "public, max-age=600",
      str(hd))
+want("armed response_headers", hd.get("x-linnea-static") == "policy", str(hd))
+
+# (3) A routed response on the SAME connection must begin with clean
+#     per-request state too. The redirect owns Location, but it must not inherit
+#     the root location's arbitrary response headers. Before the fix the
+#     worker-global location pointer still named the static hit above.
+st, hd, _ = c.request("/old/page")
+want("redirect after a static hit status", st == "301", f"{st} {hd}")
+want("redirect after a static hit location",
+     hd.get("location") == "https://example.com/old/page", str(hd))
+want("redirect carries no static response_headers",
+     "x-linnea-static" not in hd, str(hd))
 c.close()
 
-# (3) The same 413 as (1), on a new connection, with only that static hit in
+# (4) The same 413 as (1), on a new connection, with only that static hit in
 #     between. Before the fix it came back with gzip, the etag, last-modified
 #     and the Cache-Control of a file it has nothing to do with.
 c = Conn()
@@ -172,7 +186,7 @@ want_clean("413 after a static hit", st, hd, "413")
 want("413 body after a static hit", body.startswith(b"413 "), repr(body[:40]))
 c.close()
 
-# (4) The proxy's canned error, which is the harder half: it is built on a
+# (5) The proxy's canned error, which is the harder half: it is built on a
 #     completion, so the request that dirties the globals runs AFTER the one
 #     being answered has already been parked. /api/slow outlives the fixture's
 #     upstream timeout, which is what holds the leg open long enough to get a

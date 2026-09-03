@@ -156,8 +156,10 @@ LINNEA_H3_INLINE_MAX   equ 1024
 ; derivation lives. The old value enumerated "status, content-type,
 ; content-length, the validators, date and server" and left out the two fields
 ; that actually dominate — cache-control and hsts, 255 bytes each by the
-; documented config limits.
-LINNEA_H3_HEAD_MAX     equ 1024
+; documented config limits.  The 810-byte prior worst case plus the bounded
+; response_headers literal-QPACK maximum of 513 is 1323; 1536 matches the
+; per-stream buffer with room for the conservative encoding estimate.
+LINNEA_H3_HEAD_MAX     equ 1536
 ; The buffer linnea_qpack_encode_response assembles a field section in. Sized
 ; for the worst section the documented config can produce, which is a redirect:
 ; a 255-byte target plus a 2047-byte request target is a 2302-byte Location, and
