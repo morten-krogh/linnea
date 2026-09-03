@@ -613,6 +613,25 @@ linnea_qpack_encode_response:
     call qenc_str
     mov rbx, rdi
 .no_location:
+    ; --- cache-control, when a matched static location configures one ---
+    ; This is location policy, not validator metadata. Keep it before the
+    ; validator shortcut so the location's own 404/405/406/417 responses carry
+    ; the same cache decision as its representation and conditional responses.
+    cmp qword [linnea_qpack_ccontrol_ptr], 0
+    je .no_ccontrol
+    mov rax, [linnea_qpack_ccontrol_len]
+    QFSS 45, rax                     ; "cache-control" (13) + 32
+    QROOM rax + 6
+    mov rdi, rbx
+    mov eax, 36                      ; cache-control: name reference
+    mov cl, 4
+    mov dl, 0x50
+    call qenc_int
+    mov rsi, [linnea_qpack_ccontrol_ptr]
+    mov rdx, [linnea_qpack_ccontrol_len]
+    call qenc_str
+    mov rbx, rdi
+.no_ccontrol:
     ; --- validators, when the serve path computed them for this response ---
     cmp qword [linnea_qpack_send_validators], 0
     je .vary_only                    ; no validators: an error response, but a
@@ -672,22 +691,6 @@ linnea_qpack_encode_response:
     mov edx, LINNEA_HTTP_DATE_LEN
     call qenc_str
     mov rbx, rdi
-    ; --- cache-control, when the vhost's location configures one ---
-    cmp qword [linnea_qpack_ccontrol_ptr], 0
-    je .no_ccontrol
-    mov rax, [linnea_qpack_ccontrol_len]
-    QFSS 45, rax                     ; "cache-control" (13) + 32
-    QROOM rax + 6
-    mov rdi, rbx
-    mov eax, 36                      ; cache-control: name reference
-    mov cl, 4
-    mov dl, 0x50
-    call qenc_int
-    mov rsi, [linnea_qpack_ccontrol_ptr]
-    mov rdx, [linnea_qpack_ccontrol_len]
-    call qenc_str
-    mov rbx, rdi
-.no_ccontrol:
 .vary_only:
     ; A static path is content-negotiated even when it misses: a ".br" with no
     ; plain file beside it is served to whoever takes the encoding and 404s

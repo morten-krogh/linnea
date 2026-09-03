@@ -188,6 +188,12 @@ open(sys.argv[1], 'wb').write(bytes((i * 131 + (i >> 8) * 17) & 0xFF
         && echo "$hdrs" | grep -qi '^x-linnea-static: policy' \
         && echo "$hdrs" | grep -qi '^referrer-policy: no-referrer'
     check "http2 accept-ranges + configured response headers" $?
+    hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null \
+        "$u/no-such-file")
+    echo "$hdrs" | grep -qi '^HTTP/2 404' \
+        && echo "$hdrs" | grep -qi '^cache-control: max-age=60' \
+        && echo "$hdrs" | grep -qi '^x-linnea-static: policy'
+    check "http2 matched 404 repeats configured cache policy" $?
     # a single byte range: 206, the exact slice, content-range names it
     hdrs=$(curl -s --http2 -D - --cacert $CA $rl -o /dev/null -r 5-9 "$u/hello.txt")
     body=$(curl -s --http2 --cacert $CA $rl -r 5-9 "$u/hello.txt")

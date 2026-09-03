@@ -3789,10 +3789,29 @@ http_error_blob:
     mov r15, rdi
 .heb_nosniff:
     cmp qword [rbx + linnea_config_server.nosniff], 0
-    je .heb_response_headers
+    je .heb_cache_control
     mov rdi, r15
     lea rsi, [hdr_nosniff]
     mov rcx, hdr_nosniff_len
+    rep movsb
+    mov r15, rdi
+.heb_cache_control:
+    ; Cache-Control describes every response owned by a matched static
+    ; location, including a miss. Leaving it off a 404 lets that error escape
+    ; the application's no-store policy while its arbitrary policy fields are
+    ; already present. A pre-route or proxy error has no root location here.
+    test r13, r13
+    jz .heb_blank
+    cmp qword [r13 + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    jne .heb_blank
+    cmp qword [r13 + linnea_config_location.cache_control_len], 0
+    je .heb_response_headers
+    mov rdi, r15
+    lea rsi, [hdr_cache_control]
+    mov rcx, hdr_cache_control_len
+    rep movsb
+    lea rsi, [r13 + linnea_config_location.cache_control]
+    mov rcx, [r13 + linnea_config_location.cache_control_len]
     rep movsb
     mov r15, rdi
 .heb_response_headers:

@@ -165,6 +165,16 @@ want("armed cache-control", hd.get("cache-control") == "public, max-age=600",
      str(hd))
 want("armed response_headers", hd.get("x-linnea-static") == "policy", str(hd))
 
+# A missing representation is still a response owned by this matched static
+# location. Its cache policy and arbitrary policy fields belong on that 404;
+# this differs from the pre-route and proxy canned errors checked below.
+st, hd, _ = c.request("/no-such-file")
+want("matched 404 status", st == "404", f"{st} {hd}")
+want("matched 404 cache-control",
+     hd.get("cache-control") == "public, max-age=600", str(hd))
+want("matched 404 response_headers",
+     hd.get("x-linnea-static") == "policy", str(hd))
+
 # (3) A routed response on the SAME connection must begin with clean
 #     per-request state too. The redirect owns Location, but it must not inherit
 #     the root location's arbitrary response headers. Before the fix the

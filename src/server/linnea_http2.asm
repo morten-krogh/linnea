@@ -2797,6 +2797,21 @@ h2_serve:
     call h2_enc_hdr
 .no_vary_h2:
     call h2_enc_date_server
+    ; A matched root location owns its error response too. Repeat its cache
+    ; policy just as the success and conditional paths do; pre-route, redirect
+    ; and proxy errors either have no location or a non-root one.
+    mov rax, [rsp + S_LOC]
+    test rax, rax
+    jz .no_cc_error_h2
+    cmp qword [rax + linnea_config_location.kind], LINNEA_LOC_KIND_ROOT
+    jne .no_cc_error_h2
+    mov rcx, [rax + linnea_config_location.cache_control_len]
+    test rcx, rcx
+    jz .no_cc_error_h2
+    mov esi, 24                      ; cache-control
+    lea rdx, [rax + linnea_config_location.cache_control]
+    call h2_enc_hdr
+.no_cc_error_h2:
     mov rsi, [rsp + S_LOC]
     call h2_enc_response_headers
     mov rbp, rdi

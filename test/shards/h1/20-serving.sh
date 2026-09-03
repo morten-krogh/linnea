@@ -78,6 +78,7 @@ check_http "static response_headers name normalized" "x-linnea-static: policy" "
 check_http "static response_headers second field" "referrer-policy: no-referrer" "$resp"
 resp=$(curl -si --max-time 2 http://127.0.0.1:${P61080}/no-such-file)
 check_http "404 server header"   "Server: linnea" "$resp"
+check_http "matched 404 carries cache-control" "Cache-Control: max-age=60" "$resp"
 check_http "matched 404 carries response_headers" "x-linnea-static: policy" "$resp"
 
 resp=$(curl -si --max-time 2 http://127.0.0.1:${P61080}/hello.txt)

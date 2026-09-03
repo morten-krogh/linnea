@@ -576,7 +576,8 @@ linnea_config_validate:
     je .bad_prefix
     cmp byte [rdx + linnea_config_location.prefix], '/'
     jne .bad_prefix
-    ; cache_control is sent verbatim as Cache-Control, on 200 and 304 alike.
+    ; cache_control is sent verbatim as Cache-Control on responses owned by
+    ; this static location, including its conditional and error responses.
     push rax
     push rdi
     push rdx
