@@ -4,6 +4,61 @@ All notable changes to linnea are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project will use
 [semantic versioning](https://semver.org/) from its first tagged release.
 
+## [1.2.0] — 2026-09-05
+
+This release expands linnea's upstream and static-serving capabilities and
+hardens protocol handling throughout the server and prober.
+
+### Added
+- Backend TLS 1.3 with exact SHA-256 SPKI pinning and optional SNI. A failed
+  authentication returns 502 and never falls back to plaintext.
+- HTTP/2 upstream support through `proxy_h2` for HTTP/1.1, HTTP/2 and HTTP/3
+  clients, with request-body flow control and strict response validation.
+- Filesystem Unix-domain socket backends using `unix:/absolute/path`, including
+  mixed TCP/Unix backend pools.
+- Up to eight bounded `response_headers` on static locations, consistently
+  applied to ordinary, range, conditional and error responses across HTTP/1.1,
+  HTTP/2 and HTTP/3.
+- `proxy_client_identity`, which replaces any client-supplied identity field
+  with one canonical `Linnea-Client-Identity` derived from the peer address.
+
+### Changed
+- Local certificate and private-key loading now validates complete PEM, DER,
+  X.509 and PKCS#8 structure; proves that the certificate and key match; checks
+  server authentication and configured names; and verifies a self-signed
+  leaf's signature.
+- Backend HTTP/2 enforces frame, pseudo-header, field, content-length, flow
+  control and stream-state rules before translating a response downstream.
+- Randomness failures now fail closed throughout TLS, QUIC and the prober.
+
+### Fixed
+- Numerous HTTP/1.0, HTTP/1.1, HTTP/2, HTTP/3 and QUIC edge cases found by the
+  protocol audit sweep, including authority parsing, field validation, HTTP
+  date and range overflow handling, stream final sizes and priority parsing.
+- Static `Cache-Control` policy is preserved on error responses.
+
+### Known limitations
+- `proxy_h2` opens one upstream connection for one stream; upstream connection
+  reuse and multiplexing are not implemented yet.
+- An HTTP/3 request with a body sent to a `proxy_h2` location returns 502.
+
+### Release binaries
+
+The stripped x86-64 binaries shipped in `linnea-1.2.0-linux-x86_64.tar.gz` are
+byte-for-byte reproducible from the `v1.2.0` source and hash to:
+
+```
+2856e496c34b26254f24319cad4eda69b546c9f64095dc87c67cff0e4ae5aa20  linnea
+46fd7390a8af2d15d06de40991db634cbb71b8f040876fce0a8e4b861100b73e  linnea-probe
+```
+
+Reproduce and verify:
+
+```sh
+git checkout v1.2.0 && make && strip bin/linnea bin/linnea-probe
+sha256sum bin/linnea bin/linnea-probe
+```
+
 ## [1.1.0] — 2026-08-21
 
 A small, additive release: the server learns to report its own version.

@@ -110,8 +110,8 @@ every commit would make every commit a public release, which is not what a commi
 is. So the release process is a deliberate step, not something on every push:
 
 1. Run the full suite — `./test/run_full_suite.sh` — and make sure it is green.
-2. `make release`, and commit the refreshed `release/` (and bump `VERSION` in the
-   Makefile for a new version).
+2. Bump `LINNEA_VERSION` in `include/linnea_version.inc`, run `make release`,
+   and commit the refreshed `release/`.
 3. Tag, and attach `dist/linnea-<version>-linux-x86_64.tar.gz` to the release.
 
 ## Layout

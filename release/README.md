@@ -84,7 +84,7 @@ compare:
 
 ```sh
 git clone https://github.com/morten-krogh/linnea && cd linnea
-git checkout v1.1.0
+git checkout v1.2.0
 make
 strip bin/linnea bin/linnea-probe
 sha256sum bin/linnea bin/linnea-probe   # match the entries in SHA256SUMS
