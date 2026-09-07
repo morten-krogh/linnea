@@ -57,6 +57,8 @@ dump_maxup:             db " max_upstream="
 dump_maxup_len          equ $ - dump_maxup
 dump_maxbody:           db " max_body="
 dump_maxbody_len        equ $ - dump_maxbody
+dump_maxproxyresp:      db " max_proxy_response="
+dump_maxproxyresp_len   equ $ - dump_maxproxyresp
 dump_server:            db "server "
 dump_server_len         equ $ - dump_server
 dump_host:              db ": host="
@@ -975,6 +977,11 @@ linnea_config_dump:
     mov esi, dump_maxbody_len
     call linnea_print_stdout
     mov rdi, [rbx + linnea_config.max_body]
+    call linnea_print_u64_stdout
+    lea rdi, [dump_maxproxyresp]
+    mov esi, dump_maxproxyresp_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.max_proxy_response]
     call linnea_print_u64_stdout
     lea rdi, [newline]
     mov esi, 1

@@ -1098,11 +1098,10 @@ linnea_h3_proxy_body:
     call linnea_spill_write
     test eax, eax
     js .pb_fail
-    ; linnea_spill_write has no cap of its own — the chunked decoder carries
-    ; one because a request body needed it. A backend answering without a
-    ; length could otherwise fill the disk one response at a time.
+    ; linnea_spill_write has no cap of its own. HTTP/3 captures the complete
+    ; upstream response, so bound it independently from incoming uploads.
     lea rax, [linnea_config_instance]
-    mov rax, [rax + linnea_config.max_body]
+    mov rax, [rax + linnea_config.max_proxy_response]
     cmp [rbx + linnea_connection.spill_len], rax
     ja .pb_fail
     cmp qword [rbx + linnea_connection.body_rem], 0
@@ -1114,7 +1113,7 @@ linnea_h3_proxy_body:
     mov rsi, r12
     mov rdx, r13
     lea rcx, [rbx + linnea_connection.chunk_state]   ; the capture's own state
-    mov r8d, LINNEA_CHUNK_CAPTURE
+    mov r8d, LINNEA_CHUNK_PROXY_CAPTURE
     call linnea_spill_chunked        ; 0 more, 1 done, -1 bad, -2 too large
     cmp eax, 1
     je .pb_done

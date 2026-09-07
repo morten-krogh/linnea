@@ -16,6 +16,8 @@ run_test "location dump"   124 stdout "location 1: prefix=/sub root=$PWD/$WWW" \
 # to check it by
 run_test "max_body dumped"  124 stdout "max_body=1000000" \
     timeout 0.5 $BIN --config $CFG/listen.json
+run_test "max_proxy_response dumped" 124 stdout "max_proxy_response=2000000" \
+    timeout 0.5 $BIN --config $CFG/listen.json
 run_test "bad timeout"     1 stderr "timeout must be between 1 and 3600" \
     $BIN --config $CFG/bad-timeout.json
 run_test "workers dump"    124 stdout "workers=2" \
@@ -238,4 +240,3 @@ run_test "wildcard alias duplicate hostname" 1 stderr "duplicate hostname same.t
 # ...and one endpoint cannot carry two different v6only settings
 run_test "v6only conflict" 1 stderr "servers on one address and port must agree on v6only" \
     $BIN --config $CFG/bad-v6only-conflict.json
-

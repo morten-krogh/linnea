@@ -138,6 +138,17 @@ want("big status", st == "200", str(st))
 want("big length", len(body) == 40000, str(len(body)))
 want("big intact", body == "x" * 40000, f"first bad byte at {next((i for i, c in enumerate(body) if c != 'x'), -1)}")
 
+# Response capture has its own bound. This fixture accepts request bodies only
+# through 200000 bytes, while HTTP/3 may capture responses through 240000.
+# Lowering the upload limit must not silently turn a 210000-byte download into
+# 502; the independently configured response limit must still stop 250000.
+st, hd, body = request("/api/proxycap")
+want("response may exceed max_body", st == "200", str(st))
+want("response above max_body intact", body == "r" * 210000, str(len(body)))
+st, hd, body = request("/api/proxyover")
+want("response past max_proxy_response is 502", st == "502",
+     f"{st} {body[:30]!r}")
+
 # response hop-by-hop fields stop here (RFC 9110 7.6.1); the rest goes on
 st, hd, body = request("/api/hopresp")
 want("hopresp keeps x-kept", hd.get("x-kept") == "yes", str(hd))

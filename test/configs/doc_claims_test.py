@@ -58,7 +58,7 @@ EXAMPLE = {
     "log": os.path.join(D, "access.log"),
     "workers": 4, "timeout": 30, "head_timeout": 10, "drain_timeout": 30,
     "max_connections": 4096, "max_per_ip": 64, "max_upstream": 256,
-    "max_body": 8388608, "http2": 1,
+    "max_body": 8388608, "max_proxy_response": 67108864, "http2": 1,
     "servers": [
         {"host": "0.0.0.0", "port": 61897, "hostname": "example.com",
          "cert": "test/tls/server.crt", "key": "test/tls/server.key",
@@ -1140,6 +1140,11 @@ test(base(max_body=4294967297), "max_body past the old 2**32 guard accepted", Tr
 test(base(max_body=18446744073709551615), "max_body at 2**64-1 accepted", True)
 test(base(max_body=18446744073709551616), "max_body past 64 bits rejected", False,
      "number too large")
+test(base(max_proxy_response=0), "max_proxy_response 0 rejected", False,
+     "max_proxy_response must be at least 1")
+test(base(max_proxy_response=1), "max_proxy_response 1 accepted", True)
+test(base(max_proxy_response=18446744073709551615),
+     "max_proxy_response at 2**64-1 accepted", True)
 
 test(base(timeout=3601), "timeout above 3600 rejected", False)
 test(base(timeout=3600), "timeout at 3600 accepted", True)

@@ -151,3 +151,11 @@ HTTP/1.1, HTTP/2 and HTTP/3 alike — so a backend never sees a partial or slow
 request, and a client that abandons an upload costs the backend nothing. The
 capture is as large as the body, up to `max_body`; `spill_dir` decides whether
 it costs disk or RAM (see [`config.md`](config.md) — put it on a real disk).
+
+## HTTP/3 response capture
+
+An HTTP/3 proxied response is captured whole in `spill_dir` before it is handed
+to the QUIC response stream. `max_proxy_response` bounds that capture. It is
+separate from `max_body`: lowering the request-body limit must not silently
+turn larger downloads into 502 responses. HTTP/1.1 and HTTP/2 relay upstream
+responses incrementally and do not use this whole-response bound.

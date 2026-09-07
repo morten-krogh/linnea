@@ -74,6 +74,8 @@ key_maxup:              db "max_upstream"
 key_maxup_len           equ $ - key_maxup
 key_maxbody:            db "max_body"
 key_maxbody_len         equ $ - key_maxbody
+key_maxproxyresp:       db "max_proxy_response"
+key_maxproxyresp_len    equ $ - key_maxproxyresp
 key_workers:            db "workers"
 key_workers_len         equ $ - key_workers
 key_http2:              db "http2"
@@ -187,6 +189,8 @@ msg_maxup_range:        db "max_upstream must be between 1 and 65536"
 msg_maxup_range_len     equ $ - msg_maxup_range
 msg_maxbody_range:      db "max_body must be at least 1"
 msg_maxbody_range_len   equ $ - msg_maxbody_range
+msg_maxproxyresp_range: db "max_proxy_response must be at least 1"
+msg_maxproxyresp_range_len equ $ - msg_maxproxyresp_range
 msg_workers_range:      db "workers must be between 0 and 256 (0 = one per CPU)"
 msg_workers_range_len   equ $ - msg_workers_range
 msg_http2_range:        db "http2 must be 0 or 1"
@@ -308,6 +312,7 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.rate_limit], LINNEA_DEFAULT_RATE_LIMIT
     mov qword [rbx + linnea_config.max_upstream], LINNEA_DEFAULT_MAX_UPSTREAM
     mov qword [rbx + linnea_config.max_body], LINNEA_DEFAULT_MAX_BODY
+    mov qword [rbx + linnea_config.max_proxy_response], LINNEA_DEFAULT_MAX_PROXY_RESPONSE
     mov qword [rbx + linnea_config.workers], LINNEA_DEFAULT_WORKERS
     mov qword [rbx + linnea_config.http2], 1     ; HTTP/2 on by default (M19)
     push rdi
@@ -435,6 +440,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_maxbody
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_maxproxyresp]
+    mov ecx, key_maxproxyresp_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_maxproxyresp
     mov rdi, r14
     mov rsi, r15
     lea rdx, [key_workers]
@@ -673,6 +685,16 @@ linnea_config_parse:
     mov [rbx + linnea_config.max_body], rax
     jmp .top_sep
 
+.top_maxproxyresp:
+    test r13d, 131072
+    jnz .top_dup
+    or r13d, 131072
+    call linnea_parse_u64
+    test rax, rax
+    jz .maxproxyresp_range
+    mov [rbx + linnea_config.max_proxy_response], rax
+    jmp .top_sep
+
 .top_workers:
     test r13d, 16
     jnz .top_dup
@@ -791,6 +813,10 @@ linnea_config_parse:
 .maxbody_range:
     lea rdi, [msg_maxbody_range]
     mov esi, msg_maxbody_range_len
+    jmp linnea_parse_fail
+.maxproxyresp_range:
+    lea rdi, [msg_maxproxyresp_range]
+    mov esi, msg_maxproxyresp_range_len
     jmp linnea_parse_fail
 .maxup_range:
     lea rdi, [msg_maxup_range]

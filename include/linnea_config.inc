@@ -67,6 +67,9 @@ LINNEA_DEFAULT_MAX_UPSTREAM     equ 256
 ; what stands between one client and the filesystem. 64 MB by default; the
 ; ceiling is a sanity bound on the config value, not a promise of disk.
 LINNEA_DEFAULT_MAX_BODY         equ 67108864
+; HTTP/3 must capture a proxied response before handing it to the QUIC stream.
+; Keep that disk bound independent from the untrusted request-body bound.
+LINNEA_DEFAULT_MAX_PROXY_RESPONSE equ 67108864
 LINNEA_DEFAULT_MAX_CONNECTIONS  equ 1024
 LINNEA_DEFAULT_WORKERS          equ 0     ; 0 = one worker per online CPU
 LINNEA_MAX_WORKERS              equ 256
@@ -246,6 +249,7 @@ struc linnea_config
     .max_per_ip:    resq 1                        ; connections one address may hold
     .max_upstream:  resq 1                        ; upstream connections in flight
     .max_body:      resq 1                        ; largest request body accepted
+    .max_proxy_response: resq 1                   ; largest captured h3 proxy response
     .workers:       resq 1                        ; worker processes; 0 until the
                                                   ; auto count is resolved at startup
     .http2:         resq 1                        ; 1 = offer HTTP/2 via ALPN

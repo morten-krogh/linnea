@@ -717,6 +717,14 @@ def respond(conn, head, body, extra=b""):
         payload = b"x" * 40000
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
                      % (len(payload), payload))
+    elif path.endswith(b"/proxycap"):
+        payload = b"r" * 210000
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
+                     % (len(payload), payload))
+    elif path.endswith(b"/proxyover"):
+        payload = b"r" * 250000
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
+                     % (len(payload), payload))
     elif path.endswith(b"/bighead"):
         filler = b"X-Filler: " + b"y" * 200 + b"\r\n"
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
