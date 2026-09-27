@@ -209,12 +209,17 @@ linnea_spill_chunked:
     ; max_body bounds a REQUEST, so it is applied in capture mode alone: a
     ; relayed response is not a body we are holding, and capping it here would
     ; have turned every download past max_body into a dropped connection.
-    lea rax, [linnea_config_instance]
     cmp ebp, LINNEA_CHUNK_PROXY_CAPTURE
     je .raw_proxy_cap
+    mov rax, [rbx + linnea_connection.location]
+    mov rax, [rax + linnea_config_location.max_body]
+    test rax, rax
+    jnz .raw_cap_ready
+    lea rax, [linnea_config_instance]
     mov rax, [rax + linnea_config.max_body]
     jmp .raw_cap_ready
 .raw_proxy_cap:
+    lea rax, [linnea_config_instance]
     mov rax, [rax + linnea_config.max_proxy_response]
 .raw_cap_ready:
     sub rax, [r15 + linnea_chunk.raw]   ; headroom = max_body - current
@@ -347,12 +352,17 @@ linnea_spill_chunked:
     pop rcx
     test eax, eax
     js .write_failed
-    lea rax, [linnea_config_instance]
     cmp ebp, LINNEA_CHUNK_PROXY_CAPTURE
     je .data_proxy_cap
+    mov rax, [rbx + linnea_connection.location]
+    mov rax, [rax + linnea_config_location.max_body]
+    test rax, rax
+    jnz .data_cap_ready
+    lea rax, [linnea_config_instance]
     mov rax, [rax + linnea_config.max_body]
     jmp .data_cap_ready
 .data_proxy_cap:
+    lea rax, [linnea_config_instance]
     mov rax, [rax + linnea_config.max_proxy_response]
 .data_cap_ready:
     cmp [rbx + linnea_connection.spill_len], rax

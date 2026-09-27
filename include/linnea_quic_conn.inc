@@ -540,6 +540,7 @@ struc linnea_quic_ra
     ; closes -- including if we are killed mid-upload.
     .spill_fd:  resq 1              ; -1 = none opened
     .spill_len: resq 1
+    .max_body:  resq 1              ; largest location cap for the SNI vhost
     ; The window slides. .base is the stream offset buf[0] holds, so .len and
     ; .hi are measured from there rather than from the start of the stream, and
     ; a request is bounded by how much of it is UNCONSUMED at once rather than

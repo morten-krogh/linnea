@@ -1159,6 +1159,7 @@ linnea_parse_server:
 ; proxy and redirect; cache_control is optional (a Cache-Control value sent
 ; on static responses). response_headers=1024 is optional on a root location;
 ; proxy_client_identity=2048 is optional on a proxy location.
+; max_body=4096 is optional on any location (zero means inherit).
 ; A proxy value is validated here and prebuilt into a sockaddr_in.
 linnea_parse_location:
     push rbx
@@ -1170,6 +1171,7 @@ linnea_parse_location:
     xor r12d, r12d             ; key mask
     mov qword [rbx + linnea_config_location.response_header_count], 0
     mov qword [rbx + linnea_config_location.response_header_bytes], 0
+    mov qword [rbx + linnea_config_location.max_body], 0
     mov edi, '{'
     call linnea_parse_expect
 .member_loop:
@@ -1264,6 +1266,13 @@ linnea_parse_location:
     call linnea_string_equal
     test eax, eax
     jnz .key_proxy_h2
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_maxbody]
+    mov ecx, key_maxbody_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_max_body
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     mov rdx, r15
@@ -1339,6 +1348,16 @@ linnea_parse_location:
     cmp rax, 1
     ja .pka_range
     mov [rbx + linnea_config_location.proxy_keepalive], rax
+    jmp .member_sep
+
+.key_max_body:
+    test r12d, 4096
+    jnz .dup
+    or r12d, 4096
+    call linnea_parse_u64
+    test rax, rax
+    jz .maxbody_range
+    mov [rbx + linnea_config_location.max_body], rax
     jmp .member_sep
 
 .key_proxy_client_identity:
@@ -1757,7 +1776,7 @@ linnea_parse_location:
     test r12d, 2
     jz .rh_kind
 .rh_kind_ok:
-    and r12d, ~(16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048) ; optional keys
+    and r12d, ~(16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096) ; optional keys
     cmp r12d, 3                ; prefix + root
     je .done
     cmp r12d, 5                ; prefix + proxy
@@ -1838,6 +1857,10 @@ linnea_parse_location:
 .pka_range:
     lea rdi, [msg_pka]
     mov esi, msg_pka_len
+    jmp linnea_parse_fail
+.maxbody_range:
+    lea rdi, [msg_maxbody_range]
+    mov esi, msg_maxbody_range_len
     jmp linnea_parse_fail
 .pci_range:
     lea rdi, [msg_pci]

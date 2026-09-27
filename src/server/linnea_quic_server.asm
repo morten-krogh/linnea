@@ -45,6 +45,7 @@ struc linnea_quic_vhost
     .srv:      resq 1               ; the config server*, so a request can be
                                     ; routed to a location rather than served
                                     ; under whichever root was registered
+    .max_body: resq 1               ; maximum accepted by any location here
 endstruc
 
 ; Per-connection state lives in the pool slot cur_conn points at. CONNLEA loads
@@ -624,6 +625,29 @@ linnea_quic_add_vhost:
     mov r8, [rdi + linnea_config_server.nosniff]
     mov [rdx + linnea_quic_vhost.nosniff], r8
     mov [rdx + linnea_quic_vhost.srv], rdi
+    ; Before deferred QPACK decoding, an upload can only be assigned to its
+    ; SNI vhost. Cache this vhost's largest location cap; capture later uses
+    ; the maximum across origins that share the connection's certificate.
+    push rbx
+    mov r8, [linnea_config_instance + linnea_config.max_body]
+    mov rcx, [rdi + linnea_config_server.location_count]
+    lea rbx, [rdi + linnea_config_server.locations]
+.av_cap_loop:
+    test rcx, rcx
+    jz .av_cap_done
+    mov rax, [rbx + linnea_config_location.max_body]
+    test rax, rax
+    jz .av_cap_next
+    cmp rax, r8
+    jbe .av_cap_next
+    mov r8, rax
+.av_cap_next:
+    add rbx, linnea_config_location_size
+    dec rcx
+    jmp .av_cap_loop
+.av_cap_done:
+    mov [rdx + linnea_quic_vhost.max_body], r8
+    pop rbx
     inc qword [vhost_count]
 .av_full:
     xor eax, eax
@@ -675,6 +699,43 @@ select_vhost:
 vhost_slot:
     imul rax, rax, linnea_quic_vhost_size
     lea rax, [vhost_tab + rax]
+    ret
+
+; vhost_body_cap(rax = connection SNI vhost index) -> rax = largest cap
+; allowed on any origin this certificate covers. HTTP/3 may coalesce such
+; origins onto one connection; :authority is decoded only after capture.
+vhost_body_cap:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rax
+    call vhost_slot
+    mov r13, [rax + linnea_quic_vhost.max_body]
+    xor r14d, r14d
+.vbc_next:
+    cmp r14, [vhost_count]
+    jae .vbc_done
+    mov rdi, r12
+    mov rsi, r14
+    call vhost_same_cert
+    test eax, eax
+    jz .vbc_skip
+    mov rax, r14
+    call vhost_slot
+    mov rbx, [rax + linnea_quic_vhost.max_body]
+    cmp rbx, r13
+    jbe .vbc_skip
+    mov r13, rbx
+.vbc_skip:
+    inc r14
+    jmp .vbc_next
+.vbc_done:
+    mov rax, r13
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; authority_vhost(rdi = authority ptr, rsi = authority length) -> rax = vhost
@@ -2745,6 +2806,13 @@ linnea_quic_server_datagram:
     ; the body goes to a file of this context's own, not into .buf
     mov qword [rax + linnea_quic_ra.spill_fd], -1
     mov qword [rax + linnea_quic_ra.spill_len], 0
+    push rax
+    mov rcx, [cur_conn]
+    mov rax, [rcx + linnea_quic_conn.vhost]
+    call vhost_body_cap
+    mov r8, rax
+    pop rax
+    mov [rax + linnea_quic_ra.max_body], r8
     mov qword [rax + linnea_quic_ra.base], 0
     mov qword [rax + linnea_quic_ra.body_from], 0
     mov qword [rax + linnea_quic_ra.body_to], 0
@@ -3157,8 +3225,7 @@ linnea_quic_server_datagram:
     ; length) is compared against the headroom rather than added to spill_len
     ; first, so a length near 2^64 cannot wrap the counter past a max_body of
     ; 2^64-1. spill_len <= max_body holds, so the subtraction does not underflow.
-    lea rax, [linnea_config_instance]
-    mov rax, [rax + linnea_config.max_body]
+    mov rax, [rdi + linnea_quic_ra.max_body]
     sub rax, [rdi + linnea_quic_ra.spill_len]   ; headroom = max_body - current
     cmp rcx, rax                                ; declared length > headroom?
     ja .ra_body_toobig          ; the declared payload is past the cap: 413
@@ -3868,8 +3935,10 @@ linnea_quic_server_datagram:
     ; length for both the single-frame and reassembled paths (see the note at the
     ; rate-limit save below); cap it here, before routing, as the one
     ; authoritative check. .req_body_toolarge answers 413 on the stream.
-    lea rax, [linnea_config_instance]
-    cmp r9, [rax + linnea_config.max_body]
+    mov rax, [cur_conn]
+    mov rax, [rax + linnea_quic_conn.vhost]
+    call vhost_body_cap
+    cmp r9, rax
     ja .req_body_toolarge
     ; content-length must equal the sum of the DATA payloads (Finding 18, RFC 9114
     ; 4.1.3). h2 reconciles this at END_STREAM; h3 did not, so a short or long body
@@ -9242,8 +9311,7 @@ ra_body_sink:
     ; headroom rather than adding it to spill_len first, so a length near 2^64
     ; cannot wrap the counter past a max_body of 2^64-1. spill_len <= max_body
     ; holds (rejected before it exceeds), so the subtraction does not underflow.
-    lea rax, [linnea_config_instance]
-    mov rax, [rax + linnea_config.max_body]
+    mov rax, [rbx + linnea_quic_ra.max_body]
     sub rax, [rbx + linnea_quic_ra.spill_len]    ; headroom = max_body - current
     cmp r13, rax                                 ; this run's length > headroom?
     ja .bs_toobig                                ; the cap, not a failure: -2

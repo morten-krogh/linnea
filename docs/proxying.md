@@ -149,8 +149,14 @@ second) so they are never both down together.
 A request body is captured **whole before the backend is contacted** — on
 HTTP/1.1, HTTP/2 and HTTP/3 alike — so a backend never sees a partial or slow
 request, and a client that abandons an upload costs the backend nothing. The
-capture is as large as the body, up to `max_body`; `spill_dir` decides whether
+capture is as large as the body, up to the matched location's `max_body` (or
+the global value when the location has none); `spill_dir` decides whether
 it costs disk or RAM (see [`config.md`](config.md) — put it on a real disk).
+HTTP/3 defers header decoding until a stream completes, so its capture uses
+the largest cap among vhosts sharing the connection's certificate; the matched
+location's exact cap is checked
+before dispatch. With a 12 KiB global cap and a single 16 MiB location on
+Vefruna, the capture itself is bounded at 16 MiB.
 
 ## HTTP/3 response capture
 

@@ -1140,6 +1140,12 @@ test(base(max_body=4294967297), "max_body past the old 2**32 guard accepted", Tr
 test(base(max_body=18446744073709551615), "max_body at 2**64-1 accepted", True)
 test(base(max_body=18446744073709551616), "max_body past 64 bits rejected", False,
      "number too large")
+test(loc([{"prefix": "/", "root": D, "max_body": 16777216}]),
+     "location max_body override accepted", True)
+test(loc([{"prefix": "/", "root": D, "max_body": 0}]),
+     "location max_body zero rejected", False, "max_body must be at least 1")
+test(loc([{"prefix": "/", "root": D, "max_body": 1, "max_body_dup": 2}]),
+     "unknown location body key rejected", False, "unknown key")
 test(base(max_proxy_response=0), "max_proxy_response 0 rejected", False,
      "max_proxy_response must be at least 1")
 test(base(max_proxy_response=1), "max_proxy_response 1 accepted", True)

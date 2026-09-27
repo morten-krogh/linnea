@@ -5,24 +5,26 @@ below the ~17 KiB in_buf, a body of max_body bytes must be served and one byte
 over must be 413 -- for counted and for chunked framing alike, and the refused
 body must never reach the backend.
 
-Usage: max_body_small.py <port> <max_body>.  Prints OK or the first failure.
+Usage: max_body_small.py <port> <max_body> [host].
+Prints OK or the first failure.
 """
 import socket
 import sys
 
 PORT = int(sys.argv[1])
 CAP = int(sys.argv[2])
+HOST = (sys.argv[3] if len(sys.argv) > 3 else "one.test").encode("ascii")
 
 
 def status(body, chunked):
     s = socket.create_connection(("127.0.0.1", PORT), timeout=8)
     s.settimeout(8)
     if chunked:
-        req = (b"POST /api/echo HTTP/1.1\r\nHost: one.test\r\n"
+        req = (b"POST /api/echo HTTP/1.1\r\nHost: " + HOST + b"\r\n"
                b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
                + b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n")
     else:
-        req = (b"POST /api/echo HTTP/1.1\r\nHost: one.test\r\n"
+        req = (b"POST /api/echo HTTP/1.1\r\nHost: " + HOST + b"\r\n"
                b"Content-Length: %d\r\nConnection: close\r\n\r\n" % len(body)) + body
     s.sendall(req)
     data = b""

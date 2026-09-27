@@ -16,6 +16,8 @@ default rel
 %include "linnea_hpack.inc"
 %include "linnea_syscall.inc"
 
+extern linnea_config_instance
+
 global linnea_h3_read_headers
 global linnea_h3_walk_feed
 global linnea_h3_walk_decode
@@ -1067,6 +1069,13 @@ linnea_h3_serve:
     call linnea_config_match_location
     test rax, rax
     jz .notfound                     ; no location claims this path
+    mov rcx, [rax + linnea_config_location.max_body]
+    test rcx, rcx
+    jnz .route_body_cap
+    mov rcx, [linnea_config_instance + linnea_config.max_body]
+.route_body_cap:
+    cmp [rsp + 48], rcx
+    ja .route_body_too_large
     ; TRACE reflects the received request to whoever sent it; through a proxy
     ; that hands the caller its own credentials. Refused before the kinds
     ; diverge, so the answer does not depend on which location matched.
@@ -1131,6 +1140,11 @@ linnea_h3_serve:
     ; and rdx for the path, so they no longer hold it.
     mov rsi, [rsp + 56]
     mov rdx, [rsp + 64]
+    jmp .method_gate
+.route_body_too_large:
+    mov rdi, r12
+    call linnea_h3_build_413
+    jmp .sret
 .method_gate:
     ; A STATIC location answers GET and HEAD and nothing else, exactly as the h1
     ; and h2 static paths do — a PROPFIND, PUT or DELETE against a file used to

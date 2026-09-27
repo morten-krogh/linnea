@@ -1824,6 +1824,10 @@ linnea_http_handle:
     jne .resp_400
     jmp .resp_options
 .not_options_star:
+    ; Select the vhost and normalized location before judging or capturing a
+    ; body. The location can override the process body limit.
+    jmp .route_prepare
+.body_start:
     ; an unknown method is only an error on a static location (405 below);
     ; proxy locations forward whatever the client sent
     ; A body that fits is buffered whole with the head, so both can be
@@ -1919,8 +1923,13 @@ linnea_http_handle:
     ; a chunked body decoded in place, the decoded) length, before the
     ; buffered/streamed split, so both paths honour it. [rsp+128] is the body
     ; length; 0 (no body) never exceeds a nonzero max_body.
+    mov rax, [rsp + 152]
+    mov rax, [rax + linnea_config_location.max_body]
+    test rax, rax
+    jnz .body_cap_ready
     lea rax, [linnea_config_instance]
     mov rax, [rax + linnea_config.max_body]
+.body_cap_ready:
     cmp [rsp + 128], rax
     ja .body_toolarge
     mov rax, [rbx + linnea_connection.head_len]
@@ -1963,6 +1972,8 @@ linnea_http_handle:
     ; keep-alive connection still gets its own.
     mov qword [rbx + linnea_connection.continue_sent], 0
     mov [rbx + linnea_connection.head_len], rax
+    jmp .route_matched
+.route_prepare:
     ; strip the query string for routing; [rsp+144] keeps the raw length
     ; for proxying and the access log
     mov rsi, [rsp + 8]
@@ -2159,6 +2170,8 @@ linnea_http_handle:
     mov [rsp + 152], rax       ; five places downstream re-read the match here
     test rax, rax
     jz .resp_404               ; no location claims this path
+    jmp .body_start
+.route_matched:
     ; TRACE reflects the request it received back to whoever sent it. At an
     ; origin that is a curiosity; through a PROXY it hands the caller whatever
     ; the request carried by the time it arrived -- its own credentials among

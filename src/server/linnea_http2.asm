@@ -587,8 +587,13 @@ linnea_h2_handle:
     ; so a length near 2^64 cannot wrap the counter past a max_body of 2^64-1.
     ; r8 (current) <= max_body holds, so max_body - r8 does not underflow.
     push rcx
+    mov rcx, [rdi + linnea_h2p.location]
+    mov rcx, [rcx + linnea_config_location.max_body]
+    test rcx, rcx
+    jnz .fd_cap_ready
     lea rcx, [linnea_config_instance]
     mov rcx, [rcx + linnea_config.max_body]
+.fd_cap_ready:
     sub rcx, r8                        ; headroom = max_body - current
     cmp rax, rcx                       ; incoming > headroom?
     pop rcx
@@ -2479,8 +2484,13 @@ h2_serve:
     ; so whatever the client declared is what the backend got. Lowering
     ; max_body to bound uploads did nothing on the one protocol browsers use.
     push rax
+    mov rcx, [r13 + linnea_h2p.location]
+    mov rcx, [rcx + linnea_config_location.max_body]
+    test rcx, rcx
+    jnz .proxy_cap_ready
     lea rcx, [linnea_config_instance]
     mov rcx, [rcx + linnea_config.max_body]
+.proxy_cap_ready:
     cmp rax, rcx
     pop rax
     ja .proxy_toolarge

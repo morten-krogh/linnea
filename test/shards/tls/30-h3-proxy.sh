@@ -257,6 +257,13 @@ if [ "$ktls" = 1 ]; then
     # and the point of a cap: the bytes never land
     ! grep -q ' 400000$' "$SEEN"
     check "the refused h2 upload never reached the backend" $?
+    for proto in --http1.1 --http2; do
+        code=$(head -c 12289 /dev/zero | tr '\0' 'c' | curl -s -o /dev/null \
+               -w '%{http_code}' "$proto" --max-time 20 --cacert test/tls/server.crt \
+               -X POST --data-binary @- https://localhost:${P61462}/default/echo)
+        [ "$code" = "413" ]
+        check "$proto upload inherits the 12 KiB global cap ($code)" $?
+    done
     # TWO uploads on ONE connection. Every other h2 upload check is its own
     # curl, i.e. its own connection, and that shape is what let a026f0d ship:
     # every SECOND upload on a connection was refused 413 at 8192 bytes however

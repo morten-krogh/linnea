@@ -135,6 +135,7 @@ struc linnea_config_location
     .prefix:        resb LINNEA_MAX_PREFIX + 1    ; NUL-terminated path prefix
     .prefix_len:    resq 1
     .kind:          resq 1                        ; LINNEA_LOC_KIND_*
+    .max_body:      resq 1                        ; 0 = inherit global max_body
     .root:          resb LINNEA_MAX_ROOT + 1      ; NUL-terminated document root
     .root_len:      resq 1
     ; --- upstreams: .proxy_count of them, in selection order -------------

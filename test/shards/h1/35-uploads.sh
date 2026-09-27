@@ -118,6 +118,32 @@ kill $mbs_pid 2>/dev/null
 wait $mbs_pid 2>/dev/null
 rm -f "$mbs"
 
+# A location may admit a larger body than the global default. Both vhosts
+# share one listener and backend; only the selected location changes the cap.
+mbs=$CFG/max-body-location.json
+cat > "$mbs" <<EOF
+{ "log": "$PWD/$RUNDIR/max-body-location.log", "timeout": 5, "max_connections": 64,
+  "max_body": 64, "workers": 1, "spill_dir": "$PWD/$RUNDIR",
+  "servers": [
+    { "host": "127.0.0.1", "port": ${P61498}, "hostname": "one.test",
+      "locations": [ { "prefix": "/api", "proxy": "127.0.0.1:${P61100}" } ] },
+    { "host": "127.0.0.1", "port": ${P61498}, "hostname": "two.test",
+      "locations": [ { "prefix": "/api", "proxy": "127.0.0.1:${P61100}",
+                       "max_body": 128 } ] }
+  ] }
+EOF
+start_server "$mbs"
+mbs_pid=$SRV_PID
+out=$(python3 test/max_body_small.py ${P61498} 64 one.test 2>&1 | tail -1)
+[ "$out" = "OK" ]
+check "global body cap still applies to an inherited location ($out)" $?
+out=$(python3 test/max_body_small.py ${P61498} 128 two.test 2>&1 | tail -1)
+[ "$out" = "OK" ]
+check "location override applies to counted and chunked bodies ($out)" $?
+kill $mbs_pid 2>/dev/null
+wait $mbs_pid 2>/dev/null
+rm -f "$mbs"
+
 # --- proxied request log lines: upstream status, relayed byte count ---
 grep -qE 'request one\.test from 127\.0\.0\.1:[0-9]+ "GET /api/simple HTTP/1\.1" 200 12' "$LOG"
 check "proxy log 200" $?
@@ -429,4 +455,3 @@ chmod 755 test/spill_fail 2>/dev/null
 kill $spill_pid $h3big_pid $spill_backend_pid 2>/dev/null
 wait $spill_pid 2>/dev/null
 wait $spill_backend_pid 2>/dev/null
-

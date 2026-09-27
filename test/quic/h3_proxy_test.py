@@ -180,6 +180,10 @@ st, hd, body = request("/api/echo", method=b"POST",
                        body=b"z" * 250000)      # the fixture's max_body is 200000
 want("upload past max_body is 413", st == "413", f"{st} {body[:30]!r}")
 
+st, hd, body = request("/default/echo", method=b"POST", body=b"z" * 12289)
+want("h3 inherited 12 KiB location cap is 413", st == "413",
+     f"{st} {body[:30]!r}")
+
 # HEAD is deliberately not checked here. A HEAD response states the content
 # length the GET would have had and carries no body (RFC 9110 9.3.2), and this
 # client cannot accept that: aioquic's H3Connection does not track the request
