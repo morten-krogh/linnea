@@ -1,7 +1,13 @@
 # Exact pattern package ingress limit
 
-Status: proposal for the Vefruna first private Peacock reader flow. This
-document records the shared Linnea configuration contract before code changes.
+Status: documented before implementation, merged to Linnea main, and deployed
+on 2026-09-28. The installed binary SHA-256 is
+`4d43b6d3330057bcc3351a2a095a25993a869f8ec300c302472362c2a85a0b23`;
+the installed config SHA-256 is
+`3967257b54a485d382d7a9b425decde19281772187826fc6b88a7074321f9cbe`.
+The matched rollback files are
+`/usr/local/bin/linnea.pre-20260928-package-route` and
+`/etc/linnea/linnea-tls.json.pre-20260928-package-route`.
 
 Add a third optional `body_limits` rule for `POST
 /projects/{project_id}/pattern-package`, with a maximum configured cap of
@@ -23,3 +29,15 @@ and an adjacent route above the ordinary cap. Production configuration adds
 only the exact package rule to the Vefruna HTTPS server. Release requires a
 matched binary/config backup, `linnea --test`, service restart, and live
 probes. The code and config can be rolled back together.
+
+The focused `make pdf-confirmation-ingress-test` suite passed parser,
+predicate, and isolated HTTP/1.1, HTTP/2, and HTTP/3 boundary/adjacent-route
+probes. The new binary validated the exact production config before install.
+The broader `make test` run was interrupted after its TLS shard ran for more
+than eight minutes without completion; an initial sandboxed run had unrelated
+network-fixture failures. After deployment, fake-project requests of 12,289
+bytes returned app HTTP 400 on the package, source, and confirmation routes
+and Linnea HTTP 413 on the adjacent notes route, over all three protocols.
+The authenticated private Peacock package attachment and reader journey
+passed separately. HTTP/3 remains enabled. The Vefruna app's PDF import
+semantics and package validation are unchanged by this ingress rule.
