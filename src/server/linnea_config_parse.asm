@@ -80,6 +80,8 @@ key_workers:            db "workers"
 key_workers_len         equ $ - key_workers
 key_http2:              db "http2"
 key_http2_len           equ $ - key_http2
+key_http3:              db "http3"
+key_http3_len           equ $ - key_http3
 key_host:               db "host"
 key_host_len            equ $ - key_host
 key_port:               db "port"
@@ -204,6 +206,8 @@ msg_workers_range:      db "workers must be between 0 and 256 (0 = one per CPU)"
 msg_workers_range_len   equ $ - msg_workers_range
 msg_http2_range:        db "http2 must be 0 or 1"
 msg_http2_range_len     equ $ - msg_http2_range
+msg_http3_range:        db "http3 must be 0 or 1"
+msg_http3_range_len     equ $ - msg_http3_range
 msg_host_long:          db "host too long"
 msg_host_long_len       equ $ - msg_host_long
 msg_hostname_long:      db "hostname too long"
@@ -324,6 +328,7 @@ linnea_config_parse:
     mov qword [rbx + linnea_config.max_proxy_response], LINNEA_DEFAULT_MAX_PROXY_RESPONSE
     mov qword [rbx + linnea_config.workers], LINNEA_DEFAULT_WORKERS
     mov qword [rbx + linnea_config.http2], 1     ; HTTP/2 on by default (M19)
+    mov qword [rbx + linnea_config.http3], 1     ; HTTP/3 on by default
     push rdi
     push rsi
     lea rdi, [rbx + linnea_config.spill_dir]
@@ -470,6 +475,13 @@ linnea_config_parse:
     call linnea_string_equal
     test eax, eax
     jnz .top_http2
+    mov rdi, r14
+    mov rsi, r15
+    lea rdx, [key_http3]
+    mov ecx, key_http3_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .top_http3
     lea rdi, [msg_unknown_key]
     mov esi, msg_unknown_key_len
     jmp linnea_parse_fail
@@ -726,6 +738,16 @@ linnea_config_parse:
     cmp rax, 1
     ja .http2_range
     mov [rbx + linnea_config.http2], rax
+    jmp .top_sep
+
+.top_http3:
+    test r13d, 262144
+    jnz .top_dup
+    or r13d, 262144
+    call linnea_parse_u64
+    cmp rax, 1
+    ja .http3_range
+    mov [rbx + linnea_config.http3], rax
 
 .top_sep:
     call linnea_parse_skip_ws
@@ -848,6 +870,10 @@ linnea_config_parse:
 .http2_range:
     lea rdi, [msg_http2_range]
     mov esi, msg_http2_range_len
+    jmp linnea_parse_fail
+.http3_range:
+    lea rdi, [msg_http3_range]
+    mov esi, msg_http3_range_len
     jmp linnea_parse_fail
 .trailing:
     lea rdi, [msg_trailing]

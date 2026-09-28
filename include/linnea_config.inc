@@ -255,6 +255,7 @@ struc linnea_config
     .workers:       resq 1                        ; worker processes; 0 until the
                                                   ; auto count is resolved at startup
     .http2:         resq 1                        ; 1 = offer HTTP/2 via ALPN
+    .http3:         resq 1                        ; 1 = create QUIC listeners
     ; Requests per second one source address may make, 0 = unlimited. The
     ; REQUEST control; max_per_ip is the CONNECTION control, and on h2/h3 the
     ; two are far apart — 64 connections x 100 streams is 6400 requests in

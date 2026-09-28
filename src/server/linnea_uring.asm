@@ -502,6 +502,8 @@ linnea_uring_run:
     ; serve no HTTP/3.
     mov dword [quic_fd], -1
     mov dword [quic_nfd], 0
+    cmp qword [rbx + linnea_config.http3], 0
+    je .quic_done
     xor r12d, r12d
 .quic_scan:
     cmp r12, [rbx + linnea_config.server_count]

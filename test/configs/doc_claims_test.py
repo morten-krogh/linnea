@@ -52,6 +52,12 @@ def loc(l):
     return c
 
 
+test(base(http3=0), "HTTP/3 disabled", True)
+test(base(http3=1), "HTTP/3 explicitly enabled", True)
+test(base(http3=2), "HTTP/3 range", False, "http3 must be 0 or 1")
+test('{"log":"' + D + '/l.log","http3":0,"http3":1,"servers":[{"host":"127.0.0.1","port":61899,"hostname":"x.test","locations":[{"prefix":"/","root":"' + D + '"}]}]}', "HTTP/3 duplicate", False, "duplicate")
+
+
 # --- the documented example, with paths that exist here -----------------
 ex = json.load(open(os.path.join(D, "..", "x"), "r")) if False else None
 EXAMPLE = {

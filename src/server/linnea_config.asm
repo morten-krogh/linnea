@@ -33,6 +33,8 @@ dump_workers:           db " workers="
 dump_workers_len        equ $ - dump_workers
 dump_http2:             db " http2="
 dump_http2_len          equ $ - dump_http2
+dump_http3:             db " http3="
+dump_http3_len          equ $ - dump_http3
 dump_spill:             db " spill_dir="
 dump_spill_len          equ $ - dump_spill
 ; Named on the startup line, and called out when it is tmpfs: that is the
@@ -920,6 +922,11 @@ linnea_config_dump:
     mov esi, dump_http2_len
     call linnea_print_stdout
     mov rdi, [rbx + linnea_config.http2]
+    call linnea_print_u64_stdout
+    lea rdi, [dump_http3]
+    mov esi, dump_http3_len
+    call linnea_print_stdout
+    mov rdi, [rbx + linnea_config.http3]
     call linnea_print_u64_stdout
     lea rdi, [dump_spill]
     mov esi, dump_spill_len
