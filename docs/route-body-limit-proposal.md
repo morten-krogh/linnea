@@ -1,8 +1,8 @@
 # Exact route request-body limits
 
-Status: implemented and tested on local Linnea master for HTTP/1, HTTP/2, and
-HTTP/3. The exact-route rule is not configured or deployed on the live proxy.
-HTTP/3 can remain enabled when the rule is configured.
+Status: implemented and tested on Linnea master for HTTP/1, HTTP/2, and
+HTTP/3. The exact-route rule was deployed for the Vefruna HTTPS vhost on
+2026-09-28. HTTP/3 remains enabled.
 
 Location `max_body` currently applies to the longest matching path prefix on
 HTTP/1, HTTP/2, and HTTP/3. It cannot express a larger cap only for
@@ -78,4 +78,23 @@ The optional global opt-out is top-level `http3: 0`, documented in
 `docs/design/http3-opt-out.md`. It suppresses the QUIC listener and Alt-Svc
 for the entire process. A hot reload can leave old workers' UDP listeners
 active until they drain; a full stop and restart is required for immediate
-exclusion. No live configuration has been changed here.
+exclusion. This opt-out was not used in the Vefruna deployment.
+
+## Vefruna deployment, 2026-09-28
+
+The installed binary was rebuilt from local master `109d97c` and hot reloaded
+with the same listeners. The live `/etc/linnea/linnea-tls.json` keeps global
+`max_body: 12288`, sets the Vefruna HTTPS `/` location to `12288`, and adds
+the single server-level `POST /projects/{project_id}/source` rule at
+`16777216`. HTTP/3 stays at its enabled default. The master PID stayed the
+same and `/proc/<master-pid>/exe` matched the new installed binary.
+
+Public-hostname HTTP/1 and HTTP/2 probes returned 400 from Vefruna for a
+12,289-byte fake-project source request and 413 for the adjacent notes route.
+The HTTP/3 probe returned 200 for `GET /`, 400 for the same fake-project source
+request, 413 for adjacent notes, and 413 for a declared 16 MiB plus one byte
+DATA frame sent without its payload. The Linnea and Hjem host home pages also
+returned 200. These unauthenticated probes verify ingress behavior; they do
+not validate a real project upload or the Vefruna app release. Rollback copies
+are `/usr/local/bin/linnea.pre-exact-route-20260928` and
+`/etc/linnea/linnea-tls.json.pre-exact-route-20260928`.

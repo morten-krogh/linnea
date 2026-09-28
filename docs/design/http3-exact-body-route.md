@@ -1,6 +1,7 @@
 # HTTP/3 exact route body cap design
 
-Status: implemented and tested on local Linnea master; not deployed.
+Status: implemented and tested on Linnea master; deployed for Vefruna's exact
+source-upload rule on 2026-09-28 with HTTP/3 enabled.
 The startup guard was removed after the exact-route HTTP/3 protocol probe,
 same-certificate authority and spill-size checks, and existing HTTP/3 body
 regression checks passed. `http3: 0` remains a supported explicit setting.
