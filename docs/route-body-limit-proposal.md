@@ -1,8 +1,8 @@
-# Exact route request-body limits (proposal)
+# Exact route request-body limits
 
-Status: implemented locally for HTTP/1 and HTTP/2 with an explicit global
-HTTP/3 opt-out requirement. Not merged or deployed. Exact HTTP/3 enforcement
-remains proposed.
+Status: implemented and tested on local Linnea master for HTTP/1, HTTP/2, and
+HTTP/3. The exact-route rule is not configured or deployed on the live proxy.
+HTTP/3 can remain enabled when the rule is configured.
 
 Location `max_body` currently applies to the longest matching path prefix on
 HTTP/1, HTTP/2, and HTTP/3. It cannot express a larger cap only for
@@ -39,25 +39,18 @@ location `max_body` behavior for configurations without `body_limits`.
 
 Implementation is more than a location match change. HTTP/1 checks counted
 bodies in `linnea_http.asm` and chunked capture in `linnea_spill.asm`. HTTP/2
-checks declared lengths and arriving DATA in `linnea_http2.asm`. HTTP/3's QUIC
-reassembly assigns `linnea_quic_ra.max_body` from the **largest cap on the SNI
-vhost before QPACK decodes the method or path**, then may write DATA to a spill
-file before `linnea_http3.asm` routes the request. An exact limit enforced only
-in the HTTP/3 router would already have buffered an over-limit adjacent route.
-The HTTP/3 path must decode and retain enough request headers before allowing
-large body capture, or hold initial DATA under the default cap until it can
-select the scoped limit. This change needs protocol-specific regression tests
-for requests that send HEADERS and DATA in one packet and in separate packets.
+checks declared lengths and arriving DATA in `linnea_http2.asm`. HTTP/3 now
+decodes the first complete HEADERS section before reassembly can capture DATA
+or grant a larger flow window. It validates the serving authority, matches the
+raw method and path for the source exception, and stores the selected cap per
+stream. The one-packet path selects the cap before checking its body too. See
+`docs/design/http3-exact-body-route.md` for the boundary and tests.
 
-The isolated branch now parses this one rule strictly and applies it before
-HTTP/1 counted and chunked capture and HTTP/2 declared and DATA capture. The
-method/path predicate reads the raw request target, so a query or percent
-escape cannot gain the larger cap through routing normalization. Other rules
-and multiple elements are rejected at startup. HTTP/3 exact-route enforcement
-remains unresolved. Startup rejects a config containing `body_limits` unless
-top-level `http3` is explicitly `0`. The global opt-out affects every host
-served by that Linnea process, so deployment requires an explicit decision.
-HTTP/3 otherwise keeps its previous default.
+The parser accepts only this one rule shape and applies it before HTTP/1,
+HTTP/2, and HTTP/3 body capture. The method/path predicate reads the raw
+request target, so a query or percent escape cannot gain the larger cap through
+routing normalization. Other rules and multiple elements are rejected at
+startup. The default `http3: 1` remains available with `body_limits`.
 
 `test/pdf_source_body_limit.py` is a standalone HTTP/1 acceptance probe for an
 isolated Linnea instance with the proposed Vefruna rule. It checks counted and
@@ -70,15 +63,18 @@ config shapes. All passed against isolated local fixtures with an absent test
 backend. `test/pdf_source_body_limit_fixture.py` runs both probes on isolated
 instances with a 16 KiB scoped cap so exact-cap and cap-plus-one cases are
 cheap to repeat. It confirms `http3: 0` leaves the TLS UDP port unbound and omits
-`Alt-Svc` from HTTP/1.1 and HTTP/2 responses. An exact-route HTTP/3 probe
-remains to be implemented with that feature.
+`Alt-Svc` from HTTP/1.1 and HTTP/2 responses. `make pdf-h3-route-test` checks
+the exact route with HTTP/3 enabled, including fragmented HEADERS, cap
+boundaries, route variants, same-certificate authorities, and the adjacent
+route's capture bound. The full `make test` suite passed 1,270 checks after the
+HTTP/3 implementation.
 
 A pure exact-route predicate exists in
 `src/lib/linnea_pdf_source_route.asm`, with `make pdf-route-test` covering
 method, path suffix, query, project ID alphabet and length, and the all-zero
-identifier. The HTTP/1 and HTTP/2 handlers call it before body capture.
+identifier. The HTTP/1, HTTP/2, and HTTP/3 handlers use it before body capture.
 
-The interim control is top-level `http3: 0`, documented in
+The optional global opt-out is top-level `http3: 0`, documented in
 `docs/design/http3-opt-out.md`. It suppresses the QUIC listener and Alt-Svc
 for the entire process. A hot reload can leave old workers' UDP listeners
 active until they drain; a full stop and restart is required for immediate
