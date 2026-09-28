@@ -287,7 +287,7 @@ bin/linnea-quichs: test/quic/linnea_quichs.o $(QUICMSG_OBJS) \
                    src/server/linnea_quic_conn.o src/server/linnea_quic_rtx.o src/server/linnea_quic_server.o \
                    src/server/linnea_quic_debug.o src/server/linnea_log.o src/server/linnea_error.o src/lib/linnea_print.o \
                    src/server/linnea_config.o src/server/linnea_config_parse.o src/server/linnea_network.o \
-                   src/server/linnea_ratelimit.o
+                   src/server/linnea_ratelimit.o src/lib/linnea_pdf_source_route.o
 	$(LD) -o $@ $^
 
 quichs: bin/linnea-quichs
@@ -429,7 +429,7 @@ H3TEST_OBJS = test/quic/linnea_h3test.o src/server/linnea_http3.o src/server/lin
               src/server/linnea_config_parse.o src/server/linnea_network.o \
               src/server/linnea_quic_server.o src/server/linnea_quic_conn.o \
               src/server/linnea_quic_rtx.o src/server/linnea_quic_debug.o \
-              src/server/linnea_ratelimit.o $(QUICP256)
+              src/server/linnea_ratelimit.o src/lib/linnea_pdf_source_route.o $(QUICP256)
 
 test/quic/linnea_h3test.o: test/quic/linnea_h3test.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<
@@ -450,7 +450,7 @@ H3RESP_OBJS = test/quic/linnea_h3resp.o src/server/linnea_http3.o src/server/lin
               src/server/linnea_config_parse.o src/server/linnea_network.o \
               src/server/linnea_quic_server.o src/server/linnea_quic_conn.o \
               src/server/linnea_quic_rtx.o src/server/linnea_quic_debug.o \
-              src/server/linnea_ratelimit.o $(QUICP256)
+              src/server/linnea_ratelimit.o src/lib/linnea_pdf_source_route.o $(QUICP256)
 
 test/quic/linnea_h3resp.o: test/quic/linnea_h3resp.asm $(INCS)
 	$(NASM) $(NASMFLAGS) -o $@ $<

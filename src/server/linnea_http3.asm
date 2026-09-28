@@ -1078,11 +1078,6 @@ linnea_h3_serve:
     call linnea_config_match_location
     test rax, rax
     jz .notfound                     ; no location claims this path
-    mov rcx, [rax + linnea_config_location.max_body]
-    test rcx, rcx
-    jnz .route_body_cap
-    mov rcx, [linnea_config_instance + linnea_config.max_body]
-.route_body_cap:
     ; QUIC has already validated headers, authority and the exact raw route
     ; before capture. Its selected per-stream cap includes body_limits.
     mov rcx, [linnea_h3_request_body_cap]
