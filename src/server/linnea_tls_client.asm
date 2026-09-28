@@ -34,9 +34,9 @@ global linnea_tls_client_handshake
 global linnea_tls_client_app_send
 global linnea_tls_client_app_recv
 global cli_chunk_cap                   ; test knob: cap the blocking recv chunk
-; The per-leg handshake arena pool (linnea_tls_client_pool_init / _hs_for) lives
-; in linnea_tls_client_pool.asm so this object stays free of linnea_memory_map,
-; which the standalone harness cannot link.
+; The handshake arenas a server leg borrows (linnea_leg_tls_get, and the
+; per-connection linnea_tls_client_hs_for) live in linnea_leg_pool.asm, so this
+; object stays free of the pools, which the standalone harness cannot link.
 extern linnea_x25519
 extern linnea_random_bytes
 extern linnea_sha256

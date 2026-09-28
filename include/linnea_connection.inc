@@ -400,6 +400,22 @@ struc linnea_connection
     .up_rx_rectype:  resq 1
     .up_rx_buf:      resq 1    ; the last up-leg read's buffer + length, so a
     .up_rx_len:      resq 1    ; skipped control record re-arms it identically
+    ; --- the upstream leg's borrowed arenas (linnea_leg_pool.asm) ---------
+    ; A proxy_tls/proxy_h2 leg on this connection (an h1 client, or an h3
+    ; relay leg) needs a TLS handshake arena and, for proxy_h2, an h2 driver
+    ; context. They used to be one of each per connection slot, mapped for all
+    ; max_connections at startup -- 1.2 MiB of address space per slot for
+    ; contexts almost no slot ever used. They are borrowed from per-worker
+    ; pools now, only while a leg needs them, and these hold what was
+    ; borrowed (0 = nothing). linnea_connection_free gives both back.
+    .up_hs:          resq 1    ; linnea_tls_client_hs*, handshake only
+    .up_h2c:         resq 1    ; linnea_h2c*, until the response is delivered
+    ; HTTP/2: connection-window credit owed to the client for request-body
+    ; bytes of streams that died before it was sent. It used to live in each
+    ; proxied-stream slot and outlive the slot's tenancy; the slots are pooled
+    ; and handed back on release now, so the debt moves to the connection it is
+    ; owed on. Emitted on stream 0 by linnea_h2p_service.
+    .h2p_owed:       resq 1
     .in_buf:        resb LINNEA_CONN_IN_BUF
     .out_buf:       resb LINNEA_CONN_OUT_BUF
     .up_buf:        resb LINNEA_CONN_UP_BUF

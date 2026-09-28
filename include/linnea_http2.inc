@@ -143,17 +143,40 @@ LINNEA_H2_REQ_ERR    equ -2      ; connection error; the code to report is
 
 ; --- proxy-over-h2 (Q86) --------------------------------------------------
 ; A stream routed to a proxy location runs an h1 exchange with the upstream
-; (fresh connection, Connection: close) through a bounded per-connection pool
-; of upstream slots. Each slot owns a buffer that holds the rewritten request
-; (head + a bounded body) and is then reused for the upstream response. The
-; slots live in one global mmap indexed by connection pool index, so a slot
-; is addressable from an io_uring completion that carries only indices.
-; Concurrent upstream exchanges per connection. Sized for real browser
-; parallelism (six in-flight API calls is common) so a page's requests are
-; not refused and retried; also the most the 3-bit slot field in an op's
-; user_data can address. The buffers are mmap'd lazily, so an idle
-; connection's slots cost address space, not memory.
-LINNEA_H2P_SLOTS      equ 8
+; (fresh connection, Connection: close) through an upstream slot. Each slot
+; owns a buffer that holds the rewritten request (head + a bounded body) and is
+; then reused for the upstream response. A connection addresses its slots by a
+; small index (0 .. LINNEA_H2P_SLOTS-1), so a slot is reachable from an
+; io_uring completion that carries only (connection index, slot index).
+;
+; Proxied streams per connection: as many as the connection may have streams
+; at all. This was 8, while SETTINGS_MAX_CONCURRENT_STREAMS said 100, and it
+; was the binding limit the moment a browser shared one h2 connection across
+; tabs that each held a server-sent-events stream: the ninth tab's stream was
+; refused. It was 8 because the slots were laid out per connection slot at
+; startup (8 x 16.6 KiB of relay buffer, plus 8 backend-leg arenas of 1.26 MiB,
+; for every one of max_connections) and 8 was all that layout could afford.
+;
+; The slots are no longer laid out per connection. A connection holds only a
+; row of LINNEA_H2P_SLOTS pointers (h2p_tab, 800 bytes); a slot is borrowed
+; from the worker's slot pool (linnea_arena.asm) when a proxied stream opens
+; and handed back, pages and all, when it ends. The pool's capacity is
+; max_upstream + max_connections per worker (see linnea_h2p_init): at most
+; max_upstream exchanges can be holding or waiting for a backend connection,
+; and the rest is room for bodies still being collected. A stream that finds
+; the pool empty is refused with REFUSED_STREAM, the connection unharmed.
+LINNEA_H2P_SLOTS      equ LINNEA_H2_MAX_STREAMS
+; The slot index rides in an upstream op's user_data beside the connection
+; index: ((conn index << LINNEA_H2P_SLOT_BITS) | slot) << 8 | tag, in the
+; 24-bit index field the completion loop extracts. 7 bits of slot leave 17 of
+; connection index, which covers max_connections' 65536 ceiling.
+LINNEA_H2P_SLOT_BITS  equ 7
+%if LINNEA_H2P_SLOTS > (1 << LINNEA_H2P_SLOT_BITS)
+  %error "LINNEA_H2P_SLOTS no longer fits the slot field of an upstream op's user_data"
+%endif
+%if (65536 << LINNEA_H2P_SLOT_BITS) > 0x1000000
+  %error "max_connections x LINNEA_H2P_SLOTS no longer fits the 24-bit user_data index"
+%endif
 LINNEA_H2P_BUF        equ 16384   ; slot buffer
 LINNEA_H2P_HEAD_MAX   equ 8192    ; rewritten request head cap (buf[0..) )
 LINNEA_H2P_BODY_OFF   equ 8192    ; request body collects at buf[BODY_OFF..)
@@ -228,7 +251,10 @@ LINNEA_H2P_GRANT_MIN  equ 262144
 ; sized for one upload is still the right opening move for eight concurrent
 ; ones is a flow-control question worth MEASURING, and deliberately not
 ; answered by changing the arithmetic here unmeasured.
-LINNEA_H2_CONN_WINDOW_INC equ LINNEA_H2_INITIAL_WINDOW + LINNEA_H2P_SLOTS * LINNEA_H2P_BODY_MAX
+; The 8 below is the old LINNEA_H2P_SLOTS, written out: the slot count rose to
+; 100 without anyone measuring what that should do to the opening grant, so
+; the grant stays exactly what it was.
+LINNEA_H2_CONN_WINDOW_INC equ LINNEA_H2_INITIAL_WINDOW + 8 * LINNEA_H2P_BODY_MAX
 ; The request-body clock (h1 streaming relay and h2 uploads): the head deadline
 ; keeps running through the body, and every received byte buys this much more
 ; time. 2 ms/byte = a 500 B/s floor — any real uploader outruns it thousands of
@@ -347,12 +373,9 @@ struc linnea_h2p
                                   ; forward LINNEA_BODY_NS_PER_BYTE per received
                                   ; byte (capped at now), failed 408 when it
                                   ; falls head_timeout behind
-    ; Connection-level credit left behind when the slot was freed with body
-    ; bytes still uncredited (the client reset the stream, or the upstream
-    ; failed, mid-upload). The stream is gone, so this can only go out on
-    ; stream 0 — and it must, or the connection window never recovers. It
-    ; outlives the slot's tenancy and is cleared per connection.
-    .rq_owed:   resq 1
+    ; (.rq_owed, the connection-window credit a freed slot still owed, moved
+    ; to the connection as linnea_connection.h2p_owed: a slot goes back to the
+    ; pool when it is freed, so it cannot outlive its tenancy any more.)
     ; The content-length the client declared, or -1 when it declared none.
     ; RFC 9113 8.1.1 makes a body whose DATA payloads do not sum to it
     ; malformed, and that has to be judged at END_STREAM — the streaming path
@@ -373,8 +396,13 @@ struc linnea_h2p
                                   ; access line (.off gets rebased by the
                                   ; buffer compaction, so it cannot serve)
     ; --- proxy_h2 leg: TLS handshake + h2 driver over .fd, then RESP feed ---
-    .leg_lin:   resq 1            ; this slot's linear index (conn.index*SLOTS+slot),
-                                  ; keying its TLS + h2c arenas; set at connect
+    .leg_hs:    resq 1            ; borrowed TLS handshake arena (0 = none),
+                                  ; from the connect until the kTLS handoff
+    .leg_h2c:   resq 1            ; borrowed h2 driver context (0 = none): the
+                                  ; handshake's recv landing, then a proxy_h2
+                                  ; leg's buffered response until the slot ends
+    .conn_idx:  resq 1            ; the connection pool index whose row holds it
+    .slot_idx:  resq 1            ; ...and its index in that row
     .leg_sent:  resq 1            ; TLS handshake out send progress (tls.out)
     .resp_off:  resq 1            ; response body bytes copied ctx.body_buf -> .buf
     ; kTLS RX on .fd: the h2 driver's recv is RECVMSG so a backend NewSessionTicket

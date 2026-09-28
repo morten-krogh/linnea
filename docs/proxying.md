@@ -220,9 +220,29 @@ upstream connection is a descriptor, and linnea raises its own
 `RLIMIT_NOFILE` soft limit to `max_connections + max_upstream` plus the
 listeners at startup, refusing to start if the hard limit is lower. An HTTP/3
 stream's relay also borrows a connection-pool slot (`max_connections`, per
-worker) for its upstream half, and an HTTP/2 connection can relay at most
-eight proxied streams at once (`LINNEA_H2P_SLOTS`); a ninth is refused with
-`REFUSED_STREAM` until one ends.
+worker) for its upstream half.
+
+An HTTP/2 connection relays as many proxied streams at once as it allows
+streams at all — the 100 it advertises as `SETTINGS_MAX_CONCURRENT_STREAMS`,
+the same as HTTP/3 — so a browser sharing one connection across many tabs,
+each holding an event stream, is not refused. (It was eight, `LINNEA_H2P_SLOTS`,
+until the relay slots moved to a pool; the ninth tab's stream was refused.)
+Each proxied h2 stream borrows a 20 KiB relay slot from a per-worker pool of
+`max_connections + max_upstream` from its HEADERS until it ends; when the pool
+is empty a new proxied stream is refused with `REFUSED_STREAM` (the client may
+retry it), and the connection and its other streams carry on. A leg to a
+`proxy_tls` or `proxy_h2` backend likewise borrows its TLS handshake arena and
+h2 driver context from pools of `max_upstream` (see
+[architecture.md](architecture.md#memory-model-no-allocator-no-garbage)); an
+exhausted one answers that request 503 without contacting the backend.
+
+What a stream costs, measured on a 2-CPU, 16 GB host against a Unix-socket
+event-stream backend (`/proc` resident set of the worker; kernel socket buffers
+not included): about 4 KiB per proxied h2 stream (2000 streams over 20
+connections: 9 MiB), about 18 KiB per HTTP/1.1 event-stream connection (2000
+connections: 36 MiB), plus a backend socket each. An idle worker is under
+1 MiB resident at any `max_connections`; see [config.md](config.md) for sizing
+`max_connections` and `max_upstream` for long-lived streams.
 
 ### `max_proxy_response` is no longer used
 

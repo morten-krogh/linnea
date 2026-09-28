@@ -48,7 +48,8 @@ LINNEA_UD_SIGNAL        equ 7          ; signalfd read: SIGTERM = stop now,
 LINNEA_UD_CANCEL        equ 8          ; accept-cancel cqe, always ignored
 LINNEA_UD_QRECV         equ 9          ; datagram on the QUIC (UDP) listener
 LINNEA_UD_QTIMER        equ 10         ; QUIC probe-timeout tick: run the rtx sweep
-; proxy-over-h2 upstream ops: the index field carries (conn index << 3) | slot,
+; proxy-over-h2 upstream ops: the index field carries
+; (conn index << LINNEA_H2P_SLOT_BITS) | slot (linnea_http2.inc),
 ; so a completion can find its upstream slot without touching the connection
 LINNEA_UD_ARETRY        equ 14         ; accept-retry tick after a failed accept
 LINNEA_UD_DRAINTIMER    equ 15         ; the hot upgrade's drain deadline expired

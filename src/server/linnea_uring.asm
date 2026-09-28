@@ -125,14 +125,16 @@ extern linnea_ktls_enable
 extern linnea_tls_client_start
 extern linnea_tls_client_input
 extern linnea_tls_client_hs_for
+extern linnea_up_tls_acquire
+extern linnea_up_tls_release
+extern linnea_up_h2c_acquire
+extern linnea_up_arenas_release
 extern linnea_h2c_ctx_for
 extern linnea_h2c_drv_start
 extern linnea_h2c_drv_on_sent
 extern linnea_h2c_drv_on_recv
 extern linnea_h2c_drv_head
 ; proxy_h2 leg on an h2p slot (h2 clients): per-slot TLS/h2 arenas + response feed
-extern linnea_h2p_tls_hs_for
-extern linnea_h2p_h2c_for
 extern h2p_resp_feed
 extern linnea_ktls_rekey_rx
 extern linnea_ktls_rekey_tx
@@ -146,6 +148,7 @@ extern linnea_h2_conn_free
 extern linnea_h2_pool_active
 extern h2_queue_goaway_pub
 extern linnea_h2p_at
+extern linnea_h2p_linger_done
 extern linnea_h2p_event
 extern linnea_h2p_service
 extern linnea_h2p_conn_close
@@ -812,15 +815,15 @@ linnea_uring_run:
     jmp .on_accept             ; tag 0: no longer the textual fall-through
 
 ; --- proxy-over-h2 upstream completion --------------------------------
-; The index carries (connection index << 3) | slot. The handler advances the
+; The index carries (connection index << LINNEA_H2P_SLOT_BITS) | slot. The handler advances the
 ; exchange and reports whether client-bound frames are now queued; then any
 ; slot still wanting an upstream op is armed. A connection whose slot went
 ; ZOMBIE may already be freed and reused — h2p_event handles that case by
 ; freeing the slot and reporting nothing to send.
 .on_h2up:
     mov r14, r13
-    and r14, 7                 ; slot index
-    shr r13, 3                 ; connection index
+    and r14, (1 << LINNEA_H2P_SLOT_BITS) - 1   ; slot index
+    shr r13, LINNEA_H2P_SLOT_BITS              ; connection index
     mov rdi, r13
     call linnea_connection_at
     mov r12, rax
@@ -831,7 +834,7 @@ linnea_uring_run:
     ; completion is left to the close path (conn_close_now closes the fd and
     ; frees the h2p slots), so just wait.
     cmp qword [r12 + linnea_connection.linger], 0
-    jne .wait
+    jne .h2up_linger
     mov rdi, r12
     mov rsi, r14
     mov edx, [cqe_tag]         ; which upstream op completed
@@ -852,6 +855,17 @@ linnea_uring_run:
     mov rdi, r12               ; nothing to send: make sure a recv is armed
     call h2_arm_recv_once
     jmp .h2up_arm
+.h2up_linger:
+    ; ...but the completion still says the kernel is done with the slot's
+    ; buffer. Without recording that, the slot kept F_INFLIGHT with nothing in
+    ; flight: the close then parked it as a ZOMBIE whose completion had already
+    ; come and gone, and it (with its upstream descriptor) was never freed. That
+    ; cost one of eight fixed slots before; with pooled slots it would be one
+    ; the whole worker never got back.
+    mov rdi, r12
+    mov rsi, r14
+    call linnea_h2p_linger_done
+    jmp .wait
 .h2up_send:
     mov rdi, r12
     call linnea_uring_arm_send
@@ -1837,6 +1851,10 @@ linnea_uring_run:
     je .tunnel_start
 
 .response_done:
+    ; a proxied exchange's borrowed arenas (a proxy_h2 response was sent
+    ; straight out of its driver context) are free once the response is out
+    mov rdi, r12
+    call linnea_up_arenas_release
     mov rdi, [r12 + linnea_connection.file_base]
     test rdi, rdi
     jz .no_unmap
@@ -2287,8 +2305,13 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .connect_tls:
-    mov rdi, [r12 + linnea_connection.index]
-    call linnea_tls_client_hs_for         ; rax = this leg's handshake arena
+    ; the handshake arena is borrowed for the handshake alone (it goes back at
+    ; the kTLS handoff); a full pool fails this one request, 503, before any
+    ; byte reaches the backend
+    mov rdi, r12
+    call linnea_up_tls_acquire            ; rax = this leg's handshake arena
+    test rax, rax
+    jz .leg_pool_full
     mov rdi, rax
     mov r8, [r12 + linnea_connection.location]
     ; ALPN offer: h2 when this is a proxy_h2 backend, else http/1.1. The arena is
@@ -2469,6 +2492,9 @@ linnea_uring_run:
     test rax, rax
     js .tls_hs_ktls_fail
     mov qword [r12 + linnea_connection.up_ktls], 1
+    ; the kernel holds the keys now: the handshake arena is nobody's
+    mov rdi, r12
+    call linnea_up_tls_release
     ; A proxy_h2 backend speaks HTTP/2 over the kTLS socket instead of sending an
     ; h1 request: start the h2 client driver with the head waiting in up_buf.
     mov rax, [r12 + linnea_connection.location]
@@ -2495,8 +2521,12 @@ linnea_uring_run:
     ; large one — file_base owns that mapping and .response_done unmaps it).
     mov r14, [r12 + linnea_connection.out_ptr]
     mov r15, [r12 + linnea_connection.out_rem]
-    mov rdi, [r12 + linnea_connection.index]
-    call linnea_h2c_ctx_for
+    ; the driver context is borrowed until the response it buffers has been
+    ; delivered (.response_done, or the connection's free)
+    mov rdi, r12
+    call linnea_up_h2c_acquire
+    test rax, rax
+    jz .leg_pool_full
     mov rdi, rax
     mov rsi, r14
     mov rdx, r15
@@ -2677,6 +2707,13 @@ linnea_uring_run:
 .h2_leg_err:
     mov esi, 502
     jmp .proxy_fail
+; A backend leg's arena pool (linnea_leg_pool.asm) is exhausted: more legs are
+; mid-handshake or holding a buffered proxy_h2 response than max_upstream. Not
+; the backend's fault -- nothing was sent to it -- so no health strike: 503,
+; the "try again" answer the upstream ceiling gives.
+.leg_pool_full:
+    mov esi, 503
+    jmp .proxy_fail_counted
 .tls_hs_ktls_fail:
     mov esi, 502
     jmp .proxy_fail
@@ -4560,6 +4597,8 @@ linnea_uring_arm_h2p_ops:
     mov rsi, r14
     call linnea_h2p_at
     mov r12, rax
+    test r12, r12
+    jz .ao_next                       ; no slot at this index
     cmp qword [r12 + linnea_h2p.state], LINNEA_H2P_FREE
     je .ao_next                       ; nothing to arm for a free slot
     test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
@@ -4648,11 +4687,7 @@ linnea_uring_arm_h2p_ops:
 .ao_send_tls:
     ; hs.out[leg_sent .. out_len] (rax = sqe; the arena lookups preserve it via
     ; the stack and preserve r12/r13/r14).
-    push rax
-    mov rdi, [r12 + linnea_h2p.leg_lin]
-    call linnea_h2p_tls_hs_for        ; rax = hs
-    mov rdx, rax
-    pop rax
+    mov rdx, [r12 + linnea_h2p.leg_hs]
     lea rcx, [rdx + linnea_tls_client_hs.out]
     add rcx, [r12 + linnea_h2p.leg_sent]
     mov [rax + LINNEA_SQE_ADDR], rcx
@@ -4664,11 +4699,7 @@ linnea_uring_arm_h2p_ops:
     jmp .ao_finish
 .ao_send_h2:
     ; ctx.out_buf[out_sent .. out_len]
-    push rax
-    mov rdi, [r12 + linnea_h2p.leg_lin]
-    call linnea_h2p_h2c_for           ; rax = ctx
-    mov rdx, rax
-    pop rax
+    mov rdx, [r12 + linnea_h2p.leg_h2c]
     lea rcx, [rdx + linnea_h2c.out_buf]
     add rcx, [rdx + linnea_h2c.out_sent]
     mov [rax + LINNEA_SQE_ADDR], rcx
@@ -4767,8 +4798,7 @@ linnea_uring_arm_h2p_ops:
     ; LINNEA_H2P_SLOTS concurrent legs per connection), not the connection's.
     and qword [r12 + linnea_h2p.flags], ~LINNEA_H2P_F_WANT_RECV
     or qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_INFLIGHT
-    mov rdi, [r12 + linnea_h2p.leg_lin]
-    call linnea_h2p_h2c_for           ; rax = ctx
+    mov rax, [r12 + linnea_h2p.leg_h2c]
     push rax
     call linnea_uring_get_sqe_zeroed  ; rax = sqe
     pop rcx                           ; ctx
@@ -4801,9 +4831,9 @@ linnea_uring_arm_h2p_ops:
     mov edx, LINNEA_UD_H2UP_RECV
 
 .ao_finish:
-    ; user_data = ((conn index << 3 | slot) << 8) | tag
+    ; user_data = ((conn index << LINNEA_H2P_SLOT_BITS | slot) << 8) | tag
     mov rcx, r13
-    shl rcx, 3
+    shl rcx, LINNEA_H2P_SLOT_BITS
     or rcx, r14
     shl rcx, 8
     or rcx, rdx

@@ -20,6 +20,7 @@ default rel
 %include "linnea_uring.inc"
 %include "linnea_tls_client.inc"     ; proxy_h2 leg: TLS handshake state
 %include "linnea_h2_client.inc"      ; proxy_h2 leg: h2 driver context + verdicts
+%include "linnea_arena.inc"           ; the proxied-stream slot pool
 
 global linnea_h2_init
 global linnea_h2_handle
@@ -98,6 +99,7 @@ global linnea_h2p_event
 global linnea_h2p_service
 global h2p_resp_feed                 ; proxy_h2 response feed (called from .ao_recv)
 global linnea_h2p_conn_close
+global linnea_h2p_linger_done
 global h2p_compact
 global linnea_h2_busy
 
@@ -121,8 +123,14 @@ extern linnea_upstream_log_oversize
 extern linnea_upstream_mark_unanswered
 extern linnea_upstream_limit
 ; proxy_h2 leg (h2 clients): TLS handshake + h2 driver on the slot .fd
-extern linnea_h2p_tls_hs_for
-extern linnea_h2p_h2c_for
+extern linnea_leg_tls_get
+extern linnea_leg_tls_put
+extern linnea_leg_h2c_get
+extern linnea_leg_h2c_put
+extern linnea_arena_pool_init
+extern linnea_arena_get
+extern linnea_arena_put
+extern linnea_connection_at
 extern linnea_tls_client_start
 extern linnea_tls_client_input
 extern linnea_ktls_enable
@@ -2996,13 +3004,27 @@ h2_serve:
 ; linnea_h2_after_send services whatever became ready meanwhile.
 ; =========================================================================
 
-; linnea_h2p_init(rdi = connection pool size) — map the slot array.
+; linnea_h2p_init(rdi = connection pool size) — map each connection's row of
+; slot pointers, and shape (not map) the pool the slots are borrowed from.
+;
+; The pool's capacity is max_upstream + max_connections. A slot past COLLECT
+; is holding, or about to ask for, a backend connection, of which there are at
+; most max_upstream -- one that finds the ceiling full answers 503 and is gone
+; -- so that many relays can always be served. The max_connections on top is
+; room for request bodies still being collected, which hold a slot but no
+; backend yet: one per connection on average. The pool is a reservation, not a
+; working set: an arena is backed only while a stream holds it.
 linnea_h2p_init:
     push rbx
     mov rbx, rdi
-    imul rdi, rdi, LINNEA_H2P_SLOTS * linnea_h2p_size
+    imul rdi, rdi, LINNEA_H2P_SLOTS * 8
     call linnea_memory_map
-    mov [h2p_pool], rax
+    mov [h2p_tab], rax
+    lea rdi, [h2p_slot_pool]
+    mov esi, linnea_h2p_size
+    mov rdx, rbx
+    add rdx, [linnea_config_instance + linnea_config.max_upstream]
+    call linnea_arena_pool_init
     ; the HPACK decoder's per-connection dynamic table lives in the same
     ; shape: one lazily-mapped array indexed by connection pool index
     mov rdi, rbx
@@ -3034,31 +3056,142 @@ h2_dyn_for:
 .df_ret:
     ret
 
-; linnea_h2p_at(rdi = conn index, rsi = slot index) -> rax = slot*.
+; linnea_h2p_at(rdi = conn index, rsi = slot index) -> rax = slot*, or 0 when
+; that index holds no slot. Clobbers nothing else.
 linnea_h2p_at:
     mov rax, rdi
     imul rax, rax, LINNEA_H2P_SLOTS
     add rax, rsi
-    imul rax, rax, linnea_h2p_size
-    add rax, [h2p_pool]
+    shl rax, 3
+    add rax, [h2p_tab]
+    mov rax, [rax]
     ret
 
-; h2p_alloc(rdi = conn) -> rax = free slot* (0 = none), rdx = its index.
+; h2p_row(rdi = conn) -> rax = its row of LINNEA_H2P_SLOTS slot pointers.
+h2p_row:
+    mov rax, [rdi + linnea_connection.index]
+    imul rax, rax, LINNEA_H2P_SLOTS * 8
+    add rax, [h2p_tab]
+    ret
+
+; h2p_alloc(rdi = conn) -> rax = a new FREE slot* installed in the row (0 =
+; none: every index taken, or the worker's slot pool is empty), rdx = its
+; index. The slot comes zero-filled from the pool. A caller that goes on to
+; refuse the stream leaves it FREE in the row, and the next service pass (or
+; the connection's close) hands it back. A FREE slot still in the row whose
+; release waited out a client send is handed back here too, once no send is
+; in flight -- which is also what lets its index be reused.
 h2p_alloc:
-    mov rdx, [rdi + linnea_connection.index]
-    imul rdx, rdx, LINNEA_H2P_SLOTS
-    imul rax, rdx, linnea_h2p_size
-    add rax, [h2p_pool]
-    xor edx, edx
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    call h2p_row
+    mov r12, rax
+    xor r13d, r13d
 .al_scan:
+    mov rax, [r12 + r13 * 8]
+    test rax, rax
+    jz .al_hit
     cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
-    je .al_hit
-    add rax, linnea_h2p_size
-    inc edx
-    cmp edx, LINNEA_H2P_SLOTS
+    jne .al_next
+    cmp qword [rbx + linnea_connection.h2_tx_busy], 0
+    jne .al_next                     ; a send may still read its buffer
+    mov qword [r12 + r13 * 8], 0
+    lea rdi, [h2p_slot_pool]
+    mov rsi, rax
+    call linnea_arena_put
+    jmp .al_hit
+.al_next:
+    inc r13d
+    cmp r13d, LINNEA_H2P_SLOTS
     jb .al_scan
     xor eax, eax
+    jmp .al_ret
 .al_hit:
+    lea rdi, [h2p_slot_pool]
+    call linnea_arena_get
+    test rax, rax
+    jz .al_ret                       ; the worker's pool is empty: refuse
+    mov [r12 + r13 * 8], rax
+    mov rcx, [rbx + linnea_connection.index]
+    mov [rax + linnea_h2p.conn_idx], rcx
+    mov [rax + linnea_h2p.slot_idx], r13
+    mov dword [rax + linnea_h2p.fd], -1
+    mov dword [rax + linnea_h2p.rq_fd], -1
+.al_ret:
+    mov rdx, r13
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; h2p_put(rax = slot*) — the end of a slot's tenancy, after h2p_release or
+; h2p_free_slot has scrubbed it to FREE: give back the leg arenas it borrowed
+; and the slot itself. Unless a client send may still be reading its buffer
+; (every DATA frame of a proxied body is sent straight out of it, and a stream
+; can be reset while one is in flight): then the slot stays FREE in the row and
+; goes back once the send has drained (h2p_alloc, linnea_h2p_service,
+; linnea_h2p_conn_close). Handing it back early would give the in-flight send
+; another stream's bytes -- possibly another client's -- to put on the wire.
+; Preserves rax (the pointer, which may no longer be the slot's to use).
+h2p_put:
+    push rax
+    push rbx
+    mov rbx, rax
+    mov rdi, [rbx + linnea_h2p.leg_hs]
+    mov qword [rbx + linnea_h2p.leg_hs], 0
+    call linnea_leg_tls_put
+    mov rdi, [rbx + linnea_h2p.leg_h2c]
+    mov qword [rbx + linnea_h2p.leg_h2c], 0
+    call linnea_leg_h2c_put
+    mov rdi, [rbx + linnea_h2p.conn_idx]
+    call linnea_connection_at
+    mov rcx, [rax + linnea_connection.gen]
+    cmp rcx, [rbx + linnea_h2p.gen]
+    jne .put_now                     ; its connection is gone, and a closing h2
+                                     ; connection waits out its sends first
+    cmp qword [rax + linnea_connection.h2_tx_busy], 0
+    jne .put_ret                     ; parked FREE; returned once the send drains
+.put_now:
+    mov rax, [rbx + linnea_h2p.conn_idx]
+    imul rax, rax, LINNEA_H2P_SLOTS
+    add rax, [rbx + linnea_h2p.slot_idx]
+    shl rax, 3
+    add rax, [h2p_tab]
+    cmp [rax], rbx
+    jne .put_ret                     ; not in its row: never hand back twice
+    mov qword [rax], 0
+    lea rdi, [h2p_slot_pool]
+    mov rsi, rbx
+    call linnea_arena_put
+.put_ret:
+    pop rbx
+    pop rax
+    ret
+
+; h2p_owe(rax = slot*, rcx = bytes) — connection-window credit the slot's
+; stream can no longer carry: owe it on stream 0 of the slot's connection, if
+; that connection is still the one the stream belonged to. (It used to be
+; parked in the slot and survived a close, so a zombie freed after its
+; connection was gone credited the NEXT client of that pool slot.) Preserves rax.
+h2p_owe:
+    test rcx, rcx
+    jz .ow_ret
+    push rax
+    push rcx
+    mov rdi, [rax + linnea_h2p.conn_idx]
+    call linnea_connection_at
+    pop rcx
+    pop rdx                          ; the slot
+    push rdx
+    mov rdx, [rdx + linnea_h2p.gen]
+    cmp rdx, [rax + linnea_connection.gen]
+    jne .ow_gone
+    add [rax + linnea_connection.h2p_owed], rcx
+.ow_gone:
+    pop rax
+.ow_ret:
     ret
 
 ; h2p_find_collect(rdi = conn, esi = stream id) -> rax = slot* still taking
@@ -3069,22 +3202,25 @@ h2p_alloc:
 ; accepting DATA behind that — and with it the FREE and ZOMBIE exclusions that
 ; only mattered because a stale flag could otherwise answer for a dead slot.
 h2p_find_collect:
-    mov rax, [rdi + linnea_connection.index]
-    imul rax, rax, LINNEA_H2P_SLOTS
-    imul rax, rax, linnea_h2p_size
-    add rax, [h2p_pool]
-    mov ecx, LINNEA_H2P_SLOTS
+    push rdx                         ; callers keep a live value here; this
+    call h2p_row                     ; used to clobber only rax and rcx
+    mov rdx, rax
+    xor ecx, ecx
 .fc_scan:
+    mov rax, [rdx + rcx * 8]
+    test rax, rax
+    jz .fc_next
     cmp [rax + linnea_h2p.sid], rsi
     jne .fc_next
     cmp qword [rax + linnea_h2p.state], LINNEA_H2P_COLLECT
     je .fc_hit
 .fc_next:
-    add rax, linnea_h2p_size
-    dec ecx
-    jnz .fc_scan
+    inc ecx
+    cmp ecx, LINNEA_H2P_SLOTS
+    jb .fc_scan
     xor eax, eax
 .fc_hit:
+    pop rdx
     ret
 
 ; h2p_kill(rdi = conn, esi = stream id) — abandon any upstream exchange for
@@ -3094,28 +3230,30 @@ h2p_find_collect:
 h2p_kill:
     push rbx
     push r12
-    mov rax, [rdi + linnea_connection.index]
-    imul rax, rax, LINNEA_H2P_SLOTS
-    imul rax, rax, linnea_h2p_size
-    add rax, [h2p_pool]
+    push r13
+    call h2p_row
+    mov rbx, rax                     ; the row
+    mov r13, rsi                     ; the stream id, past the releases' calls
     ; the counter must be callee-saved: h2p_release issues a syscall, which
     ; clobbers rcx (and r11). A count kept in ecx would become a text address
-    ; after the first release and the scan would run off the pool.
-    mov r12d, LINNEA_H2P_SLOTS
+    ; after the first release and the scan would run off the row.
+    xor r12d, r12d
 .k_scan:
+    mov rax, [rbx + r12 * 8]
+    test rax, rax
+    jz .k_next
     cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
     je .k_next
     cmp qword [rax + linnea_h2p.state], LINNEA_H2P_ZOMBIE
     je .k_next
-    cmp [rax + linnea_h2p.sid], rsi
+    cmp [rax + linnea_h2p.sid], r13
     jne .k_next
-    mov rbx, rax
     call h2p_release
-    mov rax, rbx
 .k_next:
-    add rax, linnea_h2p_size
-    dec r12d
-    jnz .k_scan
+    inc r12d
+    cmp r12d, LINNEA_H2P_SLOTS
+    jb .k_scan
+    pop r13
     pop r12
     pop rbx
     ret
@@ -3193,7 +3331,7 @@ h2p_release:
     mov rdx, [rax + linnea_h2p.rq_wr]
     sub rdx, [rax + linnea_h2p.rq_rd]
     add rcx, rdx
-    add [rax + linnea_h2p.rq_owed], rcx
+    call h2p_owe                     ; preserves rax
 .rel_owed_done:
     mov qword [rax + linnea_h2p.rq_rd], 0
     mov qword [rax + linnea_h2p.rq_wr], 0
@@ -3201,7 +3339,7 @@ h2p_release:
     mov qword [rax + linnea_h2p.rq_buf], 0
     mov qword [rax + linnea_h2p.sid], 0
     mov qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
-    ret
+    jmp h2p_put                      ; the tenancy is over (preserves rax)
 .rel_zombie:
     ; the kernel may still write into the buffer: shut the socket down so the
     ; op completes promptly, and let that completion close and free
@@ -3217,29 +3355,54 @@ h2p_release:
     mov qword [rax + linnea_h2p.state], LINNEA_H2P_ZOMBIE
     ret
 
+; linnea_h2p_linger_done(rdi = conn, rsi = slot index) — an upstream op of
+; this connection completed while its lingering close owns the teardown, so
+; the loop does not run the exchange. It only records that the kernel is done
+; with the slot: F_INFLIGHT comes off (the close then frees the slot outright)
+; and a slot already parked as a ZOMBIE for exactly this completion is freed.
+linnea_h2p_linger_done:
+    push rbx
+    mov rdi, [rdi + linnea_connection.index]
+    call linnea_h2p_at
+    test rax, rax
+    jz .ld_ret
+    mov rbx, rax
+    and qword [rbx + linnea_h2p.flags], ~LINNEA_H2P_F_INFLIGHT
+    cmp qword [rbx + linnea_h2p.state], LINNEA_H2P_ZOMBIE
+    jne .ld_ret
+    call h2p_free_slot
+.ld_ret:
+    pop rbx
+    ret
+
 ; linnea_h2p_conn_close(rdi = conn) — release every slot of a dying
 ; connection. Called from the io_uring teardown beside linnea_h2_conn_free.
 linnea_h2p_conn_close:
     push rbx
     push r12
-    mov rax, [rdi + linnea_connection.index]
-    imul rax, rax, LINNEA_H2P_SLOTS
-    imul rax, rax, linnea_h2p_size
-    add rax, [h2p_pool]
-    mov r12d, LINNEA_H2P_SLOTS
-.cc_scan:
-    mov qword [rax + linnea_h2p.rq_owed], 0   ; the connection it was owed to
-    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
-    je .cc_next
-    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_ZOMBIE
-    je .cc_next
+    push r13
+    mov r13, rdi
+    call h2p_row
     mov rbx, rax
-    call h2p_release
-    mov rax, rbx
+    xor r12d, r12d
+.cc_scan:
+    mov rax, [rbx + r12 * 8]
+    test rax, rax
+    jz .cc_next
+    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_ZOMBIE
+    je .cc_next                      ; its completion frees it, later
+    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
+    je .cc_put                       ; parked behind a send that has drained
+    call h2p_release                 ; -> FREE and handed back, or ZOMBIE
+    jmp .cc_next
+.cc_put:
+    call h2p_put
 .cc_next:
-    add rax, linnea_h2p_size
-    dec r12d
-    jnz .cc_scan
+    inc r12d
+    cmp r12d, LINNEA_H2P_SLOTS
+    jb .cc_scan
+    mov qword [r13 + linnea_connection.h2p_owed], 0   ; owed to a peer now gone
+    pop r13
     pop r12
     pop rbx
     ret
@@ -3691,22 +3854,14 @@ h2p_retry_pooled:
     pop rbx
     ret
 
-; --- proxy_h2 leg helpers: the slot's fixed position in h2p_pool encodes its
-; linear index (conn.index*SLOTS + slot), which keys its TLS + h2c arenas. This
-; avoids threading the (conn,slot) pair through the event handler. rbx = slot*.
-h2p_leg_linear:
-    mov rax, rbx
-    sub rax, [h2p_pool]
-    xor edx, edx
-    mov rcx, linnea_h2p_size
-    div rcx
-    ret
+; --- proxy_h2 leg helpers: the arenas the leg borrowed at its TLS connect
+; (see .ev_connect_tls), kept in the slot. rbx = slot*.
 h2p_slot_hs:                          ; -> rax = linnea_tls_client_hs
-    mov rdi, [rbx + linnea_h2p.leg_lin]
-    jmp linnea_h2p_tls_hs_for
+    mov rax, [rbx + linnea_h2p.leg_hs]
+    ret
 h2p_slot_ctx:                         ; -> rax = linnea_h2c driver context
-    mov rdi, [rbx + linnea_h2p.leg_lin]
-    jmp linnea_h2p_h2c_for
+    mov rax, [rbx + linnea_h2p.leg_h2c]
+    ret
 
 ; linnea_h2p_event(rdi = conn, rsi = slot index, edx = op tag, ecx = result)
 ;   -> rax = 1 when the connection has frames to flush (out_ptr/out_rem set),
@@ -3723,6 +3878,10 @@ linnea_h2p_event:
     mov rdi, [rdi + linnea_connection.index]
     call linnea_h2p_at
     mov rbx, rax                     ; slot*
+    test rbx, rbx
+    jz .ev_noslot                    ; nothing at that index: a slot with an op
+                                     ; in flight is never handed back, so this
+                                     ; completion has no one left to tell
     and qword [rbx + linnea_h2p.flags], ~LINNEA_H2P_F_INFLIGHT
     ; the connection this exchange belonged to may have closed — and its pool
     ; slot may already serve a different client. Anything but an exact
@@ -3848,11 +4007,26 @@ linnea_h2p_event:
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
     jmp .ev_service
 .ev_connect_tls:
-    call h2p_leg_linear               ; rbx = slot -> rax = linear slot index
-    mov [rbx + linnea_h2p.leg_lin], rax
-    mov rdi, rax
-    call linnea_h2p_tls_hs_for        ; rax = this leg's TLS handshake arena
-    mov rdi, rax
+    ; Borrow the leg's arenas: the handshake state, and the h2 driver context
+    ; whose out_buf the handshake's reads land in (and which a proxy_h2 leg then
+    ; drives). A reconnect after a failed connect keeps what it already holds.
+    ; A full pool fails this one stream -- 503, before any byte reached the
+    ; backend, and no health strike: the backend was never asked.
+    cmp qword [rbx + linnea_h2p.leg_hs], 0
+    jne .ev_ct_have_hs
+    call linnea_leg_tls_get
+    mov [rbx + linnea_h2p.leg_hs], rax
+    test rax, rax
+    jz .ev_leg_pool_full
+.ev_ct_have_hs:
+    cmp qword [rbx + linnea_h2p.leg_h2c], 0
+    jne .ev_ct_have_ctx
+    call linnea_leg_h2c_get
+    mov [rbx + linnea_h2p.leg_h2c], rax
+    test rax, rax
+    jz .ev_leg_pool_full
+.ev_ct_have_ctx:
+    mov rdi, [rbx + linnea_h2p.leg_hs]
     mov r8, [rbx + linnea_h2p.location]
     ; ALPN offer: h2 when this is a proxy_h2 backend, else http/1.1. The arena is
     ; reused, so set it every connect (stale otherwise) — the same rule the h1/h3
@@ -3898,6 +4072,9 @@ linnea_h2p_event:
     cmp r14d, -LINNEA_ECANCELED
     je .ev_timeout_counted
     jmp .ev_bad_gateway_counted
+.ev_leg_pool_full:
+    mov qword [rbx + linnea_h2p.status], 503
+    jmp .ev_fail
 
 .ev_send:
     cmp qword [rbx + linnea_h2p.state], LINNEA_H2P_TLS
@@ -4069,6 +4246,10 @@ linnea_h2p_event:
     test rax, rax
     js .ev_bad_gateway
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_KTLS
+    ; the kernel holds the keys: the handshake arena is nobody's now
+    mov rdi, [rbx + linnea_h2p.leg_hs]
+    mov qword [rbx + linnea_h2p.leg_hs], 0
+    call linnea_leg_tls_put
     ; A plain proxy_tls backend speaks HTTP/1.1 over the socket kTLS now owns, so
     ; the leg rejoins the ordinary SENDING/HEAD/RELAY path from here: the request
     ; head is already in .buf and the send needs no change (kTLS encrypts what we
@@ -4076,6 +4257,11 @@ linnea_h2p_event:
     mov rax, [rbx + linnea_h2p.location]
     cmp qword [rax + linnea_config_location.proxy_h2], 0
     jne .ev_tls_handoff_h2
+    ; ...and a plain TLS leg reads into .buf from here on, so the driver
+    ; context its handshake reads landed in goes back as well
+    mov rdi, [rbx + linnea_h2p.leg_h2c]
+    mov qword [rbx + linnea_h2p.leg_h2c], 0
+    call linnea_leg_h2c_put
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_SENDING
     or qword [rbx + linnea_h2p.flags], LINNEA_H2P_F_WANT_SEND
     jmp .ev_service
@@ -4156,6 +4342,7 @@ linnea_h2p_event:
 .ev_stale:
     ; a completion for a previous incarnation of this connection slot
     call h2p_free_slot
+.ev_noslot:
     mov rax, -1                      ; the caller must not touch the connection
     jmp .ev_ret
 .ev_zombie:
@@ -4199,14 +4386,16 @@ h2p_free_slot:
     ; Skipping F_REQ_FILE would leak up to GRANT_MIN of connection window per
     ; aborted upload.
     mov rcx, [rbx + linnea_h2p.rq_credit]
-    add [rbx + linnea_h2p.rq_owed], rcx
+    mov rax, rbx
+    call h2p_owe                     ; only if its connection is still there
     mov qword [rbx + linnea_h2p.rq_rd], 0
     mov qword [rbx + linnea_h2p.rq_wr], 0
     mov qword [rbx + linnea_h2p.rq_credit], 0
     mov qword [rbx + linnea_h2p.rq_buf], 0
     mov qword [rbx + linnea_h2p.sid], 0
     mov qword [rbx + linnea_h2p.state], LINNEA_H2P_FREE
-    ret
+    mov rax, rbx
+    jmp h2p_put                      ; the tenancy is over
 
 ; ============================================================================
 ; proxy_h2 response feed: present the driver's buffered h1 response (head in the
@@ -4218,8 +4407,7 @@ h2p_resp_begin:
     push rbx
     push r12
     mov rbx, rdi
-    mov rdi, [rbx + linnea_h2p.leg_lin]
-    call linnea_h2p_h2c_for
+    mov rax, [rbx + linnea_h2p.leg_h2c]
     mov r12, rax                      ; ctx
     mov rdi, r12
     lea rsi, [rbx + linnea_h2p.buf]
@@ -4262,8 +4450,7 @@ h2p_resp_feed:
     push r12
     push r13
     mov rbx, rdi
-    mov rdi, [rbx + linnea_h2p.leg_lin]
-    call linnea_h2p_h2c_for
+    mov rax, [rbx + linnea_h2p.leg_h2c]
     mov r12, rax                      ; ctx
     mov r13, [r12 + linnea_h2c.body_len]
     sub r13, [rbx + linnea_h2p.resp_off]     ; remaining body
@@ -4323,12 +4510,21 @@ linnea_h2p_service:
     cmp qword [rbx + linnea_connection.h2_tx_busy], 0
     jne .sv_none                     ; out_buf is in flight; retry on drain
     lea r15, [rbx + linnea_connection.out_buf]   ; write cursor
-    mov rax, [rbx + linnea_connection.index]
-    imul rax, rax, LINNEA_H2P_SLOTS
-    imul rax, rax, linnea_h2p_size
-    add rax, [h2p_pool]
-    mov r12, rax                     ; slot cursor
-    mov r13d, LINNEA_H2P_SLOTS
+    ; credit dead streams' request bodies back on the connection window. The
+    ; streams are gone, so stream 0 is the only place it can go, and without it
+    ; one aborted upload leaves the connection window short for good. It is the
+    ; first thing in an empty out_buf, so it always has room.
+    mov r14, [rbx + linnea_connection.h2p_owed]
+    test r14, r14
+    jz .sv_no_owed
+    mov qword [rbx + linnea_connection.h2p_owed], 0
+    mov rdi, r15
+    xor esi, esi                     ; stream 0 only
+    mov edx, r14d
+    call h2p_emit_window
+    add r15, rax
+.sv_no_owed:
+    xor r13d, r13d                   ; slot index in the connection's row
 .sv_scan:
     ; a translated HEADERS frame has to fit whole (see LINNEA_H2P_HEAD_ROOM);
     ; if it cannot, stop and let the next pass emit it
@@ -4336,24 +4532,17 @@ linnea_h2p_service:
     sub rax, r15
     cmp rax, LINNEA_H2P_HEAD_ROOM
     jb .sv_done
-    ; credit a dead stream's request body back on the connection window. This
-    ; outlives the slot, so it runs before the free-slot skip below: the stream
-    ; is gone, so stream 0 is the only place it can go, and without it one
-    ; aborted upload leaves the connection window short for good.
-    mov r14, [r12 + linnea_h2p.rq_owed]
-    test r14, r14
-    jz .sv_no_owed
-    mov qword [r12 + linnea_h2p.rq_owed], 0
-    mov rdi, r15
-    xor esi, esi                     ; stream 0 only
-    mov edx, r14d
-    call h2p_emit_window
-    add r15, rax
-.sv_no_owed:
+    mov rdi, rbx
+    call h2p_row
+    mov r12, [rax + r13 * 8]
+    test r12, r12
+    jz .sv_next                      ; no slot at this index
     ; a free slot keeps no flags worth acting on: skip it before the credit
-    ; and readiness tests below, so a stale bit cannot resurrect it
+    ; and readiness tests below, so a stale bit cannot resurrect it. One still
+    ; in the row was parked behind a client send; no send is in flight during
+    ; this pass, so it goes back to the pool now.
     cmp qword [r12 + linnea_h2p.state], LINNEA_H2P_FREE
-    je .sv_next
+    je .sv_free
     ; a zombie belongs to a connection that is already gone — it is parked only
     ; until its in-flight op completes. Its sid names a stream this connection
     ; never opened, so acting on its readiness flags or its stream-level credit
@@ -4401,9 +4590,9 @@ linnea_h2p_service:
     test qword [r12 + linnea_h2p.flags], LINNEA_H2P_F_HEAD_RDY
     jnz .sv_head
 .sv_next:
-    add r12, linnea_h2p_size
-    dec r13d
-    jnz .sv_scan
+    inc r13d
+    cmp r13d, LINNEA_H2P_SLOTS
+    jb .sv_scan
 .sv_done:
     lea rax, [rbx + linnea_connection.out_buf]
     mov rcx, r15
@@ -4425,6 +4614,11 @@ linnea_h2p_service:
     pop r12
     pop rbx
     ret
+
+.sv_free:
+    mov rax, r12
+    call h2p_put
+    jmp .sv_next
 
 .sv_reap:
     ; its last DATA frame has drained: the buffer is nobody's now. The
@@ -6131,6 +6325,9 @@ h2_schedule:
     pop r14
     pop r13
     pop rbx
+    test rax, rax
+    jz .scan_next                    ; its slot has been handed back: nothing
+                                     ; of it is left to frame
     mov rcx, [rax + linnea_h2p.wr]
     sub rcx, [rax + linnea_h2p.off]  ; decoded bytes not yet framed
     mov [r15 + linnea_h2_stream.body_rem], rcx
@@ -6270,6 +6467,8 @@ h2_schedule:
     pop r14
     pop r13
     pop rbx
+    test rax, rax
+    jz .emit_static                  ; (cannot happen: the scan just read it)
     add [rax + linnea_h2p.off], r14
     add [rax + linnea_h2p.lg_bytes], r14   ; body bytes framed, for the access line
     test qword [rax + linnea_h2p.flags], LINNEA_H2P_F_BODY_DONE
@@ -6802,17 +7001,18 @@ linnea_h2_busy:
     pop rdi
     test eax, eax
     jnz .busy_yes
-    mov rax, [rdi + linnea_connection.index]      ; any upstream slot still live
-    imul rax, rax, LINNEA_H2P_SLOTS
-    imul rax, rax, linnea_h2p_size
-    add rax, [h2p_pool]
-    mov ecx, LINNEA_H2P_SLOTS
+    call h2p_row                     ; any upstream slot still live
+    xor ecx, ecx
 .busy_scan:
-    cmp qword [rax + linnea_h2p.state], LINNEA_H2P_FREE
+    mov rdx, [rax + rcx * 8]
+    test rdx, rdx
+    jz .busy_next
+    cmp qword [rdx + linnea_h2p.state], LINNEA_H2P_FREE
     jne .busy_yes
-    add rax, linnea_h2p_size
-    dec ecx
-    jnz .busy_scan
+.busy_next:
+    inc ecx
+    cmp ecx, LINNEA_H2P_SLOTS
+    jb .busy_scan
     xor eax, eax
     ret
 .busy_yes:
@@ -6997,7 +7197,10 @@ h2_hdrs_buf:  resb 8192              ; proxy: the rebuilt h1 header lines
 h2_cookie_buf: resb 8192             ; proxy: split cookie fields joined "; " (Finding 32)
 h2_req_es:    resd 1                 ; END_STREAM was set on the HEADERS frame
 h2_req_trail: resq 1                 ; ...and that HEADERS was a trailer section
-h2p_pool:     resq 1                 ; the upstream slot array (one mmap)
+h2p_tab:      resq 1                 ; per connection, a row of LINNEA_H2P_SLOTS
+                                     ; slot pointers (0 = no slot at that index)
+alignb 8
+h2p_slot_pool: resb linnea_arena_pool_size   ; where the slots are borrowed from
 h2_dyn_pool:  resq 1                 ; per-connection HPACK dynamic tables
 h2_hb_pool:    resq 1                ; per-connection header-block assembly +
                                      ; HPACK decode scratch (LINNEA_H2_HB_AREA)

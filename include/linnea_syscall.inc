@@ -22,6 +22,7 @@ LINNEA_SYS_PWRITE64  equ 18      ; write at an explicit offset, without moving
                                  ; the file position a sequential write uses
 LINNEA_SYS_MMAP      equ 9
 LINNEA_SYS_MUNMAP    equ 11
+LINNEA_SYS_MADVISE   equ 28
 LINNEA_SYS_RT_SIGACTION equ 13
 LINNEA_SYS_RT_SIGPROCMASK equ 14
 LINNEA_SYS_RT_SIGRETURN equ 15
@@ -113,6 +114,8 @@ LINNEA_MAP_SHARED    equ 1
 LINNEA_MAP_PRIVATE   equ 2
 LINNEA_MAP_ANONYMOUS equ 0x20
 LINNEA_MAP_POPULATE  equ 0x8000
+LINNEA_MAP_NORESERVE equ 0x4000
+LINNEA_MADV_DONTNEED equ 4
 
 LINNEA_STAT_ST_MODE  equ 24   ; offset of st_mode in struct stat, x86-64
 LINNEA_STAT_ST_SIZE  equ 48   ; offset of st_size in struct stat, x86-64

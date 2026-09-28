@@ -150,7 +150,7 @@ def main():
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", int(TARGET)))
-    srv.listen(64)
+    srv.listen(512)          # a hundred streams connect at once
     while True:
         conn, _ = srv.accept()
         threading.Thread(target=serve_one, args=(conn,), daemon=True).start()

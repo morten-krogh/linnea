@@ -4210,6 +4210,8 @@ linnea_http_proxy_error:
     je .bad_request            ; a captured body whose framing did not hold up
     cmp r12, 413
     je .too_large              ; ...or which ran past max_body
+    cmp r12, 503
+    je .unavailable            ; a leg pool was full: nothing reached a backend
     lea rax, [resp_502]
     mov ecx, resp_502_len
     jmp .set
@@ -4220,6 +4222,10 @@ linnea_http_proxy_error:
 .too_large:
     lea rax, [resp_413]
     mov ecx, resp_413_len
+    jmp .set
+.unavailable:
+    lea rax, [resp_503]
+    mov ecx, resp_503_len
     jmp .set
 .gateway_timeout:
     lea rax, [resp_504]

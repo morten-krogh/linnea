@@ -59,6 +59,7 @@ global linnea_h3_proxy_cancel
 
 extern linnea_connection_at
 extern linnea_connection_alloc
+extern linnea_connection_high
 extern linnea_connection_free
 extern linnea_upstream_open
 extern linnea_upstream_socket
@@ -1804,8 +1805,7 @@ linnea_h3_proxy_cancel:
     mov r14, rsi                     ; its connection id
     mov r15, rdx                     ; stream id, or -1 for all of them
     xor ebp, ebp                     ; pool index
-    lea rax, [linnea_config_instance]
-    mov rbx, [rax + linnea_config.max_connections]
+    mov rbx, [linnea_connection_high]   ; slots past it were never used
 .cn_slot:
     cmp rbp, rbx
     jae .cn_done

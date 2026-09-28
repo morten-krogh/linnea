@@ -51,12 +51,13 @@ for QUIC, and the timeouts that bound them all (submitted as linked timeout
 requests). There is no thread pool and no blocking call on the hot path; the
 worker submits work and reacts to completions.
 
-Connections live in a fixed-size pool allocated once at startup
-(`max_connections` per worker). A connection is a struct with its buffers inline;
-there is no per-request allocation. A completion carries only indices, so a
-late completion for a connection that has since closed is detected by a
-generation counter on the slot and dropped rather than delivered to whoever
-holds the slot now.
+Connections live in a fixed-size pool reserved once at startup
+(`max_connections` per worker). A connection is a struct with its buffers inline
+(about 35 KiB); the pool is address space until a slot is first handed out, and
+slots are handed out lowest-first, so a worker only ever touches as many as its
+busiest moment needed. A completion carries only indices, so a late completion
+for a connection that has since closed is detected by a generation counter on
+the slot and dropped rather than delivered to whoever holds the slot now.
 
 ## Memory model: no allocator, no garbage
 
@@ -66,6 +67,38 @@ record buffers, the QUIC receive buffers, the header-table scratch. A great deal
 of the audit history is about exactly this: proving each buffer is large enough
 for the largest input the configuration can produce, and that every copy into it
 is bounded first. With no memory safety underneath, those bounds are the safety.
+
+What is fixed is each buffer's **size**, not how many exist. Per-connection
+state is laid out per connection slot; the larger state a *request* needs is
+borrowed from a per-worker **arena pool** (`src/server/linnea_arena.asm`) for as
+long as the request needs it:
+
+| Pool | Arena | Borrowed by | Capacity per worker |
+|---|---|---|---|
+| HTTP/2 relay slots | 20 KiB (`linnea_h2p`) | a proxied h2 stream, HEADERS to end | `max_connections` + `max_upstream` |
+| Backend TLS handshake | 60 KiB (`linnea_tls_client_hs`) | a `proxy_tls` leg, connect to kTLS handoff | `max_upstream` |
+| Backend HTTP/2 driver | 1.2 MiB (`linnea_h2c`) | a `proxy_tls` leg's handshake, and a `proxy_h2` leg until its buffered response is delivered | `max_upstream` |
+
+A pool is a reservation made on its first borrow (`MAP_NORESERVE`, so an idle
+pool holds neither memory nor commit charge, and one the configuration never
+uses is never mapped); a returned arena's pages go back to the kernel
+(`MADV_DONTNEED`), so memory in use follows the requests actually in flight
+rather than `max_connections`. An exhausted pool fails the one request — an h2
+stream is refused with `REFUSED_STREAM`, a backend leg answers 503 — and never
+the connection or the worker. A connection keeps only a row of 100 pointers
+(800 bytes) to the relay slots it holds. The capacities are ceilings derived
+from limits the configuration already states: every leg holding a TLS or h2
+arena holds, or has just released, one of `max_upstream` backend connections,
+and a relay slot is either waiting for one of those or collecting a request
+body.
+
+Until this layout each connection slot carried eight relay slots and nine
+backend-leg arenas of its own, ~11.4 MiB of address space mapped for every
+unit of `max_connections` at startup: a worker at `max_connections` 3000 could
+not start on a 16 GB host, and an h2 connection could relay only eight proxied
+streams. Measured on that host: idle worker at the default 1024, 11.4 GiB of
+address space and 4.6 MiB resident before; 0.3 GiB and 0.6 MiB after, and
+16384 starts at 1.3 GiB and 0.6 MiB.
 
 ## TLS 1.3, and its own cryptography
 
@@ -95,8 +128,9 @@ HTTP/1.1 is served on non-TLS listeners.
 - **HTTP/1.1** — a streaming request parser, keep-alive, chunked and
   content-length framing, `Expect: 100-continue`, and the static/proxy handlers.
 - **HTTP/2** — the connection preface and SETTINGS, HPACK header
-  compression, up to 100 concurrent streams with per-stream and connection flow
-  control, a round-robin stream scheduler, and rapid-reset defences.
+  compression, up to 100 concurrent streams (any or all of them proxied) with
+  per-stream and connection flow control, a round-robin stream scheduler, and
+  rapid-reset defences.
 - **HTTP/3 over QUIC** — the QUIC transport (packet protection, streams, flow
   control, loss detection and NewReno congestion control, RTT sampling, address
   validation and amplification limits, 0-RTT gated to safe methods), QPACK

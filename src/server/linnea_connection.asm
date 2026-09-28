@@ -16,8 +16,10 @@ global linnea_upstream_closed
 global linnea_upstream_count
 global linnea_upstream_limit
 global linnea_connection_active
+global linnea_connection_high
 
 extern linnea_memory_map
+extern linnea_up_arenas_release
 
 section .bss
 
@@ -35,46 +37,55 @@ pool_base:      resq 1
 pool_size:      resq 1         ; slots in the pool (walkers need the bound)
 free_head:      resq 1         ; pool index of first free slot, -1 = none
 linnea_connection_active: resq 1   ; slots handed out; drains read it
+; One past the highest pool index ever handed out. A never-used slot is taken
+; only when no slot is waiting on the free list, so the slots a worker has
+; touched are exactly [0, high) and it only grows as far as the busiest
+; moment's concurrency. The
+; walkers that must visit every live connection (the per-IP count on each
+; accept, the h3 leg cancel) stop here instead of at max_connections, so a
+; large max_connections costs them nothing until it is actually used.
+linnea_connection_high:   resq 1
 
 section .text
 
-; linnea_connections_init(rdi=pool size) — allocate and chain the free list.
+; linnea_connections_init(rdi=pool size) — map the pool. Nothing in it is
+; written: a slot is first touched when it is first handed out (below), so an
+; idle worker's pool costs address space and not memory, however large
+; max_connections is. (It used to chain every slot onto the free list here,
+; which wrote one page of every slot -- 4 KiB of resident memory per unit of
+; max_connections before a single client connected.)
 linnea_connections_init:
-    push rbx
-    mov rbx, rdi               ; pool size
     mov [pool_size], rdi
     imul rdi, rdi, linnea_connection_size
     call linnea_memory_map
     mov [pool_base], rax
-    mov rdx, rax               ; slot cursor
-    xor ecx, ecx               ; index
-.chain:
-    cmp rcx, rbx
-    jae .done
-    mov [rdx + linnea_connection.index], rcx
-    lea r8, [rcx + 1]
-    cmp r8, rbx
-    jne .link
-    mov r8, -1
-.link:
-    mov [rdx + linnea_connection.next_free], r8
-    add rdx, linnea_connection_size
-    inc rcx
-    jmp .chain
-.done:
-    mov qword [free_head], 0
-    pop rbx
+    mov qword [free_head], -1
+    mov qword [linnea_connection_high], 0
     ret
 
 ; linnea_connection_alloc() -> rax=connection* or 0 when the pool is empty.
+; A slot given back is reused first (LIFO); only when there is none is a
+; never-used slot taken from the high-water mark up, which hands out the same
+; 0, 1, 2, ... order the pre-chained free list did.
 linnea_connection_alloc:
     mov rax, [free_head]
     cmp rax, -1
-    je .empty
+    je .fresh
     imul rdx, rax, linnea_connection_size
     add rdx, [pool_base]
     mov rcx, [rdx + linnea_connection.next_free]
     mov [free_head], rcx
+    jmp .claim
+.fresh:
+    mov rax, [linnea_connection_high]
+    cmp rax, [pool_size]
+    jae .empty
+    lea rcx, [rax + 1]
+    mov [linnea_connection_high], rcx
+    imul rdx, rax, linnea_connection_size
+    add rdx, [pool_base]
+    mov [rdx + linnea_connection.index], rax
+.claim:
     mov qword [rdx + linnea_connection.in_use], 1
     mov qword [rdx + linnea_connection.in_len], 0
     mov qword [rdx + linnea_connection.head_len], 0
@@ -114,6 +125,7 @@ linnea_connection_alloc:
     mov qword [rdx + linnea_connection.h2_rx_busy], 0
     mov qword [rdx + linnea_connection.tx_inflight], 0
     mov qword [rdx + linnea_connection.ku_pending], 0
+    mov qword [rdx + linnea_connection.h2p_owed], 0   ; owed to an earlier client
     inc qword [rdx + linnea_connection.gen]      ; this slot's new incarnation
     inc qword [linnea_connection_active]
     mov rax, rdx
@@ -129,6 +141,25 @@ linnea_connection_free:
     cmp qword [rdi + linnea_connection.in_use], 0
     je .already_free
     mov qword [rdi + linnea_connection.in_use], 0
+    ; whatever an upstream leg borrowed goes back to its pool with the slot:
+    ; every teardown -- h1, an h3 relay leg, a refused accept -- passes here
+    ; (the madvise inside clobbers what a syscall does; this function never
+    ; used to, so its callers are not asked to care)
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    call linnea_up_arenas_release    ; preserves rdi
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
     mov rax, [free_head]
     mov [rdi + linnea_connection.next_free], rax
     mov rax, [rdi + linnea_connection.index]
@@ -159,7 +190,7 @@ linnea_connection_count_ip:
     xor r14d, r14d             ; count
     xor r15d, r15d             ; index
 .ci_slot:
-    cmp r15, [pool_size]
+    cmp r15, [linnea_connection_high]   ; never-used slots hold no connection
     jae .ci_done
     mov rdi, r15
     call linnea_connection_at
