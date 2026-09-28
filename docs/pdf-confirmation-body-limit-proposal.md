@@ -5,14 +5,18 @@ Status: implemented on Linnea main, tested locally, and deployed on
 `6c7eb9302c5a7982e16832d4943938c87b65145059d16f3ba2216662839cade7`;
 the config SHA-256 is
 `e4358d0f7a0259de3aa1ef937f89c0e5a76fcc3a32281df54737529b99a57d9f`.
-The Vefruna confirmation API remains local and Peacock remains unpublished.
+The Vefruna confirmation API was deployed later on 2026-09-28. Peacock
+remains unpublished.
 
 Live fake-project probes after reload exercised HTTP/1.1, HTTP/2, and HTTP/3
 (the latter negotiated ALPN `h3`). The exact confirmation route returned 413
 at 262,145 bytes and 502 at the 262,144-byte boundary; the adjacent notes
 route returned 413 at 12,289 bytes and the source route returned 400 at that
-size. The 502 shows the ingress accepted the body but the older deployed app
-did not complete it. An authenticated Vefruna API smoke test is still pending.
+size. The 502 showed the ingress accepted the body but the older deployed app
+did not complete it. After the Vefruna app release at 13:18:34 UTC,
+fake-project probes at 262,144 bytes no longer returned 502 on HTTP/1.1,
+HTTP/2, or HTTP/3. The 262,145-byte request still returned 413. An
+authenticated Vefruna API smoke test is still pending.
 
 Extend each server's `body_limits` array to contain up to two distinct,
 explicit route rules:
