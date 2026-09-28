@@ -314,6 +314,7 @@ struc linnea_h2p
     .sid:       resq 1            ; the client stream id
     .gen:       resq 1            ; the connection incarnation this belongs to
     .location:  resq 1            ; matched location* (connect addr, log)
+    .request_body_cap: resq 1   ; selected before DATA collection
     .source_ip: resb 16            ; kernel-derived client address for the
     .source_ip_len: resq 1         ; authenticated private-backend identity
     .backend:   resq 1            ; which of the location's backends this leg is on

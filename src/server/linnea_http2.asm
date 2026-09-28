@@ -54,6 +54,7 @@ extern linnea_http_ifrange_match
 extern linnea_time_parse_http_date
 extern linnea_time_http_now
 extern linnea_config_instance
+extern linnea_pdf_source_route
 extern linnea_string_from_u64
 extern linnea_string_to_u64
 extern linnea_http_upstream_head_valid
@@ -587,13 +588,7 @@ linnea_h2_handle:
     ; so a length near 2^64 cannot wrap the counter past a max_body of 2^64-1.
     ; r8 (current) <= max_body holds, so max_body - r8 does not underflow.
     push rcx
-    mov rcx, [rdi + linnea_h2p.location]
-    mov rcx, [rcx + linnea_config_location.max_body]
-    test rcx, rcx
-    jnz .fd_cap_ready
-    lea rcx, [linnea_config_instance]
-    mov rcx, [rcx + linnea_config.max_body]
-.fd_cap_ready:
+    mov rcx, [rdi + linnea_h2p.request_body_cap]
     sub rcx, r8                        ; headroom = max_body - current
     cmp rax, rcx                       ; incoming > headroom?
     pop rcx
@@ -2338,6 +2333,28 @@ h2_serve:
     mov [r13 + linnea_h2p.gen], rcx
     mov rcx, [rsp + S_LOC]
     mov [r13 + linnea_h2p.location], rcx
+    mov rcx, [rcx + linnea_config_location.max_body]
+    test rcx, rcx
+    jnz .request_cap_inherited
+    mov rcx, [linnea_config_instance + linnea_config.max_body]
+.request_cap_inherited:
+    mov [r13 + linnea_h2p.request_body_cap], rcx
+    mov rcx, [h2_cur_srv]
+    cmp qword [rcx + linnea_config_server.pdf_source_max_body], 0
+    je .request_cap_done
+    push r12
+    mov rdi, [r12 + linnea_h2_req.method_ptr]
+    mov rsi, [r12 + linnea_h2_req.method_len]
+    mov rdx, [r12 + linnea_h2_req.path_ptr] ; original :path
+    mov rcx, [r12 + linnea_h2_req.path_len]
+    call linnea_pdf_source_route
+    pop r12
+    test eax, eax
+    jz .request_cap_done
+    mov rcx, [h2_cur_srv]
+    mov rcx, [rcx + linnea_config_server.pdf_source_max_body]
+    mov [r13 + linnea_h2p.request_body_cap], rcx
+.request_cap_done:
     mov rcx, [rbx + linnea_connection.peer_ip]
     mov [r13 + linnea_h2p.source_ip], rcx
     mov rcx, [rbx + linnea_connection.peer_ip + 8]
@@ -2484,13 +2501,7 @@ h2_serve:
     ; so whatever the client declared is what the backend got. Lowering
     ; max_body to bound uploads did nothing on the one protocol browsers use.
     push rax
-    mov rcx, [r13 + linnea_h2p.location]
-    mov rcx, [rcx + linnea_config_location.max_body]
-    test rcx, rcx
-    jnz .proxy_cap_ready
-    lea rcx, [linnea_config_instance]
-    mov rcx, [rcx + linnea_config.max_body]
-.proxy_cap_ready:
+    mov rcx, [r13 + linnea_h2p.request_body_cap]
     cmp rax, rcx
     pop rax
     ja .proxy_toolarge

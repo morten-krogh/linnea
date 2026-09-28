@@ -211,12 +211,7 @@ linnea_spill_chunked:
     ; have turned every download past max_body into a dropped connection.
     cmp ebp, LINNEA_CHUNK_PROXY_CAPTURE
     je .raw_proxy_cap
-    mov rax, [rbx + linnea_connection.location]
-    mov rax, [rax + linnea_config_location.max_body]
-    test rax, rax
-    jnz .raw_cap_ready
-    lea rax, [linnea_config_instance]
-    mov rax, [rax + linnea_config.max_body]
+    mov rax, [rbx + linnea_connection.request_body_cap]
     jmp .raw_cap_ready
 .raw_proxy_cap:
     lea rax, [linnea_config_instance]
@@ -354,12 +349,7 @@ linnea_spill_chunked:
     js .write_failed
     cmp ebp, LINNEA_CHUNK_PROXY_CAPTURE
     je .data_proxy_cap
-    mov rax, [rbx + linnea_connection.location]
-    mov rax, [rax + linnea_config_location.max_body]
-    test rax, rax
-    jnz .data_cap_ready
-    lea rax, [linnea_config_instance]
-    mov rax, [rax + linnea_config.max_body]
+    mov rax, [rbx + linnea_connection.request_body_cap]
     jmp .data_cap_ready
 .data_proxy_cap:
     lea rax, [linnea_config_instance]

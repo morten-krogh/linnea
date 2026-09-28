@@ -88,6 +88,15 @@ key_hostname:           db "hostname"
 key_hostname_len        equ $ - key_hostname
 key_locations:          db "locations"
 key_locations_len       equ $ - key_locations
+key_body_limits:        db "body_limits"
+key_body_limits_len     equ $ - key_body_limits
+key_method:             db "method"
+key_method_len          equ $ - key_method
+key_path:               db "path"
+key_path_len            equ $ - key_path
+body_method_post:       db "POST"
+body_path_source:       db "/projects/{project_id}/source"
+body_path_source_len    equ $ - body_path_source
 key_prefix:             db "prefix"
 key_prefix_len          equ $ - key_prefix
 key_root:               db "root"
@@ -856,6 +865,7 @@ linnea_parse_server:
     mov rbx, rdi               ; server*
     xor r12d, r12d             ; key mask
     mov qword [rbx + linnea_config_server.location_count], 0
+    mov qword [rbx + linnea_config_server.pdf_source_max_body], 0
     ; TLS is opt-in per server: clear the markers so a server with no
     ; "cert"/"key" is plaintext; validation enforces both-or-neither.
     mov dword [rbx + linnea_config_server.tls], 0
@@ -902,6 +912,13 @@ linnea_parse_server:
     call linnea_string_equal
     test eax, eax
     jnz .key_locations
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_body_limits]
+    mov ecx, key_body_limits_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .key_body_limits
     mov rdi, r13
     mov rsi, r14
     lea rdx, [key_cert]
@@ -1101,6 +1118,15 @@ linnea_parse_server:
     jmp .location_loop
 .end_locations:
     call linnea_parse_advance
+    jmp .member_sep
+
+.key_body_limits:
+    test r12d, 512
+    jnz .dup
+    or r12d, 512
+    mov rdi, rbx
+    call linnea_parse_pdf_body_limit
+    jmp .member_sep
 
 .member_sep:
     call linnea_parse_skip_ws
@@ -1151,6 +1177,107 @@ linnea_parse_server:
 .too_many_locations:
     lea rdi, [msg_too_many_locs]
     mov esi, msg_too_many_locs_len
+    jmp linnea_parse_fail
+
+; One exact source-upload body rule per server for the initial contract. The
+; method and template are explicit config data and must match the supported
+; route exactly; a typo must fail startup rather than broaden the cap.
+linnea_parse_pdf_body_limit:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    xor r12d, r12d                 ; method=1, path=2, max_body=4
+    mov edi, '['
+    call linnea_parse_expect
+    mov edi, '{'
+    call linnea_parse_expect
+.member:
+    call linnea_parse_skip_ws
+    call linnea_parse_string
+    mov r13, rax
+    mov r14, rdx
+    mov edi, ':'
+    call linnea_parse_expect
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_method]
+    mov ecx, key_method_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .method
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_path]
+    mov ecx, key_path_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .path
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [key_maxbody]
+    mov ecx, key_maxbody_len
+    call linnea_string_equal
+    test eax, eax
+    jnz .max_body
+    jmp .shape
+.method:
+    test r12d, 1
+    jnz .shape
+    or r12d, 1
+    call linnea_parse_string
+    cmp rdx, 4
+    jne .shape
+    cmp dword [rax], 0x54534f50
+    jne .shape
+    jmp .sep
+.path:
+    test r12d, 2
+    jnz .shape
+    or r12d, 2
+    call linnea_parse_string
+    cmp rdx, body_path_source_len
+    jne .shape
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [body_path_source]
+    mov ecx, body_path_source_len
+    call linnea_string_equal
+    test eax, eax
+    jz .shape
+    jmp .sep
+.max_body:
+    test r12d, 4
+    jnz .shape
+    or r12d, 4
+    call linnea_parse_u64
+    test rax, rax
+    jz .shape
+    mov [rbx + linnea_config_server.pdf_source_max_body], rax
+.sep:
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ','
+    je .next
+    cmp al, '}'
+    jne .shape
+    call linnea_parse_advance
+    cmp r12d, 7
+    jne .shape
+    mov edi, ']'
+    call linnea_parse_expect
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.next:
+    call linnea_parse_advance
+    jmp .member
+.shape:
+    lea rdi, [msg_unknown_key]
+    mov esi, msg_unknown_key_len
     jmp linnea_parse_fail
 
 ; linnea_parse_location(rdi=location*) — one location object.

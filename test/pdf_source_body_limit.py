@@ -56,6 +56,9 @@ def main():
          ORDINARY_CAP + 1, False, False, True),
         ("source path with extra segment", b"POST", SOURCE + b"/extra",
          ORDINARY_CAP + 1, False, False, True),
+        ("source path with percent escape", b"POST",
+         SOURCE.replace(b"/source", b"/%73ource"),
+         ORDINARY_CAP + 1, False, False, True),
         ("source above exact cap before body", b"POST", SOURCE,
          SOURCE_CAP + 1, False, True, True),
     ]

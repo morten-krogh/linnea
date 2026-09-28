@@ -143,6 +143,7 @@ struc linnea_connection
     .up_head_len:   resq 1
     .proxy_state:   resq 1         ; LINNEA_PROXY_*
     .location:      resq 1         ; matched location* (static config memory)
+    .request_body_cap: resq 1     ; resolved after route/method match, before capture
     .vhost:         resq 1         ; server* handling the request, for the log
     .body_rem:      resq 1         ; upstream body bytes still expected;
                                    ; -1 = until the upstream closes

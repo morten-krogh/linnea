@@ -105,6 +105,7 @@ LINNEA_HTTP_PATH_BUF    equ 2560
 
 extern linnea_config_instance
 extern linnea_config_match_location
+extern linnea_pdf_source_route
 extern linnea_string_from_u64
 extern linnea_string_to_u64
 extern linnea_string_from_hex_u64
@@ -1923,13 +1924,7 @@ linnea_http_handle:
     ; a chunked body decoded in place, the decoded) length, before the
     ; buffered/streamed split, so both paths honour it. [rsp+128] is the body
     ; length; 0 (no body) never exceeds a nonzero max_body.
-    mov rax, [rsp + 152]
-    mov rax, [rax + linnea_config_location.max_body]
-    test rax, rax
-    jnz .body_cap_ready
-    lea rax, [linnea_config_instance]
-    mov rax, [rax + linnea_config.max_body]
-.body_cap_ready:
+    mov rax, [rbx + linnea_connection.request_body_cap]
     cmp [rsp + 128], rax
     ja .body_toolarge
     mov rax, [rbx + linnea_connection.head_len]
@@ -2170,6 +2165,24 @@ linnea_http_handle:
     mov [rsp + 152], rax       ; five places downstream re-read the match here
     test rax, rax
     jz .resp_404               ; no location claims this path
+    mov rcx, [rax + linnea_config_location.max_body]
+    test rcx, rcx
+    jnz .cap_inherited
+    mov rcx, [linnea_config_instance + linnea_config.max_body]
+.cap_inherited:
+    mov [rbx + linnea_connection.request_body_cap], rcx
+    cmp qword [r12 + linnea_config_server.pdf_source_max_body], 0
+    je .cap_done
+    mov rdi, r14
+    mov rsi, [rsp + 104]
+    mov rdx, [rsp + 8]          ; original target, including query/escapes
+    mov rcx, [rsp + 144]
+    call linnea_pdf_source_route
+    test eax, eax
+    jz .cap_done
+    mov rcx, [r12 + linnea_config_server.pdf_source_max_body]
+    mov [rbx + linnea_connection.request_body_cap], rcx
+.cap_done:
     jmp .body_start
 .route_matched:
     ; TRACE reflects the request it received back to whoever sent it. At an

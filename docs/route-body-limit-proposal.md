@@ -7,7 +7,7 @@ HTTP/1, HTTP/2, and HTTP/3. It cannot express a larger cap only for
 `POST /projects/{id}/source`: a `/projects/` override also widens every other
 project route, and a `/` override widens the entire Vefruna host.
 
-Proposed server-level `body_limits` array:
+Initial server-level `body_limits` array (currently one supported rule):
 
 ```json
 "body_limits": [
@@ -46,16 +46,31 @@ large body capture, or hold initial DATA under the default cap until it can
 select the scoped limit. This change needs protocol-specific regression tests
 for requests that send HEADERS and DATA in one packet and in separate packets.
 
-This proposal needs Linnea owner review before implementation because it
-changes shared configuration syntax and all three public request paths.
+The isolated branch now parses this one rule strictly and applies it before
+HTTP/1 counted and chunked capture and HTTP/2 declared and DATA capture. The
+method/path predicate reads the raw request target, so a query or percent
+escape cannot gain the larger cap through routing normalization. Other rules
+and multiple elements are rejected at startup. HTTP/3 remains unresolved;
+the branch must not be merged or deployed with the rule enabled until HTTP/3
+has equivalent enforcement or is explicitly disabled for the deployment.
 
 `test/pdf_source_body_limit.py` is a standalone HTTP/1 acceptance probe for an
 isolated Linnea instance with the proposed Vefruna rule. It checks counted and
 chunked source uploads above the ordinary cap, adjacent routes, wrong method,
-malformed ID, query and extra path, plus an oversized declared source body
-without sending that body. It is not in the passing suite until the rule is
-implemented. Against an isolated instance of the current Vefruna `/` 16 MiB
-override, the probe fails on adjacent routes, wrong method, and malformed or
-extended paths because they all pass ingress. That failure is the gap, not a
-claim about the live service. HTTP/2 and HTTP/3 acceptance probes remain to be
-implemented alongside the cross-protocol change.
+malformed ID, query, percent escape and extra path, plus an oversized declared
+source body without sending that body. `test/pdf_source_body_limit_h2.py` checks
+HTTP/2 declared and no-Content-Length DATA paths, including adjacent routes
+and path variants. `test/pdf_body_limits_config.py` checks accepted/rejected
+config shapes. All passed against isolated local fixtures with an absent test
+backend. The HTTP/3 acceptance probe remains to be implemented.
+
+A pure exact-route predicate exists in
+`src/lib/linnea_pdf_source_route.asm`, with `make pdf-route-test` covering
+method, path suffix, query, project ID alphabet and length, and the all-zero
+identifier. The HTTP/1 and HTTP/2 handlers call it before body capture.
+
+An alternative to changing HTTP/3's early capture is an explicit server-level
+HTTP/3 opt-out for Vefruna, provided Linnea both omits `Alt-Svc` for that
+server and refuses QUIC SNI/authority for it. Merely hiding the advertisement
+does not prevent a client from trying HTTP/3. No such opt-out currently exists
+or has been implemented here.

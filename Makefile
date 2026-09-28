@@ -47,6 +47,10 @@ WS_BIN  = bin/linnea-ws
 # them always costs two links.
 all: $(BIN) $(PROBE_BIN) $(API_BIN) $(WS_BIN)
 
+pdf-route-test: src/lib/linnea_pdf_source_route.o test/pdf_source_route.c
+	$(CC) -Wall -Wextra -Werror -no-pie -o bin/linnea-pdf-route-test test/pdf_source_route.c src/lib/linnea_pdf_source_route.o
+	./bin/linnea-pdf-route-test
+
 $(BIN): $(LIBOBJS) $(SRVOBJS)
 	$(LD) -o $@ $^
 

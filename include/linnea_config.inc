@@ -219,6 +219,7 @@ struc linnea_config_server
     .cert_list:     resq 1                        ; TLS certificate_list, pre-framed
     .cert_list_len: resq 1                        ; at startup, or 0
     .key_priv:      resq 1                        ; P-256 private scalar ptr (startup)
+    .pdf_source_max_body: resq 1                 ; exact POST source rule; 0=absent
     .location_count: resq 1
     .locations:     resb linnea_config_location_size * LINNEA_MAX_LOCATIONS
 endstruc
