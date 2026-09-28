@@ -34,5 +34,17 @@ on the upload route, and 12 KiB plus one byte `413` on adjacent project routes,
 wrong methods, malformed project IDs, and other hosts. Preserve existing
 location `max_body` behavior for configurations without `body_limits`.
 
+Implementation is more than a location match change. HTTP/1 checks counted
+bodies in `linnea_http.asm` and chunked capture in `linnea_spill.asm`. HTTP/2
+checks declared lengths and arriving DATA in `linnea_http2.asm`. HTTP/3's QUIC
+reassembly assigns `linnea_quic_ra.max_body` from the **largest cap on the SNI
+vhost before QPACK decodes the method or path**, then may write DATA to a spill
+file before `linnea_http3.asm` routes the request. An exact limit enforced only
+in the HTTP/3 router would already have buffered an over-limit adjacent route.
+The HTTP/3 path must decode and retain enough request headers before allowing
+large body capture, or hold initial DATA under the default cap until it can
+select the scoped limit. This change needs protocol-specific regression tests
+for requests that send HEADERS and DATA in one packet and in separate packets.
+
 This proposal needs Linnea owner review before implementation because it
 changes shared configuration syntax and all three public request paths.
