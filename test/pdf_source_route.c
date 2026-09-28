@@ -4,6 +4,7 @@
 
 extern int linnea_pdf_source_route(const char *, size_t, const char *, size_t);
 extern int linnea_pdf_confirmation_route(const char *, size_t, const char *, size_t);
+extern int linnea_package_route(const char *, size_t, const char *, size_t);
 
 static int matches(const char *method, const char *path)
 {
@@ -13,6 +14,11 @@ static int matches(const char *method, const char *path)
 static int confirms(const char *method, const char *path)
 {
     return linnea_pdf_confirmation_route(method, strlen(method), path, strlen(path));
+}
+
+static int package(const char *method, const char *path)
+{
+    return linnea_package_route(method, strlen(method), path, strlen(path));
 }
 
 int main(void)
@@ -38,5 +44,15 @@ int main(void)
     assert(confirms("POST", "/projects/project_00000000000000000000000001/pdf-candidate-confirmations/extra") == 0);
     assert(confirms("POST", "/projects/project_80000000000000000000000001/pdf-candidate-confirmations") == 0);
     assert(confirms("POST", "/projects/project_0000000000000000000000000i/pdf-candidate-confirmations") == 0);
+    const char *attachment =
+        "/projects/project_00000000000000000000000001/pattern-package";
+    assert(package("POST", attachment) == 1);
+    assert(package("PUT", attachment) == 0);
+    assert(package("POST", source) == 0);
+    assert(package("POST", confirmation) == 0);
+    assert(package("POST", "/projects/project_00000000000000000000000001/pattern-package?x=1") == 0);
+    assert(package("POST", "/projects/project_00000000000000000000000001/pattern-package/extra") == 0);
+    assert(package("POST", "/projects/project_80000000000000000000000001/pattern-package") == 0);
+    assert(package("POST", "/projects/project_0000000000000000000000000i/pattern-package") == 0);
     return 0;
 }

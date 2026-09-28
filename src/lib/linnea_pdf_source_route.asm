@@ -7,6 +7,7 @@ default rel
 
 global linnea_pdf_source_route
 global linnea_pdf_confirmation_route
+global linnea_package_route
 
 section .rodata
 method_post: db "POST"
@@ -14,6 +15,8 @@ path_prefix: db "/projects/project_"
 path_suffix: db "/source"
 confirmation_suffix: db "/pdf-candidate-confirmations"
 confirmation_suffix_len equ $ - confirmation_suffix
+package_suffix: db "/pattern-package"
+package_suffix_len equ $ - package_suffix
 alphabet: db "0123456789abcdefghjkmnpqrstvwxyz"
 
 section .text
@@ -32,6 +35,16 @@ linnea_pdf_confirmation_route:
     push r13
     lea r12, [confirmation_suffix]
     mov r13d, confirmation_suffix_len
+    call pdf_route_common
+    pop r13
+    pop r12
+    ret
+
+linnea_package_route:
+    push r12
+    push r13
+    lea r12, [package_suffix]
+    mov r13d, package_suffix_len
     call pdf_route_common
     pop r13
     pop r12

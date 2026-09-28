@@ -259,6 +259,24 @@ try:
         if got != expected:
             failed.append(f"QPACK field-block fragment {path}: got {got}, expected {expected}")
     confirmation_cap = int(os.environ.get("LINNEA_H3_CONFIRM_CAP", "0"))
+    package_cap = int(os.environ.get("LINNEA_H3_PACKAGE_CAP", "0"))
+    if package_cap:
+        package = source.replace("/source", "/pattern-package")
+        for label, path, size, method, expected in [
+            ("package above ordinary", package, above_ordinary, "POST", "502"),
+            ("package at cap", package, package_cap, "POST", "502"),
+            ("package cap plus one", package, package_cap + 1, "POST", "413"),
+            ("package wrong method", package, above_ordinary, "PUT", "413"),
+            ("package query", package + "?x=1", above_ordinary, "POST", "413"),
+            ("package encoded path", package.replace(
+                "/pattern", "/%70attern"), above_ordinary, "POST", "413"),
+            ("package extra", package + "/extra", above_ordinary, "POST", "413"),
+            ("package malformed ID", package.replace(
+                project, "project_" + "8" * 26), above_ordinary, "POST", "413"),
+        ]:
+            got = request(path, size, method=method, split=True)
+            if got != expected:
+                failed.append(f"{label}: {got}, expected {expected}")
     if confirmation_cap:
         confirmation = source.replace("/source", "/pdf-candidate-confirmations")
         for label, path, length, method, expected in [
@@ -297,6 +315,12 @@ try:
                               authority=authority, split=True)
                 if got != expected:
                     failed.append(f"coalesced confirmation {authority}: {got}, expected {expected}")
+        if package_cap:
+            for authority, expected in [(host, "502"), (coalesced, "413")]:
+                got = request(package, above_ordinary,
+                              authority=authority, split=True)
+                if got != expected:
+                    failed.append(f"coalesced package {authority}: {got}, expected {expected}")
     worker_pid = os.environ.get("LINNEA_H3_WORKER_PID")
     if worker_pid:
         marker = os.environ.get("LINNEA_H3_SPILL_MARKER")

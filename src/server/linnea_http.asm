@@ -107,6 +107,7 @@ extern linnea_config_instance
 extern linnea_config_match_location
 extern linnea_pdf_source_route
 extern linnea_pdf_confirmation_route
+extern linnea_package_route
 extern linnea_string_from_u64
 extern linnea_string_to_u64
 extern linnea_string_from_hex_u64
@@ -2175,6 +2176,8 @@ linnea_http_handle:
     cmp qword [r12 + linnea_config_server.pdf_source_max_body], 0
     jne .cap_authority
     cmp qword [r12 + linnea_config_server.pdf_confirmation_max_body], 0
+    jne .cap_authority
+    cmp qword [r12 + linnea_config_server.package_max_body], 0
     je .cap_done
 .cap_authority:
     mov rdi, [rsp + 88]
@@ -2203,8 +2206,21 @@ linnea_http_handle:
     mov rcx, [rsp + 144]
     call linnea_pdf_confirmation_route
     test eax, eax
-    jz .cap_done
+    jz .cap_package
     mov rcx, [r12 + linnea_config_server.pdf_confirmation_max_body]
+    test rcx, rcx
+    jz .cap_done
+    mov [rbx + linnea_connection.request_body_cap], rcx
+    jmp .cap_done
+.cap_package:
+    mov rdi, r14
+    mov rsi, [rsp + 104]
+    mov rdx, [rsp + 8]
+    mov rcx, [rsp + 144]
+    call linnea_package_route
+    test eax, eax
+    jz .cap_done
+    mov rcx, [r12 + linnea_config_server.package_max_body]
     test rcx, rcx
     jz .cap_done
     mov [rbx + linnea_connection.request_body_cap], rcx

@@ -37,7 +37,10 @@ with tempfile.TemporaryDirectory(prefix="linnea-h3-pdf-ingress-") as raw:
                  "max_body": 512},
                 {"method": "POST", "path":
                  "/projects/{project_id}/pdf-candidate-confirmations",
-                 "max_body": 384}]},
+                 "max_body": 384},
+                {"method": "POST", "path":
+                 "/projects/{project_id}/pattern-package",
+                 "max_body": 448}]},
             {**shared, "hostname": "other.test"},
         ],
     }
@@ -68,7 +71,8 @@ with tempfile.TemporaryDirectory(prefix="linnea-h3-pdf-ingress-") as raw:
                        "LINNEA_H3_COALESCED_AUTHORITY": "other.test",
                        "LINNEA_H3_WORKER_PID": worker,
                        "LINNEA_H3_SPILL_MARKER": str(directory),
-                       "LINNEA_H3_CONFIRM_CAP": "384"}
+                       "LINNEA_H3_CONFIRM_CAP": "384",
+                       "LINNEA_H3_PACKAGE_CAP": "448"}
         subprocess.run([sys.executable, str(root / "test/pdf_source_body_limit_h3.py"),
                         str(port), "vefruna.test", "256", "512"],
                        env=environment, check=True, timeout=90)

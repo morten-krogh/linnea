@@ -101,6 +101,8 @@ body_path_source:       db "/projects/{project_id}/source"
 body_path_source_len    equ $ - body_path_source
 body_path_confirmation: db "/projects/{project_id}/pdf-candidate-confirmations"
 body_path_confirmation_len equ $ - body_path_confirmation
+body_path_package: db "/projects/{project_id}/pattern-package"
+body_path_package_len equ $ - body_path_package
 key_prefix:             db "prefix"
 key_prefix_len          equ $ - key_prefix
 key_root:               db "root"
@@ -895,6 +897,7 @@ linnea_parse_server:
     mov qword [rbx + linnea_config_server.location_count], 0
     mov qword [rbx + linnea_config_server.pdf_source_max_body], 0
     mov qword [rbx + linnea_config_server.pdf_confirmation_max_body], 0
+    mov qword [rbx + linnea_config_server.package_max_body], 0
     ; TLS is opt-in per server: clear the markers so a server with no
     ; "cert"/"key" is plaintext; validation enforces both-or-neither.
     mov dword [rbx + linnea_config_server.tls], 0
@@ -1221,7 +1224,7 @@ linnea_parse_pdf_body_limit:
     call linnea_parse_expect
 .object:
     xor r12d, r12d                 ; method=1, path=2, max_body=4
-    xor r15d, r15d                 ; 1=source, 2=confirmation
+    xor r15d, r15d                 ; 1=source, 2=confirmation, 3=package
     xor ebp, ebp                   ; selected cap
     mov edi, '{'
     call linnea_parse_expect
@@ -1282,7 +1285,7 @@ linnea_parse_pdf_body_limit:
     jmp .sep
 .path_confirmation:
     cmp rdx, body_path_confirmation_len
-    jne .shape
+    jne .path_package
     mov rdi, rax
     mov rsi, rdx
     lea rdx, [body_path_confirmation]
@@ -1291,6 +1294,18 @@ linnea_parse_pdf_body_limit:
     test eax, eax
     jz .shape
     mov r15d, 2
+    jmp .sep
+.path_package:
+    cmp rdx, body_path_package_len
+    jne .shape
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [body_path_package]
+    mov ecx, body_path_package_len
+    call linnea_string_equal
+    test eax, eax
+    jz .shape
+    mov r15d, 3
     jmp .sep
 .max_body:
     test r12d, 4
@@ -1315,12 +1330,19 @@ linnea_parse_pdf_body_limit:
     cmp r15d, 1
     je .store_source
     cmp r15d, 2
-    jne .shape
+    jne .store_package
     cmp rbp, 262144
     ja .shape
     cmp qword [rbx + linnea_config_server.pdf_confirmation_max_body], 0
     jne .shape
     mov [rbx + linnea_config_server.pdf_confirmation_max_body], rbp
+    jmp .after_store
+.store_package:
+    cmp r15d, 3
+    jne .shape
+    cmp qword [rbx + linnea_config_server.package_max_body], 0
+    jne .shape
+    mov [rbx + linnea_config_server.package_max_body], rbp
     jmp .after_store
 .store_source:
     cmp qword [rbx + linnea_config_server.pdf_source_max_body], 0

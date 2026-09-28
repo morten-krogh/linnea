@@ -15,6 +15,9 @@ confirmation = {"method": "POST",
                 "path": "/projects/{project_id}/pdf-candidate-confirmations",
                 "max_body": 262144}
 
+package = {"method": "POST", "path": "/projects/{project_id}/pattern-package",
+           "max_body": 16777216}
+
 
 def accepted(rules):
     with tempfile.TemporaryDirectory() as directory:
@@ -33,9 +36,12 @@ def accepted(rules):
 assert accepted([source])
 assert accepted([confirmation])
 assert accepted([source, confirmation])
+assert accepted([package])
+assert accepted([source, confirmation, package])
+assert accepted([package, confirmation, source])
 assert accepted([confirmation, source])
 for candidate in ([source, source], [confirmation, confirmation],
-                  [source, confirmation, source], []):
+                  [source, confirmation, source], [package, package], []):
     assert not accepted(candidate), candidate
 for altered in (confirmation | {"method": "PUT"},
                 confirmation | {"path": "/projects/"},
@@ -43,4 +49,10 @@ for altered in (confirmation | {"method": "PUT"},
                 confirmation | {"max_body": 0},
                 confirmation | {"extra": True}):
     assert not accepted([source, altered]), altered
-print("PDF source and confirmation config rules: OK")
+for altered in (package | {"method": "PUT"},
+                package | {"path": "/projects/"},
+                package | {"max_body": 16777217},
+                package | {"max_body": 0},
+                package | {"extra": True}):
+    assert not accepted([source, confirmation, altered]), altered
+print("Source, confirmation and package config rules: OK")

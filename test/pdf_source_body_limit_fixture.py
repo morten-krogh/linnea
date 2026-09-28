@@ -16,6 +16,7 @@ root = Path(__file__).resolve().parents[1]
 binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else root / "bin/linnea"
 source_cap = 16384
 confirmation_cap = 262144
+package_cap = 16384
 confirmation_path = "/projects/{project_id}/pdf-candidate-confirmations"
 
 
@@ -32,7 +33,10 @@ def serve(directory, tls):
                                             "max_body": source_cap},
                                            {"method": "POST",
                                             "path": confirmation_path,
-                                            "max_body": confirmation_cap}],
+                                            "max_body": confirmation_cap},
+                                           {"method": "POST",
+                                            "path": "/projects/{project_id}/pattern-package",
+                                            "max_body": package_cap}],
                            "locations": [{"prefix": "/",
                                           "proxy": "127.0.0.1:1"}]}]}
     if tls:
@@ -70,6 +74,9 @@ with tempfile.TemporaryDirectory(prefix="linnea-pdf-ingress-") as raw:
         subprocess.run([sys.executable, str(root / "test/pdf_source_body_limit.py"),
                         str(port), "vefruna.test", "12288", str(confirmation_cap),
                         "/pdf-candidate-confirmations"], check=True, timeout=40)
+        subprocess.run([sys.executable, str(root / "test/pdf_source_body_limit.py"),
+                        str(port), "vefruna.test", "12288", str(package_cap),
+                        "/pattern-package"], check=True, timeout=40)
     finally:
         stop(process)
 
@@ -85,6 +92,10 @@ with tempfile.TemporaryDirectory(prefix="linnea-pdf-ingress-") as raw:
                         str(root / "test/pdf_source_body_limit_h2.py"),
                         str(port), "vefruna.test", "12288", str(confirmation_cap),
                         "/pdf-candidate-confirmations"], check=True, timeout=40)
+        subprocess.run([sys.executable,
+                        str(root / "test/pdf_source_body_limit_h2.py"),
+                        str(port), "vefruna.test", "12288", str(package_cap),
+                        "/pattern-package"], check=True, timeout=40)
         for protocol in ("--http1.1", "--http2"):
             response = subprocess.run(
                 ["curl", "--noproxy", "*", protocol, "-k", "-sS", "-D", "-",
