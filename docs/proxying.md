@@ -160,6 +160,12 @@ Vefruna, the capture itself is bounded at 16 MiB.
 
 ## Responses are relayed as they arrive
 
+> **Deployed 2026-09-28** in production from `2cb52b7` (with `4448b27`),
+> with `max_upstream: 4096` and `max_connections: 8192` per worker, in front
+> of Vefruna's server-sent events (upstream protocol v2). Checked after the
+> reload: every vhost answers on HTTP/2 and HTTP/3, and Vefruna's `/events`
+> answers on HTTP/1.1, HTTP/2 and HTTP/3.
+
 A proxied response is relayed to the client **as the backend writes it**, on
 HTTP/1.1, HTTP/2 and HTTP/3 alike: the head as soon as it is complete, then
 each read of the body. Nothing captures a whole response first. That is what
