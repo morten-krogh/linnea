@@ -5,6 +5,9 @@ The top-level integer `http3` accepts `0` or `1` and defaults to `1`.
 HTTP/1.1 and their configured HTTP/2 behavior. No origin advertises `Alt-Svc`
 for HTTP/3. This is a deployment-wide control; it cannot disable one virtual
 host while leaving another on the same UDP listener enabled.
+On a hot reload, an older worker generation may continue serving its already
+open UDP listener until drain completes. Use a full stop and restart when
+HTTP/3 must cease immediately.
 
 This option provides a temporary ingress boundary for deployments that need
 method-and-path-specific body limits before Linnea's HTTP/3 request capture
