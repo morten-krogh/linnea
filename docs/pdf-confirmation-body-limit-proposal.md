@@ -1,7 +1,7 @@
 # Exact PDF candidate confirmation ingress limit
 
-Status: local design before implementation. No live configuration or listener
-changes are authorized by this document.
+Status: implemented in an isolated Linnea branch and tested locally. No live
+configuration, listener, or installed binary was changed by this work.
 
 Extend each server's `body_limits` array to contain up to two distinct,
 explicit route rules:
@@ -30,3 +30,18 @@ acceptance, 262,145-byte 413, source route regression, adjacent route/method/
 path variants at 12,289 bytes, and coalesced authorities where configured.
 The isolated fixture uses an absent backend, so accepted requests yield 502.
 No production deployment or Peacock publication follows from these tests.
+
+The prepared production config diff adds one object after the existing source
+rule on the Vefruna HTTPS server, with `method: POST`, `path:
+/projects/{project_id}/pdf-candidate-confirmations`, and `max_body: 262144`.
+The global and Vefruna `/` location caps remain 12,288 bytes. The live source
+rule remains 16,777,216 bytes. A temporary validation copy can replace the
+protected live spill/log paths with `/tmp` paths while retaining the server
+and body-limit JSON; do not deploy that test copy.
+
+Rollback for a later approved deployment: restore the pre-change Linnea binary
+and config backup together, validate that backup with `linnea --test`, and
+restart Linnea so the restored binary and all HTTP/3 workers use the old
+one-rule configuration. Recheck source ingress and the ordinary cap on the
+confirmation route. Keep Vefruna's receipt API inaccessible through the
+public proxy until a compatible exact-route Linnea version is active.

@@ -258,6 +258,30 @@ try:
                       content_length=False)
         if got != expected:
             failed.append(f"QPACK field-block fragment {path}: got {got}, expected {expected}")
+    confirmation_cap = int(os.environ.get("LINNEA_H3_CONFIRM_CAP", "0"))
+    if confirmation_cap:
+        confirmation = source.replace("/source", "/pdf-candidate-confirmations")
+        for label, path, length, method, expected in [
+            ("confirmation one packet", confirmation, above_ordinary, "POST", "502"),
+            ("confirmation at cap", confirmation, confirmation_cap, "POST", "502"),
+            ("confirmation cap plus one", confirmation, confirmation_cap + 1, "POST", "413"),
+            ("confirmation wrong method", confirmation, above_ordinary, "PUT", "413"),
+            ("confirmation query", confirmation + "?x=1", above_ordinary, "POST", "413"),
+            ("confirmation encoded path", confirmation.replace(
+                "/pdf-candidate", "/%70df-candidate"), above_ordinary, "POST", "413"),
+            ("confirmation malformed ID", confirmation.replace(
+                project, "project_" + "8" * 26), above_ordinary, "POST", "413"),
+        ]:
+            got = request(path, length, method=method,
+                          split=label != "confirmation one packet",
+                          require_one_datagram=label == "confirmation one packet")
+            if got != expected:
+                failed.append(f"{label}: got {got}, expected {expected}")
+        for split_at in (1, 12):
+            got = request(confirmation, above_ordinary,
+                          fragment_headers=split_at, content_length=False)
+            if got != "502":
+                failed.append(f"confirmation fragmented HEADERS {split_at}: {got}, expected 502")
     coalesced = os.environ.get("LINNEA_H3_COALESCED_AUTHORITY")
     if coalesced:
         # The fixture must put the source rule on `host` only and configure
@@ -267,6 +291,12 @@ try:
             got = request(source, above_ordinary, authority=authority, split=True)
             if got != expected:
                 failed.append(f"coalesced {authority}: got {got}, expected {expected}")
+        if confirmation_cap:
+            for authority, expected in [(host, "502"), (coalesced, "413")]:
+                got = request(confirmation, above_ordinary,
+                              authority=authority, split=True)
+                if got != expected:
+                    failed.append(f"coalesced confirmation {authority}: {got}, expected {expected}")
     worker_pid = os.environ.get("LINNEA_H3_WORKER_PID")
     if worker_pid:
         marker = os.environ.get("LINNEA_H3_SPILL_MARKER")

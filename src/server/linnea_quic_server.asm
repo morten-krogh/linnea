@@ -104,6 +104,7 @@ global linnea_h3_cancel_hook
 
 extern linnea_http_authority_host
 extern linnea_pdf_source_route
+extern linnea_pdf_confirmation_route
 extern linnea_static_normalize
 extern linnea_config_match_location
 extern linnea_error_exit
@@ -802,15 +803,34 @@ h3_request_body_cap:
     test r14d, r14d
     jz .hbc_done
     cmp qword [r13 + linnea_config_server.pdf_source_max_body], 0
+    jne .hbc_route
+    cmp qword [r13 + linnea_config_server.pdf_confirmation_max_body], 0
     je .hbc_done
+.hbc_route:
     mov rdi, [r12 + linnea_h2_req.method_ptr]
     mov rsi, [r12 + linnea_h2_req.method_len]
     mov rdx, [r12 + linnea_h2_req.path_ptr]
     mov rcx, [r12 + linnea_h2_req.path_len]
     call linnea_pdf_source_route
     test eax, eax
+    jz .hbc_confirmation
+    mov rcx, [r13 + linnea_config_server.pdf_source_max_body]
+    test rcx, rcx
     jz .hbc_done
-    mov rbx, [r13 + linnea_config_server.pdf_source_max_body]
+    mov rbx, rcx
+    jmp .hbc_done
+.hbc_confirmation:
+    mov rdi, [r12 + linnea_h2_req.method_ptr]
+    mov rsi, [r12 + linnea_h2_req.method_len]
+    mov rdx, [r12 + linnea_h2_req.path_ptr]
+    mov rcx, [r12 + linnea_h2_req.path_len]
+    call linnea_pdf_confirmation_route
+    test eax, eax
+    jz .hbc_done
+    mov rcx, [r13 + linnea_config_server.pdf_confirmation_max_body]
+    test rcx, rcx
+    jz .hbc_done
+    mov rbx, rcx
     jmp .hbc_done
 .hbc_misdirected:
     ; Serving will issue 421; until then do not grant a different vhost's cap.

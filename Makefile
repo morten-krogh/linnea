@@ -54,6 +54,13 @@ pdf-route-test: src/lib/linnea_pdf_source_route.o test/pdf_source_route.c
 pdf-h3-route-test: $(BIN)
 	python3 test/pdf_source_body_limit_h3_fixture.py $(BIN)
 
+pdf-confirmation-ingress-test: $(BIN) src/lib/linnea_pdf_source_route.o
+	$(CC) -Wall -Wextra -Werror -no-pie -o bin/linnea-pdf-route-test test/pdf_source_route.c src/lib/linnea_pdf_source_route.o
+	./bin/linnea-pdf-route-test
+	python3 test/pdf_confirmation_body_limits_config.py $(BIN)
+	python3 test/pdf_source_body_limit_fixture.py $(BIN)
+	python3 test/pdf_source_body_limit_h3_fixture.py $(BIN)
+
 $(BIN): $(LIBOBJS) $(SRVOBJS)
 	$(LD) -o $@ $^
 

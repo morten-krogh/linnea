@@ -99,6 +99,8 @@ key_path_len            equ $ - key_path
 body_method_post:       db "POST"
 body_path_source:       db "/projects/{project_id}/source"
 body_path_source_len    equ $ - body_path_source
+body_path_confirmation: db "/projects/{project_id}/pdf-candidate-confirmations"
+body_path_confirmation_len equ $ - body_path_confirmation
 key_prefix:             db "prefix"
 key_prefix_len          equ $ - key_prefix
 key_root:               db "root"
@@ -892,6 +894,7 @@ linnea_parse_server:
     xor r12d, r12d             ; key mask
     mov qword [rbx + linnea_config_server.location_count], 0
     mov qword [rbx + linnea_config_server.pdf_source_max_body], 0
+    mov qword [rbx + linnea_config_server.pdf_confirmation_max_body], 0
     ; TLS is opt-in per server: clear the markers so a server with no
     ; "cert"/"key" is plaintext; validation enforces both-or-neither.
     mov dword [rbx + linnea_config_server.tls], 0
@@ -1205,18 +1208,21 @@ linnea_parse_server:
     mov esi, msg_too_many_locs_len
     jmp linnea_parse_fail
 
-; One exact source-upload body rule per server for the initial contract. The
-; method and template are explicit config data and must match the supported
-; route exactly; a typo must fail startup rather than broaden the cap.
+; At most one exact rule per supported route; unsupported templates fail.
 linnea_parse_pdf_body_limit:
     push rbx
     push r12
     push r13
     push r14
+    push r15
+    push rbp
     mov rbx, rdi
-    xor r12d, r12d                 ; method=1, path=2, max_body=4
     mov edi, '['
     call linnea_parse_expect
+.object:
+    xor r12d, r12d                 ; method=1, path=2, max_body=4
+    xor r15d, r15d                 ; 1=source, 2=confirmation
+    xor ebp, ebp                   ; selected cap
     mov edi, '{'
     call linnea_parse_expect
 .member:
@@ -1264,7 +1270,7 @@ linnea_parse_pdf_body_limit:
     or r12d, 2
     call linnea_parse_string
     cmp rdx, body_path_source_len
-    jne .shape
+    jne .path_confirmation
     mov rdi, rax
     mov rsi, rdx
     lea rdx, [body_path_source]
@@ -1272,6 +1278,19 @@ linnea_parse_pdf_body_limit:
     call linnea_string_equal
     test eax, eax
     jz .shape
+    mov r15d, 1
+    jmp .sep
+.path_confirmation:
+    cmp rdx, body_path_confirmation_len
+    jne .shape
+    mov rdi, rax
+    mov rsi, rdx
+    lea rdx, [body_path_confirmation]
+    mov ecx, body_path_confirmation_len
+    call linnea_string_equal
+    test eax, eax
+    jz .shape
+    mov r15d, 2
     jmp .sep
 .max_body:
     test r12d, 4
@@ -1282,7 +1301,7 @@ linnea_parse_pdf_body_limit:
     jz .shape
     cmp rax, 16777216           ; Vefruna's immutable source-store bound
     ja .shape
-    mov [rbx + linnea_config_server.pdf_source_max_body], rax
+    mov rbp, rax
 .sep:
     call linnea_parse_skip_ws
     call linnea_parse_peek
@@ -1293,8 +1312,33 @@ linnea_parse_pdf_body_limit:
     call linnea_parse_advance
     cmp r12d, 7
     jne .shape
-    mov edi, ']'
-    call linnea_parse_expect
+    cmp r15d, 1
+    je .store_source
+    cmp r15d, 2
+    jne .shape
+    cmp rbp, 262144
+    ja .shape
+    cmp qword [rbx + linnea_config_server.pdf_confirmation_max_body], 0
+    jne .shape
+    mov [rbx + linnea_config_server.pdf_confirmation_max_body], rbp
+    jmp .after_store
+.store_source:
+    cmp qword [rbx + linnea_config_server.pdf_source_max_body], 0
+    jne .shape
+    mov [rbx + linnea_config_server.pdf_source_max_body], rbp
+.after_store:
+    call linnea_parse_skip_ws
+    call linnea_parse_peek
+    cmp al, ']'
+    je .end_array
+    cmp al, ','
+    jne .shape
+    call linnea_parse_advance
+    jmp .object
+.end_array:
+    call linnea_parse_advance
+    pop rbp
+    pop r15
     pop r14
     pop r13
     pop r12

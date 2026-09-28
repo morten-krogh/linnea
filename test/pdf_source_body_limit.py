@@ -17,8 +17,9 @@ PORT = int(sys.argv[1])
 HOST = (sys.argv[2] if len(sys.argv) > 2 else "vefruna.test").encode()
 ORDINARY_CAP = int(sys.argv[3]) if len(sys.argv) > 3 else 12288
 SOURCE_CAP = int(sys.argv[4]) if len(sys.argv) > 4 else 16777216
+SUFFIX = (sys.argv[5] if len(sys.argv) > 5 else "/source").encode()
 PROJECT_ID = b"project_" + b"0" * 25 + b"1"
-SOURCE = b"/projects/" + PROJECT_ID + b"/source"
+SOURCE = b"/projects/" + PROJECT_ID + SUFFIX
 
 
 def status(method, path, size, *, host=HOST, chunked=False, declared_only=False):
@@ -38,7 +39,7 @@ def status(method, path, size, *, host=HOST, chunked=False, declared_only=False)
 
 def main():
     adjacent = b"/projects/" + PROJECT_ID + b"/notes"
-    malformed = b"/projects/not-a-project/source"
+    malformed = b"/projects/not-a-project" + SUFFIX
     cases = [
         ("source counted above ordinary cap", b"POST", SOURCE,
          ORDINARY_CAP + 1, False, False, False),
@@ -59,7 +60,7 @@ def main():
         ("source path with extra segment", b"POST", SOURCE + b"/extra",
          ORDINARY_CAP + 1, False, False, True),
         ("source path with percent escape", b"POST",
-         SOURCE.replace(b"/source", b"/%73ource"),
+         SOURCE.replace(SUFFIX, b"/%%%02x" % SUFFIX[1] + SUFFIX[2:]),
          ORDINARY_CAP + 1, False, False, True),
         ("source above exact cap before body", b"POST", SOURCE,
          SOURCE_CAP + 1, False, True, True),

@@ -55,6 +55,7 @@ extern linnea_time_parse_http_date
 extern linnea_time_http_now
 extern linnea_config_instance
 extern linnea_pdf_source_route
+extern linnea_pdf_confirmation_route
 extern linnea_string_from_u64
 extern linnea_string_to_u64
 extern linnea_http_upstream_head_valid
@@ -2341,7 +2342,10 @@ h2_serve:
     mov [r13 + linnea_h2p.request_body_cap], rcx
     mov rcx, [h2_cur_srv]
     cmp qword [rcx + linnea_config_server.pdf_source_max_body], 0
+    jne .request_cap_authority
+    cmp qword [rcx + linnea_config_server.pdf_confirmation_max_body], 0
     je .request_cap_done
+.request_cap_authority:
     mov rdi, [r12 + linnea_h2_req.auth_ptr]
     mov rsi, [r12 + linnea_h2_req.auth_len]
     test rdi, rdi
@@ -2368,9 +2372,27 @@ h2_serve:
     call linnea_pdf_source_route
     pop r12
     test eax, eax
-    jz .request_cap_done
+    jz .request_cap_confirmation
     mov rcx, [h2_cur_srv]
     mov rcx, [rcx + linnea_config_server.pdf_source_max_body]
+    test rcx, rcx
+    jz .request_cap_done
+    mov [r13 + linnea_h2p.request_body_cap], rcx
+    jmp .request_cap_done
+.request_cap_confirmation:
+    push r12
+    mov rdi, [r12 + linnea_h2_req.method_ptr]
+    mov rsi, [r12 + linnea_h2_req.method_len]
+    mov rdx, [r12 + linnea_h2_req.path_ptr]
+    mov rcx, [r12 + linnea_h2_req.path_len]
+    call linnea_pdf_confirmation_route
+    pop r12
+    test eax, eax
+    jz .request_cap_done
+    mov rcx, [h2_cur_srv]
+    mov rcx, [rcx + linnea_config_server.pdf_confirmation_max_body]
+    test rcx, rcx
+    jz .request_cap_done
     mov [r13 + linnea_h2p.request_body_cap], rcx
 .request_cap_done:
     mov rcx, [rbx + linnea_connection.peer_ip]

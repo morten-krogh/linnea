@@ -6,19 +6,44 @@
 default rel
 
 global linnea_pdf_source_route
+global linnea_pdf_confirmation_route
 
 section .rodata
 method_post: db "POST"
 path_prefix: db "/projects/project_"
 path_suffix: db "/source"
+confirmation_suffix: db "/pdf-candidate-confirmations"
+confirmation_suffix_len equ $ - confirmation_suffix
 alphabet: db "0123456789abcdefghjkmnpqrstvwxyz"
 
 section .text
 linnea_pdf_source_route:
+    push r12
+    push r13
+    lea r12, [path_suffix]
+    mov r13d, 7
+    call pdf_route_common
+    pop r13
+    pop r12
+    ret
+
+linnea_pdf_confirmation_route:
+    push r12
+    push r13
+    lea r12, [confirmation_suffix]
+    mov r13d, confirmation_suffix_len
+    call pdf_route_common
+    pop r13
+    pop r12
+    ret
+
+pdf_route_common:
     xor eax, eax
     cmp rsi, 4
     jne .done
-    cmp rcx, 51
+    mov r10, r13
+    add r10, 44
+    cmp rcx, r10
     jne .done
     cmp dword [rdi], 0x54534f50      ; POST, little endian
     jne .done
@@ -61,10 +86,10 @@ linnea_pdf_source_route:
     jz .done
     xor r8d, r8d
 .suffix_loop:
-    cmp r8, 7
+    cmp r8, r13
     jae .match
     mov r9b, [rdx + r8 + 44]
-    cmp r9b, [path_suffix + r8]
+    cmp r9b, [r12 + r8]
     jne .done
     inc r8
     jmp .suffix_loop
