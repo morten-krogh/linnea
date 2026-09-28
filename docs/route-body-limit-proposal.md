@@ -48,3 +48,14 @@ for requests that send HEADERS and DATA in one packet and in separate packets.
 
 This proposal needs Linnea owner review before implementation because it
 changes shared configuration syntax and all three public request paths.
+
+`test/pdf_source_body_limit.py` is a standalone HTTP/1 acceptance probe for an
+isolated Linnea instance with the proposed Vefruna rule. It checks counted and
+chunked source uploads above the ordinary cap, adjacent routes, wrong method,
+malformed ID, query and extra path, plus an oversized declared source body
+without sending that body. It is not in the passing suite until the rule is
+implemented. Against an isolated instance of the current Vefruna `/` 16 MiB
+override, the probe fails on adjacent routes, wrong method, and malformed or
+extended paths because they all pass ingress. That failure is the gap, not a
+claim about the live service. HTTP/2 and HTTP/3 acceptance probes remain to be
+implemented alongside the cross-protocol change.
