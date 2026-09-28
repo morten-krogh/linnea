@@ -2342,6 +2342,24 @@ h2_serve:
     mov rcx, [h2_cur_srv]
     cmp qword [rcx + linnea_config_server.pdf_source_max_body], 0
     je .request_cap_done
+    mov rdi, [r12 + linnea_h2_req.auth_ptr]
+    mov rsi, [r12 + linnea_h2_req.auth_len]
+    test rdi, rdi
+    jz .request_cap_done
+    call linnea_http_authority_host
+    cmp rax, -1
+    je .request_cap_done
+    test rax, rax
+    jz .request_cap_done
+    mov rdi, [r12 + linnea_h2_req.auth_ptr]
+    add rdi, rdx
+    mov rsi, rax
+    mov rdx, [h2_cur_srv]
+    mov rcx, [rdx + linnea_config_server.hostname_len]
+    lea rdx, [rdx + linnea_config_server.hostname]
+    call linnea_string_iequal
+    test eax, eax
+    jz .request_cap_done
     push r12
     mov rdi, [r12 + linnea_h2_req.method_ptr]
     mov rsi, [r12 + linnea_h2_req.method_len]

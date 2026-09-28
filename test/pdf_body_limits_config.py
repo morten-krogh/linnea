@@ -17,14 +17,28 @@ def run(candidate):
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "config.json"
         base = {"log": str(Path(directory) / "log"), "max_body": 12288,
+                "http3": 0,
                 "servers": [{"host": "127.0.0.1", "port": 0,
                              "hostname": "vefruna.test",
                              "locations": [{"prefix": "/", "proxy":
                                             "127.0.0.1:1"}],
                              "body_limits": [candidate]}]}
         path.write_text(json.dumps(base))
-        return subprocess.run([binary, "--config", str(path), "--test"],
-                              capture_output=True, check=False).returncode
+        accepted = subprocess.run([binary, "--config", str(path), "--test"],
+                                  capture_output=True, check=False).returncode
+        if candidate == rule:
+            base["http3"] = 1
+            path.write_text(json.dumps(base))
+            unsafe = subprocess.run([binary, "--config", str(path), "--test"],
+                                    capture_output=True, check=False).returncode
+            assert unsafe != 0, "body_limits accepted with HTTP/3 enabled"
+            del base["http3"]
+            path.write_text(json.dumps(base))
+            default_unsafe = subprocess.run(
+                [binary, "--config", str(path), "--test"],
+                capture_output=True, check=False).returncode
+            assert default_unsafe != 0, "body_limits accepted with default H3"
+        return accepted
 
 
 assert run(rule) == 0

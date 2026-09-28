@@ -18,18 +18,18 @@ project = "project_" + "0" * 25 + "1"
 source = f"/projects/{project}/source"
 
 
-def request(path, body, *, method="POST", no_length=False):
+def request(path, body, *, method="POST", no_length=False, authority=host):
     with tempfile.TemporaryDirectory() as directory:
         payload = pathlib.Path(directory) / "payload"
         payload.write_bytes(body)
         args = ["curl", "--noproxy", "*", "--http2", "-k", "-sS",
                 "--max-time", "15", "--resolve",
-                f"{host}:{port}:127.0.0.1", "-o", "/dev/null",
+                f"{authority}:{port}:127.0.0.1", "-o", "/dev/null",
                 "-w", "%{http_code} %{http_version}", "-X", method]
         if no_length:
             args += ["-H", "Content-Length:"]
         args += ["--data-binary", f"@{payload}",
-                 f"https://{host}:{port}{path}"]
+                 f"https://{authority}:{port}{path}"]
         result = subprocess.run(args, capture_output=True, text=True,
                                 timeout=20, check=False)
     if result.returncode:
@@ -56,6 +56,9 @@ def main():
         got = request(path, body, method=method, no_length=no_length)
         if got != expected:
             failures.append(f"{name}: {got}, expected {expected}")
+    other = request(source, body, authority="other.test")
+    if other != "413 2":
+        failures.append(f"other authority: {other}, expected 413 2")
     if failures:
         print("\n".join(failures))
         return 1

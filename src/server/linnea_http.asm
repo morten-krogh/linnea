@@ -2173,6 +2173,13 @@ linnea_http_handle:
     mov [rbx + linnea_connection.request_body_cap], rcx
     cmp qword [r12 + linnea_config_server.pdf_source_max_body], 0
     je .cap_done
+    mov rdi, [rsp + 88]
+    mov rsi, [rsp + 96]
+    lea rdx, [r12 + linnea_config_server.hostname]
+    mov rcx, [r12 + linnea_config_server.hostname_len]
+    call linnea_string_iequal
+    test eax, eax
+    jz .cap_done
     mov rdi, r14
     mov rsi, [rsp + 104]
     mov rdx, [rsp + 8]          ; original target, including query/escapes

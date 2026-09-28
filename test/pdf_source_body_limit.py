@@ -73,6 +73,11 @@ def main():
     if failures:
         print("\n".join(failures))
         return 1
+    other_host = status(b"POST", SOURCE, ORDINARY_CAP + 1,
+                        host=b"other.test")
+    if b" 413 " not in other_host:
+        print(f"other host: {other_host!r}, expected 413")
+        return 1
     print("OK")
     return 0
 

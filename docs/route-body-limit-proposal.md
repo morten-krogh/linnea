@@ -1,6 +1,8 @@
 # Exact route request-body limits (proposal)
 
-Status: proposal only. No parser, routing, or deployed configuration change.
+Status: implemented locally for HTTP/1 and HTTP/2 with an explicit global
+HTTP/3 opt-out requirement. Not merged or deployed. Exact HTTP/3 enforcement
+remains proposed.
 
 Location `max_body` currently applies to the longest matching path prefix on
 HTTP/1, HTTP/2, and HTTP/3. It cannot express a larger cap only for
@@ -24,8 +26,8 @@ percent-decoding, or alternate target form.
 The rule applies only to the named server's exact hostname and method. The
 effective cap is the matching rule's `max_body`; otherwise the existing
 location/global cap applies. Duplicate matching rules are rejected at config
-parse time. The feature must reject unsupported template syntax instead of
-falling back to a prefix match.
+parse time. Unsupported template syntax is rejected rather than treated as a
+prefix match. The initial implementation accepts exactly one rule.
 
 Acceptance requires the same limit decision before body buffering on HTTP/1,
 HTTP/2, and HTTP/3, including chunked/unknown-length streams and declared
@@ -50,9 +52,11 @@ The isolated branch now parses this one rule strictly and applies it before
 HTTP/1 counted and chunked capture and HTTP/2 declared and DATA capture. The
 method/path predicate reads the raw request target, so a query or percent
 escape cannot gain the larger cap through routing normalization. Other rules
-and multiple elements are rejected at startup. HTTP/3 remains unresolved;
-the branch must not be merged or deployed with the rule enabled until HTTP/3
-has equivalent enforcement or is explicitly disabled for the deployment.
+and multiple elements are rejected at startup. HTTP/3 exact-route enforcement
+remains unresolved. Startup rejects a config containing `body_limits` unless
+top-level `http3` is explicitly `0`. The global opt-out affects every host
+served by that Linnea process, so deployment requires an explicit decision.
+HTTP/3 otherwise keeps its previous default.
 
 `test/pdf_source_body_limit.py` is a standalone HTTP/1 acceptance probe for an
 isolated Linnea instance with the proposed Vefruna rule. It checks counted and
@@ -62,15 +66,18 @@ source body without sending that body. `test/pdf_source_body_limit_h2.py` checks
 HTTP/2 declared and no-Content-Length DATA paths, including adjacent routes
 and path variants. `test/pdf_body_limits_config.py` checks accepted/rejected
 config shapes. All passed against isolated local fixtures with an absent test
-backend. The HTTP/3 acceptance probe remains to be implemented.
+backend. `test/pdf_source_body_limit_fixture.py` runs both probes on isolated
+instances and confirms `http3: 0` leaves the TLS UDP port unbound and omits
+`Alt-Svc` from HTTP/1.1 and HTTP/2 responses. An exact-route HTTP/3 probe
+remains to be implemented with that feature.
 
 A pure exact-route predicate exists in
 `src/lib/linnea_pdf_source_route.asm`, with `make pdf-route-test` covering
 method, path suffix, query, project ID alphabet and length, and the all-zero
 identifier. The HTTP/1 and HTTP/2 handlers call it before body capture.
 
-An alternative to changing HTTP/3's early capture is an explicit server-level
-HTTP/3 opt-out for Vefruna, provided Linnea both omits `Alt-Svc` for that
-server and refuses QUIC SNI/authority for it. Merely hiding the advertisement
-does not prevent a client from trying HTTP/3. No such opt-out currently exists
-or has been implemented here.
+The interim control is top-level `http3: 0`, documented in
+`docs/design/http3-opt-out.md`. It suppresses the QUIC listener and Alt-Svc
+for the entire process. A hot reload can leave old workers' UDP listeners
+active until they drain; a full stop and restart is required for immediate
+exclusion. No live configuration has been changed here.
