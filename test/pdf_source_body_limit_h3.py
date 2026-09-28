@@ -14,11 +14,12 @@ import socket
 import ssl
 import sys
 import time
+import os
 
 import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
-from aioquic.quic.events import StreamDataReceived
+from aioquic.quic.events import ConnectionTerminated, StreamDataReceived, StreamReset
 
 
 port = int(sys.argv[1])
@@ -100,8 +101,57 @@ def status(response, stream_id):
     return dict(fields).get(b":status", b"?").decode()
 
 
+def spill_sizes(worker_pid, marker):
+    """Sizes of this fixture's anonymous capture files in a Linnea worker."""
+    fd_dir = f"/proc/{worker_pid}/fd"
+    sizes = []
+    for name in os.listdir(fd_dir):
+        path = os.path.join(fd_dir, name)
+        try:
+            if marker in os.readlink(path):
+                sizes.append(os.stat(path).st_size)
+        except (FileNotFoundError, PermissionError, OSError):
+            pass  # The worker can close a descriptor between readlink and stat.
+    return sizes
+
+
+def adjacent_spill_probe(worker_pid, marker):
+    """Leave an adjacent-route upload open long enough to inspect capture."""
+    stream_id = conn.get_next_available_stream_id()
+    encoder = pylsqpack.Encoder()
+    encoder.apply_settings(max_table_capacity=0, blocked_streams=0)
+    _, fields = encoder.encode(stream_id, [
+        (b":method", b"POST"), (b":path", source.replace("/source", "/notes").encode()),
+        (b":scheme", b"https"), (b":authority", host.encode()),
+    ])
+    head = vi(1) + vi(len(fields)) + fields
+    body = vi(0) + vi(ordinary + 1) + b"A" * (ordinary + 1)
+    conn.send_stream_data(stream_id, head + body, end_stream=False)
+    pump()
+    largest = 0
+    response = b""
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        largest = max([largest, *spill_sizes(worker_pid, marker)])
+        for event in receive():
+            if isinstance(event, StreamDataReceived) and event.stream_id == stream_id:
+                response += event.data
+        pump()
+    conn.send_stream_data(stream_id, b"", end_stream=True)
+    pump()
+    deadline = time.monotonic() + 10
+    while status(response, stream_id) is None and time.monotonic() < deadline:
+        largest = max([largest, *spill_sizes(worker_pid, marker)])
+        for event in receive():
+            if isinstance(event, StreamDataReceived) and event.stream_id == stream_id:
+                response += event.data
+        pump()
+    return status(response, stream_id), largest
+
+
 def request(path, length, *, method="POST", split=False, authority=host,
-            content_length=True, require_one_datagram=False):
+            content_length=True, require_one_datagram=False,
+            fragment_headers=0, fields_override=None):
     stream_id = conn.get_next_available_stream_id()
     encoder = pylsqpack.Encoder()
     encoder.apply_settings(max_table_capacity=0, blocked_streams=0)
@@ -110,9 +160,23 @@ def request(path, length, *, method="POST", split=False, authority=host,
     if content_length:
         headers.append((b"content-length", str(length).encode()))
     _, fields = encoder.encode(stream_id, headers)
+    if fields_override is not None:
+        fields = fields_override
     head = vi(1) + vi(len(fields)) + fields
     body = vi(0) + vi(length) + b"A" * length
-    if split:
+    if fragment_headers:
+        if not 0 < fragment_headers < len(head):
+            return "invalid HEADERS split"
+        conn.send_stream_data(stream_id, head[:fragment_headers], end_stream=False)
+        if pump() == 0:
+            return "HEADERS fragment not flushed"
+        clock[0] += 0.01
+        conn.send_stream_data(stream_id, head[fragment_headers:], end_stream=False)
+        if pump() == 0:
+            return "HEADERS remainder not flushed"
+        clock[0] += 0.01
+        conn.send_stream_data(stream_id, body, end_stream=True)
+    elif split:
         conn.send_stream_data(stream_id, head, end_stream=False)
         if pump() == 0:
             return "HEADERS not flushed"
@@ -132,6 +196,10 @@ def request(path, length, *, method="POST", split=False, authority=host,
                 found = status(response, stream_id)
                 if found is not None:
                     return found
+            if isinstance(event, StreamReset) and event.stream_id == stream_id:
+                return "reset"
+            if isinstance(event, ConnectionTerminated):
+                return "connection closed"
         pump()
     return "no H3 response"
 
@@ -169,6 +237,45 @@ try:
                       require_one_datagram=single and source_cap < 1000)
         if got != expected:
             failed.append(f"{label}: got {got}, expected {expected}")
+    for label, path, expected in [
+        ("source fragmented frame header", source, "502"),
+        ("adjacent fragmented frame header", source.replace("/source", "/notes"), "413"),
+    ]:
+        got = request(path, above_ordinary, fragment_headers=1)
+        if got != expected:
+            failed.append(f"{label}: got {got}, expected {expected}")
+    # Splitting inside the QPACK field block takes a different reassembly path
+    # from splitting the frame's varint header.
+    for path, expected in [(source, "502"),
+                           (source.replace("/source", "/notes"), "413")]:
+        got = request(path, above_ordinary, fragment_headers=12,
+                      content_length=False)
+        if got != expected:
+            failed.append(f"QPACK field-block fragment {path}: got {got}, expected {expected}")
+    coalesced = os.environ.get("LINNEA_H3_COALESCED_AUTHORITY")
+    if coalesced:
+        # The fixture must put the source rule on `host` only and configure
+        # `coalesced` as a second vhost covered by the same certificate.
+        for authority, expected in [(host, "502"), (coalesced, "413"),
+                                    (host, "502")]:
+            got = request(source, above_ordinary, authority=authority, split=True)
+            if got != expected:
+                failed.append(f"coalesced {authority}: got {got}, expected {expected}")
+    worker_pid = os.environ.get("LINNEA_H3_WORKER_PID")
+    if worker_pid:
+        marker = os.environ.get("LINNEA_H3_SPILL_MARKER")
+        if not marker:
+            failed.append("LINNEA_H3_SPILL_MARKER required with worker PID")
+        else:
+            got, largest = adjacent_spill_probe(worker_pid, marker)
+            if got != "413" or largest > ordinary:
+                failed.append(f"adjacent capture: status {got}, peak {largest}, ordinary cap {ordinary}")
+    # Required Insert Count 1 is invalid with Linnea's advertised dynamic
+    # table capacity 0. RFC 9204 makes decompression failure a connection
+    # error, so this must run last on the connection.
+    invalid = request(source, above_ordinary, fields_override=b"\x01\x00")
+    if invalid != "connection closed":
+        failed.append(f"invalid QPACK dynamic reference: got {invalid}, expected connection close")
     other = request(source, above_ordinary, authority="other.test", split=True)
     if other != "413":
         failed.append(f"other authority: got {other}, expected 413")
