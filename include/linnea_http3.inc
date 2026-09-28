@@ -121,6 +121,9 @@ struc linnea_h3_walk
     ; arrived at once is still handled. .sink_ctx is the sink's to use.
     .sink:      resq 1
     .sink_ctx:  resq 1
+    ; Optional one-shot decision after the initial HEADERS section is complete,
+    ; before any DATA is accepted. callback(rdi=walk) -> 0 or -H3 error.
+    .on_headers: resq 1
     ; Decode the field section as soon as it is whole (0), or hold it and let
     ; the caller decode later (1). Deferring is what keeps the decoder's output
     ; -- the request struct, the Huffman arena its pointers reach into, and the
@@ -128,7 +131,7 @@ struc linnea_h3_walk
     ; consumed as it arrives would otherwise need its own copy of all three,
     ; from the moment its headers decode until it is finally served. Held whole
     ; is no worse than it already was: a field section is bounded either way.
-    .defer:     resq 1
+.defer:     resq 1
     .phase:     resq 1
     .frame_rem: resq 1       ; payload bytes still to consume in this frame
     ; Where the walk is in the frame SEQUENCE (RFC 9114 4.1): 0 = nothing yet,

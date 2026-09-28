@@ -1,8 +1,32 @@
 # HTTP/3 exact route body cap design
 
-Status: design and test target only. The current branch rejects `body_limits`
-unless `http3: 0`; this guard must remain until all steps below are implemented
-and tested. Nothing here changes the deployed HTTP/3 service.
+Status: implemented and tested in the isolated local branch; not deployed.
+The startup guard was removed after the exact-route HTTP/3 protocol probe,
+same-certificate authority and spill-size checks, and existing HTTP/3 body
+regression checks passed. `http3: 0` remains a supported explicit setting.
+Run `make pdf-h3-route-test` for the repeatable isolated acceptance fixture.
+
+## Proposed internal interface (2026-09-28)
+
+The implementation adds a callback to `linnea_h3_walk` which fires once after the first complete
+HEADERS field section has been accumulated, before the walker enters DATA.
+The callback receives the field section and its reassembly context, decodes it
+with the existing bounded QPACK decoder into worker scratch, validates the
+request, resolves `:authority` against the certificate, normalizes the path for
+location matching, and selects a per-stream body cap. Its result is stored in
+`linnea_quic_ra.max_body`; no decoded request pointers survive the callback.
+The existing final decode still builds the full request for serving. QPACK's
+current implementation requires Required Insert Count zero, so decoding the
+same field section a second time does not advance a dynamic table. The
+callback returns existing H3 error codes for malformed fields or oversized
+field sections. Incomplete HEADERS keep only the initial small flow window;
+the larger upload window is granted only after the callback succeeds.
+
+The one-packet path uses the same cap selection on its decoded request before
+body or route dispatch. The selected cap uses the validated serving vhost's
+matching location and the exact raw method/path predicate. An unknown
+authority can use the SNI vhost's ordinary cap, but cannot receive the scoped
+source cap. The callback does not change config schema or public APIs.
 
 ## Current sequence
 
@@ -54,7 +78,7 @@ client whose HEADERS require dynamic QPACK table updates on another stream.
 - Single-packet fast path and reassembled/spill path must agree on each status.
   Existing H3 proxy, framing, flow-control, and hot-reload suites must pass.
 
-The interim global `http3: 0` control stays available. A per-origin opt-out is
+The global `http3: 0` control stays available. A per-origin opt-out is
 insufficient while unknown SNI can select the default vhost and authority is
 checked only after capture.
 

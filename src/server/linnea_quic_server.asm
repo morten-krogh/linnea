@@ -103,6 +103,9 @@ global linnea_h3d_fss
 global linnea_h3_cancel_hook
 
 extern linnea_http_authority_host
+extern linnea_pdf_source_route
+extern linnea_static_normalize
+extern linnea_config_match_location
 extern linnea_error_exit
 extern linnea_h3_build_431
 extern linnea_h3_build_429
@@ -121,6 +124,7 @@ extern linnea_config_instance
 extern linnea_h3_body_fd
 extern linnea_h3_serve
 extern linnea_h3_srv
+extern linnea_h3_request_body_cap
 extern linnea_h3_owner_idx
 extern linnea_h3_owner_gen
 extern linnea_h3_owner_sid
@@ -362,6 +366,7 @@ req_status_pick:    resq 1
 ra_fail_reason:     resq 1
 ra_fail_reason_len: resq 1
 ra_fail_errno:      resq 1
+h3_cap_path_buf:   resb 4096
 sa:          resb 28
 salen:       resq 1
 linnea_quic_rxbuf: resb LINNEA_QUIC_RXBUF_SIZE
@@ -735,6 +740,115 @@ vhost_body_cap:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; h3_request_body_cap(rdi=req*) -> rax=cap. Decode-time selection uses the
+; same serving-vhost and normalized longest-prefix route as h3_serve, but the
+; source exception tests the ORIGINAL method/path. No request pointer escapes.
+h3_request_body_cap:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    mov rbx, [linnea_config_instance + linnea_config.max_body]
+    mov rax, [cur_conn]
+    mov r13, [rax + linnea_quic_conn.vhost]
+    mov r15, r13
+    xor r14d, r14d                  ; no validated matching authority yet
+    mov rdi, [r12 + linnea_h2_req.auth_ptr]
+    mov rsi, [r12 + linnea_h2_req.auth_len]
+    test rdi, rdi
+    jz .hbc_vhost
+    call authority_vhost
+    cmp rax, -1
+    je .hbc_vhost                 ; unknown name: SNI fallback, no exception
+    mov r15, rax
+    cmp r15, r13
+    je .hbc_authorized
+    mov rdi, r15
+    mov rsi, r13
+    call vhost_same_cert
+    test eax, eax
+    jz .hbc_misdirected
+.hbc_authorized:
+    mov r14d, 1
+.hbc_vhost:
+    mov rax, r15
+    call vhost_slot
+    mov r13, [rax + linnea_quic_vhost.srv]
+    mov rsi, [r12 + linnea_h2_req.path_ptr]
+    test rsi, rsi
+    jz .hbc_done
+    mov rdx, [r12 + linnea_h2_req.path_len]
+    lea rdi, [h3_cap_path_buf + LINNEA_H3_PATH_ROOT]
+    call linnea_static_normalize
+    test rax, rax
+    jz .hbc_done
+    mov rdx, rax
+    lea rsi, [h3_cap_path_buf + LINNEA_H3_PATH_ROOT]
+    sub rdx, rsi
+    mov rdi, r13
+    call linnea_config_match_location
+    test rax, rax
+    jz .hbc_done
+    mov rcx, [rax + linnea_config_location.max_body]
+    test rcx, rcx
+    jz .hbc_no_override
+    mov rbx, rcx
+.hbc_no_override:
+    test r14d, r14d
+    jz .hbc_done
+    cmp qword [r13 + linnea_config_server.pdf_source_max_body], 0
+    je .hbc_done
+    mov rdi, [r12 + linnea_h2_req.method_ptr]
+    mov rsi, [r12 + linnea_h2_req.method_len]
+    mov rdx, [r12 + linnea_h2_req.path_ptr]
+    mov rcx, [r12 + linnea_h2_req.path_len]
+    call linnea_pdf_source_route
+    test eax, eax
+    jz .hbc_done
+    mov rbx, [r13 + linnea_config_server.pdf_source_max_body]
+    jmp .hbc_done
+.hbc_misdirected:
+    ; Serving will issue 421; until then do not grant a different vhost's cap.
+    mov rbx, [linnea_config_instance + linnea_config.max_body]
+.hbc_done:
+    mov rax, rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Initial deferred HEADERS have become complete. Decode into worker scratch
+; now, keep only the chosen cap in this stream, and decode afresh on dispatch.
+; QPACK currently accepts only Required Insert Count zero; the second decode
+; cannot consume or reorder dynamic-table state.
+h3_early_headers:
+    push rbx
+    mov rbx, [rdi + linnea_h3_walk.sink_ctx]
+    lea rdi, [req]
+    xor eax, eax
+    mov ecx, linnea_h2_req_size
+    rep stosb
+    lea rax, [h3scratch]
+    mov [req + linnea_h2_req.scratch], rax
+    lea rax, [h3scratch + LINNEA_HPACK_MAX_LISTSIZE]
+    mov [req + linnea_h2_req.scratch_end], rax
+    lea rdi, [rbx + linnea_quic_ra.walk]
+    lea rsi, [req]
+    call linnea_h3_walk_decode
+    test rax, rax
+    js .he_done
+    lea rdi, [req]
+    call h3_request_body_cap
+    mov [rbx + linnea_quic_ra.max_body], rax
+    xor eax, eax
+.he_done:
     pop rbx
     ret
 
@@ -2803,15 +2917,12 @@ linnea_quic_server_datagram:
     rep stosb
     pop rax
     mov qword [rax + linnea_quic_ra.walk + linnea_h3_walk.defer], 1
+    lea rcx, [h3_early_headers]
+    mov [rax + linnea_quic_ra.walk + linnea_h3_walk.on_headers], rcx
     ; the body goes to a file of this context's own, not into .buf
     mov qword [rax + linnea_quic_ra.spill_fd], -1
     mov qword [rax + linnea_quic_ra.spill_len], 0
-    push rax
-    mov rcx, [cur_conn]
-    mov rax, [rcx + linnea_quic_conn.vhost]
-    call vhost_body_cap
-    mov r8, rax
-    pop rax
+    mov r8, [linnea_config_instance + linnea_config.max_body]
     mov [rax + linnea_quic_ra.max_body], r8
     mov qword [rax + linnea_quic_ra.base], 0
     mov qword [rax + linnea_quic_ra.body_from], 0
@@ -3935,9 +4046,20 @@ linnea_quic_server_datagram:
     ; length for both the single-frame and reassembled paths (see the note at the
     ; rate-limit save below); cap it here, before routing, as the one
     ; authoritative check. .req_body_toolarge answers 413 on the stream.
-    mov rax, [cur_conn]
-    mov rax, [rax + linnea_quic_conn.vhost]
-    call vhost_body_cap
+    cmp qword [s_ra_ctx], 0
+    je .req_inline_cap
+    mov rax, [s_ra_ctx]
+    mov rax, [rax + linnea_quic_ra.max_body]
+    jmp .req_cap_ready
+.req_inline_cap:
+    push r8
+    push r9
+    lea rdi, [req]
+    call h3_request_body_cap
+    pop r9
+    pop r8
+.req_cap_ready:
+    mov [linnea_h3_request_body_cap], rax
     cmp r9, rax
     ja .req_body_toolarge
     ; content-length must equal the sum of the DATA payloads (Finding 18, RFC 9114

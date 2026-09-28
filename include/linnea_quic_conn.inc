@@ -304,7 +304,7 @@ LINNEA_QUIC_FC_WINDOW        equ 0x1000000  ; 16 MiB ahead of received
 LINNEA_QUIC_FC_GRANT_MIN     equ 0x40000    ; 256 KiB minimum grant step
 LINNEA_QUIC_CTRL_RO     equ 512     ; reordered control-stream bytes held (h3-6)
 LINNEA_QUIC_RA_CTXS     equ 6       ; requests that can reassemble concurrently
-LINNEA_QUIC_RA_WALK     equ 8288    ; room for one linnea_h3_walk (asserted)
+LINNEA_QUIC_RA_WALK     equ 8296    ; room for one linnea_h3_walk (asserted)
 ; How far the request-stream window may slide before the peer is told: half of
 ; whatever buffer that stream currently holds, so it is computed rather than a
 ; constant now. Grant sooner and it is a packet per datagram, later and the
@@ -540,7 +540,7 @@ struc linnea_quic_ra
     ; closes -- including if we are killed mid-upload.
     .spill_fd:  resq 1              ; -1 = none opened
     .spill_len: resq 1
-    .max_body:  resq 1              ; largest location cap for the SNI vhost
+    .max_body:  resq 1              ; selected cap after initial HEADERS
     ; The window slides. .base is the stream offset buf[0] holds, so .len and
     ; .hi are measured from there rather than from the start of the stream, and
     ; a request is bounded by how much of it is UNCONSUMED at once rather than

@@ -31,6 +31,7 @@ global linnea_h3_build_421
 global linnea_h3_build_response_head
 global linnea_h3_serve
 global linnea_h3_srv
+global linnea_h3_request_body_cap
 global h3_hdrs_buf
 global h3_cookie_buf
 global linnea_h3_tx_cap
@@ -144,6 +145,7 @@ h3_join:     resq 1                   ; where the joined root++path starts
 ; request can be routed to a location. Zero means "no routing": serve the root
 ; the caller passed, which is what h3 did before it could route at all.
 linnea_h3_srv: resq 1
+linnea_h3_request_body_cap: resq 1
 ; Which QUIC connection and stream this request arrived on, so a proxied one
 ; can name the owner its answer is owed to. The generation is the connection ID
 ; that incarnation issued: a slot recycled meanwhile carries a different one and
@@ -448,6 +450,13 @@ linnea_h3_walk_feed:
     cmp qword [rbx + linnea_h3_walk.seq], 2
     je .w_held_trailer
     ; the section is whole in .fs; the caller decodes it when it serves
+    cmp qword [rbx + linnea_h3_walk.on_headers], 0
+    je .w_held_ready
+    mov rdi, rbx
+    call [rbx + linnea_h3_walk.on_headers]
+    test rax, rax
+    js .w_fail
+.w_held_ready:
     mov qword [rbx + linnea_h3_walk.seq], 1
     mov qword [rbx + linnea_h3_walk.phase], LINNEA_H3_W_HEADER
     jmp .w_step
@@ -1074,6 +1083,16 @@ linnea_h3_serve:
     jnz .route_body_cap
     mov rcx, [linnea_config_instance + linnea_config.max_body]
 .route_body_cap:
+    ; QUIC has already validated headers, authority and the exact raw route
+    ; before capture. Its selected per-stream cap includes body_limits.
+    mov rcx, [linnea_h3_request_body_cap]
+    test rcx, rcx
+    jnz .route_body_cap_inherited
+    mov rcx, [rax + linnea_config_location.max_body]
+    test rcx, rcx
+    jnz .route_body_cap_inherited
+    mov rcx, [linnea_config_instance + linnea_config.max_body]
+.route_body_cap_inherited:
     cmp [rsp + 48], rcx
     ja .route_body_too_large
     ; TRACE reflects the received request to whoever sent it; through a proxy

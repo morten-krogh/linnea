@@ -146,8 +146,6 @@ msg_tls_mismatch:       db "servers sharing a listener must all set TLS or none"
 msg_tls_mismatch_len    equ $ - msg_tls_mismatch
 msg_v6only_conflict:    db "servers on one address and port must agree on v6only"
 msg_v6only_conflict_len equ $ - msg_v6only_conflict
-msg_pdf_h3:             db "body_limits requires http3: 0 until HTTP/3 enforces exact routes before capture"
-msg_pdf_h3_len          equ $ - msg_pdf_h3
 
 dump_tls_on:            db " tls=on cert="
 dump_tls_on_len         equ $ - dump_tls_on
@@ -519,11 +517,6 @@ linnea_config_validate:
     jae .ok
     imul r9, r8, linnea_config_server_size
     lea r9, [rdi + r9 + linnea_config.servers]
-    cmp qword [r9 + linnea_config_server.pdf_source_max_body], 0
-    je .pdf_h3_safe
-    cmp qword [rdi + linnea_config.http3], 0
-    jne .pdf_h3_unsafe
-.pdf_h3_safe:
     ; port 0 is deliberate here, not missing: it means "let the kernel choose",
     ; resolved at bind time. A key left out entirely is caught by the parser's
     ; required-key check, so nothing silently binds a random port.
@@ -891,10 +884,6 @@ linnea_config_validate:
 .v6only_conflict:
     lea rdi, [msg_v6only_conflict]
     mov esi, msg_v6only_conflict_len
-    jmp linnea_error_exit
-.pdf_h3_unsafe:
-    lea rdi, [msg_pdf_h3]
-    mov esi, msg_pdf_h3_len
     jmp linnea_error_exit
 
 ; linnea_config_dump(rdi=config*) — human-readable dump to stdout:

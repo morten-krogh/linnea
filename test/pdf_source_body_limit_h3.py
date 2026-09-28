@@ -18,7 +18,7 @@ import os
 
 import pylsqpack
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.connection import QuicConnection
+from aioquic.quic.connection import QuicConnection, QuicConnectionState
 from aioquic.quic.events import ConnectionTerminated, StreamDataReceived, StreamReset
 
 
@@ -74,7 +74,8 @@ def receive():
         data, _ = sock.recvfrom(65535)
     except socket.timeout:
         clock[0] += 0.25
-        conn.handle_timer(now=clock[0])
+        if conn._close_at is not None:
+            conn.handle_timer(now=clock[0])
         return []
     clock[0] += 0.01
     conn.receive_datagram(data, addr, now=clock[0])
@@ -108,7 +109,8 @@ def spill_sizes(worker_pid, marker):
     for name in os.listdir(fd_dir):
         path = os.path.join(fd_dir, name)
         try:
-            if marker in os.readlink(path):
+            target = os.readlink(path)
+            if marker in target and target.endswith(" (deleted)"):
                 sizes.append(os.stat(path).st_size)
         except (FileNotFoundError, PermissionError, OSError):
             pass  # The worker can close a descriptor between readlink and stat.
@@ -200,6 +202,10 @@ def request(path, length, *, method="POST", split=False, authority=host,
                 return "reset"
             if isinstance(event, ConnectionTerminated):
                 return "connection closed"
+        if conn._state in (QuicConnectionState.CLOSING,
+                           QuicConnectionState.DRAINING,
+                           QuicConnectionState.TERMINATED):
+            return "connection closed"
         pump()
     return "no H3 response"
 
@@ -270,15 +276,15 @@ try:
             got, largest = adjacent_spill_probe(worker_pid, marker)
             if got != "413" or largest > ordinary:
                 failed.append(f"adjacent capture: status {got}, peak {largest}, ordinary cap {ordinary}")
+    other = request(source, above_ordinary, authority="other.test", split=True)
+    if other != "413":
+        failed.append(f"other authority: got {other}, expected 413")
     # Required Insert Count 1 is invalid with Linnea's advertised dynamic
     # table capacity 0. RFC 9204 makes decompression failure a connection
     # error, so this must run last on the connection.
     invalid = request(source, above_ordinary, fields_override=b"\x01\x00")
     if invalid != "connection closed":
         failed.append(f"invalid QPACK dynamic reference: got {invalid}, expected connection close")
-    other = request(source, above_ordinary, authority="other.test", split=True)
-    if other != "413":
-        failed.append(f"other authority: got {other}, expected 413")
     if failed:
         print("\n".join(failed))
         raise SystemExit(1)
