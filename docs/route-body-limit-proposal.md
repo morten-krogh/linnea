@@ -67,7 +67,8 @@ HTTP/2 declared and no-Content-Length DATA paths, including adjacent routes
 and path variants. `test/pdf_body_limits_config.py` checks accepted/rejected
 config shapes. All passed against isolated local fixtures with an absent test
 backend. `test/pdf_source_body_limit_fixture.py` runs both probes on isolated
-instances and confirms `http3: 0` leaves the TLS UDP port unbound and omits
+instances with a 16 KiB scoped cap so exact-cap and cap-plus-one cases are
+cheap to repeat. It confirms `http3: 0` leaves the TLS UDP port unbound and omits
 `Alt-Svc` from HTTP/1.1 and HTTP/2 responses. An exact-route HTTP/3 probe
 remains to be implemented with that feature.
 

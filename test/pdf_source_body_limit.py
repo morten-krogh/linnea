@@ -44,6 +44,8 @@ def main():
          ORDINARY_CAP + 1, False, False, False),
         ("source chunked above ordinary cap", b"POST", SOURCE,
          ORDINARY_CAP + 1, True, False, False),
+        ("source exactly at scoped cap", b"POST", SOURCE,
+         SOURCE_CAP, False, False, False),
         ("adjacent project route", b"POST", adjacent,
          ORDINARY_CAP + 1, False, False, True),
         ("adjacent project route chunked", b"POST", adjacent,

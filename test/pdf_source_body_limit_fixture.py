@@ -14,6 +14,7 @@ import time
 
 root = Path(__file__).resolve().parents[1]
 binary = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else root / "bin/linnea"
+source_cap = 16384
 
 
 def serve(directory, tls):
@@ -26,7 +27,7 @@ def serve(directory, tls):
                            "hostname": "vefruna.test",
                            "body_limits": [{"method": "POST",
                                             "path": "/projects/{project_id}/source",
-                                            "max_body": 16777216}],
+                                            "max_body": source_cap}],
                            "locations": [{"prefix": "/",
                                           "proxy": "127.0.0.1:1"}]}]}
     if tls:
@@ -59,7 +60,8 @@ with tempfile.TemporaryDirectory(prefix="linnea-pdf-ingress-") as raw:
     process, port = serve(directory / "h1", False)
     try:
         subprocess.run([sys.executable, str(root / "test/pdf_source_body_limit.py"),
-                        str(port)], check=True, timeout=40)
+                        str(port), "vefruna.test", "12288", str(source_cap)],
+                       check=True, timeout=40)
     finally:
         stop(process)
 
@@ -69,7 +71,8 @@ with tempfile.TemporaryDirectory(prefix="linnea-pdf-ingress-") as raw:
             udp.bind(("127.0.0.1", port))  # no QUIC listener with http3: 0
         subprocess.run([sys.executable,
                         str(root / "test/pdf_source_body_limit_h2.py"),
-                        str(port)], check=True, timeout=40)
+                        str(port), "vefruna.test", "12288", str(source_cap)],
+                       check=True, timeout=40)
         for protocol in ("--http1.1", "--http2"):
             response = subprocess.run(
                 ["curl", "--noproxy", "*", protocol, "-k", "-sS", "-D", "-",

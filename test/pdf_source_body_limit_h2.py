@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HTTP/2 part of the isolated PDF source ingress acceptance probe.
 
-Usage: pdf_source_body_limit_h2.py <tls-port> [host] [ordinary-cap]
+Usage: pdf_source_body_limit_h2.py <tls-port> [host] [ordinary-cap] [source-cap]
 The fixture may proxy to an intentionally absent backend (accepted = 502).
 """
 
@@ -14,6 +14,7 @@ import tempfile
 port = int(sys.argv[1])
 host = sys.argv[2] if len(sys.argv) > 2 else "vefruna.test"
 ordinary_cap = int(sys.argv[3]) if len(sys.argv) > 3 else 12288
+source_cap = int(sys.argv[4]) if len(sys.argv) > 4 else 16777216
 project = "project_" + "0" * 25 + "1"
 source = f"/projects/{project}/source"
 
@@ -42,6 +43,8 @@ def main():
     cases = [
         ("source counted", source, "POST", False, "502 2"),
         ("source DATA without length", source, "POST", True, "502 2"),
+        ("source exactly at scoped cap", source, "POST", False, "502 2"),
+        ("source one byte above scoped cap", source, "POST", False, "413 2"),
         ("adjacent counted", source.replace("/source", "/notes"),
          "POST", False, "413 2"),
         ("adjacent DATA without length", source.replace("/source", "/notes"),
@@ -53,7 +56,11 @@ def main():
     ]
     failures = []
     for name, path, method, no_length, expected in cases:
-        got = request(path, body, method=method, no_length=no_length)
+        candidate = (b"A" * source_cap
+                     if name == "source exactly at scoped cap" else
+                     b"A" * (source_cap + 1)
+                     if name == "source one byte above scoped cap" else body)
+        got = request(path, candidate, method=method, no_length=no_length)
         if got != expected:
             failures.append(f"{name}: {got}, expected {expected}")
     other = request(source, body, authority="other.test")
