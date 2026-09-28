@@ -126,7 +126,9 @@ older than its source. Content types come from a built-in extension table, and
 A `proxy` location forwards to one or more HTTP/1.1 backends with round-robin
 selection, passive health and connect-time failover, and optional upstream
 keep-alive shared across all three client protocols. Uploads are captured whole
-before the backend is contacted, so a backend never sees a partial request. The
+before the backend is contacted, so a backend never sees a partial request;
+responses go the other way, relayed as they arrive on every protocol, so a
+long-lived response such as a server-sent-events stream works over each. The
 full design — and the reasoning behind connect-only failover and GET/HEAD-only
 reuse — is in [`proxying.md`](proxying.md).
 

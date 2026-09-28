@@ -95,7 +95,13 @@ extern linnea_http_proxy_head
 extern linnea_h3_proxy_start
 extern linnea_h3_proxy_head
 extern linnea_h3_proxy_body
-extern linnea_h3_proxy_deliver
+extern linnea_h3_proxy_begin
+extern linnea_h3_proxy_first
+extern linnea_h3_proxy_eof
+extern linnea_h3_proxy_room
+extern linnea_h3_proxy_finish
+extern linnea_h3_proxy_abort
+extern linnea_h3_resume_hook
 extern linnea_h3_proxy_fail
 extern linnea_h3_proxy_arm_hook
 extern linnea_h3_proxy_cancel
@@ -455,6 +461,8 @@ linnea_uring_run:
     mov [linnea_h3_proxy_hook], rax    ; upstream machinery lives
     lea rax, [linnea_h3_proxy_cancel]  ; ...and the QUIC side how to drop a leg
     mov [linnea_h3_cancel_hook], rax   ; whose stream is gone
+    lea rax, [h3p_resume]              ; ...and how to wake one that paused for
+    mov [linnea_h3_resume_hook], rax   ; room in its stream
 
     mov edi, LINNEA_URING_ENTRIES
     lea rsi, [ring]
@@ -2597,10 +2605,11 @@ linnea_uring_run:
     call linnea_uring_arm_send
     call linnea_uring_submit_now
     jmp .wait
-; --- h3 client: re-encode the synthesized h1 response through QPACK and deliver
-; over QUIC, the same path the h1-backend leg uses for an h3 client. The response
-; head goes into up_buf (h3_proxy_head reads it there); the body is fed whole
-; from the leg arena and spilled by h3_proxy_body; deliver mmaps + QPACK-encodes.
+; --- h3 client: re-encode the synthesized h1 response through QPACK and relay
+; it, the same path the h1-backend leg uses for an h3 client. The response head
+; goes into up_buf (h3_proxy_head reads it there); the body is buffered whole
+; in the leg arena already, so the stream's ring is sized to take it in one
+; append and the stream ends with it.
 .h2_done_h3:
     mov rdi, r14
     lea rsi, [r12 + linnea_connection.up_buf]
@@ -2614,19 +2623,30 @@ linnea_uring_run:
     cmp eax, LINNEA_HTTP_HEAD_READY
     jne .h2_leg_err
     mov rdi, r12
+    mov rsi, [r14 + linnea_h2c.body_len]
+    xor edx, edx                        ; pump the head now: the body may be empty
+    call linnea_h3_proxy_begin
+    cmp eax, 1
+    je .h2_h3_body
+    test eax, eax
+    jz .h3_body_done
+    cmp eax, -1
+    je .h3_leg_reap
+    jmp .h2_leg_err
+.h2_h3_body:
+    mov rdi, [r12 + linnea_connection.index]
+    call linnea_h2c_ctx_for
+    mov r14, rax
+    mov rdi, r12
     lea rsi, [r14 + linnea_h2c.body_buf]
     mov rdx, [r14 + linnea_h2c.body_len]
-    call linnea_h3_proxy_body           ; -> 1 done / 0 more / -1 error
+    call linnea_h3_proxy_body           ; -> 1 done / 0 more / -1 / -2
     test eax, eax
-    js .h2_leg_err
-    mov qword [r12 + linnea_connection.proxy_state], LINNEA_PROXY_IDLE
+    jnz .h3_body_verdict
+    ; the whole body was handed over; a head without a length ends here
     mov rdi, r12
-    call linnea_http_proxy_log
-    mov rdi, r12
-    mov esi, [quic_fd]
-    call linnea_h3_proxy_deliver
-    call linnea_uring_submit_now
-    jmp .wait
+    call linnea_h3_proxy_eof
+    jmp .h3_body_verdict
 .h2_up_send:
     test r15d, r15d
     js .h2_leg_err
@@ -2800,8 +2820,8 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 
-; --- an HTTP/3 leg: the head is kept for the QPACK re-encode and the body is
-; captured whole before any of the response is sent, so there is no relay ---
+; --- an HTTP/3 leg: the head is kept for the QPACK re-encode, then the body is
+; relayed onto the QUIC stream as it arrives (upstream protocol v2) ---
 .h3_head_parse:
     call linnea_h3_proxy_head
     cmp eax, LINNEA_HTTP_HEAD_READY
@@ -2820,57 +2840,33 @@ linnea_uring_run:
     call linnea_uring_submit_now
     jmp .wait
 .h3_head_ready:
-    ; Whatever arrived behind the head is the body's first bytes. up_buf stays
-    ; untouched from here — the response head has to survive until it is
-    ; re-encoded — so the capture reads into out_buf, which an h3 leg never
-    ; uses for anything else.
+    ; Open the response stream with the head, and the body bytes that came with
+    ; it behind it. Until the stream opens nothing has been sent, so chunk
+    ; framing already malformed in this read is still a 502, counted against
+    ; the backend; a head we cannot represent is a 502 entered past the health
+    ; counter -- the backend answered, our encoder said no.
     mov rdi, r12
-    lea rsi, [r12 + linnea_connection.up_buf]
-    add rsi, [r12 + linnea_connection.h3_hoff]   ; past any interim heads...
-    add rsi, [r12 + linnea_connection.h3_hlen]   ; ...and past the final one
-    mov rdx, [r12 + linnea_connection.up_len]
-    sub rdx, [r12 + linnea_connection.h3_hoff]
-    sub rdx, [r12 + linnea_connection.h3_hlen]
-    call linnea_h3_proxy_body
+    call linnea_h3_proxy_first  ; 1 done, 0 more, -1 reset, -2 gone, -3/-4 502
+    mov esi, 502
+    cmp eax, -3
+    je .proxy_fail
+    cmp eax, -4
+    je .proxy_fail_counted
     jmp .h3_body_verdict
 .h3_body_recv:
     test r15d, r15d
     jg .h3_body_data
     jz .h3_body_eof
-    cmp r15d, -LINNEA_ECANCELED
-    je .h3_body_timeout
-    mov esi, 502
-    jmp .proxy_fail
+    ; An error, or proxy_timeout with no byte from the backend (ECANCELED):
+    ; the head is out, so there is no status left to answer with. Every read
+    ; that returned bytes re-armed the timeout, which is what makes it a
+    ; NO-PROGRESS timeout -- a stream with a keepalive inside it never gets here.
+    jmp .h3_relay_broken
 .h3_body_eof:
-    ; A CHUNKED body ends at its terminal chunk, never at a closed socket. It
-    ; reaches here with body_rem = -1, the same as a close-delimited one, so it
-    ; used to be accepted as complete: /api/chunktrunc -- "4\r\nbo" then close --
-    ; was delivered as a 200 carrying the two bytes that had arrived, and a
-    ; chunk size larger than any body produced a clean empty 200. HTTP/3
-    ; captures the whole body before it sends anything, so unlike HTTP/2 it can
-    ; still refuse at this point, and it should (audit-report-17, found beside
-    ; Finding 1 rather than in it).
-    cmp qword [r12 + linnea_connection.capture_chunked], 0
-    je .h3_body_eof_plain
-    cmp qword [r12 + linnea_connection.chunk_state], LINNEA_CHUNK_DONE
-    je .h3_body_done
-    mov esi, 502
-    jmp .proxy_fail
-.h3_body_eof_plain:
-    ; A close-delimited body ends exactly here; a counted one that is still
-    ; short was cut off, and half a response is not one we can send.
-    cmp qword [r12 + linnea_connection.body_rem], -1
-    jne .h3_body_short
-    mov qword [r12 + linnea_connection.body_rem], 0
-    jmp .h3_body_done
-.h3_body_short:
-    cmp qword [r12 + linnea_connection.body_rem], 0
-    je .h3_body_done
-    mov esi, 502
-    jmp .proxy_fail
-.h3_body_timeout:
-    mov esi, 504
-    jmp .proxy_fail
+    ; the end of a close-delimited body; any other body cut short
+    mov rdi, r12
+    call linnea_h3_proxy_eof
+    jmp .h3_body_verdict
 .h3_body_data:
     mov rdi, r12
     lea rsi, [r12 + linnea_connection.out_buf]
@@ -2880,21 +2876,35 @@ linnea_uring_run:
     cmp eax, 1
     je .h3_body_done
     test eax, eax
-    js .h3_body_fail
-    mov rdi, r12               ; more of it to come
+    jz .h3_relay_more
+    cmp eax, -2
+    je .h3_leg_reap            ; the stream is gone: nothing to send it to
+.h3_relay_broken:
+    ; framing we will not relay, a body cut short, a timeout or an error, after
+    ; the head went out: reset the stream (h2 sends RST_STREAM here)
+    mov rdi, r12
+    call linnea_h3_proxy_abort
+    call linnea_uring_submit_now
+    jmp .wait
+.h3_relay_more:
+    ; Read on only as far as the stream has room. None means the client is not
+    ; taking bytes as fast as the backend writes them: stop reading the
+    ; upstream (the backend's writes then block, which is the backpressure) and
+    ; let the QUIC side resume the leg through h3p_resume once acks free room.
+    mov rdi, r12
+    call linnea_h3_proxy_room  ; rax = read size, 0 = paused, -1 = gone
+    test rax, rax
+    js .h3_leg_reap
+    jz .wait                   ; paused: the leg holds no operation now
+    mov rdi, r12
     lea rsi, [r12 + linnea_connection.out_buf]
-    mov edx, LINNEA_CONN_OUT_BUF
+    mov rdx, rax
     call linnea_uring_arm_up_recv
     call linnea_uring_submit_now
     jmp .wait
-.h3_body_fail:
-    mov esi, 502
-    jmp .proxy_fail
 .h3_body_done:
     mov rdi, r12
-    mov esi, [quic_fd]                ; vestigial: linnea_quic_h3_deliver replaces
-                                      ; this with the connection's own udp_fd
-    call linnea_h3_proxy_deliver
+    call linnea_h3_proxy_finish
     call linnea_uring_submit_now
     jmp .wait
 
@@ -4165,6 +4175,46 @@ h3p_arm:
 .h3p_send:
     call linnea_uring_arm_up_send
     jmp linnea_uring_submit_now
+
+; h3p_resume(rdi = leg index, rsi = its generation, rdx = the room its stream
+; has now) — the resume hook: an h3 relay that stopped reading its upstream for
+; want of room may read again. Called from the QUIC pump, inside a datagram or
+; the timer sweep, so like h3p_arm it only queues the read and publishes it;
+; the bytes are appended when the read completes, never from in here.
+h3p_resume:
+    push rbx
+    push r12
+    push r13
+    mov r12, rsi
+    mov r13, rdx
+    call linnea_connection_at
+    mov rbx, rax
+    cmp qword [rbx + linnea_connection.in_use], 0
+    je .hr_ret
+    cmp [rbx + linnea_connection.gen], r12
+    jne .hr_ret                        ; the slot is someone else's by now
+    cmp qword [rbx + linnea_connection.h3_owner], 0
+    je .hr_ret
+    cmp qword [rbx + linnea_connection.h3_paused], 0
+    je .hr_ret                         ; not waiting (a read is already armed)
+    cmp qword [rbx + linnea_connection.h3_cancel], 0
+    jne .hr_ret
+    mov qword [rbx + linnea_connection.h3_paused], 0
+    sub r13, 16                        ; a DATA frame header is at most 9 bytes
+    cmp r13, LINNEA_CONN_OUT_BUF
+    jbe .hr_arm
+    mov r13d, LINNEA_CONN_OUT_BUF
+.hr_arm:
+    mov rdi, rbx
+    lea rsi, [rbx + linnea_connection.out_buf]
+    mov rdx, r13
+    call linnea_uring_arm_up_recv
+    call linnea_uring_submit_now
+.hr_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; linnea_uring_up_reconnect(rdi = connection*) -> eax = 0 armed, -1 could not
 ; Close the upstream socket whose connect failed, take a fresh one, move to the

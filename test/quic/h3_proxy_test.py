@@ -3,14 +3,15 @@
 # to an HTTP/1.1 upstream and its answer comes back over QUIC.
 #
 # The upstream leg has no client socket of its own -- the answer is owed to one
-# stream of a QUIC connection -- so the response is captured whole and then
-# streamed out of a response-stream slot like a file. What that has to get
+# stream of a QUIC connection -- so the response is relayed onto that stream as
+# it arrives, through the same pump a file is streamed by. What that has to get
 # right, and what this checks: the status and body survive; the request line,
 # query and client headers reach the backend; a chunked upstream is de-chunked
-# and described by the length it really has; a close-delimited one ends at the
-# close; a body far larger than one packet streams through the pump; hop-by-hop
-# fields travel in neither direction; and an unreachable backend is a 502 on
-# the stream rather than silence.
+# and relayed without framing or a length of its own (the stream's FIN ends
+# it); a close-delimited one ends at the close; a body far larger than one
+# packet streams through the pump; hop-by-hop fields travel in neither
+# direction; and an unreachable backend is a 502 on the stream rather than
+# silence.
 #
 # Usage: h3_proxy_test.py <port>
 import socket, ssl, sys, time
@@ -119,12 +120,13 @@ want("client header forwarded", "X-Test: abc" in body or "x-test: abc" in body, 
 want("host rewritten from :authority", "Host: localhost" in body, repr(body[:200]))
 want("connection close upstream", "Connection: close" in body, repr(body[:200]))
 
-# chunked upstream: de-chunked on the way in, so the client is told the length
-# the body really has and never sees the framing
+# chunked upstream: de-chunked on the way through, so the client never sees
+# the framing. It is relayed as it arrives, so there is no length to state
+# (h2 states none either); the stream's FIN is the end.
 st, hd, body = request("/api/chunked")
 want("chunked status", st == "200", str(st))
 want("chunked body", body == "chunked body", repr(body))
-want("chunked re-lengthed", hd.get("content-length") == "12", hd.get("content-length"))
+want("chunked states no length", "content-length" not in hd, hd.get("content-length"))
 want("no transfer-encoding", "transfer-encoding" not in hd, str(hd))
 
 # close-delimited upstream: the close is the framing
@@ -138,16 +140,19 @@ want("big status", st == "200", str(st))
 want("big length", len(body) == 40000, str(len(body)))
 want("big intact", body == "x" * 40000, f"first bad byte at {next((i for i, c in enumerate(body) if c != 'x'), -1)}")
 
-# Response capture has its own bound. This fixture accepts request bodies only
-# through 200000 bytes, while HTTP/3 may capture responses through 240000.
-# Lowering the upload limit must not silently turn a 210000-byte download into
-# 502; the independently configured response limit must still stop 250000.
+# A response is not bounded by the request-body limit: this fixture accepts
+# request bodies only through 200000 bytes, and a 210000-byte download must
+# not become a 502. Nor is it bounded by max_proxy_response any more (240000
+# here): that capped the whole-response capture HTTP/3 did before relaying,
+# and now that nothing is captured the key is accepted and has no effect, so
+# 250000 bytes arrive whole too.
 st, hd, body = request("/api/proxycap")
 want("response may exceed max_body", st == "200", str(st))
 want("response above max_body intact", body == "r" * 210000, str(len(body)))
 st, hd, body = request("/api/proxyover")
-want("response past max_proxy_response is 502", st == "502",
+want("response past the old max_proxy_response is relayed", st == "200",
      f"{st} {body[:30]!r}")
+want("...and intact", body == "r" * 250000, str(len(body)))
 
 # response hop-by-hop fields stop here (RFC 9110 7.6.1); the rest goes on
 st, hd, body = request("/api/hopresp")

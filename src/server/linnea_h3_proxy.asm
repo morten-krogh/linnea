@@ -15,17 +15,24 @@
 ; them. The leg sets .fd to -1 and names its owner in .h3_owner/.h3_qidx/
 ; .h3_qgen/.h3_sid; every client-facing path tests .h3_owner and diverts here.
 ;
-; The response is buffered whole before any of it is sent. It is captured into
-; the O_TMPFILE the request-body machinery already uses and then mapped, which
-; is exactly the shape a linnea_quic_txstream slot wants — head plus a mapping
-; — so the QUIC pump needs to learn nothing about sockets: it streams a proxied
-; response the same way it streams a file, congestion- and flow-controlled,
-; interleaved with the connection's other responses by priority. A chunked
-; upstream is de-chunked for free on the way into the file.
+; The response is RELAYED as it arrives (upstream protocol v2 -- a server-sent
+; events stream never ends by itself, so "capture it, then send it", which is
+; what this file did until then, would never send it at all). Once the final
+; head is in, linnea_h3_proxy_begin encodes it and opens the response stream
+; with it, in a ring the stream slot owns (linnea_quic_txstream.ring); every
+; upstream read after that is appended to the stream as an HTTP/3 DATA frame
+; through linnea_quic_h3_append and pumped at once, congestion- and
+; flow-controlled and interleaved with the connection's other responses by
+; priority, exactly as a file is. A chunked upstream is de-chunked in place on
+; the way. The ring is what bounds the memory: a leg that finds too little
+; room in it stops reading its upstream, and the QUIC side wakes it when
+; acknowledgements free some (linnea_h3_resume_hook). That is the same
+; backpressure HTTP/1.1 gets from its client socket and HTTP/2 from its
+; stream window.
 ;
-; The cost is that a slow backend holds a connection slot and the client waits
-; for the last byte before it sees the first. This backend answers small JSON;
-; when that stops being true, the thing to change is this file, not the pump.
+; What capture used to buy, and relay gives up: a failure after the head is
+; out can no longer become a clean 502 -- the stream is reset instead, as
+; HTTP/2 sends RST_STREAM in the same place.
 
 default rel
 
@@ -40,7 +47,12 @@ default rel
 global linnea_h3_proxy_start
 global linnea_h3_proxy_head
 global linnea_h3_proxy_body
-global linnea_h3_proxy_deliver
+global linnea_h3_proxy_begin
+global linnea_h3_proxy_first
+global linnea_h3_proxy_eof
+global linnea_h3_proxy_room
+global linnea_h3_proxy_finish
+global linnea_h3_proxy_abort
 global linnea_h3_proxy_fail
 global linnea_h3_proxy_release
 global linnea_h3_proxy_cancel
@@ -68,8 +80,6 @@ extern linnea_http_status_no_content
 extern linnea_http_status_no_clen
 extern linnea_string_iequal
 extern linnea_string_has_token
-extern linnea_spill_open
-extern linnea_spill_write
 extern linnea_spill_chunked
 extern linnea_spill_release
 extern linnea_qpack_encode_proxy
@@ -102,6 +112,15 @@ extern linnea_h3d_base
 extern linnea_h3d_size
 extern linnea_h3d_foff
 extern linnea_h3d_flen
+extern linnea_h3d_ring
+extern linnea_h3d_open
+extern linnea_h3d_leg
+extern linnea_h3d_leggen
+extern linnea_h3d_hold
+; ...and the relay's way back in once the stream is open
+extern linnea_quic_h3_append
+extern linnea_quic_h3_room
+extern linnea_quic_h3_abort
 ; the access line, written here rather than through the h1 proxy log: that one
 ; reads the request out of a client connection's buffers, which an h3 leg has
 ; none of
@@ -162,10 +181,10 @@ section .bss
 ; proxies nothing over h3 — the usual case — can skip the pool walk entirely.
 h3_legs_live: resq 1
 num_buf:  resb 24
-; The response head as it goes out: the HTTP/3 HEADERS frame and the DATA frame
-; header. It lives only for the length of one delivery — the loop is
-; single-threaded, and the head is written into the capture file (or copied
-; into a response slot, for a canned error) before anything else can run.
+; The response head as it goes out: the HTTP/3 HEADERS frame(s). It lives only
+; for the length of one delivery — the loop is single-threaded, and the head is
+; copied into the stream's ring (or into a response slot, for a canned error)
+; before anything else can run.
 h3p_head: resb LINNEA_H3_PROXY_RESERVE
 h3p_fs:   resb LINNEA_H3_PROXY_RESERVE  ; the QPACK field section before framing
 
@@ -229,6 +248,9 @@ linnea_h3_proxy_start:
     mov qword [r12 + linnea_connection.h3_hoff], 0
     mov qword [r12 + linnea_connection.h3_inum], 0
     mov qword [r12 + linnea_connection.h3_nobody], 0
+    mov qword [r12 + linnea_connection.h3_begun], 0
+    mov qword [r12 + linnea_connection.h3_fin], 0
+    mov qword [r12 + linnea_connection.h3_paused], 0
     ; A recycled slot carries the last client's address, and the per-source
     ; connection cap counts every in_use slot whose peer_ip matches. A leg that
     ; kept one would charge that client for a connection it never made. (.peer,
@@ -713,9 +735,9 @@ linnea_h3_proxy_start:
 ; _BAD, the same verdicts linnea_http_proxy_head returns, so the loop's
 ; surrounding re-arm logic is shared.
 ; READY means up_buf holds the whole response head (.h3_hlen bytes of it), the
-; status and body framing are recorded, and the leg has moved to capturing the
-; body. Nothing is rewritten: the head is re-encoded in QPACK at delivery, so
-; it is kept as the upstream wrote it.
+; status and body framing are recorded, and the leg has moved to relaying the
+; body. Nothing is rewritten: the head is re-encoded in QPACK when the stream
+; opens, so it is kept as the upstream wrote it.
 linnea_h3_proxy_head:
     push rbx
     push r12
@@ -920,22 +942,8 @@ linnea_h3_proxy_head:
     mov qword [rbx + linnea_connection.capture_chunked], 0
     mov qword [rbx + linnea_connection.h3_nobody], 1
 .ph_ready:
-    ; Open the capture file now and start the body a fixed distance into it,
-    ; leaving a hole for this response's own head. The head cannot be written
-    ; yet — its content-length is whatever the capture turns out to be — and it
-    ; has to precede the body in the mapping, so the space is claimed up front.
-    ; The hole costs nothing until it is written to.
-    mov rdi, rbx
-    call linnea_spill_open
-    test eax, eax
-    js .ph_bad
-    mov edi, [rbx + linnea_connection.spill_fd]
-    mov esi, LINNEA_H3_PROXY_RESERVE
-    xor edx, edx                     ; SEEK_SET
-    mov eax, LINNEA_SYS_LSEEK
-    syscall
-    cmp rax, -4095
-    jae .ph_bad
+    ; The body is relayed, not captured: linnea_h3_proxy_begin opens the
+    ; stream with this head and every read behind it goes straight out.
     mov qword [rbx + linnea_connection.proxy_state], LINNEA_PROXY_H3BODY
     mov eax, LINNEA_HTTP_HEAD_READY
     jmp .ph_ret
@@ -1064,10 +1072,13 @@ linnea_h3_proxy_head:
     jmp linnea_string_has_token
 
 ; linnea_h3_proxy_body(rdi = leg, rsi = bytes, rdx = count)
-;   -> rax = 0 need more, 1 the body is complete, -1 the upstream broke its
-;      own framing or the capture failed.
-; The bytes go straight into the spill file, de-chunked when the upstream
-; chose that framing, so what is finally mapped is the body and nothing else.
+;   -> rax = 1 the body is complete (the stream's FIN is queued), 0 more to
+;      come, -1 the upstream broke its own framing, -2 the stream is gone.
+; The body is RELAYED, not captured (upstream protocol v2): whatever part of
+; these bytes is body goes out on the stream now, as one HTTP/3 DATA frame,
+; de-chunked in place first when the upstream chose chunked -- the decoder
+; only ever moves data down over framing it has consumed. The caller asked
+; linnea_h3_proxy_room for this read, so it fits.
 linnea_h3_proxy_body:
     push rbx
     push r12
@@ -1075,9 +1086,10 @@ linnea_h3_proxy_body:
     mov rbx, rdi
     mov r12, rsi
     mov r13, rdx
-    cmp qword [rbx + linnea_connection.body_rem], 0
-    je .pb_done                      ; a bodiless response: anything else is
-                                     ; the backend's next-request pipelining
+    cmp qword [rbx + linnea_connection.h3_fin], 0
+    jne .pb_done                     ; ended already (a bodiless response):
+                                     ; anything more is the backend's next-
+                                     ; request pipelining, not this body
     cmp qword [rbx + linnea_connection.capture_chunked], 0
     jne .pb_chunked
     ; counted or close-delimited: everything that arrives is body, up to the
@@ -1092,34 +1104,33 @@ linnea_h3_proxy_body:
 .pb_count:
     sub [rbx + linnea_connection.body_rem], rax
 .pb_take:
-    mov rdi, rbx
-    mov rsi, r12
-    mov rdx, rax
-    call linnea_spill_write
-    test eax, eax
-    js .pb_fail
-    ; linnea_spill_write has no cap of its own. HTTP/3 captures the complete
-    ; upstream response, so bound it independently from incoming uploads.
-    lea rax, [linnea_config_instance]
-    mov rax, [rax + linnea_config.max_proxy_response]
-    cmp [rbx + linnea_connection.spill_len], rax
-    ja .pb_fail
+    xor r9d, r9d
     cmp qword [rbx + linnea_connection.body_rem], 0
-    je .pb_done
-    xor eax, eax                     ; more to come
+    jne .pb_send
+    mov r9d, 1                       ; the last of a counted body
+.pb_send:
+    mov rcx, r12
+    mov r8, rax
+    call .pb_append
     jmp .pb_ret
 .pb_chunked:
     mov rdi, rbx
     mov rsi, r12
     mov rdx, r13
-    lea rcx, [rbx + linnea_connection.chunk_state]   ; the capture's own state
-    mov r8d, LINNEA_CHUNK_PROXY_CAPTURE
-    call linnea_spill_chunked        ; 0 more, 1 done, -1 bad, -2 too large
-    cmp eax, 1
-    je .pb_done
+    lea rcx, [rbx + linnea_connection.chunk_state]   ; the response's decode
+    mov r8d, LINNEA_CHUNK_DECHUNK
+    call linnea_spill_chunked        ; 0 more, 1 done, -1 bad; rdx = decoded
     test eax, eax
-    jns .pb_ret                      ; 0: need more
-    jmp .pb_fail
+    js .pb_fail
+    xor r9d, r9d
+    cmp eax, 1
+    jne .pb_csend
+    mov r9d, 1                       ; the terminal chunk: the body ends here
+.pb_csend:
+    mov rcx, r12                     ; the decoded bytes sit at the buffer start
+    mov r8, rdx
+    call .pb_append
+    jmp .pb_ret
 .pb_done:
     mov eax, 1
     jmp .pb_ret
@@ -1131,53 +1142,312 @@ linnea_h3_proxy_body:
     pop rbx
     ret
 
-; linnea_h3_proxy_deliver(rdi = leg, esi = UDP socket fd)
-; The response is complete: map what was captured, encode the head for HTTP/3
-; and hand both to a response-stream slot on the owning QUIC connection. The
-; mapping's ownership passes to that slot, which unmaps it once the stream is
-; sent and acknowledged; if the connection is gone (or has no slot free) the
-; mapping is released here instead. The leg is freed either way.
-linnea_h3_proxy_deliver:
+; .pb_append(rbx = leg, rcx = bytes, r8 = count, r9d = 1 when this ends the
+;   body) -> eax = 1 ended, 0 more to come, -1 cannot be relayed, -2 gone.
+.pb_append:
+    test r8, r8
+    jnz .pa_go
+    test r9d, r9d
+    jz .pa_more                      ; framing only: nothing to send yet
+.pa_go:
+    push r8
+    push r9
+    sub rsp, 8
+    mov rdi, [rbx + linnea_connection.h3_qidx]
+    mov rsi, [rbx + linnea_connection.h3_qgen]
+    mov rdx, [rbx + linnea_connection.h3_sid]
+    call linnea_quic_h3_append       ; -> room, 0 ended, -1 gone, -2 no room
+    add rsp, 8
+    pop r9
+    pop r8
+    cmp rax, -1
+    je .pa_gone
+    cmp rax, -2
+    je .pa_broken
+    add [rbx + linnea_connection.relayed], r8
+    test r9d, r9d
+    jz .pa_more
+    mov qword [rbx + linnea_connection.h3_fin], 1
+    mov eax, 1
+    ret
+.pa_more:
+    xor eax, eax
+    ret
+.pa_gone:
+    mov eax, -2
+    ret
+.pa_broken:
+    mov eax, -1
+    ret
+
+; linnea_h3_proxy_eof(rdi = leg) -> rax as linnea_h3_proxy_body.
+; The upstream closed. That ends a close-delimited body -- the event-stream
+; form of upstream protocol v2 ends no other way -- and the public stream
+; ends cleanly with it. A CHUNKED body ends at its terminal chunk, never at a
+; closed socket, and a counted one still short was cut off: both are -1, and
+; since the head is already out, the caller resets the stream, as h2 sends
+; RST_STREAM (/api/chunktrunc was a 502 while h3 captured whole).
+linnea_h3_proxy_eof:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    cmp qword [rbx + linnea_connection.h3_fin], 0
+    jne .pb_done
+    cmp qword [rbx + linnea_connection.capture_chunked], 0
+    jne .pb_fail
+    cmp qword [rbx + linnea_connection.body_rem], -1
+    jne .pb_fail                     ; counted: complete ones ended already
+    ; body_rem stays -1: that is what tells the finish this socket is closed
+    ; and not one to park
+    xor r8d, r8d
+    mov r9d, 1
+    call linnea_h3_proxy_body.pb_append
+    jmp .pb_ret_eof
+.pb_done:
+    mov eax, 1
+    jmp .pb_ret_eof
+.pb_fail:
+    mov eax, -1
+.pb_ret_eof:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_h3_proxy_room(rdi = leg) -> rax = how many bytes the next upstream
+; read may return, 0 when the stream has no room and the leg must wait to be
+; resumed, -1 when the stream is gone. Room is kept for the DATA frame header
+; each read costs.
+linnea_h3_proxy_room:
+    push rbx
+    mov rbx, rdi
+    mov rdi, [rbx + linnea_connection.h3_qidx]
+    mov rsi, [rbx + linnea_connection.h3_qgen]
+    mov rdx, [rbx + linnea_connection.h3_sid]
+    mov ecx, LINNEA_H3_RELAY_MIN
+    call linnea_quic_h3_room         ; -> room, or -1; below the minimum it
+    test rax, rax                    ; also arms the resume
+    js .rm_ret
+    cmp rax, LINNEA_H3_RELAY_MIN
+    jb .rm_wait
+    sub rax, 16                      ; a DATA frame header is at most 9 bytes
+    cmp rax, LINNEA_CONN_OUT_BUF
+    jbe .rm_ret
+    mov eax, LINNEA_CONN_OUT_BUF     ; ...and a read lands in out_buf
+    jmp .rm_ret
+.rm_wait:
+    mov qword [rbx + linnea_connection.h3_paused], 1
+    xor eax, eax
+.rm_ret:
+    pop rbx
+    ret
+
+; linnea_h3_proxy_abort(rdi = leg) — the upstream failed after the response
+; head went out: reset the stream (the h3 twin of h2's RST_STREAM) and free
+; the leg. There is no status left to answer with.
+linnea_h3_proxy_abort:
+    push rbx
+    mov rbx, rdi
+    mov rdi, [rbx + linnea_connection.h3_qidx]
+    mov rsi, [rbx + linnea_connection.h3_qgen]
+    mov rdx, [rbx + linnea_connection.h3_sid]
+    mov ecx, LINNEA_H3_ERR_INTERNAL
+    call linnea_quic_h3_abort
+    mov rdi, rbx
+    pop rbx
+    jmp linnea_h3_proxy_release
+
+; linnea_h3_proxy_finish(rdi = leg) — the body has been relayed to its end and
+; the FIN is queued. Whatever this backend did before, it is working now; keep
+; the upstream connection on the same terms h1 uses, and free the leg.
+linnea_h3_proxy_finish:
+    push rbx
+    mov rbx, rdi
+    ; h3 does not pass through the uring loop's .proxy_finish, so it says so
+    ; here -- the failure side it DOES share, through .proxy_fail.
+    mov rdi, [rbx + linnea_connection.location]
+    mov rsi, [rbx + linnea_connection.up_backend]
+    call linnea_upstream_mark_ok
+    ; Keep the connection when the location opted in and the method was safe
+    ; (up_reusable), the backend did not say close, and the body was delimited
+    ; -- counted and fully consumed, or chunked through its terminal chunk. A
+    ; close-delimited body ended at the upstream's close, so there is nothing
+    ; left to keep (capture_chunked 0, and up_no_reuse or body_rem say so).
+    cmp qword [rbx + linnea_connection.up_reusable], 0
+    je .fn_release
+    cmp qword [rbx + linnea_connection.up_no_reuse], 0
+    jne .fn_release
+    cmp dword [rbx + linnea_connection.up_fd], -1
+    je .fn_release
+    cmp qword [rbx + linnea_connection.capture_chunked], 0
+    jne .fn_park                     ; finished means its terminal chunk came
+    cmp qword [rbx + linnea_connection.body_rem], 0
+    jne .fn_release                  ; -1: close-delimited, ended by the close
+.fn_park:
+    mov rdi, [rbx + linnea_connection.location]
+    mov rsi, [rbx + linnea_connection.up_backend]
+    mov edx, [rbx + linnea_connection.up_fd]
+    call linnea_upstream_park
+    test eax, eax
+    jz .fn_release             ; pool full: release closes it, as before
+    mov dword [rbx + linnea_connection.up_fd], -1
+.fn_release:
+    mov rdi, rbx
+    pop rbx
+    jmp linnea_h3_proxy_release
+
+; linnea_h3_proxy_first(rdi = leg) -> rax = 1 the response is complete, 0 more
+;   body to come, -1 the stream is open and must be reset, -2 the stream is
+;   gone, -3 nothing has been sent and the answer is a 502 (the upstream's
+;   framing), -4 the same but for a head we could not represent (ours).
+; The upstream head is complete in up_buf, and whatever arrived behind it is
+; the body's first bytes. Those are judged BEFORE the stream opens: a chunked
+; body malformed in the same read as its head is then still a 502, exactly as
+; h1 (which has not sent its head yet either) and h2 (whose HEADERS wait for the
+; same decode) answer it -- the three must not disagree about one upstream
+; answer (audit-report-24). Then the stream opens with the head, and those
+; bytes follow it in the same packet when they fit.
+linnea_h3_proxy_first:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    lea r12, [rbx + linnea_connection.up_buf]
+    add r12, [rbx + linnea_connection.h3_hoff]        ; past any interim heads...
+    add r12, [rbx + linnea_connection.h3_hlen]        ; ...and the final one
+    mov r13, [rbx + linnea_connection.up_len]
+    sub r13, [rbx + linnea_connection.h3_hoff]
+    sub r13, [rbx + linnea_connection.h3_hlen]
+    cmp qword [rbx + linnea_connection.capture_chunked], 0
+    je .fs_open
+    mov rdi, rbx
+    mov rsi, r12
+    mov rdx, r13
+    lea rcx, [rbx + linnea_connection.chunk_state]
+    mov r8d, LINNEA_CHUNK_DECHUNK
+    call linnea_spill_chunked        ; 0 more, 1 done, -1 bad; rdx = decoded
+    test eax, eax
+    js .fs_502                       ; malformed before anything was sent
+    mov r13, rdx                     ; decoded bytes, now at r12
+    push rax
+    sub rsp, 8
+    mov rdi, rbx
+    xor esi, esi
+    mov edx, 1                       ; hold the pump for the append below
+    call linnea_h3_proxy_begin
+    add rsp, 8
+    pop rcx
+    cmp eax, 1
+    jne .fs_begin_code
+    xor r9d, r9d
+    cmp ecx, 1
+    jne .fs_chunk_send
+    mov r9d, 1                       ; the whole body came with the head
+.fs_chunk_send:
+    mov rcx, r12
+    mov r8, r13
+    call linnea_h3_proxy_body.pb_append
+    jmp .fs_flush
+.fs_open:
+    mov rdi, rbx
+    xor esi, esi
+    mov edx, 1
+    call linnea_h3_proxy_begin
+    cmp eax, 1
+    jne .fs_begin_code
+    mov rdi, rbx
+    mov rsi, r12
+    mov rdx, r13
+    call linnea_h3_proxy_body
+.fs_flush:
+    ; nothing appended (the head arrived alone) leaves the held head unsent;
+    ; an empty append is a pump and nothing else
+    test eax, eax
+    jnz .fs_ret
+    cmp qword [rbx + linnea_connection.relayed], 0
+    jne .fs_ret                      ; the append pumped already
+    push rax
+    sub rsp, 8
+    mov rdi, [rbx + linnea_connection.h3_qidx]
+    mov rsi, [rbx + linnea_connection.h3_qgen]
+    mov rdx, [rbx + linnea_connection.h3_sid]
+    xor ecx, ecx
+    xor r8d, r8d
+    xor r9d, r9d
+    call linnea_quic_h3_append
+    add rsp, 8
+    cmp rax, -1
+    pop rax
+    jne .fs_ret
+    mov eax, -2                      ; gone meanwhile
+    jmp .fs_ret
+.fs_begin_code:
+    ; begin's own verdicts: 0 complete (bodiless), -1 gone, -2 unrepresentable
+    test eax, eax
+    jnz .fs_begin_fail
+    mov eax, 1
+    jmp .fs_ret
+.fs_begin_fail:
+    cmp eax, -1
+    jne .fs_head_502
+    mov eax, -2
+    jmp .fs_ret
+.fs_head_502:
+    mov eax, -4                      ; the head: ours to refuse, not the backend's
+    jmp .fs_ret
+.fs_502:
+    mov eax, -3
+.fs_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_h3_proxy_begin(rdi = leg, rsi = body bytes the caller will append in
+;   one go beyond what one upstream read can bring -- the proxy_h2 path's
+;   buffered body; 0 for a socket leg, rdx = 1 to leave the stream unpumped
+;   because an append follows at once)
+;   -> rax = 1 the stream is open and the body follows, 0 the response is
+;      complete already (it carries no body: the head went out with the FIN),
+;      -1 nobody is waiting (release the leg), -2 the head cannot be
+;      represented (answer 502 with linnea_h3_proxy_fail: nothing was sent).
+; Encode the head for HTTP/3 and open the response stream with it, in a ring
+; the stream slot owns from here on (linnea_quic_txstream.ring). The body is
+; relayed behind it as it arrives, so the stream states the upstream's
+; Content-Length when it had one and none otherwise: a chunked or
+; close-delimited body ends where the stream's FIN does.
+linnea_h3_proxy_begin:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 32                      ; [0] field-section length, [8] the head
-    mov rbx, rdi                     ; cursor, [16] the interim walk offset,
-                                     ; [24] the largest RFC 9114 4.2.2 field-
-                                     ; section size any of its HEADERS frames
-                                     ; carries.
-                                     ; 32 not 24: five pushes leave rsp 16-byte
-                                     ; aligned, so an odd multiple of 8 here
-                                     ; hands every callee a misaligned stack --
-                                     ; which the crypto paths meet as a movdqa
-                                     ; fault that reads like a null dereference
-    mov r12d, esi                    ; UDP fd
-    mov r14, [rbx + linnea_connection.spill_len]      ; body bytes captured
-    ; --- the HTTP/3 response head: HEADERS frame(s) + DATA frame header ---
-    ; The upstream's fields are re-encoded from the head still sitting in
-    ; up_buf; content-length is re-derived from what we actually captured, so
-    ; a de-chunked body is described by the length it really has. A response
-    ; that carries no body keeps whatever length the upstream stated (RFC 9110
-    ; 9.3.2: a HEAD's content-length is the GET's, not the zero bytes we hold)
-    ; -- except on the statuses where the field is forbidden outright.
-    ;
+    sub rsp, 32                      ; [0] the ring, [8] the head cursor, [16]
+    mov rbx, rdi                     ; the interim walk offset, [24] the largest
+    mov r14, rsi                     ; RFC 9114 4.2.2 field-section size any
+    mov r12, rdx                     ; hold the pump?
+                                     ; HEADERS frame carries. 32 not 24: five
+                                     ; pushes leave rsp 16-byte aligned, so an
+                                     ; odd multiple of 8 here hands every callee
+                                     ; a misaligned stack -- which the crypto
+                                     ; paths meet as a movdqa fault that reads
+                                     ; like a null dereference
+    ; --- the HTTP/3 response head: HEADERS frame(s) ---
     ; Interim (1xx) responses come first, each as its own HEADERS frame, in the
-    ; order the upstream sent them (audit-report-7 Finding 1). They are all
-    ; frames on one stream and the FIN rides the stream, not any frame, so
-    ; HEADERS(103) HEADERS(200) DATA is exactly the sequence RFC 9114 4.1
-    ; describes. NB they reach the client WITH the final response rather than
-    ; ahead of it: an h3 leg captures the whole body before it sends anything,
-    ; so 103 Early Hints is forwarded as the MUST in RFC 9110 15.2 requires but
-    ; without the head start that is its point. Delivering it early would mean
-    ; sending on the request stream before the response slot exists, which the
-    ; one-slot-per-response model does not do.
+    ; order the upstream sent them (audit-report-7 Finding 1): HEADERS(103)
+    ; HEADERS(200) DATA... is exactly the sequence RFC 9114 4.1 describes. They
+    ; still reach the client WITH the final response rather than ahead of it --
+    ; the stream opens once the final head is in -- so 103 Early Hints is
+    ; forwarded as RFC 9110 15.2 requires, without the head start that is its
+    ; point.
     lea rdi, [h3p_head]
     mov [rsp + 8], rdi               ; the cursor across every frame below
     xor eax, eax
     mov [rsp + 16], rax              ; walk offset: the first interim head
     mov [rsp + 24], rax              ; no field section measured yet
+    mov qword [rbx + linnea_connection.h3_fin], 0
+    mov qword [rbx + linnea_connection.h3_paused], 0
 .dl_interim:
     mov rax, [rsp + 16]
     cmp rax, [rbx + linnea_connection.h3_hoff]
@@ -1239,9 +1509,8 @@ linnea_h3_proxy_deliver:
     ; the encoder below, and taking it as a scratch register for the status is
     ; how this crashed the worker on its first 204 -- the field section was
     ; encoded to address 204.
-    mov r8, r14
     cmp qword [rbx + linnea_connection.h3_nobody], 0
-    je .dl_clen
+    je .dl_framed
     ; A bodiless answer states no length of its own. On HEAD and 304 the
     ; upstream's Content-Length describes the representation the client is not
     ; being sent and must survive; on 204 the field is forbidden and must not
@@ -1252,6 +1521,19 @@ linnea_h3_proxy_deliver:
     test eax, eax
     jz .dl_clen
     mov r8, -2                       ; ...unless the status forbids one
+    jmp .dl_clen
+.dl_framed:
+    ; A body relayed as it arrives has no length of ours to state. A counted
+    ; one keeps the upstream's, which the relay holds it to (a body cut short
+    ; resets the stream); a chunked or close-delimited one states none, and
+    ; its end is the stream's FIN.
+    mov r8, -2
+    cmp qword [rbx + linnea_connection.capture_chunked], 0
+    jne .dl_clen
+    mov rax, [rbx + linnea_connection.body_rem]
+    cmp rax, -1
+    je .dl_clen
+    mov r8, rax
 .dl_clen:
     lea rdi, [h3p_fs]
     mov esi, [rbx + linnea_connection.up_status]
@@ -1268,61 +1550,55 @@ linnea_h3_proxy_deliver:
     call .dl_put_headers
     test rax, rax
     jz .dl_bad_head
-    mov [rsp + 8], rax
-    mov rdi, rax                     ; the cursor, for the DATA frame header
-    test r14, r14
-    jz .dl_nodata
-    mov byte [rdi], LINNEA_H3_FRAME_DATA
-    inc rdi
-    mov rsi, r14
-    call linnea_quic_varint_encode
-    add rdi, rax
-.dl_nodata:
-    lea rax, [h3p_head]
-    sub rdi, rax
-    mov r15, rdi                     ; the head's length, frames and all
+    lea rcx, [h3p_head]
+    sub rax, rcx
+    mov r15, rax                     ; the head's length, frames and all
     cmp r15, LINNEA_H3_PROXY_RESERVE
-    ja .dl_bad_head                  ; belt to .dl_put_headers' braces: that
-                                     ; refuses to write past the buffer, this
-                                     ; catches a DATA frame header that would
-                                     ; not fit behind what it wrote
-    ; Write it into the hole so that it ends exactly where the body begins:
-    ; head and body are then one contiguous run in the file, which is what a
-    ; response-stream slot streams from. This also extends the file to at least
-    ; the reserve, so a bodiless response still has something to map.
-    mov edi, [rbx + linnea_connection.spill_fd]
-    lea rsi, [h3p_head]
-    mov rdx, r15
-    mov r10, LINNEA_H3_PROXY_RESERVE
-    sub r10, r15                     ; offset: the head ends at the reserve
-    mov eax, LINNEA_SYS_PWRITE64
-    syscall
-    cmp rax, r15
-    jne .dl_fail                     ; a short or failed write: nothing to send
-    ; map head and body together
+    ja .dl_bad_head                  ; belt to .dl_put_headers' braces
+    ; The ring: the default, or larger when the caller will append a whole
+    ; buffered body at once -- it must fit behind the head in one go, with a
+    ; DATA frame header and the room a read is never asked to go below.
+    mov r13, LINNEA_H3_RELAY_RING
+    lea rax, [r15 + r14 + 64 + LINNEA_H3_RELAY_MIN]
+.dl_ring_size:
+    cmp r13, rax
+    jae .dl_ring_sized
+    shl r13, 1                       ; stays a power of two
+    jmp .dl_ring_size
+.dl_ring_sized:
     xor edi, edi
-    mov rsi, LINNEA_H3_PROXY_RESERVE
-    add rsi, r14
-    mov edx, LINNEA_PROT_READ
-    mov r10d, LINNEA_MAP_PRIVATE
-    mov r8d, [rbx + linnea_connection.spill_fd]
+    mov rsi, r13
+    mov edx, LINNEA_PROT_READ | LINNEA_PROT_WRITE
+    mov r10d, LINNEA_MAP_PRIVATE | LINNEA_MAP_ANONYMOUS
+    mov r8, -1
     xor r9d, r9d
     mov eax, LINNEA_SYS_MMAP
     syscall
     cmp rax, -4095
-    jae .dl_fail
-    mov r13, rax                     ; the mapping, now the response slot's
-    mov [linnea_h3d_base], r13
-    mov rax, LINNEA_H3_PROXY_RESERVE
-    add rax, r14
-    mov [linnea_h3d_size], rax       ; the WHOLE mapping, for the munmap
-    mov rax, LINNEA_H3_PROXY_RESERVE
-    sub rax, r15
-    mov [linnea_h3d_foff], rax       ; the response starts at the head
-    lea rax, [r15 + r14]
-    mov [linnea_h3d_flen], rax       ; head + body, streamed as one run
+    jae .dl_bad_head                 ; no memory: nothing was sent, so a 502
+    mov [rsp], rax
+    ; the head is the stream's first bytes
+    mov rdi, rax
+    lea rsi, [h3p_head]
+    mov rcx, r15
+    rep movsb
+    mov rax, [rsp]
+    mov [linnea_h3d_base], rax
+    mov [linnea_h3d_size], r13       ; the WHOLE mapping, for the munmap
+    mov [linnea_h3d_ring], r13
+    mov qword [linnea_h3d_foff], 0
+    mov [linnea_h3d_flen], r15       ; what is written so far: the head
     mov qword [linnea_h3d_hlen], 0   ; nothing is held in the slot's own hdr
     mov qword [linnea_h3d_hdr], 0
+    ; a bodiless answer is complete with its head: FIN on the head itself
+    xor eax, eax
+    cmp qword [rbx + linnea_connection.h3_nobody], 0
+    sete al
+    mov [linnea_h3d_open], rax
+    mov rax, [rbx + linnea_connection.index]
+    mov [linnea_h3d_leg], rax
+    mov rax, [rbx + linnea_connection.gen]
+    mov [linnea_h3d_leggen], rax
     mov rax, [rbx + linnea_connection.h3_qidx]
     mov [linnea_h3d_qidx], rax
     mov rax, [rbx + linnea_connection.h3_qgen]
@@ -1333,63 +1609,35 @@ linnea_h3_proxy_deliver:
     mov [linnea_h3d_fss], rax        ; the limit is the OWNING connection's, and
                                      ; only the delivery still knows which that
                                      ; is (audit-report-143 Finding 1)
-    ; The access line, from the facts parked when the request was forwarded.
-    ; Written here rather than through the h1 proxy log: that one reads the
-    ; request out of a client connection's buffers, and an h3 leg has none —
-    ; it produced a line with no peer, no method, no target and "HTTP/1.1".
-    mov [rbx + linnea_connection.relayed], r14
-    mov rdi, rbx
-    call linnea_h3_proxy_start.lg_publish
-    lea rax, [proto_h3]
-    mov [linnea_log_acc_proto], rax
-    mov qword [linnea_log_acc_proto_len], proto_h3_len
-    mov rax, [rbx + linnea_connection.up_status]
-    mov [linnea_log_acc_status], rax
-    mov [linnea_log_acc_bytes], r14
-    call linnea_log_access
-    mov edi, r12d
-    call linnea_quic_h3_deliver      ; -> 1 sent, 0 the connection is gone,
-    cmp eax, 1                       ; -1 no response slot free
-    je .dl_done                      ; the slot owns the mapping now
-    mov rdi, r13                     ; nobody took it: release it here
-    mov rsi, LINNEA_H3_PROXY_RESERVE
-    add rsi, r14
+    ; From here the leg owes an access line whatever happens: it is written
+    ; when the leg is released, once the bytes relayed are known.
+    mov qword [rbx + linnea_connection.relayed], 0
+    mov qword [rbx + linnea_connection.h3_begun], 1
+    mov [linnea_h3d_hold], r12       ; a bodiless answer is complete: no hold
+    cmp qword [rbx + linnea_connection.h3_nobody], 0
+    je .dl_hold_set
+    mov qword [linnea_h3d_hold], 0
+.dl_hold_set:
+    xor edi, edi                     ; the connection's own socket is used
+    call linnea_quic_h3_deliver      ; -> 1 open, 0 the connection is gone,
+    cmp eax, 1                       ; -1 it could not be represented (and the
+    je .dl_open                      ; stream has been reset)
+    mov rdi, [rsp]                   ; nobody took the ring: release it here
+    mov rsi, r13
     mov eax, LINNEA_SYS_MUNMAP
     syscall
-.dl_done:
-    ; a complete response: whatever this backend did before, it is working now.
-    ; h3 does not pass through the uring loop's .proxy_finish, so it says so
-    ; here -- the failure side it DOES share, through .proxy_fail.
-    mov rdi, [rbx + linnea_connection.location]
-    mov rsi, [rbx + linnea_connection.up_backend]
-    call linnea_upstream_mark_ok
-    ; The response is delivered and the upstream exchange is over. Keep the
-    ; connection on the same terms h1 uses: the location opted in and the method
-    ; was safe (up_reusable), the backend did not say close, and the body was
-    ; delimited -- counted and fully consumed, or chunked through its terminal
-    ; chunk, which is what .pb_done means for each. A close-delimited response
-    ; has capture_chunked 0 and body_rem still -1, so it cannot pass.
-    cmp qword [rbx + linnea_connection.up_reusable], 0
-    je .dl_release
-    cmp qword [rbx + linnea_connection.up_no_reuse], 0
-    jne .dl_release
-    cmp dword [rbx + linnea_connection.up_fd], -1
-    je .dl_release
-    cmp qword [rbx + linnea_connection.capture_chunked], 0
-    jne .dl_park
-    cmp qword [rbx + linnea_connection.body_rem], 0
-    jne .dl_release
-.dl_park:
-    mov rdi, [rbx + linnea_connection.location]
-    mov rsi, [rbx + linnea_connection.up_backend]
-    mov edx, [rbx + linnea_connection.up_fd]
-    call linnea_upstream_park
-    test eax, eax
-    jz .dl_release             ; pool full: release closes it, as before
-    mov dword [rbx + linnea_connection.up_fd], -1
-.dl_release:
-    mov rdi, rbx
-    call linnea_h3_proxy_release
+    mov rax, -1
+    jmp .dl_ret
+.dl_open:
+    mov eax, 1
+    cmp qword [rbx + linnea_connection.h3_nobody], 0
+    je .dl_ret
+    mov qword [rbx + linnea_connection.h3_fin], 1
+    xor eax, eax                     ; complete: the head carried the FIN
+    jmp .dl_ret
+.dl_bad_head:
+    mov rax, -2
+.dl_ret:
     add rsp, 32
     pop r15
     pop r14
@@ -1397,18 +1645,6 @@ linnea_h3_proxy_deliver:
     pop r12
     pop rbx
     ret
-.dl_bad_head:
-.dl_fail:
-    mov rdi, rbx
-    mov esi, 502
-    mov edx, r12d
-    add rsp, 32
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    jmp linnea_h3_proxy_fail
 
 ; .dl_note_fss() — keep the largest RFC 9114 4.2.2 field-section size the
 ; encoder has reported so far in [rsp + 32] (the caller's [rsp + 24], one call
@@ -1591,6 +1827,15 @@ linnea_h3_proxy_cancel:
     cmp [r12 + linnea_connection.h3_sid], r15
     jne .cn_next
 .cn_hit:
+    ; A relay paused for room has no operation in flight -- nothing will
+    ; complete to free it -- so it goes now, and its upstream connection with
+    ; it: that close is how the backend learns its client has left.
+    cmp qword [r12 + linnea_connection.h3_paused], 0
+    je .cn_inflight
+    mov rdi, r12
+    call linnea_h3_proxy_release
+    jmp .cn_next
+.cn_inflight:
     mov qword [r12 + linnea_connection.h3_cancel], 1
     mov edi, [r12 + linnea_connection.up_fd]
     cmp edi, -1
@@ -1611,13 +1856,34 @@ linnea_h3_proxy_cancel:
 .cn_none:
     ret
 
-; linnea_h3_proxy_release(rdi = leg) — close the upstream socket, drop the
-; capture file and give the connection slot back. Nothing here is armed, so
-; there is no in-flight operation to wait for: every caller reaches this from
-; the completion of the leg's last one.
+; linnea_h3_proxy_release(rdi = leg) — write the access line of a leg whose
+; stream opened, close the upstream socket and give the connection slot back.
+; Nothing here is armed, so there is no in-flight operation to wait for: every
+; caller reaches this from the completion of the leg's last one, or -- for a
+; relay paused for room, which has none -- from the cancel.
 linnea_h3_proxy_release:
     push rbx
     mov rbx, rdi
+    ; A leg whose stream was opened owes its access line, and only now are the
+    ; bytes known: a relay's length is whatever reached the stream before the
+    ; body ended, the upstream failed, or the client went away. Written here
+    ; rather than through the h1 proxy log: that one reads the request out of
+    ; a client connection's buffers, and an h3 leg has none.
+    cmp qword [rbx + linnea_connection.h3_begun], 0
+    je .rl_logged
+    mov qword [rbx + linnea_connection.h3_begun], 0
+    mov rdi, rbx
+    call linnea_h3_proxy_start.lg_publish
+    lea rax, [proto_h3]
+    mov [linnea_log_acc_proto], rax
+    mov qword [linnea_log_acc_proto_len], proto_h3_len
+    mov rax, [rbx + linnea_connection.up_status]
+    mov [linnea_log_acc_status], rax
+    mov rax, [rbx + linnea_connection.relayed]
+    mov [linnea_log_acc_bytes], rax
+    call linnea_log_access
+.rl_logged:
+    mov qword [rbx + linnea_connection.h3_paused], 0
     mov edi, [rbx + linnea_connection.up_fd]
     cmp edi, -1
     je .rl_nofd

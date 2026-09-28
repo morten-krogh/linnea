@@ -510,6 +510,27 @@ struc linnea_quic_txstream
     ; completion in arrival order while incremental ones share the window.
     .urgency:     resq 1            ; 0 (highest) .. 7 (lowest), default 3
     .incremental: resq 1            ; 1 = deliver progressively (share the window)
+    ; A LIVE RELAY: the answer to a proxied request, still being written by its
+    ; upstream leg while it is sent (upstream protocol v2 -- a server-sent-events
+    ; stream never ends by itself, so it cannot be captured first). The mapping
+    ; is then a ring of .ring bytes (a power of two; 0 = the ordinary linear
+    ; mapping every other response uses), hlen is 0, and stream byte i sits at
+    ; base + ((i - .origin) & (.ring - 1)). The leg appends HTTP/3 DATA frames
+    ; through linnea_quic_h3_append and never holds the pointer itself, so
+    ; unmapping the ring here can never leave it writing into nothing. Bytes
+    ; stay in the ring until they are acknowledged -- a lost chunk is rebuilt
+    ; from it -- so room is .ring minus (written - lowest unacknowledged), and a
+    ; leg that finds too little stops reading its upstream: that is the
+    ; backpressure. .origin moves only when every written byte is acknowledged,
+    ; so a stream that trickles (keepalive comments) keeps rewriting the ring's
+    ; first page instead of walking through all of it.
+    .ring:     resq 1
+    .origin:   resq 1
+    .open:     resq 1               ; 1 = the leg may still append: no FIN yet
+    .wait:     resq 1               ; >0: the leg paused for room; resume it at
+                                    ; this much (0 = not waiting)
+    .leg:      resq 1               ; the producing leg's connection-pool index
+    .leg_gen:  resq 1               ; ...and its generation, for the resume
     .hdr:      resb LINNEA_QUIC_TX_HDR
 endstruc
 

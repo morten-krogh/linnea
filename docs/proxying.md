@@ -158,10 +158,77 @@ location's exact cap is checked
 before dispatch. With a 12 KiB global cap and a single 16 MiB location on
 Vefruna, the capture itself is bounded at 16 MiB.
 
-## HTTP/3 response capture
+## Responses are relayed as they arrive
 
-An HTTP/3 proxied response is captured whole in `spill_dir` before it is handed
-to the QUIC response stream. `max_proxy_response` bounds that capture. It is
-separate from `max_body`: lowering the request-body limit must not silently
-turn larger downloads into 502 responses. HTTP/1.1 and HTTP/2 relay upstream
-responses incrementally and do not use this whole-response bound.
+A proxied response is relayed to the client **as the backend writes it**, on
+HTTP/1.1, HTTP/2 and HTTP/3 alike: the head as soon as it is complete, then
+each read of the body. Nothing captures a whole response first. That is what
+makes a long-lived response work — a server-sent-events stream
+(`text/event-stream`, no `Content-Length`, `Connection: close`, ending only
+when the backend closes) reaches the browser event by event, which is the
+event-stream form of the Vefruna upstream protocol v2.
+
+How the three protocols frame what they relay:
+
+| Upstream body | HTTP/1.1 client | HTTP/2 client | HTTP/3 client |
+|---|---|---|---|
+| `Content-Length: n` | relayed with that length | relayed; `content-length` kept | relayed; `content-length` kept |
+| chunked | relayed with its chunked framing | de-chunked into DATA frames, no length | de-chunked into DATA frames, no length |
+| close-delimited | relayed, then the connection closes | DATA frames, then END_STREAM when the backend closes | DATA frames, then the stream's FIN when the backend closes |
+
+**Backpressure.** Linnea reads from the backend only as fast as the client
+takes bytes. HTTP/1.1 relays one read at a time through the client socket;
+HTTP/2 holds at most one slot buffer per stream and waits for the stream's
+flow-control window; HTTP/3 writes each read into a per-stream ring of
+256 KiB (`LINNEA_H3_RELAY_RING`) and stops reading the backend when the ring
+has less than 4 KiB free, resuming once the client's acknowledgements free a
+quarter of it. The ring holds exactly the bytes a lost packet would have to
+be rebuilt from; it is anonymous memory touched only as written, and a
+stream that trickles (a keepalive comment every 15 s) keeps reusing its first
+page. A client that stops reading therefore holds the backend's writes back
+instead of growing linnea's memory.
+
+**`proxy_timeout` is a no-progress timeout.** It bounds each wait for the
+backend — the connect, the request send, the head, and then every read of the
+body — so every relayed chunk restarts it. A stream that makes progress more
+often than `proxy_timeout` is never cut, however long it runs; one that goes
+silent for longer is. There is no absolute deadline on a proxied response.
+The client's own idle `timeout` does not end a connection with a response
+still being relayed to it either.
+
+**When the backend fails after the head.** The status line is already on the
+wire, so there is nothing left to answer with: HTTP/2 resets the stream
+(`RST_STREAM`), HTTP/3 resets it (`RESET_STREAM`, `H3_INTERNAL_ERROR`), and
+HTTP/1.1 closes the connection. A counted body cut short and a chunked body
+missing its terminal chunk are failures in this sense on all three. A
+close-delimited body cannot be cut short — its close is its end — so over
+HTTP/1.1 a stream that timed out looks like one that ended; HTTP/2 and HTTP/3
+can and do say which.
+
+**When the client goes away.** Linnea closes the upstream connection as soon
+as the public side is gone: an HTTP/1.1 client's connection closing, an
+HTTP/2 `RST_STREAM` or connection close, an HTTP/3 `RESET_STREAM` or
+`STOP_SENDING`, a `CONNECTION_CLOSE`, or the QUIC connection's idle timeout
+for a client that vanished without saying so. The backend sees that close,
+which is how an event-stream backend learns its subscriber left.
+
+**Capacity.** A long-lived stream holds its upstream connection — one of
+`max_upstream` — for as long as it runs, and its client connection or
+stream. Size `max_upstream` for the streams you expect plus ordinary traffic;
+raising it costs no memory by itself (it is a ceiling, not a pool), but every
+upstream connection is a descriptor, and linnea raises its own
+`RLIMIT_NOFILE` soft limit to `max_connections + max_upstream` plus the
+listeners at startup, refusing to start if the hard limit is lower. An HTTP/3
+stream's relay also borrows a connection-pool slot (`max_connections`, per
+worker) for its upstream half, and an HTTP/2 connection can relay at most
+eight proxied streams at once (`LINNEA_H2P_SLOTS`); a ninth is refused with
+`REFUSED_STREAM` until one ends.
+
+### `max_proxy_response` is no longer used
+
+Until upstream protocol v2, HTTP/3 captured every proxied response whole in
+`spill_dir` before sending any of it, and `max_proxy_response` bounded that
+capture (a larger response was a 502). HTTP/3 now relays like HTTP/1.1 and
+HTTP/2, so nothing is captured and there is nothing to bound: the key is still
+accepted, range-checked and printed in the startup configuration dump, so existing configurations
+load unchanged, but it has no effect. Remove it at your convenience.

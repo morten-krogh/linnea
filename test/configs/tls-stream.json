@@ -1,0 +1,20 @@
+{
+  "log": "test/linnea-stream.log",
+  "timeout": 3,
+  "proxy_timeout": 2,
+  "workers": 1,
+  "max_proxy_response": 65536,
+  "servers": [
+    {
+      "host": "127.0.0.1",
+      "port": 61474,
+      "hostname": "localhost",
+      "cert": "test/tls/server.crt",
+      "key": "test/tls/server.key",
+      "locations": [
+        { "prefix": "/sse", "proxy": "unix:test/sse.sock" },
+        { "prefix": "/", "root": "test/www" }
+      ]
+    }
+  ]
+}

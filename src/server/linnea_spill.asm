@@ -142,7 +142,7 @@ linnea_spill_write:
 ; rcx is a struc linnea_chunk the caller owns; the connection carries two, one
 ; for the request capture and one for the HTTP/1 response relay, because a
 ; chunked upload and a chunked response can be in flight on the same connection.
-; r8d is LINNEA_CHUNK_CAPTURE, _PROXY_CAPTURE, _VALIDATE or _DECHUNK.
+; r8d is LINNEA_CHUNK_CAPTURE, _VALIDATE or _DECHUNK.
 ; Validate mode judges and
 ; nothing else: no spill file, no max_body (that bounds a request, not a relayed
 ; response), and no pipelined-suffix stash. It exists so the HTTP/1 relay can
@@ -189,14 +189,12 @@ linnea_spill_chunked:
     mov r12, rsi                   ; read cursor
     lea r13, [rsi + rdx]           ; end of what arrived
     mov r15, rcx                   ; the decode state, struc linnea_chunk
-    mov ebp, r8d                   ; capture, proxy-capture, validate or dechunk
+    mov ebp, r8d                   ; capture, validate or dechunk
     sub rsp, 16
     mov [rsp], rsi                 ; dechunk's write cursor, starting at buf...
     mov [rsp + 8], rsi             ; ...and where it started, for the count
     cmp ebp, LINNEA_CHUNK_CAPTURE
-    je .raw_cap
-    cmp ebp, LINNEA_CHUNK_PROXY_CAPTURE
-    jne .step                      ; judging only: no sink, and no cap either
+    jne .step                      ; a relayed response: no sink, and no cap
 .raw_cap:
     ; Encoded bytes are capped as well as decoded ones. A client can send
     ; empty chunks and trailer lines forever without the decoded length ever
@@ -209,14 +207,7 @@ linnea_spill_chunked:
     ; max_body bounds a REQUEST, so it is applied in capture mode alone: a
     ; relayed response is not a body we are holding, and capping it here would
     ; have turned every download past max_body into a dropped connection.
-    cmp ebp, LINNEA_CHUNK_PROXY_CAPTURE
-    je .raw_proxy_cap
     mov rax, [rbx + linnea_connection.request_body_cap]
-    jmp .raw_cap_ready
-.raw_proxy_cap:
-    lea rax, [linnea_config_instance]
-    mov rax, [rax + linnea_config.max_proxy_response]
-.raw_cap_ready:
     sub rax, [r15 + linnea_chunk.raw]   ; headroom = max_body - current
     cmp rdx, rax                                   ; incoming encoded run > headroom?
     ja .too_large
@@ -347,14 +338,7 @@ linnea_spill_chunked:
     pop rcx
     test eax, eax
     js .write_failed
-    cmp ebp, LINNEA_CHUNK_PROXY_CAPTURE
-    je .data_proxy_cap
     mov rax, [rbx + linnea_connection.request_body_cap]
-    jmp .data_cap_ready
-.data_proxy_cap:
-    lea rax, [linnea_config_instance]
-    mov rax, [rax + linnea_config.max_proxy_response]
-.data_cap_ready:
     cmp [rbx + linnea_connection.spill_len], rax
     ja .too_large
     jmp .data_skip

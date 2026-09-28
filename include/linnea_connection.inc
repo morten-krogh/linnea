@@ -45,12 +45,12 @@ LINNEA_PROXY_CAPTURE    equ 8      ; capturing a request body too large to
                                    ; contacted yet, so a client that gives up
                                    ; here leaves the backend untouched rather
                                    ; than holding a truncated request.
-LINNEA_PROXY_H3BODY     equ 9      ; an HTTP/3-owned leg capturing the upstream
-                                   ; RESPONSE body into the spill file. There is
-                                   ; no client socket to relay to — the answer
-                                   ; goes out as QUIC stream chunks once whole —
-                                   ; so the response is buffered exactly as an
-                                   ; oversized request body is on the way in.
+LINNEA_PROXY_H3BODY     equ 9      ; an HTTP/3-owned leg relaying the upstream
+                                   ; RESPONSE body: each read is appended to the
+                                   ; QUIC stream as DATA as it arrives (it was
+                                   ; captured whole in the spill file until
+                                   ; upstream protocol v2), with backpressure
+                                   ; from the stream's ring (.h3_paused).
 LINNEA_PROXY_TLS_HS     equ 10     ; running the TLS 1.3 client handshake to a
                                    ; proxy_tls backend, before the request is
                                    ; sent; driven by linnea_tls_client_input,
@@ -266,6 +266,17 @@ struc linnea_connection
                                    ; content-length is the upstream's to state
                                    ; and not ours to re-derive from a capture
                                    ; that was always going to be empty
+    ; The relay (upstream protocol v2): the response head has gone out and the
+    ; stream is open, so every byte read from the upstream from here on is
+    ; appended to it as it arrives, and a failure can only reset the stream.
+    .h3_begun:      resq 1
+    ; The stream's end (FIN) has been appended: the upstream exchange is over.
+    .h3_fin:        resq 1
+    ; No upstream read is armed because the stream's ring had no room: the
+    ; client is not taking the bytes as fast as the backend writes them. The
+    ; QUIC side resumes the leg (linnea_h3_resume_hook) once acknowledgements
+    ; free room; with no operation in flight, a cancel frees the leg at once.
+    .h3_paused:     resq 1
     ; --- upgrade tunnel (websockets etc.) ----------------------------
     ; The client's Connection field value, so the proxy rewriter can honour
     ; RFC 9110 7.6.1: every field this names is hop-by-hop and MUST be removed
@@ -434,10 +445,12 @@ endstruc
 ; linnea_spill_chunked's three modes: capture writes the decoded body to the
 ; spill file and stashes anything pipelined behind it; validate only judges;
 ; dechunk judges AND compacts the decoded data down over the framing in the
-; caller's own buffer, reporting the decoded length in rdx. Only the HTTP/1
-; response relay uses the third, and only for an HTTP/1.0 client, which RFC
-; 9112 7.1 forbids sending a transfer coding to (audit-report-130).
+; caller's own buffer, reporting the decoded length in rdx. The HTTP/1
+; response relay uses the third for an HTTP/1.0 client, which RFC 9112 7.1
+; forbids sending a transfer coding to (audit-report-130), and the HTTP/3 relay
+; for every chunked response, since HTTP/3 frames the body itself. (A fourth
+; mode, PROXY_CAPTURE, spilled a whole HTTP/3 response to disk under
+; max_proxy_response until that path became a relay.)
 LINNEA_CHUNK_CAPTURE  equ 0
 LINNEA_CHUNK_VALIDATE equ 1
 LINNEA_CHUNK_DECHUNK  equ 2
-LINNEA_CHUNK_PROXY_CAPTURE equ 3

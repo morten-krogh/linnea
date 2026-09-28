@@ -595,10 +595,13 @@ def h3_all(routes):
                                 (b":scheme", b"https"), (b":authority", b"localhost")])
         bidi = conn.get_next_available_stream_id()
         conn.send_stream_data(bidi, vlq(1) + vlq(len(blk)) + blk, end_stream=True)
-        resp, reset = b"", False
+        # Read to the stream's END -- its FIN, or a reset. A proxied response
+        # is relayed as it arrives now, so the head can land before the body
+        # and a failure after the head is a reset behind data already read.
+        resp, reset, fin = b"", False, False
         sock.settimeout(0.3)
         deadline = time.time() + 15
-        while not resp and not reset and time.time() < deadline:
+        while not fin and not reset and time.time() < deadline:
             pump()
             clock[0] += 0.2
             try:
@@ -610,6 +613,7 @@ def h3_all(routes):
             while ev is not None:
                 if isinstance(ev, StreamDataReceived) and ev.stream_id == bidi:
                     resp += ev.data
+                    fin = fin or ev.end_stream
                 elif isinstance(ev, StreamReset) and ev.stream_id == bidi:
                     reset = True
                 ev = conn.next_event()
@@ -631,7 +635,7 @@ def h3_all(routes):
             elif ty == 0:
                 body += resp[i:i + ln]
             i += ln
-        out[route] = (st, body, extra, sections)
+        out[route] = (st, body, extra, sections, reset)
     return out
 
 
@@ -655,13 +659,14 @@ h3 = h3_all([r for r, _, _ in CASES if r not in H3_SKIP])
 STREAMED_BODY = set()
 
 # chunktrunc is the same family but a step further, and it separates "malformed"
-# from "detectable in time". Its head and first chunk line are VALID, so h2 has
-# already emitted the 200 before the upstream stops; all it can do then is reset
-# the stream, which is what a client must see instead of a clean end. h3 buffers
-# the whole body first, so it alone can still answer 502 -- and must, or it
-# hands over a truncated response as a complete one, which is what it did.
+# from "detectable in time". Its head and first chunk line are VALID, so the
+# response is already under way when the upstream stops; all a relay can do
+# then is reset the stream, which is what a client must see instead of a clean
+# end. h2 has always done that. h3 captured the whole body first and answered
+# 502 instead, until upstream protocol v2 made it relay as h2 does -- so the
+# two now agree, and both are asserted to reset, below.
 H2_RESET = {}
-# ...so its correct answer differs per protocol BY NECESSITY, and the generic
+# ...so its correct answer is a RESET rather than a status, and the generic
 # "all three agree" check does not apply. It is asserted on its own terms below
 # instead of being dropped from the matrix.
 PROTOCOL_SPECIFIC = {"chunktrunc", "chunknoterm", "chunkpartialtrail"}
@@ -846,12 +851,12 @@ for route in [r for r, _, _ in CASES if r not in H3_SKIP]:
 # --- a truncated chunked body is never a complete response ------------------
 for route in sorted(PROTOCOL_SPECIFIC):
     got = RESULTS.get(route, {})
-    h3_refused = got.get("h3", (None,))[0] == 502
+    h3v = got.get("h3", (None,))
+    h3_reset = h3v[0] == "RESET" or (len(h3v) > 4 and h3v[4])
     h2_reset = H2_RESET.get(route, False)
-    check(f"{route}: h3 refuses it outright and h2 resets the stream rather "
-          f"than ending it cleanly",
-          h3_refused and h2_reset,
-          f"  h3={got.get('h3', (None,))[0]} h2_reset={h2_reset}")
+    check(f"{route}: h2 and h3 reset the stream rather than ending it cleanly",
+          (h3_reset or h3 is None) and h2_reset,
+          f"  h3={h3v[0]} h3_reset={h3_reset} h2_reset={h2_reset}")
 
 for route, why in H3_SKIP.items():
     print(f"note: {route} not checked over HTTP/3 here -- {why}")

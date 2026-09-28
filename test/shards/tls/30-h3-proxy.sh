@@ -1,4 +1,4 @@
-# The HTTP/3 proxy battery over TLS: h3->h1 proxying, canned errors, max header size, stream cancellation, and h2/h3 response-framing agreement.
+# The HTTP/3 proxy battery over TLS: h3->h1 proxying, canned errors, max header size, stream cancellation, h2/h3 response-framing agreement, and incremental relay of streaming responses on all three protocols.
 
 if [ "$ktls" = 1 ]; then
     start_server $CFG/tls-h3-proxy.json
@@ -978,4 +978,50 @@ rm -f $RUNDIR/upload3_echo.bin
 
     # HTTP/2 connection bring-up: a separate http2:1 server. ALPN selects
     # h2; preface + SETTINGS + PING exchange; a request draws GOAWAY.
+
+    # --- incremental relay: upstream protocol v2's event stream ------------
+    # A close-delimited, long-lived upstream response (server-sent events: no
+    # Content-Length, Connection: close) from a Unix-socket backend, the way
+    # production reaches its application. Until protocol v2 HTTP/3 captured
+    # every proxied response whole in spill_dir before sending any of it, so an
+    # h3 client saw the first event only when the backend FINISHED -- 5.4 s
+    # late here, and never for a stream that does not end. Judged from the
+    # backend's clock (test/sse_backend.py logs each write): the first event
+    # must reach the client long before the last is written, on h1, h2 and h3.
+    # The full suite adds the counted and chunked twins, proxy_timeout as a
+    # no-progress timeout (a 5.4 s stream under a 2 s proxy_timeout and a 3 s
+    # client timeout is never cut; a 4 s silence is), the client leaving by
+    # every door (connection close, RST_STREAM, RESET_STREAM + STOP_SENDING,
+    # CONNECTION_CLOSE, a vanished QUIC client) closing the upstream promptly,
+    # backpressure against a slow reader, and a 24 MiB body arriving exact.
+    ssock="$PWD/$RUNDIR/sse.sock"
+    : > "$RUNDIR/sse-events.log"
+    python3 test/sse_backend.py "$ssock" "$PWD/$RUNDIR/sse-events.log" >/dev/null 2>&1 &
+    sse_be=$!
+    for _ in $(seq 1 50); do [ -S "$ssock" ] && break; sleep 0.1; done
+    start_server $CFG/tls-stream.json
+    sse_pid=$SRV_PID
+    # checks the driver prints: full is 10 per protocol, plus RST_STREAM on h2
+    # and RESET_STREAM / CONNECTION_CLOSE on h3; quick is 2 per protocol. With
+    # no curl-h3 the h3 ones collapse into a single "skipped" line.
+    if extensive; then
+        sse_mode=full; sse_want=33; sse_noh3=22
+    else
+        sse_mode=quick; sse_want=6; sse_noh3=5
+    fi
+    sse_n=0
+    while IFS= read -r line; do
+        case "$line" in
+            "ok "*)     check "stream: ${line#ok }" 0; sse_n=$((sse_n + 1)) ;;
+            "not ok "*) check "stream: ${line#not ok }" 1; sse_n=$((sse_n + 1)) ;;
+        esac
+    done < <(LINNEA_CURL_H3="$CURLH3" timeout 300 python3 test/proxy_stream_test.py \
+                 "$SRV_PORT" "$PWD/$RUNDIR/sse-events.log" h1,h2,h3 $sse_mode 2>&1)
+    # a driver that died part-way must not read as a shorter, passing run; with
+    # no curl-h3 the h3 checks collapse into one "skipped" line
+    if [ -x "$CURLH3" ]; then sse_exp=$sse_want; else sse_exp=$sse_noh3; fi
+    [ "$sse_n" -eq "$sse_exp" ]
+    check "stream: the driver ran every check ($sse_n of $sse_exp)" $?
+    kill $sse_pid $sse_be 2>/dev/null
+
 fi

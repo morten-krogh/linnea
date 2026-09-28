@@ -205,6 +205,27 @@ LINNEA_H3_PROXY_RESERVE   equ 16384
 ; been captured for a response that could never be sent. Real use is one or two
 ; Early Hints.
 LINNEA_H3_PROXY_IMAX      equ 8
+; A proxied response is RELAYED, not captured (upstream protocol v2): the head
+; and then each upstream read go out as HTTP/3 frames through a per-stream ring
+; the QUIC layer owns (linnea_quic_txstream.ring). Its size bounds what one
+; stream holds in memory -- sent-but-unacknowledged plus not-yet-sent -- and so
+; its throughput: at most one ring per round trip. 256 KiB is about the largest
+; congestion window the in-flight table can track (LINNEA_QUIC_MAX_CWND), so
+; the ring does not throttle a transfer the window would have allowed. It is
+; anonymous memory touched only as it is written, and a trickling stream keeps
+; reusing the first page (see .origin). A leg whose ring has less room than
+; RELAY_MIN stops reading its upstream until acknowledgements free a quarter
+; of the ring. It must exceed the largest DATA frame header (9 bytes) plus one
+; byte; 4096 keeps each read worth a syscall. The head must fit with room to
+; spare: LINNEA_H3_PROXY_RESERVE is far below the ring.
+LINNEA_H3_RELAY_RING      equ 262144
+LINNEA_H3_RELAY_MIN       equ 4096
+%if (LINNEA_H3_RELAY_RING & (LINNEA_H3_RELAY_RING - 1)) != 0
+  %error "LINNEA_H3_RELAY_RING must be a power of two"
+%endif
+%if LINNEA_H3_PROXY_RESERVE + LINNEA_H3_RELAY_MIN > LINNEA_H3_RELAY_RING / 2
+  %error "the relay ring must hold the largest encoded head with room to spare"
+%endif
 ; Where a parked request's access-line text sits in the leg's in_buf, and how
 ; much of each is kept. Long enough for any real method, target or host; a
 ; longer one is truncated, since this is a log line and not a decision.

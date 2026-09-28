@@ -101,6 +101,15 @@ global linnea_h3d_foff
 global linnea_h3d_flen
 global linnea_h3d_fss
 global linnea_h3_cancel_hook
+global linnea_h3d_ring
+global linnea_h3d_open
+global linnea_h3d_leg
+global linnea_h3d_leggen
+global linnea_h3d_hold
+global linnea_h3_resume_hook
+global linnea_quic_h3_append
+global linnea_quic_h3_room
+global linnea_quic_h3_abort
 
 extern linnea_http_authority_host
 extern linnea_pdf_source_route
@@ -468,6 +477,23 @@ linnea_h3d_fss:  resq 1
 ; call, for the same reason the serve path takes one: the QUIC server has to
 ; stay linkable without the upstream machinery behind it. 0 = no legs exist.
 linnea_h3_cancel_hook: resq 1
+; A LIVE RELAY (see linnea_quic_txstream.ring): nonzero ring makes the mapping
+; a ring of that size owned by the slot, open says the leg will append more,
+; and leg/leggen name that leg for the resume. linnea_quic_h3_deliver clears
+; ring and open once it has read them, so a caller that does not know about
+; relays (a canned error) gets the ordinary linear slot it always did.
+linnea_h3d_ring:   resq 1
+linnea_h3d_open:   resq 1
+linnea_h3d_leg:    resq 1
+linnea_h3d_leggen: resq 1
+; 1 = open the stream but do not pump yet: the leg is about to append the body
+; bytes that arrived with the head, and the first append pumps both, so a small
+; response still leaves as one packet rather than a head and then its body.
+linnea_h3d_hold:   resq 1
+; Called with (rdi = leg index, rsi = its generation, rdx = room) when a relay
+; whose leg paused for room has at least the room it asked for again. The loop
+; installs it; it queues the leg's next upstream read and nothing else.
+linnea_h3_resume_hook: resq 1
 s_ini_pn:    resq 1                   ; the Initial packet number being reassembled
 s_ack_elicit: resq 1                  ; 1 when the 1-RTT packet in hand must be acked
 s_pn_before:  resq 1                  ; conn.pn_1rtt before we processed it, so the
@@ -4470,6 +4496,9 @@ linnea_quic_server_datagram:
     jnz .sd_scan
     jmp .serve_defer_force            ; every response slot busy: emit inline
 .sd_found:
+    mov qword [rdx + linnea_quic_txstream.ring], 0    ; an ordinary slot, not a
+    mov qword [rdx + linnea_quic_txstream.open], 0    ; live relay (a recycled
+    mov qword [rdx + linnea_quic_txstream.wait], 0    ; one may have been)
     mov qword [rdx + linnea_quic_txstream.base], 0
     mov qword [rdx + linnea_quic_txstream.size], 0
     mov qword [rdx + linnea_quic_txstream.foff], 0
@@ -4564,6 +4593,9 @@ linnea_quic_server_datagram:
     jnz .sl_scan
     jmp .stream_scan                 ; no free slot (unreachable: tx_cap ensured one)
 .sl_found:
+    mov qword [rdx + linnea_quic_txstream.ring], 0    ; an ordinary slot, not a
+    mov qword [rdx + linnea_quic_txstream.open], 0    ; live relay (a recycled
+    mov qword [rdx + linnea_quic_txstream.wait], 0    ; one may have been)
     mov [rdx + linnea_quic_txstream.base], r8
     mov [rdx + linnea_quic_txstream.size], r9
     mov r10, [linnea_h3_body_off]     ; the slice the serve chose (a 206's
@@ -4636,6 +4668,9 @@ linnea_quic_server_datagram:
     call tx_reset_stream_code
     jmp .stream_scan
 .sp_found:
+    mov qword [rdx + linnea_quic_txstream.ring], 0    ; an ordinary slot, not a
+    mov qword [rdx + linnea_quic_txstream.open], 0    ; live relay (a recycled
+    mov qword [rdx + linnea_quic_txstream.wait], 0    ; one may have been)
     mov qword [rdx + linnea_quic_txstream.base], 0
     mov qword [rdx + linnea_quic_txstream.size], 0
     mov qword [rdx + linnea_quic_txstream.foff], 0
@@ -7484,6 +7519,11 @@ tx_emit_chunk:
     mov al, 0x0c                      ; STREAM | OFF
     cmp rdx, rcx
     jne .tc_typed
+    ; ...unless it is a live relay whose leg may still append: then this is
+    ; only the end of what has been written SO FAR (a later chunk, or a resend
+    ; of this one after the leg finished, carries the FIN)
+    cmp qword [rbp + linnea_quic_txstream.open], 0
+    jne .tc_typed
     or al, 0x01                       ; this chunk ends the stream: FIN
 .tc_typed:
     mov [strm_pay + r15], al
@@ -7520,6 +7560,8 @@ tx_emit_chunk:
 .tc_body:
     test r9, r9
     jz .tc_send
+    cmp qword [rbp + linnea_quic_txstream.ring], 0
+    jne .tc_ring
     mov rsi, [rbp + linnea_quic_txstream.base]
     add rsi, [rbp + linnea_quic_txstream.foff]   ; the body's start in the mapping
     add rsi, rdx
@@ -7528,6 +7570,31 @@ tx_emit_chunk:
     mov rcx, r9
     rep movsb
     add r15, r9
+    jmp .tc_send
+.tc_ring:
+    ; a live relay (hlen is 0): stream byte i is ring[(i - origin) mod ring],
+    ; so a chunk may wrap past the ring's end and continue at its start
+    mov rax, rdx
+    sub rax, [rbp + linnea_quic_txstream.origin]
+    mov rcx, [rbp + linnea_quic_txstream.ring]
+    dec rcx
+    and rax, rcx                      ; the chunk's position in the ring
+    inc rcx                           ; ring size
+    sub rcx, rax                      ; bytes before the wrap
+    cmp rcx, r9
+    jbe .tc_ring_split
+    mov rcx, r9                       ; no wrap in this chunk
+.tc_ring_split:
+    mov rsi, [rbp + linnea_quic_txstream.base]
+    add rsi, rax
+    lea rdi, [strm_pay + r15]
+    sub r9, rcx
+    add r15, rcx
+    rep movsb
+    mov rcx, r9                       ; what is left comes from the ring's start
+    mov rsi, [rbp + linnea_quic_txstream.base]
+    add r15, rcx
+    rep movsb
 .tc_send:
     lea rsi, [strm_pay]
     mov [s_pl_ptr], rsi
@@ -7627,6 +7694,37 @@ emit_inline_chunked:
     pop rbx
     ret
 
+; ring_room(rdi = conn, rsi = a live-relay stream slot, edx = its index)
+;   -> rax = bytes its leg may append now.
+; What the ring still has to hold is everything from the lowest byte the peer
+; has not acknowledged up to the last one written: unsent bytes, and sent ones
+; a loss would have to rebuild. The lowest is the send cursor unless a chunk
+; below it is still in flight, and only the in-flight table knows that.
+; Clobbers only caller-saved registers.
+ring_room:
+    mov r8, [rsi + linnea_quic_txstream.off]          ; lowest unacknowledged
+    lea rax, [rdi + linnea_quic_conn.tx_infl]
+    mov ecx, LINNEA_QUIC_TXINFL_SLOTS
+.rr_scan:
+    cmp qword [rax + linnea_quic_txchunk.in_use], 0
+    je .rr_next
+    cmp [rax + linnea_quic_txchunk.ctx], rdx
+    jne .rr_next
+    mov r9, [rax + linnea_quic_txchunk.off]
+    cmp r9, r8
+    jae .rr_next
+    mov r8, r9
+.rr_next:
+    add rax, linnea_quic_txchunk_size
+    dec ecx
+    jnz .rr_scan
+    mov rax, [rsi + linnea_quic_txstream.flen]        ; written (hlen is 0)
+    sub rax, r8                                       ; still held
+    mov rcx, [rsi + linnea_quic_txstream.ring]
+    sub rcx, rax
+    mov rax, rcx
+    ret
+
 ; tx_pump — advance the open response streams by RFC 9218 priority. First it
 ; reaps any stream fully sent AND fully acknowledged (unmap, free slot). Then it
 ; repeatedly picks the highest-priority servable stream and sends it one chunk:
@@ -7657,6 +7755,33 @@ tx_pump:
     je .tp_reap_next
     cmp qword [rbp + linnea_quic_txstream.pending], 0
     jne .tp_reap_next                 ; claimed, but its response has not arrived
+    cmp qword [rbp + linnea_quic_txstream.ring], 0
+    je .tp_reap_linear
+    ; A live relay whose leg stopped reading its upstream for want of room:
+    ; acknowledgements may have freed enough. The hook only queues the leg's
+    ; next upstream read -- it appends nothing, so this pump is not re-entered.
+    mov rax, [rbp + linnea_quic_txstream.wait]
+    test rax, rax
+    jz .tp_reap_open
+    push rax
+    mov rdi, rbx
+    mov rsi, rbp
+    mov edx, r14d
+    call ring_room                    ; rax = room
+    pop rcx
+    cmp rax, rcx
+    jb .tp_reap_open                  ; not enough yet
+    mov qword [rbp + linnea_quic_txstream.wait], 0
+    cmp qword [linnea_h3_resume_hook], 0
+    je .tp_reap_open
+    mov rdi, [rbp + linnea_quic_txstream.leg]
+    mov rsi, [rbp + linnea_quic_txstream.leg_gen]
+    mov rdx, rax
+    call [linnea_h3_resume_hook]
+.tp_reap_open:
+    cmp qword [rbp + linnea_quic_txstream.open], 0
+    jne .tp_reap_next                 ; its leg may still append: never reaped
+.tp_reap_linear:
     mov rax, [rbp + linnea_quic_txstream.hlen]
     add rax, [rbp + linnea_quic_txstream.flen]
     cmp qword [rbp + linnea_quic_txstream.off], rax
@@ -8042,6 +8167,24 @@ tx_abort_one:
     add rax, rcx                      ; rax = the slot
     cmp qword [rax + linnea_quic_txstream.active], 0
     je .ta1_table
+    ; A live relay still has its upstream leg writing into this ring. Stop it
+    ; FIRST: its stream is going, so its upstream connection must close now
+    ; rather than whenever the backend next writes (and the leg never touches
+    ; the ring directly, so once this returns nothing will).
+    cmp qword [rax + linnea_quic_txstream.ring], 0
+    je .ta1_unmap
+    cmp qword [rax + linnea_quic_txstream.open], 0
+    je .ta1_unmap
+    mov qword [rax + linnea_quic_txstream.open], 0
+    cmp qword [linnea_h3_cancel_hook], 0
+    je .ta1_unmap
+    push rax
+    movzx edi, byte [rbx + linnea_quic_conn.scid + 1]   ; the pool index
+    mov rsi, [rbx + linnea_quic_conn.scid]              ; and the incarnation
+    mov rdx, [rax + linnea_quic_txstream.sid]
+    call [linnea_h3_cancel_hook]
+    pop rax
+.ta1_unmap:
     mov rdi, [rax + linnea_quic_txstream.base]
     mov rsi, [rax + linnea_quic_txstream.size]
     mov qword [rax + linnea_quic_txstream.active], 0
@@ -8538,7 +8681,22 @@ linnea_quic_h3_deliver:
     mov qword [r15 + linnea_quic_txstream.inflight], 0
     mov rax, [rbx + linnea_quic_conn.fc_stream_init]  ; this stream's own window
     mov [r15 + linnea_quic_txstream.fc_max], rax
+    mov rax, [linnea_h3d_ring]                        ; a live relay, or not
+    mov [r15 + linnea_quic_txstream.ring], rax
+    mov rax, [linnea_h3d_open]
+    mov [r15 + linnea_quic_txstream.open], rax
+    mov qword [r15 + linnea_quic_txstream.origin], 0
+    mov qword [r15 + linnea_quic_txstream.wait], 0
+    mov rax, [linnea_h3d_leg]
+    mov [r15 + linnea_quic_txstream.leg], rax
+    mov rax, [linnea_h3d_leggen]
+    mov [r15 + linnea_quic_txstream.leg_gen], rax
+    mov qword [linnea_h3d_ring], 0
+    mov qword [linnea_h3d_open], 0
     mov qword [r15 + linnea_quic_txstream.pending], 0 ; it is a response now
+    mov eax, 1
+    cmp qword [linnea_h3d_hold], 0
+    jne .hd_ret                       ; the leg's first append pumps it
     mov [cur_conn], rbx
     call tx_pump
     mov eax, 1
@@ -8571,6 +8729,274 @@ linnea_quic_h3_deliver:
 .hd_gone:
     xor eax, eax
 .hd_ret:
+    mov qword [linnea_h3d_ring], 0    ; whatever happened, the next delivery
+    mov qword [linnea_h3d_open], 0    ; starts from an ordinary slot
+    mov qword [linnea_h3d_hold], 0
+    mov rsp, rbp
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; --- live relays: the proxied-response stream while its leg still writes -----
+; A proxied response is relayed as it arrives (upstream protocol v2). Delivery
+; opens the stream with the head in a ring the slot owns; from then on the
+; upstream leg, which lives in the io_uring loop and knows this connection only
+; by (pool index, connection ID, stream id), comes back through these three.
+; Each looks the stream up afresh, so a leg whose stream has been reset, or
+; whose connection has gone, is told so rather than writing into a slot that
+; is no longer its own.
+
+; relay_find(rdi = conn index, rsi = its connection ID, rdx = stream id)
+;   -> rax = conn* (0 = gone), rdx = the open relay slot, rcx = its index.
+relay_find:
+    push rbx
+    push r12
+    push r13
+    mov r12, rsi
+    mov r13, rdx
+    call linnea_quic_conn_slot        ; rax = conn* if that slot is in use
+    test rax, rax
+    jz .rf_none
+    mov rbx, rax
+    cmp [rbx + linnea_quic_conn.scid], r12
+    jne .rf_none                      ; the slot was recycled meanwhile
+    cmp qword [rbx + linnea_quic_conn.state], LINNEA_QUIC_ST_CLOSING
+    je .rf_none
+    lea rdx, [rbx + linnea_quic_conn.tx_streams]
+    xor ecx, ecx
+.rf_scan:
+    cmp qword [rdx + linnea_quic_txstream.active], 0
+    je .rf_next
+    cmp qword [rdx + linnea_quic_txstream.pending], 0
+    jne .rf_next
+    cmp qword [rdx + linnea_quic_txstream.ring], 0
+    je .rf_next
+    cmp qword [rdx + linnea_quic_txstream.open], 0
+    je .rf_next
+    cmp [rdx + linnea_quic_txstream.sid], r13
+    je .rf_hit
+.rf_next:
+    add rdx, linnea_quic_txstream_size
+    inc ecx
+    cmp ecx, LINNEA_QUIC_TXSTREAMS
+    jb .rf_scan
+.rf_none:
+    xor eax, eax
+    jmp .rf_ret
+.rf_hit:
+    mov rax, rbx
+.rf_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ring_put(rsi = bytes, rdx = count; r13 = the relay slot) — write them at the
+; stream's end, wrapping at the ring's. The caller has checked the room.
+ring_put:
+    mov rax, [r13 + linnea_quic_txstream.flen]
+    sub rax, [r13 + linnea_quic_txstream.origin]
+    mov rcx, [r13 + linnea_quic_txstream.ring]
+    dec rcx
+    and rax, rcx                      ; where the next byte goes
+    inc rcx
+    sub rcx, rax                      ; room before the wrap
+    cmp rcx, rdx
+    jbe .rp_split
+    mov rcx, rdx
+.rp_split:
+    add [r13 + linnea_quic_txstream.flen], rdx
+    mov rdi, [r13 + linnea_quic_txstream.base]
+    add rdi, rax
+    sub rdx, rcx
+    rep movsb
+    mov rcx, rdx                      ; the rest, from the ring's first byte
+    mov rdi, [r13 + linnea_quic_txstream.base]
+    rep movsb
+    ret
+
+; linnea_quic_h3_append(rdi = conn index, rsi = its connection ID, rdx = stream
+;   id, rcx = body bytes, r8 = their count, r9 = 1 when this ends the body)
+;   -> rax = the room left for the next append, 0 once the body has ended,
+;      -1 the stream is gone (reset, or its connection closed), -2 the bytes
+;      would not fit (the caller asked for less room than it used: a bug).
+; The bytes go out as one HTTP/3 DATA frame and the pump runs at once, so an
+; event the backend just wrote is on the wire before this returns, window
+; permitting. The end of the body is the stream's FIN: it rides the last bytes
+; still unsent, or -- when every byte is already out, as it is when a
+; close-delimited upstream closes after a quiet spell -- an empty DATA frame
+; written for it, since QUIC has no FIN without a frame to carry it and the
+; pump sends no empty chunks.
+linnea_quic_h3_append:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbp, rsp
+    and rsp, -16                      ; the pump reaches AES-GCM (see deliver)
+    sub rsp, 48
+    mov [rsp], rcx                    ; bytes
+    mov [rsp + 8], r8                 ; count
+    mov [rsp + 16], r9                ; ends the body?
+    call relay_find
+    test rax, rax
+    jz .ap_gone
+    mov rbx, rax
+    mov r13, rdx                      ; the slot
+    mov r14, rcx                      ; its index
+    mov r12d, [rbx + linnea_quic_conn.udp_fd]
+    mov rdi, rbx
+    mov rsi, r13
+    mov edx, r14d
+    call ring_room
+    cmp rax, [r13 + linnea_quic_txstream.ring]
+    jne .ap_room
+    ; nothing held: every written byte is acknowledged, so the next one can go
+    ; back to the ring's first byte (no chunk can need the old placement)
+    mov rcx, [r13 + linnea_quic_txstream.flen]
+    mov [r13 + linnea_quic_txstream.origin], rcx
+.ap_room:
+    mov r15, rax                      ; room
+    mov rcx, [rsp + 8]
+    test rcx, rcx
+    jz .ap_fin
+    lea rdx, [rcx + 9]                ; the frame header is at most 9 bytes
+    cmp rdx, r15
+    ja .ap_overrun
+    mov byte [rsp + 32], LINNEA_H3_FRAME_DATA
+    lea rdi, [rsp + 33]
+    mov rsi, rcx
+    call linnea_quic_varint_encode    ; rax = varint bytes
+    lea rdx, [rax + 1]
+    sub r15, rdx
+    lea rsi, [rsp + 32]
+    call ring_put
+    mov rsi, [rsp]
+    mov rdx, [rsp + 8]
+    sub r15, rdx
+    call ring_put
+.ap_fin:
+    cmp qword [rsp + 16], 0
+    je .ap_pump
+    mov rax, [r13 + linnea_quic_txstream.hlen]
+    add rax, [r13 + linnea_quic_txstream.flen]
+    cmp [r13 + linnea_quic_txstream.off], rax
+    jb .ap_close                      ; unsent bytes remain: the FIN rides them
+    cmp r15, 2
+    jb .ap_overrun
+    mov word [rsp + 32], LINNEA_H3_FRAME_DATA   ; type 0, length 0
+    lea rsi, [rsp + 32]
+    mov edx, 2
+    call ring_put
+.ap_close:
+    mov qword [r13 + linnea_quic_txstream.open], 0
+.ap_pump:
+    mov qword [r13 + linnea_quic_txstream.wait], 0
+    mov [cur_conn], rbx
+    call tx_pump
+    xor eax, eax
+    cmp qword [rsp + 16], 0
+    jne .ap_ret                       ; ended: the slot may already be reaped
+    mov rdi, rbx
+    mov rsi, r13
+    mov edx, r14d
+    call ring_room
+    jmp .ap_ret
+.ap_overrun:
+    mov rax, -2
+    jmp .ap_ret
+.ap_gone:
+    mov rax, -1
+.ap_ret:
+    mov rsp, rbp
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_h3_room(rdi = conn index, rsi = its connection ID, rdx = stream
+;   id, rcx = the least room worth reading for) -> rax = the room, or -1 when
+;   the stream is gone.
+; Less than asked for means the leg is about to stop reading its upstream, so
+; the slot remembers to wake it: once acknowledgements have freed a quarter of
+; the ring, the pump calls linnea_h3_resume_hook. A quarter rather than the
+; minimum, so a stream held back by a slow reader resumes in useful reads
+; instead of a syscall per packet acknowledged.
+linnea_quic_h3_room:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
+    mov r12, rcx                      ; want
+    call relay_find
+    test rax, rax
+    jz .rm_gone
+    mov rbx, rax
+    mov r13, rdx
+    mov r14, rcx
+    mov rdi, rbx
+    mov rsi, r13
+    mov edx, r14d
+    call ring_room
+    cmp rax, r12
+    jae .rm_ret
+    mov rcx, [r13 + linnea_quic_txstream.ring]
+    shr rcx, 2
+    mov [r13 + linnea_quic_txstream.wait], rcx
+    jmp .rm_ret
+.rm_gone:
+    mov rax, -1
+.rm_ret:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; linnea_quic_h3_abort(rdi = conn index, rsi = its connection ID, rdx = stream
+;   id, ecx = HTTP/3 error code) — the upstream failed after the head went out
+; (a timeout, a reset, framing we will not relay, a body cut short). Nothing
+; honest can be sent any more, so the stream is reset, which is the h3 twin of
+; the RST_STREAM h2 sends in the same place. The slot is freed here and the
+; leg is not called back: it is the one asking.
+linnea_quic_h3_abort:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbp, rsp
+    and rsp, -16
+    mov r15d, ecx                     ; the error code
+    call relay_find
+    test rax, rax
+    jz .ab_ret                        ; already gone: nothing to reset
+    mov rbx, rax
+    mov r13, rdx
+    mov r14, rcx
+    mov r12d, [rbx + linnea_quic_conn.udp_fd]
+    mov qword [r13 + linnea_quic_txstream.open], 0   ; no cancel back to the leg
+    mov [cur_conn], rbx
+    mov rdi, [r13 + linnea_quic_txstream.sid]
+    mov rsi, [r13 + linnea_quic_txstream.off]        ; final size = bytes sent
+    mov edx, r15d
+    call tx_reset_stream_code
+    mov rdi, rbx
+    mov rsi, r14
+    call tx_abort_one                 ; unmap, free the slot, drop its chunks
+.ab_ret:
     mov rsp, rbp
     pop rbp
     pop r15
