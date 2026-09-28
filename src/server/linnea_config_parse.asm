@@ -1280,6 +1280,8 @@ linnea_parse_pdf_body_limit:
     call linnea_parse_u64
     test rax, rax
     jz .shape
+    cmp rax, 16777216           ; Vefruna's immutable source-store bound
+    ja .shape
     mov [rbx + linnea_config_server.pdf_source_max_body], rax
 .sep:
     call linnea_parse_skip_ws

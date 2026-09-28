@@ -27,7 +27,8 @@ The rule applies only to the named server's exact hostname and method. The
 effective cap is the matching rule's `max_body`; otherwise the existing
 location/global cap applies. Duplicate matching rules are rejected at config
 parse time. Unsupported template syntax is rejected rather than treated as a
-prefix match. The initial implementation accepts exactly one rule.
+prefix match. The initial implementation accepts exactly one rule and caps its
+`max_body` at Vefruna's 16,777,216-byte source-store limit.
 
 Acceptance requires the same limit decision before body buffering on HTTP/1,
 HTTP/2, and HTTP/3, including chunked/unknown-length streams and declared

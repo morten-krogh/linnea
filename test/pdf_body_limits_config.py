@@ -43,7 +43,7 @@ def run(candidate):
 
 assert run(rule) == 0
 for change in ({"method": "PUT"}, {"path": "/projects/"},
-               {"max_body": 0}, {"extra": True}):
+               {"max_body": 0}, {"max_body": 16777217}, {"extra": True}):
     assert run(rule | change) != 0, change
 for missing in rule:
     assert run({key: value for key, value in rule.items()
